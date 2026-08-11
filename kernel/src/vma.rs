@@ -9,14 +9,11 @@ use crate::mm::PAGE_2M;
 /// to the PIE base — no usable VA space exists above it.
 pub const ALLOC_CEILING: u64 = STACK_BASE;
 
-/// Nothing allocated below this floor (guard against NULL-ish addresses).
-#[cfg(not(feature = "test-tiny-va"))]
-pub const ALLOC_FLOOR: u64 = 0x0002_0000_0000; // 8 GB
-
-/// `test-tiny-va` raises the floor to leave a 256 MiB arena.
+/// Nothing allocated below this floor (guard against NULL-ish addresses), and
+/// what `test-tiny-va` raises to leave a 256 MiB arena.
 ///
 /// Why an actuator rather than a program. The shipped arena is
-/// `ALLOC_CEILING - ALLOC_FLOOR`, about 1015 GB. Every region in it costs
+/// `ALLOC_CEILING - alloc_floor()`, about 1015 GB. Every region in it costs
 /// `align_up_2m(size) + GUARD_SIZE` of address space against at least
 /// `align_up_2m(size)` of *physical* memory — mmap, shared memory, io_uring
 /// and TLS all allocate through the PMM, and `dlopen`'s shared-image arm still
@@ -30,9 +27,16 @@ pub const ALLOC_FLOOR: u64 = 0x0002_0000_0000; // 8 GB
 /// 256 MiB is ~64 mappings, so a test exhausts it in a fraction of a second,
 /// and it is wide enough that every process in the boot still maps its TLS and
 /// its heap (measured: the boot completes and the guest reaches its ready
-/// marker). The code under test is the shipped code; only this number moves.
-#[cfg(feature = "test-tiny-va")]
-pub const ALLOC_FLOOR: u64 = ALLOC_CEILING - 256 * 1024 * 1024;
+/// marker). The code under test is the shipped code; only this number moves —
+/// and in a kernel without `boot-actuators` the branch is `if false` and this
+/// is the constant it always was.
+pub fn alloc_floor() -> u64 {
+    if crate::actuator::test_tiny_va() {
+        ALLOC_CEILING - 256 * 1024 * 1024
+    } else {
+        0x0002_0000_0000 // 8 GB
+    }
+}
 
 /// Main thread stack base. RSP starts at STACK_BASE + USER_STACK_SIZE.
 pub const STACK_BASE: u64 = 0x00FF_FF80_0000;

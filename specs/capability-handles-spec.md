@@ -1,5 +1,29 @@
 # ToyOS Capability Handles — Technical Specification
 
+> **Delivered by `specs/capability-endowment-spec.md`, 2026-08-10, and read that
+> one for the end state.** The endowment branch built §1's whole object model —
+> `ObjectCore { koid, handle_count, retired }`, the per-variant census, the
+> generation-tagged `RawHandle`, `HandleTable` in place of `FdTable`, and every
+> `Descriptor` kind as an object — and the end state of §1's fourth bullet with
+> it: a handle a process does not hold ends that process. `Fd`, `PipeId`,
+> `SharedToken`, `signal_pipe_id`, pid-addressed `kill`/`waitpid` and the service
+> registry are all retired numbers.
+>
+> **Four things this document asks for that are not there.** Its §12.4 gate list
+> names `handle_basic`, `handle_transfer`, `kill_while_blocked` and
+> `device_claim_crash_release`; the endowment branch built `handle_kill_policy`
+> and `process_lifecycle` and left those four to the tests that happen to cover
+> their properties (`fd_lifetime`, `abuse_shared_grant`, `device_claim_lifetime`,
+> the audio clients). Each is a name nothing answers to, which is the shape a
+> gate list should not have.
+>
+> **And two it asks for that the design cannot express.** §6.3's
+> `shm_h_with_MAP_only` needs a right that does not carry across a send, and
+> `SYS_HANDLE_SEND` requires `TRANSFER` on what it moves
+> (`specs/issues/isolation/a-moved-handle-is-always-re-movable.md`). §14.5's
+> refusal of unmap-others stands, and with it the revocation question in
+> `specs/issues/isolation/process-isolation-ungated.md`.
+
 ## 1. Goals
 
 - **Compile-time kill of the free-while-referenced class** (the crash.md UAF: an

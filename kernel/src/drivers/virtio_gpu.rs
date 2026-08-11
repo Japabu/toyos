@@ -10,7 +10,7 @@ use crate::mm::{PAGE_2M, KernelSlice};
 use crate::gpu::{FLAG_HARDWARE_CURSOR, Gpu, GpuInfo};
 use crate::log;
 use crate::mm::paging::CachePolicy;
-use crate::shared_memory::{self, SharedToken};
+use crate::object::shm::{Pages, Region};
 use crate::sync::Lock;
 
 const VIRTIO_VENDOR: u16 = 0x1AF4;
@@ -195,11 +195,18 @@ struct RespEdid {
     edid: [u8; 1024],
 }
 
+/// The two scanout buffers, as the driver and as a claimant see them.
+///
+/// **The pages are behind an `Arc` and the driver is one holder of it.** A
+/// resolution change drops this and allocates again; whatever compositor
+/// mapped the old buffers keeps them until it closes its handles, and the
+/// pages go back to the PMM when the last of the two lets go. That replaces a
+/// forced unmap-everyone, which is the one thing a capability system may not
+/// do.
 struct FbAlloc {
-    tokens: [SharedToken; 2],
+    regions: [Region; 2],
     phys_addrs: [u64; 2],
     ptrs: [*mut u8; 2],
-    _pages: [alloc::vec::Vec<crate::mm::pmm::PhysPage>; 2],
 }
 
 unsafe impl Send for GpuController {}
@@ -223,8 +230,7 @@ struct GpuController {
     height: u32,
     resource: u32,
     fb: FbAlloc,
-    cursor_token: SharedToken,
-    _cursor_pages: alloc::vec::Vec<crate::mm::pmm::PhysPage>,
+    cursor: Region,
 }
 
 impl GpuController {
@@ -461,42 +467,33 @@ impl GpuController {
     fn alloc_framebuffer(&mut self, fb_size: u32) -> Option<FbAlloc> {
         let fb_size = fb_size as usize;
         let fb_pages = (fb_size + PAGE_2M as usize - 1) / PAGE_2M as usize;
-        let mut tokens = [SharedToken::from_raw(0); 2];
+        let fb_aligned = (fb_pages * PAGE_2M as usize) as u64;
         let mut phys_addrs = [0u64; 2];
         let mut ptrs = [core::ptr::null_mut(); 2];
-        let pages0 = crate::mm::pmm::alloc_contiguous(fb_pages, crate::mm::pmm::Category::Framebuffer)?;
-        let pages1 = crate::mm::pmm::alloc_contiguous(fb_pages, crate::mm::pmm::Category::Framebuffer)?;
-        let all_pages = [pages0, pages1];
+        let all_pages =
+            [crate::mm::pmm::alloc_contiguous(fb_pages, crate::mm::pmm::Category::Framebuffer)?,
+             crate::mm::pmm::alloc_contiguous(fb_pages, crate::mm::pmm::Category::Framebuffer)?];
+        let regions = all_pages.map(|pages| {
+            let phys = pages[0].direct_map().phys();
+            Region {
+                phys: crate::DirectMap::from_phys(phys),
+                size: fb_aligned,
+                cache: CachePolicy::DeferToMtrr,
+                pages: Some(alloc::sync::Arc::new(Pages::new(pages))),
+            }
+        });
         for i in 0..2 {
-            let phys_addr = all_pages[i][0].direct_map().phys();
-            let ptr = all_pages[i][0].direct_map().as_mut_ptr::<u8>();
-            ptrs[i] = ptr;
-            phys_addrs[i] = phys_addr;
-            let fb_aligned = fb_pages * PAGE_2M as usize;
-            tokens[i] = shared_memory::register(crate::DirectMap::from_phys(phys_addr), fb_aligned as u64, CachePolicy::DeferToMtrr);
-            log!("VirtIO GPU: buffer {} at {:?} phys={:#x} ({} bytes) token={:?}", i, ptr, phys_addrs[i], fb_size, tokens[i]);
+            phys_addrs[i] = regions[i].phys.phys();
+            ptrs[i] = regions[i].phys.as_mut_ptr::<u8>();
+            log!("VirtIO GPU: buffer {} at {:?} phys={:#x} ({} bytes)", i, ptrs[i], phys_addrs[i], fb_size);
         }
-        Some(FbAlloc { tokens, phys_addrs, ptrs, _pages: all_pages })
-    }
-
-    /// Revoke both buffers from the compositor and return their pages.
-    ///
-    /// The order is the point and it used to be the other way round: `unregister`
-    /// takes the compositor's mapping away on *this* CPU, `retired`'s drop is
-    /// what tells the others, and only then does `fb` go — so a resolution
-    /// change cannot hand the PMM pages the compositor is still blitting into
-    /// through a stale entry.
-    fn free_framebuffer(&mut self, fb: FbAlloc) {
-        let retired: alloc::vec::Vec<_> =
-            fb.tokens.iter().filter_map(|t| shared_memory::unregister(*t)).collect();
-        drop(retired);
-        drop(fb);
+        Some(FbAlloc { regions, phys_addrs, ptrs })
     }
 
     fn build_gpu_info(&self) -> GpuInfo {
         GpuInfo {
-            tokens: self.fb.tokens,
-            cursor_token: self.cursor_token,
+            scanout: self.fb.regions.clone(),
+            cursor: self.cursor.clone(),
             width: self.width,
             height: self.height,
             stride: self.width,
@@ -555,8 +552,9 @@ impl Gpu for GpuController {
         self.set_scanout(0, self.resource, rect);
 
         self.destroy_resource(old_resource);
-        let old_fb = core::mem::replace(&mut self.fb, new_fb);
-        self.free_framebuffer(old_fb);
+        // The old pages go when the last holder lets go, which may be a
+        // compositor that has not yet mapped the new ones. Nothing is revoked.
+        drop(core::mem::replace(&mut self.fb, new_fb));
 
         self.width = width;
         self.height = height;
@@ -631,13 +629,11 @@ pub fn init(devices: &[PciDevice]) -> Option<(Box<dyn Gpu>, GpuInfo)> {
         height: 0,
         resource: 1,
         fb: FbAlloc {
-            tokens: [SharedToken::from_raw(0); 2],
+            regions: core::array::from_fn(|_| Region::empty()),
             phys_addrs: [0; 2],
             ptrs: [core::ptr::null_mut(); 2],
-            _pages: [alloc::vec::Vec::new(), alloc::vec::Vec::new()],
         },
-        cursor_token: SharedToken::from_raw(0),
-        _cursor_pages: alloc::vec::Vec::new(),
+        cursor: Region::empty(),
     };
 
     // EDID reports firmware-set resolution (often 640x480 from OVMF), not the
@@ -675,11 +671,15 @@ pub fn init(devices: &[PciDevice]) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     let cursor_pages = crate::mm::pmm::alloc_contiguous(1, crate::mm::pmm::Category::Framebuffer).expect("VirtIO GPU: cursor alloc failed");
     let cursor_ptr = cursor_pages[0].direct_map().as_mut_ptr::<u8>();
     let cursor_phys = cursor_pages[0].direct_map().phys();
-    gpu.cursor_token = shared_memory::register(crate::DirectMap::from_phys(cursor_phys), PAGE_2M, CachePolicy::DeferToMtrr);
-    gpu._cursor_pages = cursor_pages;
+    gpu.cursor = Region {
+        phys: crate::DirectMap::from_phys(cursor_phys),
+        size: PAGE_2M,
+        cache: CachePolicy::DeferToMtrr,
+        pages: Some(alloc::sync::Arc::new(Pages::new(cursor_pages))),
+    };
     gpu.create_resource(CURSOR_RESOURCE_ID, FORMAT_B8G8R8A8_UNORM, CURSOR_SIZE, CURSOR_SIZE);
     gpu.attach_backing(CURSOR_RESOURCE_ID, cursor_phys, cursor_bytes as u32);
-    log!("VirtIO GPU: cursor resource at {:?} phys={:#x} token={:?}", cursor_ptr, cursor_phys, gpu.cursor_token);
+    log!("VirtIO GPU: cursor resource at {:?} phys={:#x}", cursor_ptr, cursor_phys);
 
     gpu.width = width;
     gpu.height = height;

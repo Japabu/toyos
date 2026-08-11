@@ -99,7 +99,7 @@ controller is not.
   keyboard/mouse claims succeed with no hardware behind them
   (`specs/issues/hardware/device-claim-succeeds-with-no-device.md`), and every
   network client burns a second of retry before giving up
-  (`specs/issues/hardware/network-clients-pay-a-boot-retry.md`). The 2048x2048
+  (`hardware/network-clients-pay-a-boot-retry`, since closed). The 2048x2048
   mode policy was left alone.
 
   Still missing from the *simulation*: input. q35 gives the guest an i8042 and

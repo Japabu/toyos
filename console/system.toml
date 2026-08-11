@@ -11,14 +11,24 @@
 # Deliberately three programs. Every extra one is something that can fail
 # between the kernel and a prompt, on the machine where a failure costs a
 # reflash — and there is no daemon here that a shell needs.
-init = ["/bin/console"]
 
 assets = ["assets"]
 
-[programs]
-console = {}
-shell = {}
-toybox = {}
+[boot]
+start = ["console"]
+
+# `/bin/console` owns the screen and provides the surface its shell and the
+# shell's children inherit. No compositor here, so nothing receives one.
+[programs.console]
+provides = ["surface"]
+receives = ["launcher"]
+devices = ["framebuffer", "keyboard", "mouse"]
+
+[programs.shell]
+receives = ["surface", "launcher"]
+
+[programs.toybox]
+receives = ["surface"]
 
 [symlinks]
 "bin/cat" = "/bin/toybox"

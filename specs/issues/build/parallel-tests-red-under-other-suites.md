@@ -16,8 +16,9 @@ phase landed, and none reproduces on a host running one suite.
 Every entry below that says `nothing typed at the terminal window reached a
 shell` — `desktop_typing_damage`, `desktop_locale_detect`, `blocked_dump`, and
 `desktop_audio_client` in `desktop-window-child-holds-a-lane` — is now known to be the
-`/bin/terminal` boot race in `specs/issues/kernel/terminal-races-compositor-at-boot.md`
-reported through a wall-clock guard that could
+`/bin/terminal` boot race (`kernel/terminal-races-compositor-at-boot`, since
+closed by the capability endowment branch: a port exists before either end's
+process does) reported through a wall-clock guard that could
 say nothing else: three of three such reds in an eight-suite session carried the
 race in their boot log, and the wait they blew had been ruled out at 0.6 s by
 `exit: terminal pid=N code=1`. `shell_echoes` names the race now. So an

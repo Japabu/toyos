@@ -20,13 +20,14 @@ mod drivers;
 
 #[macro_use]
 mod log;
+mod actuator;
 mod mm;
 
 mod keyboard;
 mod mouse;
-#[cfg(feature = "test-input-merge")]
+#[cfg(feature = "boot-actuators")]
 mod input_merge_test;
-#[cfg(feature = "usb-storage-gate")]
+#[cfg(feature = "boot-actuators")]
 mod usb_gate;
 mod block;
 mod gpt;
@@ -37,7 +38,7 @@ mod file_backing;
 mod bcachefs_adapter;
 mod fat32_adapter;
 mod log_file;
-#[cfg(feature = "heartbeat")]
+#[cfg(feature = "boot-actuators")]
 mod heartbeat;
 #[allow(dead_code)]
 mod vfs;
@@ -54,14 +55,14 @@ mod irq_ring;
 mod trace;
 mod clock;
 mod rtc;
-mod fd;
+
+mod object;
 mod io_uring;
 mod pipe;
-mod listener;
+
 mod device;
 mod net;
 mod gpu;
-mod shared_memory;
 mod user_ptr;
 mod vma;
 
@@ -75,7 +76,7 @@ mod vma;
 /// same symbol are then on different display rows. It is a real backtrace
 /// frame off a real panic, which a synthetic wide `log!` line was only ever
 /// standing in for.
-#[cfg(feature = "test-late-panic")]
+#[cfg(feature = "boot-actuators")]
 mod late_panic {
     pub struct Nest<T>(core::marker::PhantomData<T>);
 
@@ -89,7 +90,6 @@ mod late_panic {
 
 use crate::mm::paging::CachePolicy;
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use arch::{apic, cpu, idt, pat, percpu, smp, syscall};
 use drivers::{acpi, gop, i8042, ioapic, nvme, pci, serial, virtio_console, virtio_gpu, virtio_net, virtio_sound, xhci};
 use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
@@ -267,16 +267,21 @@ pub unsafe extern "sysv64" fn _start(_kernel_args: &KernelArgs) -> ! {
 }
 
 fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
-    let fb_info = fd::FramebufferInfo {
-        token: [info.tokens[0].raw(), info.tokens[1].raw()],
-        cursor_token: info.cursor_token.raw(),
-        width: info.width,
-        height: info.height,
-        stride: info.stride,
-        pixel_format: info.pixel_format,
-        flags: info.flags,
-    };
-    crate::device::set_framebuffer_info(fb_info);
+    crate::device::set_framebuffer_info(crate::device::Screen {
+        // A description carries handles into whichever process reads it, and
+        // that process does not exist yet: `try_claim` mints them.
+        info: toyos_abi::FramebufferInfo {
+            scanout: [toyos_abi::HANDLE_INVALID; 2],
+            cursor: toyos_abi::HANDLE_INVALID,
+            width: info.width,
+            height: info.height,
+            stride: info.stride,
+            pixel_format: info.pixel_format,
+            flags: info.flags,
+        },
+        scanout: info.scanout.clone(),
+        cursor: info.cursor.clone(),
+    });
     gpu::register(driver, info);
 }
 
@@ -331,6 +336,22 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     serial::init();
 
+    // After the two channels a refusal can be read on, and before every
+    // actuator site — the earliest of them is a dozen lines below.
+    //
+    // The length is asked first because an empty `Vec` in the bootloader has no
+    // allocation behind it to point at, and every image anyone ships carries an
+    // empty one.
+    actuator::init(if kernel_args.cmdline_len == 0 {
+        ""
+    } else {
+        core::str::from_utf8(core::slice::from_raw_parts(
+            DirectMap::from_phys(kernel_args.cmdline_addr).as_ptr::<u8>(),
+            kernel_args.cmdline_len as usize,
+        ))
+        .expect("the boot parameter is not UTF-8")
+    });
+
     // Before `pat::init`, which restores the CR0 it found around its own
     // no-fill window and would carry a firmware CD straight through it.
     arch::control_regs::init_cr0(0);
@@ -343,10 +364,8 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     // The window this exists to cover: percpu is not up, no allocator, no
     // paging of our own, so the early-panic branch is the whole reporting
-    // mechanism. black_box keeps the rest of kernel_main reachable to the
-    // compiler; a bare `panic!` would make every later line dead code.
-    #[cfg(feature = "test-early-panic")]
-    if core::hint::black_box(true) {
+    // mechanism.
+    if actuator::test_early_panic() {
         panic!("test-early-panic: on-screen console check");
     }
 
@@ -368,11 +387,6 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         DirectMap::from_phys(kernel_args.kernel_elf_addr).as_ptr::<u8>(),
         kernel_args.kernel_elf_size as usize,
     );
-    let init_bytes = core::slice::from_raw_parts(
-        DirectMap::from_phys(kernel_args.init_program_addr).as_ptr::<u8>(),
-        kernel_args.init_program_len as usize,
-    );
-    let init_programs = core::str::from_utf8(init_bytes).expect("init_programs: invalid UTF-8");
     let kernel_args = &kernel_args;
 
     // Phase 1: Memory
@@ -384,11 +398,8 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         mm::Region { start: 0x8000, end: 0x9000 }, // AP trampoline page
     ];
 
-    // Copy init_programs into heap before mm::init reclaims bootloader memory.
     mm::init(maps, &reserved);
     drivers::panic_console::remap();
-    let init_programs = alloc::string::String::from(init_programs);
-    let init_programs: &str = &init_programs;
 
     // Phase 2: CPU — exceptions, LAPIC, clock
     // Get exception handlers up ASAP so bugs in later phases produce diagnostics
@@ -476,8 +487,10 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     let t_periph = clock::nanos_since_boot();
 
     xhci::init(&pci_devices);
-    #[cfg(feature = "usb-storage-gate")]
-    usb_gate::run();
+    #[cfg(feature = "boot-actuators")]
+    if actuator::usb_storage_gate() {
+        usb_gate::run();
+    }
     // Here rather than beside the NVMe probe: this machine boots off a USB
     // stick, so the disk carrying the boot partition does not exist until the
     // controller above has bound it.
@@ -487,8 +500,10 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // Last in the phase, so a probe of hardware nobody has driven cannot land
     // between two devices this kernel depends on, and so its verdict block is
     // the newest thing in the log ring the boot checkpoint paints.
-    #[cfg(feature = "hda-probe")]
-    drivers::hda_probe::run(kernel_args.rsdp_addr, &pci_devices);
+    #[cfg(feature = "boot-actuators")]
+    if actuator::hda_probe() {
+        drivers::hda_probe::run(kernel_args.rsdp_addr, &pci_devices);
+    }
 
     boot_phase!("peripherals ready", t_periph);
 
@@ -501,8 +516,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     scheduler::init();
     pipe::init();
     io_uring::init();
-    listener::init();
-    shared_memory::init();
+
 
     // Mount initrd as read-only root filesystem (bcachefs, no extraction)
     assert!(!initrd.is_empty(), "No initrd provided");
@@ -597,17 +611,18 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     boot_phase!("devices ready", t_devices);
 
     // Before userland, so nothing else is reading the input queues.
-    #[cfg(feature = "test-input-merge")]
-    input_merge_test::run();
-
-    // Phase 7: Userland
-    assert!(!init_programs.is_empty(), "bootloader must provide init_programs");
-    for entry in init_programs.split(';') {
-        let args: Vec<&str> = entry.split_whitespace().collect();
-        assert!(!args.is_empty(), "empty entry in init_programs");
-        let pid = process::spawn_kernel(&args);
-        log!("spawned {} pid={pid}", args[0]);
+    #[cfg(feature = "boot-actuators")]
+    if actuator::test_input_merge() {
+        input_merge_test::run();
     }
+
+    // Phase 7: Userland. One program, and it is not a choice the boot config
+    // makes any more: init reads `/etc/system.manifest` and starts what that
+    // says. What the bootloader used to carry — a `;`-joined argv blob baked
+    // into its own binary — made the `.efi` a function of the boot config, and
+    // a concurrent build could hand an image another config's init string.
+    let pid = process::spawn_init();
+    log!("spawned {} pid={pid}", process::INIT_PATH);
 
     report_log_destination();
     boot_phase!("complete", 0);
@@ -621,8 +636,8 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // longer true and was measured false: a drain no longer erases what the
     // console reads, so this test passes with `capture` stubbed out. See the
     // note on `panic_console::capture` for what still justifies it.
-    #[cfg(feature = "test-late-panic")]
-    if core::hint::black_box(true) {
+    #[cfg(feature = "boot-actuators")]
+    if actuator::test_late_panic() {
         late_panic::Nest::<late_panic::Nest<late_panic::Nest<late_panic::Nest<
             late_panic::Nest<late_panic::Nest<late_panic::Nest<late_panic::Nest<
             late_panic::Nest<late_panic::Nest<()>>>>>>>>>>::on_screen_console_check();

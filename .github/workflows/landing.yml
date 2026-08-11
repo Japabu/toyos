@@ -78,61 +78,92 @@ jobs:
             "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
           cargo run -- --abi-split-check --base "origin/${{ github.base_ref }}"
 
-  # **The guest gate is advisory, and this is what stops that being permanent.**
+  # **What protects `main` is configured outside the repository, and this is
+  # where it is read back.**
   #
-  # `specs/ci-plan.md` §9.2: five names reproduce on every run, so a merge gate
-  # of "twelve green shards" would block every pull request on defects that are
-  # in the kernel, in soundd and in the HDA driver rather than in CI. Widening
-  # `EXPECTED_FAILURES` to cover them is refused — an exemption names a defect
-  # and its write-up, and buying a green run while a process can kill its
-  # neighbour is not that (§9.3).
+  # This job used to hold `specs/ci-plan.md` §10.4's trigger: it went red once
+  # three consecutive `ci` runs on `main` were green while `guest-suite` was
+  # still advisory, so an advisory state could not survive being unnecessary.
+  # The trigger fired on 2026-08-09 and the owner promoted the gate (#21), which
+  # left a **required check whose whole body was `exit 0`** — decoration in a
+  # protection rule, and exactly the shape it was built to refuse.
   #
-  # So `guest-suite` is not a required check yet, and the trigger for making it
-  # one is written down as a command rather than as an intention: **three
-  # consecutive completed `ci` runs on `main`, all green.** This job goes red the
-  # moment that is true and `GUEST_GATE` still says `advisory`, so the gate
-  # cannot quietly stay decoration — the same shape as `EXPECTED_FAILURES`'s
-  # `OnAPass`, applied to the gate's own configuration.
+  # So it keeps its name — the context is matched by job name and renaming it is
+  # a ruleset change with a window in which a required check reports nothing —
+  # and it asks the question that is now worth asking. §10.5 lists the settings
+  # that govern every merge and says of them "none of this is in VCS and none of
+  # it is reviewable in a diff". Half of it is readable from an endpoint that
+  # needs no token at all, so half of it is a diff now.
   #
-  # Three and not two: six of §9.2's eleven fire at 20-40%, so one lucky green
-  # is a sample and not a state.
+  # **A minimum and not an equality.** A context required at GitHub that this
+  # file does not name is reported, never refused: the owner adding one must not
+  # red every merge until somebody edits a workflow. A context this file names
+  # and GitHub does not is a gate that has been quietly dropped, and that reds.
   gate-stage:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      # `advisory` or `required`. Flipping it is half the act; the other half is
-      # adding `guest-suite` to main's required status checks, and this job's
-      # refusal names both.
-      GUEST_GATE: advisory
     steps:
-      - name: is the guest gate still owed?
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: what protects main
         run: |
-          set -e
-          if [ "$GUEST_GATE" = required ]; then
-            echo "the guest shards are a required check."
-            exit 0
+          set -eu -o pipefail
+          # No `Authorization`: `rules/branches` is readable by anyone who can
+          # read the repository, so this asks nothing of the workflow token and
+          # cannot start failing because a permission narrowed.
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/rules/branches/main"
+          curl -sSL --fail "$api" -o /tmp/rules.json
+          jq . /tmp/rules.json
+
+          required="host abi-split gate-stage tcg guest-suite"
+          live=$(jq -r '[.[] | select(.type=="required_status_checks")
+                            | .parameters.required_status_checks[].context] | join(" ")' \
+                   /tmp/rules.json)
+          rules=$(jq -r '[.[].type] | join(" ")' /tmp/rules.json)
+          strict=$(jq -r '[.[] | select(.type=="required_status_checks")
+                              | .parameters.strict_required_status_checks_policy] | first' \
+                     /tmp/rules.json)
+          methods=$(jq -r '[.[] | select(.type=="pull_request")
+                               | .parameters.allowed_merge_methods[]] | sort | join(",")' \
+                      /tmp/rules.json)
+
+          bad=0
+          for want in $required; do
+            case " $live " in
+              *" $want "*) ;;
+              *) echo "::error::main does not require the check \`$want\`"; bad=1 ;;
+            esac
+          done
+          for want in deletion non_fast_forward pull_request required_status_checks; do
+            case " $rules " in
+              *" $want "*) ;;
+              *) echo "::error::main has no \`$want\` rule"; bad=1 ;;
+            esac
+          done
+          # Strict is what makes a check on this head a check on the merged
+          # result — §10.2, and the property `--land`'s `git merge --no-ff main`
+          # used to carry.
+          if [ "$strict" != true ]; then
+            echo "::error::required checks are not strict, so a branch could merge without"
+            echo "::error::containing main and its checks would not be about the merged result"
+            bad=1
           fi
-          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs"
-          # A run with no verdict in it is not a sample. `ci.yml` stopped
-          # cancelling itself on `main` for exactly this reason — three
-          # consecutive merges cancelled three consecutive runs and this
-          # question had nothing newer than the burst to read — but a run can
-          # still be cancelled by hand or by a timeout.
-          runs=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
-                   "$api?branch=main&status=completed&per_page=20" \
-                 | jq -r '[.workflow_runs[]
-                           | select(.conclusion=="success" or .conclusion=="failure")
-                           | .conclusion][:3] | join(" ")')
-          echo "the last completed ci runs on main: ${runs:-none}"
-          case "$runs" in
-            "success success success")
-              echo "::error::The guest suite has been green on main three runs running, and"
-              echo "::error::guest-suite is still advisory. Make it a required status check on"
-              echo "::error::main and set GUEST_GATE=required in .github/workflows/landing.yml."
-              echo "::error::specs/ci-plan.md §10 is the trigger this is enforcing."
-              exit 1
-              ;;
-          esac
-          echo "the guest gate stays advisory: specs/ci-plan.md §9.2 has what still reproduces."
+          # CLAUDE.md's "never rewrite history", said at the remote.
+          [ "$methods" = merge ] \
+            || { echo "::error::main allows merge methods \`$methods\`, not just \`merge\`"; bad=1; }
+
+          {
+            echo "### what protects main"
+            echo ""
+            echo "- rules: \`$rules\`"
+            echo "- required checks: \`$live\`"
+            echo "- strict: \`$strict\`, merge methods: \`$methods\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for have in $live; do
+            case " $required " in
+              *" $have "*) ;;
+              *) echo "- \`$have\` is required at GitHub and not named here" \
+                   >> "$GITHUB_STEP_SUMMARY" ;;
+            esac
+          done
+
+          test "$bad" = 0
+          echo "main is protected the way specs/ci-plan.md §10.4 and §10.5 say it is."

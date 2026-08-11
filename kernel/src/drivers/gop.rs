@@ -7,7 +7,7 @@ use crate::mm::paging::CachePolicy;
 use crate::mm::{PAGE_2M, align_2m_checked, DirectMap};
 use crate::gpu::{Gpu, GpuInfo};
 use crate::log;
-use crate::shared_memory;
+use crate::object::shm::Region;
 
 struct GopGpu;
 
@@ -62,10 +62,17 @@ pub fn init(
     crate::mm::paging::map_mmio(addr, aligned_size, CachePolicy::WriteCombining);
 
     let fb = DirectMap::from_phys(addr);
-    let token0 = shared_memory::register(fb, aligned_size, CachePolicy::WriteCombining);
-    let token1 = shared_memory::register(fb, aligned_size, CachePolicy::WriteCombining);
-    log!("GOP: {}x{} stride={} format={} at {:#x} tokens=[{:?}, {:?}]",
-        width, height, stride, pixel_format, addr, token0, token1);
+    // One physical scanout under both names: GOP has no second buffer, so the
+    // compositor's "back buffer" is the front one and the double buffering it
+    // asks for is virtio-gpu's alone.
+    let scanout = core::array::from_fn(|_| Region {
+        phys: fb,
+        size: aligned_size,
+        cache: CachePolicy::WriteCombining,
+        pages: None,
+    });
+    log!("GOP: {}x{} stride={} format={} at {:#x}",
+        width, height, stride, pixel_format, addr);
 
     // What a framebuffer client's writes cost, read off the mapping that was
     // installed rather than the one that was asked for.
@@ -89,16 +96,17 @@ pub fn init(
     let cursor_phys = cursor_pages[0].direct_map().phys();
     // System RAM the compositor composes the cursor in rather than part of
     // the scanout, so it keeps RAM's write-back type.
-    let cursor_token = shared_memory::register(
-        DirectMap::from_phys(cursor_phys),
-        PAGE_2M,
-        CachePolicy::DeferToMtrr,
-    );
+    let cursor = Region {
+        phys: DirectMap::from_phys(cursor_phys),
+        size: PAGE_2M,
+        cache: CachePolicy::DeferToMtrr,
+        pages: None,
+    };
     core::mem::forget(cursor_pages); // lives forever (GPU is never torn down)
 
     let info = GpuInfo {
-        tokens: [token0, token1],
-        cursor_token,
+        scanout,
+        cursor,
         width,
         height,
         stride,

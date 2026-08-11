@@ -56,7 +56,7 @@ fn executable_on_path(name: &str) -> bool {
     })
 }
 
-fn check_prerequisites() {
+fn check_prerequisites(root: &Path) {
     fn absent(tools: &'static [Tool]) -> Vec<&'static Tool> {
         tools.iter().filter(|t| !t.any.iter().any(|n| executable_on_path(n))).collect()
     }
@@ -72,6 +72,13 @@ fn check_prerequisites() {
             eprintln!("  - {} ({})", tool.any.join(" or "), tool.why);
         }
         std::process::exit(1);
+    }
+
+    // The one prerequisite whose *version* decides verdicts rather than whether
+    // anything runs at all, so a scan of `PATH` cannot ask it.
+    // `toyos_build::ci` carries why this is a note here and a red in CI.
+    if let Some(note) = toyos_build::ci::qemu_version_note(root) {
+        eprintln!("{note}");
     }
 }
 
@@ -98,8 +105,16 @@ fn main() {
         toyos_build::pr::dispatch_abi_check(&root, &args);
         return;
     }
+    // Here for the same reason: it reads twelve files a sharded run left and
+    // writes one, and it is meant to be run on the machine holding them —
+    // which, since the run that produces them is CI's, is a runner with no
+    // QEMU.
+    if args.iter().any(|a| a == "--merge-durations") {
+        toyos_build::durations::dispatch(&root, &args);
+        return;
+    }
 
-    check_prerequisites();
+    check_prerequisites(&root);
     env::set_current_dir(&root).expect("Failed to cd to project root");
 
     let debug = args.iter().any(|a| a == "--debug");
@@ -118,7 +133,8 @@ fn main() {
     let smp = parse_smp(&args);
     let profile = parse_profile(&args);
     let mute = args.iter().any(|a| a == "--mute");
-    let kernel_feature = parse_kernel_features(&args);
+    let kernel_feature = parse_repeated(&args, "--kernel-feature");
+    let kernel_param = parse_repeated(&args, "--kernel-param");
     // A machine with no serial port has the framebuffer and nothing else, and
     // the kernel stops painting it the moment userland claims it. `--diag-boot`
     // builds the image that never does; `--console-boot` builds the one that
@@ -160,11 +176,6 @@ fn main() {
         return;
     }
 
-    if args.iter().any(|a| a == "--merge-durations") {
-        toyos_build::durations::dispatch(&root, &args);
-        return;
-    }
-
     if args.iter().any(|a| a == "--worktree") {
         toyos_build::worktree::dispatch(&root, &args);
         return;
@@ -193,6 +204,7 @@ fn main() {
         rebuild_toolchain,
         claim_sysroot,
         &kernel_feature,
+        &kernel_param,
     );
     println!("Build finished.");
     println!("Boot image: {}", image.display());
@@ -202,33 +214,33 @@ fn main() {
     }
 }
 
-/// `--kernel-feature <name>`, repeatable: one cargo feature this build's kernel
-/// carries. Unknown names are refused by name in [`build::build`].
+/// `--kernel-param <name>`, repeatable: one actuator this *boot* arms, and the
+/// ordinary way to ask for one. `--kernel-feature <name>`, repeatable: one
+/// cargo feature this *build* carries, which after
+/// `specs/test-cost-audit.md` §5.9.7 is `fpu-save-nothing` and `sched-check`
+/// and nothing else. Unknown names are refused by name in [`build::build`],
+/// before any lock.
 ///
-/// **Orthogonal to the boot mode on purpose.** Attaching a feature list to
+/// **Both are orthogonal to the boot mode on purpose.** Attaching a list to
 /// `Boot::Diag` was the other way to reach the same image, and it would have
 /// made the diagnostic kernel permanently a different build from the shipping
 /// one — which is the exact guarantee that mode's own documentation makes, that
-/// what the owner flashes is the kernel everything else is tested against.
-/// Here the difference is one word he typed on one command line, and when a
-/// temporary feature is deleted there is no line in this file to take out
-/// again.
-///
-/// It is also the honest shape for what these features do: `hda-probe` takes an
-/// audio controller nothing has ever driven out of reset, and that should be an
-/// explicit act at build time rather than a property of a boot mode.
-fn parse_kernel_features(args: &[String]) -> Vec<String> {
-    let mut features = Vec::new();
+/// what the owner flashes is the kernel everything else is tested against. Here
+/// the difference is one word he typed on one command line, and a parameter is
+/// not even that: `--diag-boot --kernel-param heartbeat` and
+/// `--diag-boot --kernel-param control-regs-bench` are one kernel binary.
+fn parse_repeated(args: &[String], flag: &str) -> Vec<String> {
+    let mut values = Vec::new();
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
-        if arg == "--kernel-feature" {
-            let name = rest.next().unwrap_or_else(|| {
-                panic!("--kernel-feature needs a name: --kernel-feature <name>")
-            });
-            features.push(name.clone());
+        if arg == flag {
+            let name = rest
+                .next()
+                .unwrap_or_else(|| panic!("{flag} needs a name: {flag} <name>"));
+            values.push(name.clone());
         }
     }
-    features
+    values
 }
 
 /// `--gop` swaps virtio-gpu for a firmware framebuffer; `--metal-sim` goes

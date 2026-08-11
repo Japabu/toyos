@@ -118,7 +118,7 @@ pub fn init_wall(century_reg: Option<u8>, utc_offset_minutes: Option<i32>) {
     // the sign that matters: UEFI's relation is `Localtime = UTC - TimeZone`,
     // so UTC+2 reports -120 and UTC is *behind* what the RTC reads.
     let utc_offset_minutes =
-        if cfg!(feature = "rtc-zone-east") { Some(-120) } else { utc_offset_minutes };
+        if crate::actuator::rtc_zone_east() { Some(-120) } else { utc_offset_minutes };
 
     let civil = match crate::rtc::read(century_reg) {
         Ok(civil) => civil,

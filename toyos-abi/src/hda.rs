@@ -30,7 +30,7 @@ pub struct HdaInfo {
     /// The PCM ring, mapped writable. `periods` buffers of `period_bytes` laid
     /// end to end from the start of the region, with the buffer descriptor
     /// list already pointing at them.
-    pub pcm_token: u32,
+    pub pcm: crate::RawHandle,
     pub period_bytes: u32,
     /// Byte offset of the output stream descriptor inside the register window,
     /// so the driver names `SDnCTL` and `SDnFMT` by the same arithmetic the

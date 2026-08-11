@@ -19,13 +19,12 @@ use core::sync::atomic::Ordering;
 
 use toyos_sched::task::WaitClass;
 
-use crate::fd;
+use crate::object::shm::SharedMemObject;
+use crate::object::{ops, KObjectRef};
 use crate::id_map::{IdKey, IdMap};
-use crate::listener::ListenerId;
 use crate::pipe::{self, PipeId};
 use crate::process::{self, Pid};
 use crate::scheduler;
-use crate::shared_memory::{self, SharedToken};
 use crate::sched::payload::KWaitQueue;
 use crate::sched::waitqs::{new_queue, wake_all};
 use crate::sync::Lock;
@@ -35,6 +34,7 @@ use toyos_abi::io_uring::{
     IoUringCqe, IoUringParams, IoUringRingHeader, IoUringSqe,
     SQ_RING_OFF, CQ_RING_OFF, SQES_OFF,
 };
+use toyos_abi::handle::{RawHandle, Rights};
 use toyos_abi::syscall::SyscallError;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -56,7 +56,7 @@ impl IdKey for RingId {
 
 /// An owned reference to a ring. Creation and `Clone` bump the ring's
 /// reference count, `Drop` tears it down at zero — the `PipeReader` shape.
-/// Held by `Descriptor::IoUring`, so a `dup`ped ring fd stays usable after the
+/// Held by an `IoUringObject`, so a `dup`ped ring handle stays usable after the
 /// original is closed instead of naming a destroyed instance.
 pub struct RingRef(RingId);
 
@@ -88,10 +88,14 @@ impl Drop for RingRef {
             map.remove(self.0)
         };
         if let Some(mut instance) = instance {
-            // The polls' `WatcherGuard`s clean the per-source watcher lists.
-            instance.pending_polls.clear();
-            // Unmaps from every process and frees the backing pages.
-            let _ = shared_memory::destroy(instance.shm_token, instance.owner_pid);
+            for poll in instance.pending_polls.drain(..) {
+                for source in [poll.read_source, poll.write_source].into_iter().flatten() {
+                    source.remove_watcher(self.0);
+                }
+            }
+            // Unmap, flush, and only then let go of the pages: `Unmapped`'s
+            // drop is the flush and the `Arc` below is what frees.
+            drop(instance.shm.unmap_from(instance.owner_pid));
         }
     }
 }
@@ -104,7 +108,6 @@ pub enum IoUringOp {
     PollAdd,
     PollRemove,
     Accept,
-    Close,
 }
 
 impl IoUringOp {
@@ -114,7 +117,6 @@ impl IoUringOp {
             1 => Ok(Self::PollAdd),
             2 => Ok(Self::PollRemove),
             3 => Ok(Self::Accept),
-            4 => Ok(Self::Close),
             _ => Err(SyscallError::InvalidArgument),
         }
     }
@@ -139,43 +141,37 @@ impl PollFlags {
 /// about this object". It names the same objects the wait queues hang off, but
 /// it is not a scheduler concept — the scheduler knows only tasks, tickets and
 /// causes (scheduler-core-spec §8.1).
-#[derive(Clone, Copy, PartialEq, Eq)]
+///
+/// **A port is named by the object and never by a number.** There is no
+/// registry to look an acceptor up in any more, so the watch *holds* what it
+/// watches — which is also what stops a poll outliving the port it names. It
+/// holds the *shared* half rather than either end, because the poll a server
+/// registers on its `Acceptor` is completed by a client connecting through a
+/// `Connector`, and that is the one thing the two have in common.
+#[derive(Clone)]
 pub enum Source {
     Keyboard,
     Mouse,
     Network,
-    Listener(ListenerId),
+    Port(Arc<crate::object::port::PortShared>),
     PipeReadable(PipeId),
     PipeWritable(PipeId),
     VirtioSound,
     Hda,
 }
 
-// WatcherGuard — RAII cleanup of per-fd watcher lists
-
-struct WatcherGuard {
-    ring_id: RingId,
-    sources: [Option<Source>; 2],
-}
-
-impl WatcherGuard {
-    fn new(ring_id: RingId) -> Self {
-        Self { ring_id, sources: [None; 2] }
-    }
-
-    fn add_source(&mut self, source: Source) {
-        if self.sources[0].is_none() {
-            self.sources[0] = Some(source);
-        } else {
-            self.sources[1] = Some(source);
-        }
-    }
-}
-
-impl Drop for WatcherGuard {
-    fn drop(&mut self) {
-        for source in self.sources.iter().flatten() {
-            source.remove_watcher(self.ring_id);
+impl PartialEq for Source {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Keyboard, Self::Keyboard)
+            | (Self::Mouse, Self::Mouse)
+            | (Self::Network, Self::Network)
+            | (Self::VirtioSound, Self::VirtioSound)
+            | (Self::Hda, Self::Hda) => true,
+            (Self::Port(a), Self::Port(b)) => Arc::ptr_eq(a, b),
+            (Self::PipeReadable(a), Self::PipeReadable(b)) => a == b,
+            (Self::PipeWritable(a), Self::PipeWritable(b)) => a == b,
+            _ => false,
         }
     }
 }
@@ -184,11 +180,40 @@ impl Drop for WatcherGuard {
 
 struct PendingPoll {
     user_data: u64,
-    fd_num: u32,
+    /// The handle the poll was submitted against, and the dedup key. A handle
+    /// is a slot in *this* process's table, so it is only ever compared with
+    /// another poll on the same ring — which is the whole of what dedup needs.
+    handle: RawHandle,
     flags: PollFlags,
     read_source: Option<Source>,
     write_source: Option<Source>,
-    _watcher: WatcherGuard,
+}
+
+impl PendingPoll {
+    fn watches(&self, source: &Source) -> bool {
+        self.read_source.as_ref() == Some(source) || self.write_source.as_ref() == Some(source)
+    }
+}
+
+/// Take the poll at `index` out, unregistering this ring from any source no
+/// other poll of the same ring still names.
+///
+/// **A source's watcher list is a set of rings, not a count**, so removing the
+/// registration unconditionally — which is what an RAII guard beside each poll
+/// did — disarms a sibling poll of the same ring on the same object. Two
+/// handles to one object in one ring is the reachable shape (a `dup`ped
+/// acceptor polled through both), and nothing about the failure is visible: the
+/// poll stays in the list and no wake ever reaches it again. The guard could
+/// not have got this right, because whether a registration is still owed is a
+/// property of the ring and not of the poll.
+fn take_poll(instance: &mut IoUringInstance, index: usize) -> PendingPoll {
+    let poll = instance.pending_polls.swap_remove(index);
+    for source in [&poll.read_source, &poll.write_source].into_iter().flatten() {
+        if !instance.pending_polls.iter().any(|p| p.watches(source)) {
+            source.remove_watcher(instance.id);
+        }
+    }
+    poll
 }
 
 /// Hard cap on pending polls per ring. With dedup this should never be reached
@@ -196,8 +221,12 @@ struct PendingPoll {
 const MAX_PENDING_POLLS: usize = 1024;
 
 struct IoUringInstance {
+    id: RingId,
     shm_phys: DirectMap,
-    shm_token: SharedToken,
+    /// The ring's own pages. **A ring is not something two processes share**,
+    /// so its page has no lifetime of its own and no second name: it goes with
+    /// the last handle to the ring.
+    shm: alloc::sync::Arc<SharedMemObject>,
     /// Live `RingRef`s. Never zero while this entry is in the map.
     refs: u32,
     sq_size: u32,
@@ -279,8 +308,9 @@ pub fn init() {
 /// `submit_sqes` that a process can influence.
 const MAX_SQ_DEPTH: u32 = 256;
 
-/// Create an io_uring instance. Returns (ring reference, shared_memory_token).
-pub fn create(depth: u32) -> Result<(RingRef, SharedToken), SyscallError> {
+/// Create an io_uring instance and map its rings into the caller. Answers the
+/// reference and the address the rings are at.
+pub fn create(depth: u32) -> Result<(RingRef, u64), SyscallError> {
     if depth == 0 || depth > MAX_SQ_DEPTH || !depth.is_power_of_two() {
         return Err(SyscallError::InvalidArgument);
     }
@@ -290,13 +320,9 @@ pub fn create(depth: u32) -> Result<(RingRef, SharedToken), SyscallError> {
 
     let pid = process::current_process();
     let addr_space = process::current_address_space();
-    let shm_token = shared_memory::alloc(crate::mm::PAGE_2M, pid, &addr_space)
-        .map_err(|_| SyscallError::ResourceExhausted)?;
-
-    let shm_vaddr = shared_memory::map(shm_token, pid, &addr_space)
-        .map_err(|_| SyscallError::Unknown)?;
-    let shm_phys = addr_space.lock().translate(crate::UserAddr::new(shm_vaddr))
-        .ok_or(SyscallError::Unknown)?;
+    let shm = SharedMemObject::create(crate::mm::PAGE_2M)?;
+    let shm_vaddr = shm.map_into(pid, &addr_space)?;
+    let shm_phys = shm.phys();
 
     let base = shm_phys.as_mut_ptr::<u8>();
 
@@ -326,9 +352,10 @@ pub fn create(depth: u32) -> Result<(RingRef, SharedToken), SyscallError> {
     let ring_id = {
         let mut guard = IO_URINGS.lock();
         let map = guard.as_mut().expect("io_uring not initialized");
-        map.insert(IoUringInstance {
+        map.insert_with(|id| IoUringInstance {
+            id,
             shm_phys,
-            shm_token,
+            shm,
             refs: 1,
             sq_size,
             cq_size,
@@ -339,7 +366,7 @@ pub fn create(depth: u32) -> Result<(RingRef, SharedToken), SyscallError> {
         })
     };
 
-    Ok((RingRef(ring_id), shm_token))
+    Ok((RingRef(ring_id), shm_vaddr))
 }
 
 // Enter — submit SQEs and/or wait for CQEs
@@ -495,27 +522,25 @@ fn process_sqe(ring_id: RingId, sqe: &IoUringSqe) {
         IoUringOp::Accept => {
             process_accept(ring_id, sqe);
         }
-        IoUringOp::Close => {
-            process_close(ring_id, sqe);
-        }
     }
 }
 
 fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
-    let fd_num = sqe.fd as u32;
+    let handle = sqe.fd;
     let flags = PollFlags::from_raw(sqe.op_flags);
     let user_data = sqe.user_data;
 
-    // Check readiness first (use fd_owner_data — fds belong to the process, not the thread)
+    // Readiness first, on the process's table rather than the thread's: a ring
+    // is process-wide. A handle without `WAIT` is not watchable, and answers as
+    // if it were not there.
     let (ready, read_source, write_source) = process::with_fd_owner_data(|data| {
-        let readable = flags.readable() && fd::has_data(&data.fds, fd_num);
-        let writable = flags.writable() && fd::has_space(&data.fds, fd_num);
-        let rsrc = if flags.readable() {
-            data.fds.get(fd_num).and_then(|d| d.read_source())
-        } else { None };
-        let wsrc = if flags.writable() {
-            data.fds.get(fd_num).and_then(|d| d.write_source())
-        } else { None };
+        let Ok(object) = data.handles.get_ref(handle, Rights::WAIT) else {
+            return (false, None, None);
+        };
+        let readable = flags.readable() && ops::has_data(object);
+        let writable = flags.writable() && ops::has_space(object);
+        let rsrc = if flags.readable() { ops::read_source(object) } else { None };
+        let wsrc = if flags.writable() { ops::write_source(object) } else { None };
         (readable || writable, rsrc, wsrc)
     });
 
@@ -529,37 +554,26 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
     }
 
     // Not ready — insert pending poll.
-    // Drop any existing PendingPoll for this fd FIRST, so its WatcherGuard
-    // cleanup runs before we register the new watchers. Otherwise:
-    //   1. add_watcher(new) → no-op (old watcher still registered)
-    //   2. drop(old) → removes the watcher
-    //   3. result: zero watchers despite an active PendingPoll
+    // The old poll on this handle goes first, so its unregistration cannot
+    // undo the registration this one is about to make.
     let mut woken: Option<Arc<KWaitQueue>> = None;
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
     if let Some(instance) = map.get_mut(ring_id) {
-        // Remove existing PendingPoll for this fd (drops old WatcherGuard)
-        if let Some(pos) = instance.pending_polls.iter().position(|pp| pp.fd_num == fd_num) {
-            instance.pending_polls.swap_remove(pos);
+        if let Some(pos) = instance.pending_polls.iter().position(|pp| pp.handle == handle) {
+            take_poll(instance, pos);
         }
 
-        let mut watcher = WatcherGuard::new(ring_id);
-        if let Some(src) = read_source {
+        for src in [&read_source, &write_source].into_iter().flatten() {
             src.add_watcher(ring_id);
-            watcher.add_source(src);
-        }
-        if let Some(src) = write_source {
-            src.add_watcher(ring_id);
-            watcher.add_source(src);
         }
 
         let new_pp = PendingPoll {
             user_data,
-            fd_num,
+            handle,
             flags,
-            read_source,
-            write_source,
-            _watcher: watcher,
+            read_source: read_source.clone(),
+            write_source: write_source.clone(),
         };
 
         if instance.pending_polls.len() < MAX_PENDING_POLLS {
@@ -576,11 +590,11 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
         // insertion. A concurrent wake (complete_pending_for_event) either already
         // ran and found no PendingPoll (recheck catches the data it left behind),
         // or is blocked on IO_URINGS and will find the PendingPoll after we release.
-        let became_ready = read_source.is_some_and(Source::is_ready)
-            || write_source.is_some_and(Source::is_ready);
+        let became_ready = read_source.as_ref().is_some_and(Source::is_ready)
+            || write_source.as_ref().is_some_and(Source::is_ready);
         if became_ready {
-            if let Some(pos) = instance.pending_polls.iter().position(|pp| pp.fd_num == fd_num) {
-                let pp = instance.pending_polls.swap_remove(pos);
+            if let Some(pos) = instance.pending_polls.iter().position(|pp| pp.handle == handle) {
+                let pp = take_poll(instance, pos);
                 let mut result_flags = 0u32;
                 if pp.flags.readable() { result_flags |= PollFlags::IN.raw(); }
                 if pp.flags.writable() { result_flags |= PollFlags::OUT.raw(); }
@@ -600,7 +614,7 @@ fn process_poll_remove(ring_id: RingId, target_user_data: u64) {
     let map = guard.as_mut().expect("io_uring not initialized");
     if let Some(instance) = map.get_mut(ring_id) {
         if let Some(pos) = instance.pending_polls.iter().position(|p| p.user_data == target_user_data) {
-            instance.pending_polls.swap_remove(pos);
+            take_poll(instance, pos);
             instance.post_cqe(target_user_data, 0, 0);
         } else {
             instance.post_cqe(target_user_data, -(SyscallError::NotFound as i32), 0);
@@ -609,32 +623,35 @@ fn process_poll_remove(ring_id: RingId, target_user_data: u64) {
 }
 
 fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
-    let fd_num = sqe.fd as u32;
     let user_data = sqe.user_data;
 
-    let listener_id = process::with_fd_owner_data(|data| {
-        match data.fds.get(fd_num) {
-            Some(fd::Descriptor::Listener(l)) => Some(l.id()),
+    let acceptor = process::with_fd_owner_data(|data| {
+        match data.handles.get_ref(sqe.fd, Rights::READ) {
+            Ok(KObjectRef::Acceptor(a)) => Some(a.clone()),
             _ => None,
         }
     });
 
-    let Some(listener_id) = listener_id else {
+    let Some(acceptor) = acceptor else {
         post_cqe_locked(ring_id, user_data, -(SyscallError::InvalidArgument as i32), 0);
         return;
     };
 
-    match crate::listener::pop_connection(listener_id) {
+    match acceptor.pop() {
         Some(conn) => {
-            let new_fd = process::with_fd_owner_data(|data| {
-                data.fds.insert(fd::Descriptor::Socket {
-                    rx: conn.rx,
-                    tx: conn.tx,
-                    peer: conn.client_pid,
-                })
+            let installed = process::with_fd_owner_data(|data| {
+                ops::install(
+                    &mut data.handles,
+                    KObjectRef::Connection(crate::object::service::ConnectionEnd::new(
+                        conn.rx,
+                        conn.tx,
+                        conn.inbox,
+                        conn.outbox,
+                    )),
+                )
             });
-            match new_fd {
-                Ok(fd_num) => post_cqe_locked(ring_id, user_data, fd_num as i32, 0),
+            match installed {
+                Ok(h) => post_cqe_locked(ring_id, user_data, h.0 as i32, 0),
                 Err(e) => post_cqe_locked(ring_id, user_data, -(e as i32), 0),
             }
         }
@@ -642,17 +659,6 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
             post_cqe_locked(ring_id, user_data, -(SyscallError::WouldBlock as i32), 0);
         }
     }
-}
-
-fn process_close(ring_id: RingId, sqe: &IoUringSqe) {
-    let fd_num = sqe.fd as u32;
-    let user_data = sqe.user_data;
-
-    let result = process::with_fd_owner_data(|data| {
-        fd::close(&mut data.fds, fd_num, &mut data.pipe_maps)
-    });
-
-    post_cqe_locked(ring_id, user_data, result as i32, 0);
 }
 
 /// Post a CQE and wake this ring's waiters.
@@ -678,9 +684,7 @@ fn post_cqe_locked(ring_id: RingId, user_data: u64, result: i32, flags: u32) {
 /// Complete pending polls registered on `event`.
 /// Called from wake paths AFTER releasing source locks (PIPES, device locks).
 pub fn complete_pending_for_event(watchers: &[RingId], event: Source) {
-    complete_pending_for_source(watchers, |pp| {
-        pp.read_source == Some(event) || pp.write_source == Some(event)
-    });
+    complete_pending_for_source(watchers, |pp| pp.watches(&event));
 }
 
 fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPoll) -> bool) {
@@ -698,7 +702,7 @@ fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPol
         let mut i = 0;
         while i < instance.pending_polls.len() {
             if matches(&instance.pending_polls[i]) {
-                let pp = instance.pending_polls.swap_remove(i);
+                let pp = take_poll(instance, i);
                 let mut result_flags = 0u32;
                 if pp.flags.readable() { result_flags |= PollFlags::IN.raw(); }
                 if pp.flags.writable() { result_flags |= PollFlags::OUT.raw(); }
@@ -745,24 +749,19 @@ pub fn remove_fd(sources: &[Option<Source>]) {
 
     if affected.is_empty() { return; }
 
-    let watches_a_closing_source = |pp: &PendingPoll| {
-        sources
-            .iter()
-            .flatten()
-            .any(|&s| pp.read_source == Some(s) || pp.write_source == Some(s))
-    };
+    let watches_a_closing_source =
+        |pp: &PendingPoll| sources.iter().flatten().any(|s| pp.watches(s));
 
     let mut to_wake: Vec<Arc<KWaitQueue>> = Vec::new();
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
     for ring_id in affected {
         if let Some(instance) = map.get_mut(ring_id) {
-            // WatcherGuard drops with the poll → cleans the watcher lists.
             let mut i = 0;
             let mut cancelled = false;
             while i < instance.pending_polls.len() {
                 if watches_a_closing_source(&instance.pending_polls[i]) {
-                    let pp = instance.pending_polls.swap_remove(i);
+                    let pp = take_poll(instance, i);
                     // Post error CQE so userspace knows the poll was cancelled
                     instance.post_cqe(pp.user_data, -(SyscallError::NotFound as i32), 0);
                     cancelled = true;
@@ -781,18 +780,16 @@ pub fn remove_fd(sources: &[Option<Source>]) {
     }
 }
 
-/// Destroy an io_uring instance. Called when the ring fd is closed.
-
 // Watcher list operations — dispatch to the source object
 
 impl Source {
     /// Is the object ready right now? Called under the IO_URINGS lock during
     /// the TOCTOU recheck in `process_poll_add`.
-    fn is_ready(self) -> bool {
+    fn is_ready(&self) -> bool {
         match self {
-            Self::PipeReadable(id) => pipe::has_data(id),
-            Self::PipeWritable(id) => pipe::has_space(id),
-            Self::Listener(id) => crate::listener::has_pending_by_id(id),
+            Self::PipeReadable(id) => pipe::has_data(*id),
+            Self::PipeWritable(id) => pipe::has_space(*id),
+            Self::Port(p) => p.has_pending(),
             Self::Keyboard => crate::keyboard::has_data(),
             Self::Mouse => crate::mouse::has_data(),
             Self::Network => crate::net::has_packet(),
@@ -801,45 +798,45 @@ impl Source {
         }
     }
 
-    fn add_watcher(self, ring_id: RingId) {
+    fn add_watcher(&self, ring_id: RingId) {
         match self {
             Self::PipeReadable(pipe_id) | Self::PipeWritable(pipe_id) => {
-                pipe::add_io_uring_watcher(pipe_id, ring_id);
+                pipe::add_io_uring_watcher(*pipe_id, ring_id);
             }
             Self::Keyboard => crate::keyboard::add_io_uring_watcher(ring_id),
             Self::Mouse => crate::mouse::add_io_uring_watcher(ring_id),
             Self::Network => crate::net::add_io_uring_watcher(ring_id),
             Self::VirtioSound => crate::drivers::virtio_sound::add_io_uring_watcher(ring_id),
             Self::Hda => crate::drivers::hda::add_io_uring_watcher(ring_id),
-            Self::Listener(id) => crate::listener::add_io_uring_watcher(id, ring_id),
+            Self::Port(p) => p.add_watcher(ring_id),
         }
     }
 
-    fn remove_watcher(self, ring_id: RingId) {
+    fn remove_watcher(&self, ring_id: RingId) {
         match self {
             Self::PipeReadable(pipe_id) | Self::PipeWritable(pipe_id) => {
-                pipe::remove_io_uring_watcher(pipe_id, ring_id);
+                pipe::remove_io_uring_watcher(*pipe_id, ring_id);
             }
             Self::Keyboard => crate::keyboard::remove_io_uring_watcher(ring_id),
             Self::Mouse => crate::mouse::remove_io_uring_watcher(ring_id),
             Self::Network => crate::net::remove_io_uring_watcher(ring_id),
             Self::VirtioSound => crate::drivers::virtio_sound::remove_io_uring_watcher(ring_id),
             Self::Hda => crate::drivers::hda::remove_io_uring_watcher(ring_id),
-            Self::Listener(id) => crate::listener::remove_io_uring_watcher(id, ring_id),
+            Self::Port(p) => p.remove_watcher(ring_id),
         }
     }
 
-    fn watchers(self) -> Vec<RingId> {
+    fn watchers(&self) -> Vec<RingId> {
         match self {
             Self::PipeReadable(pipe_id) | Self::PipeWritable(pipe_id) => {
-                pipe::io_uring_watchers(pipe_id)
+                pipe::io_uring_watchers(*pipe_id)
             }
             Self::Keyboard => crate::keyboard::io_uring_watchers(),
             Self::Mouse => crate::mouse::io_uring_watchers(),
             Self::Network => crate::net::io_uring_watchers(),
             Self::VirtioSound => crate::drivers::virtio_sound::io_uring_watchers(),
             Self::Hda => crate::drivers::hda::io_uring_watchers(),
-            Self::Listener(id) => crate::listener::io_uring_watchers(id),
+            Self::Port(p) => p.watchers(),
         }
     }
 }

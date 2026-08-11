@@ -114,6 +114,44 @@ impl HostSlots {
 /// one task among sixty.
 const SHARED_BLOCK: Sched = Sched::Parallel;
 
+/// The shared-boot binaries that call `SYS_DEBUG`, and so cannot run on the
+/// kernel an image ships.
+///
+/// **Everything else on the shared boot now runs on that kernel** — no features,
+/// the same staged artifact `cargo run --build-only` writes. Until
+/// `test-actuators` became one name, `qemu::fold_inert` put it on *every* test
+/// kernel, so nothing in this suite had ever booted the shipping binary and two
+/// of the three names below depended on that without saying so.
+///
+/// A second boot rather than a second image: the block costs a fraction of a
+/// second of guest time between its members, and what these need is a syscall
+/// number the other 150 must not have.
+const ACTUATOR_TESTS: &[&str] = &[
+    // Actions 0, 1 and 2: a kernel `panic!`, a null read in kernel context, and
+    // a spinlock held across a scheduler entry. Each kills the caller and the
+    // machine has to survive it, which is the whole verdict.
+    "panic_recovery",
+    // Actions 10 and 11: the address of sixteen bytes of kernel memory and
+    // whether they still hold what the kernel put there. A guest cannot read the
+    // kernel's address space, so without them a kernel that still made the write
+    // under test answers a userland that cannot notice.
+    "abuse_kernel_addr",
+    // Actions 12 and 13: hold one CPU's shootdown acknowledgement back, so that
+    // whether the initiator waits becomes a duration userland can read.
+    "tlb_shootdown_waits",
+    // Actions 14 to 16, the live-object census, and 17 and 18 for the idle
+    // stack the deferred release path runs on. A leak is two readings and a
+    // comparison, so on a kernel that answers `InvalidArgument` both readings
+    // are the same error and the assertion passes having counted nothing.
+    "handle_basic",
+    "handle_kill_policy",
+    "handle_transfer",
+];
+
+/// What [`ACTUATOR_TESTS`] boots: the one kernel that carries `SYS_DEBUG`, with
+/// no actuator armed in it.
+const ACTUATOR_KERNEL: &[&str] = toyos_build::build::TEST_KERNEL;
+
 /// How many times a shared block will answer a dead guest with a new one.
 ///
 /// Bounded because a block whose every member kills the guest must not boot one
@@ -131,8 +169,9 @@ const RUST_SKIP: &[&str] = &[
     "i8042_mouse",
     "input_events",
     "va_exhaustion",
-    // Needs SYS_DEBUG actions 5 and 6, which only the `test-heap-ceiling`
-    // kernel has. `heap_ceiling_recovery` boots that kernel.
+    // Needs SYS_DEBUG, which the shipping kernel has no arm of at all.
+    // `heap_ceiling_recovery` boots the `test-actuators` kernel on one CPU,
+    // which is also what makes its claim about *the recovered CPU* precise.
     "heap_ceiling",
     // Fills /tmp to the VFS listing limit, so it needs a boot nothing else
     // shares — every later `read_dir("/tmp")` in it would be refused.
@@ -163,6 +202,10 @@ const RUST_SKIP: &[&str] = &[
     "netd_caps",
     // Same reason, same config: `netd_hostile_peer` runs it there.
     "netd_hostile_peer",
+    // Needs a `launcher` connector, which `tests/testcases`'s test-runner has
+    // no reason to hold. `launcher_refusals` runs it on tests/netcase, whose
+    // test-runner receives one for exactly this.
+    "launcher_refusals",
     // Needs a boot image the harness staged a file into before the machine
     // started, which only `esp_filesystem` builds.
     "esp_files",
@@ -176,6 +219,12 @@ const RUST_SKIP: &[&str] = &[
     // ever answers it. `swiss_german_layout`, `locale_detect` and
     // `locale_detect_unrecognized` drive it.
     "locale_gate",
+    // Driven, not run: `screen_console_clear` types its name at a console it is
+    // watching, and on its own it asks the kernel to paint over a panel nobody
+    // is reading and exits 0. A verdict its own exit code cannot carry — the
+    // same shape as `test_screen_churn` below, and it was in the shared registry
+    // for the same reason nobody had looked.
+    "test_screen_graffiti",
     // A workload, not a test: it prints a pattern for `screen_console_scroll`
     // to assert a panel against, and on its own it has no verdict at all. It
     // used to sit in the shared boot with defaults for its arguments, where it
@@ -237,9 +286,11 @@ const AUDIO_SMP: &[u32] = &[1, 8];
 // desktop are how those tests passed vacuously twice.
 // `screen_decoder` needs no guest at all; it proves the decoder against a
 // bitmap it rendered itself, before anything points it at a real screen.
-/// Feature-carrying tests last: each distinct kernel feature set is one more
-/// kernel rebuild, and ending on one leaves the plain-kernel tests above it
-/// untouched by the thrash.
+/// The order was once about kernel rebuilds — every actuator was a build, and a
+/// feature-carrying test last left the plain-kernel ones above it untouched by
+/// the thrash. Since `specs/test-cost-audit.md` §5.9.7 there are two kernels and
+/// nothing to thrash; the order is kept because these are read the way they are
+/// written.
 const SCREEN_TESTS: &[(&str, Sched)] = &[
     ("screen_decoder", Sched::Parallel),
     ("screen_diag_boot", Sched::Parallel),
@@ -353,6 +404,7 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // before that deadline could expire any of them. Both are wall-clock
     // margins, which is the definition of [`Sched::Serial`].
     ("netd_hostile_peer", Sched::Serial),
+    ("launcher_refusals", Sched::Parallel),
     ("foreign_disk_untouched", Sched::Parallel),
     ("boot_partition_identity", Sched::Parallel),
     ("double_fault_stack", Sched::Parallel),
@@ -564,6 +616,9 @@ const MACHINE_TESTS: &[(&str, Sched)] = &[
     // Same: the control-register verdict, against the machine this tree
     // actually booted before `arch/control_regs.rs`.
     ("control_regs_verdict", Sched::Parallel),
+    // Same: which of the two shared boots each binary belongs on, asked of the
+    // binaries rather than of the list that claims to name them.
+    ("suite_split", Sched::Parallel),
 ];
 
 /// What makes an entry stale, which is the whole safety argument for having a
@@ -763,68 +818,237 @@ const T14_ROWS: usize = 1080 / 16;
 const T14_COLS: usize = 1920 / 8;
 
 /// The line `SYS_DEBUG` action 3 logs immediately before halting every CPU.
-/// Action 3 exists only under the `test-fatal-halt` kernel feature, which
-/// screen_fatal_halt is the only caller of. Kept in sync with
+/// It exists only on a `test-actuators` kernel — every other action costs the
+/// caller its own process, this one costs the machine. Kept in sync with
 /// `kernel/src/arch/syscall.rs` by this comment and by screen_fatal_halt
 /// failing loudly if it drifts.
 const FATAL_HALT_NONCE: &str = "SYS_DEBUG: fatal halt 4b1d9e2c";
 
-// C tests that can't compile yet (missing toyos-cc features or unsupported platform APIs).
-// Tests that compile successfully are discovered automatically — only list failures here.
-const C_SKIP: &[&str] = &[
-    "03_struct",              // needs _Generic
-    "18_include",             // needs system headers we don't provide
-    "31_args",                // needs argc/argv
-    "32_led",                 // needs system APIs
-    "33_ternary_op",          // needs _Generic
-    "40_stdio",               // needs FILE* APIs
-    "60_errors_and_warnings", // meta-test for compiler errors
-    "73_arm64",               // wrong architecture
-    "101_cleanup",            // needs __attribute__((cleanup))
-    "102_alignas",            // needs _Alignas
-    "103_implicit_memmove",   // needs __builtin_memmove
-    "104_inline",             // needs weak symbols in linker
-    "106_versym",             // needs pthread
-    "107_stack_safe",         // needs alloca
-    "108_constructor",        // needs __attribute__((constructor))
-    "109_float_struct_calling", // needs struct-in-register calling convention
-    "112_backtrace",          // needs tcc_backtrace
-    "113_btdll",              // needs tcc_backtrace
-    "114_bound_signal",       // needs sigaction
-    "115_bound_setjmp",       // needs setjmp
-    "116_bound_setjmp2",      // needs setjmp
-    "117_builtins",           // needs __builtin_memmove
-    "120_alias",              // needs asm aliases
-    "122_vla_reuse",          // VLA codegen bug
-    "123_vla_bug",            // VLA codegen bug
-    "124_atomic_counter",     // needs stdatomic.h (calls process::exit, not catchable)
-    "125_atomic_misc",        // needs stdatomic.h (calls process::exit, not catchable)
-    "126_bound_global",       // needs bounds checking
-    "127_asm_goto",           // needs inline asm
-    "128_run_atexit",         // needs on_exit, and a -D per config to have a main
-    "132_bound_test",         // needs bounds checking
-    "136_atomic_gcc_style",   // needs stdatomic.h (calls process::exit, not catchable)
-];
+/// How far a corpus case gets before it stops, and what it says when it does.
+///
+/// There is no `Run`. Seventeen of these built at the moment this list was
+/// written and nobody has ever asked whether they run; turning one on is a
+/// guest slot and possibly a hung lane, so the question is filed rather than
+/// answered here.
+#[derive(Clone, Copy)]
+enum Stage {
+    /// toyos-cc refuses it, and this is what the refusal says.
+    ///
+    /// Quoted for the same reason `EXPECTED_FAILURES` quotes a failure
+    /// message: a second defect landing on the same case must not be able to
+    /// hide under the first.
+    Refused(&'static str),
+    /// It compiles, and the link does not resolve — this symbol.
+    NoLink(&'static str),
+    /// It builds. The decision is only not to run it.
+    Built,
+}
 
-/// C tests that are discovered, compiled and then thrown away because they do
-/// not build. Unlike [`C_SKIP`] these are not a decision, they are the current
-/// state of the toolchain — the reason each gives is printed by every run.
-const C_DOES_NOT_BUILD: &[(&str, &str)] = &[
-    ("78_vla_label", "cranelift verifier rejects the VLA's stack address across blocks"),
-    ("79_vla_continue", "same VLA defect, reached through `continue`"),
-    ("83_utf8_in_identifiers", "the lexer rejects a non-ASCII byte in an identifier"),
-    ("85_asm_outside_function", "file-scope asm is parsed and not emitted, so `vide` is undefined"),
-    ("89_nocode_wanted", "expr_type cannot type an identifier under `sizeof` in dead code"),
-    ("94_generic", "_Generic type dispatch is not implemented"),
-    ("95_bitfields", "aligned(16) on a bitfield member, which toyos-cc refuses"),
-    ("95_bitfields_ms", "the same file again, through 95_bitfields.c"),
-    ("96_nodata_wanted", "every branch wants a -D the harness does not pass, so no `main`"),
-    ("98_al_ax_extend", "file-scope asm again: `_us`, `_ss`, `_uc`, `_sc` are declared in it"),
-    ("99_fastcall", "typeof of an `&function` expression is not implemented"),
+/// Why a case is not run.
+enum Why {
+    /// Considered and declined. Nothing is owed, which is why this list has no
+    /// `task` field where `EXPECTED_FAILURES` requires one: an expected
+    /// failure nobody is assigned to is a disabled test, and a *decline* is
+    /// not owed to anybody by construction.
+    Declined(&'static str),
+    /// Held open by a write-up, which is where the reason lives. `docs.rs`
+    /// resolves the path.
+    Open(&'static str),
+}
+
+impl Why {
+    fn stated(&self) -> String {
+        match self {
+            Why::Declined(reason) => format!("declined: {reason}"),
+            Why::Open(path) => format!("held open by {path}"),
+        }
+    }
+}
+
+/// A corpus case the suite does not run.
+///
+/// One list, because "is this declined or is it broken" and "how far does it
+/// get" are two questions, and the two lists this replaces each answered one
+/// of them for a different set of cases. `C_SKIP` was 32 names that nothing
+/// ever attempted: 17 of them compiled fine, several stated a reason that was
+/// not the reason — `03_struct` said `_Generic` and stopped on
+/// `__attribute__((cleanup))`, `123_vla_bug` said "VLA codegen bug" and built
+/// — and a name that no longer matched a file would have left a dead
+/// exemption behind for ever.
+///
+/// **Every entry is attempted to its declared stage on every run.** Getting
+/// further means the fix arrived and the entry goes; getting less far is a
+/// regression. Both red the run. There is no review-date escape hatch of the
+/// `Stale::OnThisDate` kind, and no need of one: a host compile is
+/// deterministic, so one green here is the whole population rather than one
+/// sample of an intermittent.
+struct NotRun {
+    /// The corpus file's stem. A name with no `.c` reds the run, so a rename
+    /// takes its entry with it.
+    case: &'static str,
+    stage: Stage,
+    why: Why,
+}
+
+/// Where the question about the `Built` set lives.
+const BUILT_NOT_RUN: &str = "specs/issues/build/c-corpus-cases-build-and-are-not-run.md";
+
+const NOT_RUN: &[NotRun] = &[
+    NotRun {
+        case: "03_struct",
+        stage: Stage::Refused("__attribute__((__cleanup__)) is not implemented"),
+        why: Why::Declined("cleanup attributes; the entry used to say _Generic, which is 33_ternary_op's reason and not this one"),
+    },
+    NotRun { case: "18_include", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun { case: "78_vla_label", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun { case: "79_vla_continue", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun { case: "31_args", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun { case: "32_led", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "33_ternary_op",
+        stage: Stage::Refused("_Generic type dispatch is not implemented"),
+        why: Why::Declined("_Generic"),
+    },
+    NotRun { case: "40_stdio", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "60_errors_and_warnings",
+        stage: Stage::NoLink("main"),
+        why: Why::Declined("a meta-test of compiler diagnostics: every branch is behind a -D the harness does not pass, so the file preprocesses to no `main`"),
+    },
+    NotRun {
+        case: "73_arm64",
+        stage: Stage::Refused("arg 1 (v94) has type i32, expected i64"),
+        why: Why::Declined("aarch64-specific, and this target is x86-64. It does not stop with a refusal by name — it stops in the verifier, on a variadic call, which is a defect of ours reached through a case we decline anyway"),
+    },
+    NotRun {
+        case: "89_nocode_wanted",
+        stage: Stage::Refused("failed to define function 'kb_wait_3'"),
+        why: Why::Open("specs/issues/build/toyos-cc-goto-out-of-a-statement-expression.md"),
+    },
+    NotRun {
+        case: "83_utf8_in_identifiers",
+        stage: Stage::Refused("unexpected character '\u{ef}' (0xef)"),
+        why: Why::Declined("non-ASCII identifiers. UTF-8 in strings and comments works; the lexer stops on the byte it could not read, so nothing is dropped"),
+    },
+    NotRun {
+        case: "85_asm_outside_function",
+        stage: Stage::Refused("file-scope asm(...) is not implemented"),
+        why: Why::Declined("emitting file-scope asm needs an x86-64 assembler"),
+    },
+    NotRun {
+        case: "94_generic",
+        stage: Stage::Refused("_Generic type dispatch is not implemented"),
+        why: Why::Declined("_Generic"),
+    },
+    NotRun {
+        case: "95_bitfields",
+        stage: Stage::Refused("#pragma pack(push,1) is not implemented"),
+        why: Why::Declined("a self-including bitfield torture test wanting #pragma pack, ms_struct, gcc_struct, aligned on a declaration specifier and packed bitfields — every one of them a deliberate refusal"),
+    },
+    NotRun {
+        case: "95_bitfields_ms",
+        stage: Stage::Refused("#pragma pack(push,1) is not implemented"),
+        why: Why::Declined("the same file again, through a two-line wrapper"),
+    },
+    NotRun {
+        case: "96_nodata_wanted",
+        stage: Stage::NoLink("main"),
+        why: Why::Declined("seven configurations selected by a -D from tcc's own Makefile, four of which expect compiler diagnostics. The harness compiles one configuration and compares one stdout, so no fix to toyos-cc can make it pass"),
+    },
+    NotRun {
+        case: "98_al_ax_extend",
+        stage: Stage::Refused("file-scope asm(...) is not implemented"),
+        why: Why::Declined("file-scope asm again"),
+    },
+    NotRun {
+        case: "99_fastcall",
+        stage: Stage::Refused("file-scope asm(...) is not implemented"),
+        why: Why::Declined("32-bit x86 — pushl %esp, pusha, __attribute((fastcall)). It stops on the file-scope asm at line 26 before reaching any of that"),
+    },
+    NotRun {
+        case: "101_cleanup",
+        stage: Stage::Refused("__attribute__((cleanup)) is not implemented"),
+        why: Why::Declined("cleanup attributes"),
+    },
+    NotRun {
+        case: "102_alignas",
+        stage: Stage::Refused("expected Semi, got Alignas"),
+        why: Why::Declined("_Alignas. It stops as a parse error rather than by name, which reads worse and is still a stop"),
+    },
+    NotRun { case: "103_implicit_memmove", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "104_inline",
+        stage: Stage::Refused("unexpected token in expression: Attribute"),
+        why: Why::Declined("weak symbols. The file itself compiles — the companion `104+_inline.c` is what stops, which is the stage as the harness reaches it"),
+    },
+    NotRun {
+        case: "106_versym",
+        stage: Stage::NoLink("PTHREAD_PROCESS_SHARED"),
+        why: Why::Declined("pthread condition variables"),
+    },
+    NotRun { case: "107_stack_safe", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "108_constructor",
+        stage: Stage::Refused("__attribute__((constructor)) is not implemented"),
+        why: Why::Declined("constructor attributes"),
+    },
+    NotRun { case: "109_float_struct_calling", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun { case: "112_backtrace", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "113_btdll",
+        stage: Stage::NoLink("f_1"),
+        why: Why::Declined("three shared libraries built from the same file under -DDLL=1,2,3 and loaded at run time; the harness builds one object and one binary"),
+    },
+    NotRun {
+        case: "114_bound_signal",
+        stage: Stage::Refused("expected Semi, got Ident(\"sj\")"),
+        why: Why::Declined("sigaction and sigjmp_buf, which no header here declares, so the declaration does not parse"),
+    },
+    NotRun { case: "115_bound_setjmp", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun { case: "116_bound_setjmp2", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "117_builtins",
+        stage: Stage::NoLink("__builtin_abort"),
+        why: Why::Declined("__builtin_abort, and the compiler implements no builtin under that name"),
+    },
+    NotRun {
+        case: "120_alias",
+        stage: Stage::Refused("__attribute__((alias)) is not implemented"),
+        why: Why::Declined("symbol aliases. Its two `__asm__(_\"name\")` renames at lines 19 and 20 are refused too, but the attribute at line 9 comes first"),
+    },
+    NotRun { case: "122_vla_reuse", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun { case: "123_vla_bug", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "124_atomic_counter",
+        stage: Stage::Refused("cannot find system include file: stdatomic.h"),
+        why: Why::Declined("C11 atomics"),
+    },
+    NotRun {
+        case: "125_atomic_misc",
+        stage: Stage::Refused("cannot find system include file: stdatomic.h"),
+        why: Why::Declined("C11 atomics"),
+    },
+    NotRun { case: "126_bound_global", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "127_asm_goto",
+        stage: Stage::Refused("expected LParen, got Goto"),
+        why: Why::Declined("`asm goto`, and inline asm generally"),
+    },
+    NotRun {
+        case: "128_run_atexit",
+        stage: Stage::Refused("__attribute__((constructor)) is not implemented"),
+        why: Why::Declined("constructor attributes, and a -D per configuration to have a main at all"),
+    },
+    NotRun { case: "132_bound_test", stage: Stage::Built, why: Why::Open(BUILT_NOT_RUN) },
+    NotRun {
+        case: "136_atomic_gcc_style",
+        stage: Stage::Refused("cannot find system include file: stdatomic.h"),
+        why: Why::Declined("C11 atomics"),
+    },
 ];
 
 /// Discover C tests by scanning tests/testcases/tinycc/*.c.
-/// Skips companion files (contain '+') and tests in C_SKIP.
+/// Skips companion files (contain '+') and everything in [`NOT_RUN`].
 fn discover_c_tests() -> Vec<String> {
     let dir = compile::testcases_dir();
     let mut names: Vec<String> = fs::read_dir(&dir)
@@ -835,7 +1059,7 @@ fn discover_c_tests() -> Vec<String> {
             if stem.contains('+') {
                 return None;
             }
-            if C_SKIP.contains(&stem) {
+            if NOT_RUN.iter().any(|d| d.case == stem) {
                 return None;
             }
             Some(stem.to_string())
@@ -883,47 +1107,112 @@ fn compile_c_tests(names: &[String]) -> Vec<(String, Vec<u8>)> {
 
     std::panic::set_hook(prev_hook);
 
-    for (name, why) in &broken {
-        eprintln!("[toyos] c::{name} does not build: {why}");
+    if !broken.is_empty() {
+        let mut msg = String::from(
+            "a C test that is not declared in NOT_RUN stopped building, and a test that does \
+             not build is a test that does not run:\n",
+        );
+        for (name, why) in &broken {
+            msg += &format!("  c::{name}: {why}\n");
+        }
+        panic!("{msg}");
     }
-    check_c_build_fixture(&broken.iter().map(|(n, _)| *n).collect::<Vec<_>>());
 
     bins
 }
 
+/// Attempt every declared case exactly as far as it says it gets.
+///
+/// The list this replaces was asserted in one direction for nine names and in
+/// no direction at all for thirty-two. The cost of the whole pass is a fraction
+/// of a second, so nothing here is bought with test time.
+fn check_not_run() {
+    let dir = compile::testcases_dir();
+    let mut wrong: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+
+    for entry in NOT_RUN {
+        let case = entry.case;
+        let before = wrong.len();
+        if !seen.insert(case) {
+            wrong.push(format!("{case}: named twice"));
+            continue;
+        }
+        if !dir.join(format!("{case}.c")).is_file() {
+            wrong.push(format!("{case}: no such file in the corpus — a rename left this behind"));
+            continue;
+        }
+        let compiled = std::panic::catch_unwind(|| compile::compile_c(case));
+        match (&entry.stage, compiled) {
+            (Stage::Refused(says), Err(e)) => {
+                let said = panic_message(&e);
+                if !said.contains(says) {
+                    wrong.push(format!(
+                        "{case}: refused, but not for the declared reason.\n    \
+                         declared: {says}\n    said:     {said}"
+                    ));
+                }
+            }
+            (Stage::Refused(says), Ok(_)) => wrong.push(format!(
+                "{case}: compiles now — it was declared to stop with {says:?}. \
+                 The fix arrived; delete the entry and let the case run."
+            )),
+            (_, Err(e)) => wrong.push(format!(
+                "{case}: no longer compiles, and it was declared to get further: {}",
+                panic_message(&e)
+            )),
+            (stage, Ok((obj, extras))) => {
+                let linked = std::panic::catch_unwind(|| compile::link_toyos(&obj, &extras, case));
+                match (stage, linked) {
+                    (Stage::NoLink(symbol), Err(e)) => {
+                        let said = panic_message(&e);
+                        if !said.contains(symbol) {
+                            wrong.push(format!(
+                                "{case}: the link fails on something else.\n    \
+                                 declared: undefined symbol: {symbol}\n    said:     {said}"
+                            ));
+                        }
+                    }
+                    (Stage::NoLink(symbol), Ok(_)) => wrong.push(format!(
+                        "{case}: links now — it was declared to fail on {symbol:?}. \
+                         The fix arrived; delete the entry and let the case run."
+                    )),
+                    (Stage::Built, Err(e)) => wrong.push(format!(
+                        "{case}: no longer links, and it was declared to build: {}",
+                        panic_message(&e)
+                    )),
+                    (Stage::Built, Ok(_)) => {}
+                    (Stage::Refused(_), _) => unreachable!("handled above"),
+                }
+            }
+        }
+        for line in &mut wrong[before..] {
+            *line += &format!("\n    ({})", entry.why.stated());
+        }
+    }
+
+    std::panic::set_hook(prev_hook);
+
+    assert!(
+        wrong.is_empty(),
+        "NOT_RUN no longer describes the corpus. Every entry is attempted to its declared \
+         stage on every run, so this is a case that moved:\n  {}",
+        wrong.join("\n  "),
+    );
+}
+
+/// What a caught panic said, first line, whole. A refusal quoted in `NOT_RUN`
+/// is compared against this, so nothing here may shorten it.
 fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
     let full = e
         .downcast_ref::<String>()
         .cloned()
         .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
         .unwrap_or_else(|| "<non-string panic>".to_string());
-    full.lines().next().unwrap_or_default().chars().take(160).collect()
-}
-
-/// The suite runs a C test by booting the binary, so one that does not build is
-/// not run — and until this fixture, not reported either. The set is asserted
-/// in both directions: a case that stops building is a regression, and one that
-/// starts building is a fix whose entry has to go.
-fn check_c_build_fixture(broken: &[&str]) {
-    let expected: BTreeSet<&str> = C_DOES_NOT_BUILD.iter().map(|(n, _)| *n).collect();
-    let actual: BTreeSet<&str> = broken.iter().copied().collect();
-    if actual == expected {
-        return;
-    }
-    let new: Vec<&str> = actual.difference(&expected).copied().collect();
-    let fixed: Vec<&str> = expected.difference(&actual).copied().collect();
-    let mut msg = String::from("C_DOES_NOT_BUILD is out of date.\n");
-    if !new.is_empty() {
-        msg += &format!(
-            "  stopped building, and so stopped being run at all: {}\n  \
-             (the reason for each is printed above)\n",
-            new.join(", ")
-        );
-    }
-    if !fixed.is_empty() {
-        msg += &format!("  builds now — delete from C_DOES_NOT_BUILD: {}\n", fixed.join(", "));
-    }
-    panic!("{msg}");
+    full.lines().next().unwrap_or_default().to_string()
 }
 
 /// How many kernel lines a dead test's report is printed with.
@@ -1379,7 +1668,7 @@ fn measure_audio_run(
         rust_bins,
         BootOptions {
             smp,
-            kernel_features: if SLOW_USB.load(std::sync::atomic::Ordering::Relaxed) {
+            kernel_params: if SLOW_USB.load(std::sync::atomic::Ordering::Relaxed) {
                 &["usb-slow-device"]
             } else {
                 &[]
@@ -2361,7 +2650,7 @@ fn run_screen_test(
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 qmp: true,
-                kernel_features: &["test-screen-graffiti"],
+                kernel_features: ACTUATOR_KERNEL,
                 ready_marker: "console: ready",
                 ..Default::default()
             };
@@ -2552,7 +2841,7 @@ fn run_screen_test(
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 qmp: true,
-                kernel_features: &["test-screen-graffiti"],
+                kernel_features: ACTUATOR_KERNEL,
                 ready_marker: "console: ready",
                 ..Default::default()
             };
@@ -2763,7 +3052,7 @@ fn run_screen_test(
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 qmp: true,
-                kernel_features: &["test-fatal-halt"],
+                kernel_features: ACTUATOR_KERNEL,
                 ready_marker: "console: ready",
                 ..Default::default()
             };
@@ -2893,7 +3182,7 @@ fn run_screen_test(
                 profile: qemu::Profile::Metal,
                 qmp: true,
                 mute: true,
-                kernel_features: &["test-late-panic"],
+                kernel_params: &["test-late-panic"],
                 ..Default::default()
             };
             let argv = qemu::profile_argv(&options);
@@ -2936,7 +3225,7 @@ fn run_screen_test(
                 BootOptions {
                     profile: qemu::Profile::Gop,
                     qmp: true,
-                    kernel_features: &["test-early-panic"],
+                    kernel_params: &["test-early-panic"],
                     ready_marker: "!!! EARLY PANIC !!!",
                     ..Default::default()
                 },
@@ -2964,7 +3253,7 @@ fn run_screen_test(
                 BootOptions {
                     profile: qemu::Profile::Gop,
                     qmp: true,
-                    kernel_features: &["test-late-panic"],
+                    kernel_params: &["test-late-panic"],
                     ready_marker: "!!! PANIC !!!",
                     ..Default::default()
                 },
@@ -3001,7 +3290,7 @@ fn run_screen_test(
                 BootOptions {
                     profile: qemu::Profile::Gop,
                     qmp: true,
-                    kernel_features: &["test-late-panic"],
+                    kernel_params: &["test-late-panic"],
                     ready_marker: "!!! PANIC !!!",
                     ..Default::default()
                 },
@@ -3082,7 +3371,7 @@ fn run_screen_test(
                 BootOptions {
                     profile: qemu::Profile::Metal,
                     qmp: true,
-                    kernel_features: &["test-late-panic"],
+                    kernel_params: &["test-late-panic"],
                     ready_marker: "!!! PANIC !!!",
                     ..Default::default()
                 },
@@ -3266,7 +3555,7 @@ fn run_screen_test(
                 BootOptions {
                     profile: qemu::Profile::Gop,
                     qmp: true,
-                    kernel_features: &["test-fatal-halt"],
+                    kernel_features: ACTUATOR_KERNEL,
                     ..Default::default()
                 },
             );
@@ -3343,7 +3632,7 @@ fn run_screen_test(
                 // `/log` — tests anything at all. The probe is time-based, so
                 // it needs no console to drive it.
                 mute: true,
-                kernel_features: &["metal-panic-probe"],
+                kernel_params: &["metal-panic-probe"],
                 ..Default::default()
             };
             metal_sim_argv_check(&qemu::profile_argv(&options))?;
@@ -3584,6 +3873,11 @@ fn run_screen_test(
                 BootOptions {
                     profile: qemu::Profile::Gop,
                     qmp: true,
+                    // Action 0 is a `SYS_DEBUG` arm, and a kernel that ships
+                    // has none: the child would be answered `InvalidArgument`
+                    // and exit 0, which is this test's own red for a reason
+                    // that is not about the screen at all.
+                    kernel_features: ACTUATOR_KERNEL,
                     ..Default::default()
                 },
             );
@@ -3760,7 +4054,7 @@ fn boot_i8042_trace(
     let options = BootOptions {
         profile: qemu::Profile::Metal,
         qmp: true,
-        kernel_features: &["i8042-trace"],
+        kernel_params: &["i8042-trace"],
         ..Default::default()
     };
     metal_sim_argv_check(&qemu::profile_argv(&options)).unwrap_or_else(|e| panic!("{e}"));
@@ -4546,7 +4840,7 @@ fn locale_detect(qemu: &mut QemuInstance) -> Result<(), String> {
         // the surface acted on the config it wrote. Both are new: this ran on
         // a machine whose keyboard the gate binary claims, which is the state
         // that used to make the wizard refuse.
-        "surface: pid",
+        "surface: client",
         "surface: layout is now swiss-german",
     ] {
         if !result.stdout.contains(want) {
@@ -6207,15 +6501,21 @@ fn metal_sim_client_death(boot: &mut Boot) -> Result<(), String> {
     }
 
     // Non-vacuity, and the case that motivated the whole run: the compositor
-    // has to have met a request from a pid the kernel no longer knows, or
-    // nothing here exercised the grant that killed the desktop. The guest
-    // orders that by construction — reap, then release the process holding the
-    // socket — so a run without this line is a defect and never a lost race.
-    const VANISHED: &str = "the process behind it has exited";
+    // has to have met a request whose creator the kernel no longer knows. The
+    // guest orders that by construction — reap, then release the process
+    // holding the socket — so a run without this line is a defect and never a
+    // lost race.
+    //
+    // **The line is the compositor serving that request, where it used to be
+    // the compositor saying the process had exited.** The grant that killed the
+    // desktop named a pid; a buffer is a handle now and the connection is what
+    // it travels over, so a reaped creator costs its heir nothing and the
+    // refusal this once asserted on cannot happen.
+    const VANISHED: &str = "a reaped creator's connection still got a window";
     if !result.stdout.contains(VANISHED) {
         return Err(format!(
-            "the compositor never met a request from a reaped creator, so this run says \
-             nothing about the grant:\n{}",
+            "the compositor never served a request from a reaped creator, so this run says \
+             nothing about what replaced the grant:\n{}",
             result.stdout
         ));
     }
@@ -6239,8 +6539,8 @@ fn metal_sim_client_death(boot: &mut Boot) -> Result<(), String> {
     let console = format!("{}\n{after}", result.serial);
     serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
     eprintln!(
-        "  [metal-sim] {CASES} client deaths survived, a reaped creator's request refused by \
-         name, desktop still compositing"
+        "  [metal-sim] {CASES} client deaths survived, a reaped creator's request served \
+         anyway, desktop still compositing"
     );
     Ok(())
 }
@@ -6317,7 +6617,7 @@ fn run_machine_test(
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 smp: 8,
-                kernel_features: &["heartbeat"],
+                kernel_params: &["heartbeat"],
                 ..Default::default()
             };
             let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
@@ -7444,6 +7744,7 @@ fn run_machine_test(
         "expected_failure_exit_status" => expected_failure_exit_status(),
         "expected_failure_entries" => expected_failure_entries(),
         "control_regs_verdict" => control_regs_verdict(),
+        "suite_split" => suite_split(),
         "nvme_wide_sector" => {
             // The other half of "a device's size is a shape dimension": not how
             // many sectors, but how big one is. `lba_ds` is an 8-bit
@@ -7499,7 +7800,7 @@ fn run_machine_test(
             // arena too small for a process to map its TLS and its heap would
             // prove the actuator works and nothing about the kernel.
             let options = BootOptions {
-                kernel_features: &["test-tiny-va"],
+                kernel_params: &["test-tiny-va"],
                 ..Default::default()
             };
             let mut qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
@@ -7674,15 +7975,15 @@ fn run_machine_test(
             // machine `/bin/echo` could run somewhere else and pass without
             // touching it. With one CPU there is nowhere else.
             //
-            // The actuator is `test-heap-ceiling`'s three SYS_DEBUG actions,
-            // and the reason it is not an ordinary workload is on the feature
-            // in `kernel/Cargo.toml`: routes past the ceiling do still exist,
+            // The actuator is SYS_DEBUG 5, 6 and 7, and the reason it is not
+            // an ordinary workload is beside them in `arch/syscall.rs`: routes
+            // past the ceiling do still exist,
             // and each of them holds the VFS lock when it dies, so the
             // machine wedges either way and the allocator's recovery cannot
             // be observed on its own.
             let options = BootOptions {
                 smp: 1,
-                kernel_features: &["test-heap-ceiling"],
+                kernel_features: ACTUATOR_KERNEL,
                 ..Default::default()
             };
             let mut qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
@@ -7752,7 +8053,7 @@ fn run_machine_test(
 
             let options = BootOptions {
                 profile: qemu::Profile::MetalDisk,
-                kernel_features: &["test-small-caches"],
+                kernel_params: &["test-small-caches"],
                 ..Default::default()
             };
             let mut qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
@@ -7837,7 +8138,7 @@ fn run_machine_test(
             // bound, not the controller's politeness.
             let options = BootOptions {
                 profile: qemu::Profile::MetalUsb,
-                kernel_features: &["xhci-one-slot"],
+                kernel_params: &["xhci-one-slot"],
                 ..Default::default()
             };
             let argv = qemu::profile_argv(&options);
@@ -8041,7 +8342,7 @@ fn run_machine_test(
                 c_bins,
                 rust_bins,
                 BootOptions {
-                    kernel_features: &["test-input-merge"],
+                    kernel_params: &["test-input-merge"],
                     ..Default::default()
                 },
             );
@@ -8072,7 +8373,7 @@ fn run_machine_test(
                 BootOptions {
                     profile: qemu::Profile::Metal,
                     qmp: true,
-                    kernel_features: &["i8042-fast-health"],
+                    kernel_params: &["i8042-fast-health"],
                     ..Default::default()
                 },
             );
@@ -8252,7 +8553,7 @@ fn run_machine_test(
                 rust_bins,
                 BootOptions {
                     profile: qemu::Profile::Metal,
-                    kernel_features: &["xhci-descriptor-selftest"],
+                    kernel_params: &["xhci-descriptor-selftest"],
                     ..Default::default()
                 },
             );
@@ -8298,7 +8599,7 @@ fn run_machine_test(
                 rust_bins,
                 BootOptions {
                     profile: qemu::Profile::Metal,
-                    kernel_features: &["xhci-xecp-selftest"],
+                    kernel_params: &["xhci-xecp-selftest"],
                     ..Default::default()
                 },
             );
@@ -8353,7 +8654,7 @@ fn run_machine_test(
                 rust_bins,
                 BootOptions {
                     profile: qemu::Profile::Metal,
-                    kernel_features: &["i8042-budget-expired"],
+                    kernel_params: &["i8042-budget-expired"],
                     ..Default::default()
                 },
             );
@@ -8398,7 +8699,7 @@ fn run_machine_test(
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 qmp: true,
-                kernel_features: &["i8042-fadt-denial"],
+                kernel_params: &["i8042-fadt-denial"],
                 ..Default::default()
             };
             metal_sim_argv_check(&qemu::profile_argv(&options))?;
@@ -8464,7 +8765,7 @@ fn run_machine_test(
             let options = BootOptions {
                 profile: qemu::Profile::Metal,
                 qmp: true,
-                kernel_features: &["i8042-kbd-echo"],
+                kernel_params: &["i8042-kbd-echo"],
                 ..Default::default()
             };
             metal_sim_argv_check(&qemu::profile_argv(&options))?;
@@ -8674,7 +8975,7 @@ fn run_machine_test(
                 BootOptions {
                     profile: qemu::Profile::Metal,
                     qmp: true,
-                    kernel_features: &["i8042-fault"],
+                    kernel_params: &["i8042-fault"],
                     ..Default::default()
                 },
             );
@@ -9071,7 +9372,7 @@ fn run_machine_test(
             // share one window (`specs/issues/build/`), which here is what makes the
             // daemon's side of the story readable at all.
             console.push_str(&result.serial);
-            for named in ["netd: dropping pid", "netd: refusing pid"] {
+            for named in ["netd: dropping client", "netd: refusing client"] {
                 if !console.contains(named) {
                     return Err(format!(
                         "netd got rid of clients without a `{named}` line — a daemon that \
@@ -9081,6 +9382,66 @@ fn run_machine_test(
             }
             serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
             eprintln!("  [netcase] {refused} hostile frames refused, netd named every peer it dropped");
+            Ok(())
+        }
+        "launcher_refusals" => {
+            // **`/bin/init` is the one process the machine cannot lose**, and
+            // every launcher client — the compositor, every terminal, every
+            // shell, sshd — can send it whatever it likes. The guest carries
+            // the verdicts: init answered, init is still launching, and the
+            // kernel's live-object count did not grow across sixteen refused
+            // launches. The host carries the one the guest cannot see —
+            // whether init said anything about what it refused.
+            //
+            // `tests/netcase` because its test-runner is the only one that
+            // receives a `launcher` connector, and because two boot programs
+            // is the smallest blast radius for a test whose whole subject is
+            // making init misbehave.
+            let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/netcase");
+            let bins: Vec<(String, Vec<u8>)> = rust_bins
+                .iter()
+                .filter(|(name, _)| name == "launcher_refusals")
+                .cloned()
+                .collect();
+            if bins.is_empty() {
+                return Err("launcher_refusals was not built".to_string());
+            }
+            let mut qemu = QemuInstance::boot_with_options(
+                &config,
+                &[],
+                &bins,
+                BootOptions {
+                    profile: qemu::Profile::Headless,
+                    // The live-object count is a `SYS_DEBUG` action, and a
+                    // shipping kernel has none: both readings would be the same
+                    // `InvalidArgument` and the leak arm would pass having
+                    // counted nothing.
+                    kernel_features: ACTUATOR_KERNEL,
+                    ..Default::default()
+                },
+            );
+            let mut console = qemu.boot_log().to_string();
+            let _ = await_marker(&mut qemu, &mut console, "===READY===", "test-runner to come up");
+
+            let result = qemu.run_test("test_rs_launcher_refusals", Duration::from_secs(120));
+            if let Some(err) = &result.error {
+                return Err(format!("{err}\n{}", result.stdout));
+            }
+            if result.exit_code != Some(0) {
+                return Err(format!(
+                    "launcher_refusals exited {:?}:\n{}",
+                    result.exit_code, result.stdout
+                ));
+            }
+            console.push_str(&result.serial);
+            if !console.contains("init: launcher: cannot start") {
+                return Err(format!(
+                    "init refused a launch without a line saying so — a launcher that \
+                     drops requests silently cannot be asked what happened:\n{console}"
+                ));
+            }
+            serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
+            eprintln!("  [netcase] init refused three bad launches, named them, and kept launching");
             Ok(())
         }
         "metal_sim_input" => {
@@ -9573,7 +9934,7 @@ fn control_regs_negative(
         BootOptions {
             smp: CPUS,
             profile: qemu::Profile::Metal,
-            kernel_features: &["no-ap-control-regs"],
+            kernel_params: &["no-ap-control-regs"],
             ready_marker: MARKER,
             ..Default::default()
         },
@@ -9951,8 +10312,12 @@ fn run_debug_mode(c_tests: &[(String, Vec<u8>)], rust_bins: &[(String, Vec<u8>)]
 /// load-bearing and a group split across two workers would boot two machines
 /// and drain one console between them.
 enum Task<'a> {
-    /// Every Rust and C test, on the one guest they share.
-    Shared(Vec<&'a TestDef>),
+    /// Rust and C tests on one guest, and the kernel that guest boots.
+    ///
+    /// Two blocks rather than one: [`ACTUATOR_TESTS`] needs `SYS_DEBUG` and
+    /// everything else must not have it, which is what makes the second list
+    /// the shipping binary's own coverage.
+    Shared(Vec<&'a TestDef>, &'static [&'static str]),
     Machine(Vec<&'static str>),
     Screen(&'static str),
 }
@@ -10695,6 +11060,116 @@ fn expected_failure_exit_status() -> Result<(), String> {
 }
 
 /// What the declaration itself has to be, before any of it means anything.
+/// Which shared-boot binaries need `SYS_DEBUG`, asked of their source.
+///
+/// A name reaches the syscall directly, or through a child it spawns —
+/// `panic_recovery`'s three actions are all `test_panic_child`'s, and a rule
+/// that only read the test's own source would miss the one test in the list
+/// whose whole subject is the syscall.
+fn needs_actuators(sources: &[(String, String)], registry: &[&str]) -> BTreeSet<String> {
+    // The third spelling is the SDK's: `toyos::census` calls `debug_with` on the
+    // caller's behalf, so a binary whose leak assertion is a census names no
+    // syscall of its own and reads as innocent to the two above.
+    let calls = |text: &str| {
+        text.contains("SYS_DEBUG")
+            || text.contains("syscall::debug(")
+            || text.contains("census::Census")
+    };
+    let direct: BTreeSet<&str> =
+        sources.iter().filter(|(_, t)| calls(t)).map(|(n, _)| n.as_str()).collect();
+    let mut out = BTreeSet::new();
+    for (name, text) in sources {
+        if !registry.contains(&name.as_str()) {
+            continue;
+        }
+        let spawns = direct.iter().any(|d| text.contains(&format!("test_rs_{d}")));
+        if direct.contains(name.as_str()) || spawns {
+            out.insert(name.clone());
+        }
+    }
+    out
+}
+
+/// [`ACTUATOR_TESTS`] is exactly the shared-boot binaries that reach
+/// `SYS_DEBUG`, and the binaries are what is asked.
+///
+/// **What this does not cover, stated because the hole is real:** a machine or
+/// screen test that *drives* one of those binaries on a boot of its own.
+/// `screen_recoverable_untouched` was the instance — it runs
+/// `test_rs_test_panic_child` on a featureless kernel, where action 0 is answered
+/// `InvalidArgument` and the child exits 0 — and no static rule here can say
+/// which `BootOptions` a `run_test` call belongs to. What answers it instead is
+/// the guest: `test_panic_child` names `InvalidArgument` as *this kernel carries
+/// no actuators* rather than reporting a kernel that failed to kill anybody, so
+/// the red says what is wrong wherever it happens.
+///
+/// **Both directions are the point.** A binary that gains a `debug()` call and
+/// no entry would run on the shipping kernel, where the syscall answers
+/// `InvalidArgument` — and a test whose verdict is that a process died would
+/// then fail for a reason with nothing to do with what it is about. An entry
+/// whose binary no longer calls it is a test kept off the shipping kernel for
+/// nothing, which is the erosion this split exists to stop.
+fn suite_split() -> Result<(), String> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/toyos-rust-tests/src/bin");
+    let mut sources: Vec<(String, String)> = Vec::new();
+    for entry in fs::read_dir(&dir).map_err(|e| format!("read {}: {e}", dir.display()))? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let text = fs::read_to_string(&path).map_err(|e| format!("read {name}: {e}"))?;
+        sources.push((name, text));
+    }
+    let registry: Vec<&str> =
+        sources.iter().map(|(n, _)| n.as_str()).filter(|n| !RUST_SKIP.contains(n)).collect();
+
+    // The negative control, and it carries its own bad input: a binary that
+    // calls the syscall and is on no list must be named, or the check above is
+    // a spelling of `true`.
+    let staged = vec![
+        ("a_listed_one".to_string(), "syscall::debug(3)".to_string()),
+        ("an_unlisted_one".to_string(), "SYS_DEBUG".to_string()),
+        ("its_parent".to_string(), "Command::new(\"/bin/test_rs_an_unlisted_one\")".to_string()),
+        ("a_censor".to_string(), "use toyos::census::Census;".to_string()),
+        ("innocent".to_string(), "println!()".to_string()),
+    ];
+    let staged_registry =
+        ["a_listed_one", "an_unlisted_one", "its_parent", "a_censor", "innocent"];
+    let found = needs_actuators(&staged, &staged_registry);
+    let want: BTreeSet<String> = ["a_listed_one", "an_unlisted_one", "its_parent", "a_censor"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if found != want {
+        return Err(format!("the check does not work: on staged input it named {found:?}"));
+    }
+
+    let want: BTreeSet<String> = needs_actuators(&sources, &registry);
+    let listed: BTreeSet<String> = ACTUATOR_TESTS.iter().map(|s| s.to_string()).collect();
+    let missing: Vec<&String> = want.difference(&listed).collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{missing:?} reach SYS_DEBUG and are on the shipping boot, where the syscall answers \
+             InvalidArgument. Add each to ACTUATOR_TESTS, or to RUST_SKIP if it is driven rather \
+             than run."
+        ));
+    }
+    let stale: Vec<&String> = listed.difference(&want).collect();
+    if !stale.is_empty() {
+        return Err(format!(
+            "{stale:?} are held off the shipping kernel and no longer reach SYS_DEBUG. Delete \
+             each entry — coverage of the binary an image ships is what it costs."
+        ));
+    }
+    println!(
+        "  [split] {} shared binaries on the shipping kernel, {} on the actuator one",
+        registry.len() - listed.len(),
+        listed.len()
+    );
+    Ok(())
+}
+
 fn expected_failure_entries() -> Result<(), String> {
     static NAMED_NOTHING: &[ExpectedFailure] = &[ExpectedFailure {
         test: "a_test_that_was_renamed",
@@ -10793,7 +11268,7 @@ fn expected_failure_entries() -> Result<(), String> {
 /// thing that changed between the two attempts is how many guests the host had.
 fn retry_task<'a>(name: &str, all_tests: &[&'a TestDef]) -> Option<Task<'a>> {
     if let Some(def) = all_tests.iter().find(|t| t.name == name) {
-        return Some(Task::Shared(vec![def]));
+        return Some(Task::Shared(vec![def], shared_kernel(name)));
     }
     if let Some((registered, _)) = SCREEN_TESTS.iter().find(|(n, _)| *n == name) {
         return Some(Task::Screen(registered));
@@ -10808,6 +11283,16 @@ fn retry_task<'a>(name: &str, all_tests: &[&'a TestDef]) -> Option<Task<'a>> {
             .collect(),
     };
     Some(Task::Machine(names))
+}
+
+/// Which of the two shared boots a name belongs on — a *kernel build*, because
+/// `SYS_DEBUG` is compiled in or it is not, and never a boot parameter.
+fn shared_kernel(name: &str) -> &'static [&'static str] {
+    if ACTUATOR_TESTS.contains(&name) {
+        ACTUATOR_KERNEL
+    } else {
+        &[]
+    }
 }
 
 /// The binaries and config every task boots with.
@@ -10830,13 +11315,21 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
         });
     };
     match task {
-        Task::Shared(tests) => {
+        Task::Shared(tests, features) => {
             // The boot itself can fail, and it used to take the run with it.
             // Reporting the block's tests against its reason keeps the count
             // honest and says which one it died on.
             let mut done = 0usize;
             let outcome = catching(|| {
-                let mut qemu = QemuInstance::boot(bins.test_config, bins.c_bins, bins.rust_bins);
+                let boot = || {
+                    QemuInstance::boot_with_options(
+                        bins.test_config,
+                        bins.c_bins,
+                        bins.rust_bins,
+                        BootOptions { kernel_features: features, ..Default::default() },
+                    )
+                };
+                let mut qemu = boot();
                 let mut reboots = 0usize;
                 for test in &tests {
                     let start = common::clock::mark();
@@ -10862,7 +11355,7 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
                              ({reboots}/{MAX_SHARED_REBOOTS}) ----",
                             test.name
                         );
-                        qemu = QemuInstance::boot(bins.test_config, bins.c_bins, bins.rust_bins);
+                        qemu = boot();
                         result = qemu.run_test(&test.qemu_name, test.timeout);
                     }
                     let reason = (!(test.check)(&result)).then(|| {
@@ -10923,7 +11416,7 @@ impl Task<'_> {
     /// Every name this task will report an outcome for.
     fn names(&self) -> Vec<&str> {
         match self {
-            Task::Shared(tests) => tests.iter().map(|t| t.name.as_str()).collect(),
+            Task::Shared(tests, _) => tests.iter().map(|t| t.name.as_str()).collect(),
             Task::Machine(names) => names.to_vec(),
             Task::Screen(name) => vec![name],
         }
@@ -11356,7 +11849,12 @@ fn main() {
     }
 
     let c_names = discover_c_tests();
-    eprintln!("[toyos] Compiling {} C tests...", c_names.len());
+    eprintln!(
+        "[toyos] Compiling {} C tests, and attempting {} declared ones...",
+        c_names.len(),
+        NOT_RUN.len()
+    );
+    check_not_run();
     let c_bins = compile_c_tests(&c_names);
     let c_compiled: Vec<String> = c_bins.iter().map(|(n, _)| n.clone()).collect();
 
@@ -11495,15 +11993,26 @@ fn main() {
     let mut parallel: Vec<Task> = Vec::new();
     let mut serial: Vec<Task> = Vec::new();
     if !tests_to_run.is_empty() {
+        let (actuator, shipping): (Vec<&TestDef>, Vec<&TestDef>) =
+            tests_to_run.iter().copied().partition(|t| ACTUATOR_TESTS.contains(&t.name.as_str()));
         eprintln!(
-            "[toyos] The shared boot carries {} C + {} Rust binaries",
+            "[toyos] The shared boot carries {} C + {} Rust binaries: {} on the shipping \
+             kernel, {} on the actuator one",
             c_bins.len(),
-            rust_bins.len()
+            rust_bins.len(),
+            shipping.len(),
+            actuator.len(),
         );
-        let task = Task::Shared(tests_to_run.clone());
-        match SHARED_BLOCK {
-            Sched::Parallel => parallel.push(task),
-            Sched::Serial => serial.push(task),
+        for tests in [shipping, actuator] {
+            if tests.is_empty() {
+                continue;
+            }
+            let features = shared_kernel(&tests[0].name);
+            let task = Task::Shared(tests, features);
+            match SHARED_BLOCK {
+                Sched::Parallel => parallel.push(task),
+                Sched::Serial => serial.push(task),
+            }
         }
     }
     for (sched, names) in machine_tasks(&machine_to_run) {
@@ -11707,6 +12216,16 @@ fn main() {
     // A run with both real failures and invalidated tests exits 1: a red that
     // survives is still a red, and re-running the suspended ones does not make
     // it green.
+    // What this run cost cargo, and the number `specs/test-cost-audit.md` §5.9.7
+    // is about: a kernel build is ~6.9 s of wall clock and ~29.6 s of CPU after
+    // any edit under `kernel/`, and a full run used to make 45 of them.
+    let (boots, feature_boots, kernels) = qemu::boot_census();
+    eprintln!(
+        "  --- {boots} guests, {feature_boots} of them not the shipping kernel, {} kernel \
+         build(s): {kernels:?}",
+        kernels.len(),
+    );
+
     eprint!("{}", tally.summary(total, suite_start.elapsed(), suite_start.suspended()));
     std::process::exit(tally.exit_code());
 }

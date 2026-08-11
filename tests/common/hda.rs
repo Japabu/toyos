@@ -15,7 +15,7 @@ use crate::common::audio::{await_null_sink, NULL_SINK};
 use crate::common::qemu::{self, BootOptions, Profile, QemuInstance};
 use crate::common::serial::Serial;
 
-const FEATURE: &[&str] = &["hda-probe"];
+const PARAMS: &[&str] = &["hda-probe"];
 
 /// The three controllers [`Profile::MetalHda`] stages, by the bus address the
 /// probe names each one. Read from here rather than restated per assertion:
@@ -37,7 +37,7 @@ pub fn hda_probe(
     _c_bins: &[(String, Vec<u8>)],
     _rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    let log = probe_boot(FEATURE)?;
+    let log = probe_boot(PARAMS)?;
 
     // (a) handoff, both arms of the scope rule on one machine.
     let scopes = lines(log.text(), "hda: (a) scope members=");
@@ -183,16 +183,17 @@ pub fn hda_probe(
     ordinary_boot_is_untouched()
 }
 
-/// The other half of the feature's promise: **the probe is the feature and
+/// The other half of the actuator's promise: **the probe is the actuator and
 /// nothing else.**
 ///
-/// Same machine, same three controllers, a kernel without the flag. Not implied
-/// by anything above — a probe wired into `drivers::init` rather than behind it
-/// would satisfy every assertion in this file.
+/// Same machine, same three controllers, the kernel an image ships — which has
+/// no probe in it at all. Not implied by anything above: a probe wired into
+/// `drivers::init` rather than behind the parameter would satisfy every
+/// assertion in this file.
 ///
 /// It can no longer be "the log says nothing about HDA": H4's driver brings
 /// every class-0403 function up on every boot, which is what it is for. What
-/// the flag owns is the four verdict blocks and the widget dump, and those are
+/// the actuator owns is the four verdict blocks and the widget dump, and those are
 /// what must be absent.
 fn ordinary_boot_is_untouched() -> Result<(), String> {
     let log = probe_boot(&[])?;
@@ -209,13 +210,20 @@ fn ordinary_boot_is_untouched() -> Result<(), String> {
 /// One diagnostic boot of the three-controller machine.
 ///
 /// The **diag config**, because that is the image H0 ships in: no test binaries
-/// in the initrd and no process that can claim the framebuffer, so what the
-/// harness boots here is what gets flashed.
-fn probe_boot(features: &'static [&'static str]) -> Result<Serial, String> {
+/// in the initrd and no process that can claim the framebuffer, so the *image*
+/// the harness boots here is the one that gets flashed.
+///
+/// The kernel in it is not, and that is the one thing this cannot claim. A
+/// flashed diagnostic image is built with `boot-actuators` alone; the suite has
+/// only two kernels and the one carrying actuators carries `test-actuators`
+/// too, so what boots here has a debug syscall the flashed one does not
+/// (`specs/test-cost-audit.md` §5.9.7). Everything the probe touches is the
+/// same code either way.
+fn probe_boot(params: &'static [&'static str]) -> Result<Serial, String> {
     let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("diag");
     let options = BootOptions {
         profile: Profile::MetalHda,
-        kernel_features: features,
+        kernel_params: params,
         // No test runner in this image, so the kernel's own last phase line is
         // the marker.
         ready_marker: "Boot: complete",
@@ -252,7 +260,7 @@ pub fn hda_tone(
         rust_bins,
         BootOptions {
             profile: Profile::Hda,
-            kernel_features: &["hda-allowlist-selftest"],
+            kernel_params: &["hda-allowlist-selftest"],
             ..Default::default()
         },
     );

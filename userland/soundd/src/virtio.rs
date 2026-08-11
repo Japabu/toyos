@@ -215,7 +215,6 @@ impl Used {
 /// soundd prints before falling back to the null sink — "no sound" without which
 /// of these it was is a report nobody can act on.
 pub enum Refusal {
-    NoDevice(SyscallError),
     /// The kernel's answers stopped making sense, which is a bug here or there
     /// and never a property of the machine.
     Kernel(SyscallError),
@@ -231,7 +230,6 @@ pub enum Refusal {
 impl core::fmt::Display for Refusal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::NoDevice(e) => write!(f, "no virtio-sound device the kernel bound ({e})"),
             Self::Kernel(e) => write!(f, "the kernel refused a call this driver has to make ({e})"),
             Self::Silent(what) => write!(f, "the device never answered {what}"),
             Self::Rejected(what, status) => write!(f, "the device refused {what} ({status:#x})"),
@@ -255,11 +253,14 @@ pub struct Virtio {
 }
 
 impl Virtio {
-    /// Claim the device, ask what its stream can do, and configure it.
-    pub fn claim() -> Result<(Self, u32, u8), Refusal> {
-        let dev = VirtioSoundDev::open().map_err(Refusal::NoDevice)?;
+    /// Ask what the device's stream can do, and configure it.
+    ///
+    /// The claim is the argument: `/bin/init` minted it and endowed it, so
+    /// "does this machine have a virtio-sound?" was already answered before
+    /// soundd's first instruction.
+    pub fn claim(dev: VirtioSoundDev) -> Result<(Self, u32, u8), Refusal> {
         let info = dev.info().map_err(Refusal::Kernel)?;
-        let shm = SharedMemory::map(info.dma_token, 2 * 1024 * 1024)
+        let shm = SharedMemory::adopt(info.dma, 2 * 1024 * 1024)
             .map_err(Refusal::Kernel)?;
         let base = shm.as_ptr();
 

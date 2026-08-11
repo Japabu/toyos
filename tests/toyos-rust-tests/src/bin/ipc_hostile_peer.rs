@@ -22,7 +22,8 @@
 
 use std::process::exit;
 
-use toyos::{services, Connection};
+use toyos::endow;
+use toyos::Connection;
 use toyos_abi::syscall;
 use window::Window;
 
@@ -45,7 +46,7 @@ const EOF_POLL_NS: u64 = 10_000_000;
 
 fn main() {
     for (name, msg_type, len) in CASES {
-        let conn = services::connect("compositor")
+        let conn = endow::service("compositor")
             .unwrap_or_else(|e| panic!("[{name}] the compositor is not serving: {e:?}"));
 
         let mut frame = [0u8; 8];

@@ -123,6 +123,11 @@ fn prepare(root: &Path) -> Result<String, String> {
         ));
     }
 
+    // Asked of the remote and asked *before* the push, because it is the one
+    // question here that stops being answerable a second later.
+    let first_push = git(root, &["ls-remote", "--heads", "origin", &branch])
+        .is_ok_and(|refs| refs.trim().is_empty());
+
     git(root, &["push", "-u", "origin", &branch]).map_err(|e| {
         format!(
             "{e}\n\
@@ -136,18 +141,59 @@ fn prepare(root: &Path) -> Result<String, String> {
     let head = git(root, &["rev-parse", "--short", "HEAD"])?;
     Ok(format!(
         "[pr] {}\n\
-         [pr] {branch} is at {head} on origin and CI is running on it.\n\
+         [pr] {branch} is at {head} on origin.\n\
          [pr]\n\
-         [pr]   gh pr create --fill --base main --head {branch}   (once; --draft if not ready)\n\
-         [pr]   gh pr merge --auto --merge   (merges when the required checks pass)\n\
-         [pr]   gh pr checks --watch   (what the gate is doing)\n\
-         [pr]\n\
-         [pr] The pull request's title and body become the merge commit's, so write them as the \
-         record of what landed.\n\
+         {}\n\
          [pr] main must be *in* this branch for the merge button to unlock, which is what the \
          merge above is for. If main moves again, re-run `cargo run -- --pr`.",
         lines.join("\n[pr] "),
+        if first_push { open_it_now(&branch) } else { finish_it(&branch) },
     ))
+}
+
+/// **The first push is where the draft belongs, and a branch's first `--pr` is
+/// the only moment anyone is reading this.**
+///
+/// Nothing runs CI on a branch push — deliberately, `specs/ci-plan.md` §5, since
+/// a push and the pull request on it were two runs of the same twelve shards. So
+/// a branch without a pull request is a branch nothing has ever gated, and that
+/// is not a corner case: eleven agents took `wt/toyos-endow` to completion with
+/// zero CI exposure, which is how a `rust` submodule pin that matched in twelve
+/// hex digits survived four green local suites.
+///
+/// A draft costs nothing and buys a run on every push. It used to be four words
+/// in a parenthesis at the end of the line that recommended `--fill`.
+fn open_it_now(branch: &str) -> String {
+    format!(
+        "[pr] **Open it as a draft now, on this first chunk.** CI runs on a pull request and \
+         on nothing else, so until one exists this branch is ungated however long it lives.\n\
+         [pr]\n\
+         [pr]   gh pr create --draft --base main --head {branch} \\\n\
+         [pr]       --title \"{branch}: in progress\" --body \"opened early; CI on every push\"\n\
+         [pr]\n\
+         [pr] Then push as often as you like. `cargo run -- --pr` again when it is finished."
+    )
+}
+
+/// What to run on every later `--pr`, which is a branch that already has a
+/// remote and probably a draft.
+///
+/// **Never `--fill`.** It composes the title and body out of the commits, and
+/// those two become the merge commit's — main's record of what landed, written
+/// on purpose rather than concatenated.
+fn finish_it(branch: &str) -> String {
+    format!(
+        "[pr]   gh pr ready   (if it is a draft and it is finished)\n\
+         [pr]   gh pr edit --title \"<what landed>\" --body-file <file>\n\
+         [pr]   gh pr merge --auto --merge   (merges when the required checks pass)\n\
+         [pr]   gh pr checks --watch   (what the gate is doing)\n\
+         [pr]\n\
+         [pr] If {branch} has no pull request yet, open one as a draft first:\n\
+         [pr]   gh pr create --draft --base main --head {branch} --title \"<what landed>\"\n\
+         [pr]\n\
+         [pr] The title and body become the merge commit's, so write them as main's record. \
+         Not `--fill`: that concatenates the commits."
+    )
 }
 
 /// The refusals that do not need the network.
@@ -625,5 +671,37 @@ mod tests {
         sh(&wt, &["checkout", "-q", "--", "g"]);
         sh(&wt, &["switch", "-q", "main"]);
         assert!(preflight(&wt).expect_err("main is not a branch to land").contains("on main"));
+    }
+
+    /// **The draft has to be the answer on the push that creates the branch**,
+    /// because that is the only moment an agent is reading for what to do next
+    /// and CI runs on a pull request and on nothing else.
+    ///
+    /// `ls-remote` is the question, and the whole point is that it is asked
+    /// *before* the push — a second later the answer is the wrong one for ever.
+    #[test]
+    fn the_first_push_is_told_to_open_a_draft_and_later_ones_are_not() {
+        let (_origin, wt) = repo("first-push");
+        commit(&wt, "g", "mine\n", "work");
+
+        let before = git(&wt, &["ls-remote", "--heads", "origin", "wt"]).unwrap();
+        assert!(before.trim().is_empty(), "the branch is not on the remote yet");
+        assert!(open_it_now("wt").contains("gh pr create --draft"));
+
+        let first = prepare(&wt).expect("the first --pr should push and print");
+        assert!(first.contains("Open it as a draft now"), "{first}");
+        assert!(
+            !first.contains("create --fill"),
+            "--fill composes what becomes the merge commit's message: {first}"
+        );
+
+        let after = git(&wt, &["ls-remote", "--heads", "origin", "wt"]).unwrap();
+        assert!(!after.trim().is_empty(), "the push happened");
+
+        commit(&wt, "g2", "more\n", "more work");
+        let later = prepare(&wt).expect("a later --pr should push and print");
+        assert!(later.contains("gh pr ready"), "{later}");
+        assert!(!later.contains("Open it as a draft now"), "{later}");
+        assert!(!later.contains("create --fill"), "{later}");
     }
 }

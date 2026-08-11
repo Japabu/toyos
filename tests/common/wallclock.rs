@@ -8,7 +8,7 @@
 //! received, never off anything the guest said about it — the boot log is used
 //! only to say *why* a disagreement happened.
 //!
-//! # What only a kernel feature can stage
+//! # What only an actuator can stage
 //!
 //! Four states of the clock, and the host can produce none of them: QEMU has no
 //! switch that removes or wedges the mc146818, its RTC always presents the
@@ -125,11 +125,11 @@ fn boot_and_read(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
     image_name: &str,
-    features: &'static [&'static str],
+    params: &'static [&'static str],
     stage: &[(String, Vec<u8>)],
 ) -> Result<(Vec<Entry>, String), String> {
     let image_path = super::lane::dir().join(image_name);
-    let mut image = qemu::build_boot_image(test_config, c_bins, rust_bins, features);
+    let mut image = qemu::build_boot_image(test_config, c_bins, rust_bins, params);
     std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
     let (start, len) = volumes::log_extent(&image, &image_path)?;
 
@@ -145,7 +145,7 @@ fn boot_and_read(
         BootOptions {
             profile: qemu::Profile::Metal,
             boot_image: Some(image_path.clone()),
-            kernel_features: features,
+            kernel_params: params,
             rtc_base: Some(RTC_BASE),
             ..Default::default()
         },
@@ -318,12 +318,12 @@ fn zone_from_firmware(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURES: &[&str] = &["rtc-zone-east"];
+    const PARAMS: &[&str] = &["rtc-zone-east"];
     /// What `clock::init_wall` stages, in seconds: two hours east of UTC.
     const OFFSET_SECS: i64 = -120 * 60;
 
     let (entries, log) =
-        boot_and_read(test_config, c_bins, rust_bins, "wall-clock-zone.img", FEATURES, &[])?;
+        boot_and_read(test_config, c_bins, rust_bins, "wall-clock-zone.img", PARAMS, &[])?;
     let logs = logs(&entries);
 
     let [only] = logs.as_slice() else {
@@ -376,17 +376,17 @@ fn undated(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
     image_name: &str,
-    features: &'static [&'static str],
+    params: &'static [&'static str],
     because: &str,
 ) -> Result<(), String> {
-    let (entries, log) = boot_and_read(test_config, c_bins, rust_bins, image_name, features, &[])?;
+    let (entries, log) = boot_and_read(test_config, c_bins, rust_bins, image_name, params, &[])?;
     let logs = logs(&entries);
 
     // The refusal, by name and with its reason. A kernel that silently took
     // some other number for the time would produce a dated file and no line.
     if !log.contains("clock: this machine will not say what time it is") || !log.contains(because) {
         return Err(format!(
-            "with {features:?} the kernel never refused the clock for {because:?}\n{}",
+            "with {params:?} the kernel never refused the clock for {because:?}\n{}",
             clock_lines(&log)
         ));
     }
@@ -395,7 +395,7 @@ fn undated(
     };
     if only.name != "unknown-00.log" {
         return Err(format!(
-            "with {features:?} this boot's log is {}, which claims a time the machine never gave \
+            "with {params:?} this boot's log is {}, which claims a time the machine never gave \
              it\n{}",
             only.name,
             clock_lines(&log)
@@ -404,23 +404,23 @@ fn undated(
     // The boot has to have *finished* — a clock that refuses must not cost the
     // machine anything else — and the file has to carry it.
     if !log.contains("Boot: complete") {
-        return Err(format!("with {features:?} the boot never completed\n{log}"));
+        return Err(format!("with {params:?} the boot never completed\n{log}"));
     }
     // Userland is told the same thing the kernel knows. A syscall answering
     // 1970 here is the defect this whole shape exists to make impossible: the
     // caller cannot tell it from a machine that really is at the epoch.
     if !log.contains("wall-clock: no epoch") {
         return Err(format!(
-            "with {features:?} the clock syscalls did not refuse a process the way the kernel \
+            "with {params:?} the clock syscalls did not refuse a process the way the kernel \
              refused itself\n{}",
             clock_lines(&log)
         ));
     }
     if only.len == 0 {
-        return Err(format!("with {features:?} {} is on the volume and empty", only.name));
+        return Err(format!("with {params:?} {} is on the volume and empty", only.name));
     }
     eprintln!(
-        "  [clock] {features:?}: refused by name, {} carries {} bytes, boot complete",
+        "  [clock] {params:?}: refused by name, {} carries {} bytes, boot complete",
         only.name, only.len
     );
     Ok(())
@@ -444,9 +444,9 @@ fn no_century(
     // kernel that read a hardcoded 0x32 would pass. Staging the register at the
     // *next* century separates them: honouring the table gives 2033 and
     // ignoring it gives 2133.
-    const FEATURES: &[&str] = &["rtc-no-century", "rtc-century-next"];
+    const PARAMS: &[&str] = &["rtc-no-century", "rtc-century-next"];
     let (entries, log) =
-        boot_and_read(test_config, c_bins, rust_bins, "wall-clock-no-century.img", FEATURES, &[])?;
+        boot_and_read(test_config, c_bins, rust_bins, "wall-clock-no-century.img", PARAMS, &[])?;
     let logs = logs(&entries);
 
     if !log.contains("ACPI: the FADT names no RTC century register") {
@@ -485,9 +485,9 @@ fn century_from_the_register(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURES: &[&str] = &["rtc-century-next"];
+    const PARAMS: &[&str] = &["rtc-century-next"];
     let (entries, log) =
-        boot_and_read(test_config, c_bins, rust_bins, "wall-clock-century.img", FEATURES, &[])?;
+        boot_and_read(test_config, c_bins, rust_bins, "wall-clock-century.img", PARAMS, &[])?;
     let logs = logs(&entries);
 
     let [only] = logs.as_slice() else {

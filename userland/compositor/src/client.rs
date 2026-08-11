@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use toyos::shm::SharedMemory;
 use toyos::{ipc, Connection};
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use toyos_desktop::Window;
 
 /// Connections accepted but not yet identified by a first frame.
@@ -42,10 +42,10 @@ pub const MAX_KEPT_PAYLOAD: usize = 116;
 ///
 /// Two things meet here. `MSG_CLIPBOARD_SET_SHM` carries a length the client
 /// chooses and the compositor reads that many bytes out of a region the client
-/// granted, so an unbounded length is a read past the mapping — and the kernel
-/// rounds every shared region up to one 2 MiB page (`shared_memory::alloc`),
-/// which makes a page the largest length that cannot leave the smallest region
-/// anybody can grant. It is also policy: a clipboard is text somebody selected,
+/// sent, so an unbounded length is a read past the mapping — and the kernel
+/// rounds every shared region up to one 2 MiB page
+/// (`object::shm::SharedMemObject::create`), which makes a page the largest
+/// length that cannot leave the smallest region anybody can send. It is also policy: a clipboard is text somebody selected,
 /// and a megabyte of it is already generous.
 pub const MAX_CLIPBOARD_BYTES: usize = 2 * 1024 * 1024;
 
@@ -58,7 +58,6 @@ pub type ClientRx = ipc::FrameRx<MAX_KEPT_PAYLOAD>;
 /// never look at any of it.
 pub struct Client {
     pub conn: Connection,
-    pub pid: u32,
     pub shm: SharedMemory,
     pub rx: ClientRx,
 }
@@ -72,8 +71,7 @@ pub type Win = Window<Client>;
 /// `MSG_CREATE_WINDOW` keeps it, and every other message type answers on it
 /// and lets it close.
 pub struct ClientFrame {
-    pub fd: Fd,
-    pub pid: u32,
+    pub fd: RawHandle,
     pub msg_type: u32,
     payload: [u8; MAX_KEPT_PAYLOAD],
     payload_len: usize,
@@ -81,8 +79,8 @@ pub struct ClientFrame {
 }
 
 impl ClientFrame {
-    pub fn new(fd: Fd, pid: u32, msg_type: u32) -> Self {
-        Self { fd, pid, msg_type, payload: [0; MAX_KEPT_PAYLOAD], payload_len: 0, conn: None }
+    pub fn new(fd: RawHandle, msg_type: u32) -> Self {
+        Self { fd, msg_type, payload: [0; MAX_KEPT_PAYLOAD], payload_len: 0, conn: None }
     }
 
     pub fn set_payload(&mut self, bytes: &[u8]) {
@@ -102,17 +100,20 @@ impl ClientFrame {
 /// that connected and sent four bytes owned the desktop until it disconnected.
 pub struct PendingConn {
     pub conn: Connection,
-    pub pid: u32,
     pub rx: ClientRx,
     pub since: Instant,
 }
 
 /// Why a client is going.
 ///
-/// **Every one of these is printed with the pid.** A client is not entitled to
-/// end the compositor, but the compositor is not entitled to make one vanish
-/// without saying so either: the log is the only place the machine this runs
-/// on can be asked what happened.
+/// **Every one of these is printed, named by the connection's handle.** A
+/// client is not entitled to end the compositor, but the compositor is not
+/// entitled to make one vanish without saying so either: the log is the only
+/// place the machine this runs on can be asked what happened. The handle is
+/// this process's own slot for that connection, carrying a generation that a
+/// reissued slot does not repeat — so it names one client and designates
+/// nothing anywhere else. It used to be the pid the kernel reported at accept,
+/// which was a designation any process could present.
 #[derive(Clone, Copy)]
 pub enum DropReason {
     /// A frame no protocol here can produce. The next message boundary is
@@ -125,11 +126,6 @@ pub enum DropReason {
     Gone,
     /// Accepted, and never completed a first frame.
     HandshakeTimeout,
-    /// The kernel refused to give it memory because it no longer names a
-    /// process. Distinct from [`Gone`](Self::Gone): the connection is still
-    /// open and readable, and the compositor learns of the death only by
-    /// trying to hand the client something.
-    Vanished,
 }
 
 impl DropReason {
@@ -139,7 +135,6 @@ impl DropReason {
             Self::NotReading => "its pipe will not take another message and it is not reading",
             Self::Gone => "its connection is gone",
             Self::HandshakeTimeout => "it never finished its first message",
-            Self::Vanished => "the process behind it has exited",
         }
     }
 }
@@ -154,24 +149,24 @@ impl From<ipc::TrySendError> for DropReason {
 }
 
 /// A client the next removal pass will take out.
-pub type Dead = (Fd, u32, DropReason);
+pub type Dead = (RawHandle, DropReason);
 
-pub fn mark_dead(dead: &mut Vec<Dead>, fd: Fd, pid: u32, reason: DropReason) {
-    if !dead.iter().any(|(f, _, _)| *f == fd) {
-        dead.push((fd, pid, reason));
+pub fn mark_dead(dead: &mut Vec<Dead>, fd: RawHandle, reason: DropReason) {
+    if !dead.iter().any(|(f, _)| *f == fd) {
+        dead.push((fd, reason));
     }
 }
 
 pub fn announce(dead: &[Dead]) {
-    for (_, pid, reason) in dead {
-        eprintln!("compositor: dropping pid {pid} — {}", reason.why());
+    for (fd, reason) in dead {
+        eprintln!("compositor: dropping client {} — {}", fd.0, reason.why());
     }
 }
 
 /// Say that a window was deliberately closed, and by what.
 ///
-/// A client that *dies* is already announced — `dropping pid N — why` — and a
-/// window somebody closed was not, so the desktop's only record of one was the
+/// A client that *dies* is already announced — `dropping client N — why` — and
+/// a window somebody closed was not, so the desktop's only record of one was the
 /// `windows=N` count in the statistics line. That is a sample of a level taken
 /// every two seconds: two closes inside one interval are indistinguishable
 /// from one, and from none if a window opened in between. Every report the
@@ -179,8 +174,8 @@ pub fn announce(dead: &[Dead]) {
 /// which window went, why, and how many are left is the first thing anyone
 /// asks of the log — and a caller that re-sends a close because it could not
 /// tell whether the first one landed closes the next window down.
-pub fn note_closed(by: &str, pid: u32, remaining: usize) {
-    eprintln!("compositor: window closed pid={pid} by {by}, {remaining} left");
+pub fn note_closed(by: &str, client: RawHandle, remaining: usize) {
+    eprintln!("compositor: window closed client={} by {by}, {remaining} left", client.0);
 }
 
 /// Hand a window a typed frame, or mark it for removal.
@@ -190,13 +185,30 @@ pub fn note_closed(by: &str, pid: u32, remaining: usize) {
 /// which is the price of never blocking on it.
 pub fn deliver<T: ipc::IpcPayload>(dead: &mut Vec<Dead>, win: &Win, msg_type: u32, payload: &T) {
     if let Err(e) = win.client.conn.try_send(msg_type, payload) {
-        mark_dead(dead, win.client.conn.fd(), win.client.pid, e.into());
+        mark_dead(dead, win.client.conn.fd(), e.into());
+    }
+}
+
+/// [`deliver`] for a message whose payload names buffers that travel with it.
+///
+/// The handles are moved whether or not the frame lands, so the caller has
+/// already given them up — and a client dropped here drops the queue holding
+/// them, which is what releases the region.
+pub fn deliver_with_handles<T: ipc::IpcPayload>(
+    dead: &mut Vec<Dead>,
+    win: &Win,
+    handles: &[RawHandle],
+    msg_type: u32,
+    payload: &T,
+) {
+    if let Err(e) = win.client.conn.try_send_with_handles(handles, msg_type, payload) {
+        mark_dead(dead, win.client.conn.fd(), e.into());
     }
 }
 
 /// [`deliver`] for a message that is only its own header.
 pub fn deliver_signal(dead: &mut Vec<Dead>, win: &Win, msg_type: u32) {
     if let Err(e) = win.client.conn.try_signal(msg_type) {
-        mark_dead(dead, win.client.conn.fd(), win.client.pid, e.into());
+        mark_dead(dead, win.client.conn.fd(), e.into());
     }
 }

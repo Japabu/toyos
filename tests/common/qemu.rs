@@ -30,6 +30,45 @@ pub fn live_instances() -> u32 {
     LIVE.load(Ordering::SeqCst)
 }
 
+/// Guests this run has started, how many of them were not the shipping kernel,
+/// and every distinct kernel build it asked cargo for.
+///
+/// A registration is not a boot — several tests boot two machines and one boots
+/// four — so the count that decides whether a scheduling or build change worked
+/// cannot be read off the test lists. It was static analysis until now, and
+/// `specs/test-cost-audit.md` §6 records that as a lower bound.
+///
+/// **The third is the one this run is judged on.** A kernel build is ~6.9 s of
+/// wall clock and ~29.6 s of CPU after any edit to `kernel/` (§5.9.2), and
+/// until 2026-08-10 a full run made 45 of them. The set is what a run reports
+/// and what [`declared_kernel_builds`] refuses an addition to.
+static BOOTS: AtomicU32 = AtomicU32::new(0);
+static FEATURE_BOOTS: AtomicU32 = AtomicU32::new(0);
+static KERNELS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// `(boots, boots that were not the shipping kernel, the kernels built)`.
+pub fn boot_census() -> (u32, u32, Vec<String>) {
+    (
+        BOOTS.load(Ordering::Relaxed),
+        FEATURE_BOOTS.load(Ordering::Relaxed),
+        KERNELS.lock().expect("the kernel census").iter().cloned().collect(),
+    )
+}
+
+/// The kernel builds a run is allowed to make, and the whole list.
+///
+/// `""` is what an image ships. [`toyos_build::build::TEST_KERNEL`] is every
+/// actuator compiled in, armed by boot parameter. `fpu-save-nothing` is the one
+/// actuator that could not become a parameter — it takes the `fxsave64` out of
+/// `arch::entry`'s `naked_asm!` bracket, which is the path its own gate is
+/// about — and `specs/test-cost-audit.md` §5.9.7 is where that is argued.
+///
+/// A fourth entry is a decision to pay a kernel build per run forever, so it is
+/// made here and out loud rather than by adding a `kernel_features` to a
+/// `BootOptions`.
+pub const DECLARED_KERNEL_BUILDS: [&str; 3] = ["", "boot-actuators,test-actuators", "fpu-save-nothing"];
+
 /// How many guests the phase now running may have up at once.
 ///
 /// The harness's own wall-clock margins are margins on the *host*, and they were
@@ -1257,7 +1296,14 @@ pub struct BootOptions {
     /// Open a per-instance QMP socket, which `screendump` needs. Per-instance
     /// because screen tests boot their own QEMU and several may exist at once.
     pub qmp: bool,
+    /// Which of [`DECLARED_KERNEL_BUILDS`] this boot wants, and empty for the
+    /// kernel an image ships. Only a test whose subject *is* a build sets it —
+    /// `fpu-save-nothing`, and the `SYS_DEBUG` boot; everything else names an
+    /// actuator in [`BootOptions::kernel_params`] instead.
     pub kernel_features: &'static [&'static str],
+    /// The actuators this boot arms, by the names `kernel/src/actuator.rs`
+    /// declares. Non-empty selects the test kernel, which carries all of them.
+    pub kernel_params: &'static [&'static str],
     /// Give the machine an i8042 at all. `-machine q35,i8042=off` is the one
     /// absence scenario QEMU can stage.
     pub i8042: bool,
@@ -1326,6 +1372,7 @@ impl Default for BootOptions {
             profile: Profile::Headless,
             qmp: false,
             kernel_features: &[],
+            kernel_params: &[],
             i8042: true,
             mute: false,
             ready_marker: DEFAULT_READY,
@@ -1391,8 +1438,71 @@ pub fn build_boot_image(
     test_crate: &Path,
     c_tests: &[(String, Vec<u8>)],
     rust_tests: &[(String, Vec<u8>)],
-    kernel_features: &[&str],
+    kernel_params: &[&str],
 ) -> Vec<u8> {
+    let kernel: &[&str] =
+        if kernel_params.is_empty() { &[] } else { toyos_build::build::TEST_KERNEL };
+    build_boot_image_with(test_crate, c_tests, rust_tests, kernel, kernel_params)
+}
+
+/// Which of [`DECLARED_KERNEL_BUILDS`] this boot wants.
+///
+/// **A parameter never decides a build.** Every actuator lives in the one test
+/// kernel, so asking for one selects that kernel and nothing more; the third
+/// build is asked for by name and by one test.
+fn kernel_of(options: &BootOptions) -> Vec<&'static str> {
+    if options.kernel_params.is_empty() {
+        return options.kernel_features.to_vec();
+    }
+    assert!(
+        options.kernel_features.is_empty(),
+        "a boot asking to arm {:?} also asks for the kernel build {:?}; an actuator is a \
+         parameter and the test kernel carries all of them",
+        options.kernel_params,
+        options.kernel_features,
+    );
+    toyos_build::build::TEST_KERNEL.to_vec()
+}
+
+fn build_boot_image_with(
+    test_crate: &Path,
+    c_tests: &[(String, Vec<u8>)],
+    rust_tests: &[(String, Vec<u8>)],
+    kernel_features: &[&str],
+    kernel_params: &[&str],
+) -> Vec<u8> {
+    // **The two fields have the same type, so swapping them compiles.** It
+    // happened once, in this file's own conversion: the shared boot handed
+    // `["boot-actuators", "test-actuators"]` to `kernel_params` and every
+    // `SYS_DEBUG` test died with the kernel refusing `boot-actuators` as a
+    // parameter it does not declare. The kernel's refusal is what found it and
+    // it is the right refusal, but a name is a name on this side of the wire
+    // too, and the guest need not be started to know which kind it is.
+    static ACTUATORS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let actuators =
+        ACTUATORS.get_or_init(|| toyos_build::build::declared_actuators(&compile::repo_root()));
+    for name in kernel_params {
+        assert!(
+            actuators.iter().any(|a| a == name),
+            "{name:?} is a `kernel_params` and `kernel/src/actuator.rs` declares no such actuator"
+        );
+    }
+    for name in kernel_features {
+        assert!(
+            !actuators.iter().any(|a| a == name),
+            "{name:?} is an actuator and was passed as a `kernel_features`; it is a boot \
+             parameter, so it belongs in `kernel_params`"
+        );
+    }
+
+    let joined = kernel_features.join(",");
+    assert!(
+        DECLARED_KERNEL_BUILDS.contains(&joined.as_str()),
+        "this boot asks for the kernel build {joined:?}, which is not one of the {} a run may \
+         make: {DECLARED_KERNEL_BUILDS:?}",
+        DECLARED_KERNEL_BUILDS.len(),
+    );
+    KERNELS.lock().expect("the kernel census").insert(joined);
     let mut extra_files: Vec<(String, Vec<u8>)> = Vec::new();
     for (name, data) in c_tests {
         extra_files.push((format!("bin/test_c_{name}"), data.clone()));
@@ -1416,47 +1526,11 @@ pub fn build_boot_image(
     toyos_build::build::build_test_image(
         &compile::repo_root(),
         &config_path,
-        &fold_inert(kernel_features),
+        kernel_features,
+        kernel_params,
         quiet,
         &extra_files,
     )
-}
-
-/// Actuators that are a `SYS_DEBUG` action arm and nothing else.
-///
-/// A boot cannot reach any of them; only a test that asks for one by number
-/// can. So the kernels that differ only in which of them they carry are
-/// several builds of the same machine, and [`fold_inert`] makes them one.
-///
-/// **Membership is a claim about the kernel, not about the test that uses it**,
-/// and the claim is checkable: each name below has its `#[cfg]` sites in
-/// `arch/syscall.rs`'s `SYS_DEBUG` match and nowhere on any path a boot runs.
-/// A feature that changes what `init` does, what a driver reads, or what a
-/// ceiling is worth belongs in its own build and is not eligible.
-/// `specs/test-cost-audit.md` §5.4.3 classifies every one of them.
-///
-/// `test-tlb-ack-delay` is the one member whose code is not confined to the
-/// match arm: `arch::tlb::serve_ipi` loads one relaxed word per flush. Nothing
-/// writes that word except the arm, and its own gate re-measures with the delay
-/// disarmed, so a kernel carrying the feature and never asked flushes exactly as
-/// one without it. Stated rather than assumed, because the claim above is what
-/// makes folding sound.
-const INERT_ACTUATORS: &[&str] = &[
-    "test-fatal-halt",
-    "test-screen-graffiti",
-    "test-double-fault",
-    "test-heap-ceiling",
-    "test-kernel-canary",
-    "test-tlb-ack-delay",
-];
-
-/// The feature set to build, with every inert actuator replaced by the union of
-/// them. A test still names the actuator it needs — that is what its assertion
-/// is about — and the build system stops treating the name as a distinct kernel.
-fn fold_inert<'a>(requested: &[&'a str]) -> Vec<&'a str> {
-    let mut out: Vec<&'a str> = vec!["test-actuators"];
-    out.extend(requested.iter().copied().filter(|f| !INERT_ACTUATORS.contains(f)));
-    out
 }
 
 /// Build all binaries in a test crate.
@@ -1496,11 +1570,16 @@ impl QemuInstance {
         rust_tests: &[(String, Vec<u8>)],
         options: BootOptions,
     ) -> Self {
-        let mut features: Vec<&str> = options.kernel_features.to_vec();
+        let mut features: Vec<&str> = kernel_of(&options);
         if options.debug_wait {
             features.push("debug-wait");
         }
-        let disk = build_boot_image(test_crate, c_tests, rust_tests, &features);
+        BOOTS.fetch_add(1, Ordering::Relaxed);
+        if !features.is_empty() {
+            FEATURE_BOOTS.fetch_add(1, Ordering::Relaxed);
+        }
+        let disk =
+            build_boot_image_with(test_crate, c_tests, rust_tests, &features, options.kernel_params);
 
         let test_dir = super::lane::dir();
         let seq = BOOT_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -2714,7 +2793,14 @@ fn wait_for_ready(
     loop {
         if !no_timeout && start.elapsed() > boot_timeout {
             let _ = child.kill();
-            panic!("[qemu] Boot timed out waiting for {ready}");
+            // With what it did say. A timeout that discards the console is the
+            // one failure in this harness that arrives with no evidence at all,
+            // and "the guest printed nothing" and "the guest printed sixty
+            // lines and then stopped" are different machines.
+            panic!(
+                "[qemu] Boot timed out waiting for {ready}; the console carried:\n{}",
+                if seen.is_empty() { "nothing at all".to_string() } else { seen.clone() }
+            );
         }
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(line) if line.contains(ready) => {

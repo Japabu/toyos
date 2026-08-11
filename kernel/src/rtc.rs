@@ -168,7 +168,7 @@ fn read_registers(century_reg: Option<u8>) -> Result<Registers, RtcFault> {
 /// reads century 20 and year 01, and reports 2001 — so the host can set every
 /// digit of the date except this one.
 fn century_read(reg: u8) -> u8 {
-    if cfg!(feature = "rtc-century-next") { 0x21 } else { cmos_read(reg) }
+    if crate::actuator::rtc_century_next() { 0x21 } else { cmos_read(reg) }
 }
 
 fn wait_for_update() -> Result<(), RtcFault> {
@@ -253,42 +253,33 @@ fn port_read(reg: u8) -> u8 {
     cpu::inb(CMOS_DATA)
 }
 
-#[cfg(not(any(feature = "rtc-dead", feature = "rtc-unstable")))]
-fn cmos_read(reg: u8) -> u8 {
-    port_read(reg)
-}
-
-/// An RTC that is not there: every register reads `0xFF`, which is what an
-/// unclaimed x86 port answers and what an absent or wedged clock looks like
-/// from software. Bit 7 of that is [`UPDATE_IN_PROGRESS`], so this is also the
-/// only way to reach [`wait_for_update`]'s bound.
+/// What the *hardware* answers, and the one place either clock actuator
+/// replaces it. Everything downstream — the decoder, the matched-pair rule,
+/// [`wait_for_update`]'s bound — is shipped code reading whatever comes back.
 ///
-/// A kernel feature because nothing outside the guest can produce the state:
-/// QEMU has no switch that removes or wedges the mc146818, so a machine whose
-/// clock never answers cannot be built from the host.
-#[cfg(feature = "rtc-dead")]
-fn cmos_read(_reg: u8) -> u8 {
-    0xFF
-}
-
-/// A clock whose registers change under the reader: the seconds register
-/// answers a different valid BCD value every read, so no two reads of the set
-/// can agree. That is [`read`]'s matched-pair requirement seen from the failing
-/// side — what a torn read looks like when it never stops.
+/// `rtc-dead` is an RTC that is not there: every register reads `0xFF`, which
+/// is what an unclaimed x86 port answers and what an absent or wedged clock
+/// looks like from software. Bit 7 of that is [`UPDATE_IN_PROGRESS`], so it is
+/// also the only way to reach [`wait_for_update`]'s bound.
 ///
-/// A kernel feature for the same reason the one above is: QEMU's RTC presents a
-/// coherent register set to the guest at every instant, so a set that disagrees
-/// with itself cannot be staged from the host.
-#[cfg(feature = "rtc-unstable")]
+/// `rtc-unstable` is a clock whose registers change under the reader: the
+/// seconds register answers a different valid BCD value every read, so no two
+/// reads of the set can agree. That is [`read`]'s matched-pair requirement seen
+/// from the failing side — what a torn read looks like when it never stops.
+///
+/// Neither can be staged from the host: QEMU has no switch that removes or
+/// wedges the mc146818, and its RTC presents the guest a coherent register set
+/// at every instant.
 fn cmos_read(reg: u8) -> u8 {
-    use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
-    static TICK: AtomicU8 = AtomicU8::new(0);
-
-    if reg == SECONDS {
+    if crate::actuator::rtc_dead() {
+        return 0xFF;
+    }
+    if crate::actuator::rtc_unstable() && reg == SECONDS {
+        use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
+        static TICK: AtomicU8 = AtomicU8::new(0);
         // 0x01..=0x09, so every answer is a valid BCD second and what this
         // stages is `Unstable` rather than `NotADate`.
-        TICK.fetch_add(1, Relaxed) % 9 + 1
-    } else {
-        port_read(reg)
+        return TICK.fetch_add(1, Relaxed) % 9 + 1;
     }
+    port_read(reg)
 }

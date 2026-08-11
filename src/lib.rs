@@ -1,6 +1,7 @@
 pub mod assets;
 pub mod build;
 pub mod buildlock;
+pub mod ci;
 pub mod docs;
 pub mod durations;
 pub mod forkcheck;
@@ -8,6 +9,10 @@ pub mod image;
 pub mod libc;
 pub mod pr;
 pub mod soundfont;
+/// Nothing outside its own gates reads this, so it is not compiled into the
+/// build system at all.
+#[cfg(test)]
+pub mod sourcegate;
 pub mod stamps;
 pub mod testargs;
 pub mod toolchain;

@@ -8,18 +8,16 @@
 # kernel logged — including the one `i8042:` line that says why the integrated
 # keyboard is dead — was on screen for about a tenth of a second and then gone.
 #
-# The guarantee here is structural rather than a property of this list: the
-# compositor is the only process that claims the framebuffer, and it is not
-# built into this image at all. Nothing that *could* take the screen exists to
-# be started by accident.
+# `/bin/init` is in every image and holds the one `SysCap`, so the guarantee is
+# no longer "nothing here *can* claim the framebuffer" but "this config declares
+# no `devices`" — which `no_diag_program_claims_the_screen` checks before the
+# image is written, and which nothing checked before. The reachable set is the
+# same; a bug in init could reach a device where previously no code in the image
+# could, and that is the trade.
 #
-# The list cannot be empty — `kernel/src/main.rs` asserts the bootloader handed
-# it one, and a violated assert paints a panic report instead of a boot log — so
-# it is the least a program in this tree can do: print the cwd and exit. It used
-# to be the shipping list's own first entry, `locale --load`, which is gone with
-# the layout syscall; the shipping list now starts with the compositor, which is
-# the one process this image must not contain.
-init = ["/bin/toybox pwd"]
+# The one program it starts prints the cwd and exits.
+[boot]
+start = ["toybox"]
 
-[programs]
-toybox = {}
+[programs.toybox]
+args = ["pwd"]

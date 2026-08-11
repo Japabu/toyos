@@ -477,7 +477,7 @@ Two arms, and the test is worthless without both:
 - **Positive.** The same driver, the same page, the IOVA *mapped*. The frame's bytes
   appear in the guest's buffer, byte-exact against a seeded payload.
 
-The canary needs a kernel-feature actuator (`iommu-canary`): the harness must know
+The canary needs an actuator (`iommu-canary`): the harness must know
 which physical page an unmapped IOVA would resolve to if translation were bypassed,
 and only the kernel knows that. The actuator maps a canary page, reports its
 physical address, and hands the driver the numerically equal IOVA — deliberately
@@ -543,7 +543,7 @@ would never construct:
   hotplug does nothing today; PCIe hotplug is unimplemented; the honest answer may
   be a refusal, and the test is what makes that answer explicit.
 - **Reclaim racing a second claim** of the same device from another process.
-- **A malformed DMAR** — the parser is fed crafted tables by a kernel-feature
+- **A malformed DMAR** — the parser is fed crafted tables by an
   self-test, the way `xhci-xecp-selftest` feeds eight synthetic extended-capability
   lists (`specs/issues/hardware/`). Firmware is untrusted input.
 

@@ -5,6 +5,7 @@ extern crate std;
 
 pub mod audio;
 pub mod boot;
+pub mod handle;
 pub mod hda;
 pub mod input;
 pub mod io_uring;
@@ -13,8 +14,7 @@ pub mod ring;
 pub mod syscall;
 pub mod virtio_sound;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Fd(pub i32);
+pub use handle::{RawHandle, Rights, HANDLE_INVALID};
 
 /// A process ID. Identifies a process — owns address space, FDs, vruntime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -61,11 +61,16 @@ impl core::ops::Add for Tid {
 
 /// GPU framebuffer info passed between kernel and userland.
 /// Shared definition so both sides agree on the layout.
+///
+/// **The three handles are installed by the read that answers this.** A
+/// description is a set of buffers, and the process being told about them is
+/// the one that must be able to map them — which is never the process that
+/// minted the claim, because `/bin/init` mints every claim and holds none.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FramebufferInfo {
-    pub token: [u32; 2],
-    pub cursor_token: u32,
+    pub scanout: [RawHandle; 2],
+    pub cursor: RawHandle,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
@@ -81,6 +86,7 @@ impl FramebufferInfo {
     }
 }
 
-// SAFETY: FramebufferInfo is #[repr(C)] and contains only u32 fields — no padding, no pointers.
+// SAFETY: FramebufferInfo is #[repr(C)] and every field is a u32 or a
+// `repr(transparent)` wrapper over one — no padding, no pointers.
 unsafe impl Sync for FramebufferInfo {}
 unsafe impl Send for FramebufferInfo {}
