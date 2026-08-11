@@ -1,0 +1,101 @@
+name: qemu-probe
+
+# The other half of `probe-input.yml`. That one holds QEMU at `ubuntu-24.04`'s
+# 8.2.2 and moves the accelerator; this one holds the runner and moves QEMU to
+# **11.0.3, the dev host's exact version**, which `debian:sid` ships (measured,
+# run `31245897225`: trixie 10.0.11, sid 11.0.3, ubuntu:25.10 10.1.0,
+# ubuntu:24.04 8.2.2). Between them the two probes are a 2x2.
+#
+# A container changes less than it looks like it does: the firmware is `ovmf/`
+# in this repository on every host, the boot image is built here, and the host
+# CPU is the same Azure vCPU. What differs is the QEMU binary and the libraries
+# under it.
+#
+# The container runs as root, which is how the KVM arm opens a `crw-rw---- root:
+# kvm` node with no chmod — and how the TCG arm is the *absence* of the device
+# rather than a flag: `kvm_usable` opens `/dev/kvm` and there is nothing else in
+# the tree to branch on.
+
+on:
+  push:
+    branches: ['ci/probe-qemu']
+  workflow_dispatch:
+
+jobs:
+  sid:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - accel: kvm
+            opts: --device=/dev/kvm
+          - accel: tcg
+            opts: --name probe-tcg
+    container:
+      image: debian:sid
+      options: ${{ matrix.opts }}
+    steps:
+      # Before the checkout, because `actions/checkout` wants git and this image
+      # has none.
+      - name: deps
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+            git curl ca-certificates jq zstd xz-utils build-essential \
+            qemu-system-x86 > /dev/null
+          qemu-system-x86_64 --version | head -1
+          ls -l /dev/kvm || echo "no /dev/kvm node: this is the TCG arm"
+          grep -m1 'model name' /proc/cpuinfo
+          nproc
+
+      - uses: actions/checkout@v4
+
+      - name: rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # No `gh` in this image, so the same release is fetched through the API.
+      - name: install the toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
+          echo "toolchain: $tag"
+          api=https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag
+          for _ in $(seq 90); do
+            asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
+              | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
+            [ -n "$asset" ] && break
+            echo "waiting for the toolchain workflow to publish $tag ..."
+            sleep 60
+          done
+          test -n "$asset"
+          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst
+          mkdir -p rust/build
+          zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
+          rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+
+      - name: one test at a time
+        run: |
+          red=
+          green=
+          for t in abuse_gpu_resolution i8042_keyboard i8042_mouse \
+                   i8042_fadt_denial metal_sim_pointer_churn xhci_hotplug \
+                   xhci_flap desktop_typing_damage; do
+            echo "::group::$t (qemu 11, ${{ matrix.accel }})"
+            if cargo test --test toyos-build -- --jobs 1 --host-slots 0 "$t"; then
+              green="$green $t"
+            else
+              red="$red $t"
+            fi
+            echo "::endgroup::"
+          done
+          echo "PROBE-SUMMARY qemu11-${{ matrix.accel }} GREEN:$green"
+          echo "PROBE-SUMMARY qemu11-${{ matrix.accel }} RED:$red"

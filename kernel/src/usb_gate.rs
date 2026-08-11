@@ -144,8 +144,8 @@ fn check(index: usize, disk: &mut usb_storage::UsbBlockDevice) {
     // the guest's idea of them. The block read into that window immediately
     // before this one is a different LBA, which is what a caller is handed when
     // the two accounts disagree and only the device's is kept.
-    #[cfg(feature = "usb-short-read")]
-    {
+    #[cfg(feature = "boot-actuators")]
+    if crate::actuator::usb_short_read() {
         let block = at(blocks, HOST_BLOCKS[0]);
         buf.fill(0);
         crate::drivers::xhci::arm_short_read();

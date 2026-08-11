@@ -59,7 +59,6 @@ pub struct Hda {
 /// prints before falling back to the null sink — "no sound" without which of
 /// these it was is a report nobody can act on.
 pub enum Refusal {
-    NoDevice(SyscallError),
     /// The kernel's answers stopped making sense, which is a bug here or there
     /// and never a property of the machine.
     Kernel(SyscallError),
@@ -75,7 +74,6 @@ pub enum Refusal {
 impl core::fmt::Display for Refusal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::NoDevice(e) => write!(f, "no HDA controller the kernel bound ({e})"),
             Self::Kernel(e) => write!(f, "the kernel refused a call this driver has to make ({e})"),
             Self::NoCodec => write!(f, "no codec STATESTS named answered a verb"),
             Self::NoOutput(PathError::NoOutputPin { codecs }) => {
@@ -107,9 +105,12 @@ impl core::fmt::Display for Refusal {
 }
 
 impl Hda {
-    /// Claim the controller, walk its codecs, choose an output and configure it.
-    pub fn claim() -> Result<(Self, OutputPath, u8), Refusal> {
-        let dev = HdaDev::open().map_err(Refusal::NoDevice)?;
+    /// Walk the controller's codecs, choose an output and configure it.
+    ///
+    /// The claim is the argument: `/bin/init` minted it and endowed it, so
+    /// "does this machine have an HDA?" was already answered before soundd's
+    /// first instruction.
+    pub fn claim(dev: HdaDev) -> Result<(Self, OutputPath, u8), Refusal> {
         let info = dev.info().map_err(Refusal::Kernel)?;
         let mut hda = Hda { dev, info, running: false };
 
@@ -118,7 +119,7 @@ impl Hda {
         for entry in found {
             match entry {
                 Ok(codec) => {
-                    eprintln!(
+                    say!(
                         "soundd: hda codec{} vendor={:04x} device={:04x}, {} function group(s)",
                         codec.address,
                         codec.vendor,
@@ -128,7 +129,7 @@ impl Hda {
                     codecs.push(codec);
                 }
                 Err((address, fault)) => {
-                    eprintln!("soundd: hda codec{address} answered nothing usable ({fault:?})")
+                    say!("soundd: hda codec{address} answered nothing usable ({fault:?})")
                 }
             }
         }
@@ -138,7 +139,7 @@ impl Hda {
 
         let path = toyos_hda::find_output_path(&codecs).map_err(Refusal::NoOutput)?;
         let (format, channels) = config::format(&codecs, &path).ok_or(Refusal::Rate)?;
-        eprintln!(
+        say!(
             "soundd: hda codec{} group {:#04x} converter {:#04x} -> pin {:#04x} ({}), \
              headphone {}, format {:#06x} ({} Hz {} ch {}-bit)",
             path.codec,
@@ -169,7 +170,7 @@ impl Hda {
         hda.write(SD_CTL_TAG, RegWidth::U8, (info.stream_tag as u32) << 4)
             .map_err(Refusal::Kernel)?;
         hda.write(SD_FMT, RegWidth::U16, format as u32).map_err(Refusal::Kernel)?;
-        eprintln!("soundd: hda path configured in {sent} verbs, stream tag {}", info.stream_tag);
+        say!("soundd: hda path configured in {sent} verbs, stream tag {}", info.stream_tag);
         Ok((hda, path, channels))
     }
 

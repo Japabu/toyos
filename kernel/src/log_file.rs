@@ -119,7 +119,7 @@ const UNDATED_STEM: &str = "unknown";
 /// Sixteen boots of history, which is the number that makes "it broke after the
 /// firmware update" answerable by looking. Against the volume: `create_log_volume`
 /// makes the smallest volume there is a FAT32 for and `fsck_msdos` reports
-/// 35,098,112 free bytes on a fresh one, so sixteen files at [`MAX_LOG_BYTES`]
+/// 35,098,112 free bytes on a fresh one, so sixteen files at [`max_log_bytes`]
 /// is 16 MiB — under half, with the rest left for anything a later diagnostic
 /// wants to drop beside them. In practice a whole metal-sim boot's log measured
 /// 7,910 bytes, so sixteen of them are about 128 KiB.
@@ -130,7 +130,7 @@ const MAX_LOG_FILES: usize = 16;
 
 /// How many continuation files one boot may produce before the sink gives up.
 ///
-/// A boot that fills [`MAX_LOG_BYTES`] carries on in `<stem>_0002.log` rather
+/// A boot that fills [`max_log_bytes`] carries on in `<stem>_0002.log` rather
 /// than dropping either end of its own log, and [`MAX_LOG_FILES`] deletes this
 /// boot's earlier parts as it goes. The bound exists because the part number is
 /// four digits wide and a fifth would sort before the fourth, putting retention
@@ -152,11 +152,13 @@ const MAX_LOG_PARTS: u32 = 9999;
 /// wait, and the code it drives is the shipped code — only the bound moves. 256
 /// bytes, so that one boot's own log crosses it many times over and drives both
 /// the continuation and the retention path.
-const MAX_LOG_BYTES: u64 = if cfg!(feature = "log-rotate-fast") {
-    256
-} else {
-    1024 * 1024
-};
+fn max_log_bytes() -> u64 {
+    if crate::actuator::log_rotate_fast() {
+        256
+    } else {
+        1024 * 1024
+    }
+}
 
 /// Bytes moved per pass of the drain loop, and the size of the stack buffer it
 /// goes through.
@@ -170,7 +172,8 @@ const CHUNK: usize = 512;
 /// How long the VFS lock may stay held before the sink gives up on it.
 ///
 /// It bounds the one case that never clears — a thread that panicked holding
-/// the VFS lock, which known issues records as live. Without it the ring would
+/// the VFS lock, which `specs/issues/panic-path/panic-holding-process-table-hangs.md`
+/// records as live. Without it the ring would
 /// report bytes pending forever and the idle loop, which declines to sleep on
 /// that, would spin a CPU with nothing to do about it.
 ///
@@ -380,7 +383,7 @@ impl Sink {
         // is not optional and is per batch rather than per line.
         vfs.sync_mount(MOUNT).map_err(|e| ("the volume sync", e))?;
 
-        if self.size >= MAX_LOG_BYTES {
+        if self.size >= max_log_bytes() {
             self.continue_in_next_part(vfs).map_err(|e| ("the rotation", e))?;
         }
         Ok(())

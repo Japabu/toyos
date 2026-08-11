@@ -12,8 +12,7 @@ use toyos_abi::syscall::{self, SyscallError};
 const DEPTH: u32 = 8;
 
 fn main() {
-    let (ring_fd, shm_token) = syscall::io_uring_setup(DEPTH).expect("io_uring_setup");
-    let base = unsafe { syscall::try_map_shared(shm_token) }.expect("map_shared");
+    let (ring_fd, base) = unsafe { syscall::io_uring_setup(DEPTH) }.expect("io_uring_setup");
     let sq = unsafe { &*(base.add(SQ_RING_OFF as usize) as *const IoUringRingHeader) };
 
     // 4 million entries claimed in an 8-entry ring: 160 MB of IoUringSqe.

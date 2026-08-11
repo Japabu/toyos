@@ -261,60 +261,98 @@ pub fn init_timer() {
     TIMER_TICKS.store(ticks_10ms, Ordering::Release);
     // Fallback for any Ring 0 fire before the scheduler arms its first quantum.
     let percpu = unsafe { &*percpu::percpu_ptr() };
-    percpu.last_armed_ticks.store(ticks_10ms, Ordering::Relaxed);
+    percpu.last_armed_ticks.store(OneShot::ticks(ticks_10ms as u64).0, Ordering::Relaxed);
     log!("LAPIC timer: {} ticks/10ms", ticks_10ms);
 }
 
 /// AP timer init — calibration was done on the BSP, nothing to start.
 pub fn init_timer_ap() {}
 
-/// Arm a one-shot timer to fire after `nanos` nanoseconds.
+/// The shortest interval this kernel will ask the one-shot for, and therefore
+/// the resolution of every deadline in the system.
+///
+/// **A CPU that takes the timer interrupt again before it can retire the
+/// instruction after the one that armed it never retires anything again.** The
+/// Ring 0 stub reloads whatever was last armed with no Rust in the path, so a
+/// count too small to outlast the interrupt it schedules is not one late tick
+/// but a livelock nothing recomputes its way out of. Ring 3 can ask for one — a
+/// deadline already past when the pass arms it — and did (`#156`,
+/// `specs/metal-logs/2026-08-08-cpu0/`).
+///
+/// Policy, not physics, and it sits between two bounds. Below: an interrupt
+/// entry and `iretq`, which is what the interval has to be worth more than for
+/// the interrupted code to get any of the CPU at all. Above: `QUANTUM_NS`,
+/// which this is a thousandth of, so no scheduling decision can feel it.
+const MIN_ONE_SHOT_NS: u64 = 10_000;
+
+/// A count the CPU can make progress under, and the only thing that reaches
+/// `X2APIC_TIMER_INIT` or `last_armed_ticks`.
+///
+/// The floor is in the constructor rather than at the three call sites because
+/// the assembly stub reloads the remembered count with no Rust in the path: an
+/// arm that could not be survived is a state this module has to be unable to
+/// name, not one each caller has to remember not to ask for.
+struct OneShot(u32);
+
+impl OneShot {
+    fn ticks(ticks: u64) -> Self {
+        let per_10ms = TIMER_TICKS.load(Ordering::Relaxed) as u64;
+        let floor = (MIN_ONE_SHOT_NS * per_10ms / 10_000_000).max(1);
+        // Zero is the register's "stopped", so it is `stop_timer`'s word and
+        // never a count — `min` alone would let a calibration this small write
+        // it. `u32::MAX` is the register.
+        Self(ticks.clamp(floor, u32::MAX as u64) as u32)
+    }
+
+    fn after(nanos: u64) -> Self {
+        let per_10ms = TIMER_TICKS.load(Ordering::Relaxed) as u128;
+        Self::ticks((nanos as u128 * per_10ms / 10_000_000) as u64)
+    }
+
+    /// Program it, and remember it for the Ring 0 stub's reload.
+    fn arm(self) {
+        cpu::wrmsr(X2APIC_TIMER_DIVIDE, 0b1011);
+        // An AP reaches its first idle before it has ever run a task, so before
+        // this register has ever been written — and an LVT resets masked.
+        cpu::wrmsr(X2APIC_LVT_TIMER, TIMER_VECTOR as u64);
+        let percpu = unsafe { &*percpu::percpu_ptr() };
+        percpu.last_armed_ticks.store(self.0, Ordering::Relaxed);
+        cpu::wrmsr(X2APIC_TIMER_INIT, self.0 as u64);
+    }
+}
+
+/// Arm a one-shot timer to fire after `nanos` nanoseconds, or after
+/// [`MIN_ONE_SHOT_NS`] if that is longer.
 pub fn arm_one_shot(nanos: u64) {
-    let ticks_10ms = TIMER_TICKS.load(Ordering::Relaxed) as u64;
-    let ticks = (nanos as u128 * ticks_10ms as u128 / 10_000_000) as u64;
-    let ticks = ticks.clamp(1, u32::MAX as u64) as u32;
-    cpu::wrmsr(X2APIC_TIMER_DIVIDE, 0b1011);
-    cpu::wrmsr(X2APIC_LVT_TIMER, TIMER_VECTOR as u64);
-    let percpu = unsafe { &*percpu::percpu_ptr() };
-    percpu.last_armed_ticks.store(ticks, Ordering::Relaxed);
-    cpu::wrmsr(X2APIC_TIMER_INIT, ticks as u64);
+    OneShot::after(nanos).arm();
     crate::trace::trace(crate::trace::Kind::TimerArm, nanos as u32);
 }
 
 /// Shorten this CPU's armed interval to at most `nanos`, arming it if the last
 /// pass left it stopped.
 ///
-/// The minimum against what is already armed is what keeps this a pure
-/// addition: a parked task's deadline is never pushed out, and all the
-/// scheduler ever sees is extra passes — which it already tolerates, since a
-/// kick IPI is one.
-///
-/// `last_armed_ticks` is written too, so the reload the timer stub does in
-/// assembly before any Rust runs carries the cap forward. That is what stops
-/// the tick depending on the code it exists to watch: one fire arms the next,
-/// and the chain breaks only where a CPU stops taking interrupts.
+/// The minimum against what is already armed is what keeps this close to a pure
+/// addition: a parked task's deadline is never pushed out by more than
+/// [`MIN_ONE_SHOT_NS`], and all the scheduler ever sees is extra passes — which
+/// it already tolerates, since a kick IPI is one.
 ///
 /// Traces nothing, unlike [`arm_one_shot`]: no scheduler deadline is being set
 /// here, and a `TimerArm` record would make the trace say one was.
-#[cfg(feature = "diag-tick")]
+#[cfg(feature = "boot-actuators")]
 pub fn arm_within(nanos: u64) {
-    let ticks_10ms = TIMER_TICKS.load(Ordering::Relaxed) as u64;
-    let ticks = (nanos as u128 * ticks_10ms as u128 / 10_000_000) as u64;
-    let ticks = ticks.clamp(1, u32::MAX as u64) as u32;
+    let want = OneShot::after(nanos);
     // A running count never reaches zero without the fire that reloads it, so
     // zero is `stop_timer` and not an expiry an instant away.
     let remaining = cpu::rdmsr(X2APIC_TIMER_CURRENT) as u32;
-    let ticks = if remaining == 0 { ticks } else { ticks.min(remaining) };
-    cpu::wrmsr(X2APIC_TIMER_DIVIDE, 0b1011);
-    // An AP reaches its first idle before it has ever run a task, so before
-    // `arm_one_shot` has ever written this register — and an LVT resets masked.
-    cpu::wrmsr(X2APIC_LVT_TIMER, TIMER_VECTOR as u64);
-    let percpu = unsafe { &*percpu::percpu_ptr() };
-    percpu.last_armed_ticks.store(ticks, Ordering::Relaxed);
-    cpu::wrmsr(X2APIC_TIMER_INIT, ticks as u64);
+    let ticks = if remaining == 0 { want.0 } else { want.0.min(remaining) };
+    OneShot::ticks(ticks as u64).arm();
 }
 
 /// Stop the timer. No more interrupts until re-armed.
+///
+/// Zero in both places, which is the hardware's word for a stopped counter and
+/// the Ring 0 stub's for "do not re-arm" — the one count that is not a
+/// [`OneShot`], because it is not an interval.
 pub fn stop_timer() {
     let percpu = unsafe { &*percpu::percpu_ptr() };
     percpu.last_armed_ticks.store(0, Ordering::Relaxed);

@@ -79,6 +79,22 @@ pub fn nanos_since_boot() -> u64 {
     ((delta as u128 * period_fs as u128) / 1_000_000) as u64
 }
 
+/// A [`cpu::rdtsc`] value `nanos` in the future, for a wait whose loop may not
+/// call anything.
+///
+/// [`nanos_since_boot`]'s 128-bit divide is `__udivti3`, an out-of-line call in
+/// `compiler_builtins`, so a spin that reads the clock every iteration spends a
+/// large fraction of its time at an address that is not in the spinning
+/// function. That is invisible to everything except an instrument that samples
+/// the instruction pointer — and `sched::dump`'s NMI probe is exactly one:
+/// `dump_nmi_probe` reported `u128_div_rem+0x99` for a CPU that was in the deaf
+/// window all along, on `main`'s CI run `31280877870` and twice more.
+pub fn tsc_deadline(nanos: u64) -> u64 {
+    let period_fs = TSC_PERIOD_FS.load(Relaxed);
+    let ticks = (nanos as u128 * 1_000_000) / period_fs.max(1) as u128;
+    cpu::rdtsc().saturating_add(ticks as u64)
+}
+
 /// Unix seconds, in the machine's own zone, at `nanos_since_boot() == 0`.
 static BOOT_LOCAL_SECS: AtomicU64 = AtomicU64::new(0);
 /// Seconds to add to the machine's own zone to get UTC — firmware's
@@ -102,7 +118,7 @@ pub fn init_wall(century_reg: Option<u8>, utc_offset_minutes: Option<i32>) {
     // the sign that matters: UEFI's relation is `Localtime = UTC - TimeZone`,
     // so UTC+2 reports -120 and UTC is *behind* what the RTC reads.
     let utc_offset_minutes =
-        if cfg!(feature = "rtc-zone-east") { Some(-120) } else { utc_offset_minutes };
+        if crate::actuator::rtc_zone_east() { Some(-120) } else { utc_offset_minutes };
 
     let civil = match crate::rtc::read(century_reg) {
         Ok(civil) => civil,

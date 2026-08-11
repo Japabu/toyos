@@ -256,7 +256,7 @@ ToyOS's audio contract is `{mask, timestamp}` and not a sample position. That
 deletes the whole of the `position_fix` family from scope, and it is worth
 stating as a design property rather than an accident.
 
-**What zero-on-complete does not buy, found on the T14 (known-issues §4).** It
+**What zero-on-complete does not buy, found on the T14 (`specs/issues/audio/`).** It
 makes an unfilled period *sound* the same on both backends. It does not make one
 *mean* the same, and soundd's free list was written for the meaning virtio has:
 a period soundd has not submitted is a period the device does not have. Here the
@@ -935,7 +935,7 @@ throughout.
 
 | Stage | Content | Size (est.) | Gate |
 |---|---|---|---|
-| **H0** | **Feasibility, on metal. No driver.** A kernel diagnostic behind a feature flag, present only in the diagnostic image, deleted at H9. It carries the comment `specs/device-test-strategy.md` requires of a kernel-feature actuator, and the reason nothing else can reach it is exact: **there is no way for a userland process to touch a codec before the capability of §4 exists, and the questions it answers are the ones that decide whether that capability will ever be given this device.** Two halves on one boot. **(a) Handoff**, for `00:1f.3`: its DMAR device scope, whether its isolation scope is a singleton given four sibling functions (§7 risk 1), whether it carries an RMRR, whether it offers MSI or MSI-X and how many vectors, BAR0's size/width/prefetchability and whether a 2 MiB relocation target exists, and the unit's `ECAP.SC` (§4.4 item 4). **(b) Codec**, using the immediate-command registers so it needs no DMA and no capability: release `GCTL.CRST`, read `GCAP`/`VMIN`/`VMAJ` and `STATESTS`, and for every codec present dump vendor and device id, every function group, every widget's capabilities and every pin's configuration default. Plus: log every i8042 scancode sequence that decodes to no key, and press the three volume keys. | ~120 + ~250 lines kernel | The log carries a named line per item, read off the panel and off `/log/kernel.log`. **If the isolation scope or an RMRR refuses the device, or `STATESTS` reads zero, this track stops here and is re-decided.** |
+| **H0** | **Feasibility, on metal. No driver.** A kernel diagnostic behind a boot parameter, armed only in the diagnostic image, deleted at H9. It carries the comment `specs/device-test-strategy.md` requires of an actuator, and the reason nothing else can reach it is exact: **there is no way for a userland process to touch a codec before the capability of §4 exists, and the questions it answers are the ones that decide whether that capability will ever be given this device.** Two halves on one boot. **(a) Handoff**, for `00:1f.3`: its DMAR device scope, whether its isolation scope is a singleton given four sibling functions (§7 risk 1), whether it carries an RMRR, whether it offers MSI or MSI-X and how many vectors, BAR0's size/width/prefetchability and whether a 2 MiB relocation target exists, and the unit's `ECAP.SC` (§4.4 item 4). **(b) Codec**, using the immediate-command registers so it needs no DMA and no capability: release `GCTL.CRST`, read `GCAP`/`VMIN`/`VMAJ` and `STATESTS`, and for every codec present dump vendor and device id, every function group, every widget's capabilities and every pin's configuration default. Plus: log every i8042 scancode sequence that decodes to no key, and press the three volume keys. | ~120 + ~250 lines kernel | The log carries a named line per item, read off the panel and off `/log/kernel.log`. **If the isolation scope or an RMRR refuses the device, or `STATESTS` reads zero, this track stops here and is re-decided.** |
 | **H1** | **DONE — `toyos-hda`, the host-tested core.** Verb encode/decode, the graph model, `find_output_path`, `SDnFMT` encoding, BDL construction. No I/O. | ~1,500 lines Rust | `cargo test` in-crate, against three fixtures including **H0's dump of the T14's own codec**. §5.2's state-space attacks, each with teeth: deleting the cycle check must red the cyclic fixture, and deleting the speaker-pin preference must red the two-codec one. |
 | **H2** | **The stub's capability.** Rewritten under §4.1's decision: I3 and I4 are **not** in it and `userspace-drivers-spec.md` stage 3 is not either (§4.2). What lands is the four syscalls of §4.4 item 1 plus `SYS_DEVICE_REG_WRITE` (item 1b), `CachePolicy::Uncacheable`, a `writable` field on `SharedRegion`, and the claim-time 2 MiB-neighbour refusal of §4.1.4. **Proposes that the capability be staged against a second `intel-hda` rather than a second `virtio-net-pci`** (§4.2). | ~600 lines kernel (est.) | The refusals, each by name: a write off the allow-list, a write of an address register, a claim whose BAR shares its page. Teeth: deleting the allow-list check must red the first two. |
 | **H3** | **DONE, and §6.7 is what it actually built.** soundd drives virtio-sound from userland through the same stub HDA got: descriptor tables kernel-only, avail rings and every buffer in the region the driver maps. Deleted: `audio.rs`, `SYS_AUDIO_SUBMIT`, `SYS_AUDIO_POLL`, `DEVICE_AUDIO`, `AudioInfo`. **Not** deleted, and §6.7 says why each: `virtio_sound.rs` (it is the stub now), `AudioCompletionRecord`, vector `0x23`. Closes `userspace-drivers-spec.md` stage 7. | ~1,000 lines Rust moved, 285 lines of kernel deleted | **Gate A's thorough tier, `cargo test --test toyos-build -- --audio-gate 30`, same-session A/B against the pre-stage tree.** Same rule as a scheduler-migration transition and for the same reason. ~~This is the stage that can revert the direction, and it is deliberately before HDA exists.~~ **Spent** — H4 landed first (§6.7). |
@@ -945,7 +945,7 @@ throughout.
 | **H7** | **Master volume and mute.** A gain on soundd's mix bus, §4.4 item 6's three messages, the existing ramp machinery, and `toybox audio` to read and set it. | ~400 lines Rust | **Harness, with real teeth**: a guest test sets master to 0.5 and the wav capture's amplitude halves; sets mute and the capture goes silent; neither transition fires the click detector. |
 | **H8** | **The volume keys.** Three `SET1_E0` entries in `toyos-ps2` — Keyboard/Keypad-page Mute, Volume Up and Volume Down usages, against what H0 observed the EC actually sends — and the surface owners consuming those three usages instead of forwarding them (§6.1). | ~150 lines Rust | Harness: QMP injects the scancodes and a guest test asserts soundd's master state moved and the capture followed. Metal: the owner presses F1/F2/F3. |
 | **H9** | **Persistence, and H0's probe deleted.** Master volume and mute survive a reboot. **Blocked** — §6.2. | ~200 lines Rust | Reboot in the harness and read the value back; on metal, only once there is a volume to write to. |
-| **H10** | **The end condition.** `userspace-drivers-spec.md` §7.5's checks pass for audio; CLAUDE.md's architecture and `metal-hardware-inventory.md`'s undriven list updated; `known-issues.md` entries closed. | — | Those commands |
+| **H10** | **The end condition.** `userspace-drivers-spec.md` §7.5's checks pass for audio; CLAUDE.md's architecture and `metal-hardware-inventory.md`'s undriven list updated; `specs/issues/` entries closed. | — | Those commands |
 
 H0 and H1 are independent of everything else and of each other, and H0 is a
 diagnostic on a boot the owner is doing anyway. **H0 should be run early and
@@ -1008,10 +1008,10 @@ and requires no `hda:` line at all, which is the only assertion that binds
 #### Running it on the T14
 
 ```
-cargo run -- --diag-boot --kernel-feature hda-probe --build-only
+cargo run -- --diag-boot --kernel-param hda-probe --build-only
 ```
 
-→ `target/bootable-diag.img`. **`--kernel-feature` is orthogonal to the boot
+→ `target/bootable-diag.img`. **`--kernel-param` is orthogonal to the boot
 mode on purpose.** Attaching a feature list to `Boot::Diag` was the other way to
 reach this image, and it would have made the diagnostic kernel permanently a
 different build from the shipping one — which is the guarantee that mode exists
@@ -1212,6 +1212,14 @@ file had only argued:
    48 kHz at 16/20/24-bit; QEMU's offers 16 k–96 k at 16-bit. Both do 44.1 kHz
    S16, so **§5.3 item 2's per-config physical scale is not needed** and gate
    A's existing constants serve both backends.
+
+   **And asking for it is not the same as getting it.** `stream_format` put the
+   sample-base bit at 13, where the field's multiplier is, so H4 asked both
+   machines for 44.1 kHz with `0x2011` — a 48 kHz base carrying a reserved
+   multiplier — and both played 48 kHz. Every buffer was correct and the whole
+   pipeline ran 8.8% fast. Closed 2026-08-08; the evidence, the two gates and
+   what it had been hiding in the `hda_tone` capture are in
+   `specs/issues/audio/` and `specs/metal-logs/2026-08-08-audio-underruns/`.
 6. **Association is the codec's own statement** that the speaker and the jack
    are one output: both association 1, the jack last by sequence.
 7. **QEMU has no speaker pin, so §2.3's rule is widened. Decided 2026-08-06.**
@@ -1265,7 +1273,7 @@ What is built:
   up from 64.
 - **The instrument §5.3 item 5 asked for**: `audio::phase_breaks`, which reads 0
   on all four recorded virtio configs and 8–16 on the HDA arm. That is
-  `known-issues.md` §4's declared red and the largest open thing in this track.
+  `specs/issues/audio/`'s declared red and the largest open thing in this track.
 
 What is **not** built, and is H4's own gate as §5.3 states it: the four new
 `tests/audio-baseline.toml` sections. Recording them is 30 invocations of four
@@ -1349,7 +1357,7 @@ gone is the cheap exit.
 
 **And the gate did not price it, because the instrument was down.** The A arm —
 `main`, no delta — failed the thorough tier on its own at 10 dropouts in 120 runs
-against a recorded 0/120, which is `known-issues.md` §4's new entry and the rate
+against a recorded 0/120, which is `specs/issues/audio/`'s new entry and the rate
 that section had been asking for. Both B-arm attempts then stopped at iterations
 2 and 4 on a kernel double-panic in the TLB shootdown work that landed between
 the arms (§3). So **risk 3 remains unmeasured**, and the accounting above — one
@@ -1444,7 +1452,7 @@ Each with what settles it, and how early.
    backends and remains a design promise. What it does not cover is the free
    list's *meaning*, and that is where the T14 killed soundd: three mix-loop
    rules assumed a period soundd holds is one the device does not have
-   (known-issues §4). Gate A saw none of it — its clients keep their rings full
+   (`specs/issues/audio/`). Gate A saw none of it — its clients keep their rings full
    — so the gate is `hda_client_stall`, whose actuator is a client that stops.
    §5.3 item 5's phase check is built and is separately red (#88).
 8. **CLOSED — QEMU's codec may not offer 44,100 Hz.** It does, at 16-bit, and so
@@ -1508,7 +1516,7 @@ Each with what settles it, and how early.
 11. **Master-volume access control.** There is no mechanism today by which
     soundd can tell an authorized volume client from any other process — service
     names are not gated. H7 ships it open and files that, which is the same hole
-    `SYS_OPEN_DEVICE`'s first-come claim already has (`known-issues.md` §1).
+    `SYS_OPEN_DEVICE`'s first-come claim already has (`specs/issues/isolation/`).
     Closing it is `capability-handles-spec.md`'s work.
 12. **A codec amplifier as the master volume control.** §9.
 13. **Mapping any BAR writable into userland**, on this device or any other.

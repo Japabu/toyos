@@ -1,0 +1,111 @@
+Licences and provenance of the C test corpus
+============================================
+
+`tinycc/` and `pp_tcc/` are the inputs `toyos-cc` is tested against. Most of
+them are not ours. This file says which, and carries the notices that have to
+travel with them; it is the attribution the corpus was missing until
+2026-08-08.
+
+They are *data* — source files a compiler under test reads and a guest then
+runs — and nothing here is linked into ToyOS. That is why an LGPL-2.1 corpus
+does not put its terms on this repository's own MIT OR Apache-2.0 code. It is
+not why they may be carried unattributed, which is a separate obligation and
+the one this file discharges.
+
+
+What is whose
+-------------
+
+Established by content, not by memory: every file was compared byte for byte
+against tinycc upstream at 64552b3faa39ee7948a9ea21bfcc11045b90c70d
+(repo.or.cz/tinycc.git, 2026-08-05), allowing for the `-` → `_` renames this
+project made to some filenames.
+
+  tinycc/    312 files: 239 byte-identical to tinycc's `tests/tests2`,
+                        17 tinycc files this project modified,
+                        56 not upstream at all — 55 cases written here, plus
+                        `fred.txt`, which is output `40_stdio.c` writes when it
+                        runs and which was committed by accident.
+
+  pp_tcc/     51 files: 46 byte-identical to tinycc's `tests/pp`,
+                        2 modified here (`11.c`, `11.expect`),
+                        3 written here (`24.c`, `24.expect`,
+                        `24_include_in_call.h`).
+
+The cases written here use upstream's conventions — `NN_name.c` beside
+`NN_name.expect`, and `NN+_name.c` for a companion translation unit — because
+`tests/toyos.rs` discovers all of them by that shape.
+
+
+TinyCC: LGPL-2.1
+----------------
+
+TinyCC is distributed under the GNU Lesser General Public License version 2.1
+(its `COPYING`, and its README: "TCC is distributed under the GNU Lesser
+General Public License"). The imported cases and the modifications made to them
+here are under those terms.
+
+
+Verbatim, from tinycc's own `tests/tests2/LICENSE`
+--------------------------------------------------
+
+    The tests in this directory are either directly copied from the picoc
+    project or are subsequently modified and added to for the purpose of TinyCC
+    project. All these modifications are licensed under the same terms as
+    TinyCC as specified in the file COPYING.
+
+    === picoc license ===
+
+    Copyright (c) 2009-2011, Zik Saleeba
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are
+    met:
+
+        * Redistributions of source code must retain the above copyright
+          notice, this list of conditions and the following disclaimer.
+
+        * Redistributions in binary form must reproduce the above copyright
+          notice, this list of conditions and the following disclaimer in
+          the documentation and/or other materials provided with the
+          distribution.
+
+        * Neither the name of the Zik Saleeba nor the names of its
+          contributors may be used to endorse or promote products derived
+          from this software without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+    A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+    OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+    SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+    LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+    DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+    THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+One case is gone, and is not coming back
+----------------------------------------
+
+`tinycc/46_grep.c` was deleted on 2026-08-08. It was byte-identical to
+upstream's, but upstream inherited it with a header of its own:
+
+    Copyright (C) 1980, DECUS
+
+    General permission to copy or modify, but not for profit, is hereby
+    granted, provided that the above copyright notice is included and
+    reference made to the fact that reproduction privileges were granted by
+    DECUS.
+
+"but not for profit" discriminates against a field of endeavour, so it is not a
+free licence by any definition, and it was never TinyCC's to relicense — they
+vendored it as a test input the same way we did. It cannot sit in a repository
+offered under MIT OR Apache-2.0. It was in `C_SKIP` and had never been run
+here: it needs `argc`/`argv` and `FILE*`, neither of which `userland/libc`
+provides yet.
+
+Do not re-import it. If a regex case is wanted, write one.

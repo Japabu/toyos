@@ -1138,92 +1138,99 @@ pub(crate) fn gc_sections(state: &mut LinkState, entry: &str) {
 // as real code sections: each __rust_X is a `jmp __rdl_X` trampoline,
 // and __rust_no_alloc_shim_is_unstable_v2 is a single `ret`.
 
+/// An item of the compiler-internal `___rustc` crate, split out of its v0
+/// mangling: `_RNvCs<disambiguator>_7___rustc<len>_<name>`.
+///
+/// The disambiguator is a rustc build hash that changes every time `rust/` is
+/// rebuilt, so it is matched wild — a hash frozen into a string literal has no
+/// way to announce that it has gone stale, and the symptom when it does is an
+/// undefined symbol far from the cause. **The name never is**: the same
+/// sysroot carries `__rust_start_panic`, `__rust_drop_panic`,
+/// `__rust_foreign_exception`, `__rust_panic_cleanup`, `__rust_abort` and
+/// `__rust_probestack`, and none of them is an allocator shim.
+struct RustcItem<'a> {
+    disambiguator: &'a str,
+    name: &'a str,
+}
+
+fn parse_rustc_item(symbol: &str) -> Option<RustcItem<'_>> {
+    let rest = symbol.strip_prefix("_RNvCs")?;
+    let (disambiguator, rest) = rest.split_once('_')?;
+    let rest = rest.strip_prefix("7___rustc")?;
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    let len: usize = rest.get(..digits)?.parse().ok()?;
+    // v0 separates the length from an identifier that itself starts with `_`
+    // by another `_`, which every name below does.
+    let name = rest.get(digits..)?.strip_prefix('_')?;
+    (name.len() == len).then_some(RustcItem { disambiguator, name })
+}
+
+fn mangle_rustc_item(disambiguator: &str, name: &str) -> String {
+    format!("_RNvCs{disambiguator}_7___rustc{}_{name}", name.len())
+}
+
+/// Each shim rustc synthesizes at final link time, with the
+/// `#[global_allocator]` symbol it forwards to. A closed list.
 const ALLOC_SHIMS: &[(&str, &str)] = &[
-    (
-        "_RNvCs2fcwfXhWpkc_7___rustc12___rust_alloc",
-        "_RNvCs2fcwfXhWpkc_7___rustc11___rdl_alloc",
-    ),
-    (
-        "_RNvCs2fcwfXhWpkc_7___rustc14___rust_dealloc",
-        "_RNvCs2fcwfXhWpkc_7___rustc13___rdl_dealloc",
-    ),
-    (
-        "_RNvCs2fcwfXhWpkc_7___rustc14___rust_realloc",
-        "_RNvCs2fcwfXhWpkc_7___rustc13___rdl_realloc",
-    ),
-    (
-        "_RNvCs2fcwfXhWpkc_7___rustc19___rust_alloc_zeroed",
-        "_RNvCs2fcwfXhWpkc_7___rustc18___rdl_alloc_zeroed",
-    ),
+    ("__rust_alloc", "__rdl_alloc"),
+    ("__rust_dealloc", "__rdl_dealloc"),
+    ("__rust_realloc", "__rdl_realloc"),
+    ("__rust_alloc_zeroed", "__rdl_alloc_zeroed"),
+    ("__rust_alloc_error_handler", "__rdl_alloc_error_handler"),
 ];
 
-const SHIM_NO_ALLOC_UNSTABLE: &str =
-    "_RNvCs2fcwfXhWpkc_7___rustc35___rust_no_alloc_shim_is_unstable_v2";
+const SHIM_NO_ALLOC_UNSTABLE: &str = "__rust_no_alloc_shim_is_unstable_v2";
+
+/// A shim body, padded to 16 with `int3`.
+fn define_shim(state: &mut LinkState, symbol: &str, mut code: Vec<u8>) -> SectionIdx {
+    code.resize(16, 0xCC);
+    let sec_idx = SectionIdx(state.sections.len());
+    state.sections.push(InputSection {
+        name: format!(".text.{symbol}"),
+        data: code,
+        align: 16,
+        size: 16,
+        vaddr: None,
+        kind: SectionKind::Code,
+        merge: false,
+        strings: false,
+        entsize: 0,
+    });
+    state
+        .globals
+        .insert(symbol.to_string(), SymbolDef::Defined { section: sec_idx, value: 0, size: 0 });
+    sec_idx
+}
 
 pub(crate) fn synthesize_alloc_shims(state: &mut LinkState) {
-    // Only create shims for symbols that are actually referenced but undefined
-    let undefined: HashSet<String> = state
+    // Only symbols something references and nothing defines. Ordered, not
+    // hashed: iterating this is the order the sections reach the output.
+    let undefined: BTreeSet<String> = state
         .relocs
         .iter()
         .map(|r| r.target.name().to_string())
         .filter(|name| !state.globals.contains_key(name.as_str()))
         .collect();
 
-    // Each trampoline is: `jmp rel32` (E9 xx xx xx xx) = 5 bytes, padded to 16
-    for &(shim_name, target_name) in ALLOC_SHIMS {
-        if !undefined.contains(shim_name) {
+    for symbol in &undefined {
+        let Some(item) = parse_rustc_item(symbol) else { continue };
+        if item.name == SHIM_NO_ALLOC_UNSTABLE {
+            define_shim(state, symbol, vec![0xC3]);
             continue;
         }
-        let mut code = vec![0xE9, 0, 0, 0, 0];
-        code.resize(16, 0xCC); // pad with int3
-        let sec_idx = SectionIdx(state.sections.len());
-        state.sections.push(InputSection {
-            name: format!(".text.{shim_name}"),
-            data: code,
-            align: 16,
-            size: 16,
-            vaddr: None,
-            kind: SectionKind::Code,
-            merge: false,
-            strings: false,
-            entsize: 0,
-        });
-        state.globals.insert(
-            shim_name.to_string(),
-            SymbolDef::Defined { section: sec_idx, value: 0, size: 0 },
-        );
+        let Some(&(_, target)) = ALLOC_SHIMS.iter().find(|(shim, _)| *shim == item.name) else {
+            continue;
+        };
+        // `jmp rel32`
+        let sec_idx = define_shim(state, symbol, vec![0xE9, 0, 0, 0, 0]);
         state.relocs.push(InputReloc {
             section: sec_idx,
             offset: 1,
             r_type: RelocType::X86Plt32,
-            target: SymbolRef::Global(target_name.to_string()),
+            target: SymbolRef::Global(mangle_rustc_item(item.disambiguator, target)),
             addend: -4,
             subtrahend: None,
         });
-    }
-
-    // __rust_no_alloc_shim_is_unstable_v2: single `ret` (C3)
-    if undefined.contains(SHIM_NO_ALLOC_UNSTABLE)
-        && !state.globals.contains_key(SHIM_NO_ALLOC_UNSTABLE)
-    {
-        let mut code = vec![0xC3];
-        code.resize(16, 0xCC);
-        let sec_idx = SectionIdx(state.sections.len());
-        state.sections.push(InputSection {
-            name: format!(".text.{SHIM_NO_ALLOC_UNSTABLE}"),
-            data: code,
-            align: 16,
-            size: 16,
-            vaddr: None,
-            kind: SectionKind::Code,
-            merge: false,
-            strings: false,
-            entsize: 0,
-        });
-        state.globals.insert(
-            SHIM_NO_ALLOC_UNSTABLE.to_string(),
-            SymbolDef::Defined { section: sec_idx, value: 0, size: 0 },
-        );
     }
 }
 

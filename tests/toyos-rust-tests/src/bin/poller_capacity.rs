@@ -51,7 +51,7 @@ fn main() {
 fn full_capacity_delivers_everything() {
     let mut pipes = Vec::new();
     for _ in 0..CAP {
-        let p = syscall::pipe();
+        let p = syscall::pipe().expect("a pipe to poll");
         // Readable before it is ever registered, which is the case that used
         // to post a completion mid-registration.
         syscall::write(p.write, b"x").expect("write into a fresh pipe");
@@ -98,7 +98,7 @@ fn over_register() {
     let poller = Poller::new(SMALL);
     let mut pipes = Vec::new();
     for _ in 0..=SMALL {
-        let p = syscall::pipe();
+        let p = syscall::pipe().expect("a pipe to poll");
         syscall::write(p.write, b"x").expect("write into a fresh pipe");
         pipes.push(p);
     }

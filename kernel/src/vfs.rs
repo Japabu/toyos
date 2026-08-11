@@ -36,8 +36,8 @@ pub fn lock() -> VfsGuard {
 /// about to run a scheduler pass — and for the one case where waiting would
 /// not merely be slow: a thread that panicked while holding this lock never
 /// releases it, and `Lock::lock` turns that into a second panic after 500M
-/// spins. Known issues records that hazard; this is how a caller declines to
-/// inherit it.
+/// spins. `specs/issues/panic-path/panic-holding-process-table-hangs.md` records
+/// that hazard; this is how a caller declines to inherit it.
 pub fn try_lock() -> Option<VfsGuard> {
     let guard = VFS.try_lock()?;
     if guard.is_none() {
@@ -86,7 +86,7 @@ pub trait FileSystem: Send {
     /// `bcachefs::Mounted::list` has no count primitive and `btree::collect_all`
     /// under it builds the whole entry set first. Their check is on the result,
     /// so it makes the refusal uniform without making the allocation bounded —
-    /// see known issues.
+    /// see `specs/issues/isolation/untrusted-input-panics.md`.
     fn list(&mut self, limit: usize) -> Result<Vec<(String, u64)>, SyscallError>;
 
     /// When `name` was last written, in whatever epoch the mount keeps.

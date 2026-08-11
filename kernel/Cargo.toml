@@ -12,325 +12,44 @@ license = "MIT OR Apache-2.0"
 # A kernel build cannot enable it — the kernel does not depend on loom — and it
 # is declared only so `cfg` checking knows the name.
 loom = []
-# Every actuator below that a boot cannot reach on its own: each is a `SYS_DEBUG`
-# action arm and nothing else, so a kernel carrying all of them boots, schedules,
-# drives its devices and panics exactly as a kernel carrying none does. The
-# harness folds any request for one of them into this, because a feature set is
-# a whole kernel build and sets that differ only in which unreachable arm
-# they carry are several builds of one kernel. `specs/test-cost-audit.md` §5.4.3 is
-# the per-feature ledger this is the "inert" half of; every other feature there
-# changes a path a boot takes and keeps its own build.
-test-actuators = [
-    "test-fatal-halt",
-    "test-screen-graffiti",
-    "test-double-fault",
-    "test-heap-ceiling",
-    "test-kernel-canary",
-    "test-tlb-ack-delay",
-]
-# SYS_DEBUG actions 12 and 13: make the last CPU a TLB shootdown waits for
-# answer late — 12 arms it, takes one shootdown and reports what it cost, 13
-# gives the machine its latency back.
+# **Every actuator, and which one is armed comes from the boot parameter.**
+# `kernel/src/actuator.rs` declares all 47 with the claim each rests on; this
+# name is the whole of what a build decides about them. A kernel without it has
+# no arm set, no name and no parser, every accessor is `const fn … { false }`,
+# and a constant an actuator moves is still a constant.
 #
-# What nothing else reaches: whether the initiator *waits*. A correct wait and no
-# wait at all both measure zero on a machine where every CPU answers in
-# microseconds, and QEMU has no way to make one vCPU answer an IPI late — no
-# device, no machine property, no `-cpu` flag. The delay is staged after the
-# flush and before the publication, so what it produces is a slow answer and
-# never an incorrect one.
+# Until 2026-08-10 each of these was a cargo feature and therefore a kernel
+# build: 45 in a full `cargo test`, ~6.9 s of wall clock and ~29.6 s of CPU
+# each after any kernel edit. `specs/test-cost-audit.md` §3.6 is the trade and
+# §5.9.5 the design.
+boot-actuators = []
+# **`SYS_DEBUG` and every actuator reachable through it, and nothing a boot
+# runs.** A kernel carrying this boots, schedules, drives its devices and panics
+# exactly as a kernel carrying none does; what it has in addition is a syscall
+# number that answers, and every action behind it is a state the host cannot
+# stage. A kernel *without* it has no debug syscall at all — the number falls to
+# the dispatch's default and answers `InvalidArgument`, which is what an
+# unassigned number answers.
 #
-# The one place it is not inert: `serve_ipi` loads one relaxed word per flush, on
-# a path a boot runs. That word is written by nothing except action 12, so a
-# kernel carrying this feature and never asked flushes exactly as one without it
-# — which is the claim `INERT_ACTUATORS` membership makes, stated here because
-# this is the first member whose code is not confined to the match arm.
-test-tlb-ack-delay = []
+# One name rather than seven, because a feature set is a whole kernel build and
+# builds that differ only in which unreachable arm they carry are several builds
+# of one kernel. The per-action justification — what nothing else can reach — now
+# lives beside each arm in `arch/syscall.rs`, which is the file that has to stay
+# true when an arm changes.
+#
+# The one place it is not confined to the match: `arch::tlb::serve_ipi` loads one
+# relaxed word per flush. Nothing writes that word except action 12, so a kernel
+# carrying this and never asked flushes exactly as one without it — stated rather
+# than assumed, because that claim is what makes the split below sound.
+#
+# **Separate from `boot-actuators` on purpose.** A diagnostic image the owner
+# flashes wants `heartbeat` and `diag-tick`; it must not also gain a debug
+# syscall, which is what folding the two into one name would give it.
+test-actuators = []
+# The debugger's spin gate, and the one thing `--debug` compiles in. Not a boot
+# parameter: it would then have to live in the shipping kernel, and what
+# `cargo run -- --debug` exists to debug is the kernel an image ships.
 debug-wait = []
-# Panic between arming the on-screen console and mm::init, so a test can
-# assert the console covers the window where nothing else can report.
-test-early-panic = []
-# SYS_DEBUG action 3: halt every CPU on demand. A test needs a fatal path it
-# can trigger from userland; a shipped kernel must not have one.
-test-fatal-halt = []
-# SYS_DEBUG action 9: read the byte below this CPU's idle stack. The idle stack
-# is heap, so its guard page is the one page in the kernel deliberately absent
-# from the direct map -- and absence is invisible to every log line and every
-# screendump. Nothing else in the kernel addresses that page, which is the
-# whole point of it, so a test cannot reach it any other way.
-test-idle-guard = []
-# SYS_DEBUG actions 10 and 11: the address of sixteen bytes of kernel memory,
-# and whether they still hold what the kernel put there. A guest cannot read
-# the kernel's address space, so a syscall that writes through a user-chosen
-# address into it leaves nothing a test can assert on — the call returns, the
-# machine survives, and the corruption is somebody else's crash later. This is
-# the only way to make that write observable from userland, and what it
-# observes is the memory itself rather than a verdict about it.
-test-kernel-canary = []
-# SYS_DEBUG action 8: paint the whole panel a colour no glyph contains, over a
-# screen a userland process owns and is still drawing on. Nothing else can put
-# a pixel on the glass behind a running console's back -- the framebuffer is
-# claimed exclusively, so no second process can map it, and every other kernel
-# painter either honours the claim or halts the machine on its way out.
-test-screen-graffiti = []
-# One log line per i8042 drain: bytes seen, events queued, whether the queue
-# was woken. The only way a test can assert the wake guard from outside.
-# `i8042-fast-health` comes with it: a kernel built to be watched has no use for
-# a counter line every 10 s, and a member of the trace group reads those
-# counters. Bundled rather than asked for at the call site because a kernel
-# build is keyed on the feature set, and a second set is a second kernel.
-i8042-trace = ["i8042-fast-health", "i8042-edge-race"]
-# Hold a scheduler pass between reading the source's `irq_ring` record and
-# reading its byte ring, so an interrupt lands in between and the pass sees
-# bytes it has been told nothing about. Unwidened that window is a handful of
-# instructions on one CPU: no injection the harness can time and no load it can
-# stage reaches it. Bundled into `i8042-trace` for that feature's own reason —
-# the trace group is the only boot that counts interrupts against bytes, and a
-# second feature set is a second kernel build.
-i8042-edge-race = []
-# Make the ISR's output-buffer check lie, so its 16-byte bound trips and the
-# quarantine path runs. A controller that chatters forever is the one case the
-# bound alone still lets livelock a CPU, and nothing else can stage it.
-i8042-fault = []
-# Set the i8042 probe's whole init budget to zero, so its expiry paths run on a
-# controller that is answering perfectly. QEMU answers every step in
-# microseconds — the whole probe measures 0.099 s to 0.100 s on a metal-sim
-# boot — and no real EC has ever been timed, so nothing else can reach them.
-i8042-budget-expired = []
-# Hand the i8042 probe the T14's own FADT answer — revision 6,
-# iapc_boot_arch=0x0011, the 8042 bit clear — on a machine that has a working
-# controller. QEMU cannot stage that disagreement: `-machine q35,i8042=off`
-# clears the bit by removing the device and `-device i8042` puts the device back
-# into the QOM tree the bit is read from, so there the claim and the hardware
-# always agree.
-i8042-fadt-denial = []
-# Answer the i8042 probe's `0xF0 0x00` scancode-set query with `0xEE` — ECHO's
-# own reply, and what the T14's EC answered on the laptop's own screen — on a
-# keyboard that is otherwise working. QEMU's PS/2 keyboard implements `0xF0`
-# to the letter (`hw/input/ps2.c`, `KBD_CMD_SCANCODE`) and no device or machine
-# property makes it stop, so the host side cannot hand the driver a keyboard
-# that will not report its set. Only the verdict is replaced; both bytes still
-# go out.
-i8042-kbd-echo = []
-# Shorten the i8042's post-verdict counter report from 10 s to 500 ms. The
-# report is what turns "the log went silent" into a readable fact, and its
-# whole claim is about what happens over tens of seconds: one line after the
-# pin asserts, none while it is quiet, another when it asserts again. No guest
-# test program lives that long, and stretching every input test to watch a log
-# cadence is the wrong trade.
-# Only the period moves: the counters, the change gate and the line are the
-# shipped ones, so what the gate certifies is the logic and not the number.
-i8042-fast-health = []
-# Script the input core directly at end of boot. QEMU activates one input
-# handler per device class, so two keyboards or two pointers can never both be
-# live in a guest — the merge has no end-to-end test and this is its only one.
-test-input-merge = []
-# Clamp the xHCI driver to one device block, so a test can drive the path
-# where the controller hands back a slot the DMA pool has no room for. QEMU's
-# `nec-usb-xhci,slots=N` does not reach HCSPARAMS1 and its Enable Slot ignores
-# the MaxSlotsEn a driver writes, so nothing on the host side can stage it.
-xhci-one-slot = []
-# Run the xHCI extended-capability walk over eight malformed lists at init.
-# The list comes from firmware and QEMU's controller publishes none at all, so
-# without this the bounds in `xhci/legacy.rs` would ship never having executed.
-xhci-xecp-selftest = []
-# Read and write every USB disk that carries the gate's stamp in block 0, at
-# the end of the peripheral phase. A raw block device has no path to userland,
-# so the kernel is the only in-guest actor that can drive one — and the stamp,
-# not the flag, is what decides which disk gets written: the boot stick is on
-# the same bus and must come back untouched. See `kernel/src/usb_gate.rs`.
-usb-storage-gate = []
-# Answer SYNCHRONIZE CACHE with a device's refusal instead of its own verdict:
-# `usb-flush-unimplemented` with the ILLEGAL REQUEST / INVALID COMMAND
-# OPERATION CODE a stick with no write cache gives, `usb-flush-fails` with a
-# HARDWARE ERROR. QEMU's `scsi-disk` implements 0x35 for every front end that
-# reaches it — `usb-storage` and `usb-bot`, `scsi-hd` and `scsi-block` — and no
-# device or drive property turns it off, so the difference between a device
-# that will not flush and one that cannot is unreachable from the host side.
-# The command is still issued; only its verdict is replaced. See
-# `xhci/msc.rs`'s `FLUSH_SENSE`.
-usb-flush-unimplemented = []
-usb-flush-fails = []
-# Abandon the data phase of the first WRITE(10) of the boot without waiting for
-# it. QEMU's `usb-storage` answers every CBW, data phase and CSW it is handed,
-# in microseconds and in order; no device, drive or machine property makes one
-# bulk transfer not complete, and `rerror`/`werror` fail the whole drive instead
-# of leaving a transfer in flight. Nothing is faked: the TRB is really on the
-# ring, the endpoint is really left Running, and the controller really completes
-# the transfer afterwards — only the wait is skipped, which is the state a
-# transfer that ran out `USB_TIMEOUT_NS` leaves behind, and the state a
-# conformant xHC answers Reset Endpoint with Context State Error for. See
-# `xhci/msc.rs`'s `transport_break`.
-usb-transport-break = []
-# Under-deliver one READ(10) data phase where the gate asks for it, so that the
-# controller's count of the bytes it moved and the device's own CSW residue
-# disagree. QEMU derives both from one transfer, so they can never contradict
-# each other there; on real hardware a device that ends its data phase early and
-# reports `dCSWDataResidue` as zero is a firmware bug that ships. Nothing is
-# faked: the bytes left in the tail of the window are the previous transfer's,
-# read off that window rather than invented, which is exactly what a caller is
-# handed when the controller's number is discarded. See `xhci/msc.rs`'s
-# `short_read`.
-usb-short-read = ["usb-storage-gate"]
-# Starve one of the xHCI bring-up register waits on a controller that is
-# otherwise answering: `xhci-deaf-controller` the four in `init_one`,
-# `xhci-deaf-port` the port-reset wait in `init_device`. QEMU's xHC halts,
-# resets, clears CNR and starts in microseconds and finishes a port reset
-# synchronously; no device or machine property makes a register bit not settle,
-# and unplugging between the port scan and the reset is not expressible either.
-# See `xhci/mod.rs`'s `settles`.
-xhci-deaf-controller = []
-xhci-deaf-port = []
-# Make one CPU ignore a kick — the one machine state the blocked-task dump
-# exists to describe, and the one nothing on the host can stage: QEMU delivers
-# every IPI it is given, so a guest CPU stops answering only for reasons that
-# are properties of this code. The victim really clears IF and really spins,
-# for longer than the dump's kick budget and then no longer, so the kick is
-# genuinely unanswered, the NMI is genuinely what reaches it, and the CPU
-# genuinely comes back. See `sched/dump.rs`'s `deaf_window`.
-dump-deaf-cpu = []
-# Report an empty root hub for the first 300 ms of the boot, so the port scan
-# runs against a controller that has not finished detecting its devices yet.
-# That is what every physical root hub does after HCRST and what QEMU's cannot:
-# it answers PORTSC from the QOM tree, so an attached device reads CCS the
-# instant the register is touched and no device or machine property changes
-# that. `device_add` cannot reach the window either — the scan runs tens of
-# milliseconds into the boot. The register is replaced, not a verdict: during
-# the window the port reads CCS, PED and speed exactly as an unpopulated one
-# does, and the device that appears afterwards enumerates by the ordinary path.
-# See `xhci/mod.rs`'s `SLOW_CONNECT_NS`.
-xhci-slow-connect = []
-# Report the *first* root-hub port empty for the same window, leaving every
-# other port on the machine reading normally. A different machine from the one
-# above and not a weaker version of it: `await_connect_settle` ends as soon as
-# the connect set has held still and is non-empty, so a bus whose other devices
-# have settled settles on them — which is the T14, with four internal USB
-# devices beside the stick it boots from, and the interleaving that cost it
-# `/boot` and `/log` on one boot and not the next. Hiding the whole bus can
-# never reach it, because the devices it hides are the ones that would end the
-# wait early. The register is replaced, not a verdict.
-# See `xhci/mod.rs`'s `SLOW_STORAGE_PORT`.
-xhci-slow-storage-connect = []
-# Give PORTSC's PED bit (bit 1) the RW1CS meaning xHCI 1.2 §5.4.8 gives it: a
-# port software writes a '1' to goes from Enabled to Disabled (§4.19.1.1.6) and
-# reads PED clear until it is reset again. QEMU's `xhci_port_write` clears only
-# CSC|PEC|WRC|OCC|PRC|PLC|CEC on a written '1' and PED is in neither that set nor
-# its read/write set, so a write of PED=1 is a no-op there and no device, machine
-# property or register sequence makes it anything else. The register is replaced,
-# not a verdict: the port reads exactly what the T14's five ports read.
-# See `XhciController::software_disabled`.
-xhci-portsc-rw1c = []
-# Take one completion away from each bound HID device and hand the driver a
-# stall in its place: `xhci-hid-break-first` the device's very first, which is
-# the shape a Logitech mouse hot-plugged into the T14 showed, and
-# `xhci-hid-break-late` its fourth, where a device that has been delivering
-# stops. QEMU's `usb-hid` completes every interrupt TRB it is given —
-# `usb_hid_handle_data` answers an IN token on endpoint 1 with a report or with
-# NAK and has no path to `USB_RET_STALL` for it — and no device or machine
-# property adds one. What is replaced is the code *and the report that transfer
-# delivered*: a staged failure carries a real movement into the report buffer,
-# so without taking the bytes away a driver that dispatched it anyway would
-# publish a delta it never earned and the gate would pass against the defect it
-# names. Everything the recovery reads is real: the TRB was on the ring, the
-# controller ran it, the ring is left empty, and the Endpoint State it branches
-# on is the controller's own. See `xhci/hid.rs`'s `stage_break`.
-xhci-hid-break-first = []
-xhci-hid-break-late = []
-# Run `parse_config` over nine crafted configuration descriptors at init. The
-# bytes come from a device and every device QEMU can attach describes itself
-# correctly, so without this the parser's refusals — an endpoint address naming
-# endpoint 0 above all, which resolves to the slot context or to EP0's — would
-# ship never having executed. See `xhci/device.rs`'s `selftest`.
-xhci-descriptor-selftest = []
-# Shrink both disk caches to 64 entries each. The honest ceilings are tens of
-# megabytes, so a test that reached them by doing real I/O would spend minutes
-# proving what 256 KiB proves in a second. The eviction code under test is the
-# shipped code; only the bound moves.
-test-small-caches = []
-# Shrink each process's VA arena from ~1015 GB to 256 MiB, so that exhausting
-# it is a test rather than a physics problem. Every region costs at worst twice
-# its size in physical memory, so the shipped arena needs upwards of 500 GB of
-# RAM to fill and the PMM refuses long first — `find_gap` cannot be made to
-# fail by any workload this harness can express. See `vma::ALLOC_FLOOR`.
-test-tiny-va = []
-# SYS_DEBUG action 4: take a real #DF, by faulting with an unusable RSP. The
-# only way to exercise the IST1 stack, which is the one stack in the kernel
-# whose overflow corrupts the heap while writing the report that explains the
-# fault. Nothing but a genuine double fault reaches that path.
-test-double-fault = []
-# Panic once the boot phases are done, with no thread current, so a test can
-# drive the ordinary fatal panic — the one path where the report reaches the
-# screen only because the panic handler captured it before draining the ring.
-test-late-panic = []
-# Panic a few seconds after a *compositor* has claimed the framebuffer, from an
-# idle CPU, so the panic handler's recovery branch is not taken and the report
-# reaches `halt_all_cpus`.
-#
-# What nothing else reaches: whether a fatal report lands on the panel of the
-# owner's T14 while his desktop owns the scanout. `screen_fatal_halt_composited`
-# certifies the software half and cannot certify more — QEMU's framebuffer is
-# host RAM, while the T14's is a write-combining MMIO mapping the compositor is
-# also writing, and a full paint measures ~460 ms there. Three investigations
-# into the machine freeze have assumed a fatal panic would have been seen if one
-# had happened; this is the boot that turns that assumption into an observation,
-# and its negative result would be the larger finding of the two.
-#
-# `test-late-panic` cannot serve: it fires during the boot phases, before any
-# userland process exists, so it paints a screen nobody had claimed.
-#
-# Takes `diag-tick` because the probe's deadline is read from the idle loop, and
-# without it the probe fires on the first interrupt after the deadline rather
-# than at the deadline. On the owner's T14 that was 99 seconds late and looked
-# like a probe that never fired.
-metal-panic-probe = ["diag-tick"]
-# Cap how long a CPU with nothing to run may sleep, so the idle loop keeps
-# running on a machine that has gone quiet.
-#
-# The shipping kernel is right not to: a CPU whose pass found no work and no
-# deadline stops its LAPIC timer and halts until an interrupt arrives, which is
-# correct and is good power management. But everything the kernel does *for the
-# person watching it* lives in the idle loop — the heartbeat, the probe's
-# deadline, the log sink's flush — so on a machine that has gone quiet none of
-# it runs. Eight boots of the owner's T14 produced two heartbeats each, at
-# 1.15 s and 1.78 s, then nothing for as long as 102 s until a keypress; the
-# instrument built to tell a live machine from a dead one wrote the same file
-# for both.
-#
-# So a diagnostic build holds the machine out of full quiescence and a shipping
-# build must not, and that difference is this feature. It costs the wakes and
-# the flushes they carry — with `heartbeat` on, four `sync_mount`s a second on
-# whatever `/log` sits on — which also means the instrument is no longer a
-# passive observer of the boot it is watching.
-diag-tick = []
-# One log line every 250 ms carrying the monotonic time and which CPUs are still
-# alive.
-#
-# What nothing else reaches: *was this boot alive at time T*. Ten logs off the
-# owner's stick are byte-identical between the boots that froze and the boots
-# that did not — a live idle desktop and a dead machine have the same last thing
-# to say — so the log records the freeze's existence and never its time. With
-# this, a frozen boot's log ends at the last heartbeat before death, and the mask
-# says whether the machine stopped all at once or a CPU at a time, which is the
-# difference between a global cause and a local one.
-#
-# `diag-tick` is what makes the mask mean that. Without it a clear bit means
-# "this CPU had nothing to do", which every idle CPU on a quiet machine has, and
-# the field discriminates nothing.
-#
-# Not a default: four lines a second is a diagnostic budget, and a machine
-# nobody is watching should not spend its log volume saying nothing happened.
-heartbeat = ["diag-tick"]
-# SYS_DEBUG actions 5, 6 and 7: one kernel heap allocation at
-# `mm::MAX_HEAP_ALLOC`, one a page over it, and one at the ceiling but
-# page-aligned. Ordinary code can still ask for more than one page backs — a
-# `read_dir` over 32,769 files in one tmpfs directory does, measured — but
-# every such route runs under the VFS lock, so the panic strands that lock too
-# and the allocator's own recovery cannot be told apart from the filesystem's.
-# These three hold nothing but the allocator, which is the property under
-# test. See `mm::MAX_HEAP_ALLOC`.
-# Also drops `MAX_SYSINFO_THREADS` to 16. The same ceiling one layer up: the
-# real bound is a thread count no guest can reach, so the constant is the only
-# actuator, and the refusal it runs is the shipped one.
-test-heap-ceiling = []
 # The on-target half of the scheduler spec's invariants (spec §10.2, §10.5).
 # Turns on `toyos-sched/check`, which asserts container-vs-state-word agreement
 # and invariant T at the end of every scheduler pass, and asserts the pass
@@ -341,91 +60,35 @@ test-heap-ceiling = []
 # ready queue and parked map plus a second clock read, and that lands on the
 # audio path. A bring-up, bisect or bare-metal build wants it; a build being
 # measured does not.
+#
+# Not a boot parameter, and the one that could not be: it forwards to a
+# dependency's cargo feature, which no runtime value can reach.
 sched-check = ["toyos-sched/check"]
-# Rotate `/log/kernel.log` at 256 bytes instead of 4 MiB. Filling megabytes by
-# logging would take a boot far longer than a test should wait, and the
-# rotation code this drives is the shipped code — only the bound moves, exactly
-# as `test-small-caches` moves the cache ceilings. See `log_file::MAX_LOG_BYTES`.
-log-rotate-fast = []
-# Fail every re-read of a page of a file on either FAT mount through
-# `FatBacking`, with the mount and the filesystem underneath it working. Both
-# partitions are on the disk the guest is running from, so no QEMU-side way of
-# failing its reads leaves the machine booted and the volumes mounted —
-# `readonly=on` is writes only and `rerror` takes the whole drive. The read is
-# still issued and only its verdict is replaced, so the injection cannot hide a
-# device that was never asked. What it drives is the partial write `log_file`
-# makes into an evicted page: before the error channel existed, that merged the
-# new bytes into a page of zeros and flushed it back over the kernel's own log.
-# See `fat32_adapter.rs`'s `FAT_BACKING_READS`.
-fat-backing-read-fails = []
-# Fail every *filesystem* read of the boot volume once it is mounted, with the
-# mount and the rest of the machine working. Its sibling above injects one layer
-# higher, at `FatBacking::read_page`, which is the page-fault path and reaches
-# no directory entry — so with that one armed an `open`, a `read_dir` and an
-# mtime of the same volume all still succeed, and nothing in the tree can make
-# `vfs::FileSystem`'s metadata calls fail. This one is under `Fat32` itself,
-# where a directory entry, a FAT chain and an extent list are read. Same reason
-# neither can be staged host-side: both partitions are on the disk the guest
-# runs from, so `readonly=on` is writes only and `rerror` takes the whole drive.
-# `Role::Boot` because nothing in the kernel reads that volume after the mount,
-# so the log, the shell and the serial console all survive and a process can be
-# sent to ask it a question. The read is still issued and the buffer is scrubbed
-# with the verdict. See `fat32_adapter.rs`'s `BOOT_VOLUME_READS`.
-fat-boot-reads-fail = []
-# Mis-program the IOMMU for the NVMe controller and nothing else:
-# `iommu-context-absent` leaves it out of the root table, so it reaches
-# translation with no context entry; `iommu-empty-domain` gives it a present
-# context entry naming a second-level table with no mappings in it. A root
-# table, a context entry and a page table are all the kernel's own memory, so
-# no QEMU device or machine property can reach either state while leaving the
-# rest of the machine correct. Nothing is faked: the transaction really
-# happens, the unit really blocks it, and the fault record the handler reads is
-# the hardware's own. Together they are the negative control on the whole of
-# stage I2 — a unit that were bypassing or never enabled would let both
-# through, and the second alone separates a real second-level walk from a
-# context entry naming passthrough, which would fault identically for the
-# first. See `iommu/vtd/mod.rs`'s `enable`.
-iommu-context-absent = []
-iommu-empty-domain = []
-# Stage H0 of `specs/hda-driver-plan.md`: take every class-0403 function out of
-# reset once, at the end of the peripheral phase, and report what is behind it.
-# Nothing else can reach those questions — a codec is not on the PCI bus, and
-# the capability that would let a userland process touch one is
-# `specs/userspace-drivers-spec.md` stage 4, unbuilt, and whether it should ever
-# be given this device is exactly what H0 asks. Off in every ordinary boot: no
-# shipped path takes an audio controller out of reset, and the whole feature is
-# deleted at H9. See `kernel/src/drivers/hda_probe.rs`.
-hda-probe = []
-# Run the HDA register allow-list over every arm of it at bind time, and report
-# each verdict by name. Nothing else can be the caller: the check is gated on
-# holding the device claim, soundd takes that claim for the life of the boot,
-# and the claim is exclusive by construction — so a guest test can only reach
-# the allow-list on a machine where nothing is driving the sound card, which is
-# a machine with no audio. The shipped path runs; only the caller is staged.
-# See `kernel/src/drivers/hda.rs`'s `allowlist_selftest`.
-hda-allowlist-selftest = []
-# Four states of the wall clock, none of which the host can produce: QEMU has no
-# switch that removes or wedges the mc146818, its RTC always presents the guest
-# a coherent register set, the FADT a guest reads is generated by QEMU and
-# always names the century register at 0x32, and `-rtc base=` sets every digit
-# of the date except the century — measured, a guest booted at 2101 reads
-# century 20 and year 01. Each replaces what the *hardware* answers and leaves
-# the decoder and everything downstream of it shipped code. See
-# `kernel/src/rtc.rs` and `drivers/acpi.rs`'s `rtc_century_register`.
-rtc-dead = []
-rtc-unstable = []
-rtc-no-century = []
-rtc-century-next = []
-# A machine whose firmware names its zone. OVMF ships EFI_UNSPECIFIED_TIMEZONE
-# and nothing in QEMU sets the UEFI variable that would change it, so without
-# this every emulated boot assumes UTC and the arithmetic between local time and
-# UTC never runs. See `clock::init_wall`.
-rtc-zone-east = []
+# Take the FP body out of `arch::entry`'s bracket and the declared state out of
+# the loader's trampolines, leaving a kernel that preserves the *rest* of the
+# user machine state and nothing else — which is the kernel this tree had before
+# `specs/user-machine-state.md`.
+#
+# The negative control for `fpu_isolation`, and the only way to have one: the
+# defect it stages is a CPU register file surviving a task switch, and QEMU has
+# no device, machine property or `-cpu` flag that changes what an entry saves.
+#
+# It replaces the *behaviour* and not a verdict. The reservation, the alignment,
+# the rsp bookkeeping and every assertion are the shipped ones; what is absent
+# is the `fxsave64`, the `fxrstor64` and the trampoline's load. A feature that
+# flipped an assertion would make its own gate vacuous.
+#
+# **The one actuator that kept its own kernel build, and `specs/test-cost-audit.md`
+# §5.9.7 says why**: these are `naked_asm!` bodies on every ring transition, so a
+# boot parameter would have to be a branch there — on the path the gate is about,
+# in a binary the shipping one no longer resembles. The gate would then certify
+# a bracket nothing ships.
+fpu-save-nothing = []
 
 # The one profile every guest binary is built with — `specs/boot-image-split.md`
 # §6. Optimised, because an unoptimised guest mismeasures everything under TCG;
 # debug-assertions and overflow-checks on, because fail-fast beats speed here
-# and both crafted-ELF kernel panics in `specs/known-issues.md` were *found* by
+# and both crafted-ELF kernel panics in `specs/issues/` were *found* by
 # an overflow check. `--release` would turn the last two off silently, so this
 # build system no longer has the flag.
 [profile.toyos]

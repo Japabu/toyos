@@ -24,15 +24,6 @@ pub fn main(args: Vec<String>) {
     }
 }
 
-/// The surface hosting this program, if there is one.
-///
-/// Absent when nothing above set [`surface::HOST_ENV`] — a program run
-/// straight from init, or a test runner. Writing the config still works; it is
-/// read by every translator that starts afterwards.
-fn host() -> Option<String> {
-    std::env::var(surface::HOST_ENV).ok()
-}
-
 /// Record `name` as the machine's layout.
 ///
 /// The file is the layout. Nothing here tells a translator *which* one to use:
@@ -51,9 +42,10 @@ fn set(name: &str) {
         eprintln!("locale: failed to save config: {e}");
         return;
     }
-    if let Some(host) = host() {
-        surface::notify_layout_changed(&host);
-    }
+    // Best effort by construction: the config is already written, so a program
+    // with no surface above it has still changed the layout — for the next
+    // translator that starts.
+    surface::notify_layout_changed();
     println!("Keyboard layout set to '{name}'");
 }
 
@@ -150,16 +142,16 @@ const ANSWER_TIMEOUT_NS: u64 = 60 * 1_000_000_000;
 /// arrives: stdin would carry what the *current* layout made of the press, and
 /// the question is which layout to use.
 fn detect() {
-    let Some(host) = host() else {
-        eprintln!(
-            "locale: nothing is hosting this program's keyboard. The wizard reads key \
-             positions, which only a surface — a terminal, /bin/console, a window — can \
-             hand over. Run it from one, or pick a layout by name: locale <name>."
-        );
-        return;
-    };
-    let mut keys = match Keys::grab(&host) {
+    let mut keys = match Keys::grab() {
         Ok(keys) => keys,
+        Err(GrabError::HostGone) => {
+            eprintln!(
+                "locale: nothing is hosting this program's keyboard. The wizard reads key \
+                 positions, which only a surface — a terminal, /bin/console, a window — can \
+                 hand over. Run it from one, or pick a layout by name: locale <name>."
+            );
+            return;
+        }
         Err(e @ GrabError::Busy) => {
             eprintln!("locale: {e}. Finish with that first, or pick one by name: locale <name>.");
             return;

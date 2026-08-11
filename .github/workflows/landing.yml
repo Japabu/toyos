@@ -1,0 +1,169 @@
+name: landing
+
+# The two checks that are about the landing protocol rather than about the code.
+#
+# Both were rules `cargo run -- --land` enforced on the dev host. `--land` is
+# retired (`specs/worktrees.md` §5), so the rules it carried needed somewhere
+# to live, and the only thing between a branch and `main` now is CI.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: landing-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # **A sysroot change may not be merged with the work that depends on it.**
+  # `toyos-abi/src`, `toyos/src` and `userland/libc/src` are compiled into the
+  # one sysroot every worktree on the dev host builds against, so a branch that
+  # changes them holds it from its first build until it lands — the rule is that
+  # the sysroot half lands first, making that window one merge instead of one
+  # task. Followed once in four times on 2026-08-07, at 35 and 50 minutes of two
+  # other agents each (`specs/worktrees.md` §3.2).
+  #
+  # The same function answers here and at `cargo run -- --pr`, deliberately: an
+  # agent that ran the preflight gets the refusal in a second, and a branch that
+  # skipped it gets the identical words from this check.
+  abi-split:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # **The merge commit, which is the default, and it took a red run to see
+      # why.** This checked out `pull_request.head.sha` at first, reasoning that
+      # the question is which of *this branch's* commits touch the sysroot and a
+      # merge commit is not one of them. That is true of the question and false
+      # of the checkout: the step runs `cargo run` out of the tree it checked
+      # out, so a branch forked before `--abi-split-check` existed ran a build
+      # system that has never heard of the flag — pull request #3, `abi-split`
+      # red in 57 s with no `[abi]` line in it, because the old binary fell
+      # through to `check_prerequisites` and found no QEMU on the runner.
+      #
+      # The merge ref answers both halves. Its build system is base's, which is
+      # always the current one, and `origin/main..HEAD --no-merges` over it is
+      # exactly the branch's own commits — the merge commit is the one thing
+      # `--no-merges` drops.
+      #
+      # The general form: **a workflow comes from base and the code it runs
+      # comes from wherever it checks out**, and any job that runs this
+      # repository's own tooling has to take base's.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: landing-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: landing-${{ runner.os }}-
+
+      # Always runs, and answers "not a pull request" rather than being skipped:
+      # a required check that a `push` event skips reports a state a protection
+      # rule then has to have an opinion about, and this one has nothing to say
+      # about a commit that is already on main.
+      - name: the ABI-first rule
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "not a pull request: this rule is about a branch against its base."
+            exit 0
+          fi
+          git fetch --quiet origin \
+            "+refs/heads/${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}"
+          cargo run -- --abi-split-check --base "origin/${{ github.base_ref }}"
+
+  # **What protects `main` is configured outside the repository, and this is
+  # where it is read back.**
+  #
+  # This job used to hold `specs/ci-plan.md` §10.4's trigger: it went red once
+  # three consecutive `ci` runs on `main` were green while `guest-suite` was
+  # still advisory, so an advisory state could not survive being unnecessary.
+  # The trigger fired on 2026-08-09 and the owner promoted the gate (#21), which
+  # left a **required check whose whole body was `exit 0`** — decoration in a
+  # protection rule, and exactly the shape it was built to refuse.
+  #
+  # So it keeps its name — the context is matched by job name and renaming it is
+  # a ruleset change with a window in which a required check reports nothing —
+  # and it asks the question that is now worth asking. §10.5 lists the settings
+  # that govern every merge and says of them "none of this is in VCS and none of
+  # it is reviewable in a diff". Half of it is readable from an endpoint that
+  # needs no token at all, so half of it is a diff now.
+  #
+  # **A minimum and not an equality.** A context required at GitHub that this
+  # file does not name is reported, never refused: the owner adding one must not
+  # red every merge until somebody edits a workflow. A context this file names
+  # and GitHub does not is a gate that has been quietly dropped, and that reds.
+  gate-stage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: what protects main
+        run: |
+          set -eu -o pipefail
+          # No `Authorization`: `rules/branches` is readable by anyone who can
+          # read the repository, so this asks nothing of the workflow token and
+          # cannot start failing because a permission narrowed.
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/rules/branches/main"
+          curl -sSL --fail "$api" -o /tmp/rules.json
+          jq . /tmp/rules.json
+
+          required="host abi-split gate-stage tcg guest-suite"
+          live=$(jq -r '[.[] | select(.type=="required_status_checks")
+                            | .parameters.required_status_checks[].context] | join(" ")' \
+                   /tmp/rules.json)
+          rules=$(jq -r '[.[].type] | join(" ")' /tmp/rules.json)
+          strict=$(jq -r '[.[] | select(.type=="required_status_checks")
+                              | .parameters.strict_required_status_checks_policy] | first' \
+                     /tmp/rules.json)
+          methods=$(jq -r '[.[] | select(.type=="pull_request")
+                               | .parameters.allowed_merge_methods[]] | sort | join(",")' \
+                      /tmp/rules.json)
+
+          bad=0
+          for want in $required; do
+            case " $live " in
+              *" $want "*) ;;
+              *) echo "::error::main does not require the check \`$want\`"; bad=1 ;;
+            esac
+          done
+          for want in deletion non_fast_forward pull_request required_status_checks; do
+            case " $rules " in
+              *" $want "*) ;;
+              *) echo "::error::main has no \`$want\` rule"; bad=1 ;;
+            esac
+          done
+          # Strict is what makes a check on this head a check on the merged
+          # result — §10.2, and the property `--land`'s `git merge --no-ff main`
+          # used to carry.
+          if [ "$strict" != true ]; then
+            echo "::error::required checks are not strict, so a branch could merge without"
+            echo "::error::containing main and its checks would not be about the merged result"
+            bad=1
+          fi
+          # CLAUDE.md's "never rewrite history", said at the remote.
+          [ "$methods" = merge ] \
+            || { echo "::error::main allows merge methods \`$methods\`, not just \`merge\`"; bad=1; }
+
+          {
+            echo "### what protects main"
+            echo ""
+            echo "- rules: \`$rules\`"
+            echo "- required checks: \`$live\`"
+            echo "- strict: \`$strict\`, merge methods: \`$methods\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for have in $live; do
+            case " $required " in
+              *" $have "*) ;;
+              *) echo "- \`$have\` is required at GitHub and not named here" \
+                   >> "$GITHUB_STEP_SUMMARY" ;;
+            esac
+          done
+
+          test "$bad" = 0
+          echo "main is protected the way specs/ci-plan.md §10.4 and §10.5 say it is."

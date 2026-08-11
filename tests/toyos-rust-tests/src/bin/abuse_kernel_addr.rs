@@ -15,15 +15,12 @@
 //! would return the same error to a userland that cannot read a byte of the
 //! kernel's address space to notice. So the kernel keeps sixteen bytes with a
 //! known value and answers two questions about them
-//! (`kernel/Cargo.toml`'s `test-kernel-canary`): where they are, and whether
-//! they still say what it put there.
+//! (`SYS_DEBUG` actions 10 and 11): where they are, and whether they still say
+//! what it put there.
 
 use toyos_abi::syscall::{self, MmapFlags, MmapProt, SyscallError, SYS_DLOPEN};
 
-/// SYS_DEBUG action 10: the canary's own address, in the direct map.
-const CANARY_ADDR: u64 = 10;
-/// SYS_DEBUG action 11: 0 while it still holds what the kernel wrote.
-const CANARY_CHANGED: u64 = 11;
+use toyos_abi::syscall::debug_action::{CANARY_ADDR, CANARY_CHANGED};
 
 /// The one the TLS tests load, chosen because it exists in this image and has
 /// an `init_array` — so a successful call has something to report.

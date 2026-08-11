@@ -35,16 +35,17 @@ pub fn main(_args: Vec<String>) {
 
     let uptime_ns = u64::from_le_bytes(buf[24..32].try_into().unwrap());
 
-    println!("{:>5} {:>3} {:>5} {:>2} {:>8} {:>5} {:>5}  {}",
-        "PID", "TID", "PPID", "S", "CPU", "%CPU", "MEM", "NAME");
+    // No PPID column: a process has no parent. What started it gave it what it
+    // holds and kept a handle, and neither of those is a number the table has.
+    println!("{:>5} {:>3} {:>2} {:>8} {:>5} {:>5}  {}",
+        "PID", "TID", "S", "CPU", "%CPU", "MEM", "NAME");
 
     let mut pos = HEADER;
     while pos + ENTRY <= n {
         let pid = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
-        let ppid = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap());
-        let tid = u32::from_le_bytes(buf[pos + 8..pos + 12].try_into().unwrap());
-        let state = buf[pos + 12];
-        let is_thread = buf[pos + 13] != 0;
+        let tid = u32::from_le_bytes(buf[pos + 4..pos + 8].try_into().unwrap());
+        let state = buf[pos + 8];
+        let is_thread = buf[pos + 9] != 0;
         let memory = u64::from_le_bytes(buf[pos + 16..pos + 24].try_into().unwrap());
         let cpu_ns = u64::from_le_bytes(buf[pos + 24..pos + 32].try_into().unwrap());
         let name_bytes = &buf[pos + 32..pos + 60];
@@ -65,11 +66,10 @@ pub fn main(_args: Vec<String>) {
             format!("{}B", memory)
         };
 
-        let ppid_str = if ppid == u32::MAX { 0 } else { ppid };
         let kind = if is_thread { " (thread)" } else { "" };
 
-        println!("{:>5} {:>3} {:>5} {:>2} {:>8} {:>4}% {:>5}  {}{}",
-            pid, tid, ppid_str, state_str(state), format_cpu_time(cpu_ns),
+        println!("{:>5} {:>3} {:>2} {:>8} {:>4}% {:>5}  {}{}",
+            pid, tid, state_str(state), format_cpu_time(cpu_ns),
             cpu_pct, mem, name, kind);
 
         pos += ENTRY;

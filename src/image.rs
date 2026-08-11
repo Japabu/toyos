@@ -43,13 +43,18 @@ pub fn create_initrd(
 /// Takes the artifacts as bytes rather than reading them: the caller stages them
 /// under a build-key-derived name first, because cargo's own path is shared by
 /// every config and is overwritten by any concurrent build (see `build.rs`).
-pub fn create_boot_image(kernel_bytes: &[u8], bl_bytes: &[u8], initrd_bytes: &[u8]) -> Vec<u8> {
+pub fn create_boot_image(
+    kernel_bytes: &[u8],
+    bl_bytes: &[u8],
+    initrd_bytes: &[u8],
+    cmdline: &str,
+) -> Vec<u8> {
     // Drawn here and written twice: into the GPT entry that *is* the log
     // partition, and into a file on the ESP that the bootloader hands the
     // kernel. The kernel is given the partition by name; nothing anywhere goes
     // looking for one by type or by format.
     let log_guid = uuid::Uuid::new_v4();
-    let esp_volume = create_esp_volume(kernel_bytes, bl_bytes, initrd_bytes, log_guid);
+    let esp_volume = create_esp_volume(kernel_bytes, bl_bytes, initrd_bytes, log_guid, cmdline);
     let log_volume = create_log_volume();
     create_gpt_disk(esp_volume, log_volume, log_guid)
 }
@@ -205,15 +210,15 @@ fn build_time() -> FatTime {
 ///
 /// Using `toyos-fat32` is not a way round them. It deletes the second FAT32
 /// writer from the project: this is the one the kernel appends `kernel.log`
-/// with, the one `toyos-fat32`'s host suite runs `fsck_msdos` and a real macOS
-/// mount against on every `cargo test` in that crate, and now the one the claim
-/// "the image we build is clean" is a claim about. `fatfs` keeps the format
-/// call, where it has never had a complaint against it — an empty volume has no
-/// subdirectory for either bug to live in.
+/// with, the one `toyos-fat32`'s host suite runs the volume checker and a real
+/// macOS mount against on every `cargo test` in that crate, and now the one the
+/// claim "the image we build is clean" is a claim about. `fatfs` keeps the
+/// format call, where it has never had a complaint against it — an empty volume
+/// has no subdirectory for either bug to live in.
 ///
-/// The free-cluster count is the third thing `fsck_msdos` used to ask for:
+/// The free-cluster count is the third thing the checker asks for:
 /// `format_volume` leaves FSInfo's field 0xFFFFFFFF, which FAT32 defines as
-/// "unknown" and `fsck_msdos` reports as `Free space in FSInfo block is unset`.
+/// "unknown" and every host then reports this volume's free space from.
 /// `free_bytes` counts the FAT when the volume arrived without a hint and
 /// `sync` writes it.
 fn populate(volume: &mut [u8], label: &str, files: &[(&str, &[u8])]) {
@@ -245,6 +250,7 @@ fn create_esp_volume(
     bootloader: &[u8],
     initrd: &[u8],
     log_guid: uuid::Uuid,
+    cmdline: &str,
 ) -> Vec<u8> {
     let content_size = kernel.len() + bootloader.len() + initrd.len();
     let total_size = round_up_sectors(
@@ -267,6 +273,12 @@ fn create_esp_volume(
             // and nothing converts the table's, so the comparison that decides
             // which partition holds the log cannot be got backwards.
             ("toyos/log.guid", &log_guid.to_bytes_le()),
+            // The actuators this boot arms, comma-separated and empty on every
+            // image anyone ships. Read by the bootloader beside the three above
+            // and handed to the kernel in `KernelArgs`, because the earliest
+            // actuator fires before `mm::init` and there is nowhere later to
+            // fetch it from. `kernel/src/actuator.rs` is the list.
+            ("toyos/cmdline", cmdline.as_bytes()),
         ],
     );
 
@@ -277,7 +289,7 @@ fn create_esp_volume(
 ///
 /// Exactly [`FAT32_MIN_BYTES`], because the floor is not ours to choose and the
 /// log cannot use much of it: two generations of `kernel.log` come to 8 MiB at
-/// `log_file::MAX_LOG_BYTES`, under a quarter of what this volume has free, and
+/// `log_file::max_log_bytes`, under a quarter of what this volume has free, and
 /// there is no smaller FAT32 to cut it down to.
 fn create_log_volume() -> Vec<u8> {
     let mut volume = format_fat32(FAT32_MIN_BYTES, "TOYOS-LOG");
@@ -288,83 +300,52 @@ fn create_log_volume() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Command;
 
-    /// Everything `fsck_msdos -n` has to say about a volume, minus the one
-    /// summary line a clean run prints.
+    /// The two volumes this build writes break no rule of the format, and the
+    /// gate is silence rather than sameness.
     ///
-    /// Never the exit code: `fsck_msdos -n` exits 0 while printing `Fix?` for
-    /// problems it declined to repair, and exits 0 on a volume it has just
-    /// called dirty.
-    fn fsck(volume: &[u8], name: &str) -> Vec<String> {
-        let tool = std::path::Path::new("/sbin/fsck_msdos");
-        assert!(tool.exists(), "no /sbin/fsck_msdos: this gate's outside judge is missing");
-        let path = std::env::temp_dir().join(format!("toyos-image-{}-{name}.vol", std::process::id()));
-        std::fs::write(&path, volume).expect("stage the volume for fsck");
-        let out = Command::new(tool).arg("-n").arg(&path).output().expect("run fsck_msdos");
-        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&out.stderr));
-        let _ = std::fs::remove_file(&path);
-
-        let mut summaries = 0;
-        let mut complaints = Vec::new();
-        for line in text.lines().map(str::trim_end) {
-            if line.is_empty()
-                || line.starts_with("**")
-                || line.starts_with(&path.display().to_string())
-            {
-                continue;
-            }
-            // `Warning: 5 files, 306560 KiB free (76640 clusters)`.
-            let summary = line
-                .strip_prefix("Warning: ")
-                .and_then(|rest| rest.split_once(' '))
-                .is_some_and(|(n, tail)| {
-                    n.chars().all(|c| c.is_ascii_digit()) && tail.starts_with("files,")
-                });
-            if summary {
-                summaries += 1;
-                continue;
-            }
-            complaints.push(line.to_string());
-        }
-        assert_eq!(summaries, 1, "fsck_msdos printed {summaries} summary lines, wanted one:\n{text}");
-        complaints
-    }
-
-    /// The two volumes this build writes are `fsck_msdos`-clean, and the gate
-    /// is silence rather than sameness.
-    ///
-    /// The ESP was not, from the first image this project ever built until
-    /// [`populate`] stopped writing it with `fatfs` — twelve complaints, before
-    /// any guest ran, from two format violations that crate's `create_dir` has.
-    /// The consequence was not only a dirty volume: `esp_filesystem` could only
-    /// ask that the guest add no *new* complaint, so a complaint the guest
-    /// produced for its own reason would have hidden inside the twelve.
+    /// The ESP did break some, from the first image this project ever built
+    /// until [`populate`] stopped writing it with `fatfs` — twelve complaints,
+    /// before any guest ran, from two format violations that crate's
+    /// `create_dir` has. The consequence was not only a dirty volume:
+    /// `esp_filesystem` could only ask that the guest add no *new* complaint,
+    /// so a complaint the guest produced for its own reason would have hidden
+    /// inside the twelve.
     ///
     /// Here rather than in the boot suite because it needs no guest, no QEMU
     /// and no kernel: it is a claim about the writer, and it fails in seconds
     /// on `cargo test --lib`.
     #[test]
-    fn the_volumes_this_build_writes_are_fsck_clean() {
-        let esp = create_esp_volume(b"kernel", b"bootloader", b"initrd", uuid::Uuid::new_v4());
-        let complaints = fsck(&esp, "esp");
-        assert!(complaints.is_empty(), "fsck_msdos on the ESP:\n{}", complaints.join("\n"));
-
-        let log = create_log_volume();
-        let complaints = fsck(&log, "log");
-        assert!(complaints.is_empty(), "fsck_msdos on the log volume:\n{}", complaints.join("\n"));
+    fn the_volumes_this_build_writes_break_no_format_rule() {
+        for (what, volume) in [
+            ("ESP", create_esp_volume(b"kernel", b"bootloader", b"initrd", uuid::Uuid::new_v4(), "")),
+            ("log volume", create_log_volume()),
+        ] {
+            let complaints = toyos_fat32_check::check(&volume);
+            assert!(
+                complaints.is_empty(),
+                "the {what} this build writes is not a clean FAT32 volume:\n{}",
+                toyos_fat32_check::describe(&complaints)
+            );
+        }
     }
 
     /// And it is clean because it is right, not because it is empty: a
     /// `populate` that wrote nothing at all would satisfy the gate above.
     #[test]
     fn the_esp_carries_what_the_bootloader_looks_for() {
-        let mut esp = create_esp_volume(b"kernel", b"bootloader", b"initrd", uuid::Uuid::new_v4());
+        let mut esp =
+            create_esp_volume(b"kernel", b"bootloader", b"initrd", uuid::Uuid::new_v4(), "");
         let mut fs = Fat32::mount(VolumeIo(&mut esp)).expect("mount the ESP we just built");
         let found: Vec<String> =
             fs.walk(64).expect("walk the ESP").into_iter().map(|(path, _)| path).collect();
-        for want in ["EFI/BOOT/BOOTx64.EFI", "toyos/kernel.elf", "toyos/initrd.img", "toyos/log.guid"]
+        for want in [
+            "EFI/BOOT/BOOTx64.EFI",
+            "toyos/kernel.elf",
+            "toyos/initrd.img",
+            "toyos/log.guid",
+            "toyos/cmdline",
+        ]
         {
             assert!(found.iter().any(|p| p.trim_start_matches('/') == want), "{want} is not on the ESP; it holds {found:?}");
         }

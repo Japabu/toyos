@@ -2,7 +2,7 @@
 //! claimed.
 //!
 //! Every test here starts from a real volume — `newfs_msdos` made it, macOS
-//! populated it, `fsck_msdos` passed it — and then breaks it on purpose. The
+//! populated it, the checker passed it — and then breaks it on purpose. The
 //! assertion in all of them is the same: a typed error, and never a panic, a
 //! hang, or an allocation the volume chose the size of. A `#[test]` that
 //! returns has already proved the no-panic half, because a panic in a test is

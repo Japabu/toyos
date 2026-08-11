@@ -1,5 +1,29 @@
 # ToyOS Capability Handles — Technical Specification
 
+> **Delivered by `specs/capability-endowment-spec.md`, 2026-08-10, and read that
+> one for the end state.** The endowment branch built §1's whole object model —
+> `ObjectCore { koid, handle_count, retired }`, the per-variant census, the
+> generation-tagged `RawHandle`, `HandleTable` in place of `FdTable`, and every
+> `Descriptor` kind as an object — and the end state of §1's fourth bullet with
+> it: a handle a process does not hold ends that process. `Fd`, `PipeId`,
+> `SharedToken`, `signal_pipe_id`, pid-addressed `kill`/`waitpid` and the service
+> registry are all retired numbers.
+>
+> **Four things this document asks for that are not there.** Its §12.4 gate list
+> names `handle_basic`, `handle_transfer`, `kill_while_blocked` and
+> `device_claim_crash_release`; the endowment branch built `handle_kill_policy`
+> and `process_lifecycle` and left those four to the tests that happen to cover
+> their properties (`fd_lifetime`, `abuse_shared_grant`, `device_claim_lifetime`,
+> the audio clients). Each is a name nothing answers to, which is the shape a
+> gate list should not have.
+>
+> **And two it asks for that the design cannot express.** §6.3's
+> `shm_h_with_MAP_only` needs a right that does not carry across a send, and
+> `SYS_HANDLE_SEND` requires `TRANSFER` on what it moves
+> (`specs/issues/isolation/a-moved-handle-is-always-re-movable.md`). §14.5's
+> refusal of unmap-others stands, and with it the revocation question in
+> `specs/issues/isolation/process-isolation-ungated.md`.
+
 ## 1. Goals
 
 - **Compile-time kill of the free-while-referenced class** (the crash.md UAF: an
@@ -29,7 +53,7 @@
 at open and reads them by absolute block number with no re-validation, so after an unlink
 frees those blocks to bcachefs's allocator and another file takes them, a process
 demand-paging the unlinked file reads **another process's file contents**. Ordinary
-filesystem operations, no crafting (`specs/known-issues.md` §1).
+filesystem operations, no crafting (`specs/issues/isolation/`).
 
 That is this spec's refcount, missing: the backing must keep the file's blocks alive for
 as long as it can read them. It is deliberately left unfixed pending this work, because a
@@ -37,7 +61,7 @@ local patch — re-validating extents per read, or invalidating backings on unli
 reimplements refcounting badly at one call site while every other cached reference keeps
 the same shape.
 
-`known-issues.md` §1 names the pair this closes: **an id or a name treated as a
+`specs/issues/isolation/` names the pair this closes: **an id or a name treated as a
 capability** (guessing a designation) and **a reference that outlives the object it
 names** (outliving one). Handles make the first unrepresentable by carrying rights and the
 second by carrying a refcount.
@@ -547,6 +571,14 @@ stdio pre-seeding at spawn.
 known issue. `PendingPoll` keys move from fd numbers to `(Koid, RawHandle)`;
 close-cancels-poll is preserved via the koid.
 
+**The rule underneath that move:** an fd number names a slot in one process's
+table and means nothing in another's, so anything reached across a process
+boundary is selected by the object it watches and never by the number.
+`io_uring::remove_fd` now takes `sources: &[Option<Source>]` with no fd number
+in its signature, which makes the old shape unrepresentable at its one call
+site; the rule is what stops the next cross-process structure being keyed the
+same way.
+
 ## 7. Kernel-internal integers: what stays, what dies
 
 | Today | Becomes | Why safe |
@@ -973,7 +1005,7 @@ kill-soundd-respawn-audio-recovers.
 
 **Stage F — audit & shrink.**
 Dead constants and `_ =>` arms deleted; grep-gates added to CI (§12.2); CLAUDE.md
-architecture + known-issues updated (closes: `SharedToken` RAII, io_uring shm abuse,
+architecture + `specs/issues/` updated (closes: `SharedToken` RAII, io_uring shm abuse,
 `Fd` rename, unprivileged RT); census check in `log_health` behind a boot flag.
 
 Dependency notes: Stages A–D are independent of Phase 1 (scheduler) and Phase 2

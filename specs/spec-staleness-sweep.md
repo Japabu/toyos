@@ -69,7 +69,7 @@ with a halving as the threshold. Proven in both directions: forcing the balance 
 false takes the reach to 0% and the test reds with `its *reach* has collapsed`, while the
 sweep line printed beside it still reads `clean`. Evidence and per-scenario figures in
 `specs/metal-track-history.md`; the A/B across the redesign is an entry criterion in
-`specs/known-issues.md`.
+`specs/issues/`.
 
 Generalised: whenever a change touches the machinery a gate's *precondition* depends on,
 the gate's reach is a silent casualty. Whenever a check has a window, a filter or a
@@ -111,12 +111,17 @@ The dead-gate pattern is prose claiming a test proves something. Its **inverse**
 is a test that asserts the current, *known-wrong* behaviour on purpose, so that
 fixing the behaviour turns the test red and tells you the limitation lifted.
 
-`pipe_peer_scope` is the model. It asserts `be604ef`'s stated residual — a peer
-that only ever called `connect()` can open a pipe it was never handed and read
-another client's data. It passes today. The day `SYS_HANDLE_SEND` lands it goes
-red, with a panic message that says what to do:
+`pipe_peer_scope` was the model, and it worked: it asserted `be604ef`'s stated
+residual — a peer that only ever called `connect()` could open a pipe it was
+never handed and read another client's data — and carried the message that said
+what to do the day the residual closed:
 
 > `GOOD NEWS, BAD TEST: delete this file and assert the refusal instead.`
+
+Capability endowment closed it: a client's connection records no peer pid, so
+the clause that gave a peer its creator's pipes cannot fire. The file is
+deleted, which is the ending this pattern is *for* — `abuse_pipe_owner` carries
+the general property from here.
 
 **Use this whenever an entry is blocked on a named condition.** Of the three
 isolation items currently blocked, it is the only one that can watch for its own
@@ -187,7 +192,7 @@ merely plausible.
 Cheapest check here and the one that saved most. Twice in one session an approved
 change turned out to belong to a different owner: boot-log capture already
 existed, and serial interleaving was a **libc** defect, not the kernel one its
-own known-issues heading named.
+own `specs/issues/` heading named.
 
 Both times checking cost minutes. Not checking would have cost a wrong change
 *and* a wrong record — a "fixed" note over an untouched defect, which is worse
@@ -230,7 +235,7 @@ objection or not*. Then check whether that is what the code provides.
 | | Meaning | Where it goes |
 |---|---|---|
 | **STALE** | Spec asserts something false about current code | Fix the spec |
-| **OPEN DEFECT** | Spec identified a real problem; the code never got it | `known-issues.md` — a *code* bug |
+| **OPEN DEFECT** | Spec identified a real problem; the code never got it | `specs/issues/` — a *code* bug |
 | **PLAN CHANGED** | Code deliberately diverges from the spec's intent | Ask the owner; a design decision, not a doc fix |
 | **ACCURATE** | Verified true | Nothing |
 

@@ -201,16 +201,37 @@ const _: () = assert!(core::mem::offset_of!(PerCpu, last_seen_ring0_fires) == 25
 const _: () = assert!(core::mem::offset_of!(PerCpu, fault_state) == 256);
 const _: () = assert!(core::mem::offset_of!(PerCpu, last_armed_ticks) == 260);
 
-const IDLE_STACK_SIZE: usize = 16384; // 16KB
+/// **One stack size, so "which stack am I on" is not a question kernel code
+/// has to answer.**
+///
+/// It was 16 KiB, and that number was never a decision about the work this
+/// stack carries. The idle loop runs a scheduler pass, `drain_irqs` — which
+/// reaches USB enumeration — `log_file::poll`, a filesystem write down to a
+/// block device whose measured high water was **11,505 bytes of the 16,384**
+/// with the USB command path still below the probe, and
+/// `object::drain_zero_handles`, which releases arbitrary kernel objects.
+///
+/// That last one is why this is the same number a task's kernel stack is.
+/// `kobject!` classifies each object `deferred` or `immediate`, and an
+/// `immediate` row's promise is that its destructor runs on the dropping
+/// thread's 128 KiB stack rather than here — which `6d81a73` bought at 147
+/// collateral reds after a killed process's file flush wrote through the guard
+/// page below. **A `deferred` object may own an `immediate` one**: a `File`
+/// sent over a connection whose peer dies is released from the drain, so the
+/// classification is defeated by nesting and the macro cannot see it. Nothing
+/// expressible in the object layer fixes that, because the entries are dropped
+/// wherever the drain runs — so the drain gets a stack, and the invariant
+/// becomes one every release path already has.
+///
+/// The cost is 112 KiB per CPU of a machine's physical memory, 14 MiB at 128
+/// cores.
+const IDLE_STACK_SIZE: usize = crate::process::KERNEL_STACK_SIZE;
 
 /// One unmapped 4 KiB page below every idle stack.
 ///
-/// The idle stack is ordinary heap, so without this an overflow does not fault
-/// — it rewrites whatever the allocator put underneath, and the damage
-/// surfaces later and elsewhere. That is not hypothetical here: the idle loop
-/// runs `log_file::poll`, a filesystem write reaching a block device, whose
-/// measured high water was 11,505 bytes of the 16,384 with the USB command
-/// path still below the probe.
+/// The idle stack is ordinary physical memory, so without this an overflow does
+/// not fault — it rewrites whatever is underneath, and the damage surfaces
+/// later and elsewhere.
 ///
 /// Unmapped rather than [`IST1_GUARD_SIZE`]'s fill pattern, and the difference
 /// is the stack, not the taste: #PF has no IST, so a frame pushed past the
@@ -235,7 +256,7 @@ const IDLE_GUARD_SIZE: usize = 4096;
 /// Both numbers here are `ist1_report`'s, off a real #DF, not estimates:
 /// **9968 bytes** used before the drain buffers were cut to `DRAIN_CHUNK`, and
 /// **4512** after. So the overrun was 5872 bytes — four times the ~1.4 KiB
-/// known issues estimated — and, more to the point, cutting the buffers was
+/// first estimated — and, more to the point, cutting the buffers was
 /// never going to be sufficient on its own: 4512 still does not fit 4096. The
 /// stack had to grow whatever happened to the buffers.
 ///
@@ -286,22 +307,30 @@ const IDLE_SLOT: usize = IDLE_GUARD_SIZE + IDLE_STACK_SIZE;
 /// structures, and they went from one TLB entry to 512 — measured against the
 /// same tree with the guard as the only difference, `i8042_mouse` fell from
 /// 1006 pointer events to 27 under the full suite, three runs to one. An arena
-/// the stacks alone share keeps that cost where it belongs: 102 of them per
+/// the stacks alone share keeps that cost where it belongs: 15 of them per
 /// leaf, and nothing else in it.
 ///
 /// Never freed, which is what makes the permanent split sound — a leaf handed
 /// back to the PMM would be reissued with a hole in its direct map.
-static IDLE_STACKS: crate::sync::Lock<IdleArena> =
-    crate::sync::Lock::new(IdleArena { pages: alloc::vec::Vec::new(), next: 0, left: 0 });
+static IDLE_STACKS: crate::sync::Lock<IdleArena> = crate::sync::Lock::new(IdleArena {
+    pages: alloc::vec::Vec::new(),
+    stacks: alloc::vec::Vec::new(),
+    next: 0,
+    left: 0,
+});
 
 struct IdleArena {
     pages: alloc::vec::Vec<crate::mm::pmm::PhysPage>,
+    /// The bottom of every idle stack this machine has, so the deepest any of
+    /// them has ever gone can be read from one CPU. Without it the measurement
+    /// is per-CPU and the CPU that ran deepest is the one that is not asking.
+    stacks: alloc::vec::Vec<u64>,
     /// Direct-map address of the next free slot.
     next: u64,
     left: usize,
 }
 
-/// A zeroed, 4 KiB-aligned `IDLE_SLOT` from the arena.
+/// A 4 KiB-aligned `IDLE_SLOT` from the arena.
 fn alloc_idle_slot() -> u64 {
     let mut arena = IDLE_STACKS.lock();
     if arena.left < IDLE_SLOT {
@@ -314,14 +343,56 @@ fn alloc_idle_slot() -> u64 {
     let base = arena.next;
     arena.next += IDLE_SLOT as u64;
     arena.left -= IDLE_SLOT;
+    arena.stacks.push(base + IDLE_GUARD_SIZE as u64);
     base
 }
 
 fn alloc_idle_stack(percpu: &mut PerCpu) {
     let base = alloc_idle_slot();
     crate::mm::paging::guard_kernel_page(base);
+    // Filled rather than zeroed, for [`idle_stack_high_water`]: a zero is a
+    // value the stack legitimately holds, so it cannot tell untouched from
+    // written. After the guard, because the guard's page is no longer mapped.
+    unsafe {
+        core::ptr::write_bytes(
+            (base + IDLE_GUARD_SIZE as u64) as *mut u8,
+            STACK_FILL,
+            IDLE_STACK_SIZE,
+        )
+    };
     percpu.idle_stack_top = base + IDLE_SLOT as u64;
     percpu.idle_rsp = percpu.idle_stack_top;
+}
+
+/// How big one idle stack is. Read by `SYS_DEBUG`, so the high water below is
+/// a fraction of something rather than a number with no scale.
+pub fn idle_stack_size() -> usize {
+    IDLE_STACK_SIZE
+}
+
+/// The deepest any CPU's idle stack has ever been, in bytes.
+///
+/// **The instrument that says whether [`IDLE_STACK_SIZE`] is a decision or a
+/// hope.** The guard page below turns an overflow into a reported fault, which
+/// is a machine that stopped; this answers before it, from a running one, and
+/// is what a churn test asserts against so a release path that grows deep is a
+/// red rather than a halt.
+///
+/// Read from the bottom up, so it is the high water and not the current depth:
+/// nothing legitimate writes [`STACK_FILL`], and a frame that reached a byte
+/// leaves it changed for the rest of the boot.
+pub fn idle_stack_high_water() -> usize {
+    let arena = IDLE_STACKS.lock();
+    arena
+        .stacks
+        .iter()
+        .map(|&bottom| {
+            let untouched =
+                words(bottom, IDLE_STACK_SIZE).take_while(|&w| w == STACK_FILL_WORD).count() * 8;
+            IDLE_STACK_SIZE - untouched
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn alloc_ist1_stack(percpu: &mut PerCpu) {
@@ -407,44 +478,16 @@ pub fn init_bsp(lapic_id: u32) {
     alloc_ist1_stack(percpu);
 
     unsafe { percpu.load_gdt(); }
-    cpu::enable_sse();
-    let smep = cpu::enable_smep();
-    let smap = cpu::enable_smap();
-    require_fsgsbase(cpu::enable_fsgsbase());
-    let pcid = crate::mm::paging::enable_pcid();
+    super::control_regs::init(0);
+    super::fpu::init();
 
     cpu::wrmsr(MSR_GS_BASE, ptr as u64);
 
     // GS base is now valid — enable CPU/TID context in log! macro
     crate::log::PERCPU_READY.store(true, core::sync::atomic::Ordering::Release);
 
-    // One line for the whole machine. Every CPU runs the identical sequence
-    // against identical silicon, so the per-CPU repetition this replaces was
-    // 4 lines times the core count of noise carrying one bit each — 28 of the
-    // T14's ~150 boot lines, on a screen that holds 67. Reported rather than
-    // asserted: on TCG none of the three is available, and a line claiming
-    // otherwise would be a diagnostic that lies on the only machine most of
-    // this tree's boots happen on.
-    log!(
-        "percpu: BSP cpu_id=0 lapic_id={} smep={} smap={} pcid={}",
-        lapic_id, on(smep), on(smap), on(pcid)
-    );
-}
-
-fn on(enabled: bool) -> &'static str {
-    if enabled { "on" } else { "off" }
-}
-
-/// Unlike SMEP, SMAP and PCID, FSGSBASE is not optional here: `hw.rs` saves and
-/// restores the user TLS base with `rdfsbase`/`wrfsbase` on every context
-/// switch, so a CPU without it would #UD at the first one. Said out loud rather
-/// than discovered, because the alternative is a fault on a path that has no
-/// business faulting, on some future machine, with no line explaining it.
-fn require_fsgsbase(enabled: bool) {
-    assert!(
-        enabled,
-        "cpu: FSGSBASE is required — every context switch uses rdfsbase/wrfsbase",
-    );
+    log!("percpu: BSP cpu_id=0 lapic_id={lapic_id}");
+    super::fpu::log_state();
 }
 
 /// Allocate percpu for an AP on the BSP. Returns the raw pointer for the trampoline
@@ -459,16 +502,16 @@ pub fn alloc_ap(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
 
 /// Finish AP percpu initialization (called from ap_entry after GS base is set by trampoline).
 ///
-/// Silent throughout: `boot_aps` already logs one line per AP that came up,
-/// and this CPU's answers to the feature questions are the BSP's answers.
+/// `control_regs::init` and `fpu::log_state` are the two things here that print,
+/// and each says at its own definition why it may not assume this CPU answers
+/// like the BSP. Everything else is silent: `boot_aps` already logs one line per
+/// AP that came up.
 pub fn init_ap(percpu_ptr: *mut PerCpu) {
     let percpu = unsafe { &mut *percpu_ptr };
     unsafe { percpu.load_gdt(); }
-    cpu::enable_sse();
-    cpu::enable_smep();
-    cpu::enable_smap();
-    require_fsgsbase(cpu::enable_fsgsbase());
-    crate::mm::paging::enable_pcid();
+    super::control_regs::init(percpu.cpu_id);
+    super::fpu::init();
+    super::fpu::log_state();
 }
 
 /// Update both the percpu kernel_rsp (for syscall entry) and tss.rsp0 (for interrupts).
@@ -534,7 +577,7 @@ pub fn idle_rsp_ptr() -> *mut u64 {
 
 /// The byte immediately below this CPU's idle stack — the last byte of its
 /// guard page, and the first thing an overflowing frame reaches.
-#[cfg(feature = "test-idle-guard")]
+#[cfg(feature = "test-actuators")]
 pub fn idle_guard_byte() -> u64 {
     idle_stack_top() - IDLE_STACK_SIZE as u64 - 1
 }

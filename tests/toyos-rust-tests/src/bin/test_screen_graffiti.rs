@@ -5,5 +5,5 @@
 //! This action must return, or the console would have nothing left to be asked
 //! to clean up.
 fn main() {
-    toyos_abi::syscall::debug(8);
+    toyos_abi::syscall::debug(toyos_abi::syscall::debug_action::SCREEN_GRAFFITI);
 }

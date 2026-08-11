@@ -11,7 +11,7 @@ use core::ptr::{copy_nonoverlapping, write_bytes};
 
 use crate::log;
 use super::super::device::Endpoint;
-use super::Restart;
+use super::{Owed, Restart};
 use super::super::{with_disk, Disk, StorageGeometry, Trb, TrbRing, XhciController, PAGE};
 use super::super::{CC_SUCCESS, CC_STALL, CC_SHORT_PACKET, TRB_NORMAL, OFF_INPUT_CTX};
 use super::super::USB_TIMEOUT_NS;
@@ -32,6 +32,24 @@ const HOST_BLOCK: u32 = 4096;
 /// timeout and must not be given three more of them. Boot time is what is
 /// being protected, and boot time is what this measures.
 const READY_BUDGET_NS: u64 = 500_000_000;
+
+/// How many times one SCSI command is issued when the transport breaks under
+/// it.
+///
+/// **Derived rather than tuned.** A transfer the driver stopped waiting for is
+/// still the device's to answer, and that answer can undo one Reset Recovery
+/// (see [`XhciController::reset_recovery`]) — once, because there is one such
+/// transfer and it is answered once. So the first attempt can break on the
+/// fault itself, the second on the recovery that answer undid, and a third
+/// attempt runs over a transport nothing left over is still able to disturb. A
+/// command that breaks all three times is a device that is not recovering, and
+/// the caller is told so rather than being made to wait for a fourth
+/// [`USB_TIMEOUT_NS`].
+///
+/// It costs nothing on a device that is merely gone: [`XhciController::scsi`]
+/// re-issues only after a Reset Recovery that *succeeded*, and a dead device
+/// fails that on the class request it does not answer.
+const MAX_TRANSPORT_ATTEMPTS: u8 = 3;
 
 const CBW_SIGNATURE: u32 = 0x4342_5355;
 const CSW_SIGNATURE: u32 = 0x5342_5355;
@@ -101,6 +119,12 @@ impl MscDevice {
     /// "did this disk ever come up", not "is it still there".
     pub fn online(&self) -> bool {
         !self.failed
+    }
+
+    /// Which slot this disk is on, for a caller holding an event that needs to
+    /// know whether a disk is behind it.
+    pub fn slot_id(&self) -> u8 {
+        self.slot_id
     }
 
     pub fn geometry(&self) -> StorageGeometry {
@@ -204,7 +228,7 @@ impl core::fmt::Display for Broke {
 /// state a transfer that ran out [`USB_TIMEOUT_NS`] leaves behind. So the
 /// recovery below runs against a real endpoint state, which is the whole thing
 /// under test. Same reason `xhci-one-slot` and `xhci-slow-connect` exist.
-#[cfg(feature = "usb-transport-break")]
+#[cfg(feature = "boot-actuators")]
 mod transport_break {
     use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -213,6 +237,9 @@ mod transport_break {
 
     /// Called where the driver is about to run a WRITE(10) data phase.
     pub fn arm() {
+        if !crate::actuator::usb_transport_break() {
+            return;
+        }
         ARMED.store(UNSPENT.swap(false, Ordering::Relaxed), Ordering::Relaxed);
     }
 
@@ -242,7 +269,7 @@ mod transport_break {
 /// Only the residue is the injection's, and it names bytes that really are not
 /// this transfer's. Same reason `usb-transport-break` and `xhci-one-slot`
 /// exist.
-#[cfg(feature = "usb-short-read")]
+#[cfg(feature = "boot-actuators")]
 pub(in crate::drivers::xhci) mod short_read {
     use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -258,6 +285,9 @@ pub(in crate::drivers::xhci) mod short_read {
     static ARMED: AtomicBool = AtomicBool::new(false);
 
     pub fn arm() {
+        if !crate::actuator::usb_short_read() {
+            return;
+        }
         ARMED.store(true, Ordering::Relaxed);
     }
 
@@ -351,13 +381,15 @@ fn log_refusal(cdb: &[u8], key: u8, asc: u8, ascq: u8) {
 /// cache answers, and must not be a failure; HARDWARE ERROR / INTERNAL TARGET
 /// FAILURE is a flush that was tried and did not work, and must reach the
 /// caller as one.
-const FLUSH_SENSE: Option<(u8, u8, u8)> = if cfg!(feature = "usb-flush-unimplemented") {
-    Some((0x05, 0x20, 0x00))
-} else if cfg!(feature = "usb-flush-fails") {
-    Some((0x04, 0x44, 0x00))
-} else {
-    None
-};
+fn flush_sense() -> Option<(u8, u8, u8)> {
+    if crate::actuator::usb_flush_unimplemented() {
+        Some((0x05, 0x20, 0x00))
+    } else if crate::actuator::usb_flush_fails() {
+        Some((0x04, 0x44, 0x00))
+    } else {
+        None
+    }
+}
 
 /// Which way a block transfer moves, so one batching loop serves both without
 /// a `&[u8]` pretending to be a `&mut [u8]`.
@@ -416,7 +448,7 @@ impl XhciController {
             // a cache flush above a block device can mean.
             let cdb = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
             let issued = ctrl.scsi(dev, &cdb, 10, 0, 0, false);
-            let outcome = match FLUSH_SENSE {
+            let outcome = match flush_sense() {
                 Some((key, asc, ascq)) => Scsi::Refused { key, asc, ascq },
                 None => issued,
             };
@@ -540,8 +572,17 @@ impl XhciController {
         true
     }
 
-    /// One SCSI command, with the transport's recovery applied. `Scsi::Ok`
-    /// means the device reported success and moved `delivered` bytes.
+    /// One SCSI command, with the transport's recovery applied and the command
+    /// re-issued over the transport that recovery gave back. `Scsi::Ok` means
+    /// the device reported success and moved `delivered` bytes.
+    ///
+    /// **Reset Recovery restores the transport and says nothing about the
+    /// command**, so a driver that recovers and then reports failure has thrown
+    /// away a write it could have completed — the T14's boot disk losing a
+    /// block to one transport hiccup. Every CDB this file issues is
+    /// idempotent, and the caller's bytes are still in the same DMA window
+    /// nothing between two attempts touches, so an attempt is a genuine
+    /// re-issue of the same command and not an approximation of one.
     fn scsi(
         &mut self,
         dev: &mut MscDevice,
@@ -551,22 +592,32 @@ impl XhciController {
         data_len: u32,
         data_in: bool,
     ) -> Scsi {
-        match self.bot(dev, cdb, cdb_len, data_phys, data_len, data_in) {
-            Ok(Bot::Done { delivered }) => Scsi::Ok { delivered },
-            Ok(Bot::Failed) => {
-                let (key, asc, ascq) = self.request_sense(dev);
-                Scsi::Refused { key, asc, ascq }
-            }
-            Err(broke) => {
-                log!("usb-storage: transport broke on SCSI {:#04x}: {broke}",
-                    cdb.first().copied().unwrap_or(0));
-                if !self.reset_recovery(dev) {
-                    log!("usb-storage: reset recovery failed; disk is offline");
-                    dev.failed = true;
+        let opcode = cdb.first().copied().unwrap_or(0);
+        for attempt in 1..=MAX_TRANSPORT_ATTEMPTS {
+            match self.bot(dev, cdb, cdb_len, data_phys, data_len, data_in) {
+                Ok(Bot::Done { delivered }) => {
+                    if attempt > 1 {
+                        log!("usb-storage: SCSI {opcode:#04x} completed on attempt {attempt}");
+                    }
+                    return Scsi::Ok { delivered };
                 }
-                Scsi::Broken
+                Ok(Bot::Failed) => {
+                    let (key, asc, ascq) = self.request_sense(dev);
+                    return Scsi::Refused { key, asc, ascq };
+                }
+                Err(broke) => {
+                    log!("usb-storage: transport broke on SCSI {opcode:#04x}: {broke}");
+                    if !self.reset_recovery(dev) {
+                        log!("usb-storage: reset recovery failed; disk is offline");
+                        dev.failed = true;
+                        return Scsi::Broken;
+                    }
+                }
             }
         }
+        log!("usb-storage: SCSI {opcode:#04x} broke {MAX_TRANSPORT_ATTEMPTS} times running; \
+             the transport is not coming back on its own");
+        Scsi::Broken
     }
 
     /// REQUEST SENSE, as (sense key, ASC, ASCQ) and zeroed if the device would
@@ -664,11 +715,11 @@ impl XhciController {
         // the CSW's residue is checked against below.
         let mut moved = 0u32;
         if data_len > 0 {
-            #[cfg(feature = "usb-transport-break")]
+            #[cfg(feature = "boot-actuators")]
             if cdb.first() == Some(&0x2A) {
                 transport_break::arm();
             }
-            #[cfg(feature = "usb-short-read")]
+            #[cfg(feature = "boot-actuators")]
             let held = short_read::hold(
                 &dma,
                 (data_phys - dma.phys()) as usize,
@@ -676,7 +727,7 @@ impl XhciController {
                 data_in && cdb.first() == Some(&0x28),
             );
             let completion = self.bulk(dev, data_in, data_phys, data_len);
-            #[cfg(feature = "usb-short-read")]
+            #[cfg(feature = "boot-actuators")]
             let completion = short_read::release(&dma, held, completion);
             match completion {
                 Some((CC_SUCCESS | CC_SHORT_PACKET, unmoved)) => {
@@ -765,25 +816,25 @@ impl XhciController {
         ring.enqueue(trb);
         let slot = dev.slot_id;
         self.ring_doorbell(slot, dci);
-        #[cfg(feature = "usb-transport-break")]
+        #[cfg(feature = "boot-actuators")]
         if transport_break::take() {
             return None;
         }
         self.wait_transfer(slot, dci)
     }
 
-    /// One of this disk's bulk endpoints, back to a state that runs TRBs.
+    /// One of this disk's bulk endpoints, as the recovery needs to see it.
     ///
     /// The route is [`XhciController::restart_endpoint`]'s to choose, because
     /// which command is legal is a property of the endpoint's state and nothing
     /// about that is per class. All this decides is which of the pair is meant.
-    fn restart_bulk(&mut self, dev: &mut MscDevice, in_dir: bool) -> bool {
+    fn bulk_endpoint<'a>(dev: &'a mut MscDevice, in_dir: bool) -> Restart<'a> {
         let (dci, ep_addr, ring_off) = if in_dir {
             (dev.in_dci, dev.in_ep, MSC_IN_RING)
         } else {
             (dev.out_dci, dev.out_ep, MSC_OUT_RING)
         };
-        self.restart_endpoint(Restart {
+        Restart {
             slot_id: dev.slot_id,
             ctx_block: dev.dev_block,
             dci,
@@ -791,26 +842,62 @@ impl XhciController {
             ring_at: dev.block + ring_off,
             ring: if in_dir { &mut dev.in_ring } else { &mut dev.out_ring },
             ep0_ring: &mut dev.ep0_ring,
-        })
+        }
+    }
+
+    /// One of this disk's bulk endpoints, back to a state that runs TRBs.
+    fn restart_bulk(&mut self, dev: &mut MscDevice, in_dir: bool) -> bool {
+        self.restart_endpoint(Self::bulk_endpoint(dev, in_dir))
     }
 
     /// Bulk-Only Mass Storage Reset plus whatever each endpoint needs: what the
     /// class specification requires once the device's command/data/status state
     /// machine no longer agrees with the driver's.
+    ///
+    /// **Both endpoints come off their transfers before the device is spoken
+    /// to, and that order is the whole of the correctness.** The transfer this
+    /// recovers from is one the driver stopped waiting for, which is not one
+    /// that is over: it is still the controller's to run and still the device's
+    /// to answer. A class request issued into that window is undone by the
+    /// answer when it lands — the device finishes the command it was given, is
+    /// left owing a status block again, and stalls the next command block the
+    /// driver sends. That is a second broken transfer out of one fault, and a
+    /// caller's write lost with it. Whether the window opens at all is a race
+    /// between the guest and the device, which is why the dev host has never
+    /// seen it and CI reproduces it every run (`specs/issues/hardware/`).
+    ///
+    /// [`Owed`](super::Owed) is what keeps that order rather than a comment.
+    /// Everything this says to the device is [`Self::reset_the_device`], whose
+    /// arguments are the two endpoints' quiesces — so there is no order of
+    /// these three lines that speaks first.
     fn reset_recovery(&mut self, dev: &mut MscDevice) -> bool {
+        let owed_in = self.quiesce_endpoint(&mut Self::bulk_endpoint(dev, true));
+        let owed_out = self.quiesce_endpoint(&mut Self::bulk_endpoint(dev, false));
+        self.reset_the_device(dev, owed_in, owed_out)
+    }
+
+    /// Every word of Reset Recovery that reaches the device, in BOT §5.3.4's
+    /// order: the class request, then a CLEAR_FEATURE for each endpoint that is
+    /// halted.
+    ///
+    /// It takes both endpoints' [`Owed`](super::Owed) because the class request
+    /// may not go out until the controller has taken both of them off their
+    /// transfers — see [`Self::reset_recovery`]. Reading them afterwards would
+    /// have been the same code with the guarantee taken out.
+    fn reset_the_device(&mut self, dev: &mut MscDevice, in_ep: Owed, out_ep: Owed) -> bool {
         let slot = dev.slot_id;
         let iface = dev.iface as u16;
         let reset = self.control_transfer(slot, &mut dev.ep0_ring, 0x21, 0xFF, 0, iface, None, 0);
         if !reset.done() {
             log!("usb-storage: slot {slot} would not take a Bulk-Only Reset: {reset}");
         }
-        // Both endpoints are restarted even if the class request did not land:
-        // the endpoints are what the next command touches, and leaving one
-        // stopped because the other step failed turns a recoverable device into
-        // a permanently offline one.
-        let restarted_in = self.restart_bulk(dev, true);
-        let restarted_out = self.restart_bulk(dev, false);
-        reset.done() && restarted_in && restarted_out
+        // Both halts are cleared even if the class request did not land: the
+        // endpoints are what the next command touches, and leaving one halted
+        // because another step failed turns a recoverable device into a
+        // permanently offline one.
+        let cleared_in = self.clear_endpoint_halt(slot, &mut dev.ep0_ring, in_ep);
+        let cleared_out = self.clear_endpoint_halt(slot, &mut dev.ep0_ring, out_ep);
+        reset.done() && cleared_in && cleared_out
     }
 }
 

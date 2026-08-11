@@ -6,11 +6,11 @@ use core::ptr::NonNull;
 use crate::arch::percpu;
 use crate::mm::paging::CachePolicy;
 use crate::mm::PAGE_2M;
-use crate::fd::{self, FdTable};
+use crate::object::{ops, HandleTable};
 use crate::sync::Lock;
 use crate::symbols::SymbolTable;
 use crate::sched::payload::ThreadSched;
-use crate::{elf, pipe, scheduler, shared_memory};
+use crate::{elf, pipe, scheduler};
 use crate::{DirectMap, UserAddr};
 use crate::loader::{
     setup_tls, setup_combined_tls, alloc_kernel_stack, thread_start,
@@ -18,9 +18,14 @@ use crate::loader::{
 
 pub use toyos_abi::{Pid, Tid};
 pub use crate::scheduler::TaskId;
+use toyos_abi::syscall::EndowEntry;
+
+/// One `EndowEntry` on the wire. Named once, because both the reader in
+/// `loader::start` and the writer in [`Endowments::encode`] index by it.
+pub const ENDOW_ENTRY_LEN: usize = core::mem::size_of::<EndowEntry>();
 
 // Re-export loader functions so existing callers (via `process::`) keep working.
-pub use crate::loader::{spawn, spawn_kernel, build_child_fds};
+pub use crate::loader::{build_child_handles, spawn, spawn_init, INIT_PATH};
 pub(crate) use crate::loader::read_file_range;
 
 /// Page tables shared between a process and all its threads.
@@ -124,7 +129,7 @@ impl PageAlloc {
 /// `PageAlloc`'s Drop returns the pages to the PMM and reaches no address
 /// space, so pages and mapping cannot be dropped as one. Holding the two
 /// together is what makes the unmap expressible at all; enforcing it is the
-/// `SharedToken`/RAII item in `specs/known-issues.md`.
+/// `SharedToken`/RAII item in `specs/issues/`.
 ///
 /// Dropping without unmapping is only sound when the address space itself is
 /// being destroyed (process teardown).
@@ -267,25 +272,25 @@ impl UserStack {
     }
 }
 
-/// Where a thread/process is in its lifecycle.
+/// Where a *thread* is in its lifecycle.
 ///
-/// The process table tracks alive vs zombie. For alive threads, the scheduler
-/// is authoritative about whether they're running, ready, or blocked —
-/// query `scheduler::task_sched_state()` for that detail.
+/// **A process has no such state.** Its exit code lives on its
+/// [`ProcessObject`], published once and readable for ever after, so the table
+/// never holds a corpse waiting for somebody entitled to claim it. A thread
+/// still has one, because `SYS_THREAD_JOIN` reads it out of the table and a
+/// `Tid` names nothing outside its own process.
+///
+/// For a live thread the scheduler is authoritative about running, ready or
+/// blocked — `scheduler::task_sched_state()` has that detail.
+///
+/// [`ProcessObject`]: crate::object::process::ProcessObject
 #[derive(Clone, Copy, PartialEq)]
 pub enum ThreadLocation {
     /// Alive: running, ready, or blocked. The scheduler owns the detail.
     Scheduled,
-    /// Exited with the given code. Waiting to be reaped.
+    /// Exited with the given code, waiting for its joiner.
     Zombie(i32),
 }
-
-pub type ProcessState = ThreadLocation;
-
-/// Proof that a process was zombified and its orphaned children must be handled.
-/// Returned by `ProcessEntry::zombify`, consumed by `ProcessTable::handle_orphans`.
-#[must_use = "orphaned children must be collected after zombifying a process"]
-pub struct OrphanCleanup(Pid);
 
 impl ThreadLocation {
     pub fn name(&self) -> &'static str {
@@ -340,8 +345,12 @@ impl ThreadEntry {
 /// A process and all its threads. Removing a ProcessEntry removes all threads.
 pub struct ProcessEntry {
     pid: Pid,
-    parent: Option<Pid>,
-    state: ProcessState,
+    /// The thing a handle to this process names, and where its exit code goes.
+    ///
+    /// The entry holds it, not the other way round: an object outlives the
+    /// entry for exactly as long as somebody still holds a handle, and a
+    /// process nobody kept a handle to leaves nothing behind at all.
+    object: Arc<crate::object::process::ProcessObject>,
     name: [u8; THREAD_NAME_LEN],
     process_data: Arc<Lock<ProcessData>>,
     symbols: Arc<Lock<SymbolTable>>,
@@ -358,7 +367,6 @@ impl ProcessEntry {
     /// allocated main tid (always Tid(0) for the first thread).
     pub fn new(
         pid: Pid,
-        parent: Option<Pid>,
         name: [u8; THREAD_NAME_LEN],
         process_data: Arc<Lock<ProcessData>>,
         symbols: Arc<Lock<SymbolTable>>,
@@ -366,11 +374,19 @@ impl ProcessEntry {
     ) -> Self {
         let mut threads = crate::id_map::IdMap::new();
         let main_tid = threads.insert(main_thread);
-        Self { pid, parent, state: ThreadLocation::Scheduled, name, process_data, symbols, main_tid, threads, tearing_down: false }
+        Self {
+            pid,
+            object: crate::object::process::ProcessObject::new(pid),
+            name,
+            process_data,
+            symbols,
+            main_tid,
+            threads,
+            tearing_down: false,
+        }
     }
     pub fn pid(&self) -> Pid { self.pid }
-    pub fn parent(&self) -> Option<Pid> { self.parent }
-    pub fn state(&self) -> ProcessState { self.state }
+    pub fn object(&self) -> &Arc<crate::object::process::ProcessObject> { &self.object }
     pub fn name(&self) -> &[u8; THREAD_NAME_LEN] { &self.name }
     pub fn name_str(&self) -> &str {
         core::str::from_utf8(&self.name).unwrap_or("?").trim_end_matches('\0')
@@ -383,14 +399,6 @@ impl ProcessEntry {
 }
 
 impl ProcessEntry {
-    /// Zombify this process. Returns an `OrphanCleanup` token that must be consumed.
-    pub fn zombify(&mut self, code: i32) -> OrphanCleanup {
-        assert!(!matches!(self.state, ProcessState::Zombie(_)),
-            "double zombify pid={}", self.pid);
-        self.state = ProcessState::Zombie(code);
-        OrphanCleanup(self.pid)
-    }
-
     /// Claim exclusive teardown of this process. Exactly one exit/kill path
     /// wins; later callers must simply exit their own thread — the claimant's
     /// retire sweep handles them like any other thread.
@@ -496,10 +504,12 @@ pub struct ElfInfo {
 }
 
 /// Process-level data shared across all threads via `Arc<Lock<ProcessData>>`.
-/// Contains fds, memory mappings, ELF state, accounting — everything that belongs to the process.
+/// Contains handles, memory mappings, ELF state, accounting — everything that belongs to the process.
 /// Accessed via `with_fd_owner_data`. All threads of a process share the same Arc.
 pub struct ProcessData {
-    pub fds: FdTable,
+    /// Every kernel object this process can name. Stdio is slots 0, 1 and 2 at
+    /// generation 0, which is what makes those handles literally `0`, `1`, `2`.
+    pub handles: HandleTable,
     pub cwd: String,
     /// Inherited environment variables (KEY=VALUE\0KEY2=VALUE2\0...)
     pub env: Vec<u8>,
@@ -525,8 +535,56 @@ pub struct ProcessData {
 
     pub spawn_ns: u64,
     pub accounting: ProcessAccounting,
-    /// Stashed stats from exited children (capped at 64).
-    pub child_stats: Vec<(Pid, toyos_abi::syscall::ProcessStats)>,
+    /// What this process's parent called each handle it moved in at spawn.
+    pub endowments: Endowments,
+}
+
+/// The labels a parent put on the handles it endowed, and nothing else.
+///
+/// **Names, not authority.** The handles are in the table whether or not the
+/// child ever asks; this is only how it learns which of its slots its parent
+/// meant by `serve:compositor`. Written once by spawn and freed with the
+/// process, which is the whole of the per-process state the endowment design
+/// adds.
+pub struct Endowments {
+    entries: alloc::boxed::Box<[EndowEntry]>,
+    labels: alloc::boxed::Box<[u8]>,
+}
+
+impl Endowments {
+    pub fn empty() -> Self {
+        Self { entries: alloc::boxed::Box::new([]), labels: alloc::boxed::Box::new([]) }
+    }
+
+    pub fn new(entries: Vec<EndowEntry>, labels: Vec<u8>) -> Self {
+        Self { entries: entries.into_boxed_slice(), labels: labels.into_boxed_slice() }
+    }
+
+    /// Bytes [`SYS_ENDOWMENTS`] answers with: a `u64` count, the entries, then
+    /// the blob their offsets index.
+    ///
+    /// [`SYS_ENDOWMENTS`]: toyos_abi::syscall::SYS_ENDOWMENTS
+    pub fn encoded_len(&self) -> usize {
+        8 + self.entries.len() * ENDOW_ENTRY_LEN + self.labels.len()
+    }
+
+    /// Render into `out`, which the caller has sized at [`Self::encoded_len`].
+    ///
+    /// Field by field rather than a transmute of the slice: `EndowEntry`'s
+    /// padding word is written as a zero here, so nothing of the kernel's
+    /// reaches a child in it.
+    pub fn encode(&self, out: &mut [u8]) {
+        out[..8].copy_from_slice(&(self.entries.len() as u64).to_ne_bytes());
+        for (i, entry) in self.entries.iter().enumerate() {
+            let at = 8 + i * ENDOW_ENTRY_LEN;
+            out[at..at + 4].copy_from_slice(&entry.label_off.to_ne_bytes());
+            out[at + 4..at + 8].copy_from_slice(&entry.label_len.to_ne_bytes());
+            out[at + 8..at + 12].copy_from_slice(&entry.handle.0.to_ne_bytes());
+            out[at + 12..at + 16].copy_from_slice(&0u32.to_ne_bytes());
+        }
+        let blob = 8 + self.entries.len() * ENDOW_ENTRY_LEN;
+        out[blob..blob + self.labels.len()].copy_from_slice(&self.labels);
+    }
 }
 
 /// Per-process accounting counters. Accumulated from all threads on exit.
@@ -558,7 +616,7 @@ pub struct ThreadData {
     pub user_stack_base: UserAddr,
     pub user_stack_size: u64,
     /// Syscall counts per syscall number (for profiling)
-    pub syscall_counts: [u32; 64],
+    pub syscall_counts: [u32; toyos_abi::syscall::SYSCALL_PROFILE_BINS],
     pub syscall_total: u64,
     /// Wall-clock nanoseconds spent in syscall dispatch (includes preemption time)
     pub syscall_total_ns: u64,
@@ -568,14 +626,14 @@ pub struct ThreadData {
 ///
 /// Recorded so it can be taken away. The page belongs to the pipe, and the
 /// pipe is freed the moment its last reader and writer reference drop — so a
-/// mapping that outlives the process's descriptors is a writable window onto
+/// mapping that outlives the process's handles is a writable window onto
 /// memory the PMM has already handed to something else. Nothing on the
-/// fd-close path used to touch it.
+/// close path used to touch it.
 ///
 /// One entry per *pipe*, not per call: `sys_pipe_map` returns the window it
 /// already made. That is what bounds this vector — every entry needs a live
-/// descriptor naming its pipe, and distinct pipes need distinct descriptors,
-/// so it can never hold more than `fd::MAX_FDS` entries.
+/// handle naming its pipe, and distinct pipes need distinct handles, so it can
+/// never hold more than `object::handle::MAX_HANDLES` entries.
 pub struct PipeMap {
     pub pipe: pipe::PipeId,
     pub addr: UserAddr,
@@ -583,7 +641,7 @@ pub struct PipeMap {
 
 /// Take back every window onto `pipe` that `maps` holds.
 ///
-/// Called when the process's last descriptor for the pipe goes: from there on
+/// Called when the process's last handle for the pipe goes: from there on
 /// nothing keeps the ring page alive, so the mapping has to stop before the
 /// page can be reissued.
 pub fn revoke_pipe_maps(maps: &mut Vec<PipeMap>, pt: &PageTables, pipe: pipe::PipeId) {
@@ -692,15 +750,58 @@ pub fn try_for_each_thread(mut f: impl FnMut(ThreadCensus<'_>)) -> bool {
     true
 }
 
-/// Waitpid: collect a zombie child process. Removes process and ALL its threads.
-pub fn collect_child_zombie(table: &mut ProcessTable, child_pid: Pid, parent_pid: Pid) -> Result<Option<i32>, ()> {
-    let proc = table.get(child_pid).ok_or(())?;
-    if proc.parent != Some(parent_pid) { return Err(()); }
-    if let ProcessState::Zombie(code) = proc.state {
-        table.remove(child_pid);
-        Ok(Some(code))
-    } else {
-        Ok(None)
+/// The object a handle to `pid` would name, for a process still in the table.
+pub fn process_object(pid: Pid) -> Option<Arc<crate::object::process::ProcessObject>> {
+    let guard = PROCESS_TABLE.lock();
+    let table = guard.as_ref()?;
+    table.get(pid).map(|proc| Arc::clone(proc.object()))
+}
+
+/// Accounting for a process, from wherever the numbers are.
+///
+/// A live one is sampled from its own `ProcessData` and its threads' published
+/// counters; an exited one answers with what its teardown took. `None` is the
+/// window between the two, which is the process being torn down right now.
+pub fn stats_of(
+    object: &crate::object::process::ProcessObject,
+) -> Option<toyos_abi::syscall::ProcessStats> {
+    if let Some(stats) = object.final_stats() {
+        return Some(stats);
+    }
+    let pid = object.pid();
+    // Nothing is locked under the table lock: the two other locks are taken
+    // after it is given up, so this adds no ordering edge.
+    let (data_arc, cpu_ns, threads) = {
+        let guard = PROCESS_TABLE.lock();
+        let proc = guard.as_ref()?.get(pid)?;
+        let mut cpu_ns = 0;
+        let mut threads = Vec::new();
+        for (_, thread) in proc.threads().iter() {
+            cpu_ns += thread.sched().map_or(0, scheduler::task_cpu_ns);
+            threads.push(Arc::clone(thread.thread_data()));
+        }
+        (Arc::clone(proc.process_data()), cpu_ns, threads)
+    };
+    let (mut syscall_total, mut syscall_total_ns) = (0, 0);
+    for tdata in threads {
+        let tdata = tdata.lock();
+        syscall_total += tdata.syscall_total;
+        syscall_total_ns += tdata.syscall_total_ns;
+    }
+    let data = data_arc.lock();
+    Some(stats_from(&data, pid, cpu_ns, syscall_total, syscall_total_ns))
+}
+
+/// Mark one thread dead.
+///
+/// Idempotent, and silent about an entry that has gone: a main thread reaches
+/// this after its own process published its exit, by which point any idle pass
+/// may already have reaped the entry.
+pub fn mark_thread_zombie(table: &mut ProcessTable, pid: Pid, tid: Tid, code: i32) {
+    let Some(proc) = table.get_mut(pid) else { return };
+    let Some(thread) = proc.threads.get_mut(tid) else { return };
+    if !matches!(thread.state, ThreadLocation::Zombie(_)) {
+        thread.state = ThreadLocation::Zombie(code);
     }
 }
 
@@ -716,79 +817,70 @@ pub fn collect_thread_zombie(table: &mut ProcessTable, tid: Tid, parent_pid: Pid
     }
 }
 
-/// Handle orphaned child processes of a just-zombified process.
-/// Consumes the `OrphanCleanup` token, ensuring this step is never skipped.
-fn handle_orphans(table: &mut ProcessTable, cleanup: OrphanCleanup) {
-    let pid = cleanup.0;
-    let orphan_pids: Vec<Pid> = table.iter()
-        .filter(|(_, p)| p.parent == Some(pid))
-        .map(|(pid, _)| pid)
-        .collect();
-    for child_pid in orphan_pids {
-        if table.get(child_pid).map_or(false, |p| matches!(p.state, ProcessState::Zombie(_))) {
-            table.remove(child_pid);
-        } else {
-            table.get_mut(child_pid).unwrap().parent = None;
-        }
-    }
-}
-
-/// Zombify a thread or process. Handles main-thread-vs-child-thread
-/// logic internally. Idempotent — does nothing if already a zombie.
-pub fn zombify_tid(table: &mut ProcessTable, pid: Pid, tid: Tid, code: i32) {
-    let is_main = table.get(pid).map_or(false, |p| p.main_tid == tid);
-    if is_main {
-        let proc = table.get_mut(pid).unwrap();
-        if !matches!(proc.state, ProcessState::Zombie(_)) {
-            let cleanup = proc.zombify(code);
-            handle_orphans(table, cleanup);
-        }
-    } else {
-        if let Some(proc) = table.get_mut(pid) {
-            if let Some(thread) = proc.threads.get_mut(tid) {
-                if !matches!(thread.state, ProcessState::Zombie(_)) {
-                    thread.state = ProcessState::Zombie(code);
-                }
-            }
-        }
-    }
-}
-
-/// Zombify a thread that died in panic recovery, and name the waiter that
-/// must be woken for it.
+/// What a thread that died in panic recovery leaves to be cleaned up.
 ///
-/// The panic path itself cannot do this — it may hold any lock the faulted
+/// The panic path itself cannot do any of it — it may hold any lock the faulted
 /// thread was holding — so it only records the thread in the poison set and
-/// this runs later, from the idle loop. Returning the waiter rather than
-/// waking it here keeps the wake outside the table lock, as every other exit
-/// path does.
-///
-/// The waiter is the same one the corresponding clean exit would wake: a main
-/// thread's death releases the parent's `waitpid` (`exit`), any other thread's
-/// releases its own process's `thread_join` (`thread_exit`). `None` means
-/// there is nothing to wake — the entry is already gone, or the process has
-/// no parent, in which case `collect_orphan_zombies` reaps it.
-#[must_use = "the waiter of a zombified thread must be woken"]
-pub fn zombify_poisoned(table: &mut ProcessTable, pid: Pid, tid: Tid) -> Option<(Pid, Tid)> {
-    let Some(proc) = table.get(pid) else { return None };
-    let waiter = if tid == proc.main_tid {
-        proc.parent.and_then(|ppid| table.get(ppid).map(|p| (ppid, p.main_tid)))
-    } else {
-        Some((pid, proc.main_tid))
-    };
-    zombify_tid(table, pid, tid, -1);
-    waiter
+/// this runs later, from the idle loop. Both wakes are carried out rather than
+/// performed here, because both must happen with the table lock given up.
+#[must_use = "a poisoned thread's waiter must be woken"]
+pub enum PoisonWake {
+    /// A child thread died: its own process's `thread_join` is what waits.
+    Joiner(Pid, Tid),
+    /// The main thread died, so the process is over. The exit is published on
+    /// the object — outside the table lock, like every other publish — and
+    /// whoever holds a handle reads it there.
+    Process(Arc<crate::object::process::ProcessObject>),
 }
 
-/// Sweep orphan zombie processes. Single pass — threads are structurally owned.
-pub fn collect_orphan_zombies(table: &mut ProcessTable, _proof: IdleProof) {
-    let orphans: Vec<Pid> = table.iter()
-        .filter(|(_, p)| p.parent.is_none() && matches!(p.state, ProcessState::Zombie(_)))
+/// Mark a poisoned thread dead and name what must be woken for it.
+///
+/// `None` means there is nothing to do: the entry is gone, or another path
+/// already owns this process's teardown and will publish its exit.
+#[must_use = "a poisoned thread's waiter must be woken"]
+pub fn zombify_poisoned(table: &mut ProcessTable, pid: Pid, tid: Tid) -> Option<PoisonWake> {
+    let proc = table.get_mut(pid)?;
+    if tid != proc.main_tid {
+        let thread = proc.threads.get_mut(tid)?;
+        if !matches!(thread.state, ThreadLocation::Zombie(_)) {
+            thread.state = ThreadLocation::Zombie(-1);
+        }
+        return Some(PoisonWake::Joiner(pid, proc.main_tid));
+    }
+    // The same claim every exit and kill takes, for the same reason: exactly
+    // one path publishes one exit.
+    if !proc.claim_teardown() {
+        return None;
+    }
+    proc.threads.get_mut(tid)?.state = ThreadLocation::Zombie(-1);
+    // No `teardown_resources` runs on this path, so the process's mappings and
+    // handles go with the table entry rather than before it. That is the
+    // pre-existing cost of a panic recovery: this is reached from the idle loop
+    // and every release below it wants a lock the faulted thread may still be
+    // recorded as holding.
+    Some(PoisonWake::Process(Arc::clone(&proc.object)))
+}
+
+/// Take every entry whose process has published its exit.
+///
+/// **The whole of what replaced reaping.** Nobody has to be entitled to this,
+/// there is no orphan to adopt and nothing is kept for anyone to read later:
+/// the exit code and the final accounting are on the `ProcessObject`, which
+/// outlives the entry for as long as a handle to it does. The [`IdleProof`]
+/// stays, and for its original reason — an entry owns its threads, so this may
+/// not run on one of them.
+///
+/// The entries come back rather than being dropped here, because the caller
+/// holds the table lock and an entry's drop reaches `remove_vruntime` and — for
+/// a process whose teardown never ran — the whole of its `ProcessData`.
+#[must_use = "the reaped entries must be dropped outside the table lock"]
+pub fn reap_finished(table: &mut ProcessTable, _proof: IdleProof) -> Vec<ProcessEntry> {
+    let finished: Vec<Pid> = table
+        .iter()
+        .filter(|(_, p)| p.object.finished())
         .map(|(pid, _)| pid)
         .collect();
-    for pid in orphans {
-        table.remove(pid);
-    }
+    finished.into_iter().filter_map(|pid| table.remove(pid)).collect()
 }
 
 pub fn current_tid() -> Tid {
@@ -929,13 +1021,13 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     };
 
     // Phase 3: Insert into table (brief table lock)
-    // Threads share the parent's ProcessData Arc — no empty fds or zeroed process fields.
+    // Threads share the parent's ProcessData Arc — no empty handle table or zeroed process fields.
     let thread_data = Arc::new(Lock::new(ThreadData {
         tls_pages: Some(tls_alloc),
         stack_pages: None,
         user_stack_base: UserAddr::new(stack_base),
         user_stack_size: if stack_base > 0 { stack_ptr - stack_base } else { 0 },
-        syscall_counts: [0; 64],
+        syscall_counts: [0; toyos_abi::syscall::SYSCALL_PROFILE_BINS],
         syscall_total: 0,
         syscall_total_ns: 0,
     }));
@@ -1011,7 +1103,7 @@ fn teardown_resources(
             data.peak_memory / (1024 * 1024), data.alloc_count, data.free_count);
     }
 
-    fd::close_all(&mut data.fds);
+    ops::close_all(&mut data.handles);
     data.elf.elf_alloc.take();
     data.elf.loaded_libs.clear();
     data.mmap_regions.clear();
@@ -1022,17 +1114,21 @@ fn teardown_resources(
     (syscall_total, syscall_total_ns)
 }
 
-/// Table-side teardown bookkeeping: mark remaining thread entries zombie,
-/// release shared memory, zombify the process, adopt orphans.
+/// Table-side teardown bookkeeping: mark remaining thread entries zombie and
+/// drop the symbol table.
 ///
 /// Caller must hold the PROCESS_TABLE lock, have claimed teardown, retired
 /// every other thread of the process (so none can run), and freed resources.
-/// Returns the (pid, tid) wakes to deliver after the table lock drops, and the
-/// shared regions to free after it — freeing one waits for every other CPU to
-/// flush, which is not something to do holding the process table.
+/// Returns the process's object, whose exit the caller publishes once the table
+/// lock is given up.
+///
+/// It used to hand back the shared regions to free outside the lock too. There
+/// is no pid sweep left to do: a region is an object, its mappings go with the
+/// last handle, and `close_all` in phase 3 is what releases them.
+#[must_use = "the exit must be published on the object returned"]
 fn teardown_bookkeeping(table: &mut ProcessTable, process_pid: Pid, code: i32,
                         main_cpu_ns: u64)
-                        -> (Vec<(Pid, Tid)>, crate::mm::Unmapped<shared_memory::Retired>) {
+                        -> Arc<crate::object::process::ProcessObject> {
     let proc = table.get_mut(process_pid)
         .expect("teardown_bookkeeping: process not found");
     let main_tid = proc.main_tid;
@@ -1040,74 +1136,65 @@ fn teardown_bookkeeping(table: &mut ProcessTable, process_pid: Pid, code: i32,
     let tids: Vec<Tid> = proc.threads.iter().map(|(tid, _)| tid).collect();
     for tid in tids {
         let thread = proc.threads.get_mut(tid).unwrap();
-        if !matches!(thread.state, ProcessState::Zombie(_)) {
-            thread.state = ProcessState::Zombie(if tid == main_tid { code } else { -1 });
+        if !matches!(thread.state, ThreadLocation::Zombie(_)) {
+            thread.state = ThreadLocation::Zombie(if tid == main_tid { code } else { -1 });
         }
     }
 
-    let retired = shared_memory::cleanup_process(process_pid);
-
-    // Beside the shared-memory release and for the same reason: the symbol
-    // table is megabytes of the process's own pages now that it is read off the
-    // binary rather than pointed at in the initrd, and a zombie has no
-    // backtrace left for anyone to take — every caller of `resolve_user_symbol`
-    // is a crash report, which runs on the live process before this.
+    // The symbol table is megabytes of the process's own pages now that it is
+    // read off the binary rather than pointed at in the initrd, and a dead
+    // process has no backtrace left for anyone to take — every caller of
+    // `resolve_user_symbol` is a crash report, which runs on the live process
+    // before this.
     *proc.symbols.lock() = SymbolTable::empty();
 
-    let proc = table.get(process_pid).unwrap();
     let cpu_ms = main_cpu_ns / 1_000_000;
-    let parent_pid = proc.parent;
     let name = proc.name_str();
     log!("exit: {name} pid={process_pid} code={code} cpu={cpu_ms}ms");
 
-    // Tolerate an already-zombified process: a main thread that lost the
-    // teardown claim zombifies itself through exit_current's zombify_tid
-    // before the claimant reaches this point.
-    let proc = table.get_mut(process_pid).unwrap();
-    if !matches!(proc.state, ProcessState::Zombie(_)) {
-        let orphan_cleanup = proc.zombify(code);
-        handle_orphans(table, orphan_cleanup);
-    }
-
-    let mut to_wake = Vec::new();
-    if let Some(ppid) = parent_pid {
-        if let Some(parent_proc) = table.get(ppid) {
-            to_wake.push((ppid, parent_proc.main_tid));
-        }
-    }
-
-    (to_wake, retired)
+    Arc::clone(&proc.object)
 }
 
-/// Snapshot this process's accounting onto its parent, for `waitpid` to read.
+/// The accounting a process leaves behind, for `SYS_PROCESS_STATS` to answer
+/// after it is gone.
+///
 /// Must run after `teardown_scheduling`, which is what flushes the child
 /// threads' counters into `ProcessData`.
-fn stash_accounting_snapshot(
+fn final_stats(
     process_data_arc: &Arc<Lock<ProcessData>>,
     pid: Pid,
-    parent_pid: Option<Pid>,
     syscall_total: u64,
     syscall_total_ns: u64,
     main_cpu_ns: u64,
-) {
-    use toyos_abi::syscall::ProcessStats;
-
-    let ppid = match parent_pid {
-        Some(ppid) => ppid,
-        None => return,
-    };
+) -> toyos_abi::syscall::ProcessStats {
     let data = process_data_arc.lock();
+    stats_from(&data, pid, main_cpu_ns, syscall_total, syscall_total_ns)
+}
+
+/// One `ProcessStats`, from a process's own data.
+///
+/// Written once because `SYS_PROCESS_STATS` samples a live process through the
+/// same fields the teardown snapshots, and two spellings of one record is two
+/// records that can disagree.
+pub fn stats_from(
+    data: &ProcessData,
+    pid: Pid,
+    cpu_ns: u64,
+    syscall_total: u64,
+    syscall_total_ns: u64,
+) -> toyos_abi::syscall::ProcessStats {
+    use toyos_abi::syscall::ProcessStats;
     let acct = &data.accounting;
-    let snapshot = ProcessStats {
+    ProcessStats {
         wall_ns: crate::clock::nanos_since_boot().saturating_sub(data.spawn_ns),
-        cpu_ns: main_cpu_ns + acct.child_threads_cpu_ns,
+        cpu_ns: cpu_ns + acct.child_threads_cpu_ns,
         syscall_total,
         syscall_total_ns,
         fault_demand_count: acct.fault_demand_count,
         fault_zero_count: acct.fault_zero_count,
         fault_ns: acct.fault_ns,
         io_read_ops: acct.io_read_ops,
-        _pad: 0,
+        pid: pid.raw(),
         io_read_bytes: acct.io_read_bytes,
         blocked_io_ns: acct.blocked_io_ns,
         blocked_futex_ns: acct.blocked_futex_ns,
@@ -1117,42 +1204,46 @@ fn stash_accounting_snapshot(
         runqueue_wait_ns: acct.runqueue_wait_ns,
         peak_memory: data.peak_memory,
         alloc_count: data.alloc_count,
-    };
-    drop(data);
-
-    let parent_arc = {
-        let guard = PROCESS_TABLE.lock();
-        guard.as_ref().and_then(|t| t.get(ppid))
-            .map(|p| Arc::clone(&p.process_data))
-    };
-    if let Some(parent_arc) = parent_arc {
-        let mut pdata = parent_arc.lock();
-        if pdata.child_stats.len() >= 64 {
-            pdata.child_stats.remove(0);
-        }
-        pdata.child_stats.push((pid, snapshot));
     }
 }
 
 pub fn exit(code: i32) -> ! {
+    release_process(code);
+    scheduler::exit_current(code);
+}
+
+/// Everything a process's own teardown gives back — and it **returns**, which
+/// is the whole reason it is a function.
+///
+/// `exit_current` never comes back and nothing here unwinds, so a value still
+/// live at that call is a value nothing will ever drop: the kernel stack it
+/// sits on is freed by the exit pass without running a destructor. Three `Arc`s
+/// were — the [`ProcessObject`], the process's `ProcessData` and the exiting
+/// thread's `ThreadData` — which leaked one live kernel object per process the
+/// machine had ever run, and the per-variant census is what saw it. A scope
+/// that ends is the only thing that releases them, and a caller that diverges
+/// has none.
+///
+/// [`ProcessObject`]: crate::object::process::ProcessObject
+fn release_process(code: i32) {
     let process_pid = current_process();
     let tid = current_tid();
 
     // Phase 1: claim teardown. Exactly one exit/kill path tears a process
     // down; later arrivals just exit their own thread — the claimant's
     // retire sweep accounts for them like any other thread.
-    let (process_data_arc, thread_data_arc, parent_pid, main_tid, other_tids) = {
+    let (process_data_arc, thread_data_arc, main_tid, other_tids) = {
         let mut guard = PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
         let Some(proc) = table.get_mut(process_pid) else {
             drop(guard);
             unsafe { crate::mm::paging::kernel_cr3().activate(); }
-            scheduler::exit_current(code);
+            return;
         };
         if proc.threads.get(tid).is_none() || !proc.claim_teardown() {
             drop(guard);
             unsafe { crate::mm::paging::kernel_cr3().activate(); }
-            scheduler::exit_current(code);
+            return;
         };
         let other_tids: Vec<Tid> = proc.threads.iter()
             .map(|(t, _)| t)
@@ -1160,7 +1251,7 @@ pub fn exit(code: i32) -> ! {
             .collect();
         let thread = proc.threads.get(tid).unwrap();
         (Arc::clone(&proc.process_data), Arc::clone(&thread.thread_data),
-         proc.parent, proc.main_tid, other_tids)
+         proc.main_tid, other_tids)
     };
 
     unsafe { crate::mm::paging::kernel_cr3().activate(); }
@@ -1191,24 +1282,19 @@ pub fn exit(code: i32) -> ! {
     // Phase 3: free resources — no other thread of this process can run.
     let (syscall_total, syscall_total_ns) = teardown_resources(&process_data_arc, &thread_data_arc, process_pid);
 
-    // Phase 4: table bookkeeping (zombie marks, orphan adoption, parent wake)
-    let (to_wake, retired) = {
+    // Phase 4: table bookkeeping (thread zombie marks, symbols released)
+    let object = {
         let mut guard = PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
         teardown_bookkeeping(table, process_pid, code, main_cpu_ns)
     };
-    // After the table lock, because the drop waits for every other CPU to flush.
-    drop(retired);
 
-    // Phase 5: stash accounting on the parent, wake waiters, exit
-    stash_accounting_snapshot(&process_data_arc, process_pid, parent_pid, syscall_total, syscall_total_ns, main_cpu_ns);
-
-    // Table lock released — now safe to wake via scheduler
-    for (pid, tid) in to_wake {
-        scheduler::wake_task(TaskId(pid, tid));
-    }
-
-    scheduler::exit_current(code);
+    // Phase 5: publish the exit. The table lock is given up, which is what the
+    // wake inside it needs — and once it is published the entry is reapable,
+    // so nothing may read the table for this pid after this point.
+    let stats =
+        final_stats(&process_data_arc, process_pid, syscall_total, syscall_total_ns, main_cpu_ns);
+    object.publish_exit(crate::object::process::Exit { code, stats });
 }
 
 /// Exit the current thread. If this is the main thread, tears down the entire
@@ -1226,6 +1312,17 @@ pub fn thread_exit(code: i32) -> ! {
         exit(code);
     }
 
+    let parent_main_tid = release_thread(process_pid, tid, code);
+    scheduler::wake_task(TaskId(process_pid, parent_main_tid));
+    scheduler::exit_current(code);
+}
+
+/// A child thread's own teardown, and the main thread it must wake.
+///
+/// Returns for [`release_process`]'s reason: the address space this clones out
+/// is an `Arc`, and one left live where `exit_current` is called is one nothing
+/// ever drops.
+fn release_thread(process_pid: Pid, tid: Tid, code: i32) -> Tid {
     // Thread-only exit path: release this thread's mappings, zombify, wake parent.
     let addr_space = current_address_space();
     unsafe { crate::mm::paging::kernel_cr3().activate(); }
@@ -1245,21 +1342,16 @@ pub fn thread_exit(code: i32) -> ! {
     // takes with `IF` clear.
     drop(released);
 
-    let parent_main_tid = {
-        let mut guard = PROCESS_TABLE.lock();
-        let table = guard.as_mut().unwrap();
-        let cpu_ms = table.get(process_pid).and_then(|p| p.threads.get(tid))
-            .and_then(|t| t.sched())
-            .map_or(0, scheduler::task_cpu_ns) / 1_000_000;
-        table.get_mut(process_pid).unwrap().threads.get_mut(tid).unwrap().state = ProcessState::Zombie(code);
-        let proc = table.get(process_pid).unwrap();
-        let name = proc.name_str();
-        log!("exit: {name} tid={tid} code={code} cpu={cpu_ms}ms");
-        proc.main_tid
-    };
-
-    scheduler::wake_task(TaskId(process_pid, parent_main_tid));
-    scheduler::exit_current(code);
+    let mut guard = PROCESS_TABLE.lock();
+    let table = guard.as_mut().unwrap();
+    let cpu_ms = table.get(process_pid).and_then(|p| p.threads.get(tid))
+        .and_then(|t| t.sched())
+        .map_or(0, scheduler::task_cpu_ns) / 1_000_000;
+    table.get_mut(process_pid).unwrap().threads.get_mut(tid).unwrap().state = ThreadLocation::Zombie(code);
+    let proc = table.get(process_pid).unwrap();
+    let name = proc.name_str();
+    log!("exit: {name} tid={tid} code={code} cpu={cpu_ms}ms");
+    proc.main_tid
 }
 
 /// A thread's scheduler record, cloned out of the table.
@@ -1346,13 +1438,6 @@ pub fn wake_pipe_writers(pipe_id: pipe::PipeId) {
             crate::io_uring::Source::PipeWritable(pipe_id),
         );
     }
-}
-
-/// Atomically validate parent-child relationship and collect a zombie child process.
-pub fn wait_child_zombie(child_pid: Pid, parent_pid: Pid) -> Result<Option<i32>, ()> {
-    let mut guard = PROCESS_TABLE.lock();
-    let table = guard.as_mut().unwrap();
-    collect_child_zombie(table, child_pid, parent_pid)
 }
 
 /// Atomically validate parent-thread relationship and collect a zombie thread.
@@ -1675,22 +1760,26 @@ fn with_user_symbols(pid: Pid, f: impl FnOnce(&crate::symbols::SymbolTable) -> b
     f(&syms)
 }
 
-/// Kill a child process. Only the parent can kill its children.
-/// Returns 0 on success, error code on failure.
-pub fn kill_process(target_pid: Pid) -> u64 {
-    use toyos_abi::syscall::SyscallError;
-    let caller = current_process();
+/// Kill the process an object names.
+///
+/// **The handle is the whole authorization.** This used to check that the
+/// caller was the target's parent — a relationship the kernel happened to
+/// remember, which meant a parent could always kill a child and nobody else
+/// ever could. A `Process` handle carrying `Rights::MANAGE` is the thing that
+/// says who may, and it can be narrowed away or handed on.
+///
+/// Answers `Ok` for a process that is already gone: the caller asked for it to
+/// be dead and it is.
+pub fn kill_process(object: &crate::object::process::ProcessObject) -> u64 {
+    let target_pid = object.pid();
 
-    // Phase 1: validate parentage and claim teardown (brief table lock)
+    // Phase 1: claim teardown (brief table lock)
     let (process_data_arc, thread_data_arc, main_tid, tids) = {
         let mut guard = PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
 
-        let Some(proc) = table.get_mut(target_pid) else { return SyscallError::NotFound.to_u64() };
-        if proc.parent != Some(caller) {
-            return SyscallError::PermissionDenied.to_u64();
-        }
-        if matches!(proc.state, ProcessState::Zombie(_)) || !proc.claim_teardown() {
+        let Some(proc) = table.get_mut(target_pid) else { return 0 };
+        if !proc.claim_teardown() {
             return 0; // already dead or dying
         }
         let tids: Vec<Tid> = proc.threads.iter().map(|(t, _)| t).collect();
@@ -1718,23 +1807,50 @@ pub fn kill_process(target_pid: Pid) -> u64 {
     let (syscall_total, syscall_total_ns) = teardown_resources(&process_data_arc, &thread_data_arc, target_pid);
 
     // Phase 4: Table bookkeeping (same path as exit)
-    let (to_wake, retired) = {
+    let published = {
         let mut guard = PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
-        teardown_bookkeeping(table, target_pid, 137, main_cpu_ns)
+        teardown_bookkeeping(table, target_pid, KILLED_EXIT_CODE, main_cpu_ns)
     };
-    // After the table lock, because the drop waits for every other CPU to flush.
-    drop(retired);
 
-    // Phase 5: Stash accounting snapshot on parent
-    stash_accounting_snapshot(&process_data_arc, target_pid, Some(caller), syscall_total, syscall_total_ns, main_cpu_ns);
-
-    // Phase 6: Wake parent if blocked on waitpid
-    for (pid, tid) in to_wake {
-        scheduler::wake_task(TaskId(pid, tid));
-    }
+    // Phase 5: publish the exit, which is what releases every waiter.
+    let stats =
+        final_stats(&process_data_arc, target_pid, syscall_total, syscall_total_ns, main_cpu_ns);
+    published
+        .publish_exit(crate::object::process::Exit { code: KILLED_EXIT_CODE, stats });
 
     0
+}
+
+/// What a killed process's exit code is. The shell convention for "died on
+/// SIGKILL", kept because every test that reads one already spells it.
+pub const KILLED_EXIT_CODE: i32 = 137;
+
+/// What a process that named a handle it does not hold exits with. The shell
+/// convention for "died on SIGSEGV", which is the same class of mistake with a
+/// pointer instead of a handle.
+pub const HANDLE_FAULT_EXIT_CODE: i32 = 139;
+
+/// End a process that named a handle it does not hold.
+///
+/// **The fail-fast rule, applied at the one boundary where it is userland's bug
+/// rather than the kernel's.** A handle is a local name a process was given; a
+/// name it was not given, one it closed, or one of the wrong type is a bug in
+/// that process, and a word it can ignore lets the bug survive. It cannot be a
+/// kernel panic — the rule about untrusted input holds — so the process dies
+/// alone and says why.
+///
+/// Must be reached with nothing held: this is `exit`, and `exit` takes the
+/// process's own lock, the table lock and whatever a released object reaches
+/// for.
+pub fn handle_fault(error: crate::object::HandleError) -> ! {
+    log!(
+        "handle fault: pid={} tid={} syscall={} {error}",
+        current_process(),
+        current_tid(),
+        percpu::syscall_num(),
+    );
+    exit(HANDLE_FAULT_EXIT_CODE)
 }
 
 /// AP entry into the scheduler. Called from smp::ap_entry after SMP_READY.

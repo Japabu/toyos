@@ -331,7 +331,12 @@ pub fn scale_wallpaper(
 }
 
 /// Render the cursor sprite (RGBA) into a 64x64 BGRA hardware cursor buffer.
-pub fn upload_cursor(cursor_buf: *mut u8, sprite: &sprite::Sprite, hw_cursor: bool) {
+pub fn upload_cursor(
+    fb: &toyos::FramebufferDev,
+    cursor_buf: *mut u8,
+    sprite: &sprite::Sprite,
+    hw_cursor: bool,
+) {
     let data = sprite.data();
     let w = sprite.width();
     let h = sprite.height();
@@ -352,7 +357,7 @@ pub fn upload_cursor(cursor_buf: *mut u8, sprite: &sprite::Sprite, hw_cursor: bo
         }
     }
     if hw_cursor {
-        toyos::gpu::set_cursor(0, 0).expect("compositor owns the framebuffer");
+        fb.set_cursor(0, 0).expect("compositor holds the framebuffer claim");
     }
 }
 

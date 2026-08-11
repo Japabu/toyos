@@ -8,7 +8,7 @@
 //!
 //! **Why this is a kernel feature and nothing else can reach it**
 //! (`specs/device-test-strategy.md`'s requirement of an actuator): there is no
-//! way for a userland process to touch a codec at all. `SYS_OPEN_DEVICE` hands
+//! way for a userland process to touch a codec at all. `SYS_DEVICE_CLAIM` hands
 //! out a claim on a device the kernel already bound, not a PCI function; the
 //! capability that would let a process map a BAR and drive one is
 //! `specs/userspace-drivers-spec.md` stage 4, and it is unbuilt. The questions

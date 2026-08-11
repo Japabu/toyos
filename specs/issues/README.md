@@ -1,0 +1,115 @@
+# Issues
+
+One file per issue, `specs/issues/<area>/<slug>.md`. There is no index and no
+numbering: **`ls` is the index and the frontmatter is the query.** A number
+encodes a position, and every insertion moved one — which is what made a
+reference to an issue a reference that rots.
+
+`ls specs/issues/*/` lists everything. To ask a question of the set:
+
+```
+rg -l '^status: open' specs/issues/       # every unheld piece of work
+rg -l '^status: assigned' specs/issues/   # what somebody is holding
+rg -l '^status: owner' specs/issues/      # what is waiting on the owner
+rg -c '' specs/issues/audio/              # how much audio owes
+```
+
+## Frontmatter
+
+Four fields, all required, no defaults. `src/docs.rs`'s `every_issue_is_well_formed`
+is the gate; it runs under `cargo test --lib` and takes seconds.
+
+| field | values | means |
+|---|---|---|
+| `status` | `open` | it is work, and nobody is holding it |
+| | `assigned` | it is work, and somebody is — the body says who or which task |
+| | `expected-red` | a test fails on this today and `EXPECTED_FAILURES` names it |
+| | `owner` | it is the owner's to decide, and nobody else may |
+| | `none` | nothing is owed |
+| `kind` | `defect` | real, reproducible, someone should fix it |
+| | `finding` | noticed in passing; may never be worth fixing |
+| | `question` | blocked on the owner, and nobody else can decide it |
+| | `rejected` | considered and declined, recorded so nobody re-proposes it |
+| `opened` | `YYYY-MM-DD` | the first commit whose `specs/known-issues.md` or `specs/issues/` carried this heading. Before 2026-08-08 that is derived from the single file this directory replaced, so a reworded heading dates from the rewording |
+| `task` | a number | optional; present only where the issue names one |
+
+**`status` and `kind` are not free of each other, and the gate enforces it.**
+`kind` says what the entry is; `status` says what is owed. Two of the kinds
+answer that second question by themselves, so they may not contradict it:
+
+| `kind` | `status` must be |
+|---|---|
+| `defect`, `finding` | `open`, `assigned` or `expected-red` |
+| `question` | `owner` |
+| `rejected` | `none` |
+
+That rule is what makes `rg -l '^status: open'` mean *unheld work* rather than
+"every file that was not assigned to somebody" — the eleven `question` and
+`rejected` files all said `open` before it existed, so the query over-reported
+by eleven and nothing could tell.
+
+**`kind: rejected` is not work.** It is here so the next agent does not spend a
+day re-deriving an answer the owner already gave. Nothing in a `rejected` file
+is owed — and if the body says otherwise, the *kind* is what is wrong. A ruling
+that declared a standing failure rather than removing it deferred the work; it
+did not decline it, so the entry is a `defect` and stays open.
+
+**`kind: question` is not work either** — not yours. It is owed by the owner,
+and an agent that "fixes" one has decided something that was his to decide. But
+a file blocked on an *instrument* — a gate, a machine, a measurement — is not a
+question. Nobody has to decide it; somebody has to run it.
+
+## Areas
+
+`isolation` · `panic-path` · `kernel` · `audio` · `diagnostics` · `build` ·
+`design-debt` · `hardware` · `filesystem` · `boot-media`
+
+That list is closed, and the gate refuses a file outside it. An area is a
+directory because it makes every cross-reference a path that resolves. Moving
+an issue between areas is a `git mv`; the **slug** is its identity — unique
+across every area, which the gate also checks — so `rg <slug>` finds every
+pointer at it wherever it has been put.
+
+## Pointing at one
+
+**Name the file, not the directory.** `specs/issues/audio/hda-tone-phase-check.md`
+is a claim something can check; `specs/issues/audio/` is a claim that an area
+exists, which says nothing about whether the entry you meant is still there. The
+gate resolves every `specs/issues/<area>/<slug>.md` path written anywhere in the
+tree and names the ones that do not exist.
+
+Never write "the entry above" or "the entry below". Position was what the
+numbered document had and what this directory exists to be rid of; a positional
+reference inside a file that no longer sits beside its neighbour points at
+nothing at all.
+
+## Filing one
+
+Write a new file. Do not touch an existing one you do not own — nine agents
+appending to nine different files produce zero conflicts, and that is the whole
+reason this is a directory and not a document.
+
+## Closing one
+
+**Delete the file.** Git keeps the story, and the commit message is where
+evidence, measurements and what-the-code-used-to-do belong.
+
+Before you delete it, ask what durable rule it carries — an invariant a future
+agent could violate again, independent of the bug that revealed it. One line of
+that goes to the spec or the doc comment that owns the subject. The story does
+not go with it.
+
+## Two area notes, carried over from the file this replaced
+
+**`filesystem`** — `toyos-fat32/` is new (host tests: `cargo test` inside it) and
+its kernel adapter is `kernel/src/fat32_adapter.rs`; `boot-media` carries what
+that adapter found. Most of what is filed here is not a defect found later but a
+residual the crate's own gate identified while it was being written, recorded so
+the adapter's author did not have to rediscover it.
+
+**`boot-media`** — `/boot` and `/log` are both `kernel/src/fat32_adapter.rs` over
+`toyos-fat32`, mounted from `gpt::boot_volume()` and `gpt::log_volume()`;
+`kernel/src/log_file.rs` writes one file per boot to `/log`, named for the wall
+clock. Gated by `esp_filesystem`, `kernel_log_file`, `log_backing_read_error`,
+`boot_volume_metadata_error`, `log_partition_automount`, `log_partition_identity`
+and `wall_clock_file`, plus `toybox_cp_volume`.

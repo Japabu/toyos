@@ -33,6 +33,43 @@
 pub mod boot;
 pub mod msc;
 
+/// How much of the kernel is holding a spinlock at the moment a device is
+/// waited for.
+///
+/// A measurement and not an actuator: nothing here changes what the driver
+/// does. It exists because the depth cannot be read off the call graph — the
+/// backtrace it prints beside it is what says which locks those are, and one of
+/// them is named nowhere in the chain of function names. Every stage of
+/// `specs/blocking-io-plan.md` is judged on this number falling.
+///
+/// Deepest-so-far rather than every wait, because a line per transfer on a
+/// machine whose log lives on the transfer's own device is the self-sustaining
+/// write loop [`msc::MscDevice`]'s `no_write_cache` already records.
+#[cfg(feature = "boot-actuators")]
+mod depth_probe {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::log;
+
+    static DEEPEST: AtomicU32 = AtomicU32::new(0);
+
+    pub fn report() {
+        let depth = crate::preempt::count();
+        if depth <= DEEPEST.fetch_max(depth, Ordering::Relaxed) {
+            return;
+        }
+        log!(
+            "io-depth: a disk transfer is being waited for at preempt depth {depth}, task {:?}",
+            crate::arch::percpu::current_tid().map(|t| t.raw())
+        );
+        let rbp: u64;
+        // SAFETY: reading the frame pointer. `kernel_backtrace` walks the chain
+        // defensively and stops at the first frame it cannot read.
+        unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack)) };
+        crate::arch::idt::exceptions::kernel_backtrace(rbp, 20);
+    }
+}
+
 use crate::log;
 use super::{deadline, enqueue_control, log_unrecoverable, Completion, Trb, TrbRing};
 use super::{XhciController, EVENT_TRANSFER, EVENT_CMD_COMPLETE, USB_TIMEOUT_NS};
@@ -135,6 +172,30 @@ fn settles(ready: impl Fn() -> bool) -> bool {
 }
 
 
+/// What one endpoint's recovery still owes the **device** once the controller
+/// has taken it off the transfer it was running.
+///
+/// A value of this is what [`XhciController::quiesce_endpoint`] produces and
+/// the only thing [`XhciController::clear_endpoint_halt`] accepts, so the two
+/// halves of a recovery cannot be run in the other order. That matters to
+/// exactly one caller: Bulk-Only Transport's Reset Recovery has a device reset
+/// of its own to put between them, and it may not issue that reset while either
+/// endpoint still holds a transfer the driver stopped waiting for — see
+/// [`Act::ClearHalt`].
+#[derive(Clone, Copy)]
+pub(in crate::drivers::xhci) enum Owed {
+    /// The endpoint runs. Nothing further is owed.
+    Nothing,
+    /// The device is still holding a halt on the endpoint at this address.
+    ClearHalt { ep_addr: u8 },
+    /// The endpoint could not be taken off its transfer. Carried rather than
+    /// reported by returning early, because the *other* endpoint and the
+    /// device's own reset still have to happen — leaving one endpoint stopped
+    /// because a step on the other failed is what turns a recoverable device
+    /// into a permanently offline one.
+    Failed,
+}
+
 impl XhciController {
     /// Take one endpoint back to a state that runs TRBs, waiting for each step.
     ///
@@ -144,38 +205,54 @@ impl XhciController {
     /// faulted, which is spending its own time. A HID endpoint is recovered at
     /// the top of a scheduler pass, where it would be spending everybody's, and
     /// [`Self::step_recovery`] is the same route stepped across passes.
-    fn restart_endpoint(&mut self, ep: Restart<'_>) -> bool {
+    fn restart_endpoint(&mut self, mut ep: Restart<'_>) -> bool {
+        let owed = self.quiesce_endpoint(&mut ep);
+        self.clear_endpoint_halt(ep.slot_id, ep.ep0_ring, owed)
+    }
+
+    /// The half of one endpoint's recovery the **controller** answers: every
+    /// command [`Recovery`] owes, up to the point where the sequence would
+    /// speak to the device.
+    fn quiesce_endpoint(&mut self, ep: &mut Restart<'_>) -> Owed {
         let state = self.endpoint_state(ep.ctx_block, ep.dci);
         log!("xHCI: slot {} endpoint {} is {state}, recovering", ep.slot_id, ep.dci);
         let (mut seq, mut act) = match Recovery::begin(state) {
             Ok(begun) => begun,
             Err(NeedsConfigure(state)) => {
                 log_unrecoverable(ep.slot_id, ep.dci, state);
-                return false;
+                return Owed::Failed;
             }
         };
         loop {
-            match act {
-                Act::Running => return true,
-                Act::Command(cmd) => {
-                    let trb = self.recovery_trb(cmd, ep.slot_id, ep.dci, ep.ring, ep.ring_at);
-                    if !self.run_command(trb, cmd.name()) {
-                        return false;
-                    }
-                }
-                Act::ClearHalt => {
-                    let cleared = self.control_transfer(
-                        ep.slot_id, ep.ep0_ring, 0x02, 0x01, 0, ep.ep_addr as u16, None, 0,
-                    );
-                    if !cleared.done() {
-                        log!("xHCI: slot {} would not clear the halt on endpoint {:#04x}: \
-                             {cleared}", ep.slot_id, ep.ep_addr);
-                        return false;
-                    }
-                }
+            let cmd = match act {
+                Act::Running => return Owed::Nothing,
+                Act::ClearHalt => return Owed::ClearHalt { ep_addr: ep.ep_addr },
+                Act::Command(cmd) => cmd,
+            };
+            let trb = self.recovery_trb(cmd, ep.slot_id, ep.dci, ep.ring, ep.ring_at);
+            if !self.run_command(trb, cmd.name()) {
+                return Owed::Failed;
             }
             act = seq.completed();
         }
+    }
+
+    /// The half the **device** answers, which is the only packet a recovery
+    /// puts on the bus.
+    fn clear_endpoint_halt(&mut self, slot_id: u8, ep0_ring: &mut TrbRing, owed: Owed) -> bool {
+        let ep_addr = match owed {
+            Owed::Nothing => return true,
+            Owed::Failed => return false,
+            Owed::ClearHalt { ep_addr } => ep_addr,
+        };
+        let cleared =
+            self.control_transfer(slot_id, ep0_ring, 0x02, 0x01, 0, ep_addr as u16, None, 0);
+        if !cleared.done() {
+            log!("xHCI: slot {slot_id} would not clear the halt on endpoint {ep_addr:#04x}: \
+                 {cleared}");
+            return false;
+        }
+        true
     }
 
     /// Run whatever is outstanding to its end, waiting for each answer.
@@ -261,6 +338,10 @@ impl XhciController {
     /// well as the slot matters for mass storage, where one slot carries three
     /// endpoints and a stalled one still completes.
     fn wait_transfer(&mut self, slot: u8, dci: u8) -> Option<(u32, u32)> {
+        #[cfg(feature = "boot-actuators")]
+        if crate::actuator::io_depth_probe() {
+            depth_probe::report();
+        }
         let deadline = deadline();
         let port = self.port_of_slot(slot);
         loop {

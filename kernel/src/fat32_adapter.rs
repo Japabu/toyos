@@ -375,13 +375,15 @@ impl BlockAccess for FatVolume {
 /// injection that also hides a broken transport, so the gate goes green on a
 /// boot where the device was never asked. Same reason `xhci-one-slot` and
 /// `i8042-fault` exist.
-const FAT_BACKING_READS: bool = !cfg!(feature = "fat-backing-read-fails");
+fn fat_backing_reads() -> bool {
+    !crate::actuator::fat_backing_read_fails()
+}
 
 /// Whether the boot volume may still answer a *filesystem* read once it is
 /// mounted.
 ///
 /// The negative control for the metadata half of the error channel, and the
-/// sibling of [`FAT_BACKING_READS`] rather than a duplicate of it: that one
+/// sibling of [`fat_backing_reads`] rather than a duplicate of it: that one
 /// fails [`FatBacking::read_page`], which is the page-fault path and touches no
 /// directory entry at all, so with it armed `open_file`, `list` and
 /// `file_mtime` still succeed and there is nothing in the tree that can make
@@ -398,7 +400,9 @@ const FAT_BACKING_READS: bool = !cfg!(feature = "fat-backing-read-fails");
 /// its serial console, and the refusal is something a process can be sent to go
 /// and ask about. The log volume is where the kernel's own log goes, so failing
 /// its reads would take the channel the evidence arrives on.
-const BOOT_VOLUME_READS: bool = !cfg!(feature = "fat-boot-reads-fail");
+fn boot_volume_reads() -> bool {
+    !crate::actuator::fat_boot_reads_fail()
+}
 
 /// Set once [`mount`] has installed the boot volume.
 ///
@@ -409,7 +413,7 @@ const BOOT_VOLUME_READS: bool = !cfg!(feature = "fat-boot-reads-fail");
 static BOOT_MOUNTED: AtomicBool = AtomicBool::new(false);
 
 fn injected_read_failure(role: Role) -> bool {
-    !BOOT_VOLUME_READS && role == Role::Boot && BOOT_MOUNTED.load(Ordering::Relaxed)
+    !boot_volume_reads() && role == Role::Boot && BOOT_MOUNTED.load(Ordering::Relaxed)
 }
 
 /// A file on one of these volumes, as byte ranges the page-fault path can read
@@ -452,7 +456,7 @@ impl FileBacking for FatBacking {
                 return Err(crate::block::BlockError);
             };
             let served = dev.read_at(extent.offset + within, &mut buf[done..done + n]);
-            if !FAT_BACKING_READS {
+            if !fat_backing_reads() {
                 // The read above was issued and is the shipped one, so a
                 // transport that really broke is still what `served` says —
                 // the injection cannot hide it. What it does replace is the
@@ -462,7 +466,7 @@ impl FileBacking for FatBacking {
                 // would make every assertion about the consequences vacuous.
                 buf[done..done + n].fill(0);
             }
-            if served.is_err() || !FAT_BACKING_READS {
+            if served.is_err() || !fat_backing_reads() {
                 log!("{}-volume: read of {n} B at volume offset {} failed; serving zeros",
                     self.role, extent.offset + within);
                 return Err(crate::block::BlockError);
@@ -701,7 +705,8 @@ impl FileSystem for FatFs {
     ///
     /// The read side is not closed here — the `FatBacking` an open fd already
     /// holds still names those byte ranges, which is the same live
-    /// cross-process leak known issues records for `/home`. This closes the
+    /// cross-process leak `specs/issues/isolation/tmpfs-backing-outlives-deletion.md`
+    /// records for `/home`. This closes the
     /// destructive half only.
     fn delete(&mut self, name: &str) -> Result<(), SyscallError> {
         if let Some(file_id) = self.by_name.remove(name) {
@@ -907,7 +912,8 @@ fn probe_announced(mut probed: usize) -> usize {
 /// Only USB today. A machine that boots off an internal disk lands in the
 /// `None` arm and gets neither mount, because the NVMe device is owned by the
 /// page cache from the moment storage comes up and there is no second handle
-/// to it — see the report in known issues rather than a workaround here.
+/// to it — see the report in `specs/issues/build/page-cache-owns-one-device.md`
+/// rather than a workaround here.
 fn device_carrying(id: crate::block::DeviceId) -> Option<Box<dyn BlockDevice>> {
     (0..usb_storage::count())
         .filter_map(usb_storage::open)

@@ -298,9 +298,9 @@ impl<X: SchedPayload> CpuSched<X> {
         }
     }
 
-    /// `SYS_SET_RT_PRIORITY` on the running task — permanent RT, as opposed
-    /// to the bounded window a waker lends. The privilege gate lives at the
-    /// syscall layer (spec §9.2).
+    /// `SYS_RT_ENTER` on the running task — permanent RT, as opposed to the
+    /// bounded window a waker lends. The privilege gate lives at the syscall
+    /// layer (spec §9.2).
     pub fn set_current_rt(&mut self, permanent: bool) {
         if let Some(current) = self.running.as_mut() {
             current.set_permanent_rt(permanent);
@@ -620,7 +620,11 @@ impl<X: SchedPayload> CpuSched<X> {
 
     /// The earliest deadline this CPU owes, and the only thing `apply_timer`
     /// arms from.
-    fn earliest_deadline(&self) -> Option<Nanos> {
+    ///
+    /// Public because it is also the answer to *may this CPU start something
+    /// long*: a CPU that owes a wake is the wrong one to run unbounded I/O on,
+    /// and the idle loop asks before it flushes (`sched::driver::owes_deadline`).
+    pub fn earliest_deadline(&self) -> Option<Nanos> {
         self.parked.values().filter_map(|entry| entry.deadline).min()
     }
 

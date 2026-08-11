@@ -826,6 +826,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
+name = "toyos-abi"
+version = "0.1.0"
+
+[[package]]
 name = "toyos-build"
 version = "0.1.0"
 dependencies = [
@@ -840,8 +844,10 @@ dependencies = [
  "toml",
  "toyos-cc",
  "toyos-fat32",
+ "toyos-fat32-check",
  "toyos-gpt",
  "toyos-ld",
+ "toyos-manifest",
  "uuid",
 ]
 
@@ -862,6 +868,10 @@ name = "toyos-fat32"
 version = "0.1.0"
 
 [[package]]
+name = "toyos-fat32-check"
+version = "0.1.0"
+
+[[package]]
 name = "toyos-gpt"
 version = "0.1.0"
 
@@ -873,6 +883,13 @@ dependencies = [
  "sha2",
  "thiserror",
  "zerocopy",
+]
+
+[[package]]
+name = "toyos-manifest"
+version = "0.1.0"
+dependencies = [
+ "toyos-abi",
 ]
 
 [[package]]

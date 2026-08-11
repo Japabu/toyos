@@ -19,18 +19,26 @@ pub const SYS_GETCWD: u64 = 21;
 // Syscall number 23 unused (formerly SYS_SET_KEYBOARD_LAYOUT: the kernel has
 // no layout to set — it delivers key transitions and userland translates).
 pub const SYS_PIPE: u64 = 24;
+/// Start a program, endowing it exactly what the caller names. Answers a
+/// `Process` handle — see [`spawn`].
 pub const SYS_SPAWN: u64 = 25;
-pub const SYS_WAITPID: u64 = 26;
+// Syscall number 26 unused (formerly SYS_WAITPID: a pid is not authority over
+// a process, and a pid outlives nothing — the number is reissued. Waiting is
+// [`SYS_PROCESS_WAIT`] on the handle the spawn answered with).
 pub const SYS_MARK_TTY: u64 = 28;
-// Syscall numbers 29-30 unused (formerly SYS_SEND_MSG/SYS_RECV_MSG).
-pub const SYS_OPEN_DEVICE: u64 = 31;
+// Syscall numbers 29-31 unused (formerly SYS_SEND_MSG/SYS_RECV_MSG and
+// SYS_OPEN_DEVICE: first-come claiming, where whoever asked first got the
+// device. Arbitration is the manifest now — init mints every claim from a
+// `SysCap` and endows it, so who holds a device is a fact the image was built
+// with rather than a race).
 // Syscall numbers 32-33 unused (formerly SYS_REGISTER_NAME/SYS_FIND_PID).
 // Syscall number 34 unused (formerly SYS_SET_SCREEN_SIZE).
 pub const SYS_GPU_PRESENT: u64 = 35;
-pub const SYS_ALLOC_SHARED: u64 = 36;
-pub const SYS_GRANT_SHARED: u64 = 37;
-pub const SYS_MAP_SHARED: u64 = 38;
-pub const SYS_RELEASE_SHARED: u64 = 39;
+// Syscall numbers 36-39 unused (formerly SYS_ALLOC_SHARED, SYS_GRANT_SHARED,
+// SYS_MAP_SHARED and SYS_RELEASE_SHARED: a shared-memory token was an id
+// treated as a capability and the grant list was a pid ACL. A region is a
+// handle now — [`SYS_SHM_CREATE`], [`SYS_SHM_MAP`], [`SYS_SHM_UNMAP`] — and
+// giving one away is [`SYS_HANDLE_SEND`]).
 pub const SYS_THREAD_SPAWN: u64 = 40;
 pub const SYS_THREAD_JOIN: u64 = 41;
 pub const SYS_CLOCK_REALTIME: u64 = 42;
@@ -41,7 +49,9 @@ pub const SYS_SYSINFO: u64 = 45;
 // an ungated frame-copy path that no program ever used — netd drives the NIC
 // through its DMA descriptor instead).
 pub const SYS_NANOSLEEP: u64 = 49;
-pub const SYS_DUP: u64 = 50;
+/// A second handle to the same object, carrying no more than the first. See
+/// [`dup`] and [`dup_narrowed`].
+pub const SYS_HANDLE_DUP: u64 = 50;
 pub const SYS_GETPID: u64 = 51;
 pub const SYS_RENAME: u64 = 52;
 pub const SYS_MKDIR: u64 = 53;
@@ -56,20 +66,35 @@ pub const SYS_STACK_INFO: u64 = 61;
 pub const SYS_CPU_COUNT: u64 = 62;
 pub const SYS_MMAP: u64 = 63;
 pub const SYS_MUNMAP: u64 = 64;
-pub const SYS_KILL: u64 = 65;
+// Syscall number 65 unused (formerly SYS_KILL: pid-addressed, and gated on
+// being the target's parent — which is a relationship the kernel happened to
+// remember, not a capability anyone was given. [`SYS_PROCESS_KILL`] takes a
+// handle carrying `Rights::MANAGE`).
 pub const SYS_READ_NONBLOCK: u64 = 66;
 pub const SYS_WRITE_NONBLOCK: u64 = 67;
-pub const SYS_PIPE_OPEN: u64 = 68;
-pub const SYS_PIPE_ID: u64 = 70;
+// Syscall numbers 68 and 70 unused (formerly SYS_PIPE_OPEN and SYS_PIPE_ID: a
+// pipe id was guessable, and openable by anyone its creator had ever spoken to.
+// A pipe end travels as itself now, over [`SYS_HANDLE_SEND`]).
 // Syscall numbers 71 and 84 unused (formerly SYS_AUDIO_SUBMIT and
 // SYS_AUDIO_POLL: the kernel no longer drives a sound card, so a period is
 // published into a ring the kernel built and there is nothing to submit).
 // 84 never had a dispatch arm or a caller, so retiring it saves nothing.
 pub const SYS_EXIT: u64 = 72;
 pub const SYS_GET_ENV: u64 = 73;
-pub const SYS_DUP2: u64 = 74;
+/// A second handle to the same object, at a slot the caller picks. See
+/// [`dup2`].
+pub const SYS_HANDLE_DUP_AT: u64 = 74;
 pub const SYS_CLOCK_EPOCH: u64 = 75;
-pub const SYS_SOCKET_CREATE: u64 = 76;
+/// Join a pipe read end and a pipe write end into one duplex `Connection`.
+/// See [`connection_join`].
+///
+/// Formerly `SYS_SOCKET_CREATE`, which took two pipe *ids* and is the same
+/// operation with the argument the capability model requires — the way
+/// [`SYS_HANDLE_DUP`] is `SYS_DUP` with a rights word. What is retired is
+/// addressing a pipe by a number anyone could guess, not making a duplex
+/// object out of two simplex ends: `std`'s `TcpStream` is one fd, and netd's
+/// data path is two pipes.
+pub const SYS_CONNECTION_JOIN: u64 = 76;
 pub const SYS_PIPE_MAP: u64 = 77;
 pub const SYS_NIC_RX_POLL: u64 = 78;
 pub const SYS_NIC_RX_DONE: u64 = 79;
@@ -77,9 +102,16 @@ pub const SYS_NIC_TX: u64 = 80;
 pub const SYS_SYMLINK: u64 = 81;
 pub const SYS_READLINK: u64 = 82;
 pub const SYS_GPU_SET_RESOLUTION: u64 = 83;
-pub const SYS_LISTEN: u64 = 85;
+// Syscall number 85 is retired and unused: it was `SYS_LISTEN`, which took a
+// service name first-come from a flat global registry. There is no registry;
+// a server is endowed an acceptor.
+/// Accept a queued connection from an [`Acceptor`] handle.
+///
+/// [`Acceptor`]: crate::handle::RawHandle
 pub const SYS_ACCEPT: u64 = 86;
-pub const SYS_CONNECT: u64 = 87;
+// Syscall number 87 is retired and unused: it was `SYS_CONNECT`, which
+// resolved a name through that registry. A name resolves in a namespace a
+// process was given, through `SYS_NAMESPACE_OPEN`, or nowhere.
 /// Allocate a TLS block for a dlopen'd module on the current thread.
 /// Arg0: module_id (1-based DTV index). Returns the block's virtual address,
 /// or a `SyscallError` word — see [`tls_alloc_block`].
@@ -94,27 +126,234 @@ pub const SYS_DEBUG: u64 = 92;
 pub const SYS_SCHED_INFO: u64 = 93;
 pub const SYS_PROCESS_STATS: u64 = 94;
 pub const SYS_SET_THREAD_NAME: u64 = 95;
-pub const SYS_SET_RT_PRIORITY: u64 = 96;
+// Syscall number 96 unused (formerly SYS_SET_RT_PRIORITY: gated on holding a
+// sound-device claim, and a claim is not a privilege. [`SYS_RT_ENTER`] is the
+// privilege that gate was standing in for).
 /// Read one register of a claimed device. See [`device_reg_read`].
 pub const SYS_DEVICE_REG_READ: u64 = 97;
 /// Write one register of a claimed device. See [`device_reg_write`].
 pub const SYS_DEVICE_REG_WRITE: u64 = 98;
 
+/// Read this process's endowment table back: the `(label, handle)` pairs its
+/// parent gave it at spawn, as an `[EndowEntry]` count followed by the entries
+/// and the label blob they index into. `buf_len == 0` asks how many bytes the
+/// answer needs. See [`endowments`].
+///
+/// The handles themselves are in the table whether or not this is ever called —
+/// the labels are *names* for them, not the authority.
+pub const SYS_ENDOWMENTS: u64 = 99;
+
+/// Make a port: one [`Acceptor`] for the server, one `Connector` for its
+/// clients, packed `(acceptor << 32) | connector`. See [`port_create`].
+///
+/// **The packing cannot be read as an error, and the reason is slot
+/// retirement.** A `SyscallError` encodes as `u64::MAX - code` for
+/// `code < 256`, so a pair could collide only if both halves could reach
+/// `0xFFFF_FFFF`. A slot at [`RawHandle::MAX_GENERATION`] is retired rather
+/// than reissued, so the largest handle any table hands out is `0xFFFF_EFFF`
+/// and the largest pair is `0xFFFF_EFFF_FFFF_EFFF` — four billion below the
+/// error range. The retirement rule and this packing are load-bearing for each
+/// other.
+///
+/// [`Acceptor`]: port_create
+pub const SYS_PORT_CREATE: u64 = 100;
+/// Build a namespace from a base and a set of `(name, connector)` additions.
+/// See [`NamespaceBuild`].
+pub const SYS_NAMESPACE_BUILD: u64 = 101;
+/// Open a connection to a name **in a namespace this process holds**. There is
+/// no other place to ask, and a name it was not given resolves to nothing.
+pub const SYS_NAMESPACE_OPEN: u64 = 102;
+
+/// Move handles to the peer of a connection. See [`handle_send`].
+///
+/// The batch is queued on the connection, not interleaved with its bytes, so
+/// **handles are sent before the frame that announces them** and a receiver
+/// that has the frame already has the handles. The SDK's
+/// `Connection::send_with_handles` is that ordering written once.
+pub const SYS_HANDLE_SEND: u64 = 103;
+/// Take the oldest batch of handles the peer sent. See [`handle_recv`].
+pub const SYS_HANDLE_RECV: u64 = 104;
+/// Make a shared-memory region, sized up to whole 2 MiB pages.
+/// See [`shm_create`].
+pub const SYS_SHM_CREATE: u64 = 105;
+/// Map a region into the caller. Idempotent: a second call answers the first
+/// call's address. See [`shm_map`].
+pub const SYS_SHM_MAP: u64 = 106;
+/// Unmap a region from the caller. See [`shm_unmap`].
+pub const SYS_SHM_UNMAP: u64 = 107;
+
+/// Wait for the process a handle names and take its exit code, gated by
+/// [`Rights::WAIT`]. See [`process_wait`].
+///
+/// **An exit code is a property of the object, not of a table entry**, so this
+/// answers whether or not the process is still around: a spawner that waits a
+/// second time gets the same code, and one that waits for the first time long
+/// after the process is gone gets it too. There is nothing to reap and no
+/// window in which an exit is missed.
+///
+/// [`Rights::WAIT`]: crate::handle::Rights::WAIT
+pub const SYS_PROCESS_WAIT: u64 = 108;
+/// Kill the process a handle names, gated by [`Rights::MANAGE`].
+/// See [`process_kill`].
+///
+/// [`Rights::MANAGE`]: crate::handle::Rights::MANAGE
+pub const SYS_PROCESS_KILL: u64 = 109;
+/// A `Process` handle for a pid, gated by [`Rights::MANAGE`] on a `SysCap`.
+/// See [`process_open`].
+///
+/// The one place a pid becomes authority, and only `/bin/init` holds a cap that
+/// carries the right — so the set of processes that can reach a process they
+/// did not start is exactly what init endowed.
+///
+/// [`Rights::MANAGE`]: crate::handle::Rights::MANAGE
+pub const SYS_PROCESS_OPEN: u64 = 110;
+
+/// Mint a device claim for a class, gated by [`Rights::DEVICE`] on a `SysCap`.
+/// Only `/bin/init` holds such a cap, so the set of processes that can ever
+/// claim a device is exactly what init endowed. See [`device_claim`].
+///
+/// [`Rights::DEVICE`]: crate::handle::Rights::DEVICE
+pub const SYS_DEVICE_CLAIM: u64 = 111;
+/// Enter the real-time scheduling band, gated by [`Rights::RT`] on a `SysCap`.
+/// A claim is not a privilege; this is. See [`rt_enter`].
+///
+/// [`Rights::RT`]: crate::handle::Rights::RT
+pub const SYS_RT_ENTER: u64 = 112;
+
+// Number 113 is **reserved, not free**: it is `SYS_PORT_REARM`
+// (`specs/capability-endowment-spec.md` §12), which mints a fresh `Acceptor`
+// for a port whose server died and is the one thing that would make any
+// `serves` daemon restartable. Nothing needs it yet, so nothing is built.
+//
+// 115 is likewise held, for `SYS_SLEEP_UNTIL`
+// (`specs/completion-architecture-spec.md`), which replaces a retired
+// `SYS_NANOSLEEP`.
+//
+// **Both are recorded here rather than in those specs alone**, because this
+// file is where an agent allocating a number looks and a reservation nobody
+// reads is not a reservation. Holes are already ordinary here — a retired
+// number is never reused either.
+
+/// Copy kernel log records into a caller's buffer, advancing a cursor the
+/// caller owns. Gated by [`Rights::LOG`] on a `SysCap`. See [`log_read`] and
+/// [`crate::log`].
+///
+/// **The kernel keeps no per-reader state**, so a second reader costs nothing
+/// and the stream is not consumed: `/bin/logd` and a `log-follow` tool coexist
+/// with no coordination. Reading the whole machine's log is authority, which is
+/// why it rides a right rather than being ambient.
+///
+/// [`Rights::LOG`]: crate::handle::Rights::LOG
+pub const SYS_LOG_READ: u64 = 114;
+
+/// Bins in the per-process syscall profile — one for every number this ABI
+/// issues, and one at the end for every number it does not.
+///
+/// **The profile's parts sum to its total, and that is the whole requirement.**
+/// It was `[u32; 64]` while the ABI reached 98, and the bump was guarded by a
+/// silent `if num < len`: every audio, network, IPC and pipe call fell out of
+/// the line, 15% of doom's, with the total still counting them.
+pub const SYSCALL_PROFILE_BINS: usize = 128;
+
+/// Where a number this ABI does not issue is counted. Merging is a degradation
+/// a reader can see in the line; dropping is one nobody can.
+pub const SYSCALL_PROFILE_OTHER: usize = SYSCALL_PROFILE_BINS - 1;
+
+const _: () = assert!(SYS_LOG_READ < SYSCALL_PROFILE_OTHER as u64);
+
 pub const WNOHANG: u64 = 1;
 
 /// Arguments for the `SYS_SPAWN` syscall, passed as a single pointer.
+///
+/// **Two vectors, two verbs.** `slot_map` *duplicates* — the parent keeps its
+/// stdout — and `endow` *moves*, so a parent that wants to keep what it endows
+/// duplicates first. That is what makes endowing a device claim work with no
+/// special case: a claim carries no [`Rights::DUP`], so the move is the only
+/// expressible form and the parent provably no longer holds it.
+///
+/// [`Rights::DUP`]: crate::handle::Rights::DUP
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SpawnArgs {
     pub argv_ptr: u64,
     pub argv_len: u64,
-    pub fd_map_ptr: u64,
-    pub fd_map_count: u64,
+    /// `[[child_slot: u32, parent_handle: RawHandle]]`, duplicated into the
+    /// child. Stdio and nothing else, in practice.
+    pub slot_map_ptr: u64,
+    pub slot_map_count: u64,
     pub env_ptr: u64,
     pub env_len: u64,
+    /// `[EndowEntry]`, moved out of the parent's table.
+    pub endow_ptr: u64,
+    pub endow_count: u64,
+    /// The label blob every [`EndowEntry`]'s `label_off`/`label_len` indexes.
+    pub labels_ptr: u64,
+    pub labels_len: u64,
 }
 
-use crate::{Fd, Pid};
+const _: () = assert!(core::mem::size_of::<SpawnArgs>() == 80);
+
+/// One `(label, handle)` pair of a process's endowment table.
+///
+/// `label_off`/`label_len` index the label blob that travels beside the
+/// entries — in [`SpawnArgs`] going in, in [`endowments`]'s answer coming back.
+/// The label is a *local name* in one process's own table and buys nothing to
+/// guess: a name not in your table resolves to nothing.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EndowEntry {
+    pub label_off: u32,
+    pub label_len: u32,
+    pub handle: RawHandle,
+    /// Named, so nothing leaks kernel stack into it.
+    pub _pad: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<EndowEntry>() == 16);
+
+/// The label the kernel puts on `/bin/init`'s system capability, and the one
+/// init puts on the `RT`-only dup it endows a `realtime` program.
+///
+/// Here rather than in the SDK because the kernel writes it and userland reads
+/// it, and a label spelled twice is a label that can be spelled two ways.
+pub const SYSCAP_LABEL: &str = "syscap";
+/// The label for a program's namespace — what its manifest `receives` becomes.
+pub const SVC_LABEL: &str = "svc";
+/// `serve:<name>`: the acceptor of a machine-wide port this program serves.
+pub const SERVE_PREFIX: &str = "serve:";
+/// `dev:<class>`: the claim for a device class this program was given.
+pub const DEV_PREFIX: &str = "dev:";
+/// `provide:<name>`: a connector a *launching client* transferred, beside the
+/// namespace entry the launcher made from it.
+///
+/// **Both, and the second is what makes the chain work.** A namespace answers
+/// with connections, not with connectors, so a process holding `surface` only
+/// in its namespace cannot hand `surface` to a child — and the terminal → shell
+/// → `locale` chain is exactly that. The connector arrives labelled as well, so
+/// the holder can pass it on and the child's own manifest row still decides
+/// everything else it gets.
+pub const PROVIDE_PREFIX: &str = "provide:";
+
+/// Endowed `(label, handle)` pairs one spawn may carry. Policy on the
+/// primitive, refused by name, never truncated — the widest manifest row plus
+/// stdio.
+pub const MAX_ENDOWMENTS: usize = 32;
+/// `(child slot, parent handle)` pairs one spawn may carry.
+///
+/// **Derived rather than chosen.** A slot map installs into the child's table,
+/// which has [`RawHandle::MAX_SLOTS`] slots, so a longer one necessarily names
+/// a slot twice and the second pair says everything the first did. Without it
+/// the count was bounded only by the 2 MiB window the arguments are read
+/// through — 262,144 pairs, every one of them a `duplicate_entry` under the
+/// parent's own lock, and every repeat of one slot displacing a live entry the
+/// caller has to carry out of that lock. That vector passes `MAX_HEAP_ALLOC`
+/// at 87,211 repeats, and the allocator's refusal there is a kernel panic.
+pub const MAX_SLOT_MAP: usize = RawHandle::MAX_SLOTS;
+/// Bytes of label blob one endowment table may carry.
+pub const MAX_LABELS_LEN: usize = 4096;
+
+use crate::handle::Rights;
+use crate::{Pid, RawHandle, HANDLE_INVALID};
 
 /// Syscall error with a specific code. Values occupy the top of the u64 range:
 /// error code N is encoded as `u64::MAX - N`. Any return value `>= u64::MAX - 255`
@@ -145,6 +384,16 @@ pub enum SyscallError {
     /// triage reads them; an enum here would be a vocabulary userland has no
     /// use for and every new driver would have to guess an arm from.
     Io = 9,
+    /// The object was there and its other end is not.
+    ///
+    /// **A different fact from `NotFound`, and the design does not work without
+    /// the difference.** "The name is not in the namespace this process was
+    /// given" is a statement about this process and the answer is "you have a
+    /// bug"; "the server exited" is a statement about the machine. The SDK sees
+    /// one `u64`, so if the kernel gives one word the SDK has one answer — and
+    /// the same rule the storage layer already obeys applies here: a dead peer
+    /// must not be indistinguishable from a handle that was never there.
+    Gone = 10,
 }
 
 impl SyscallError {
@@ -168,6 +417,7 @@ impl SyscallError {
             7 => Some(Self::ResourceExhausted),
             8 => Some(Self::NotSupported),
             9 => Some(Self::Io),
+            10 => Some(Self::Gone),
             _ => Some(Self::Unknown),
         }
     }
@@ -186,6 +436,7 @@ impl core::fmt::Display for SyscallError {
             Self::ResourceExhausted => f.write_str("resource exhausted"),
             Self::NotSupported => f.write_str("not supported"),
             Self::Io => f.write_str("the device did not complete the transfer"),
+            Self::Gone => f.write_str("the other end is gone"),
         }
     }
 }
@@ -311,8 +562,8 @@ impl core::ops::BitOr for MmapFlags {
 /// Result of [`pipe`]: the read and write ends.
 #[derive(Debug, Clone, Copy)]
 pub struct PipeFds {
-    pub read: Fd,
-    pub write: Fd,
+    pub read: RawHandle,
+    pub write: RawHandle,
 }
 
 /// Wall-clock time from RTC.
@@ -381,12 +632,12 @@ fn encode_timeout(timeout: Option<u64>) -> u64 {
 }
 
 /// Write bytes to a file descriptor. Returns number of bytes written.
-pub fn write(fd: Fd, buf: &[u8]) -> Result<usize, SyscallError> {
+pub fn write(fd: RawHandle, buf: &[u8]) -> Result<usize, SyscallError> {
     check(syscall(SYS_WRITE, fd.0 as u64, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
 /// Read bytes from a file descriptor. Returns number of bytes read.
-pub fn read(fd: Fd, buf: &mut [u8]) -> Result<usize, SyscallError> {
+pub fn read(fd: RawHandle, buf: &mut [u8]) -> Result<usize, SyscallError> {
     check(syscall(SYS_READ, fd.0 as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
@@ -401,27 +652,128 @@ pub fn exit(code: i32) -> ! {
     loop { syscall(SYS_EXIT, code as u64, 0, 0, 0); }
 }
 
-/// Debug syscall. `action`: 0 = kernel panic, 1 = kernel fault,
-/// 2 = kernel lock held across a scheduler entry, 3 = fatal halt.
-/// 0, 1 and 2 kill the calling process and the system survives; 3 halts
-/// every CPU and does not return.
+/// Ask the kernel to do one of the things [`SYS_DEBUG`] does. The actions are
+/// the `DEBUG_*` constants below, not bare numbers.
 pub fn debug(action: u64) -> u64 {
     syscall(SYS_DEBUG, action, 0, 0, 0)
 }
 
-/// Create a pipe. Returns the read and write file descriptors.
+/// [`debug`] for the actions that take an argument.
+pub fn debug_with(action: u64, arg: u64) -> u64 {
+    syscall(SYS_DEBUG, action, arg, 0, 0)
+}
+
+/// What [`SYS_DEBUG`] can be asked to do.
 ///
-/// The return type is dishonest and the caller must not trust it: `sys_pipe`
-/// answers `ResourceExhausted` on three paths (no pipe pages, and either fd
-/// insert hitting `MAX_FDS`), and that one word splits into `read = Fd(-1)`,
-/// `write = Fd(-8)` here. Both are rejected by any later syscall, so the
-/// failure surfaces as whatever the *next* call decides to do about a bad fd.
-pub fn pipe() -> PipeFds {
-    let raw = syscall(SYS_PIPE, 0, 0, 0, 0);
-    PipeFds {
-        read: Fd((raw >> 32) as i32),
-        write: Fd((raw & 0xFFFF_FFFF) as i32),
-    }
+/// **One declaration, because a number that means something is a constant.**
+/// These were bare integers in the kernel's dispatch and re-declared in each
+/// test binary that called one — five spellings of `14`, and the kernel's own
+/// arms said nothing about which was which except in prose beside them. An
+/// action's *reason* stays at the kernel arm, where the code it runs is; its
+/// number lives here once, where both sides read it.
+///
+/// **Every action here needs a kernel built with `test-actuators`, and a kernel
+/// without it has no `SYS_DEBUG` at all** — the number falls to the dispatch's
+/// default and answers `InvalidArgument`, which is what an unassigned number
+/// answers. So a constant below is a number a shipping kernel does not have,
+/// and the caller of one is a test that has to be given the kernel that does.
+pub mod debug_action {
+    /// Panic the kernel. Kills the caller's machine, deliberately.
+    pub const PANIC: u64 = 0;
+    /// Read through a null pointer in Ring 0.
+    pub const NULL_READ: u64 = 1;
+    /// Hold a kernel lock across a scheduler entry. Armed once per boot.
+    pub const LOCK_ACROSS_SWITCH: u64 = 2;
+    /// Halt every CPU.
+    pub const FATAL_HALT: u64 = 3;
+    /// Provoke a real #DF, to exercise the IST1 stack.
+    pub const DOUBLE_FAULT: u64 = 4;
+    /// Heap allocations either side of `MAX_HEAP_ALLOC`.
+    pub const HEAP_AT_CEILING: u64 = 5;
+    pub const HEAP_OVER_CEILING: u64 = 6;
+    pub const HEAP_AT_CEILING_PAGE_ALIGNED: u64 = 7;
+    /// Draw over the screen a userland process owns.
+    pub const SCREEN_GRAFFITI: u64 = 8;
+    /// Read the guard page below this CPU's idle stack.
+    pub const IDLE_GUARD_READ: u64 = 9;
+    /// The kernel canary's address, and whether it still holds what the kernel
+    /// wrote.
+    pub const CANARY_ADDR: u64 = 10;
+    pub const CANARY_CHANGED: u64 = 11;
+    /// Make the last CPU a shootdown waits for answer `arg` nanoseconds late,
+    /// and take it away again.
+    pub const TLB_ACK_DELAY_ARM: u64 = 12;
+    pub const TLB_ACK_DELAY_DISARM: u64 = 13;
+    /// How many kernel objects are alive right now, machine-wide.
+    pub const CENSUS_TOTAL: u64 = 14;
+    /// The same, per kind, into the kernel log.
+    pub const CENSUS_BREAKDOWN: u64 = 15;
+    /// The same for one [`OBJECT_KINDS`](super::OBJECT_KINDS) index, which is
+    /// the argument. The one a guest test can assert on.
+    pub const CENSUS_KIND: u64 = 16;
+    /// The deepest any CPU's idle stack has been this boot, in bytes.
+    ///
+    /// The idle loop is where `object::drain_zero_handles` releases objects
+    /// with nothing held, and a release path that reaches the filesystem is the
+    /// deepest thing this kernel does. This is how a test asserts that stack is
+    /// sized for it, rather than waiting for the guard page below it to say so
+    /// by halting the machine.
+    pub const IDLE_STACK_HIGH_WATER: u64 = 17;
+    /// How big that stack is, so the reading above is a *fraction* rather than
+    /// a number nobody can judge. The size is the kernel's choice and not the
+    /// ABI's, which is why it is asked for rather than declared here.
+    pub const IDLE_STACK_SIZE: u64 = 18;
+    /// Put a count this guest can reach in `MAX_SYSINFO_THREADS`'s place, for
+    /// the rest of the boot. `SYS_SYSINFO`'s real bound is a thread count no
+    /// guest can make, so only the number can move and moving it runs the
+    /// shipped count, comparison and refusal.
+    pub const LOWER_SYSINFO_BOUND: u64 = 19;
+}
+
+/// Every kind of kernel object, in the order the kernel's own `kobject!`
+/// declares them — so an index into this is the index
+/// [`debug_action::CENSUS_KIND`] takes.
+///
+/// **In the ABI rather than in the kernel alone, because a census nobody can
+/// read per kind is a total.** Every leak assertion in the test estate was
+/// against the machine-wide count, where a leak of one kind is hidden by churn
+/// in another, and six of the thirteen kinds were exercised by no census
+/// assertion at all. The kernel checks this list against its own declaration
+/// order when the action is called, so a row added to `kobject!` without a row
+/// here is a named refusal rather than an index that quietly names its
+/// neighbour.
+pub const OBJECT_KINDS: &[&str] = &[
+    "PipeRead",
+    "PipeWrite",
+    "Connection",
+    "Device",
+    "Acceptor",
+    "IoUring",
+    "SharedMem",
+    "Connector",
+    "Namespace",
+    "File",
+    "Console",
+    "SysCap",
+    "Process",
+];
+
+/// Create a pipe. Returns the read and write ends.
+///
+/// **Fallible, because `sys_pipe` is.** It answers `ResourceExhausted` on three
+/// paths — no pipe pages, and either handle install hitting the table cap — and
+/// a wrapper that cannot say so hands the caller a pair of handles that are an
+/// error word cut in half.
+///
+/// A packed pair can never be mistaken for an error word: no handle is ever
+/// `0xFFFF_FFFF`, because a slot at `MAX_GENERATION` is retired rather than
+/// reissued, and `SyscallError` occupies only the top 256 values.
+pub fn pipe() -> Result<PipeFds, SyscallError> {
+    let raw = check(syscall(SYS_PIPE, 0, 0, 0, 0))?;
+    Ok(PipeFds {
+        read: RawHandle((raw >> 32) as u32),
+        write: RawHandle((raw & 0xFFFF_FFFF) as u32),
+    })
 }
 
 /// Read the inherited environment variables into `buf`.
@@ -432,26 +784,85 @@ pub fn get_env(buf: &mut [u8]) -> usize {
 
 /// Spawn a new process. The `SpawnArgs` struct contains argv, fd_map, and env.
 ///
+/// Answers a `Process` handle carrying `WAIT|MANAGE|READ|DUP|TRANSFER`. A
+/// caller that wants nothing to do with the child closes it; a caller that
+/// wants to hand it on transfers it. There is no pid-addressed way back to a
+/// process, so this handle is the whole of what a spawn confers.
+///
 /// # Safety
 /// The raw pointer fields in `SpawnArgs` must point to valid memory.
-pub unsafe fn spawn(args: &SpawnArgs) -> Result<Pid, SyscallError> {
+pub unsafe fn spawn(args: &SpawnArgs) -> Result<RawHandle, SyscallError> {
     check(syscall(SYS_SPAWN, args as *const SpawnArgs as u64, 0, 0, 0))
-        .map(|pid| Pid(pid as u32))
+        .map(|h| RawHandle(h as u32))
 }
 
-/// Wait for process to exit. Returns exit code (blocking).
-pub fn waitpid(pid: Pid) -> u64 {
-    syscall(SYS_WAITPID, pid.0 as u64, 0, 0, 0)
+/// Read this process's endowment table into `buf`: an `[EndowEntry]` count and
+/// entries followed by the label blob. Returns the bytes written, or — when
+/// `buf` is empty — the bytes the answer needs.
+///
+/// The one place a name is resolved to a handle at all: there is no global
+/// registry, so a process learns what it holds only from its own table.
+pub fn endowments(buf: &mut [u8]) -> usize {
+    syscall(SYS_ENDOWMENTS, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) as usize
 }
 
-/// Wait for process with flags. Returns exit code, or `Err(WouldBlock)` with WNOHANG
-/// if the child has not exited yet.
-pub fn waitpid_flags(pid: Pid, flags: u64) -> Result<u64, SyscallError> {
-    check(syscall(SYS_WAITPID, pid.0 as u64, flags, 0, 0))
+/// Block until the process `proc` names has exited, and take its exit code.
+pub fn process_wait(proc: RawHandle) -> Result<i32, SyscallError> {
+    check(syscall(SYS_PROCESS_WAIT, proc.0 as u64, 0, 0, 0)).map(|code| code as i32)
+}
+
+/// The exit code if the process has already exited, `Err(WouldBlock)` if it has
+/// not.
+///
+/// [`WNOHANG`] rather than a syscall of its own: this is the same question with
+/// the wait taken out, and a caller that polls is asking about the same object.
+pub fn process_wait_nonblock(proc: RawHandle) -> Result<i32, SyscallError> {
+    check(syscall(SYS_PROCESS_WAIT, proc.0 as u64, WNOHANG, 0, 0)).map(|code| code as i32)
+}
+
+/// Kill the process `proc` names. Answers `Ok` for one already dead: the
+/// caller asked for it to be gone and it is.
+pub fn process_kill(proc: RawHandle) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_PROCESS_KILL, proc.0 as u64, 0, 0, 0))
+}
+
+/// A `Process` handle for `pid`, presenting a `SysCap` that carries
+/// `Rights::MANAGE`.
+pub fn process_open(syscap: RawHandle, pid: Pid) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_PROCESS_OPEN, syscap.0 as u64, pid.0 as u64, 0, 0))
+        .map(|h| RawHandle(h as u32))
+}
+
+/// Copy records into `out`, oldest first and merged by `at_ns`, advancing
+/// `cursor`. Answers how many records were written, and `0` when there is
+/// nothing new.
+///
+/// **It never blocks.** A caller with nothing to read arms on a readiness
+/// source and parks; a syscall that waited would be a second blocking mechanism
+/// in a kernel that is converging on one.
+///
+/// `out` is whole [`crate::log::LogRecord`]s at a fixed stride, so the caller
+/// indexes by shift and the kernel does no length arithmetic. A buffer that
+/// cannot hold one record, or that cannot hold what the machine's shard count
+/// requires, is `InvalidArgument` — untrusted input that cannot be satisfied is
+/// refused, never truncated to fit.
+pub fn log_read(
+    syscap: RawHandle,
+    cursor: &mut crate::log::LogCursor,
+    out: &mut [crate::log::LogRecord],
+) -> Result<usize, SyscallError> {
+    check(syscall(
+        SYS_LOG_READ,
+        syscap.0 as u64,
+        cursor as *mut crate::log::LogCursor as u64,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+    ))
+    .map(|n| n as usize)
 }
 
 /// Mark file descriptor as the controlling TTY for this process.
-pub fn mark_tty(fd: Fd) {
+pub fn mark_tty(fd: RawHandle) {
     syscall(SYS_MARK_TTY, fd.0 as u64, 0, 0, 0);
 }
 
@@ -476,17 +887,17 @@ pub fn set_thread_name(name: &[u8]) {
 }
 
 /// Open a file.
-pub fn open(path: &[u8], flags: OpenFlags) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, flags.0, 0)).map(|v| Fd(v as i32))
+pub fn open(path: &[u8], flags: OpenFlags) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, flags.0, 0)).map(|v| RawHandle(v as u32))
 }
 
 /// Close a file descriptor.
-pub fn close(fd: Fd) {
+pub fn close(fd: RawHandle) {
     syscall(SYS_CLOSE, fd.0 as u64, 0, 0, 0);
 }
 
 /// Seek within a file descriptor. Returns new offset.
-pub fn seek(fd: Fd, pos: SeekFrom) -> Result<u64, SyscallError> {
+pub fn seek(fd: RawHandle, pos: SeekFrom) -> Result<u64, SyscallError> {
     let (offset, whence) = match pos {
         SeekFrom::Start(n) => (n as i64, 0u64),
         SeekFrom::Current(n) => (n, 1u64),
@@ -496,14 +907,14 @@ pub fn seek(fd: Fd, pos: SeekFrom) -> Result<u64, SyscallError> {
 }
 
 /// Get file metadata for a file descriptor.
-pub fn fstat(fd: Fd) -> Result<Stat, SyscallError> {
+pub fn fstat(fd: RawHandle) -> Result<Stat, SyscallError> {
     let mut stat = Stat { file_type: FileType::Unknown, size: 0, mtime: 0 };
     check_unit(syscall(SYS_FSTAT, fd.0 as u64, &mut stat as *mut Stat as u64, 0, 0))?;
     Ok(stat)
 }
 
 /// Flush file descriptor to disk.
-pub fn fsync(fd: Fd) -> Result<(), SyscallError> {
+pub fn fsync(fd: RawHandle) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_FSYNC, fd.0 as u64, 0, 0, 0))
 }
 
@@ -584,22 +995,31 @@ pub fn clock_epoch() -> Option<u64> {
     check(syscall(SYS_CLOCK_EPOCH, 0, 0, 0, 0)).ok()
 }
 
-/// Transfer a region of the framebuffer to the GPU and flush it.
-/// Pass (0, 0, 0, 0) to flush the full screen.
+/// Two `u32`s in one argument word.
 ///
-/// Fallible: the kernel refuses a caller that does not own the display.
-pub fn gpu_present(x: u32, y: u32, w: u32, h: u32) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_GPU_PRESENT, x as u64, y as u64, w as u64, h as u64))
+/// The four device calls below take the claim handle that authorizes them, and
+/// `SYS_GPU_PRESENT`'s rectangle then does not fit in what is left. A pair is a
+/// wire encoding decoded at the kernel boundary and carried no further.
+const fn pair(hi: u32, lo: u32) -> u64 {
+    ((hi as u64) << 32) | lo as u64
+}
+
+/// Transfer a region of the framebuffer to the GPU and flush it, presenting the
+/// framebuffer claim. Pass (0, 0, 0, 0) to flush the full screen.
+///
+/// Fallible: the kernel refuses a handle that is not a live framebuffer claim.
+pub fn gpu_present(claim: RawHandle, x: u32, y: u32, w: u32, h: u32) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_GPU_PRESENT, claim.0 as u64, pair(x, y), pair(w, h), 0))
 }
 
 /// Upload the cursor image from backing and enable hardware cursor.
-pub fn gpu_set_cursor(hot_x: u32, hot_y: u32) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_GPU_SET_CURSOR, hot_x as u64, hot_y as u64, 0, 0))
+pub fn gpu_set_cursor(claim: RawHandle, hot_x: u32, hot_y: u32) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_GPU_SET_CURSOR, claim.0 as u64, hot_x as u64, hot_y as u64, 0))
 }
 
 /// Move the hardware cursor to screen position (x, y).
-pub fn gpu_move_cursor(x: u32, y: u32) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_GPU_MOVE_CURSOR, x as u64, y as u64, 0, 0))
+pub fn gpu_move_cursor(claim: RawHandle, x: u32, y: u32) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_GPU_MOVE_CURSOR, claim.0 as u64, x as u64, y as u64, 0))
 }
 
 /// Request a GPU resolution change. On success, writes the new
@@ -608,8 +1028,19 @@ pub fn gpu_move_cursor(x: u32, y: u32) -> Result<(), SyscallError> {
 /// # Safety
 /// `info_out` must point to a writable buffer of at least
 /// `size_of::<FramebufferInfo>()` bytes.
-pub unsafe fn gpu_set_resolution(width: u32, height: u32, info_out: *mut u8) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_GPU_SET_RESOLUTION, width as u64, height as u64, info_out as u64, 0))
+pub unsafe fn gpu_set_resolution(
+    claim: RawHandle,
+    width: u32,
+    height: u32,
+    info_out: *mut u8,
+) -> Result<(), SyscallError> {
+    check_unit(syscall(
+        SYS_GPU_SET_RESOLUTION,
+        claim.0 as u64,
+        pair(width, height),
+        info_out as u64,
+        0,
+    ))
 }
 
 /// Shut down the machine. Does not return.
@@ -618,32 +1049,86 @@ pub fn shutdown() -> ! {
     loop {}
 }
 
-/// Device types for [`open_device`].
-#[repr(u64)]
-#[derive(Debug, Clone, Copy)]
-pub enum DeviceType {
-    Keyboard = 0,
-    Mouse = 1,
-    Framebuffer = 2,
-    Nic = 3,
+/// The device classes, their wire numbers, and the name a `system.toml`
+/// `devices` entry and a `dev:` endowment label spell each one with.
+///
+/// **One row per class, so the four cannot disagree.** The build system checks
+/// a config against this table, `/bin/init` mints from it, and a claimant finds
+/// its own claim by it; a second spelling anywhere is a class a config can name
+/// and no program can find. The wire number is here too, because a class whose
+/// number and name came from different lists is the same defect one level down.
+macro_rules! device_classes {
+    ($($(#[$meta:meta])* $variant:ident = $num:literal => $name:literal),+ $(,)?) => {
+        #[repr(u64)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum DeviceType {
+            $($(#[$meta])* $variant = $num),+
+        }
+
+        impl DeviceType {
+            /// What a manifest calls this class.
+            pub fn class_name(self) -> &'static str {
+                match self { $(Self::$variant => $name),+ }
+            }
+
+            /// The class a config named, or `None` — a typo in a `devices`
+            /// list, refused where the image is built.
+            pub fn from_class_name(name: &str) -> Option<Self> {
+                match name { $($name => Some(Self::$variant),)+ _ => None }
+            }
+
+            /// The wire number a syscall carries, decoded once.
+            pub fn from_raw(raw: u64) -> Option<Self> {
+                match raw { $($num => Some(Self::$variant),)+ _ => None }
+            }
+
+            /// Every class, for a caller that must consider all of them.
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+        }
+    };
+}
+
+device_classes! {
+    Keyboard = 0 => "keyboard",
+    Mouse = 1 => "mouse",
+    Framebuffer = 2 => "framebuffer",
+    Nic = 3 => "nic",
     // 4 was `Audio`, a sound card the kernel drove on the claimant's behalf.
     // Retired with the syscall that fed it rather than reused for the stub that
-    // replaced it: the claim below authorizes register writes and answers no
-    // submit, so a caller that still names 4 has to be refused rather than
-    // handed a capability of a different shape.
+    // replaced it: the claim authorizes register writes and answers no submit,
+    // so a caller that still names 4 has to be refused rather than handed a
+    // capability of a different shape.
     /// An Intel HDA controller the kernel has brought up but drives no policy
     /// on.
-    HdaAudio = 5,
+    HdaAudio = 5 => "hda-audio",
     /// A virtio-sound device, on the same terms: the kernel negotiated its
     /// features, built its virtqueues and owns their descriptors, and every
     /// decision above that — the stream, the rate, the format, when a period is
     /// published — belongs to whoever holds this.
-    VirtioSound = 6,
+    VirtioSound = 6 => "virtio-sound",
 }
 
-/// Claim exclusive access to a device.
-pub fn open_device(device: DeviceType) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_OPEN_DEVICE, device as u64, 0, 0, 0)).map(|v| Fd(v as i32))
+/// Mint a device claim for `class`, presenting a `SysCap` handle that carries
+/// [`Rights::DEVICE`]. `NotFound` for a class no driver registered — init
+/// endows what exists and logs what it did not.
+///
+/// The claim comes back **without** [`Rights::DUP`], so it can only be moved,
+/// which is what makes endowing one to a child a provable hand-off.
+///
+/// [`Rights::DEVICE`]: crate::handle::Rights::DEVICE
+/// [`Rights::DUP`]: crate::handle::Rights::DUP
+pub fn device_claim(syscap: RawHandle, class: DeviceType) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_DEVICE_CLAIM, syscap.0 as u64, class as u64, 0, 0))
+        .map(|v| RawHandle(v as u32))
+}
+
+/// Enter the real-time scheduling band, presenting a `SysCap` handle that
+/// carries [`Rights::RT`]. The privilege a device claim was never enough to
+/// confer.
+///
+/// [`Rights::RT`]: crate::handle::Rights::RT
+pub fn rt_enter(syscap: RawHandle) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_RT_ENTER, syscap.0 as u64, 0, 0, 0))
 }
 
 /// How wide a register access is.
@@ -692,7 +1177,7 @@ impl RegWidth {
 /// name; there is no way to name an address here and no way to reach a
 /// register the list does not carry.
 pub fn device_reg_read(
-    fd: Fd,
+    fd: RawHandle,
     offset: u32,
     width: RegWidth,
 ) -> Result<u32, SyscallError> {
@@ -707,7 +1192,7 @@ pub fn device_reg_read(
 /// entry costs a driver that cannot bring its stream up and says so, which is
 /// the failure mode a refusal list does not have.
 pub fn device_reg_write(
-    fd: Fd,
+    fd: RawHandle,
     offset: u32,
     width: RegWidth,
     value: u32,
@@ -722,88 +1207,202 @@ pub fn device_reg_write(
     .map(|_| ())
 }
 
-// Service IPC (listen / accept / connect)
+// Ports and namespaces
 
-/// Register a named service and return a listener fd.
-/// Other processes can connect to this service by name.
-pub fn listen(name: &str) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_LISTEN, name.as_ptr() as u64, name.len() as u64, 0, 0)).map(|v| Fd(v as i32))
+/// Both ends of a fresh port.
+///
+/// Two types and not one object with a direction right: "accept the
+/// connections of a service you were only given access to" is a state that
+/// cannot be written, the same way a pipe's two ends are two types.
+pub struct Port {
+    pub acceptor: RawHandle,
+    pub connector: RawHandle,
 }
 
-/// Result of [`accept`]: socket fd + connecting client's PID.
-pub struct AcceptResult {
-    pub fd: Fd,
-    pub client_pid: u32,
-}
-
-/// Accept a pending connection on a listener fd.
-/// Blocks until a client connects. Returns a socket fd and the client's PID.
-pub fn accept(listener_fd: Fd) -> Result<AcceptResult, SyscallError> {
-    let raw = syscall(SYS_ACCEPT, listener_fd.0 as u64, 0, 0, 0);
+/// Make a port. Needs no right and grants none — a port with no clients is not
+/// authority.
+pub fn port_create() -> Result<Port, SyscallError> {
+    let raw = syscall(SYS_PORT_CREATE, 0, 0, 0, 0);
     if let Some(e) = SyscallError::from_u64(raw) {
         return Err(e);
     }
-    Ok(AcceptResult {
-        fd: Fd((raw & 0xFFFF_FFFF) as i32),
-        client_pid: (raw >> 32) as u32,
+    Ok(Port {
+        acceptor: RawHandle((raw >> 32) as u32),
+        connector: RawHandle((raw & 0xFFFF_FFFF) as u32),
     })
 }
 
-/// Connect to a named service. Blocks until the server accepts.
-/// Returns a bidirectional socket fd.
-pub fn connect(name: &str) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_CONNECT, name.as_ptr() as u64, name.len() as u64, 0, 0)).map(|v| Fd(v as i32))
+/// One `(name, connector)` pair `SYS_NAMESPACE_BUILD` adds.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NamespaceEntry {
+    pub off: u32,
+    pub len: u32,
+    pub connector: RawHandle,
+    /// Named, so nothing leaks kernel stack into it.
+    pub _pad: u32,
 }
 
-/// Allocate a 2MB-aligned shared memory region. Returns an opaque token.
+/// One name carried over from the base namespace.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NameRef {
+    pub off: u32,
+    pub len: u32,
+}
+
+/// Arguments for [`SYS_NAMESPACE_BUILD`], passed as a single pointer.
+///
+/// A namespace is immutable once built: there is no insert, no remove and no
+/// replace, so a narrower one is a *new* object built from this one and a
+/// handle to a namespace is a handle to a fixed set.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NamespaceBuild {
+    /// [`HANDLE_INVALID`] for an empty base.
+    ///
+    /// [`HANDLE_INVALID`]: crate::handle::HANDLE_INVALID
+    pub base: RawHandle,
+    pub _pad: u32,
+    /// `[NameRef]` — the names to carry over from `base`.
+    pub keep_ptr: u64,
+    pub keep_n: u64,
+    /// `[NamespaceEntry]` — new bindings.
+    pub add_ptr: u64,
+    pub add_n: u64,
+    /// The blob every `off`/`len` above indexes into.
+    pub names_ptr: u64,
+    pub names_len: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<NamespaceBuild>() == 56);
+const _: () = assert!(core::mem::size_of::<NamespaceEntry>() == 16);
+const _: () = assert!(core::mem::size_of::<NameRef>() == 8);
+
+/// Names one namespace may bind. Policy on the primitive; a caller asking for
+/// one more is refused by name and never truncated.
+pub const MAX_NAMESPACE_ENTRIES: usize = 64;
+/// Bytes in one service name.
+pub const MAX_SERVICE_NAME: usize = 64;
+
+/// # Safety
+/// Every pointer in `args` must name `args`'s stated length of readable memory.
+pub unsafe fn namespace_build(args: &NamespaceBuild) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_NAMESPACE_BUILD, args as *const _ as u64, 0, 0, 0))
+        .map(|v| RawHandle(v as u32))
+}
+
+/// Open a connection to `name` in the namespace `ns` holds.
+///
+/// `NotFound` means the name is not in this namespace — a fact about this
+/// process. [`SyscallError::Gone`] means the server that held the acceptor has
+/// exited. There is no third answer, and in particular there is no "not yet":
+/// the port exists before either process runs.
+pub fn namespace_open(ns: RawHandle, name: &str) -> Result<RawHandle, SyscallError> {
+    check(syscall(
+        SYS_NAMESPACE_OPEN,
+        ns.0 as u64,
+        name.as_ptr() as u64,
+        name.len() as u64,
+        0,
+    ))
+    .map(|v| RawHandle(v as u32))
+}
+
+/// Accept a queued connection. Blocks until there is one.
+///
+/// **It answers with the connection and nothing else.** Who connected is not
+/// the kernel's to assert: a server that wants to name its client reads it out
+/// of the protocol's first frame, where it is already the client's own claim
+/// about itself and already distrusted.
+pub fn accept(acceptor: RawHandle) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_ACCEPT, acceptor.0 as u64, 0, 0, 0)).map(|v| RawHandle(v as u32))
+}
+
+/// Join a pipe read end and a pipe write end into one duplex connection.
+///
+/// The two ends stay open and this takes references of its own, so the caller
+/// closes what it handed in. The result carries no handle-transfer queue: a
+/// connection made this way has no peer holding the other half, so
+/// [`handle_send`] on one answers [`SyscallError::Gone`].
+pub fn connection_join(rx: RawHandle, tx: RawHandle) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_CONNECTION_JOIN, rx.0 as u64, tx.0 as u64, 0, 0))
+        .map(|v| RawHandle(v as u32))
+}
+
+/// Handles one [`handle_send`] may carry.
+///
+/// Policy on the primitive: a caller asking for one more is refused by name
+/// and never truncated to fit.
+pub const MAX_TRANSFER_HANDLES: usize = 8;
+
+/// Batches one direction of a connection may hold unreceived.
+pub const MAX_QUEUED_BATCHES: usize = 16;
+
+/// Move `handles` to the peer of `conn`.
+///
+/// Each handle must carry [`Rights::TRANSFER`], and so must `conn`. The move is
+/// all-or-nothing: a refusal leaves every handle where it was.
+///
+/// **Send the handles before the frame that announces them.** They travel in a
+/// queue of their own rather than interleaved with the connection's bytes, so a
+/// peer that has read the frame is guaranteed to find them only in that order.
+///
+/// [`Rights::TRANSFER`]: crate::handle::Rights::TRANSFER
+pub fn handle_send(conn: RawHandle, handles: &[RawHandle]) -> Result<(), SyscallError> {
+    check_unit(syscall(
+        SYS_HANDLE_SEND,
+        conn.0 as u64,
+        handles.as_ptr() as u64,
+        handles.len() as u64,
+        0,
+    ))
+}
+
+/// Take the oldest batch the peer sent, into `out`. Answers how many it wrote.
+///
+/// Never blocks: zero means nothing is queued right now. A batch larger than
+/// `out` is `InvalidArgument` and stays queued — `out` should be
+/// [`MAX_TRANSFER_HANDLES`] long.
+pub fn handle_recv(conn: RawHandle, out: &mut [RawHandle]) -> Result<usize, SyscallError> {
+    check(syscall(
+        SYS_HANDLE_RECV,
+        conn.0 as u64,
+        out.as_mut_ptr() as u64,
+        out.len() as u64,
+        0,
+    ))
+    .map(|n| n as usize)
+}
+
+/// Make a shared-memory region and answer a handle to it.
 ///
 /// Fallible: a size the kernel cannot express in whole 2 MiB pages is
 /// `InvalidArgument` and memory it does not have is `ResourceExhausted`. A
 /// daemon reaches both through a client's request, so neither may be an
 /// assertion here.
-pub fn alloc_shared(size: usize) -> Result<u32, SyscallError> {
-    check(syscall(SYS_ALLOC_SHARED, size as u64, 0, 0, 0)).map(|token| token as u32)
+pub fn shm_create(size: usize) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_SHM_CREATE, size as u64, 0, 0, 0)).map(|v| RawHandle(v as u32))
 }
 
-/// Grant another process permission to map a shared memory region.
+/// Map the region `shm` names into this process. Needs [`Rights::MAP`].
 ///
-/// Fallible: only the region's owner may grant, and only to a live process.
-pub fn grant_shared(token: u32, target_pid: Pid) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_GRANT_SHARED, token as u64, target_pid.0 as u64, 0, 0))
-}
-
-/// Map a shared memory region into this process's address space.
+/// Idempotent: a second call answers the first call's address.
 ///
-/// Panics if the kernel refuses. Kept infallible because the `mio` fork calls
-/// it — an ecosystem fork is a consumer of this crate exactly as the monorepo
-/// is, and a signature change here breaks a build nothing in the tree greps.
-/// [`try_map_shared`] is the same call with the answer kept.
+/// [`Rights::MAP`]: crate::handle::Rights::MAP
 ///
 /// # Safety
 /// Caller must manage the returned pointer.
-pub unsafe fn map_shared(token: u32) -> *mut u8 {
-    match unsafe { try_map_shared(token) } {
-        Ok(ptr) => ptr,
-        Err(e) => panic!("map_shared failed: {e:?}"),
-    }
-}
-
-/// Map a shared memory region, reporting a refusal instead of panicking.
-///
-/// A token the caller was never granted is `PermissionDenied`, which is a
-/// thing callers and tests need to be able to observe rather than die on.
-///
-/// # Safety
-/// Caller must manage the returned pointer.
-pub unsafe fn try_map_shared(token: u32) -> Result<*mut u8, SyscallError> {
-    check(syscall(SYS_MAP_SHARED, token as u64, 0, 0, 0))
+pub unsafe fn shm_map(shm: RawHandle) -> Result<*mut u8, SyscallError> {
+    check(syscall(SYS_SHM_MAP, shm.0 as u64, 0, 0, 0))
         .map(|addr| core::ptr::with_exposed_provenance_mut(addr as usize))
 }
 
-/// Release this process's mapping of a shared memory region.
-pub fn release_shared(token: u32) {
-    let result = syscall(SYS_RELEASE_SHARED, token as u64, 0, 0, 0);
-    assert_eq!(result, 0, "release_shared failed");
+/// Unmap the region `shm` names from this process. Needs [`Rights::MAP`].
+///
+/// [`Rights::MAP`]: crate::handle::Rights::MAP
+pub fn shm_unmap(shm: RawHandle) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_SHM_UNMAP, shm.0 as u64, 0, 0, 0))
 }
 
 /// Query system information (memory, CPUs, processes).
@@ -818,24 +1417,43 @@ pub fn nanosleep(nanos: u64) {
     syscall(SYS_NANOSLEEP, nanos, 0, 0, 0);
 }
 
-/// Set or clear real-time scheduling priority on the current thread.
+/// What [`SYS_HANDLE_DUP`]'s rights word carries when the caller wants the
+/// source's own set.
 ///
-/// `PermissionDenied` unless the caller holds the audio device claim. A caller
-/// that discards the result drops out of the RT band with no symptom beyond
-/// the glitches the band exists to prevent.
-pub fn set_rt_priority(enable: bool) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_SET_RT_PRIORITY, enable as u64, 0, 0, 0))
+/// A wire encoding of `Option<Rights>`, decoded at the syscall boundary and
+/// never carried inward: `Rights` is nine bits, so this value is not one. The
+/// two wrappers below are the only writers, so no caller ever spells it.
+pub const RIGHTS_UNCHANGED: u64 = u64::MAX;
+
+/// A second handle to the same object, carrying what the first carries.
+pub fn dup(handle: RawHandle) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_HANDLE_DUP, handle.0 as u64, RIGHTS_UNCHANGED, 0, 0))
+        .map(|v| RawHandle(v as u32))
 }
 
-/// Duplicate a file descriptor.
-pub fn dup(fd: Fd) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_DUP, fd.0 as u64, 0, 0, 0)).map(|v| Fd(v as i32))
+/// A second handle to the same object, carrying **less**.
+///
+/// `PermissionDenied` for a set the source does not itself hold: rights only
+/// shrink, and asking to widen is a bug in the asker rather than a request to
+/// be quietly cut down to size. This is how init hands a program an `RT`-only
+/// `SysCap` while keeping the full one.
+pub fn dup_narrowed(handle: RawHandle, rights: Rights) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_HANDLE_DUP, handle.0 as u64, rights.bits() as u64, 0, 0))
+        .map(|v| RawHandle(v as u32))
 }
 
-/// Duplicate a file descriptor to a specific fd number.
-/// If `new_fd` is already open, it is closed first.
-pub fn dup2(old_fd: Fd, new_fd: Fd) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_DUP2, old_fd.0 as u64, new_fd.0 as u64, 0, 0)).map(|v| Fd(v as i32))
+/// A second handle to the same object, at a **slot** the caller picks.
+///
+/// A slot and not a handle: a handle carries a generation the caller has no
+/// business choosing, and the one this hands back is the slot's own — so the
+/// answer is not the number that went in. Whatever was at that slot is closed
+/// first.
+/// The rights are the source's: narrowing at a slot is [`dup_narrowed`]
+/// followed by this, and a third argument no caller writes would be a right
+/// nobody can request.
+pub fn dup2(handle: RawHandle, slot: u16) -> Result<RawHandle, SyscallError> {
+    check(syscall(SYS_HANDLE_DUP_AT, handle.0 as u64, slot as u64, 0, 0))
+        .map(|v| RawHandle(v as u32))
 }
 
 /// Get the current process ID.
@@ -919,7 +1537,7 @@ pub unsafe fn futex_wake(addr: *const u32, count: u32) -> u64 {
 }
 
 /// Truncate file descriptor to `size` bytes.
-pub fn ftruncate(fd: Fd, size: u64) -> Result<(), SyscallError> {
+pub fn ftruncate(fd: RawHandle, size: u64) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_FTRUNCATE, fd.0 as u64, size, 0, 0))
 }
 
@@ -959,37 +1577,14 @@ pub unsafe fn munmap(addr: *mut u8, size: usize) -> Result<(), SyscallError> {
     check_unit(syscall(SYS_MUNMAP, addr as u64, size as u64, 0, 0))
 }
 
-/// Terminate a child process.
-pub fn kill(pid: Pid) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_KILL, pid.0 as u64, 0, 0, 0))
-}
-
 /// Non-blocking read. Returns bytes read, or `Err(WouldBlock)` if no data available.
-pub fn read_nonblock(fd: Fd, buf: &mut [u8]) -> Result<usize, SyscallError> {
+pub fn read_nonblock(fd: RawHandle, buf: &mut [u8]) -> Result<usize, SyscallError> {
     check(syscall(SYS_READ_NONBLOCK, fd.0 as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
 /// Non-blocking write. Returns bytes written, or `Err(WouldBlock)` if no space available.
-pub fn write_nonblock(fd: Fd, buf: &[u8]) -> Result<usize, SyscallError> {
+pub fn write_nonblock(fd: RawHandle, buf: &[u8]) -> Result<usize, SyscallError> {
     check(syscall(SYS_WRITE_NONBLOCK, fd.0 as u64, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
-}
-
-/// Open an existing pipe by internal ID. `mode`: 0 = read, 1 = write.
-/// Returns a new file descriptor for the pipe.
-pub fn pipe_open(pipe_id: u64, mode: u64) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_PIPE_OPEN, pipe_id, mode, 0, 0)).map(|v| Fd(v as i32))
-}
-
-/// Get the internal pipe ID for a pipe/tty file descriptor.
-/// Used to share pipe access across processes via `pipe_open`.
-pub fn pipe_id(fd: Fd) -> Result<u64, SyscallError> {
-    check(syscall(SYS_PIPE_ID, fd.0 as u64, 0, 0, 0))
-}
-
-/// Create a socket file descriptor from two pipe IDs (rx for reading, tx for writing).
-/// The kernel bumps refcounts on both pipes. Caller should close original pipe fds after this.
-pub fn socket_create(rx_pipe_id: u64, tx_pipe_id: u64) -> Result<Fd, SyscallError> {
-    check(syscall(SYS_SOCKET_CREATE, rx_pipe_id, tx_pipe_id, 0, 0)).map(|v| Fd(v as i32))
 }
 
 /// Map a pipe's shared-memory ring buffer into this process's address space.
@@ -997,56 +1592,79 @@ pub fn socket_create(rx_pipe_id: u64, tx_pipe_id: u64) -> Result<Fd, SyscallErro
 ///
 /// The mapping is writable, and the header is a publication: writing it tells
 /// the kernel nothing. Reads and writes still go through `SYS_READ`/`SYS_WRITE`.
-pub fn pipe_map(fd: Fd) -> Result<*mut u8, SyscallError> {
+pub fn pipe_map(fd: RawHandle) -> Result<*mut u8, SyscallError> {
     check(syscall(SYS_PIPE_MAP, fd.0 as u64, 0, 0, 0)).map(|v| v as *mut u8)
 }
 
-/// Poll for a received frame. Returns `(buf_index << 16) | frame_len`, or 0 if none.
+/// Poll for a received frame, presenting the NIC claim. Returns
+/// `(buf_index << 16) | frame_len`, or 0 if none.
 ///
-/// Fallible: the kernel refuses a caller that does not own the NIC. The packed
-/// success value tops out at `(255 << 16) | 4096`, far below the range
+/// Fallible: the kernel refuses a handle that is not a live NIC claim. The
+/// packed success value tops out at `(255 << 16) | 4096`, far below the range
 /// `SyscallError::from_u64` claims, so nothing is ambiguous.
-pub fn nic_rx_poll() -> Result<u64, SyscallError> {
-    check(syscall(SYS_NIC_RX_POLL, 0, 0, 0, 0))
+pub fn nic_rx_poll(claim: RawHandle) -> Result<u64, SyscallError> {
+    check(syscall(SYS_NIC_RX_POLL, claim.0 as u64, 0, 0, 0))
 }
 
 /// Tell the kernel to refill RX buffer `buf_index` after consuming the frame.
 ///
 /// A dropped refill costs an RX slot permanently: 256 of them and the NIC
 /// stops receiving.
-pub fn nic_rx_done(buf_index: u64) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_NIC_RX_DONE, buf_index, 0, 0, 0))
+pub fn nic_rx_done(claim: RawHandle, buf_index: u64) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_NIC_RX_DONE, claim.0 as u64, buf_index, 0, 0))
 }
 
 /// Submit the TX DMA buffer to hardware. `total_len` includes the net header.
 ///
 /// A refused submit means the frame never goes out, which must not be
 /// indistinguishable from a delivered one.
-pub fn nic_tx(total_len: u64) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_NIC_TX, total_len, 0, 0, 0))
+pub fn nic_tx(claim: RawHandle, total_len: u64) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_NIC_TX, claim.0 as u64, total_len, 0, 0))
 }
 
 /// Allocate a TLS block for a dlopen'd module on the current thread.
-/// Returns the block's *virtual* address, which is what the kernel writes into
-/// the DTV.
 ///
-/// The return type is dishonest and the caller must not trust it: the kernel
-/// answers `InvalidArgument` for a `module_id` of 0 or one outside the
-/// process's module list, and `ResourceExhausted` past `DTV_INITIAL_CAPACITY`
-/// or when the mapping fails. Each arrives here as a value near `u64::MAX`
-/// that `__tls_get_addr_slow` adds an offset to and returns as a pointer.
-pub fn tls_alloc_block(module_id: u64) -> u64 {
-    syscall(SYS_TLS_ALLOC_BLOCK, module_id, 0, 0, 0)
+/// The block's *virtual* address, which is what the kernel writes into the DTV.
+/// `InvalidArgument` for a `module_id` of 0 or one outside the process's module
+/// list, `ResourceExhausted` past `DTV_INITIAL_CAPACITY` or when the mapping
+/// fails — and every user address is far below where `SyscallError` encodes, so
+/// no block is ever read as one.
+pub fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
+    check(syscall(SYS_TLS_ALLOC_BLOCK, module_id, 0, 0, 0))
 }
 
-/// Create an io_uring instance with the given queue depth (must be power of 2, max 256).
-/// Returns (ring_fd, shared_memory_token). The shared memory contains the SQ/CQ rings
-/// and SQE array; map it with `map_shared()` to access them.
-pub fn io_uring_setup(depth: u32) -> Result<(Fd, u32), SyscallError> {
-    let raw = check(syscall(SYS_IO_URING_SETUP, depth as u64, 0, 0, 0))?;
-    let fd = Fd((raw & 0xFFFF_FFFF) as i32);
-    let token = (raw >> 32) as u32;
-    Ok((fd, token))
+/// A ring and where its SQ/CQ/SQE page is mapped.
+///
+/// **The ring owns its page and the kernel maps it at setup.** It used to hand
+/// back a shared-memory token the caller mapped itself, which is the only place
+/// io_uring ever needed shared memory to be a separate thing with a separate
+/// lifetime.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IoUringSetup {
+    pub handle: RawHandle,
+    pub _pad: u32,
+    pub vaddr: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<IoUringSetup>() == 16);
+
+/// Create an io_uring instance with the given queue depth (a power of two, at
+/// most 256), and map its rings.
+///
+/// # Safety
+/// Caller must manage the returned pointer; it stops being mapped when the
+/// last handle to the ring closes.
+pub unsafe fn io_uring_setup(depth: u32) -> Result<(RawHandle, *mut u8), SyscallError> {
+    let mut out = IoUringSetup { handle: HANDLE_INVALID, _pad: 0, vaddr: 0 };
+    check_unit(syscall(
+        SYS_IO_URING_SETUP,
+        depth as u64,
+        &raw mut out as u64,
+        0,
+        0,
+    ))?;
+    Ok((out.handle, core::ptr::with_exposed_provenance_mut(out.vaddr as usize)))
 }
 
 /// Submit SQEs and/or wait for completions on an io_uring instance.
@@ -1054,7 +1672,7 @@ pub fn io_uring_setup(depth: u32) -> Result<(Fd, u32), SyscallError> {
 /// `min_complete`: block until at least this many CQEs are available (0 = don't block).
 /// `timeout_nanos`: 0 = non-blocking, u64::MAX = block forever, else timeout in nanos.
 /// Returns the number of CQEs available.
-pub fn io_uring_enter(fd: Fd, to_submit: u32, min_complete: u32, timeout_nanos: u64) -> Result<u32, SyscallError> {
+pub fn io_uring_enter(fd: RawHandle, to_submit: u32, min_complete: u32, timeout_nanos: u64) -> Result<u32, SyscallError> {
     check(syscall(SYS_IO_URING_ENTER, fd.0 as u64, to_submit as u64, min_complete as u64, timeout_nanos))
         .map(|n| n as u32)
 }
@@ -1123,8 +1741,7 @@ pub fn sched_info() -> SchedInfo {
     info
 }
 
-/// Per-process accounting statistics. Used as the snapshot stashed on the parent
-/// at process exit and returned by SYS_PROCESS_STATS.
+/// Per-process accounting statistics, as [`SYS_PROCESS_STATS`] answers them.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct ProcessStats {
@@ -1136,7 +1753,11 @@ pub struct ProcessStats {
     pub fault_zero_count: u32,
     pub fault_ns: u64,
     pub io_read_ops: u32,
-    pub _pad: u32,
+    /// The process's own pid. Not authority — nothing takes a pid but
+    /// [`SYS_PROCESS_OPEN`], which takes a `SysCap` beside it — but it is the
+    /// name a diagnostic prints, and this is where a holder of a handle reads
+    /// it. It also fills what was named padding.
+    pub pid: u32,
     pub io_read_bytes: u64,
     pub blocked_io_ns: u64,
     pub blocked_futex_ns: u64,
@@ -1148,12 +1769,13 @@ pub struct ProcessStats {
     pub alloc_count: u64,
 }
 
-/// Read accounting stats for an exited child process.
-/// Returns Ok(()) on success, Err if no stats available for that pid.
-pub fn process_stats(child_pid: Pid, stats: &mut ProcessStats) -> Result<(), SyscallError> {
+/// Read accounting for the process a `Process` handle names, alive or exited.
+///
+/// Repeatable: the numbers are the object's, so sampling one does not spend it.
+pub fn process_stats(proc: RawHandle, stats: &mut ProcessStats) -> Result<(), SyscallError> {
     check_unit(syscall(
         SYS_PROCESS_STATS,
-        child_pid.0 as u64,
+        proc.0 as u64,
         stats as *mut ProcessStats as u64,
         core::mem::size_of::<ProcessStats>() as u64,
         0,

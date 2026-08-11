@@ -1,9 +1,18 @@
-use core::arch::naked_asm;
+use crate::arch::entry::{restore_user_state, ring3_naked_asm, save_user_state};
 
-/// TLB flush IPI handler. See xhci_entry for register-save rationale.
+/// TLB flush IPI handler.
+///
+/// The GPR save is `device_irq_entry`'s, for its reasons: the Rust half may
+/// clobber every System V scratch register, and leaving one unsaved leaks
+/// kernel state into a user register on `iretq`. The user machine state is
+/// parked for the Ring 3 epilogue alone, which is the only window here that can
+/// context-switch — a comment used to point at `xhci_entry` for the rationale
+/// and then not follow it, which is how this vector spent its life returning to
+/// userland with another thread's XMM registers
+/// (`specs/user-machine-state.md` §3).
 #[unsafe(naked)]
 pub(super) extern "sysv64" fn tlb_flush_entry() {
-    naked_asm!(
+    ring3_naked_asm!(
         "push rax",
         "push rcx",
         "push rdx",
@@ -27,10 +36,9 @@ pub(super) extern "sysv64" fn tlb_flush_entry() {
         "test dword ptr [rsp + 88], 3",
         "jz 1f",
         "cli",
-        "mov rbp, rsp",
-        "and rsp, -16",
+        save_user_state!(),
         "call {exit_to_user}",
-        "mov rsp, rbp",
+        restore_user_state!(),
         "1:",
         "pop rbp",
         "pop r11",

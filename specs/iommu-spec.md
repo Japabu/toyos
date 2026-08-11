@@ -46,7 +46,7 @@ Three properties, in the order they matter:
    use-after-free: unmap without invalidating the IOTLB and the device keeps a
    translation for a page the PMM has already handed to somebody else. Same shape as
    `SYS_PIPE_MAP`'s mapping outliving its page and `FileBacking` outliving unlink
-   (`specs/known-issues.md` §1), with a DMA engine instead of a process on the
+   (`specs/issues/isolation/`), with a DMA engine instead of a process on the
    reading end.
 
 What this is **not** for: it is not a performance feature, not a virtualization
@@ -548,7 +548,7 @@ past a rate ceiling the kernel clears `IRTE.P` for that binding — which the dr
 cannot undo, because the IRTE is kernel memory — and kills the process. **The ceiling
 check does not log per interrupt.** CLAUDE.md's rule applies with unusual force here:
 the log ring is drained by `esp_log` through the boot block device from the idle loop
-(`known-issues.md` §10), so an error path that logs per event is an error path that
+(`specs/issues/boot-media/`), so an error path that logs per event is an error path that
 makes a storm into a storage workload.
 
 ---
@@ -671,7 +671,7 @@ page tables and poll a hardware queue.
 from the idle loop.** `specs/capability-handles-spec.md` §5.2 drains that queue at
 syscall exit, at `do_schedule` entry, and in the idle loop — and putting an
 unbounded, uninterruptible device operation in front of `pass()` is precisely the
-`esp_log` defect (`known-issues.md` §10, and the flush that costs 2.0–9.7 ms against
+`esp_log` defect (`specs/issues/boot-media/`, and the flush that costs 2.0–9.7 ms against
 a 23.219 ms audio pipeline). Reclaim runs as an **explicit phase of `process::exit`**,
 on the exiting or killing thread's own stack, which is a live thread context that may
 block. The zero-handle hook does step 1 only, and enqueues nothing slow.
@@ -836,9 +836,9 @@ descriptions.
 |---|---|---|
 | **I0** | **Harness first.** An `iommu` dimension on `Shape` in `tests/common/qemu.rs` and `src/qemu.rs`; every profile passes `-device intel-iommu,intremap=on,caching-mode=on,aw-bits=48` and `-machine q35,kernel-irqchip=split`. No kernel change. Proves OVMF and the current kernel tolerate the device before anything depends on it. | `cargo test` green with the flag on every profile |
 | **I1** | **Discovery, read-only.** `acpi::find_table` made public; `kernel/src/iommu/{mod,vtd/dmar}.rs`; DRHD inventory, register windows mapped, `CAP`/`ECAP`/`VER` decoded, one log line per unit. Refuses nothing. | `cargo test -- iommu_discovery` — asserts the capability line under the flag and the distinct no-DMAR line without it |
-| **I2** | **Translation on, one identity domain** (not "everything passthrough" — §8.1). Root/context tables for every enumerated function, second-level tables over `[0, top)`, queued invalidation, the fault-event MSI, `SRTP`, `TE`. Behaviour unchanged by construction. | full `cargo test` green with `TES=1` asserted; plus `iommu_context_absent` and `iommu_empty_domain`, kernel-feature actuators that strand one function above and below the context entry and assert the boot dies with a DMA fault naming it |
+| **I2** | **Translation on, one identity domain** (not "everything passthrough" — §8.1). Root/context tables for every enumerated function, second-level tables over `[0, top)`, queued invalidation, the fault-event MSI, `SRTP`, `TE`. Behaviour unchanged by construction. | full `cargo test` green with `TES=1` asserted; plus `iommu_context_absent` and `iommu_empty_domain`, actuators that strand one function above and below the context entry and assert the boot dies with a DMA fault naming it |
 | **I3** | **Interrupt remapping on.** Remappable IOAPIC RTEs and remappable `pci::enable_msi`/`enable_msix`; IRTA, `SIRTP`, `IRE=1`, `CFI=0`; every IRTE `SVT`-verified. | `cargo test -- metal_sim_input xhci audio nvme esp` green — every one of these depends on an interrupt arriving. Teeth: an IRTE written with the wrong source-id must red the corresponding test |
-| **I4** | **Domains, mapping, invalidation, faults.** `create_domain`/`attach`/`map`/`unmap`/`flush`, the `Unmapped`/`Flushed` pair, IOVA allocator, fault MSI and the kill-on-fault path. No syscall yet; driven by a kernel-feature self-test. | `cargo test -- iommu_selftest`, which maps, reads back through a device, unmaps, and asserts a stale access faults. Teeth: deleting the unmap-side invalidation must red it |
+| **I4** | **Domains, mapping, invalidation, faults.** `create_domain`/`attach`/`map`/`unmap`/`flush`, the `Unmapped`/`Flushed` pair, IOVA allocator, fault MSI and the kill-on-fault path. No syscall yet; driven by an actuator self-test. | `cargo test -- iommu_selftest`, which maps, reads back through a device, unmaps, and asserts a stale access faults. Teeth: deleting the unmap-side invalidation must red it |
 | **I5** | **The refusal.** Sequenced deliberately after `specs/userspace-drivers-spec.md`'s first driver has moved, because before that a refusal costs every machine and protects nothing. | `cargo test -- iommu_refusal` — three variants (no `intel-iommu`; `intremap=off`; a unit whose `SAGAW` we reject via actuator), each asserting its own message and that userland is never reached |
 
 **I0 and I1 are done**, `82a69a8..9eab2f2`. Every profile in `tests/common/qemu.rs`

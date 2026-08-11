@@ -40,12 +40,12 @@
 //! issued concurrently each spun for the other's acknowledgement with `IF`
 //! clear and no path left by which either could give one, so both died at the
 //! deadline — reproduced as a double kernel panic and as seven different
-//! wide-phase test failures carrying one signature (`specs/known-issues.md` §3).
+//! wide-phase test failures carrying one signature (`specs/issues/kernel/`).
 //!
 //! What is left is an `IF=0` spin that is *not* a `Lock` and not this wait: a
 //! driver waiting on a device register inside a handler. Those are latency, not
 //! deadlock, because each carries its own deadline — but the deadline can be
-//! seconds (`specs/known-issues.md` §3, xHCI inside `drain_irqs`), so
+//! seconds (`specs/issues/kernel/`, xHCI inside `drain_irqs`), so
 //! [`ACK_TIMEOUT_NS`] is set above the largest of them and a CPU past it is
 //! named in a panic rather than waited for forever.
 
@@ -75,7 +75,7 @@ static SIBLINGS_ANSWER: AtomicBool = AtomicBool::new(false);
 ///
 /// Generous on purpose: a target inside `drain_irqs` may be in xHCI enumeration
 /// or endpoint recovery, which spin on `USB_TIMEOUT_NS` = 2 s with `IF` clear
-/// (`specs/known-issues.md` §3). Anything past that is not a slow CPU, it is a
+/// (`specs/issues/kernel/`). Anything past that is not a slow CPU, it is a
 /// CPU that will never answer, and a panic naming it is worth more than a hang
 /// that looks like every other freeze.
 const ACK_TIMEOUT_NS: u64 = 5_000_000_000;
@@ -188,10 +188,10 @@ pub fn siblings_answer() {
     SIBLINGS_ANSWER.store(true, Ordering::Release);
 }
 
-#[cfg(not(feature = "test-tlb-ack-delay"))]
+#[cfg(not(feature = "test-actuators"))]
 fn stage_ack_delay() {}
 
-#[cfg(feature = "test-tlb-ack-delay")]
+#[cfg(feature = "test-actuators")]
 mod delay {
     use core::sync::atomic::{AtomicU32, AtomicU64};
 
@@ -208,7 +208,7 @@ mod delay {
 /// come first — a daemon exiting, a `dlopen` — and the syscall under measurement
 /// would read zero and fail for a reason that is not the defect. And a window
 /// cannot outlive a test that panicked before disarming, which a latch would.
-#[cfg(feature = "test-tlb-ack-delay")]
+#[cfg(feature = "test-actuators")]
 const ARM_WINDOW_NANOS: u64 = 2_000_000_000;
 
 /// Hold this CPU's acknowledgement back, without holding its flush back.
@@ -219,7 +219,7 @@ const ARM_WINDOW_NANOS: u64 = 2_000_000_000;
 /// nothing else can stage: QEMU has no way to make one vCPU answer an IPI late,
 /// and without a late answer the initiator's wait is unobservable, because a
 /// correct wait and no wait at all take the same measurable zero.
-#[cfg(feature = "test-tlb-ack-delay")]
+#[cfg(feature = "test-actuators")]
 fn stage_ack_delay() {
     use core::sync::atomic::Ordering;
     if delay::CPU.load(Ordering::Relaxed) != percpu::cpu_id() {
@@ -240,7 +240,7 @@ fn stage_ack_delay() {
 /// The last rather than any, because [`shootdown`] walks its targets in order: a
 /// wait that covered only the first would still measure long if the delay sat on
 /// cpu 1, and what the gate is about is that every online CPU is waited for.
-#[cfg(feature = "test-tlb-ack-delay")]
+#[cfg(feature = "test-actuators")]
 fn last_target() -> Option<u32> {
     let top = smp::cpu_count().checked_sub(1)?;
     match percpu::cpu_id() {
@@ -254,7 +254,7 @@ fn last_target() -> Option<u32> {
 ///
 /// The return value is the gate on the primitive; the arming outlives it so the
 /// caller can then time an ordinary syscall and gate the *paths*.
-#[cfg(feature = "test-tlb-ack-delay")]
+#[cfg(feature = "test-actuators")]
 pub fn debug_arm_ack_delay(nanos: u64) -> u64 {
     use core::sync::atomic::Ordering;
     let Some(target) = last_target() else { return 0 };
@@ -270,7 +270,7 @@ pub fn debug_arm_ack_delay(nanos: u64) -> u64 {
 }
 
 /// Give the machine its ordinary latency back before the window lapses.
-#[cfg(feature = "test-tlb-ack-delay")]
+#[cfg(feature = "test-actuators")]
 pub fn debug_disarm_ack_delay() -> u64 {
     use core::sync::atomic::Ordering;
     delay::UNTIL.store(0, Ordering::Relaxed);

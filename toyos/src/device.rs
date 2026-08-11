@@ -1,12 +1,24 @@
 //! Hardware device access.
 //!
-//! Typed device wrappers. Each type claims exclusive access to its device
-//! and provides typed read methods.
+//! Typed device wrappers, one per class. **None of them opens anything**: a
+//! claim is minted by `/bin/init` alone and arrives in this process's endowment
+//! table under `dev:<class>`, so [`crate::endow::device`] is the only way to
+//! get one and a program the manifest gives no device cannot express reaching
+//! hardware.
 
-use toyos_abi::syscall::{self, DeviceType, SyscallError};
-use crate::{Device, Handle, AsHandle};
-use toyos_abi::Fd;
+use toyos_abi::syscall::{self, SyscallError};
+use crate::{Device, AsHandle};
+use toyos_abi::RawHandle;
 
+/// Read a claim's description, whose buffer fields are handles this call
+/// installs.
+///
+/// **They are installed once.** The kernel remembers what it minted for a
+/// claim and answers a later read with the same numbers, so the description is
+/// read once per claim and the handles in it are owned from then on — reading
+/// twice and adopting both answers closes one buffer twice. A mode set is the
+/// exception and says so: [`FramebufferDev::set_resolution`] remints, and its
+/// answer is the fresh set.
 pub(crate) fn read_info<T: Copy>(dev: &Device) -> Result<T, SyscallError> {
     let size = core::mem::size_of::<T>();
     let mut val = unsafe { core::mem::zeroed::<T>() };
@@ -21,11 +33,7 @@ pub(crate) fn read_info<T: Copy>(dev: &Device) -> Result<T, SyscallError> {
 pub struct Keyboard(pub(crate) Device);
 
 impl Keyboard {
-    pub fn open() -> Result<Self, SyscallError> {
-        syscall::open_device(DeviceType::Keyboard).map(|fd| Keyboard(Device(Handle(fd))))
-    }
-
-    pub fn fd(&self) -> Fd { self.0.fd() }
+    pub fn fd(&self) -> RawHandle { self.0.fd() }
 
     /// Non-blocking read of pending key events; empty surfaces as `Err(WouldBlock)`.
     ///
@@ -40,17 +48,13 @@ impl Keyboard {
 }
 
 impl AsHandle for Keyboard {
-    fn as_handle(&self) -> Fd { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.fd() }
 }
 
 pub struct Mouse(pub(crate) Device);
 
 impl Mouse {
-    pub fn open() -> Result<Self, SyscallError> {
-        syscall::open_device(DeviceType::Mouse).map(|fd| Mouse(Device(Handle(fd))))
-    }
-
-    pub fn fd(&self) -> Fd { self.0.fd() }
+    pub fn fd(&self) -> RawHandle { self.0.fd() }
 
     /// Non-blocking read of pending mouse events; empty surfaces as `Err(WouldBlock)`.
     ///
@@ -62,41 +66,49 @@ impl Mouse {
 }
 
 impl AsHandle for Mouse {
-    fn as_handle(&self) -> Fd { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.fd() }
 }
 
 pub struct FramebufferDev(pub(crate) Device);
 
 impl FramebufferDev {
-    pub fn open() -> Result<Self, SyscallError> {
-        syscall::open_device(DeviceType::Framebuffer).map(|fd| FramebufferDev(Device(Handle(fd))))
-    }
-
     pub fn info(&self) -> Result<toyos_abi::FramebufferInfo, SyscallError> {
         read_info(&self.0)
     }
 }
 
 impl AsHandle for FramebufferDev {
-    fn as_handle(&self) -> Fd { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.fd() }
 }
 
 pub struct Nic(pub(crate) Device);
 
 impl Nic {
-    pub fn open() -> Result<Self, SyscallError> {
-        syscall::open_device(DeviceType::Nic).map(|fd| Nic(Device(Handle(fd))))
-    }
-
-    pub fn fd(&self) -> Fd { self.0.fd() }
+    pub fn fd(&self) -> RawHandle { self.0.fd() }
 
     pub fn info(&self) -> Result<toyos_abi::net::NicInfo, SyscallError> {
         read_info(&self.0)
     }
+
+    /// The next received frame as `(buf_index << 16) | frame_len`, or 0.
+    pub fn rx_poll(&self) -> Result<u64, SyscallError> {
+        syscall::nic_rx_poll(self.0.fd())
+    }
+
+    /// Give buffer `buf_index` back to the RX ring. A dropped refill costs an
+    /// RX slot permanently: 256 of them and the NIC stops receiving.
+    pub fn rx_done(&self, buf_index: u64) -> Result<(), SyscallError> {
+        syscall::nic_rx_done(self.0.fd(), buf_index)
+    }
+
+    /// Submit the TX DMA buffer. `total_len` includes the net header.
+    pub fn tx(&self, total_len: u64) -> Result<(), SyscallError> {
+        syscall::nic_tx(self.0.fd(), total_len)
+    }
 }
 
 impl AsHandle for Nic {
-    fn as_handle(&self) -> Fd { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.fd() }
 }
 
 /// A virtio-sound device the kernel brought up and drives no policy on.
@@ -108,10 +120,6 @@ impl AsHandle for Nic {
 pub struct VirtioSoundDev(pub(crate) Device);
 
 impl VirtioSoundDev {
-    pub fn open() -> Result<Self, SyscallError> {
-        syscall::open_device(DeviceType::VirtioSound).map(|fd| VirtioSoundDev(Device(Handle(fd))))
-    }
-
     pub fn info(&self) -> Result<toyos_abi::virtio_sound::VirtioSoundInfo, SyscallError> {
         read_info(&self.0)
     }
@@ -145,7 +153,7 @@ impl VirtioSoundDev {
 }
 
 impl AsHandle for VirtioSoundDev {
-    fn as_handle(&self) -> Fd { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.fd() }
 }
 
 /// An Intel HDA controller the kernel brought up and drives no policy on.
@@ -157,10 +165,6 @@ impl AsHandle for VirtioSoundDev {
 pub struct HdaDev(pub(crate) Device);
 
 impl HdaDev {
-    pub fn open() -> Result<Self, SyscallError> {
-        syscall::open_device(DeviceType::HdaAudio).map(|fd| HdaDev(Device(Handle(fd))))
-    }
-
     pub fn info(&self) -> Result<toyos_abi::hda::HdaInfo, SyscallError> {
         read_info(&self.0)
     }
@@ -210,5 +214,5 @@ impl HdaDev {
 }
 
 impl AsHandle for HdaDev {
-    fn as_handle(&self) -> Fd { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.fd() }
 }

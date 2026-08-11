@@ -4,7 +4,7 @@
 //! Every one of these cases used to park the compositor's whole event loop in
 //! a kernel wait with no deadline — no redraws, no input, nothing — because
 //! the compositor read and wrote its clients with blocking calls. The one
-//! written up in `specs/known-issues.md` §1 is the second case here: a client
+//! written up in `specs/issues/isolation/` is the second case here: a client
 //! that connects and sends four bytes, met by `ipc::recv_header` on a freshly
 //! accepted fd.
 //!
@@ -19,7 +19,8 @@ use std::process::exit;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use toyos::{ipc, services, Connection};
+use toyos::endow;
+use toyos::{ipc, Connection};
 use toyos_abi::syscall::{self, SyscallError};
 use window::Window;
 
@@ -142,7 +143,7 @@ fn header(msg_type: u32, len: u32) -> [u8; 8] {
 }
 
 fn connect(what: &str) -> Connection {
-    services::connect("compositor")
+    endow::service("compositor")
         .unwrap_or_else(|e| fail(&format!("[{what}] the compositor is not serving: {e:?}")))
 }
 
@@ -152,7 +153,7 @@ fn write_raw(conn: &Connection, bytes: &[u8], what: &str) {
 
 /// Every write here fits in the pipe it goes into, so a blocking `write` can
 /// only be the compositor's problem, never this binary's.
-fn write_raw_fd(fd: toyos_abi::Fd, bytes: &[u8], what: &str) {
+fn write_raw_fd(fd: toyos_abi::RawHandle, bytes: &[u8], what: &str) {
     let mut offset = 0;
     while offset < bytes.len() {
         match syscall::write(fd, &bytes[offset..]) {

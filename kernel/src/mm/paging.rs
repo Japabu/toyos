@@ -3,8 +3,6 @@
 // The only code that writes page table entries. Manages the kernel direct map
 // (all physical memory at PHYS_OFFSET) and per-process user address spaces.
 
-use core::sync::atomic::Ordering;
-
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -152,30 +150,15 @@ fn indices(addr: u64) -> (usize, usize, usize) {
     )
 }
 
-use core::sync::atomic::AtomicBool;
-
 const CR3_NOFLUSH: u64 = 1 << 63;
 const CR3_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
-/// True when CR4.PCIDE + INVPCID are active.
-static PCID_ACTIVE: AtomicBool = AtomicBool::new(false);
-
-/// Enable PCID if the CPU supports both PCID and INVPCID. Returns whether it
-/// is now active; when it is not, context switches flush the whole TLB.
-///
-/// Without INVPCID there's no way to flush all PCIDs, so PCID alone is useless.
-/// Must be called on each CPU. CR3 must have PCID 0 when called. Silent:
-/// `percpu::init_bsp` reports the answer once for the machine.
-pub fn enable_pcid() -> bool {
-    let active = crate::arch::cpu::enable_pcid();
-    if active {
-        PCID_ACTIVE.store(true, Ordering::Relaxed);
-    }
-    active
-}
-
+/// Whether `CR4.PCIDE` is in the machine's control-register declaration, and
+/// therefore whether a targeted flush exists. Without INVPCID there is no way
+/// to flush all PCIDs, so `control_regs` declares neither without the other and
+/// a context switch flushes the whole TLB instead.
 pub fn pcid_active() -> bool {
-    PCID_ACTIVE.load(Ordering::Relaxed)
+    crate::arch::control_regs::pcid_active()
 }
 
 /// Flush all TLB entries on this CPU, all PCIDs.
@@ -504,7 +487,7 @@ impl AddressSpace {
             top = start.raw();
         }
         // Gap below all regions
-        if top >= total + vma::ALLOC_FLOOR {
+        if top >= total + vma::alloc_floor() {
             return Some(UserAddr::new(top - total));
         }
         None

@@ -1,7 +1,20 @@
 use std::io::{self, BufRead, Write};
+use std::os::toyos::process::CommandExt;
 use std::process::{Command, Stdio};
 
+use toyos::endow::{Endowments, SYSCAP_LABEL};
+use toyos::syscap::SysCap;
+
 fn main() {
+    // **The test estate's authority, and the one place least authority is not
+    // enforced** (`specs/capability-endowment-spec.md` §6.7a). The 90 guest
+    // binaries are not `[programs]` keys, so no manifest row can name what any
+    // of them holds: a test binary holds what test-runner holds. The namespace
+    // travels by inheritance; this capability is handed over explicitly, as a
+    // duplicate rather than the cap itself, because one boot runs several
+    // binaries that each need the keyboard and a device claim moves.
+    let cap: Option<SysCap> = Endowments::get().take(SYSCAP_LABEL);
+
     println!("===READY===");
     let _ = io::stdout().flush();
 
@@ -36,7 +49,13 @@ fn main() {
 
         // Spawn with piped stdin (so child doesn't consume serial commands)
         // but inherited stdout/stderr (output goes directly to serial).
-        match Command::new(&path).args(&args).stdin(Stdio::piped()).spawn() {
+        let mut command = Command::new(&path);
+        command.args(&args).stdin(Stdio::piped());
+        if let Some(cap) = &cap {
+            let dup = cap.duplicate().expect("test-runner: the system capability refused a dup");
+            command.endow(SYSCAP_LABEL, dup.into_raw().0);
+        }
+        match command.spawn() {
             Ok(mut child) => {
                 // Drop stdin pipe so child gets EOF if it tries to read
                 drop(child.stdin.take());

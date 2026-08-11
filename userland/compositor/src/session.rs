@@ -9,11 +9,14 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use toyos::endow;
 use toyos::ipc::RxStep;
 use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::port::Acceptor;
 use toyos::shm::SharedMemory;
-use toyos::{gpu, ipc, services, system, FramebufferDev, Keyboard, Listener, Mouse};
-use toyos_abi::Fd;
+use toyos::{ipc, system, AsHandle, FramebufferDev, Keyboard, Mouse};
+use toyos_abi::syscall::DeviceType;
+use toyos_abi::RawHandle;
 use toyos_desktop::{
     cursor_from_abs, cursor_style, fold_mouse, hit_test, key_action, set_mode, tab_action, Chrome,
     CursorStyle, Damage, Desk, Grab, Held, Hit, KeyAction, Point, Rect, Released, Stack, TabAction,
@@ -22,8 +25,9 @@ use toyos_desktop::{
 use window::Screen;
 
 use crate::client::{
-    announce, deliver, deliver_signal, mark_dead, note_closed, Client, ClientFrame, ClientRx, Dead,
-    DropReason, PendingConn, Win, HANDSHAKE_TIMEOUT, MAX_CLIPBOARD_BYTES, MAX_PENDING_CONNS,
+    announce, deliver, deliver_signal, deliver_with_handles, mark_dead, note_closed, Client,
+    ClientFrame, ClientRx, Dead, DropReason, PendingConn, Win, HANDSHAKE_TIMEOUT,
+    MAX_CLIPBOARD_BYTES, MAX_PENDING_CONNS,
 };
 use crate::render::{self, Assets, BackBuffer, SystemStats, TitleBarIcons};
 use crate::stats::FrameStats;
@@ -71,15 +75,15 @@ impl Wallpaper {
 }
 
 pub struct Session {
-    listener: Listener,
+    acceptor: Acceptor,
     kb: Keyboard,
     mouse: Mouse,
     poller: Poller,
 
-    /// Held because closing it gives the framebuffer back to the kernel, and
-    /// every `gpu::` call afterwards is made by a process that no longer owns
-    /// the panel it is drawing on.
-    _fb_dev: FramebufferDev,
+    /// The claim, and the thing every screen call is made *through*: closing it
+    /// gives the framebuffer back to the kernel, and there is then no handle to
+    /// present with.
+    fb_dev: FramebufferDev,
     fb_info: toyos_abi::FramebufferInfo,
     /// Held because [`Session::screen`] points into it.
     _fb_shm: SharedMemory,
@@ -103,7 +107,7 @@ pub struct Session {
     cursor: Point,
     prev_buttons: u8,
     grab: Grab,
-    last_click_fd: Option<Fd>,
+    last_click_fd: Option<RawHandle>,
     last_click_at: Instant,
     clipboard: String,
     launcher_open: bool,
@@ -127,18 +131,27 @@ pub struct Session {
 
 impl Session {
     pub fn start() -> Self {
-        let listener = services::listen("compositor").expect("compositor already running");
-        let kb = Keyboard::open().expect("failed to claim keyboard");
-        let mouse = Mouse::open().expect("failed to claim mouse");
-        let fb_dev = FramebufferDev::open().expect("failed to claim framebuffer");
+        // Every one of these is a statement about the manifest the image was
+        // built from, which `src/build.rs` checked before the image was
+        // written — so `expect` is right here where `services::listen`'s was
+        // not. There is no other process to have taken the name and no name to
+        // take.
+        let acceptor = endow::acceptor("compositor")
+            .expect("the manifest declares this program serves `compositor`");
+        let kb: Keyboard = endow::device(DeviceType::Keyboard)
+            .expect("the manifest gives this program the keyboard");
+        let mouse: Mouse = endow::device(DeviceType::Mouse)
+            .expect("the manifest gives this program the mouse");
+        let fb_dev: FramebufferDev = endow::device(DeviceType::Framebuffer)
+            .expect("the manifest gives this program the framebuffer");
 
         let fb_info = fb_dev.info().expect("failed to read framebuffer info");
         let fb_size = fb_info.stride as usize * fb_info.height as usize * 4;
-        // The framebuffer's tokens come from the device this process has just
-        // claimed, so a refusal here is the kernel contradicting itself and not
-        // a client doing anything.
-        let fb_shm = SharedMemory::map(fb_info.token[0], fb_size)
-            .expect("the scanout token the framebuffer device just reported");
+        // The scanout and cursor buffers are handles the claim's own read
+        // installed, so a refusal here is the kernel contradicting itself and
+        // not a client doing anything.
+        let fb_shm = SharedMemory::adopt(fb_info.scanout[0], fb_size)
+            .expect("the scanout buffer the framebuffer claim just handed over");
         let screen = Screen::new(
             fb_shm.as_ptr(),
             fb_info.width as usize,
@@ -149,8 +162,8 @@ impl Session {
         let back = BackBuffer::new(screen.width(), screen.height(), screen.pixel_format_raw());
 
         let hw_cursor = fb_info.flags & FLAG_HARDWARE_CURSOR != 0;
-        let cursor_shm = SharedMemory::map(fb_info.cursor_token, 64 * 64 * 4)
-            .expect("the cursor token the framebuffer device just reported");
+        let cursor_shm = SharedMemory::adopt(fb_info.cursor, 64 * 64 * 4)
+            .expect("the cursor buffer the framebuffer claim just handed over");
         let cursor_buf = cursor_shm.as_ptr();
         let cursors = Cursors {
             default: read_sprite("/share/icons/cursor-bold.svg", CURSOR_PX, [255, 255, 255]),
@@ -161,7 +174,7 @@ impl Session {
             ),
             crosshair: read_sprite("/share/icons/crosshair-simple-bold.svg", CURSOR_PX, [0, 0, 0]),
         };
-        render::upload_cursor(cursor_buf, &cursors.default, hw_cursor);
+        render::upload_cursor(&fb_dev, cursor_buf, &cursors.default, hw_cursor);
 
         let font_data = std::fs::read("/share/fonts/JetBrainsMono-Regular-8x16.font")
             .expect("failed to read font");
@@ -206,28 +219,27 @@ impl Session {
         let poller = Poller::new(FIXED_POLL_FDS + MAX_WINDOW_SLOTS + MAX_PENDING_CONNS);
         poller.poll_add(&kb, IORING_POLL_IN, kb.fd().0 as u64);
         poller.poll_add(&mouse, IORING_POLL_IN, mouse.fd().0 as u64);
-        poller.poll_add(&listener, IORING_POLL_IN, listener.fd().0 as u64);
+        poller.poll_add(&acceptor, IORING_POLL_IN, acceptor.as_handle().0 as u64);
 
         let cursor = Point { x: desk.screen.w() / 2, y: desk.screen.h() / 2 };
         if hw_cursor {
-            gpu::move_cursor(cursor.x as u32, cursor.y as u32)
-                .expect("compositor owns the framebuffer");
+            fb_dev.move_cursor(cursor.x as u32, cursor.y as u32)
+                .expect("compositor holds the framebuffer claim");
         }
         let mut damage = Damage::default();
         damage.add(desk.screen);
 
         eprintln!("compositor: ready");
-        Command::new("/bin/filepicker").spawn().ok();
 
         let now = Instant::now();
         Self {
             reported_traffic: screen.traffic(),
             reported_composed: back.surface.traffic(),
-            listener,
+            acceptor,
             kb,
             mouse,
             poller,
-            _fb_dev: fb_dev,
+            fb_dev,
             fb_info,
             _fb_shm: fb_shm,
             screen,
@@ -269,7 +281,11 @@ impl Session {
         let mut waited = false;
         let drain_until = Instant::now() + DRAIN_BUDGET;
         loop {
-            let timeout = if waited { Duration::from_nanos(1) } else { FRAME_INTERVAL };
+            // Zero and not one nanosecond: every turn after the first is
+            // consuming what has already arrived, and a timeout of 1 ns is not
+            // a spelling of "do not block" — it parks the thread on a deadline
+            // that is already past, which is the whole of #156.
+            let timeout = if waited { Duration::ZERO } else { FRAME_INTERVAL };
             if !self.drain(timeout) {
                 break;
             }
@@ -295,7 +311,7 @@ impl Session {
 
         let kb_ready = self.is_ready(self.kb.fd());
         let mouse_ready = self.is_ready(self.mouse.fd());
-        let listener_ready = self.is_ready(self.listener.fd());
+        let accept_ready = self.is_ready(self.acceptor.as_handle());
         let client_ready = self.stack.iter().any(|w| self.is_ready(w.client.conn.fd()))
             || self.pending.iter().any(|p| self.is_ready(p.conn.fd()));
 
@@ -306,14 +322,14 @@ impl Session {
         let now = Instant::now();
         for p in self.pending.iter().filter(|p| now.duration_since(p.since) >= HANDSHAKE_TIMEOUT) {
             eprintln!(
-                "compositor: dropping pid {} — {}",
-                p.pid,
+                "compositor: dropping client {} — {}",
+                p.conn.fd().0,
                 DropReason::HandshakeTimeout.why()
             );
         }
         self.pending.retain(|p| now.duration_since(p.since) < HANDSHAKE_TIMEOUT);
 
-        if !kb_ready && !mouse_ready && !listener_ready && !client_ready {
+        if !kb_ready && !mouse_ready && !accept_ready && !client_ready {
             return false;
         }
 
@@ -324,17 +340,17 @@ impl Session {
         if mouse_ready {
             self.pointer();
         }
-        if listener_ready {
+        if accept_ready {
             self.accept();
         }
         let frames = self.take_frames();
         self.dispatch(frames);
         self.reap();
-        self.rearm(kb_ready, mouse_ready, listener_ready);
+        self.rearm(kb_ready, mouse_ready, accept_ready);
         true
     }
 
-    fn is_ready(&self, fd: Fd) -> bool {
+    fn is_ready(&self, fd: RawHandle) -> bool {
         self.ready.contains(&(fd.0 as u64))
     }
 
@@ -402,7 +418,7 @@ impl Session {
                     let Some(idx) = focused else { continue };
                     self.damage.add(self.stack[idx].frame(&self.desk.chrome));
                     let win = self.stack.remove(idx);
-                    note_closed("GUI+Q", win.client.pid, self.stack.len());
+                    note_closed("GUI+Q", win.client.conn.fd(), self.stack.len());
                     let _ = win.client.conn.try_signal(window::MSG_WINDOW_CLOSE);
                     self.damage_all();
                 }
@@ -421,8 +437,8 @@ impl Session {
         let was = self.cursor;
         self.cursor = cursor_from_abs(sample.abs_x, sample.abs_y, self.desk.screen);
         if self.hw_cursor {
-            gpu::move_cursor(self.cursor.x as u32, self.cursor.y as u32)
-                .expect("compositor owns the framebuffer");
+            self.fb_dev.move_cursor(self.cursor.x as u32, self.cursor.y as u32)
+                .expect("compositor holds the framebuffer claim");
         } else {
             let px = CURSOR_PX as i32;
             self.damage.add(Rect::new(was.x, was.y, px, px));
@@ -434,7 +450,12 @@ impl Session {
             cursor_style(&self.desk, &self.stack, &self.grab, self.cursor, self.launcher_open);
         if wanted != self.current_cursor {
             self.current_cursor = wanted;
-            render::upload_cursor(self.cursor_buf, self.cursors.get(wanted), self.hw_cursor);
+            render::upload_cursor(
+                &self.fb_dev,
+                self.cursor_buf,
+                self.cursors.get(wanted),
+                self.hw_cursor,
+            );
         }
 
         if sample.pressed {
@@ -469,7 +490,7 @@ impl Session {
         match hit_test(&self.desk, &self.stack, at, self.launcher_open) {
             Hit::CloseButton(idx) => {
                 let win = self.stack.remove(idx);
-                note_closed("its close button", win.client.pid, self.stack.len());
+                note_closed("its close button", win.client.conn.fd(), self.stack.len());
                 self.damage.add(win.frame(&self.desk.chrome));
                 let _ = win.client.conn.try_signal(window::MSG_WINDOW_CLOSE);
                 self.damage_all();
@@ -600,23 +621,18 @@ impl Session {
         // `accept` installs a descriptor, so it answers `ResourceExhausted` on
         // a full fd table — and clients drive that table, one fd per
         // connection. The connection is lost either way; the desktop is not.
-        match services::accept(&self.listener) {
+        match self.acceptor.accept() {
             Err(e) => eprintln!("compositor: a connection could not be accepted ({e:?})"),
-            Ok(result) if self.pending.len() >= MAX_PENDING_CONNS as usize => {
+            Ok(conn) if self.pending.len() >= MAX_PENDING_CONNS as usize => {
                 eprintln!(
-                    "compositor: refusing pid {} — {MAX_PENDING_CONNS} connections are already \
+                    "compositor: refusing client {} — {MAX_PENDING_CONNS} connections are already \
                      waiting to say what they want",
-                    result.client_pid
+                    conn.fd().0
                 );
             }
-            Ok(result) => {
-                self.poller.poll_add(&result.conn, IORING_POLL_IN, result.conn.fd().0 as u64);
-                self.pending.push(PendingConn {
-                    conn: result.conn,
-                    pid: result.client_pid,
-                    rx: ClientRx::new(),
-                    since: Instant::now(),
-                });
+            Ok(conn) => {
+                self.poller.poll_add(&conn, IORING_POLL_IN, conn.fd().0 as u64);
+                self.pending.push(PendingConn { conn, rx: ClientRx::new(), since: Instant::now() });
             }
         }
     }
@@ -638,20 +654,19 @@ impl Session {
                 p.rx.pump(&p.conn)
             };
             let fd = self.pending[i].conn.fd();
-            let pid = self.pending[i].pid;
             match step {
                 RxStep::Idle => {}
-                RxStep::Eof => mark_dead(&mut self.dead, fd, pid, DropReason::Gone),
+                RxStep::Eof => mark_dead(&mut self.dead, fd, DropReason::Gone),
                 RxStep::Malformed => {
-                    mark_dead(&mut self.dead, fd, pid, DropReason::OutOfProtocol)
+                    mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol)
                 }
                 RxStep::Frame { msg_type, payload_len } => {
-                    let mut frame = ClientFrame::new(fd, pid, msg_type);
+                    let mut frame = ClientFrame::new(fd, msg_type);
                     frame.set_payload(self.pending[i].rx.payload(payload_len));
                     // A connection is identified by its first frame and by
                     // nothing else. `MSG_CREATE_WINDOW` promotes it to a
                     // window; anything else is a one-shot request, answered and
-                    // closed — which is what a `services::connect` caller like
+                    // closed — which is what an `endow::service` caller like
                     // `window::clipboard_set` expects.
                     //
                     // One promotion per pass keeps `i` meaningful across the
@@ -670,15 +685,15 @@ impl Session {
             }
             let win = &mut self.stack[i];
             let step = win.client.rx.pump(&win.client.conn);
-            let (fd, pid) = (win.client.conn.fd(), win.client.pid);
+            let fd = win.client.conn.fd();
             match step {
                 RxStep::Idle => {}
-                RxStep::Eof => mark_dead(&mut self.dead, fd, pid, DropReason::Gone),
+                RxStep::Eof => mark_dead(&mut self.dead, fd, DropReason::Gone),
                 RxStep::Malformed => {
-                    mark_dead(&mut self.dead, fd, pid, DropReason::OutOfProtocol)
+                    mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol)
                 }
                 RxStep::Frame { msg_type, payload_len } => {
-                    let mut frame = ClientFrame::new(fd, pid, msg_type);
+                    let mut frame = ClientFrame::new(fd, msg_type);
                     frame.set_payload(win.client.rx.payload(payload_len));
                     out.push(frame);
                 }
@@ -690,12 +705,11 @@ impl Session {
     fn dispatch(&mut self, frames: Vec<ClientFrame>) {
         for frame in frames {
             let fd = frame.fd;
-            let pid = frame.pid;
             match frame.msg_type {
                 window::MSG_CREATE_WINDOW => self.create_window(frame),
                 window::MSG_PRESENT => {
                     let Ok(rect) = ipc::decode_payload::<window::Rect>(frame.payload()) else {
-                        mark_dead(&mut self.dead, fd, pid, DropReason::OutOfProtocol);
+                        mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol);
                         continue;
                     };
                     if let Some(i) = self.stack.find(|w| w.client.conn.fd() == fd) {
@@ -707,7 +721,7 @@ impl Session {
                 window::MSG_DESTROY_WINDOW => {
                     if let Some(i) = self.stack.find(|w| w.client.conn.fd() == fd) {
                         let gone = self.stack.remove(i);
-                        note_closed("the client itself", gone.client.pid, self.stack.len());
+                        note_closed("the client itself", gone.client.conn.fd(), self.stack.len());
                         self.damage.add(gone.frame(&self.desk.chrome));
                         self.damage_all();
                     }
@@ -731,33 +745,37 @@ impl Session {
                     let Ok(info) =
                         ipc::decode_payload::<window::ClipboardShmMsg>(frame.payload())
                     else {
-                        mark_dead(&mut self.dead, fd, pid, DropReason::OutOfProtocol);
+                        mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol);
                         continue;
                     };
-                    // Two numbers off the wire, and both decide what this
-                    // process reads. The token names a region the client says
-                    // it granted — a token it never granted, or never
-                    // allocated, is a refusal the compositor has to survive —
-                    // and the length is its claim about how much of it is text,
-                    // which past the region is a read of somebody else's memory
-                    // rather than a clipboard.
+                    // The length is the client's claim about how much of the
+                    // region it sent is text, and past the region that is a
+                    // read of somebody else's memory rather than a clipboard.
+                    // The region itself is no longer a claim: it is a handle
+                    // the client moved, so there is nothing left to disbelieve
+                    // about which memory this is.
                     if info.len as usize > MAX_CLIPBOARD_BYTES {
                         eprintln!(
-                            "compositor: refusing {} bytes of clipboard from pid {pid}, max \
+                            "compositor: refusing {} bytes of clipboard from client {}, max \
                              {MAX_CLIPBOARD_BYTES}",
-                            info.len
+                            info.len,
+                            fd.0
                         );
                         continue;
                     }
-                    let Ok(shm) = SharedMemory::map(info.token, info.len as usize) else {
-                        mark_dead(&mut self.dead, fd, pid, DropReason::OutOfProtocol);
+                    let Some([buffer]) = ipc::recv_handles_exact::<1>(fd) else {
+                        mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol);
+                        continue;
+                    };
+                    let Ok(shm) = SharedMemory::adopt(buffer, info.len as usize) else {
+                        mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol);
                         continue;
                     };
                     self.clipboard = String::from_utf8_lossy(shm.as_slice()).into_owned();
                 }
                 window::MSG_SET_CURSOR => {
                     let Ok(style) = ipc::decode_payload::<u32>(frame.payload()) else {
-                        mark_dead(&mut self.dead, fd, pid, DropReason::OutOfProtocol);
+                        mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol);
                         continue;
                     };
                     if let Some(i) = self.stack.find(|w| w.client.conn.fd() == fd) {
@@ -768,23 +786,23 @@ impl Session {
                     let Ok(req) =
                         ipc::decode_payload::<window::ResolutionRequest>(frame.payload())
                     else {
-                        mark_dead(&mut self.dead, fd, pid, DropReason::OutOfProtocol);
+                        mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol);
                         continue;
                     };
                     self.set_resolution(req.width, req.height);
-                    self.answer_resolution(fd, pid);
+                    self.answer_resolution(fd);
                 }
                 // The one message a client can ask for faster than it can read
                 // the answer: eight bytes in, sixteen out. Blocking here is a
                 // client filling its own pipe and taking the desktop with it.
-                window::MSG_GET_RESOLUTION => self.answer_resolution(fd, pid),
+                window::MSG_GET_RESOLUTION => self.answer_resolution(fd),
                 _ => {}
             }
         }
     }
 
     fn create_window(&mut self, frame: ClientFrame) {
-        let (fd, pid) = (frame.fd, frame.pid);
+        let fd = frame.fd;
         // `frame.conn` is dropped by every early return here, which closes the
         // fd: there is no window to remove yet.
         let Ok(req) = ipc::decode_payload::<window::CreateWindowRequest>(frame.payload()) else {
@@ -796,7 +814,7 @@ impl Session {
         // rather than as a protocol error made one message from any client
         // fatal.
         let Some(conn) = frame.conn else {
-            mark_dead(&mut self.dead, fd, pid, DropReason::OutOfProtocol);
+            mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol);
             return;
         };
 
@@ -814,10 +832,11 @@ impl Session {
         };
         if let Some(reason) = refusal {
             eprintln!(
-                "compositor: refusing {}x{} window from pid {pid} ({} live, max {}), reason \
+                "compositor: refusing {}x{} window from client {} ({} live, max {}), reason \
                  {reason}",
                 req.width,
                 req.height,
+                fd.0,
                 self.stack.len(),
                 self.max_windows
             );
@@ -831,14 +850,15 @@ impl Session {
             self.stack.len(),
             self.desk.screen,
         );
-        let shm = match SharedMemory::allocate((content.area() * 4) as usize) {
+        let shm = match SharedMemory::create((content.area() * 4) as usize) {
             Ok(shm) => shm,
             Err(e) => {
                 eprintln!(
-                    "compositor: refusing {}x{} window from pid {pid} — there is no memory for \
-                     it ({e:?})",
+                    "compositor: refusing {}x{} window from client {} — there is no memory \
+                     for it ({e:?})",
                     content.w(),
-                    content.h()
+                    content.h(),
+                    fd.0
                 );
                 let _ = ipc::try_send(
                     fd,
@@ -848,15 +868,26 @@ impl Session {
                 return;
             }
         };
-        // The client can be gone before its first frame is served: `accept`
-        // names the process that connected, and the frame it left in the pipe
-        // outlives it. Dropping `conn` here is the whole cleanup — there is no
-        // window yet.
-        if shm.grant(pid).is_err() {
-            eprintln!("compositor: dropping pid {pid} — {}", DropReason::Vanished.why());
-            return;
-        }
-        let token = shm.token();
+        // A second handle to the same region, for the client. The compositor
+        // keeps the first and draws chrome through it, so the two lifetimes are
+        // genuinely separate: a client that exits takes its own handle and
+        // leaves the compositor's buffer intact until the window goes.
+        let client_shm = match shm.share() {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!(
+                    "compositor: refusing a window to client {} — its buffer cannot be shared \
+                     ({e:?})",
+                    fd.0
+                );
+                let _ = ipc::try_send(
+                    fd,
+                    window::MSG_WINDOW_REFUSED,
+                    &window::WindowRefused { reason: window::REFUSED_NO_MEMORY },
+                );
+                return;
+            }
+        };
         let title = if req.title_len > 0 {
             let len = (req.title_len as usize).min(30);
             String::from_utf8_lossy(&req.title[..len]).into_owned()
@@ -864,7 +895,7 @@ impl Session {
             String::new()
         };
         let at = self.stack.insert(Window::new(
-            Client { conn, pid, shm, rx: ClientRx::new() },
+            Client { conn, shm, rx: ClientRx::new() },
             content,
             title,
             req.flags & window::WINDOW_FLAG_TOPMOST != 0,
@@ -873,12 +904,12 @@ impl Session {
 
         self.poller.poll_add(&self.stack[at].client.conn, IORING_POLL_IN, fd.0 as u64);
         let pixel_format = self.pixel_format();
-        deliver(
+        deliver_with_handles(
             &mut self.dead,
             &self.stack[at],
+            &[client_shm],
             window::MSG_WINDOW_CREATED,
             &window::WindowInfo {
-                token,
                 width: content.w() as u32,
                 height: content.h() as u32,
                 stride: content.w() as u32,
@@ -888,22 +919,22 @@ impl Session {
         self.damage_all();
     }
 
-    fn answer_resolution(&mut self, fd: Fd, pid: u32) {
+    fn answer_resolution(&mut self, fd: RawHandle) {
         let reply =
             window::ResolutionInfo { width: self.fb_info.width, height: self.fb_info.height };
         if ipc::try_send(fd, window::MSG_RESOLUTION_CHANGED, &reply).is_err() {
-            mark_dead(&mut self.dead, fd, pid, DropReason::NotReading);
+            mark_dead(&mut self.dead, fd, DropReason::NotReading);
         }
     }
 
     fn set_resolution(&mut self, width: u32, height: u32) {
-        let Ok(info) = gpu::set_resolution(width, height) else {
+        let Ok(info) = self.fb_dev.set_resolution(width, height) else {
             return;
         };
         self.fb_info = info;
         let size = info.stride as usize * info.height as usize * 4;
-        self._fb_shm = SharedMemory::map(info.token[0], size)
-            .expect("the scanout token the mode set just returned");
+        self._fb_shm = SharedMemory::adopt(info.scanout[0], size)
+            .expect("the scanout buffer the mode set just handed over");
         self.screen = Screen::new(
             self._fb_shm.as_ptr(),
             info.width as usize,
@@ -950,12 +981,12 @@ impl Session {
         let vacated: Vec<Rect> = self
             .stack
             .iter()
-            .filter(|w| self.dead.iter().any(|(fd, _, _)| *fd == w.client.conn.fd()))
+            .filter(|w| self.dead.iter().any(|(fd, _)| *fd == w.client.conn.fd()))
             .map(|w| w.frame(&self.desk.chrome))
             .collect();
         let dead = std::mem::take(&mut self.dead);
-        self.stack.retain(|w| !dead.iter().any(|(fd, _, _)| *fd == w.client.conn.fd()));
-        self.pending.retain(|p| !dead.iter().any(|(fd, _, _)| *fd == p.conn.fd()));
+        self.stack.retain(|w| !dead.iter().any(|(fd, _)| *fd == w.client.conn.fd()));
+        self.pending.retain(|p| !dead.iter().any(|(fd, _)| *fd == p.conn.fd()));
         self.dead = dead;
         if self.stack.len() != before {
             for rect in vacated {
@@ -966,15 +997,16 @@ impl Session {
     }
 
     /// Re-arm the one-shot poll registrations for every fd that fired.
-    fn rearm(&mut self, kb: bool, mouse: bool, listener: bool) {
+    fn rearm(&mut self, kb: bool, mouse: bool, acceptor: bool) {
         if kb {
             self.poller.poll_add(&self.kb, IORING_POLL_IN, self.kb.fd().0 as u64);
         }
         if mouse {
             self.poller.poll_add(&self.mouse, IORING_POLL_IN, self.mouse.fd().0 as u64);
         }
-        if listener {
-            self.poller.poll_add(&self.listener, IORING_POLL_IN, self.listener.fd().0 as u64);
+        if acceptor {
+            let h = self.acceptor.as_handle();
+            self.poller.poll_add(&self.acceptor, IORING_POLL_IN, h.0 as u64);
         }
         for win in self.stack.iter() {
             let fd = win.client.conn.fd();
@@ -1085,13 +1117,14 @@ impl Session {
         );
 
         for region in &regions {
-            gpu::present(
-                region.x0 as u32,
-                region.y0 as u32,
-                region.w() as u32,
-                region.h() as u32,
-            )
-            .expect("compositor owns the framebuffer");
+            self.fb_dev
+                .present(
+                    region.x0 as u32,
+                    region.y0 as u32,
+                    region.w() as u32,
+                    region.h() as u32,
+                )
+                .expect("compositor holds the framebuffer claim");
         }
 
         self.frame_callbacks(&regions);
@@ -1130,11 +1163,11 @@ impl Session {
             return;
         }
         for win in
-            self.stack.iter().filter(|w| dead.iter().any(|(fd, _, _)| *fd == w.client.conn.fd()))
+            self.stack.iter().filter(|w| dead.iter().any(|(fd, _)| *fd == w.client.conn.fd()))
         {
             self.damage.add(win.frame(&self.desk.chrome));
         }
-        self.stack.retain(|w| !dead.iter().any(|(fd, _, _)| *fd == w.client.conn.fd()));
+        self.stack.retain(|w| !dead.iter().any(|(fd, _)| *fd == w.client.conn.fd()));
         self.damage_all();
     }
 
@@ -1167,10 +1200,8 @@ impl Session {
 
     /// GUI+V: hand the window at `idx` the clipboard.
     ///
-    /// Over 4096 bytes it goes through shared memory. The grant is what makes
-    /// the token mean anything to the window: without it the client's own
-    /// `map_shared` is refused, and this path sent one for every paste over
-    /// 4096 bytes.
+    /// Over 4096 bytes it goes through shared memory — a region made here and
+    /// moved to the window with the message that says how much of it is text.
     fn paste(&mut self, idx: usize) {
         if self.clipboard.is_empty() {
             return;
@@ -1182,41 +1213,40 @@ impl Session {
                 .conn
                 .try_send_bytes(window::MSG_CLIPBOARD_PASTE, self.clipboard.as_bytes())
             {
-                mark_dead(&mut self.dead, win.client.conn.fd(), win.client.pid, e.into());
+                mark_dead(&mut self.dead, win.client.conn.fd(), e.into());
             }
             return;
         }
-        // Held until the next big paste replaces it: the window maps the token
-        // after this returns, and a region dropped here is a region it cannot
-        // map.
-        static PASTE_SHM: std::sync::Mutex<Option<SharedMemory>> = std::sync::Mutex::new(None);
-        match SharedMemory::allocate(self.clipboard.len()) {
-            Ok(mut shm) if shm.grant(win.client.pid).is_ok() => {
-                shm.as_mut_slice()[..self.clipboard.len()]
-                    .copy_from_slice(self.clipboard.as_bytes());
-                deliver(
-                    &mut self.dead,
-                    win,
-                    window::MSG_CLIPBOARD_PASTE_SHM,
-                    &window::ClipboardShmMsg {
-                        token: shm.token(),
-                        len: self.clipboard.len() as u32,
-                    },
+        // Nothing is held here. The window's handle keeps the region alive once
+        // the send has moved it, so the compositor's own mapping goes at the end
+        // of this function — where the old code kept the last paste mapped until
+        // the next one replaced it.
+        let mut shm = match SharedMemory::create(self.clipboard.len()) {
+            Ok(shm) => shm,
+            Err(e) => {
+                eprintln!(
+                    "compositor: client {} gets no paste — no memory for {} bytes ({e:?})",
+                    win.client.conn.fd().0,
+                    self.clipboard.len()
                 );
-                *PASTE_SHM.lock().unwrap() = Some(shm);
+                return;
             }
-            Ok(_) => mark_dead(
-                &mut self.dead,
-                win.client.conn.fd(),
-                win.client.pid,
-                DropReason::Vanished,
-            ),
-            Err(e) => eprintln!(
-                "compositor: pid {} gets no paste — no memory for {} bytes ({e:?})",
-                win.client.pid,
-                self.clipboard.len()
-            ),
-        }
+        };
+        let Ok(handle) = shm.share() else {
+            eprintln!(
+                "compositor: client {} gets no paste — its region cannot be shared",
+                win.client.conn.fd().0
+            );
+            return;
+        };
+        shm.as_mut_slice()[..self.clipboard.len()].copy_from_slice(self.clipboard.as_bytes());
+        deliver_with_handles(
+            &mut self.dead,
+            win,
+            &[handle],
+            window::MSG_CLIPBOARD_PASTE_SHM,
+            &window::ClipboardShmMsg { len: self.clipboard.len() as u32 },
+        );
     }
 }
 
@@ -1283,44 +1313,48 @@ fn mouse_event(
 
 /// Give `win` a buffer the size of its content rect, and say whether it got one.
 ///
-/// **Neither refusal is fatal, and one of them is how the desktop died.** The
-/// grant names a process, and a client whose window is being maximized may have
-/// exited since the compositor decided to: `grant_shared` answers
-/// `InvalidArgument` for a pid the process table no longer knows, and an
-/// infallible `SharedMemory::grant` over that took every other window with it.
-/// The allocation is the compositor's own memory rather than the client's
-/// doing, so a refusal there keeps the window at a size it can afford.
+/// **Neither refusal is fatal.** The memory is the compositor's own rather than
+/// the client's doing, so a refusal keeps the window at a size it can afford —
+/// and a client that has exited is learned about by the send below refusing,
+/// never by a grant naming a pid the process table no longer knows. That grant
+/// is how the desktop used to die: `SharedMemory::grant` was infallible over an
+/// `InvalidArgument` that a maximize could reach, and it took every other
+/// window with it.
 fn rebuffer(win: &mut Win, pixel_format: u32, dead: &mut Vec<Dead>) -> bool {
     let (w, h) = (win.content.w(), win.content.h());
-    let old_token = win.client.shm.token();
-    let new_shm = match SharedMemory::allocate(w as usize * h as usize * 4) {
+    let new_shm = match SharedMemory::create(w as usize * h as usize * 4) {
         Ok(shm) => shm,
         Err(e) => {
             eprintln!(
-                "compositor: pid {} keeps its {}x{} buffer — no memory for {w}x{h} ({e:?})",
-                win.client.pid, win.buf_w, win.buf_h
+                "compositor: client {} keeps its {}x{} buffer — no memory for {w}x{h} ({e:?})",
+                win.client.conn.fd().0,
+                win.buf_w,
+                win.buf_h
             );
             return false;
         }
     };
-    if new_shm.grant(win.client.pid).is_err() {
-        mark_dead(dead, win.client.conn.fd(), win.client.pid, DropReason::Vanished);
+    let Ok(client_shm) = new_shm.share() else {
+        eprintln!(
+            "compositor: client {} keeps its {}x{} buffer — the new one cannot be shared",
+            win.client.conn.fd().0,
+            win.buf_w,
+            win.buf_h
+        );
         return false;
-    }
-    let token = new_shm.token();
+    };
     win.client.shm = new_shm;
     win.buf_w = w;
     win.buf_h = h;
     // The one message a window cannot afford to miss — the old mapping is
     // already gone — so a client that will not take it is dropped rather than
     // left drawing into memory it no longer owns.
-    deliver(
+    deliver_with_handles(
         dead,
         win,
+        &[client_shm],
         window::MSG_WINDOW_RESIZED,
         &window::ResizeInfo {
-            token,
-            old_token,
             width: w as u32,
             height: h as u32,
             stride: w as u32,

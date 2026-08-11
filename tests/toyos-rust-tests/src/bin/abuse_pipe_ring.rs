@@ -40,7 +40,7 @@ fn fill(buf: &mut [u8], start: u64) {
 }
 
 fn main() {
-    let p = syscall::pipe();
+    let p = syscall::pipe().expect("a pipe to map");
     let base = syscall::pipe_map(p.write).expect("pipe_map") as *mut u8;
     let header_len = size_of::<RingHeader>();
 

@@ -1,0 +1,27 @@
+# doom, soundd and the assets doom's music is made of.
+#
+# `tests/doomcase` is deliberately asset-free — its actuator synthesises its own
+# sound and opens neither the WAD nor the SoundFont — and this one is the
+# opposite: what it exists to check is that `assets/soundfont.sf2` and
+# `assets/DOOM1.WAD` reach an initrd and that doom finds both. So the two cannot
+# share a config, and this one pays 19 MiB of initrd that no other test should.
+#
+# No compositor: `/bin/doom --music-check` never opens a window.
+
+assets = ["assets"]
+
+[boot]
+start = ["soundd", "test-runner"]
+
+[programs.soundd]
+serves = ["soundd"]
+devices = ["hda-audio", "virtio-sound"]
+syscap = ["rt"]
+
+# No compositor: `/bin/doom --music-check` opens no window. test-runner passes
+# its namespace to doom (§6.7a).
+[programs.test-runner]
+receives = ["soundd"]
+
+[programs.doom]
+receives = ["soundd"]

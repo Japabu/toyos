@@ -221,10 +221,14 @@ fn spawn_path(path: &str) -> Result<u64, SyscallError> {
         syscall::spawn(&SpawnArgs {
             argv_ptr: argv.as_ptr() as u64,
             argv_len: argv.len() as u64,
-            fd_map_ptr: 0,
-            fd_map_count: 0,
+            slot_map_ptr: 0,
+            slot_map_count: 0,
             env_ptr: 0,
             env_len: 0,
+            endow_ptr: 0,
+            endow_count: 0,
+            labels_ptr: 0,
+            labels_len: 0,
         })
     }
     .map(|pid| pid.0 as u64)
@@ -413,7 +417,7 @@ fn main() {
     //     on the push.
     //
     //     This case is also the actuator for the allocator-lock defect
-    //     (known-issues §2): the >2 MiB assert fires inside
+    //     (`specs/issues/panic-path/`): the >2 MiB assert fires inside
     //     `KernelAllocator::alloc` *while it holds the dlmalloc lock*, so the
     //     recovered CPU's next allocation spins on a lock the dead thread
     //     still owns. Nothing else in the suite stages that, which is part of

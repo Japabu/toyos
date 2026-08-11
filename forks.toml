@@ -11,6 +11,11 @@
 #              backends: the fork eventually disappears.
 #   fork     — the change is genuinely invasive and must live in the crate.
 #   toolchain— consumed by the rust/ submodule rather than userland.
+#   source   — not a crate: third-party source this project compiles, pinned to
+#              an upstream commit and fetched rather than patched. doomgeneric
+#              is the only one. The tier exists because this manifest is the
+#              estate's inventory, and a third-party source tree that is not in
+#              it is precisely the hole the manifest closes.
 #
 # `base` is the upstream commit the branch is built on. Several are NOT release
 # tags: the vendored snapshots predated the tags they claimed, and using the tag
@@ -52,7 +57,7 @@ branch = "toyos"
 [socket2]
 upstream = "rust-lang/socket2"
 base = "v0.6.3"
-delta = "+1302/-11"
+delta = "+1293/-11"
 tier = "fork"
 why = "Full socket backend (src/sys/toyos.rs) over the ToyOS network syscalls."
 pr = "none — blocked on publishing toyos-abi/toyos"
@@ -61,7 +66,7 @@ pr = "none — blocked on publishing toyos-abi/toyos"
 upstream = "tokio-rs/mio"
 base = "844cf25"
 base_note = "two commits past v1.2.0; the tag itself gives a polluted diff"
-delta = "+773/-30"
+delta = "+775/-30"
 tier = "fork"
 why = "io_uring-driven selector, pipe waker, ToyOS TCP types."
 pr = "none — blocked on publishing toyos-abi/toyos"
@@ -220,6 +225,50 @@ pr = "https://github.com/bytecodealliance/target-lexicon/pull/134 (open, 2026-07
 pr_branch = "add-toyos-os"
 pr_note = "Unlike raw-window-handle the two branches cannot be made identical: `add-toyos-os` sits on a later upstream (it carries #131 and #133) and is +5/-1, while `toyos` stays on v0.13.5 and is +7/-1. The ToyOS hunks in src/targets.rs and src/triple.rs are the same on both; the extra two lines are `not_pr_content`."
 not_pr_content = "`#![allow(unexpected_cfgs)]` in build.rs and src/lib.rs. build.rs:56 emits `cargo:rustc-cfg=feature=\"rust_1_40\"`, a feature the manifest never declares, so the lint fires on a crate that denies warnings. It is an upstream lint debt, not ToyOS content — fixing it upstream is its own PR, and doing so would let this fork drop to +5/-1."
+
+[doomgeneric]
+upstream = "ozkl/doomgeneric"
+base = "fc601639494e089702a1ada082eb51aaafc03722"
+base_note = """
+"I_Error exits instead of infinite loop", 2025-08-24. Not a tag — doomgeneric
+publishes none. Chosen because it is what this project has been building all
+along: of the 202 files in the checkout that produced every doom measurement on
+record, the 197 nobody had touched match this commit's `doomgeneric/` tree
+exactly, and it is the newest commit for which that is true. Identified by
+hashing each file and comparing against every commit on master.
+"""
+delta = "none"
+tier = "source"
+why = """
+The C half of /bin/doom — 56,726 lines descended from id Software's Doom, via
+Chocolate Doom. `userland/doom/build.rs` fetches the commit's archive into
+`userland/doom/doomgeneric/`, which is gitignored, and compiles it with
+`toyos-cc`. Every ToyOS-side change lives beside it rather than in it:
+`userland/doom/include/` is force-included ahead of the C tree and
+`userland/doom/src/` is the Rust side, so the fetched sources are upstream's
+unmodified and `delta` is honestly zero.
+"""
+pin = """
+The commit is the pin and the checksum both: GitHub's archive of a sha is that
+sha's tree and can be nothing else, so no second hash of ours would say more.
+`userland/doom/doomgeneric/.toyos-commit` records what a checkout actually has,
+and a mismatch replaces the tree. Before 2026-08-08 the fetch was
+`refs/heads/master` guarded by whether the directory existed, so which Doom
+sources you built was a function of when you first cloned.
+"""
+licence = "GPL-2.0 — the one exception the README's licence section already declares."
+pr = """
+none, and none is owed: nothing of ours is in the tree to send back.
+"""
+followup = """
+This is a fetch, not a fork, and the two differ where it matters: there is no
+`toyos` branch, so a ToyOS patch to the C would have nowhere to live but an
+untracked directory — which is where the one that existed had been living. The
+end state the audit recommends is Japabu/doomgeneric as a submodule at that
+path, which deletes the fetch and the five build-dependencies that serve it
+(`ureq`, `rustls-rustcrypto`, `webpki-roots`, `flate2`, `tar`). It needs a repo
+the owner creates, so it is his call rather than an agent's.
+"""
 
 # Not a crate fork: rust/ is a submodule of Japabu/rust (compiler + std with
 # ToyOS as a target). Its own upstream sync is tracked separately.

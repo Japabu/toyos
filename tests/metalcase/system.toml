@@ -7,25 +7,36 @@
 # its own and reaches the machine's shape only through netd — and it was the
 # one this config left out, so nothing anywhere ran the branch where it finds
 # no network. It costs the boot the second `NetdConn::connect_blocking` spends
-# retrying a netd that will never come (known-issues §3), which is the price of
+# retrying a netd that will never come
+# (`hardware/network-clients-pay-a-boot-retry`, since closed), which is the price of
 # certifying the line at all.
 # test-runner makes the boot announce itself, so the harness waits for a
 # marker instead of guessing from pixels — and it is what lets an in-guest
 # binary run on the machine shape that gets flashed. Under `mute` it simply
 # parks on a console that never produces a byte.
-init = ["/bin/compositor", "/bin/soundd", "/bin/netd", "/bin/sshd", "/bin/test-runner"]
 
 assets = ["assets"]
 
-# In the directory and not in git, on purpose: 5.99 MB of SoundFont that doom
-# synthesises its music from. A sweep cannot tell it from a .DS_Store, so it is
-# named here, and a build that cannot find it stops rather than shipping a doom
-# with no music.
-untracked-assets = ["timgm6mb.sf2"]
+[boot]
+start = ["compositor", "soundd", "netd", "sshd", "test-runner"]
 
-[programs]
-compositor = {}
-soundd = {}
-netd = {}
-sshd = {}
-test-runner = {}
+[programs.compositor]
+serves = ["compositor"]
+receives = ["soundd", "launcher"]
+devices = ["framebuffer", "keyboard", "mouse"]
+
+[programs.soundd]
+serves = ["soundd"]
+devices = ["hda-audio", "virtio-sound"]
+syscap = ["rt"]
+
+[programs.netd]
+serves = ["netd"]
+devices = ["nic"]
+
+[programs.sshd]
+receives = ["netd", "launcher"]
+
+# The union its guest binaries need on this machine shape.
+[programs.test-runner]
+receives = ["compositor", "soundd", "netd"]

@@ -4,7 +4,7 @@ pub use framebuffer::{Color, Framebuffer, Screen, Traffic};
 
 use toyos::ipc;
 use toyos::poller::{Poller, IORING_POLL_IN};
-use toyos::services;
+use toyos::endow::{self, EndowError};
 use toyos::surface;
 use toyos::Connection;
 use toyos::shm::SharedMemory;
@@ -77,9 +77,14 @@ toyos::ipc_payload! {
 /// Why creating a window failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateError {
-    /// Nothing is serving the `compositor` service, or it went away between
-    /// the request and the reply.
-    NoCompositor,
+    /// This program was given no `compositor` connector. A statement about
+    /// what the manifest says this program holds, not about the machine — and
+    /// never about timing: every port exists before any server runs.
+    NotEndowed,
+    /// The compositor exited, or the connection died mid-request.
+    CompositorGone,
+    /// The compositor answered, and not with anything this exchange allows.
+    Protocol(u32),
     /// The compositor is already holding as many windows as it can afford.
     AtCapacity,
     /// The requested size is bigger than the screen it would be drawn on.
@@ -88,15 +93,13 @@ pub enum CreateError {
     NoMemory,
     /// Refused for a reason this build of the client does not know.
     Refused(u32),
-    /// The compositor answered `MSG_CREATE_WINDOW` with a message that is
-    /// neither [`MSG_WINDOW_CREATED`] nor [`MSG_WINDOW_REFUSED`].
-    Protocol(u32),
 }
 
 impl std::fmt::Display for CreateError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NoCompositor => write!(f, "no compositor is running"),
+            Self::NotEndowed => write!(f, "this program was given no compositor"),
+            Self::CompositorGone => write!(f, "the compositor is gone"),
             Self::AtCapacity => write!(f, "the compositor is at its window limit"),
             Self::TooLarge => write!(f, "the window is larger than the screen"),
             Self::NoMemory => write!(f, "there is no memory for a window that size"),
@@ -109,6 +112,15 @@ impl std::fmt::Display for CreateError {
 }
 
 impl std::error::Error for CreateError {}
+
+impl From<EndowError> for CreateError {
+    fn from(e: EndowError) -> Self {
+        match e {
+            EndowError::NotEndowed => Self::NotEndowed,
+            EndowError::ServerGone | EndowError::Refused(_) => Self::CompositorGone,
+        }
+    }
+}
 
 impl CreateError {
     fn from_wire(reason: u32) -> Self {
@@ -136,8 +148,9 @@ toyos::ipc_payload! {
         pub h: u32,
     }
 
+    /// How much of the region that travels with this message is text. The
+    /// region itself is one transferred handle, sent ahead of the frame.
     pub struct ClipboardShmMsg {
-        pub token: u32,
         pub len: u32,
     }
 
@@ -185,17 +198,22 @@ toyos::ipc_payload! {
         pub scroll: i8,
     }
 
+    /// The shape of the window's buffer. **The buffer is one transferred
+    /// handle**, sent ahead of the frame that carries this.
     pub struct WindowInfo {
-        pub token: u32,
         pub width: u32,
         pub height: u32,
         pub stride: u32,
         pub pixel_format: u32,
     }
 
+    /// The shape of the window's new buffer, which arrives as a handle the same
+    /// way [`WindowInfo`]'s does.
+    ///
+    /// It used to name the *old* buffer too, so the client could tell which
+    /// token was being replaced. A client holds the old buffer as a handle now
+    /// and needs nobody to name it.
     pub struct ResizeInfo {
-        pub token: u32,
-        pub old_token: u32,
         pub width: u32,
         pub height: u32,
         pub stride: u32,
@@ -320,20 +338,31 @@ pub fn load_layout(translator: &mut Translator) {
     }
 }
 
-/// Set the system clipboard contents (standalone, uses a temporary compositor connection).
-pub fn clipboard_set(text: &str) {
+/// Put `text` on the system clipboard, over a connection of its own.
+///
+/// Fallible where it used to `expect`: a program the manifest gives no
+/// compositor is a program that cannot copy, which is an answer and not a
+/// reason to take the caller down.
+pub fn clipboard_set(text: &str) -> Result<(), CreateError> {
     use std::sync::Mutex;
     static CLIPBOARD_SHM: Mutex<Option<SharedMemory>> = Mutex::new(None);
 
-    let conn = services::connect("compositor").expect("compositor not running");
+    let conn = endow::service("compositor")?;
     let bytes = text.as_bytes();
     if bytes.len() <= 4096 {
         let _ = conn.send_bytes(MSG_CLIPBOARD_SET, bytes);
-    } else if let Ok(mut shm) = SharedMemory::allocate(bytes.len()) {
+    } else if let Ok(mut shm) = SharedMemory::create(bytes.len()) {
         shm.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
-        let _ = conn.send(MSG_CLIPBOARD_SET_SHM, &ClipboardShmMsg { token: shm.token(), len: bytes.len() as u32 });
+        if let Ok(handle) = shm.share() {
+            let _ = conn.send_with_handles(
+                &[handle],
+                MSG_CLIPBOARD_SET_SHM,
+                &ClipboardShmMsg { len: bytes.len() as u32 },
+            );
+        }
         *CLIPBOARD_SHM.lock().unwrap() = Some(shm);
     }
+    Ok(())
 }
 
 pub struct Window {
@@ -375,7 +404,7 @@ impl Window {
         title: &str,
         flags: u8,
     ) -> Result<Self, CreateError> {
-        let conn = services::connect("compositor").map_err(|_| CreateError::NoCompositor)?;
+        let conn = endow::service("compositor")?;
 
         let mut req = CreateWindowRequest {
             width,
@@ -388,30 +417,32 @@ impl Window {
         let len = bytes.len().min(30);
         req.title[..len].copy_from_slice(&bytes[..len]);
         req.title_len = len as u8;
-        conn.send(MSG_CREATE_WINDOW, &req).map_err(|_| CreateError::NoCompositor)?;
+        conn.send(MSG_CREATE_WINDOW, &req).map_err(|_| CreateError::CompositorGone)?;
 
         // Header first, then the payload the message type calls for: the two
         // answers carry different structs, and a payload shorter than the type
         // it was asked for is a refusal from `recv_payload`, not a window.
-        let header = conn.recv_header().map_err(|_| CreateError::NoCompositor)?;
+        let header = conn.recv_header().map_err(|_| CreateError::CompositorGone)?;
         match header.msg_type {
             MSG_WINDOW_CREATED => {}
             MSG_WINDOW_REFUSED => {
                 let refused: WindowRefused = conn
                     .recv_payload(&header)
-                    .map_err(|_| CreateError::NoCompositor)?;
+                    .map_err(|_| CreateError::CompositorGone)?;
                 return Err(CreateError::from_wire(refused.reason));
             }
             other => return Err(CreateError::Protocol(other)),
         }
         let info: WindowInfo = conn
             .recv_payload(&header)
-            .map_err(|_| CreateError::NoCompositor)?;
+            .map_err(|_| CreateError::CompositorGone)?;
 
         let buf_size = info.stride as usize * info.height as usize * 4;
-        // A token the compositor named and did not grant is a compositor that
-        // is not serving this client, whatever else it is doing.
-        let shm = SharedMemory::map(info.token, buf_size).map_err(|_| CreateError::NoCompositor)?;
+        // The buffer crossed ahead of the frame. A compositor that announced a
+        // window and sent nothing with it is not serving this client, whatever
+        // else it is doing.
+        let [buffer] = conn.recv_handles_exact::<1>().ok_or(CreateError::CompositorGone)?;
+        let shm = SharedMemory::adopt(buffer, buf_size).map_err(|_| CreateError::CompositorGone)?;
 
         let poller = Poller::new(1);
         Ok(Self {
@@ -468,7 +499,7 @@ impl Window {
     /// A caller that drains until `None` — which is the ordinary shape, and is
     /// what `winit`'s ToyOS backend does — never leaves that loop, so closing
     /// the window spun the client on a core instead of ending it (snake, on
-    /// the T14, `specs/known-issues.md` §3).
+    /// the T14, `specs/issues/kernel/`).
     pub fn poll_event(&mut self, timeout_nanos: u64) -> Option<Event> {
         if self.closed {
             return None;
@@ -509,7 +540,10 @@ impl Window {
                 // The old buffer is already gone on the compositor's side, so
                 // a window that cannot map the new one has nothing to draw
                 // into and its session is over.
-                let Ok(shm) = SharedMemory::map(info.token, buf_size) else {
+                let Some([buffer]) = self.conn.recv_handles_exact::<1>() else {
+                    return Event::Close;
+                };
+                let Ok(shm) = SharedMemory::adopt(buffer, buf_size) else {
                     return Event::Close;
                 };
                 self.shm = shm;
@@ -529,7 +563,10 @@ impl Window {
                 let Ok(info) = self.conn.recv_payload::<ClipboardShmMsg>(header) else {
                     return Event::Close;
                 };
-                let Ok(shm) = SharedMemory::map(info.token, info.len as usize) else {
+                let Some([buffer]) = self.conn.recv_handles_exact::<1>() else {
+                    return Event::ClipboardPaste(Vec::new());
+                };
+                let Ok(shm) = SharedMemory::adopt(buffer, info.len as usize) else {
                     return Event::ClipboardPaste(Vec::new());
                 };
                 Event::ClipboardPaste(shm.as_slice().to_vec())
@@ -567,7 +604,7 @@ impl Window {
         let _ = self.conn.send(MSG_PRESENT, &damage);
     }
 
-    pub fn fd(&self) -> toyos_abi::Fd {
+    pub fn fd(&self) -> toyos_abi::RawHandle {
         self.conn.fd()
     }
 

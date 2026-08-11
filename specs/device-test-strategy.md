@@ -56,17 +56,17 @@ bug that has produced every metal-track blocker so far.
 
 The crowded-USB config is built: `Profile::MetalUsb` is metal-sim with six
 devices on the xHCI, two of them keyboards, and it cost two boots, one extra
-kernel build and no new instrument. The extra build is the shortage config's:
-a distinct `kernel_features` set is a distinct cargo fingerprint, so budget one
-rebuild per feature-carrying config, not one boot. It also fixed the shape of
+kernel build and no new instrument. The extra build was the shortage
+config's, when an actuator was still a cargo feature; since
+`specs/test-cost-audit.md` §5.9.7 it is a boot parameter and costs no build at
+all. It also fixed the shape of
 the assertion — the driver logs the DMA offset of each device's interrupt ring
 and the block count it derived, so "these two devices are independent" and "this
 number came from HCSPARAMS" are both text assertions rather than hopes. One
 caveat it recorded: a *shortage*
 scenario is not always host-stageable. QEMU's `nec-usb-xhci,slots=N` does not
 reach HCSPARAMS1 and its Enable Slot ignores the MaxSlotsEn the driver writes,
-so the exhaustion path needs a kernel feature (`xhci-one-slot`) as its
-actuator. Check that the actuator exists before promising the config.
+so the exhaustion path needs an actuator (`xhci-one-slot`). Check that the actuator exists before promising the config.
 
 Protocol depth comes second, and only where the device is load-bearing: storage
 (data loss is unrecoverable) and network (gate N).
@@ -89,7 +89,11 @@ fail a driver test for an unrelated reason. Input tests inject a *relative*
 delta and a button and assert the guest received that delta and that button —
 true no matter where anything is drawn.
 
-**The one exception: the panic console.** There the framebuffer *is* the device
+**The one exception: the panic console.** A screendump is a conversion
+taken while the guest is still drawing, and the panic console writes only
+`0x00` and `0xFF` — so any other colour in a band that lost its text names
+userland as the last painter, and a missing line is evidence about where on the
+glass it sat rather than about what the kernel wrote. There the framebuffer *is* the device
 under test, and on a machine with no serial port it is the only diagnostic
 channel, so asking the question without looking at pixels is not a weaker test
 but no test. Those assertions are text anyway: the harness decodes each 8x16

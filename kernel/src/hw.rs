@@ -8,7 +8,6 @@
 
 use core::arch::asm;
 
-#[cfg(feature = "diag-tick")]
 use toyos_sched::cpu::SleepToken;
 use toyos_sched::cpu::RunToken;
 use toyos_sched::hw::{CpuId, Hw, Kicker, Machine, Nanos, TraceEvent};
@@ -76,9 +75,10 @@ impl Machine for KernelHw {
     /// absolute value, so the conversion here becomes ns→TSC scaling with no
     /// clock read at all.
     ///
-    /// A deadline already in the past arms the one-tick minimum and fires
-    /// immediately (`arm_one_shot` clamps), which is what a past-due deadline
-    /// should do.
+    /// A deadline already in the past arms the one-shot's floor and fires at
+    /// the end of it. Not sooner: "as soon as possible" is an interrupt the
+    /// CPU takes before it can retire the instruction that armed it, and the
+    /// Ring 0 stub then reloads the same count forever.
     fn set_timer(&self, deadline: Nanos) {
         apic::arm_one_shot(deadline.0.saturating_sub(self.now().0));
     }
@@ -127,10 +127,12 @@ impl Machine for KernelHw {
     /// its STI shadow, so a fire that lands in the window between them is taken
     /// rather than slept through. Ordering with the pass's own arming is
     /// [`apic::arm_within`]'s minimum, so this only ever adds wakes.
-    #[cfg(feature = "diag-tick")]
     fn idle_wait(&self, token: SleepToken) {
         let _consumed = token;
-        apic::arm_within(DIAG_TICK_NS);
+        #[cfg(feature = "boot-actuators")]
+        if crate::actuator::diag_tick() {
+            apic::arm_within(DIAG_TICK_NS);
+        }
         self.halt();
     }
 }
@@ -142,7 +144,6 @@ impl Machine for KernelHw {
 /// line a CPU whose wake landed just the wrong side of the boundary would drop
 /// out of the mask, and a field that flickers on a healthy machine cannot be
 /// read as "that CPU stopped" on a sick one.
-#[cfg(feature = "diag-tick")]
 const DIAG_TICK_NS: u64 = 100_000_000;
 
 impl Hw for KernelHw {
@@ -180,7 +181,7 @@ impl Hw for KernelHw {
                     // *task* rather than the idle context becomes what a CPU is
                     // running, which is what `ran=` has to count for a machine
                     // that schedules but runs nothing to be visible at all.
-                    #[cfg(feature = "heartbeat")]
+                    #[cfg(feature = "boot-actuators")]
                     crate::heartbeat::note_dispatch();
                     percpu::set_kernel_stack(incoming.kernel_stack_top);
                     incoming.cr3.activate();

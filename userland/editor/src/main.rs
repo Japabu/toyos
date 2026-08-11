@@ -1568,7 +1568,7 @@ fn handle_key(editor: &mut Editor, key: &KeyPress, fb: &mut Framebuffer) {
         match ch {
             Some('s') => {
                 if editor.buffer.path.is_none() {
-                    if let Some(path) = filepicker_api::pick_file(PickerMode::Save, "/") {
+                    if let Some(path) = pick(PickerMode::Save) {
                         editor.buffer.path = Some(path);
                     }
                 }
@@ -1579,7 +1579,7 @@ fn handle_key(editor: &mut Editor, key: &KeyPress, fb: &mut Framebuffer) {
                 }
             }
             Some('o') => {
-                if let Some(path) = filepicker_api::pick_file(PickerMode::Open, "/") {
+                if let Some(path) = pick(PickerMode::Open) {
                     editor.buffer = Buffer::from_file(&path);
                     editor.cursor_row = 0;
                     editor.cursor_col = 0;
@@ -1610,12 +1610,12 @@ fn handle_key(editor: &mut Editor, key: &KeyPress, fb: &mut Framebuffer) {
             }
             Some('c') => {
                 if let Some(text) = editor.selected_text() {
-                    window::clipboard_set(&text);
+                    window::clipboard_set(&text).ok();
                 }
             }
             Some('x') => {
                 if let Some(text) = editor.selected_text() {
-                    window::clipboard_set(&text);
+                    window::clipboard_set(&text).ok();
                     editor.delete_selection();
                 }
             }
@@ -1890,5 +1890,20 @@ fn handle_mouse(
         }
 
         _ => {}
+    }
+}
+
+/// The picker's answer, with a refusal named on stderr.
+///
+/// A cancellation and "this program was given no file picker" are different
+/// facts and only one of them is the user's; the caller does the same thing
+/// either way, so the difference goes in the log rather than into the return.
+fn pick(mode: PickerMode) -> Option<String> {
+    match filepicker_api::pick_file(mode, "/") {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("{}: {e}", env!("CARGO_PKG_NAME"));
+            None
+        }
     }
 }

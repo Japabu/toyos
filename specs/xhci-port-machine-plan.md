@@ -1,6 +1,9 @@
 # The xHCI port machine: extraction, host model, and the three defects it carries
 
-Plan of record. Nothing here is built yet.
+Plan of record. **X0, X1 (`6bfeed9`), X2a and X2b are built; X2c and X3 are
+not** — §3 carries the per-stage state and is the authority. This line said
+"nothing here is built yet" until 2026-08-08, three stages after it stopped
+being true.
 
 Governed by `specs/code-quality-review-2026-08.md` — the doctrine (§1) and the
 `xhci/` verdict (§2 drivers/), which names this extraction as the vehicle for
@@ -49,7 +52,7 @@ has 25 call sites of the five blocking primitives across three files.
 mailbox drain.** `sched/driver.rs`'s `drain_irqs` is the only caller, and both
 `pass` and `pass_block` call it before `SchedPass::begin`. So the 2 s above is
 spent while the CPU is holding every message addressed to it. Already filed:
-known-issues "A scheduler pass may spend two seconds in xHCI before it drains
+`specs/issues/` "A scheduler pass may spend two seconds in xHCI before it drains
 its mailbox", with the T14's `retire_task` 1 s guard panic as the observed
 consequence.
 
@@ -195,8 +198,9 @@ the one most likely to need a second landing.
 
 #### Working state, so this stage survives its agent
 
-X0 and X1 are on main (`6bfeed9`); **X2a is built** and X2b is not started.
-Everything below is established and should not be re-derived.
+X0 and X1 are on main (`6bfeed9`); **X2a and X2b are both built** — see the
+X2b section below, which this line contradicted until 2026-08-08. X2c is not
+started. Everything below is established and should not be re-derived.
 
 **The three call sites that must lose the ability to wait.** `poll_if_pending`
 reaches exactly four things — `next_event`/`dispatch_event` (a drain, no wait),
@@ -249,8 +253,8 @@ the metal proof is the owner's and it is the one that counts.
   round each time. **If X2 makes it pass that is not evidence of anything** — as
   likely the race landing the other way, which is exactly why its
   `EXPECTED_FAILURES` entry expires on a date rather than on a green run.
-  Nothing to do: `cargo run -- --land` takes a run it fired in, and does not
-  take one where it failed some other way.
+  Nothing to do: the gate takes a run it fired in, and does not take one where
+  it failed some other way.
 - **There is no gate for the unplug window and it cannot be aimed.** The hazard
   is the 100 ms between the device going and the teardown running, and a QEMU
   `device_del` cannot be landed inside it. That is the answer and belongs in a
@@ -458,13 +462,13 @@ call site contradicts.
 What X2 does **not** fix even then, stated so the task is not closed on a
 half-answer:
 `storage_read`/`storage_write` still run SCSI commands under the same lock from
-whatever thread faulted, and known-issues already says that is not fixable by
+whatever thread faulted, and `specs/issues/` already says that is not fixable by
 this conversion. That path does not run inside `drain_irqs`, so #156's prologue
 is closed and the lock-hold finding is not.
 
 Price: no new code beyond X2 — it is X2's proof obligation. One guest gate that
 measures the pass duration across a plug, plus the `sched-check` pass-budget
-assertion known-issues records as never enabled.
+assertion `specs/issues/` records as never enabled.
 
 ### #100 rides X2; there is no fourth stage
 

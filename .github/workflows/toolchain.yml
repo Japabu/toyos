@@ -9,9 +9,17 @@ name: toolchain
 # superseded run by design; a second push during an hour-long bootstrap would
 # throw that hour away and the next run would start it again.
 
+# **On pull requests too, and that is not optional.** `ci.yml` waits up to two
+# hours for the release keyed on the four trees it is about to build against, and
+# a branch is no longer pushed *and* opened as a pull request — it is one event.
+# A branch that changes one of those trees and never got a `push` event would
+# have every shard wait that out and then fail. A pull-request checkout is the
+# merge of head and base, which is the commit `ci.yml` keys on, so the two agree.
+
 on:
   push:
-    branches-ignore: ['ci/**']
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -77,13 +85,37 @@ jobs:
       # ci`. Unset, it walks back to a real bors commit as it does on the dev
       # host.
       - name: build
+        id: build
         if: steps.have.outputs.build == 'yes'
         run: |
+          set -o pipefail
           t0=$(date +%s)
-          env -u GITHUB_ACTIONS -u CI cargo run -- --build-only
+          env -u GITHUB_ACTIONS -u CI cargo run -- --build-only 2>&1 | tee /tmp/build.log
           echo "BUILD-ONLY-SECONDS: $(( $(date +%s) - t0 ))"
           df -h /
           du -sh rust/build
+
+      # **The first error, on the run's own front page.** The real failure of
+      # pull request #22 was four lines of `error[E0433]` among four
+      # pre-existing std warnings, an hour into a 2,300-line log, and reaching
+      # it took `gh run view --log-failed | grep`. The build system now stops on
+      # the first compile error rather than 83 seconds later on a missing file
+      # (`src/toolchain.rs`), so the two lines worth lifting out are that error
+      # and the panic that ended the run.
+      - name: what failed
+        if: failure() && steps.build.outcome == 'failure'
+        run: |
+          {
+            echo "### the toolchain did not build"
+            echo ""
+            echo '```'
+            grep -m1 -A5 -E '^error(\[|: could not compile)' /tmp/build.log \
+              || echo "(no compile error in the log)"
+            echo ""
+            grep -A2 -E "^thread '.*' panicked at" /tmp/build.log | tail -20 \
+              || echo "(the build system did not panic)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # `lib/rustlib/<host>` is a symlink into whatever stable toolchain built
       # it, which is not a path any artifact can carry. `Owner::Installed`
@@ -109,3 +141,29 @@ jobs:
             --notes "x86_64-unknown-linux-gnu toolchain for rust $(git rev-parse HEAD:rust), built from ${{ github.sha }}." \
             /tmp/toyos-toolchain.tar.zst \
             || gh release view "${{ steps.key.outputs.tag }}"
+
+      # **A release without its asset is not a publication, and the line above
+      # cannot tell that from being second.** `create` makes the release and
+      # then uploads 401 MiB to it, so a failed upload leaves a tag that answers
+      # 200 and nothing to install — while this job reports success, which is
+      # the verdict `ci.yml` reads to decide that thirteen shards may start. The
+      # wait is for the *other* branch's upload, in the idempotent case the
+      # `||` above exists for.
+      - name: the artifact is on the release
+        if: steps.have.outputs.build == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for _ in $(seq 20); do
+            if gh release view "${{ steps.key.outputs.tag }}" --json assets \
+                 --jq '.assets[].name' | grep -qx toyos-toolchain.tar.zst; then
+              echo "${{ steps.key.outputs.tag }} carries toyos-toolchain.tar.zst."
+              exit 0
+            fi
+            echo "the release is there and the asset is not on it yet; waiting"
+            sleep 15
+          done
+          echo "::error::${{ steps.key.outputs.tag }} exists and carries no"
+          echo "::error::toyos-toolchain.tar.zst. Nothing can install this toolchain, and a"
+          echo "::error::green here is what lets ci.yml start thirteen shards."
+          exit 1

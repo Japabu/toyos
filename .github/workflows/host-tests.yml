@@ -3,14 +3,14 @@ name: host tests
 # Everything that needs no ToyOS toolchain and boots no guest, so it answers
 # before the toolchain job has finished restoring one.
 #
-# macOS because the dev host is macOS and two of these gates have a macOS-only
-# outside judge: `toyos-fat32` formats real volumes through `newfs_msdos` and
-# `hdiutil`, and both it and `src/image.rs` are judged by `fsck_msdos`. There is
-# no Linux equivalent whose output either parser understands.
+# macOS because the dev host is macOS and because `toyos-fat32` still builds its
+# volumes with `newfs_msdos` and `hdiutil` — the *judge* is ours now
+# (`toyos-fat32-check`, written from fatgen103), so that is the only macOS-only
+# thing left here and the only reason this job is not on Linux.
 
 on:
   push:
-    branches-ignore: ['ci/**']
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -43,33 +43,64 @@ jobs:
             toyos-sched/target
             toyos-ps2/target
             toyos-gpt/target
+            toyos-elf/target
             toyos-cc/target
+            toyos-ld/target
             toyos-hda/target
+            toyos-pci/target
             toyos-xhci/target
+            toyos-desktop/target
             kernel-loom/target
             kernel-span/target
             toyos-fat32/target
+            toyos-fat32-check/target
             userland/sshd/target
           key: host-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: host-${{ runner.os }}-
 
       # The build system's own gates: the two lock scopes, the landing
-      # protocol, the sysroot witness, and the image builder's fsck gate.
+      # protocol, the sysroot witness, and the format check on the two volumes
+      # the image builder writes.
       - name: build system
-        run: cargo test --lib
+        run: |
+          set -o pipefail
+          cargo test --lib 2>&1 | tee -a /tmp/host.log
 
+      # CLAUDE.md's list, whole. It used to be nine of the thirteen — the four
+      # that were missing (`toyos-elf`, `toyos-ld`, `toyos-pci`,
+      # `toyos-desktop`) are pure crates whose whole point is that a decision
+      # is testable without a guest, so a CI that skipped them skipped exactly
+      # the tests it was cheapest to run.
       - name: host crates
         run: |
-          set -e
-          for crate in toyos-sched toyos-ps2 toyos-gpt toyos-cc toyos-hda \
-                       toyos-xhci kernel-loom kernel-span toyos-fat32; do
-            echo "=== $crate"
-            cargo test --manifest-path "$crate/Cargo.toml"
+          set -e -o pipefail
+          for crate in toyos-sched toyos-ps2 toyos-gpt toyos-elf toyos-cc \
+                       toyos-ld toyos-hda toyos-pci toyos-xhci toyos-desktop \
+                       kernel-loom kernel-span toyos-fat32 toyos-fat32-check; do
+            echo "=== $crate" | tee -a /tmp/host.log
+            cargo test --manifest-path "$crate/Cargo.toml" 2>&1 | tee -a /tmp/host.log
           done
 
       # `userland/.cargo/config.toml` cross-compiles by default, so its host
       # tests have to name the host.
       - name: sshd
         run: |
+          set -o pipefail
           host=$(rustc -vV | sed -n 's/^host: //p')
-          cargo test --manifest-path userland/sshd/Cargo.toml --target "$host"
+          cargo test --manifest-path userland/sshd/Cargo.toml --target "$host" 2>&1 \
+            | tee -a /tmp/host.log
+
+      # Fifteen `cargo test` invocations in three steps, and a red is one line
+      # somewhere among them. The summary is what a reader sees before opening
+      # anything: which crate, and the first thing that failed in it.
+      - name: what failed
+        if: failure()
+        run: |
+          {
+            echo "### host tests"
+            echo ""
+            echo '```'
+            grep -E '^(=== |error(\[|:)|test .* FAILED|failures:$|    [a-z_:]+$|test result: FAILED)' \
+              /tmp/host.log | tail -40 || echo "(nothing matched; read the log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

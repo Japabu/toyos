@@ -2,7 +2,7 @@ use filepicker_api::{PickerMode, MSG_FILEPICKER_REQUEST, MSG_FILEPICKER_RESULT};
 use font::Font;
 use std::fs;
 use toyos::Connection;
-use toyos::services;
+use toyos::endow;
 use std::path::{Path, PathBuf};
 use window::{Color, Event, Framebuffer, KeyPress, MouseEvent, Window};
 
@@ -460,11 +460,16 @@ fn run_picker(mode: PickerMode, start_dir: &str, client: &Connection) {
 // --- Main daemon loop ---
 
 fn main() {
-    let listener = services::listen("filepicker").expect("filepicker: name already taken");
+    // A statement about the manifest the image was built from, not a race: the
+    // `filepicker` port exists before any process does, so an editor holding
+    // its connector can ask for a file before this program has run an
+    // instruction.
+    let acceptor = endow::acceptor("filepicker")
+        .expect("the manifest declares this program serves `filepicker`");
 
     loop {
-        let conn = services::accept(&listener).expect("accept failed");
-        let Ok(header) = conn.conn.recv_header() else {
+        let conn = acceptor.accept().expect("accept failed");
+        let Ok(header) = conn.recv_header() else {
             continue;
         };
         if header.msg_type != MSG_FILEPICKER_REQUEST {
@@ -472,7 +477,7 @@ fn main() {
         }
 
         let mut data = [0u8; 4096];
-        let n = conn.conn.recv_bytes(&header, &mut data).unwrap_or(0);
+        let n = conn.recv_bytes(&header, &mut data).unwrap_or(0);
         let mode = if n > 0 && data[0] == PickerMode::Save as u8 {
             PickerMode::Save
         } else {
@@ -484,6 +489,6 @@ fn main() {
             "/"
         };
 
-        run_picker(mode, start_dir, &conn.conn);
+        run_picker(mode, start_dir, &conn);
     }
 }
