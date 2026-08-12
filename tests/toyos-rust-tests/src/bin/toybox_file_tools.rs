@@ -26,12 +26,11 @@
 //! output of the host's own `xxd` over the same 25 bytes, pasted in, so the
 //! format is judged by something that is not this project.
 //!
-//! Every directory this test makes gets a file put in it first. An empty
-//! directory does not stat as one — `sys_readdir` answers 0 for "empty" and for
-//! "no such path" alike — so a `cp x emptydir/` would silently write a *file*
-//! named `emptydir`. That is a kernel defect, recorded in
-//! `specs/issues/kernel/empty-directory-does-not-stat.md`; it is
-//! designed around here rather than asserted, because it is not `cp`'s.
+//! Every directory this test makes is left empty, which is the harder case and
+//! until recently the broken one: `cp x emptydir/` wrote a *file* named
+//! `emptydir`, because both halves of `is_dir` read "no entries" as "no such
+//! path". Both halves are fixed and this is where the pair is judged together —
+//! `/bin/cp` asks `fs::metadata`, which asks `readdir`, which asks the kernel.
 
 use std::fs;
 use std::path::Path;
@@ -74,13 +73,9 @@ fn big() -> Vec<u8> {
 
 /// Spawn `/bin/<cmd>` with one of its two output streams on a pipe.
 ///
-/// `Command::output()` is not used and cannot be: `sys::process::toyos::output`
-/// returns `Vec::new()` for stderr unconditionally, so every refusal below
-/// would read as an empty message. `wait_with_output` is the cross-platform
-/// path and does read the pipe. One stream at a time, which keeps it off the
-/// two-pipe `read2` path — the stream that is not piped is inherited, so if a
-/// command says something unexpected it lands on the console rather than
-/// nowhere.
+/// One stream at a time rather than `Command::output()`: the stream that is
+/// not piped is inherited, so a command that says something unexpected says it
+/// on the console instead of into a buffer no assertion reads.
 fn spawn(cmd: &str, args: &[&str], errors: bool) -> std::process::Output {
     let mut command = Command::new(format!("/bin/{cmd}"));
     command.args(args);
@@ -116,12 +111,9 @@ fn must_refuse(cmd: &str, args: &[&str], needle: &str) -> String {
     stderr
 }
 
-/// A directory with something in it, which is the only kind this machine can
-/// tell from a missing one.
+/// An empty directory, which is the case `cp x d/` used to get wrong.
 fn make_dir(path: &str) {
-    fs::create_dir(path).ok();
-    fs::write(format!("{path}/occupied"), b"so that this directory stats as one\n")
-        .unwrap_or_else(|e| panic!("occupy {path}: {e}"));
+    fs::create_dir(path).unwrap_or_else(|e| panic!("mkdir {path}: {e}"));
 }
 
 /// Every sibling of `path` whose name marks it as a copy in progress.
@@ -171,7 +163,6 @@ fn cp_round_trip() {
     fs::remove_file(BIG_SRC).expect("cleanup");
     fs::remove_file(BIG_DST).expect("cleanup");
     fs::remove_file(landed).expect("cleanup");
-    fs::remove_file("/tmp/toybox_cp_dir/occupied").expect("cleanup");
 }
 
 fn cp_refusals() {
@@ -223,7 +214,6 @@ fn mv_within_a_mount() {
     println!("  PASS mv refuses a missing source before it renames anything");
 
     fs::remove_file("/tmp/toybox_mv_dir/toybox_mv_b.bin").expect("cleanup");
-    fs::remove_file("/tmp/toybox_mv_dir/occupied").expect("cleanup");
 }
 
 /// Whether `/home`'s listing holds a name. Other tests write there in the same

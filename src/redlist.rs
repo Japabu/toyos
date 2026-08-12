@@ -1022,6 +1022,33 @@ pub const KNOWN_RED: &[Red] = &[
         measured: "2026-08-07",
     },
     Red {
+        test: "screen_blocked_dump",
+        instrument: Instrument::Ci,
+        finding: Finding::fires(1, 2),
+        standing: Standing::Stands,
+        what: "`the report the keystroke painted does not carry \"== VERDICT:\"`; the decoded \
+               panel was the boot-log tail ending `[page 2/4]`, with none of the dump's three \
+               summary markers. The isolated re-run painted `0 overdue, 0 absurd, 0 unheld, 0 \
+               never ran` and passed in 6 s",
+        evidence: "PR #33 run 31472702284, job 93736011023, merge ref \
+                   1d19104d1b832da1aaad43906e0673cb87db93ba",
+        source: "specs/issues/diagnostics/blocked-dump-cannot-fire-on-a-total-freeze.md",
+        measured: "2026-08-11",
+    },
+    Red {
+        test: "screen_blocked_dump",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`the report the keystroke painted does not carry \"== VERDICT:\"`, after 520 s in \
+               the wide phase; the isolated re-run was green. This is the no-verdict shape, not \
+               the retired compositor-overlay red under the same test name",
+        evidence: "one 12-wide full suite on 2026-08-09 while a second worktree's suite was live, \
+                   then the harness's isolated re-run",
+        source: "specs/issues/diagnostics/blocked-dump-cannot-fire-on-a-total-freeze.md",
+        measured: "2026-08-09",
+    },
+    Red {
         test: "desktop_typing_damage",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(3, 7),

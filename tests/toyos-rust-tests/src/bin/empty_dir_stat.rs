@@ -5,14 +5,14 @@
 //! later call could see until something was written into it. What that cost is
 //! not `readdir` — it is every tool whose two-argument form means "into this
 //! directory", because `cp x d/` on a `d` that does not stat as a directory
-//! silently writes a *file* named `d`. `toybox_file_tools` puts a file in every
-//! directory it makes so it can test that rule at all.
+//! silently writes a *file* named `d`.
 //!
-//! Asked at the syscall boundary as well as through `std`, because the two say
-//! different things today and the difference is the point: `SYS_READDIR` now
-//! separates them, and `std`'s `is_dir` still reads a zero-length listing as
-//! "not a directory" — the half of the fix that lives in the `rust/` submodule
-//! and is recorded as owed in `specs/issues/kernel/`.
+//! Asked at the syscall boundary and again through `std`, because it took a fix
+//! at each: the kernel tells the two cases apart and `std`'s `is_dir` reads
+//! anything the kernel accepted as a directory. A machine carrying one half and
+//! not the other passes the first block below and reds in the second, which is
+//! how they are kept from drifting apart again. `toybox_file_tools` is where
+//! the pair is judged by a program rather than by assertions.
 
 use std::fs;
 
@@ -68,6 +68,20 @@ fn main() {
         "read_dir on a missing path reported {err:?}"
     );
 
+    // `stat`, which is the question `cp x d/` actually asks and the one
+    // `read_dir` above does not answer: `is_dir` decided it from the *length*
+    // of the listing, so an empty directory came back `NotFound`.
+    let empty = fs::metadata(EMPTY).expect("metadata on an empty directory must succeed");
+    assert!(empty.is_dir(), "an empty directory answered is_dir() == false");
+    assert!(!empty.is_file(), "an empty directory also answered is_file()");
+    assert!(fs::metadata(WITH_FILE).expect("metadata on an occupied directory").is_dir());
+    let err = fs::metadata(MISSING).expect_err("metadata on a missing path must fail");
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::NotFound,
+        "metadata on a missing path reported {err:?}"
+    );
+
     // A directory that has had a file removed from it is empty, not gone — the
     // state the `created_dirs` lookup exists for, reached by ordinary use
     // rather than by never writing anything.
@@ -77,6 +91,10 @@ fn main() {
         Ok(0),
         "a directory emptied by a delete must still list as a directory"
     );
+    assert!(
+        fs::metadata(WITH_FILE).expect("metadata on an emptied directory").is_dir(),
+        "a directory emptied by a delete stopped stat-ing as one"
+    );
 
-    println!("empty dir stat: empty lists as empty, missing refuses, emptied stays a directory");
+    println!("empty dir stat: empty stats as a directory, missing refuses, emptied stays one");
 }
