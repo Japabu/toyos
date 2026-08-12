@@ -2059,7 +2059,7 @@ better than a nightly job.
   depend on a filtered unit-test name that could match zero tests.
 - `cargo test --test toyos-build -- --nightly` runs them manually. It is also
   the flag `.github/workflows/ci.yml`'s `03:00 UTC` schedule takes, which
-  `specs/testing-strategy.md` §6 is the contract for.
+  `specs/testing-strategy.md` §5 is the contract for.
 - **Every run says what it held back**, by name, in the header and again above
   the result line, and the result line itself carries `N held back for the
   nightly tier` — which is the line CI's per-shard job summary extracts.

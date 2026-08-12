@@ -256,17 +256,20 @@ jobs:
       # changed: cleaning` lines in both arms of the probe.
       #
       # **`cache-writer` writes it and the twelve shards only read it.** Until
-      # 2026-08-12 `tcg` did — `specs/testing-strategy.md` §3.3 (D1) found that
-      # job carrying two unrelated roles, an emulator smoke test and this cache's
+      # 2026-08-12 `tcg` did — `specs/testing-strategy.md` §4 found that job
+      # carrying two unrelated roles, an emulator smoke test and this cache's
       # writer, and the owner's ruling sent the first to nightly and named the
       # property the second had to keep: "exactly one job per run writes the
-      # entry, it runs on every run, and it is not the nightly one" — a nightly
-      # writer would refresh this entry on a tree the pull request reading it
-      # could be several merges behind. Twelve concurrent uploads of the same
-      # content would race for one key, and none of them would benefit from a
-      # sibling anyway — the twelve start together, so the win is across runs. A
-      # cache written on `main` is the only one every branch can restore (§8.4),
-      # and a branch's own second push restores its first.
+      # entry, it runs on every run, and it is not the nightly one" —
+      # `actions/cache/save` never overwrites an existing key, so whichever
+      # job's save call reaches a key first owns it for good; a nightly writer
+      # could win that race with a tree the day's pull requests are several
+      # merges behind, and nothing afterward could write over it. Twelve
+      # concurrent uploads of the same content would race for one key, and
+      # none of them would benefit from a sibling anyway — the twelve start
+      # together, so the win is across runs. A cache written on `main` is the
+      # only one every branch can restore (§8.4), and a branch's own second
+      # push restores its first.
       - uses: actions/cache/restore@v4
         with:
           path: |
@@ -407,14 +410,14 @@ jobs:
   # It is also the arm that keeps `-cpu qemu64` alive: the shards ask for `-cpu
   # host`, so nothing else in CI boots the model the emulated path presents.
   #
-  # **Nightly and dispatch only, since 2026-08-12 — the owner's ruling (D1),**
-  # `specs/testing-strategy.md` §3.3: across its history as a required check
+  # **Nightly and dispatch only, since 2026-08-12 — the owner's ruling.**
+  # `specs/testing-strategy.md` §5: across its history as a required check
   # this job never named a tree defect, and its badge rested on "everything
   # should work under emulation and kvm" rather than on a caught one. The class
   # gets a real reader in the nightly tier instead — a whole TCG shard, not one
-  # test (§6.1) — and the pull-request required set drops from five checks to
+  # test — and the pull-request required set drops from five checks to
   # four (`landing.yml`). What this job also did on every push and pull request
-  # — write the cache the twelve shards read — did not move with it; §3.3 is
+  # — write the cache the twelve shards read — did not move with it; §4 is
   # explicit that losing that silently costs more than the badge ever bought,
   # and it would show up as a slow pull request rather than a red. It is
   # `cache-writer`, below, now.
@@ -495,8 +498,10 @@ jobs:
       # Restore only, since 2026-08-12 — `cache-writer` below is the writer now
       # (`guest`'s own restore step carries the full argument for why it is a
       # single job and not twelve). A once-nightly `tcg` would be the wrong
-      # writer for a pull request reading this cache anyway: it would refresh
-      # the entry from a tree the pull request could be several merges behind.
+      # writer for a pull request reading this cache anyway: `actions/cache/save`
+      # never overwrites an existing key, so it could only win the one save a
+      # key ever gets, permanently, with a tree the pull request is several
+      # merges behind.
       - uses: actions/cache/restore@v4
         with:
           path: |
@@ -518,26 +523,32 @@ jobs:
         run: cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats
 
   # **What `tcg` used to write, kept alive on the trigger `tcg` no longer runs
-  # on.** `specs/testing-strategy.md` §3.3 (D1) names the property this job
-  # exists to hold: "exactly one job per run writes the entry, it runs on every
-  # run, and it is not the nightly one." Losing it silently is the failure mode
-  # named there — `restore-keys` is prefixed on the toolchain tag and cannot
-  # fall back across a sysroot change, so a branch touching any of the four
-  # witness trees would find nothing and pay the cold build without a red to
-  # say so: 519 s against 282 s, measured, run `31385467644`.
+  # on.** `specs/testing-strategy.md` §4 names the property this job exists to
+  # hold: "exactly one job per run writes the entry, it runs on every run, and
+  # it is not the nightly one." Losing it silently is the failure mode named
+  # there — `restore-keys` is prefixed on the toolchain tag and cannot fall
+  # back across a sysroot change, so a branch touching any of the four witness
+  # trees would find nothing and pay the cold build without a red to say so:
+  # 519 s against 282 s, measured, run `31385467644`.
   #
   # Same build, same one fast test the old writer ran, under KVM instead of
   # TCG: nothing about *what* gets cached depends on which accelerator produced
   # it, and KVM is both faster to boot and the accelerator every reader of this
   # cache actually uses.
   #
-  # Advisory, not required — every one of the twelve shards below already
-  # builds the same tree and would fail if it were broken, so this job's only
-  # job is cache hygiene. A bare `needs: [toolchain-ready]` is enough: if the
-  # toolchain never arrived there is nothing to build and nothing to cache, and
-  # a skip says that as plainly as a guard step would.
+  # `if:` is "it is not the nightly one" written as code and not just as prose:
+  # without it the `03:00 UTC` schedule runs this job too, and `guest`'s own
+  # restore comment above is the argument for why that write must not happen.
+  #
+  # `guest-suite` needs this job now and reds if it did not succeed — a build
+  # that cannot produce what it caches is a real defect, not cache hygiene, and
+  # this job used to carry no consequence for failing at it. A bare
+  # `needs: [toolchain-ready]` is still enough: if the toolchain never arrived
+  # there is nothing to build and nothing to cache, and a skip says that as
+  # plainly as a guard step would.
   cache-writer:
     needs: [toolchain-ready]
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
@@ -754,7 +765,7 @@ jobs:
           retention-days: 7
 
   guest-suite:
-    needs: [toolchain-ready, guest, durations]
+    needs: [toolchain-ready, guest, durations, cache-writer]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -766,6 +777,7 @@ jobs:
           echo "toolchain: ${{ needs.toolchain-ready.result }}"
           echo "twelve shards: ${{ needs.guest.result }}"
           echo "fast-tier durations: ${{ needs.durations.result }}"
+          echo "cache writer: ${{ needs.cache-writer.result }}"
           if [ "${{ needs.toolchain-ready.result }}" != success ]; then
             echo "::error::the toolchain for this tree did not build, so no shard ran."
             exit 1
@@ -786,6 +798,18 @@ jobs:
               or the twelve shards did not leave a complete measurement."
             exit 1
           fi
+          # `cache-writer` is `if: github.event_name != 'schedule'`, so a
+          # nightly run reports it `skipped` by design — that is the trigger
+          # `specs/testing-strategy.md` §4 says must not write. Anything else
+          # means the write itself failed, and a cold cache for the next branch
+          # to touch a witness tree used to be invisible here.
+          if [ "${{ needs.cache-writer.result }}" != success ] \
+             && [ "${{ needs.cache-writer.result }}" != skipped ]; then
+            echo "::error::cache-writer reported ${{ needs.cache-writer.result }}. Its build is"
+            echo "::error::the same one the twelve shards run, so this is a real defect, not"
+            echo "::error::cache hygiene — see the job's own log."
+            exit 1
+          fi
 
   # **A nightly red must surface somewhere a human actually looks.** A
   # scheduled job nobody reads is worse than none, because it converts "we do
@@ -803,7 +827,7 @@ jobs:
   # naming those two here would be redundant with what it already refuses.
   nightly-red:
     needs: [tcg, guest-suite]
-    if: always() && github.event_name == 'schedule' && (needs.tcg.result != 'success' || needs.guest-suite.result != 'success')
+    if: ${{ !cancelled() && github.event_name == 'schedule' && (needs.tcg.result != 'success' || needs.guest-suite.result != 'success') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read

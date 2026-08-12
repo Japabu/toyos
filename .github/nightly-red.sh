@@ -15,8 +15,13 @@ set -eu
 : "${TITLE:?}"
 : "${BODY:?}"
 
-number=$(gh issue list --state open --limit 100 --json number,title \
-           --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+# /bin/sh has no `pipefail`, so a `gh` piped straight into `head` would let a
+# `gh` failure fall through as an empty `number` — read as "no open issue" and
+# answered by filing a duplicate. `gh issue list` runs alone below so its own
+# exit status is what `set -e` sees; only the already-captured text is piped.
+found=$(gh issue list --state open --search "in:title \"$TITLE\"" --limit 30 \
+          --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number")
+number=$(printf '%s\n' "$found" | head -1)
 
 if [ -n "$number" ]; then
   echo "updating #$number"

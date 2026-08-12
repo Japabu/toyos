@@ -12,8 +12,11 @@ name: host tests
 # long-running tests like audio + stress" (the owner), and this job runs the
 # same host suite every push already runs; nightly's value here is one more
 # data point taken at a time nothing else is queued for it, not new coverage.
-# Five minutes behind `ci.yml`'s `03:00 UTC` so the two scheduled runs are not
-# opening `nightly-red`'s standing issue at the same instant.
+# Five minutes behind `ci.yml`'s `03:00 UTC`, though that offset does not keep
+# the two scheduled runs from racing to open `nightly-red`'s standing issue —
+# each files only after its own workflow's jobs finish, which differ by whole
+# workflow durations, not five minutes. `nightly-red.sh`'s find-by-title
+# idempotency is the actual guard against a duplicate.
 on:
   push:
     branches: [main]
@@ -121,9 +124,14 @@ jobs:
   # same reason: a scheduled red must surface somewhere a human looks rather
   # than in a workflow-failure email nobody here reads. Only on `schedule` — a
   # dispatched run is somebody watching it directly.
-  nightly-red:
+  #
+  # Named `nightly-red-host` and not `nightly-red`: a job id becomes a check
+  # run name, and `ci.yml` already has a job called `nightly-red` — two jobs
+  # sharing that id across workflows would produce two check runs under one
+  # context.
+  nightly-red-host:
     needs: [host]
-    if: always() && github.event_name == 'schedule' && needs.host.result != 'success'
+    if: ${{ !cancelled() && github.event_name == 'schedule' && needs.host.result != 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
