@@ -25,6 +25,14 @@ between them. Running the suite locally as the gate is already refused by the
 owner's own decision to retire `--land`: the dev host is cross-arch TCG and
 cannot execute the class that decision was made for.
 
+**And the latency answer is not a tier answer.** 65% of the critical-path guest
+job is setup and build, two named and filed causes account for 249 s of it, and
+fixing them puts the whole fast-tier guest gate **under the `host` job's floor**
+— a pull request gating 246 guest tests would finish at the same minute as one
+gating none (§2.7). Every coverage cut still available is worth 161 s together.
+**So do the substrate work first; it is worth more than everything left to cut
+and it costs no coverage.**
+
 ---
 
 ## 1. The strategic goal
@@ -56,18 +64,23 @@ gate that can execute the class — and the classes this tree has actually been
 bitten by are overwhelmingly *not* compute-bound. The rest of this document is
 where the line goes and what it costs on each side of it.
 
-**A third goal, deliberately not adopted: minimum PR latency.** §2 measures what
-latency is made of here, and the answer is that test verdicts are **5% of the
-critical-path job**; boots and image builds are 28%, and 65% is pipeline that one
-test would pay as readily as 246. Optimising the 5% by removing the only evidence
-the tree has for most of its defect classes is the trade this document declines —
-and §8 names where the minutes actually are.
+**A third goal, and it is not in tension with either: minimum PR latency, bought
+from the substrate rather than from coverage.** §2 measures what latency is made
+of here, and the answer is that test verdicts are **5% of the critical-path
+job**; boots and image builds are 28%, and 65% is pipeline that one test would
+pay as readily as 246. Optimising the 5% by removing the only evidence the tree
+has for most of its defect classes is the trade this document declines.
+Optimising the 65% is §2.6–§2.9, it is worth more than every coverage cut
+available, and it costs nothing at all.
 
 ---
 
-## 2. What a pull request actually costs, measured
+## 2. What a pull request costs, and what the substrate could give back
 
-This is the section the owner's question turns on, so it is first.
+This is the section the owner's question turns on, so it is first. §2.1–§2.5
+decompose what a pull request pays today; §2.6–§2.9 are the CI substrate — how
+much of that is our code, how much is setup, what removing the setup is worth,
+and what does not help.
 
 ### 2.1 The runs
 
@@ -207,6 +220,155 @@ Unit-only PR CI is real and it is 2.7 minutes at today's tier. What it buys back
 is a gate that cannot execute any of the classes §3 shows this tree is actually
 bitten by, over a kernel that §4.4 measures as **99.1% guest-only**. §5 prices
 what each of those classes then costs to detect elsewhere.
+
+### 2.6 The CI substrate: the setup seconds, named
+
+**Self-hosted runners are ruled out by the owner, 2026-08-12.** Recorded here in
+one line so no future agent re-derives the proposal. Everything below is about
+making GitHub-hosted runners fast.
+
+The owner's observation is correct and the decomposition puts a number on it: a
+shard runs 16–63 s of measured test verdicts inside a 7–9 minute job. Per-step
+medians across the twelve shards of each of the three runs:
+
+| step | `31601279765` | `31495665450` | `31472065811` |
+|---|---:|---:|---:|
+| Set up job | 1 | 1 | 1 |
+| Initialize containers | 5 | 5 | 5 |
+| **`deps` — one `apt-get` for six packages** | **56** (51–132) | **56** (52–89) | **57** (52–120) |
+| `actions/checkout@v4` | 2 | 2 | 2 |
+| `the instrument` | 0 | 0 | 0 |
+| `rust` — `rustup-init` | 8 | 8 | 8 |
+| `install the toolchain` — 401 MiB | 6 | 5 | 4 |
+| `actions/cache/restore@v4` — 786 MB | 17 | 15 | 12 |
+| **setup total** | **96** | **93** | **90** |
+
+And the build inside the suite step, from shard 1's own log of `31601279765`:
+
+| what | seconds |
+|---|---:|
+| host crates recompile (`toyos-abi`, `toyos-fat32`, `bcachefs`, `toyos-ld`, `toyos-manifest`, `toyos-gpt`, `toyos-build`, `toyos-cc`) | 27 |
+| 110 C test binaries | 6 |
+| `toyos-ld` and `toyos-cc` again, at release | 14 |
+| **`external deps changed: cleaning` the four Rust test crates, then rebuilding them** | **185** |
+| cleaning and rebuilding kernel + bootloader + userland, inside the first task | ~35 |
+| **build total** | **239** (median across the twelve) |
+
+**185 of the 239 seconds are one filed defect.** The log names it exactly: the
+clean removes `396 files, 570.5MiB` from `tls-cranelift` alone, plus three more
+crates, and then rebuilds all of it — and the cause is
+`specs/issues/build/external-dep-fingerprint-is-mtime-not-content.md`,
+`external_fingerprint` keying on `toyos-ld`'s `len:mtime` when every job rebuilds
+that binary from the same sources to the same bytes. `specs/ci-plan.md` §12.5
+measured the same eight `cleaning` lines in the *warm* arm of the cache probe, so
+it is unconditional and the restored cache cannot help it.
+
+### 2.7 The levers, priced from the decomposition
+
+Critical path today, unqueued: `toolchain-ready` 12 s → slowest guest job 542 s →
+`durations` 35 s → `guest-suite` 5 s = **594 s**, against a 381 s `host` floor.
+
+| lever | critical path | runner time | what it costs |
+|---|---:|---:|---|
+| **Fix the mtime fingerprint** (already filed) | **−185 s** | −185 × 13 = **−40 min** | Nothing. It is a correctness fix that happens to be the largest latency item in CI. |
+| **A pinned prebuilt image on ghcr.io** — QEMU 11.0.3, `rustup`, the six apt packages baked in | **−64 s** (`deps` 56 + `rust` 8) | −64 × 13 = **−14 min** | A registry artifact to build and keep. `specs/ci-plan.md` §11.6 declined this at "53 s of 1,058 is 5%"; at today's 542 s job it is **11.8%**, and §2.8 is the correctness argument that is not about seconds at all. |
+| **Build the tree once and distribute it** | **+124 s** (derived) | **−41 min** | It is a *queue* lever wearing a latency lever's clothes — see below. |
+| **Slim the toolchain artifact** | −0 to −5 s | −1 min | 401 MiB already installs in 4–6 s. **Not a lever; do not spend a task on it.** |
+| **Shallower checkout** | 0 | 0 | `actions/checkout@v4` is 2 s. Nothing to win. |
+| **Slim the 786 MB cache entry** | ≤ −8 s | −2 min | It is what removes 177 crate compiles (§12.5). Slimming it risks the thing it buys. |
+
+**Build-once, in full, because it is the option that looks best and is not.**
+`needs:` serialises, so a prelude job that builds the tree and uploads it does not
+overlap the shards' setup. Today: 12 + (96 + 239 + 181.5) = 528 s to the last
+shard. With build-once: prelude (96 + 239 + ~20 upload) + shard (96 + ~20
+download + 181.5) = **652 s (derived)**. It is **124 s worse solo** and saves
+12 × 239 − 355 = 2,513 s ≈ 41 minutes of runner time per run. That trade is only
+worth taking if the queue is the binding constraint — and §2.4 measured a run
+losing ~525 s to exactly that with three pull requests in flight. **So it is a
+real option, priced honestly: it buys fleet capacity with two minutes of solo
+latency, and the fingerprint fix buys the same capacity while also making the
+solo case faster.** Do the fingerprint first; revisit this only if the queue is
+still binding afterwards.
+
+**What the two good levers add up to.** Fingerprint + pinned image:
+
+| | today | with both | full tier, with both |
+|---|---:|---:|---:|
+| guest job setup | 96 s | **32 s** | 32 s |
+| guest job build | 239 s | **54 s** | 54 s |
+| harness | 181.5 s | 181.5 s | 427.4 s |
+| guest job | 542 s | **271 s** | 517 s |
+| chain to `guest-suite` | 594 s | **323 s** | 569 s |
+| against the 381 s `host` floor | +161 s | **−58 s: free** | +188 s |
+
+**That is the finding the substrate question was worth asking for. With those two
+levers, the entire fast-tier guest gate disappears under the host job — a pull
+request gating all 246 guest tests would conclude at the same minute as one
+gating none — and even the *full* guest suite would cost 3.1 minutes rather than
+6.1.** (derived from the measured components above; both arms use the same
+measured harness times, so only setup and build are being changed.)
+
+**And it changes the tier argument.** A guest gate that is free removes *latency*
+as a reason to move anything to nightly. What survives is determinism — §5.3's
+timer-anchored flakes — and that is the owner's 2026-08-12 rule, which was never
+a latency argument in the first place. §5.4 folds this in.
+
+### 2.8 What does not help, with the arithmetic
+
+- **Fewer shards.** The critical path is the *longest* shard, so consolidating
+  raises it. Σ harness at the fast tier is 1,646.2 s: twelve shards give a
+  measured max of 181.5 s, six shards give ≥274 s even with a perfect partition,
+  and one gives 1,646 s. Six shards would be 335 + 274 = **609 s against 542 s** —
+  67 s worse — and buys six job slots. If the queue is the problem, build-once
+  buys more and costs less.
+- **More shards.** Already at the floor. 1,646.2 / 12 = 137 s per shard against a
+  largest indivisible unit of 166.7 s — the shared boot, which
+  `specs/ci-plan.md` §7.3 measured and declined to split for a different reason.
+  A thirteenth shard buys nothing.
+- **Cutting coverage further.** This is the arithmetic that should settle it. The
+  *entire* guest gate is 161 s of the pull request; the 320–340 s of per-shard
+  fixed cost and the 381 s host floor are untouched by any tier decision
+  whatsoever. So **every coverage cut that could ever be made is worth at most
+  161 s, the nightly relegation has already spent 206 s of the 367 s that was
+  available, and the two substrate levers are worth 249 s.** Substrate work is
+  worth more than everything left to cut, and it costs no coverage at all.
+- **Larger runners.** Not purchasable: `specs/ci-plan.md` §9.4 measured three
+  larger labels sitting `queued` for thirty minutes against a control that
+  finished in four seconds, because the labels do not resolve for a User-owned
+  repository. Same cause as D2.
+
+### 2.9 The vendor axis, as a finding
+
+`.github/instrument.sh` prints each job's `model name`, so the fleet's vendor mix
+is readable off any run. Across the three runs' 39 guest and `tcg` jobs:
+
+| CPU | jobs |
+|---|---:|
+| AMD EPYC 7763 | 18 |
+| AMD EPYC 9V74 | 13 |
+| INTEL XEON PLATINUM 8573C | 7 |
+| Intel Xeon 6973P-C | 1 |
+| **AMD / Intel** | **31 / 8 — 79% AMD** |
+
+**The good news is that the AMD class is gated in practice.** At 79% per job and
+thirteen jobs a run, a run drawing no AMD machine at all is about 1.5 × 10⁻⁹ —
+the `STAR[63:48]` class §3.1 assigns to KVM CI is effectively certain to be
+executed on every pull request.
+
+**The finding is the other direction.** At 21% Intel, **a run draws no Intel
+machine about 4.6% of the time** (0.79¹³, derived from the counts above) — so an
+Intel-only defect of the same shape has roughly a one-in-twenty-two chance of
+crossing a given merge unexecuted, and nothing in the tree would say so.
+`instrument.sh` reds on a QEMU version mismatch and merely *prints* the CPU;
+`guest-suite` aggregates twelve shard results and does not look at what they ran
+on.
+
+**Cheap and proposed: have `guest-suite` read the vendor lines and say, in one
+advisory sentence, which vendors this run actually drew.** Advisory and not a
+gate — a required check whose verdict is a lottery is exactly what §1's second
+clause forbids — but a run that executed one vendor is a run whose green means
+less, and today nobody can tell without opening thirteen job logs. It is also the
+only thing that would notice the fleet's mix shifting under us.
 
 ---
 
@@ -707,6 +869,25 @@ change in this document.**
 
 **Rejected as a gate; §7 keeps it as the contention instrument, which is the one
 thing it owns.**
+#### (vii) The substrate, which is not an alternative but changes every row above
+
+| | |
+|---|---|
+| **(a) latency** | **The dominant lever, and it is not a tier decision.** Fixing the mtime fingerprint and pinning a prebuilt image take the guest job from 542 s to 271 s and the chain from 594 s to 323 s — **under the 381 s host floor** (§2.7). The full tier would land at 569 s, +188 s. |
+| **(b) detection** | Improves every row, because it is what makes option (ii) affordable again. |
+| **(c) bisection** | Unchanged. |
+| **(d) flake** | Unchanged — and this is the point. Substrate work buys latency without touching what is gated, so it does not trade against determinism at all. |
+| **verdict** | **Do this first.** It is worth 249 s against the 161 s that *all* remaining coverage-cutting could ever buy (§2.8), and it costs no coverage. |
+
+**The interaction, stated plainly, because it is what the owner asked about.**
+With the substrate fixed, the fast guest gate is free and the full guest gate is
+3.1 minutes. **Latency stops being a reason to relegate anything.** Option (ii)
+— the full suite per pull request — is then rejected only on flake exposure, and
+option (iii) is chosen only for determinism. That is a better state to be in than
+today's, because it means the tier boundary is decided by one criterion instead
+of two pulling in different directions, and that one criterion is the owner's own
+real-time rule.
+
 
 ---
 
@@ -830,6 +1011,7 @@ sentences.
 | **D4** | **Is the nightly workflow this document's next task, or a separate one?** `nightly-tier-has-no-workflow` in `specs/issues/build/` is open and unassigned, and until it is built the tier is a bin (§6). This document proposes the contract; somebody has to build it. | It is a scheduling call about what gets an agent next. |
 | **D5** | **Sweep the real-time rule across the rest of the fast tier now, or wait?** `src/tiers.rs` records the sweep as pending. §5.3 says it removes exactly the three standing flakes from the merge button; it will also relegate more tests, and every one of them lands in a tier with no reader until D4 is answered. **The two are coupled and the order matters.** | A coverage trade. |
 | **D6** | **Does the class in §3.4 get an owner?** `control-regs-bench` exists and has never been run on silicon, and no automated gate can produce or refute that class. The answer is either "metal, on a cadence somebody owns" or "nothing, declared". | Metal time is his. |
+| **D7** | **Which substrate levers, in which order?** §2.7 says the mtime fingerprint (−185 s, already filed) then a pinned prebuilt image (−64 s); build-once is +124 s of solo latency for −41 min of runner time and should wait. A pinned image is also a new registry artifact, which is a dependency-bar question (`specs/issues/build/nothing-checks-the-dependency-bar.md`). | The dependency bar is his, and so is the ordering against everything else in flight. |
 
 ### What this document deliberately does not propose
 
@@ -838,9 +1020,12 @@ sentences.
   standing position (§3.7) — that selective running trades confidence for speed
   and the audit's answer is no — is unchanged, and this document agrees with it:
   the argument here is that the *guest gate stays*, not that it shrinks.
-- **No latency work.** §2.2 shows the largest single item on the critical path is
-  230 s of build in every one of thirteen jobs, with a filed cause
-  (`specs/issues/build/external-dep-fingerprint-is-mtime-not-content.md`) and a
-  measured cache underneath it (`specs/ci-plan.md` §12.5). **That is worth more minutes than every
-  tier decision in this document put together, and it costs no coverage at all.**
-  It belongs to whoever owns #188 and the build system, not here.
+- **No implementation of the substrate levers.** §2.6–§2.8 price them and D7
+  asks which and in what order; the work itself belongs to whoever owns #188 and
+  the build system. This document's claim is only that **the substrate is worth
+  more minutes than every tier decision in it put together, and costs no
+  coverage** — which is a reason to sequence it first, not a reason for a
+  strategy document to do it.
+- **No new required check.** §2.9's vendor line and §6.3's redlist obligation are
+  both advisory by construction. A required check whose verdict is a lottery, or
+  whose input is a nightly job's mood, is the thing §1's second clause forbids.
