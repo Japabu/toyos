@@ -17,6 +17,7 @@ pub mod soundfont;
 pub mod sourcegate;
 pub mod stamps;
 pub mod testargs;
+pub mod tiers;
 pub mod toolchain;
 pub mod wallpaper;
 pub mod worktree;
