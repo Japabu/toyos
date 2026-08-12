@@ -85,9 +85,14 @@ pub enum Why {
 /// One test that the fast tier does not run.
 pub struct Relegated {
     pub test: &'static str,
-    /// Milliseconds in the effective CI profile. For `audio_tone_load`, which
-    /// registers one test but emits an `(smp=1)` and `(smp=8)` label, this is the
-    /// sum of both labels; the cutoff is still applied to each label separately.
+    /// The last measurement recorded for this row, in milliseconds — for
+    /// `audio_tone_load`, which registers one test but emits an `(smp=1)` and
+    /// an `(smp=8)` label, the sum of both as last recorded. Documentation,
+    /// not a fixture: `validate_ci_profile` checks a fresh profile's tier
+    /// *placement*, never this field against it, so a nightly run refreshing
+    /// every Nightly label does not have to reproduce this number. A human
+    /// updates it by hand when a "returns to Fast" or "belongs Nightly"
+    /// finding lands a tier correction — `specs/testing-strategy.md` §5.
     pub ci_ms: u64,
     pub why: Why,
     /// **What stops being gated per pull request.** Not what the test does —
@@ -696,18 +701,10 @@ pub fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
             ));
             continue;
         }
-        // The profile loop above already refuses a marker on a Nightly row.
-        // Do not then add that sentinel to a second audio label and overflow
-        // while constructing the rest of the explanation.
+        // The profile loop above already refuses a marker on a Nightly row; do
+        // not also grade a sentinel here as if it were a fresh measurement.
         if labels.iter().any(|(_, ms)| *ms == UNMEASURED_MS) {
             continue;
-        }
-        let measured: u64 = labels.iter().map(|(_, ms)| ms).sum();
-        if row.ci_ms != measured {
-            errors.push(format!(
-                "{} records {} ms but the merged CI labels sum to {measured} ms",
-                row.test, row.ci_ms
-            ));
         }
         match row.why {
             Why::Cost if !labels.iter().any(|(_, ms)| *ms > FAST_CEILING_MS) => {
@@ -789,6 +786,38 @@ mod tests {
         ci.insert("audio_tone_load (smp=8)".to_string(), FAST_CEILING_MS - 1);
         let refusal = validate_ci_profile(&ci).unwrap_err();
         assert!(refusal.contains("audio_tone_load"), "{refusal}");
+        assert!(refusal.contains("belongs Fast"), "{refusal}");
+    }
+
+    /// §5: "Nightly measurements refresh the recorded Nightly costs; they are
+    /// validated against the tier rule, never against equality with a past
+    /// measurement." A fresh nightly run never reproduces every `ci_ms` to the
+    /// millisecond — this drifts every Cost row's numbers, keeping each safely
+    /// over the ceiling — and the profile must still validate: `ci_ms` is
+    /// last-measured documentation, not a fixture the merge checks against.
+    #[test]
+    fn a_nightly_measurement_drifts_ci_ms_and_still_validates() {
+        let mut ci = committed_profile();
+        let cost_names: BTreeSet<&str> =
+            RELEGATED.iter().filter(|r| r.why == Why::Cost).map(|r| r.test).collect();
+        for (label, ms) in ci.iter_mut() {
+            if cost_names.contains(canonical_profile_name(label.as_str())) {
+                *ms += 12_345;
+            }
+        }
+        assert!(validate_ci_profile(&ci).is_ok());
+    }
+
+    /// The other half of the same bidirectional rule: drifted numbers do not
+    /// launder a Cost row that a fresh measurement puts at or under the
+    /// ceiling. That is a real tier-placement finding ("returns to Fast"),
+    /// never masked by ci_ms no longer being checked for equality.
+    #[test]
+    fn a_cost_row_at_the_ceiling_still_reds_despite_drifted_ci_ms() {
+        let mut ci = committed_profile();
+        ci.insert("desktop_window_child".to_string(), FAST_CEILING_MS);
+        let refusal = validate_ci_profile(&ci).unwrap_err();
+        assert!(refusal.contains("desktop_window_child"), "{refusal}");
         assert!(refusal.contains("belongs Fast"), "{refusal}");
     }
 
