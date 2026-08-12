@@ -799,6 +799,42 @@ pub const KNOWN_RED: &[Red] = &[
         source: "specs/issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-10",
     },
+    // ---------------------------------------------------------------------
+    // The endpoint-count shape, seen on two PR branches rather than on `main`.
+    // Neither branch's diff touches the test or the xHCI driver, so this is
+    // the same defect the row above measures, on a denominator that row's
+    // "fifteen most recent `main` runs" does not cover — hence `Seen`, not a
+    // bump to that row's rate.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "xhci_hid_break",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`3 endpoint(s) were found Running after the break, want 2` — the wide run's message. \
+               The harness's re-run-alone failed too, but on a *different* assertion, the \
+               `input never came back` shape `parallel-tests-red-under-other-suites.md` records on \
+               the dev host — its first appearance on CI. `ALONE xhci_hid_break: red again` quoted \
+               the wide run's message regardless, because that line always carries the original text",
+        evidence: "PR #22 (`wt/toyos-endow`), run 31424496450 attempt 1, job 93586744461 \
+                   (\"guest (5)\"), sha 73d0761b",
+        source: "specs/issues/hardware/xhci-hid-break-counts-any-endpoint-3.md",
+        measured: "2026-08-10",
+    },
+    Red {
+        test: "xhci_hid_break",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`3 endpoint(s) were found Running after the break, want 2`, byte-identical between \
+               the wide run (51s) and the alone re-run (9s) — the first occurrence where isolation \
+               reproduces this exact assertion rather than going green or landing on the other \
+               shape. 9s alone rules out host contention for this instance",
+        evidence: "PR #35 (`codex/debug-wait-census`), run 31601325987, job 94129283847 \
+                   (\"guest (5)\"), sha d522424e",
+        source: "specs/issues/hardware/xhci-hid-break-counts-any-endpoint-3.md",
+        measured: "2026-08-12",
+    },
     Red {
         test: "metal_sim_pointer_churn",
         instrument: Instrument::Ci,
