@@ -248,6 +248,11 @@ impl Shard {
         record: &LogRecord,
         _guard: &crate::arch::LogCommitGuard,
     ) {
+        debug_assert!(
+            self.head().saturating_sub(seq) < SHARD_RECORDS as u64,
+            "reservation {seq} was lapped inside its publication bracket: an IF-ignoring path emitted a whole shard generation before this commit"
+        );
+
         let slot = &self.slots[(seq % SHARD_RECORDS as u64) as usize];
 
         // **Two stores publish, not one, and the first is what makes the

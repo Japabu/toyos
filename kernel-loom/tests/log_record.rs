@@ -12,6 +12,8 @@
 //!
 //! `specs/log-architecture-spec.md` §2.5, obligations W1, W2 and W4.
 
+#![cfg(feature = "loom")]
+
 use kernel_loom::log_shard::{Shard, FIRST_SEQ, SHARD_RECORDS};
 use loom::sync::Arc;
 use toyos_abi::log::{LogRecord, MAX_RECORD_MESSAGE};
