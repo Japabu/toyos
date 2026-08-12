@@ -2022,6 +2022,16 @@ it down" half. It is the record the owner reads to decide whether the interim is
 acceptable, so it names every test by what the tree loses while that test is not
 gated per pull request — not by what the test does.
 
+**The owner ruled again on 2026-08-12, after `audio_tone` crossed the line in
+CI**: the ceiling is hard, with deliberately no margin or hysteresis band — a
+measured crossing reds `durations` however close. And the tier boundary is not
+about a test's current price: a test whose verdict or duration is anchored to
+real time — it plays or records in real time, waits out a staged latency
+window, or measures a rate, such that a 2x slower machine would change its
+verdict or price — belongs Nightly; only a compute-bound verdict stays Fast.
+The full sweep applying this to the rest of the fast tier is pending as its own
+change.
+
 **This changed no assertion and optimised nothing.** §3.7 is the audit's
 standing position that selective test running is the owner's call and that the
 audit's own answer is no; this is the owner overriding that for a stated
@@ -2081,9 +2091,15 @@ Nightly registrations account for **4,083.8 s, 92.1%** of the effective profile.
 
 The cutoff is per emitted execution label. `audio_tone_load (smp=1)` measured
 40.524 s and `(smp=8)` 11.121 s, so the one registration is Nightly; ordinary
-`audio_tone` measured 8.156 s and 8.504 s and remains Fast. Shared machine boots
-close upward after that per-name decision: four cheap metal-sim members ride
-`metal_sim_compositor`, and two cheap trace readers ride `i8042_keyboard`.
+`audio_tone` measured 8.156 s and 8.504 s and remained Fast on this profile.
+Shared machine boots close upward after that per-name decision: four cheap
+metal-sim members ride `metal_sim_compositor`, and two cheap trace readers ride
+`i8042_keyboard`.
+
+**2026-08-12: `audio_tone` crossed too.** CI run `31601279765` measured
+`(smp=1)` at 10,790 ms and `(smp=8)` at 11,144 ms, both over the line; it
+gained a `Why::Cost` row (`ci_ms: 21,934`, the sum of both labels) and joined
+`audio_tone_load` in the nightly tier — §7.3 names what the fast path lost.
 
 Dev-host TCG timings remain useful optimisation evidence, but not tier policy.
 They answer a different machine and disagreed in both directions. The concrete
@@ -2163,6 +2179,7 @@ this is the index and the reason each one is worth a reader's attention.
 | `blocked_dump` | 33.140 s | A complete 8/8 compositor dump with consistent deadline/task census and final verdict. |
 | `metal_sim_input` | 32.603 s | The T14-shaped, no-virtio-input machine reaching the shipped input stack. |
 | `dump_nmi_probe` | 24.625 s | Non-responding CPUs probed by NMI with their RIPs symbolised. |
+| `audio_tone` | 21.934 s | The real-time glitch check per config, unloaded: dropouts, wake-lateness and underrun ceilings, confirmed on a second boot. |
 | `toybox_cp_volume` | 18.735 s | The real `/bin/cp` against FAT32, including filling the volume. |
 | `iommu_discovery` | 17.594 s | Capability-by-capability remapping-unit discovery across four machine shapes. |
 | `usb_storage_gate` | 17.558 s | Raw USB reads/writes, host byte verification, unstamped-disk interlock, and one-stick bind. |
@@ -2192,11 +2209,12 @@ back in Fast.
 
 ### 7.4 What was deliberately not touched
 
-- **The audio assertions and the thorough rate gate.** Ordinary `audio_tone`
-  remains Fast on both SMP configurations. Loaded audio's two configurations
-  are now Nightly because each CI label crosses the line; no wake, cadence,
-  capture, or continuity assertion changed. `--audio-gate` remains the separate
-  repeated-distribution tier used for scheduler stage transitions.
+- **The audio assertions and the thorough rate gate.** Both audio
+  registrations are now Nightly — `audio_tone_load` because each CI label
+  crossed the line on 2026-08-11, `audio_tone` for the same reason on
+  2026-08-12 (§7.2) — and no wake, cadence, capture, or continuity assertion
+  changed for either. `--audio-gate` remains the separate repeated-distribution
+  tier used for scheduler stage transitions.
 - **`EXPECTED_FAILURES`.** Both standing entries survive unchanged.
   `desktop_window_child` being relegated does not touch its exemption, and
   because that entry is `Stale::OnThisDate` rather than `Stale::OnAPass`, it

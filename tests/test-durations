@@ -125,8 +125,8 @@ abuse_spawn_argv 13
 abuse_tls_alloc 14
 allocator_stress 771
 audio_idle_suspend 1066
-audio_tone (smp=1) 8156
-audio_tone (smp=8) 8504
+audio_tone (smp=1) 10790
+audio_tone (smp=8) 11144
 audio_tone_load (smp=1) 40524
 audio_tone_load (smp=8) 11121
 blocked_dump 33140

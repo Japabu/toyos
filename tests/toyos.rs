@@ -283,7 +283,7 @@ const RUST_SKIP: &[&str] = &[
 // asserts on the wav the virtio-sound device captured, so they are excluded
 // from the shared multi-test boot.
 const AUDIO_TESTS: &[(&str, Tier)] =
-    &[("audio_tone", Tier::Fast), ("audio_tone_load", Tier::Nightly)];
+    &[("audio_tone", Tier::Nightly), ("audio_tone_load", Tier::Nightly)];
 
 // Scheduler-core gate A covers both SMP configs: smp=1 is the audio spec's
 // first-class single-CPU case, smp=8 the full-SMP case.

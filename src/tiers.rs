@@ -9,13 +9,13 @@
 //! and a future scheduled job must include, and `tests/toyos.rs` writes
 //! [`Tier::Nightly`] against each of those names in its own registration.
 //!
-//! **This is interim and it is a loss.** Fifty-four registered tests have a CI
-//! execution over the line (loaded audio has two measured SMP labels), and six
-//! more ride a shared boot with one that is. Between them they account for
-//! 4,083.8 s of the effective 4,433.8 s CI profile, and none is gated per pull
-//! request. `guards` on every row says what stopped being gated, because a run
-//! that quietly does less is the whole failure mode here —
-//! `specs/test-cost-audit.md` §7 is the long form.
+//! **This is interim and it is a loss.** Fifty-five registered tests have a CI
+//! execution over the line (loaded audio and ordinary `audio_tone` each have two
+//! measured SMP labels), and six more ride a shared boot with one that is.
+//! Between them they account for 4,105.7 s of the effective 4,439.1 s CI
+//! profile, and none is gated per pull request. `guards` on every row says what
+//! stopped being gated, because a run that quietly does less is the whole
+//! failure mode here — `specs/test-cost-audit.md` §7 is the long form.
 //!
 //! **Nothing here is an optimisation and nothing here changes an assertion.**
 //! A relegated test measures exactly what it measured; the manual nightly
@@ -35,6 +35,15 @@ use std::collections::{BTreeMap, BTreeSet};
 ///
 /// Policy, and the owner's. A test at exactly the line is fast: the rule he
 /// stated is "ten seconds or less".
+///
+/// **2026-08-12: the line is hard, and there is deliberately no margin or
+/// hysteresis band** — a measured crossing reds `durations`, however close.
+/// Same date, the tier boundary: a test whose verdict or duration is anchored
+/// to real time — it plays or records in real time, waits out a staged latency
+/// window, or measures a rate, such that a 2x slower machine would change its
+/// verdict or price — belongs Nightly; only a compute-bound verdict stays Fast.
+/// The full sweep applying this to the rest of the fast tier is pending as its
+/// own change.
 pub const FAST_CEILING_MS: u64 = 10_000;
 
 /// A committed profile row that exists only to put a new registration into one
@@ -591,6 +600,16 @@ pub const RELEGATED: &[Relegated] = &[
         guards: "Paced PS/2 mouse packets preserve button and displacement state through the \
                  merged input path. It reuses the initialized controller trace boot and \
                  cannot be selected independently without paying that boot again.",
+    },
+    Relegated {
+        test: "audio_tone",
+        ci_ms: 21_934,
+        why: Why::Cost,
+        guards: "The real-time audio pipeline glitch check per config: the tone captured on \
+                 one and eight CPUs is checked for dropouts against per-run wake-lateness and \
+                 underrun ceilings, with a harm verdict confirmed by a second boot before it \
+                 fails. `audio_tone_load` runs the same check with two busy-spin burners \
+                 added and was already Nightly.",
     },
 ];
 
