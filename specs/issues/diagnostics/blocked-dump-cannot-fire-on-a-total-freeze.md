@@ -109,13 +109,23 @@ summary off the page — was wrong: userland repaints over the report, and the
 failing string is the one that sat under the window rather than beside or below
 it. That is what `panic_console::hold_report` answers.
 
-**A second red shape, one occurrence: the report painted but carried no
-`== VERDICT:` line at all** (2026-08-09, 12-wide, 520 s, host carrying a second
-worktree's suite; `ALONE: GREEN`). The recorded mechanism does not cover it —
-that one names a string the window covered, and the verdict is the report's
-*last* line rather than one the desktop sits on top of. `dump-deaf-cpu` is ruled
-out despite landing on `sched/dump.rs` hours earlier: `deaf_window` is
+**A second red shape, now seen on two instruments: the panel carries no
+`== VERDICT:` line at all.** The first occurrence was 2026-08-09: 12-wide,
+520 s, the dev host carrying a second worktree's suite, then `ALONE: GREEN`.
+The second is PR #33's KVM run `31472702284`, job `93736011023`, on merge ref
+`1d19104d1b832da1aaad43906e0673cb87db93ba` (head
+`ffbb17ab4d53a7b7fb9560be0cb68a4531434a3b`). Its first 70 s run decoded the
+boot-log tail ending `[page 2/4]`, with none of `== deadlines:`,
+`cpu(s) answered` or `== VERDICT:`. The harness's isolated re-run passed in
+6 s and painted `== VERDICT: 0 overdue, 0 absurd, 0 unheld, 0 never ran`.
+The CI job ran one guest at a time, so its initial and isolated executions are a
+CI rate of one in two; the earlier loaded-dev-host occurrence is evidence on a
+different instrument and is not folded into that rate.
+
+The recorded repaint mechanism does not cover this shape — that one names a
+string the window covered, while this panel is a paginated boot-log tail rather
+than a dump missing only its last line. `dump-deaf-cpu` is ruled out despite
+landing on `sched/dump.rs` hours before the first occurrence: `deaf_window` is
 `#[cfg(feature = "dump-deaf-cpu")]`, only `dump_nmi_probe` asks for that feature
 (`tests/common/faults.rs:321`), and `screen_blocked_dump` boots a kernel that
-does not contain the function. One occurrence is not a shape; what it is worth
-is the next reader not filing it as the repaint above.
+does not contain the function.

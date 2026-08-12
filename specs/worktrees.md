@@ -269,6 +269,57 @@ landed. It asks `git diff main...HEAD` against the merge base now, plus
 `toyos-abi/src` that no diff against a commit could see. Gate:
 `a_checkout_behind_main_has_no_standing_to_claim`.
 
+### 3.3 A std edit is made in the primary's `rust/`, and it needs no claim
+
+**Where it has to live.** A linked worktree's `rust/` is the stub §2 leaves and
+`toolchain::rust_dir` sends every read to the primary's, so *the*
+`rust/library` on this host is one directory and editing the std fork edits it
+for every checkout at once. There is nowhere else to put the edit and no way to
+hold it privately.
+
+**What that does and does not cost.** It does not cost a claim.
+`build/toyos-std-fork-witness` is a hash of `rust/library` kept apart from the
+other three witnessed trees, and a worktree finding only *that* stale rebuilds
+std rather than being refused (`src/toolchain.rs`, `std_fork_stale`) — because a
+rebuild out of the shared `rust/` produces the sysroot every checkout wants and
+takes nothing from any of them, where a `toyos-abi` claim refuses all of them
+until it lands. Observed 2026-08-11 landing the task #114 std fixes from
+`wt/toyos-std`: `The std fork under … has changed since the sysroot was built.
+Rebuilding std.`, one rebuild, no claim, no other worktree refused. What it does
+cost is that the next build in *every* worktree links against an edit that has
+not landed yet, so a std change is landed promptly for the same reason an ABI
+change is.
+
+Before 2026-08-10 the witness did not cover `rust/library` at all: the worktree
+compiled against the std already on disk and the symptom was the compiler
+refusing a method the source plainly has. A brief written before that date says
+a std edit needs `--claim-sysroot`. It does not.
+
+**Type-checking one without touching the sysroot at all** is still worth having
+while iterating, because the rebuild above is minutes and this is seconds.
+`~/.rustup/toolchains/toyos/lib/rustlib/src/rust` is a symlink to the primary's
+`rust/`, so `-Zbuild-std` compiles the working tree rather than a copy of it,
+and it writes only into a target directory you name. `cargo` is not in the
+toyos toolchain — rustup falls back to the default one's, which is fine, the
+`rustc` is what matters:
+
+    __CARGO_TESTS_ONLY_SRC_ROOT=<src> CARGO_TARGET_DIR=<scratch> \
+      cargo +toyos build -Z build-std=std,panic_abort \
+      --target x86_64-unknown-toyos --offline
+
+`<src>` needs a `library/` and a root `Cargo.toml` whose workspace names
+`library/std` — the real `rust/Cargo.toml` does not, its workspace is the
+compiler's and `library/` has its own. Pointing `<src>` at an APFS clone of
+`rust/library` (`cp -Rc`, 59 MiB, instant) under a directory holding symlinks to
+`toyos-abi` and `toyos` — std names them `../../../toyos-abi` — gives a tree
+that can be edited while the primary stays clean and no other worktree's build
+sees anything. Measured 2026-08-08: 15 s cold, 2.5 s per std edit after.
+
+Two things it does not tell you. Cargo does not re-fingerprint std on a source
+change under `-Zbuild-std`, so delete `<scratch>/<target>/debug/.fingerprint/std-*`
+between runs or you will read a stale green. And it is a compile, not a boot:
+whether the guest behaves differently still needs the sysroot.
+
 ## 4. Two lock scopes
 
 `buildlock::Scope` is named at every `act_if`, because the two are not
