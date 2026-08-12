@@ -1890,11 +1890,19 @@ minutes).** Those are two different statements about one change, and the second
 is the one that keeps somebody else's pull request out of the queue §5 measured.
 `tcg`'s own build went 534 s to 302 s inside it.
 
-**Two things left open, honestly.** The probe's two arms drew different runner
+**One thing left open, honestly.** The probe's two arms drew different runner
 CPUs — an EPYC 7763 cold and an EPYC 9V74 warm — so some part of its 237 s is
 the machine rather than the cache; the compile counts are the part that is not,
 and the shard A/B above has no such confound because both attempts are the same
-matrix on the same day. And the 8 cleans in the warm arm are
-`external_fingerprint` keying on the *mtime* of a `toyos-ld` binary that every
-job rebuilds, which is a further win still on the table with its own entry
-(`specs/issues/build/external-dep-fingerprint-is-mtime-not-content.md`).
+matrix on the same day.
+
+The 8 cleans in the warm arm were `external_fingerprint` keying on the *mtime*
+of a `toyos-ld` binary that every job rebuilds — fixed by hashing its content
+instead, so a relink to identical bytes is no longer read as a changed external
+dependency. Measured on pull request #37, this branch's own two CI runs: the
+transitional run (still reading a cache written under the old `len:mtime`
+stamp) held at a 183.4 s mean shard build gap and 8 cleans; the following run,
+reading the cache `tcg` re-saved with the new content-hashed stamp, dropped to
+a 27.5 s mean and 1 harmless clean (`tests/toyos-rust-tests` itself, 0 files —
+its own target dir sits outside the `tests/toyos-rust-tests/*/target` cache
+glob, a separate and free-standing gap).
