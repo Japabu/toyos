@@ -1403,10 +1403,16 @@ impl Registry {
                 }
             }
         }
-        // `AUDIO_TESTS`, one line of bare string literals.
-        if let Some(line) = harness.lines().find(|l| l.starts_with("const AUDIO_TESTS")) {
-            for piece in line.split('"').skip(1).step_by(2) {
-                tests.insert(piece.to_string());
+        // `AUDIO_TESTS`, whose tuples carry the same explicit Tier as the
+        // machine and screen registries. Read the value block rather than a
+        // line: formatting it across lines must not make known-red rows stale.
+        if let Some(at) = harness.find("const AUDIO_TESTS:") {
+            let block = &harness[at..];
+            let end = block.find("];").unwrap_or(block.len());
+            for tuple in block[..end].split("(\"").skip(1) {
+                if let Some(name) = tuple.split('"').next() {
+                    tests.insert(name.to_string());
+                }
             }
         }
         // The shared boot's binaries are discovered from what is built, and the
@@ -1556,7 +1562,13 @@ mod tests {
     #[test]
     fn the_registry_is_read_out_of_the_harness_and_is_not_empty() {
         let r = registry();
-        for name in ["desktop_window_child", "hda_tone", "screen_pager_keys", "audio_tone_load"] {
+        for name in [
+            "desktop_window_child",
+            "hda_tone",
+            "screen_pager_keys",
+            "audio_tone",
+            "audio_tone_load",
+        ] {
             assert!(r.tests.contains(name), "the test-name scan missed `{name}`");
         }
         for name in ["std_unwind", "fpu_isolation"] {

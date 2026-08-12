@@ -1567,11 +1567,24 @@ this task did not have.
 The `durations` job is what stops the profile rotting again: it runs
 `--merge-durations` over the twelve artifacts on every
 `ci` run and puts the spread, the even split and **the names no entry priced**
-into the job summary with the command to update. Advisory by construction — a
-slow partition is not a wrong verdict, and a pull request that adds a test must
-not be red for the profile not knowing it yet. One thing in it is a gate and
-always was: `--merge-durations` refuses a name two shards both measured, which is
-§4's partition defect that a concatenation cannot see.
+into the job summary. Since the 2026-08-11 fast/nightly split it is also the
+instrument for a required policy: every Fast execution must take at most ten
+seconds in CI. The merge command itself invokes the production tier validator;
+a Fast label over the line, a Cost row now at/below it, or missing current
+evidence for a declared Cost row reds. `guest-suite` requires `durations`, so
+this verdict reaches the protected check rather than sitting beside it as
+advice or relying on a filtered unit test that could run zero tests.
+
+Fast shards intentionally omit Nightly work. The merge therefore retains an old
+label only when its canonical registration is in `RELEGATED` — including
+audio's `(smp=N)` labels — and replaces it when a run did measure it. It does not
+permit an absent Fast label: a complete shard set missing one is refused. A new
+registration first uses `specs/test-cost-audit.md` §7.2's disposable
+measurement commit, then lands only
+with the measured profile row and the tier that row earns; adding it without a
+starting price is a red declaration error. `--merge-durations` refuses any
+duplicate label, including two copies from the same shard, as a partition or
+registration defect.
 
 `--merge-durations` also moved above `check_prerequisites`, beside `--pr` and
 `--abi-split-check`. It reads twelve files and writes one, it needed a QEMU on
@@ -1808,8 +1821,11 @@ of `gate-a.yml`, which is the state §12.1 repairs, the gate reds naming `gate`.
   answer — `test-durations.shard-<i>-of-<n>` — and it is read now: one `n` across
   the set, every `i` in `1..=n`, each exactly once. `ci.yml`'s `durations` job
   counts the files before it runs the command and reports a short set instead of
-  merging it, because that job is advisory and a cancelled shard has already
-  reddened `guest`.
+  merging it. A short or empty artifact set is tolerated only when `guest` is
+  already non-success, so it does not add a second diagnosis to a cancelled or
+  red matrix. If `guest` says success, missing duration evidence is itself red;
+  `guest-suite` consumes both results and cannot report green without the whole
+  partition and the ten-second tier gate.
 
 ### 12.5 Thirteen machines build the same tree, and now twelve of them do not
 

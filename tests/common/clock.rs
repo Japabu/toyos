@@ -31,6 +31,7 @@ use std::time::{Duration, Instant, SystemTime};
 pub struct Mark {
     wall: SystemTime,
     mono: Instant,
+    artifact_build: toyos_build::build::ArtifactBuildMark,
 }
 
 /// Below this, the pair is drifting rather than jumping.
@@ -58,14 +59,23 @@ pub fn stage_suspend(how_long: Duration) {
 
 pub fn mark() -> Mark {
     let staged = Duration::from_millis(STAGED.load(Ordering::SeqCst));
-    Mark { wall: SystemTime::now() + staged, mono: Instant::now() }
+    Mark {
+        wall: SystemTime::now() + staged,
+        mono: Instant::now(),
+        artifact_build: toyos_build::build::mark_artifact_build_time(),
+    }
 }
 
 impl Mark {
-    /// Monotonic time since this mark: the duration a test actually took, with
-    /// any suspend in the middle already excluded because the clock stopped too.
+    /// Monotonic execution time since this mark.
+    ///
+    /// Suspend is already excluded because the monotonic clock stops with the
+    /// host. Construction of a memoized boot artifact is excluded explicitly:
+    /// it is a cold-cache cost shared by the shard, not the repeatable cost of
+    /// whichever test happened to request that kernel or initrd first. Fresh
+    /// per-boot image creation and the boot itself remain in this duration.
     pub fn elapsed(&self) -> Duration {
-        self.mono.elapsed()
+        self.artifact_build.execution_part(self.mono.elapsed())
     }
 
     /// How long the host was stopped between this mark and now.

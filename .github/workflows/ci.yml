@@ -278,11 +278,20 @@ jobs:
       # guest on the machine. It costs nothing, because a shard is a whole
       # machine and this repository is public — twenty jobs may run at once and
       # the minutes are unmetered.
+      #
+      # A manually dispatched workflow is the KVM instrument for the whole
+      # tier set. Pull requests and main stay Fast; `workflow_dispatch` adds
+      # `--nightly` so a withheld label can be refreshed without temporarily
+      # putting it back into every pull request. This is deliberately manual,
+      # not the still-open scheduled Nightly gate.
       - name: suite
+        env:
+          SUITE_TIER_ARGS: ${{ github.event_name == 'workflow_dispatch' && '--nightly' || '' }}
         run: |
           set -o pipefail
           cargo test --test toyos-build -- \
-            --shard ${{ matrix.shard }}/12 --jobs 1 --host-slots 0 2>&1 \
+            --shard ${{ matrix.shard }}/12 --jobs 1 --host-slots 0 \
+            $SUITE_TIER_ARGS 2>&1 \
             | tee /tmp/suite.log
 
       # **`--land` wrote "gate ok" or "gate ok, NOT clean" into the landing
@@ -513,14 +522,14 @@ jobs:
   # **143.1 s of critical path, on every merge**, now that `guest-suite` is
   # required.
   #
-  # It goes stale silently because a test added without a profile entry is
-  # silent, and stays silent until somebody reads two shard timings side by side.
-  # So the run that produces the measurement reports on it. Advisory by
-  # construction — a slow partition is not a wrong verdict, and a pull request
-  # that adds a test cannot be red for the profile not knowing it yet — with one
-  # thing in it that *is* a gate: `--merge-durations` refuses a name two shards
-  # both measured, which is §4's partition defect and a concatenation cannot see
-  # it.
+  # It used to go stale silently when a test had no profile entry. Registration
+  # and whole-run merge checks now refuse that absence, and the run that
+  # produces the measurement gates the policy it is the
+  # instrument for: every test selected for fast CI must finish in at most ten
+  # seconds. `guest-suite` consumes this job's result, so a green merge button
+  # cannot ignore a profile which disproves the tier declaration. The merge also
+  # refuses any duplicate execution label, which catches §4's cross-shard
+  # partition defect and same-shard duplicate registrations.
   durations:
     needs: [guest]
     if: always()
@@ -546,21 +555,21 @@ jobs:
           merge-multiple: false
 
       # **A run whose shards never finished measured nothing, and that is not a
-      # finding about the profile.** `--merge-durations` refuses an empty
-      # directory by name — right for the human typing it, wrong here, where a
-      # cancelled or gated-off run would red a job that has nothing to say. Run
-      # `31376796572` is the instance: `toolchain-ready` was green, the twelve
-      # shards were cancelled by the next push, and this job failed on
-      # `no test-durations.shard-*`.
+      # second finding when `guest` is already red.** `--merge-durations`
+      # refuses an empty directory by name; here a cancelled or gated-off run
+      # reports that fact and lets the required aggregate carry `guest`'s red.
+      # But a *green* guest job with no measurement is a false green in the
+      # ten-second gate, so that combination is refused below.
       # **A run whose shards did not all finish is not a partition of anything,
       # and `--merge-durations` refuses one.** Right for the human typing it —
       # it writes the committed profile, and eleven files of twelve write one
       # missing a twelfth of the suite, which every later run then prices at the
-      # longest it knows. Wrong here, where this job is advisory and a shard
-      # cancelled at its timeout has already reddened `guest`. So the count is
-      # checked before the command is run, and a short set is reported rather
-      # than merged. The refusal that stays a refusal is the other one: a name
-      # two shards both measured, which is §4's defect.
+      # longest it knows. Wrong here, where a shard cancelled at its timeout has
+      # already reddened required `guest`; inventing a second profile finding
+      # would obscure that cause. So the count is checked before the command is
+      # run, and a short set is reported rather than merged. The refusals that
+      # stay refusals are duplicate execution labels and disagreement between
+      # the merged profile and the tier policy.
       - name: what the partition cost
         run: |
           set -o pipefail
@@ -568,6 +577,11 @@ jobs:
             echo "no shard left a measurement: ${{ needs.guest.result }}"
             echo "- no shard measured anything (\`guest\`: ${{ needs.guest.result }})" \
               >> "$GITHUB_STEP_SUMMARY"
+            if [ "${{ needs.guest.result }}" = success ]; then
+              echo "::error::guest passed without leaving the duration evidence its fast-tier \
+                verdict requires."
+              exit 1
+            fi
             exit 0
           fi
           have=$(ls /tmp/durations/*/test-durations.shard-* | wc -l | tr -d ' ')
@@ -577,6 +591,11 @@ jobs:
             echo "- $have of $want shards left a measurement (\`guest\`: \
               ${{ needs.guest.result }}), so this run measured no whole partition and \
               \`tests/test-durations\` was not touched." >> "$GITHUB_STEP_SUMMARY"
+            if [ "${{ needs.guest.result }}" = success ]; then
+              echo "::error::guest passed without a complete duration partition for the \
+                fast-tier verdict."
+              exit 1
+            fi
             exit 0
           fi
           cargo run -- --merge-durations /tmp/durations 2>&1 | tee /tmp/merged.log
@@ -594,13 +613,14 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: test-durations-merged
           path: tests/test-durations
           retention-days: 7
 
   guest-suite:
-    needs: [toolchain-ready, guest]
+    needs: [toolchain-ready, guest, durations]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -611,6 +631,7 @@ jobs:
         run: |
           echo "toolchain: ${{ needs.toolchain-ready.result }}"
           echo "twelve shards: ${{ needs.guest.result }}"
+          echo "fast-tier durations: ${{ needs.durations.result }}"
           if [ "${{ needs.toolchain-ready.result }}" != success ]; then
             echo "::error::the toolchain for this tree did not build, so no shard ran."
             exit 1
@@ -623,5 +644,11 @@ jobs:
             echo "::error::a guest shard reported ${{ needs.guest.result }}. The run summary"
             echo "::error::names the shard, the test and whether it survived being re-run"
             echo "::error::alone; specs/ci-plan.md §9.2 is the rate to read that against."
+            exit 1
+          fi
+          if [ "${{ needs.durations.result }}" != success ]; then
+            echo "::error::the merged duration profile reported \
+              ${{ needs.durations.result }}. Fast CI may contain a test over ten seconds, \
+              or the twelve shards did not leave a complete measurement."
             exit 1
           fi
