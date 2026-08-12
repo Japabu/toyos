@@ -7,9 +7,9 @@ opened: 2026-08-08
 # There is no cyclictest, so nobody can ask this machine what its wake latency is
 
 `grep -rni cyclictest` over the tree returns 12 hits, all in two spec files and
-none in code: `specs/metal-boot-plan.md:350-351` ("A real cyclictest-equivalent
+none in code: `specs/plans/metal-boot-plan.md:350-351` ("A real cyclictest-equivalent
 for ToyOS should exist before the first metal boot — it is the instrument that
-turns the boot into a measurement") and `specs/production-audio-baselines.md:343-347`
+turns the boot into a measurement") and `specs/reference/production-audio-baselines.md:343-347`
 and `:667-670`, which state the design — an RT-priority thread that arms an
 absolute timer, sleeps, and histograms `actual − programmed` at 1 µs resolution —
 and the consequence: "Until such a tool exists, **no honest 2x claim can be made

@@ -24,7 +24,7 @@ true.** The original wording said the damaging cases were all covered by
 "a revisited cluster reads as free" — it needs the walk to *revisit*, and
 `truncate_chain` writes an end-of-chain marker at the cluster it is keeping,
 which is an exit the walk takes instead. The audit
-(`specs/type-safety-audit/storage-stack.md` F3) demonstrated `set_len`
+(`specs/assessments/type-safety-audit/storage-stack.md` F3) demonstrated `set_len`
 returning `Ok(())` having freed every cluster the truncated file still needed,
 with the directory entry still naming the first of them. A residual that
 overstates what is detected is worse than one that admits the gap, because

@@ -23,5 +23,5 @@ byte buffer to sample a running daemon twice.
 
 That is now a *policy* gap rather than an ABI one, and it has an obvious shape:
 init serves a diagnostic port that answers a program name with a `Process`
-handle narrowed to `Rights::READ`. `specs/introspection-plan.md` is where that
+handle narrowed to `Rights::READ`. `specs/plans/introspection-plan.md` is where that
 belongs; nothing in the kernel has to change for it.

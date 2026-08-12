@@ -72,7 +72,7 @@ Do not substitute "the storage tests pass".
 |---|---|
 | **Run** | `git grep -n "raw_block_write\|write_block\|NvmeBlockDevice" -- kernel/src` and enumerate every caller. For each, establish it is downstream of `probe`. |
 | **Expect** | Every writer is reached only via a `Storage` returned by `probe`. |
-| **False pass** | An enumeration that covered only `kernel/src`. Per `specs/fork-lint-audit-plan.md`, **"I enumerated the call sites" is only true if the enumeration covered `~/.cargo/git/checkouts/`.** Check there too. |
+| **False pass** | An enumeration that covered only `kernel/src`. Per `specs/plans/fork-lint-audit-plan.md`, **"I enumerated the call sites" is only true if the enumeration covered `~/.cargo/git/checkouts/`.** Check there too. |
 
 ### 1.4 Present the disk read-only for the first boot, if the owner accepts
 

@@ -35,5 +35,5 @@ the harness for `test_rs_<name>`, intersect with the shared registry, and requir
 each hit to declare — either `RUST_SKIP` with the reason its driver exists, or a
 statement that its shared-boot run has a verdict of its own. The list of
 legitimate double-runs is four names long, so declaring them is cheap; what is
-not cheap is the class, which `specs/test-cost-audit.md` §5.2 already found once
+not cheap is the class, which `specs/assessments/test-cost-audit.md` §5.2 already found once
 (`test_screen_churn`) and which nothing has been watching since.

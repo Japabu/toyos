@@ -15,7 +15,7 @@
 //! Between them they account for 4,105.7 s of the effective 4,439.1 s CI
 //! profile, and none is gated per pull request. `guards` on every row says what
 //! stopped being gated, because a run that quietly does less is the whole
-//! failure mode here — `specs/test-cost-audit.md` §7 is the long form.
+//! failure mode here — `specs/assessments/test-cost-audit.md` §7 is the long form.
 //!
 //! **Nothing here is an optimisation and nothing here changes an assertion.**
 //! A relegated test measures exactly what it measured; the manual nightly

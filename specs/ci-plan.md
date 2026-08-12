@@ -1579,7 +1579,7 @@ Fast shards intentionally omit Nightly work. The merge therefore retains an old
 label only when its canonical registration is in `RELEGATED` — including
 audio's `(smp=N)` labels — and replaces it when a run did measure it. It does not
 permit an absent Fast label: a complete shard set missing one is refused. A new
-registration first uses `specs/test-cost-audit.md` §7.2's disposable
+registration first uses `specs/assessments/test-cost-audit.md` §7.2's disposable
 measurement commit, then lands only
 with the measured profile row and the tier that row earns; adding it without a
 starting price is a red declaration error. `--merge-durations` refuses any

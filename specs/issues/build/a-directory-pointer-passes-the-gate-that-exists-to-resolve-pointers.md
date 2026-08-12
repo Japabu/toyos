@@ -23,8 +23,8 @@ obey the rule. **Writing the unresolvable form is the way past it.**
 Measured 2026-08-11 on `9d535d6`, counting `` `specs/issues/<area>/` `` in
 `specs/`, `CLAUDE.md` and the four subdirectory `CLAUDE.md`s: **190 occurrences
 across 83 (file, area) pairs.** The heaviest are
-`specs/code-quality-review-2026-08.md` with 19 to `design-debt/`,
-`specs/type-safety-audit/crates.md` with 11 to `isolation/` and 9 to `kernel/`,
+`specs/assessments/code-quality-review-2026-08.md` with 19 to `design-debt/`,
+`specs/assessments/type-safety-audit/crates.md` with 11 to `isolation/` and 9 to `kernel/`,
 and `specs/ci-plan.md` with 7 to `hardware/`. Twenty-two of them are inside
 `specs/issues/` files pointing at each other. `specs/issues/README.md` itself has
 one, as the example of what not to write, which any fix has to allow for.

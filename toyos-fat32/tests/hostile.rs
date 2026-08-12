@@ -638,7 +638,7 @@ fn writes_past_the_format_limit_are_refused() {
 
 // ------------------------------------- the write path, after the 2026-08-01 audit
 //
-// Each of these was a working reproducer in `specs/type-safety-audit/storage-stack.md`.
+// Each of these was a working reproducer in `specs/assessments/type-safety-audit/storage-stack.md`.
 // They are grouped because they have one shape: a value that came off the disk
 // reached a device operation without the check that gives it meaning, because
 // the check sat behind a condition — `is_dir || size > 0`, `steps > 0`, "the

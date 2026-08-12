@@ -1,6 +1,6 @@
 # Audio gate (gate A) baselines — one section per (test, smp) config.
 # specs/scheduler-core-spec.md §11, specs/audio-subsystem-spec.md §5.4/§5.9,
-# specs/audio-glitch-distribution-2026-07-28.md.
+# specs/assessments/audio-glitch-distribution-2026-07-28.md.
 #
 # Every config must appear here. A missing section is a hard error, not a
 # pass: an ungated config would go green by omission.

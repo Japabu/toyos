@@ -11,7 +11,7 @@
 //!
 //! **What is here is the order and nothing else.** Which endpoints an interface
 //! offered, what a slot id is, where a ring lives — none of that decides what
-//! comes next, so none of it is here. `specs/xhci-port-machine-plan.md` X2b is
+//! comes next, so none of it is here. `specs/plans/xhci-port-machine-plan.md` X2b is
 //! the design.
 
 /// EP0's Max Packet Size before the device has been asked, and `None` for a

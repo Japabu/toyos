@@ -490,7 +490,7 @@ fn profile_name(profile: Profile) -> &'static str {
 
 /// Presence, configuration and *position* of the unit in the argv.
 ///
-/// The last one is the vacuity trap `specs/userspace-drivers-spec.md` §7.2
+/// The last one is the vacuity trap `specs/plans/userspace-drivers-spec.md` §7.2
 /// names, in its harness-side form: QEMU hands a PCI function the bypassing
 /// address space when the function is created before the unit exists, so a
 /// `-device intel-iommu` emitted after the devices it is meant to decode is a

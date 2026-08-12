@@ -8,7 +8,7 @@ opened: 2026-08-11
 
 `cargo test --test toyos-build -- --nightly` runs the relegated tests manually.
 Nothing in `.github/workflows/ci.yml` schedules that command, so the coverage
-loss recorded in `specs/test-cost-audit.md` §7 remains absent from automated CI.
+loss recorded in `specs/assessments/test-cost-audit.md` §7 remains absent from automated CI.
 
 Build a scheduled CI job that invokes the nightly tier. Beyond the relegated
 tests, the eventual job carries the intended TCG, long-running audio and stress

@@ -664,7 +664,7 @@ impl Capabilities {
 
     /// `ECAP.SC`: a second-level page-table entry may carry the snoop-force
     /// bit, which makes a device's DMA snoop the CPU cache whatever the device
-    /// itself requested. `specs/hda-driver-plan.md` §4.4 item 4 is why it is
+    /// itself requested. `specs/plans/hda-driver-plan.md` §4.4 item 4 is why it is
     /// read: an Intel HDA controller carries a vendor no-snoop control in its
     /// config space, and setting this bit in every mapping makes that control
     /// irrelevant — one layer down, with no config-write syscall.

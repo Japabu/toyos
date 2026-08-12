@@ -1063,6 +1063,9 @@ model weak memory.
 
 ## 11. Migration plan — always-green stages
 
+**Current state: stage 7c is done** — the legacy scheduler body is deleted and the kernel runs
+on `toyos-sched` exclusively; stages 8 (consolidation) and 9 (the scale stage) are open.
+
 Gate legend: **B** = `cargo run -- --build-only` clean; **T** = `cargo test` (QEMU integration,
 run in background per CLAUDE.md, full output read; includes gate A's **fast tier**); **A** =
 gate A's **thorough tier**, `cargo test --test toyos-build -- --audio-gate 30`, ~17 min, at `-smp 1` and `-smp 8`;

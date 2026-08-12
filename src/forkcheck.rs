@@ -11,7 +11,7 @@
 //! upstream to merge; and `target-lexicon`'s unpinned commit was the one adding
 //! `OperatingSystem::Toyos` to the SysV arm, so `default_calling_convention()`
 //! answered `Err(())` in `toyos-cc` and `SystemV` in cranelift.
-//! `specs/dependency-audit-2026-08-08.md` §11 has both.
+//! `specs/assessments/dependency-audit-2026-08-08.md` §11 has both.
 //!
 //! **On demand only, and it must stay that way.** It asks every fork remote for
 //! a branch head, so it needs the network. Wiring it into `cargo test` or into

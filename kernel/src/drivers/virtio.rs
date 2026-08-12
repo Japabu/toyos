@@ -277,7 +277,7 @@ impl Virtqueue {
     /// The half of [`submit`](Self::submit) that names memory, separated so a
     /// queue whose chains are fixed at bind can have them built once by the
     /// kernel and published by somebody who never sees a descriptor
-    /// (`specs/hda-driver-plan.md` §4.1). Chains built this way are addressed by
+    /// (`specs/plans/hda-driver-plan.md` §4.1). Chains built this way are addressed by
     /// index rather than by a [`DescSlot`], because the proof a slot carries —
     /// that this descriptor is not in flight — is the publisher's to hold and
     /// the publisher is not here.

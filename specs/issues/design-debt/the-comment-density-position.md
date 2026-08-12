@@ -29,7 +29,7 @@ higher):
   407/997 (40%).
 
 The rule this measures against already exists — CLAUDE.md's slop-comment
-paragraph, and `specs/code-quality-review-2026-08.md` §1.5, which narrows the
+paragraph, and `specs/assessments/code-quality-review-2026-08.md` §1.5, which narrows the
 surviving kinds to three: the one-clause invariant at the edit site, the
 boundary contract, and the refusal-reason at a surprising decision, with a
 module doc of contract plus one spec pointer, target ten lines. **What does not

@@ -1,7 +1,7 @@
 # Device and driver testing strategy
 
 How ToyOS tests the code that talks to hardware. Gate A (audio) and gate N
-(`specs/net-gate-plan.md`) are instances of this; this file is the general rule
+(`specs/plans/net-gate-plan.md`) are instances of this; this file is the general rule
 and the build order.
 
 ## Two principles, both earned
@@ -58,7 +58,7 @@ The crowded-USB config is built: `Profile::MetalUsb` is metal-sim with six
 devices on the xHCI, two of them keyboards, and it cost two boots, one extra
 kernel build and no new instrument. The extra build was the shortage
 config's, when an actuator was still a cargo feature; since
-`specs/test-cost-audit.md` §5.9.7 it is a boot parameter and costs no build at
+`specs/assessments/test-cost-audit.md` §5.9.7 it is a boot parameter and costs no build at
 all. It also fixed the shape of
 the assertion — the driver logs the DMA offset of each device's interrupt ring
 and the block count it derived, so "these two devices are independent" and "this
@@ -188,7 +188,7 @@ a distribution would be expensive noise.
 
 ## The instrument is code, and it will be wrong before the driver is
 
-`specs/audio-gate-history.md` records four instrument defects that were read as
+`specs/assessments/audio-gate-history.md` records four instrument defects that were read as
 properties of the system. Budget for certifying every new observer against a
 known-good and a known-bad capture before trusting a single green run, and prove
 each new assertion's teeth by breaking what it guards and watching it go red.
