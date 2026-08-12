@@ -278,11 +278,20 @@ jobs:
       # guest on the machine. It costs nothing, because a shard is a whole
       # machine and this repository is public — twenty jobs may run at once and
       # the minutes are unmetered.
+      #
+      # A manually dispatched workflow is the KVM instrument for the whole
+      # tier set. Pull requests and main stay Fast; `workflow_dispatch` adds
+      # `--nightly` so a withheld label can be refreshed without temporarily
+      # putting it back into every pull request. This is deliberately manual,
+      # not the still-open scheduled Nightly gate.
       - name: suite
+        env:
+          SUITE_TIER_ARGS: ${{ github.event_name == 'workflow_dispatch' && '--nightly' || '' }}
         run: |
           set -o pipefail
           cargo test --test toyos-build -- \
-            --shard ${{ matrix.shard }}/12 --jobs 1 --host-slots 0 2>&1 \
+            --shard ${{ matrix.shard }}/12 --jobs 1 --host-slots 0 \
+            $SUITE_TIER_ARGS 2>&1 \
             | tee /tmp/suite.log
 
       # **`--land` wrote "gate ok" or "gate ok, NOT clean" into the landing

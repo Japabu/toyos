@@ -1,9 +1,12 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::Deserialize;
 
@@ -11,6 +14,60 @@ use crate::assets;
 use crate::buildlock;
 use crate::image;
 use crate::toolchain;
+
+thread_local! {
+    /// Time this worker has spent constructing memoized boot artifacts.
+    ///
+    /// A suite worker is also the thread that asks for its boot image, so a
+    /// cumulative thread-local clock lets the harness remove a cold build from
+    /// the test that happened to ask for it first. A process-wide counter would
+    /// subtract another worker's concurrent build instead.
+    static ARTIFACT_BUILD_TIME: Cell<Duration> = Cell::new(Duration::ZERO);
+}
+
+/// One reading of the artifact-build clock for the current thread.
+///
+/// Test duration profiles are execution prices, not ownership of a shared
+/// cache miss. Without this distinction, each CI shard charges its first
+/// shipping- and test-kernel users tens of seconds, relegating those names;
+/// the next run then charges the same builds to two different names. The raw
+/// suite wall clock still includes every build. Only per-test prices use this
+/// mark to remove construction of memoized kernel, bootloader, and initrd
+/// artifacts.
+#[derive(Clone, Copy)]
+pub struct ArtifactBuildMark(Duration, PhantomData<Rc<()>>);
+
+/// Read the current thread's cumulative artifact-build time.
+pub fn mark_artifact_build_time() -> ArtifactBuildMark {
+    ArtifactBuildMark(ARTIFACT_BUILD_TIME.get(), PhantomData)
+}
+
+impl ArtifactBuildMark {
+    /// Remove artifact construction since this mark from a raw elapsed time.
+    pub fn execution_part(self, raw: Duration) -> Duration {
+        let built = ARTIFACT_BUILD_TIME.get().saturating_sub(self.0);
+        raw.saturating_sub(built)
+    }
+}
+
+/// Charges the slow, cache-filling half of [`build_test_image`] to the build
+/// clock even if it unwinds. Image creation on a memo hit is deliberately
+/// outside this guard: every boot pays that work, so it is part of the test's
+/// repeatable execution price.
+struct ArtifactBuildTimer(Instant);
+
+impl ArtifactBuildTimer {
+    fn start() -> Self {
+        Self(Instant::now())
+    }
+}
+
+impl Drop for ArtifactBuildTimer {
+    fn drop(&mut self) {
+        let elapsed = self.0.elapsed();
+        ARTIFACT_BUILD_TIME.set(ARTIFACT_BUILD_TIME.get().saturating_add(elapsed));
+    }
+}
 
 // --- Config ---
 
@@ -1031,6 +1088,12 @@ pub fn build_test_image(
         return image::create_boot_image(&kernel, &bl, &initrd, &cmdline);
     }
 
+    // A cache miss is shared setup, not a property of whichever test happened
+    // to be first on this shard. Keep it on a separate clock until all missing
+    // memo parts have been constructed. The fresh per-boot image below remains
+    // outside the charge because every execution needs one.
+    let build_timer = ArtifactBuildTimer::start();
+
     // **Below the memo's early return, so a boot that builds nothing queues for
     // nothing.** Above every build lock, per the module header. This is the
     // acquisition the eight-landing day was about: twelve suite workers each
@@ -1104,6 +1167,8 @@ pub fn build_test_image(
     let initrd_bytes = INITRD.get_or_build(initrd_key, || {
         build_and_assemble(root, &config, &path_env, extra_files, quiet)
     });
+
+    drop(build_timer);
 
     image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes, &cmdline)
 }
@@ -1299,6 +1364,37 @@ fn find_host_rlibs(root: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_artifact_build_is_not_part_of_a_test_execution_price() {
+        let before = mark_artifact_build_time();
+        ARTIFACT_BUILD_TIME.set(
+            ARTIFACT_BUILD_TIME
+                .get()
+                .saturating_add(Duration::from_millis(70)),
+        );
+        assert_eq!(
+            before.execution_part(Duration::from_millis(83)),
+            Duration::from_millis(13)
+        );
+
+        let after = mark_artifact_build_time();
+        assert_eq!(
+            after.execution_part(Duration::from_millis(13)),
+            Duration::from_millis(13)
+        );
+
+        // A coarse build clock must not underflow a very short failed outcome.
+        ARTIFACT_BUILD_TIME.set(
+            ARTIFACT_BUILD_TIME
+                .get()
+                .saturating_add(Duration::from_millis(70)),
+        );
+        assert_eq!(
+            after.execution_part(Duration::from_millis(13)),
+            Duration::ZERO
+        );
+    }
 
     /// A test that asks for no kernel feature boots the binary an image ships.
     ///
