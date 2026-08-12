@@ -179,15 +179,21 @@ fn external_fingerprint(root: &Path) -> String {
         }
     }
 
+    // Content, not `len:mtime`: `toyos-ld` relinks every CI job because a fresh
+    // `actions/checkout` gives its sources a mtime cargo's own path-dependency
+    // fingerprint has never seen, and the relink is a few MB — hashing it is
+    // milliseconds against the `cargo clean` a changed mtime used to trigger on
+    // every crate this fingerprint gates, `tests/toyos-rust-tests/tls-cranelift`
+    // among them at 570 MiB. The sysroot rlibs above stay on `len:mtime`: CI
+    // unpacks a byte-identical toolchain artifact with `tar`, which restores
+    // mtimes, so their triple is already stable across jobs of one toolchain
+    // tag and hashing every rlib would cost what the clean does today.
     let linker = toolchain::toyos_ld_binary(root);
-    if let Ok(meta) = linker.metadata() {
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        entries.push(format!("toyos-ld:{}:{mtime}", meta.len()));
+    if let Ok(data) = fs::read(&linker) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        data.hash(&mut h);
+        entries.push(format!("toyos-ld:{:016x}", h.finish()));
     }
 
     entries.sort();
