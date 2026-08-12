@@ -3,7 +3,8 @@
 ## 1. Invariants
 
 1. **Every defect class has exactly one owning instrument.** The owner's red is
-   the class's alarm. A class no instrument can observe is listed in §7.
+   the class's alarm. A class with no owning instrument is recorded as
+   unowned.
 2. **A pull-request verdict is deterministic for its author.** Green means the
    merged result is clean. Red means the diff is defective. A gate that reds at
    a rate independent of the diff is itself the defect, and is fixed or
@@ -13,12 +14,9 @@
 
 | instrument | owns | blind to |
 |---|---|---|
-| host suites | pure logic: decoders, validators, layouts, the build system's own gates | everything that requires a booted kernel |
-| KVM guest shards | the booted kernel on native silicon: memory, processes, syscalls, IPC, filesystems, drivers against QEMU's device models | contention; semantics the hypervisor absorbs |
+| host suites | pure logic: decoders, validators, layouts, the build system's own gates; the memory orderings x86 TSO hides (kernel-loom) | everything that requires a booted kernel |
+| KVM guest shards | the booted kernel on native silicon: memory, processes, syscalls, IPC, filesystems, drivers against QEMU's device models; audible harm (gate A) | contention; semantics the hypervisor absorbs |
 | TCG shard | ISA breadth: instruction paths the KVM hosts' CPUs never decode | vendor-real semantics; realistic instruction cost |
-| loaded dev host | contention: parallel suites, lock storms, scheduler collapse | vendor semantics; run-to-run comparability |
-| kernel-loom | memory orderings x86 TSO hides from every guest test | code outside the modeled primitives |
-| gate A | audible harm | everything inaudible |
 | metal | consequences emulation absorbs: cache and control-register effects, PAT/MTRR, device timing, real latency | anything requiring repetition or isolation; it is one manual machine |
 
 A defect found by a non-owning instrument transfers to its owner: the owner
@@ -75,22 +73,16 @@ tier, and stress.
 
 ## 6. The local suite
 
-The dev host's suite is developer feedback and the only contention
-instrument. It is never a gate: nothing merges on the strength of a local
-green, and no local red blocks a merge — it is adjudicated like any other
-instrument's finding.
+The dev host's suite is developer feedback. It is never a gate: nothing
+merges on the strength of a local green, and no local red blocks a merge.
 
 ## 7. The metal checklist
 
-Defect classes only silicon can observe. An entry names a measurement, not a
-topic; names what closes it; and does not replace an automated tripwire: the
-tripwire catches recurrence, the entry prices the consequence.
-
-| # | measurement | closes |
-|---|---|---|
-| 1 | one T14 boot with `no-ap-control-regs` armed against one without, same image, same session; record the delta | `specs/issues/kernel/ap-control-registers-inherit-init.md` |
-
-Every metal session walks this table before anything else.
+A defect class only silicon can observe carries an entry on the metal session
+checklist. An entry names a measurement, not a topic; names what closes it;
+and does not replace an automated tripwire: the tripwire catches recurrence,
+the entry prices the consequence. A metal session walks the checklist before
+anything else.
 
 ## 8. Substrate
 
@@ -98,6 +90,3 @@ Every metal session walks this table before anything else.
 - The pull-request gate's wall clock is bounded by its slowest required job.
   Setup cost is attacked before coverage is: a setup cut needs a measurement,
   a coverage cut needs an invariant-level justification.
-
-Evidence and derivations, frozen at their date:
-`specs/testing-strategy-assessment-2026-08-12.md`.

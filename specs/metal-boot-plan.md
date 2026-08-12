@@ -20,13 +20,12 @@ two full metal boots and annotated with what ToyOS drives and what it skips. Rea
 it before planning any driver. It also answers, for M5, where the touchpad's I2C
 controller is not.
 
-**What a session owes before it starts is `specs/testing-strategy.md` §7**: the
-metal checklist. A session walks its table before anything else; its first
-entry is a measurement this machine owes — one boot with the
-`no-ap-control-regs` actuator armed against one without, on the same image in
-the same session, the delta recorded, and
-`specs/issues/kernel/ap-control-registers-inherit-init.md` closed with the two
-numbers in it.
+**The session checklist.** A session walks this table before anything else. An
+entry names a measurement, not a topic, and names what closes it.
+
+| # | measurement | closes |
+|---|---|---|
+| 1 | one boot with `no-ap-control-regs` armed against one without, same image, same session; record the delta | `specs/issues/kernel/ap-control-registers-inherit-init.md` |
 
 ## Starting position (verified 2026-07-30 — re-verify before acting, this ages)
 
