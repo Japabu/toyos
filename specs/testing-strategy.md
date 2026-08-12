@@ -1,12 +1,9 @@
 # Testing strategy
 
-This document is normative. It states how ToyOS is tested; it does not argue.
-
 ## 1. Invariants
 
 1. **Every defect class has exactly one owning instrument.** The owner's red is
-   the class's alarm. A class no instrument can observe is listed in §7 rather
-   than left to whichever instrument trips over it.
+   the class's alarm. A class no instrument can observe is listed in §7.
 2. **A pull-request verdict is deterministic for its author.** Green means the
    merged result is clean. Red means the diff is defective. A gate that reds at
    a rate independent of the diff is itself the defect, and is fixed or
@@ -85,10 +82,9 @@ instrument's finding.
 
 ## 7. The metal checklist
 
-Defect classes only silicon can observe are enumerated here. An entry names a
-measurement, not a topic; names what closes it; and does not replace an
-automated tripwire — the tripwire catches recurrence, the entry prices the
-consequence.
+Defect classes only silicon can observe. An entry names a measurement, not a
+topic; names what closes it; and does not replace an automated tripwire: the
+tripwire catches recurrence, the entry prices the consequence.
 
 | # | measurement | closes |
 |---|---|---|
