@@ -11,12 +11,24 @@ name: ci
 # and the pull request on it were two runs of the same twelve shards. `main`
 # itself still runs: it is what `landing.yml`'s `gate-stage` reads, and its
 # `actions/cache` entries are the only ones every branch can restore.
+#
+# **And once a night, on a schedule.** `cargo test --test toyos-build --
+# --nightly` runs the tier the fast shards hold back — `src/tiers.rs`'s
+# `RELEGATED` — and until 2026-08-12 nothing scheduled it, so the coverage a
+# withheld test still carries had nobody actually running it. `schedule`
+# generalizes the `workflow_dispatch` precedent below rather than duplicating
+# it — the same `SUITE_TIER_ARGS` line that already added `--nightly` for a
+# manual dispatch does it for `03:00 UTC` too. `schedule` always runs the
+# default branch's copy of this file against its own tip, so a nightly red is a
+# red about `main`, never about a branch.
 
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
 
 # **A superseded pull-request run is thrown away; a run on `main` never is.**
 # Cancelling a pull request's previous run is free — the newer push is the
@@ -27,8 +39,13 @@ on:
 # requests merged inside ninety minutes left `e4b7279`, `782b9e5` and `aaa7a7a`
 # each cancelled by the merge behind it, and the newest verdict `main` had was
 # from before any of them.
+# The nightly run gets its own group so it never queues behind, or ahead of, a
+# pull request's or a push's — `cancel-in-progress` staying false for `main`
+# already means the two would never cancel each other, but they would still
+# serialize in the same group, and a merge landing at `03:04` has no business
+# waiting behind a run that is exercising the withheld tier.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
@@ -238,11 +255,18 @@ jobs:
       # is the belt to that brace and it fires either way: 8 `external deps
       # changed: cleaning` lines in both arms of the probe.
       #
-      # **`tcg` writes it and the twelve shards only read it.** Twelve concurrent
-      # uploads of the same content race for one key, and none of them would
-      # benefit from a sibling anyway — the twelve start together, so the win is
-      # across runs. A cache written on `main` is the only one every branch can
-      # restore (§8.4), and a branch's own second push restores its first.
+      # **`cache-writer` writes it and the twelve shards only read it.** Until
+      # 2026-08-12 `tcg` did — `specs/testing-strategy.md` §3.3 (D1) found that
+      # job carrying two unrelated roles, an emulator smoke test and this cache's
+      # writer, and the owner's ruling sent the first to nightly and named the
+      # property the second had to keep: "exactly one job per run writes the
+      # entry, it runs on every run, and it is not the nightly one" — a nightly
+      # writer would refresh this entry on a tree the pull request reading it
+      # could be several merges behind. Twelve concurrent uploads of the same
+      # content would race for one key, and none of them would benefit from a
+      # sibling anyway — the twelve start together, so the win is across runs. A
+      # cache written on `main` is the only one every branch can restore (§8.4),
+      # and a branch's own second push restores its first.
       - uses: actions/cache/restore@v4
         with:
           path: |
@@ -279,14 +303,14 @@ jobs:
       # machine and this repository is public — twenty jobs may run at once and
       # the minutes are unmetered.
       #
-      # A manually dispatched workflow is the KVM instrument for the whole
-      # tier set. Pull requests and main stay Fast; `workflow_dispatch` adds
-      # `--nightly` so a withheld label can be refreshed without temporarily
-      # putting it back into every pull request. This is deliberately manual,
-      # not the still-open scheduled Nightly gate.
+      # `--nightly` restores the withheld tier: on the `03:00 UTC` schedule
+      # every night, and on a manual `workflow_dispatch` the same way it always
+      # could — a withheld label can be refreshed without temporarily putting it
+      # back into every pull request. Pull requests and ordinary pushes to
+      # `main` stay Fast.
       - name: suite
         env:
-          SUITE_TIER_ARGS: ${{ github.event_name == 'workflow_dispatch' && '--nightly' || '' }}
+          SUITE_TIER_ARGS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '--nightly' || '' }}
         run: |
           set -o pipefail
           cargo test --test toyos-build -- \
@@ -383,18 +407,28 @@ jobs:
   # It is also the arm that keeps `-cpu qemu64` alive: the shards ask for `-cpu
   # host`, so nothing else in CI boots the model the emulated path presents.
   #
-  # Same image as the shards, so the accelerator is the only thing that differs
-  # between this job and one of them.
+  # **Nightly and dispatch only, since 2026-08-12 — the owner's ruling (D1),**
+  # `specs/testing-strategy.md` §3.3: across its history as a required check
+  # this job never named a tree defect, and its badge rested on "everything
+  # should work under emulation and kvm" rather than on a caught one. The class
+  # gets a real reader in the nightly tier instead — a whole TCG shard, not one
+  # test (§6.1) — and the pull-request required set drops from five checks to
+  # four (`landing.yml`). What this job also did on every push and pull request
+  # — write the cache the twelve shards read — did not move with it; §3.3 is
+  # explicit that losing that silently costs more than the badge ever bought,
+  # and it would show up as a slow pull request rather than a red. It is
+  # `cache-writer`, below, now.
   #
-  # **`if: always()` and a guard step rather than a bare `needs:`, because this
-  # one is a required check.** GitHub reports a job skipped by an unmet `needs:`
-  # as a state a protection rule reads as satisfied, so a required check that
-  # skips is a required check that cannot fail. The guard costs a container
-  # start and makes the report honest: `tcg` runs, and reds, when the toolchain
-  # did not build.
+  # Same image as the shards restore, so the accelerator is the only thing that
+  # differs between this job and one of them.
+  #
+  # **`if: always()` and a guard step, kept from when this was a required
+  # check.** It answers no protection rule now, but a nightly run that silently
+  # skipped instead of naming *why* the toolchain never arrived would be exactly
+  # the quiet loss `nightly-red` exists to catch.
   tcg:
     needs: [toolchain-ready]
-    if: always()
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
@@ -458,12 +492,11 @@ jobs:
           TAG: ${{ steps.key.outputs.tag }}
         run: .github/install-toolchain.sh
 
-      # **This job is the one that writes what the twelve shards read**, and the
-      # `guest` job's own restore step carries the argument for all of it. It is
-      # the right writer because it is one job rather than twelve racing for a
-      # key, it builds exactly the shared set the shards pay for before their
-      # first boot, and it runs on every run — the guard above means it reds
-      # rather than skipping.
+      # Restore only, since 2026-08-12 — `cache-writer` below is the writer now
+      # (`guest`'s own restore step carries the full argument for why it is a
+      # single job and not twelve). A once-nightly `tcg` would be the wrong
+      # writer for a pull request reading this cache anyway: it would refresh
+      # the entry from a tree the pull request could be several merges behind.
       - uses: actions/cache/restore@v4
         with:
           path: |
@@ -482,6 +515,98 @@ jobs:
           restore-keys: guest-${{ steps.key.outputs.tag }}-
 
       - name: one test, emulated
+        run: cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats
+
+  # **What `tcg` used to write, kept alive on the trigger `tcg` no longer runs
+  # on.** `specs/testing-strategy.md` §3.3 (D1) names the property this job
+  # exists to hold: "exactly one job per run writes the entry, it runs on every
+  # run, and it is not the nightly one." Losing it silently is the failure mode
+  # named there — `restore-keys` is prefixed on the toolchain tag and cannot
+  # fall back across a sysroot change, so a branch touching any of the four
+  # witness trees would find nothing and pay the cold build without a red to
+  # say so: 519 s against 282 s, measured, run `31385467644`.
+  #
+  # Same build, same one fast test the old writer ran, under KVM instead of
+  # TCG: nothing about *what* gets cached depends on which accelerator produced
+  # it, and KVM is both faster to boot and the accelerator every reader of this
+  # cache actually uses.
+  #
+  # Advisory, not required — every one of the twelve shards below already
+  # builds the same tree and would fail if it were broken, so this job's only
+  # job is cache hygiene. A bare `needs: [toolchain-ready]` is enough: if the
+  # toolchain never arrived there is nothing to build and nothing to cache, and
+  # a skip says that as plainly as a guard step would.
+  cache-writer:
+    needs: [toolchain-ready]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container:
+      image: debian:sid
+      options: --device=/dev/kvm
+    steps:
+      - name: deps
+        run: |
+          got=no
+          for attempt in 1 2 3; do
+            if apt-get update -qq \
+               && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                    git curl ca-certificates jq zstd xz-utils build-essential \
+                    qemu-system-x86 > /dev/null; then
+              got=yes
+              break
+            fi
+            echo "apt attempt $attempt failed"
+            [ "$attempt" = 3 ] || sleep 20
+          done
+          if [ "$got" != yes ]; then
+            echo "::error::apt failed three times against sid's mirror. Nothing here is about"
+            echo "::error::the tree — re-run the job."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: the instrument
+        run: .github/instrument.sh
+
+      - id: key
+        name: the toolchain this tree needs
+        run: |
+          git config --global --add safe.directory "$PWD"
+          echo "tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: install the toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.key.outputs.tag }}
+        run: .github/install-toolchain.sh
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+            kernel/target
+            bootloader/target
+            userland/target
+            toyos-ld/target
+            toyos-cc/target
+            tests/target
+            tests/toyos-rust-tests/*/target
+          key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: guest-${{ steps.key.outputs.tag }}-
+
+      - name: one test, to build and validate what gets cached
         run: cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats
 
       # After the test and not before it: what is worth keeping is a tree that
@@ -530,6 +655,15 @@ jobs:
   # cannot ignore a profile which disproves the tier declaration. The merge also
   # refuses any duplicate execution label, which catches §4's cross-shard
   # partition defect and same-shard duplicate registrations.
+  #
+  # **This is also how the nightly tier's own labels stay priced.** `guest`'s
+  # `SUITE_TIER_ARGS` widens the twelve shards' selection to include
+  # `RELEGATED` on a nightly run, so their `test-durations.shard-*` files carry
+  # fresh Nightly measurements the same way an ordinary run's carry Fast ones —
+  # this job does not need to know which trigger produced them. Without that, a
+  # withheld label would stay frozen at whatever it measured before the
+  # fast/nightly split and `tiers::validate_ci_profile` could never notice a
+  # Nightly test's CI cost changing.
   durations:
     needs: [guest]
     if: always()
@@ -652,3 +786,41 @@ jobs:
               or the twelve shards did not leave a complete measurement."
             exit 1
           fi
+
+  # **A nightly red must surface somewhere a human actually looks.** A
+  # scheduled job nobody reads is worse than none, because it converts "we do
+  # not gate this" into "we gate this" without changing anything. Files or
+  # updates one standing issue rather than leaning on GitHub's own
+  # workflow-failure email, which nobody here reads either.
+  #
+  # Only on `schedule`. A `workflow_dispatch` of the nightly tier is somebody
+  # watching the run directly — `--nightly` exists for refreshing a withheld
+  # label on demand — and an issue comment would just be noise to the same
+  # person who is already looking at the log.
+  #
+  # `tcg` and `guest-suite` are enough: `guest-suite` already reds if
+  # `toolchain-ready`, `guest` or `durations` did (its own body checks each), so
+  # naming those two here would be redundant with what it already refuses.
+  nightly-red:
+    needs: [tcg, guest-suite]
+    if: always() && github.event_name == 'schedule' && (needs.tcg.result != 'success' || needs.guest-suite.result != 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: file or update "nightly is red"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TCG_RESULT: ${{ needs.tcg.result }}
+          GUEST_SUITE_RESULT: ${{ needs.guest-suite.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          failed=""
+          [ "$TCG_RESULT" = success ] || failed="$failed tcg($TCG_RESULT)"
+          [ "$GUEST_SUITE_RESULT" = success ] || failed="$failed guest-suite($GUEST_SUITE_RESULT)"
+          export TITLE="nightly is red"
+          export BODY="Run: $RUN_URL"$'\n'"Failed jobs:$failed"
+          .github/nightly-red.sh

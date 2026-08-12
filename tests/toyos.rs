@@ -12215,8 +12215,8 @@ fn main() {
             .sum();
         eprintln!(
             "[toyos] nightly tier: {} test(s) NOT run, {:.1} s of effective CI test time. \
-             `cargo test --test toyos-build -- --nightly` runs them manually; scheduled CI \
-             is not built: specs/issues/build/nightly-tier-has-no-workflow.md. \
+             `cargo test --test toyos-build -- --nightly` runs them manually; \
+             .github/workflows/ci.yml runs them every night at 03:00 UTC. \
              specs/test-cost-audit.md §7 says what each one guards.",
             held_back.len(),
             ms as f64 / 1000.0,

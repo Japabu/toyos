@@ -2,12 +2,11 @@
 //! with what each relegation costs the tree written beside it.
 //!
 //! **The owner's line, 2026-08-11: the fast per-PR path runs tests taking ten
-//! seconds or less.** Everything above it moves to a manually invoked nightly
-//! tier. `--nightly` exists now; scheduled CI is separate, unassigned work in
-//! `specs/issues/build/nightly-tier-has-no-workflow.md`. This module is that
-//! decision as data: [`RELEGATED`] is exactly the set the manual command selects
-//! and a future scheduled job must include, and `tests/toyos.rs` writes
-//! [`Tier::Nightly`] against each of those names in its own registration.
+//! seconds or less.** Everything above it moves to a nightly tier, scheduled in
+//! `.github/workflows/ci.yml` at `03:00 UTC` and reachable on demand through
+//! `--nightly` or a `workflow_dispatch`. This module is that decision as data:
+//! [`RELEGATED`] is exactly the set the nightly job selects, and `tests/toyos.rs`
+//! writes [`Tier::Nightly`] against each of those names in its own registration.
 //!
 //! **This is interim and it is a loss.** Fifty-five registered tests have a CI
 //! execution over the line (loaded audio and ordinary `audio_tone` each have two
@@ -60,9 +59,9 @@ pub const UNMEASURED_MS: u64 = u64::MAX;
 pub enum Tier {
     /// Every `cargo test`.
     Fast,
-    /// Only manual `cargo test --test toyos-build -- --nightly` until the
-    /// scheduled workflow in `specs/issues/build/nightly-tier-has-no-workflow.md`
-    /// is built.
+    /// `cargo test --test toyos-build -- --nightly`, run every night by
+    /// `.github/workflows/ci.yml`'s `03:00 UTC` schedule and on demand through
+    /// the same flag or a `workflow_dispatch`.
     Nightly,
 }
 
