@@ -13,6 +13,14 @@ Every number below came off a command that was run, and the run ids are given so
 each can be re-read. Where a figure is arithmetic on measured components it says
 **(derived)**.
 
+**Ruled by the owner on 2026-08-12, and applied throughout: `tcg` leaves the
+pull-request path for the nightly tier (D1), there is no merge queue and the
+repository does not move (D2), and a defect class whose observable exists only on
+silicon is owned by the metal track with a named checklist entry each (D6).**
+Two further rulings of the same date are recorded here so the doctrine is
+complete in one document: self-hosted runners are out, and the 10 s Fast ceiling
+is hard with no margin. §8.1 is the list; §8.2 is what is still open.
+
 **The recommendation, before the evidence for it.** Keep a guest gate on every
 pull request and make it exactly the compute-bound core; move everything
 timer-anchored, plus TCG breadth, audio's thorough tier and stress, to a nightly
@@ -163,7 +171,7 @@ The other required checks on the same head, run by run for `31601279765`:
 | `abi-split` | `landing.yml` | 37 s |
 | `gate-stage` | `landing.yml` | 2 s |
 | `build` (toolchain) | `toolchain.yml`, warm | 8 s |
-| `tcg` | `ci.yml` | 436 s |
+| `tcg` | `ci.yml` | 436 s — **and it leaves the pull-request path under D1** (§3.3) |
 
 **So a pull request cannot conclude faster than the `host` job no matter what is
 removed from it**, because it is on a macOS runner and is compilation almost end
@@ -270,8 +278,8 @@ Critical path today, unqueued: `toolchain-ready` 12 s → slowest guest job 542 
 
 | lever | critical path | runner time | what it costs |
 |---|---:|---:|---|
-| **Fix the mtime fingerprint** (already filed) | **−185 s** | −185 × 13 = **−40 min** | Nothing. It is a correctness fix that happens to be the largest latency item in CI. |
-| **A pinned prebuilt image on ghcr.io** — QEMU 11.0.3, `rustup`, the six apt packages baked in | **−64 s** (`deps` 56 + `rust` 8) | −64 × 13 = **−14 min** | A registry artifact to build and keep. `specs/ci-plan.md` §11.6 declined this at "53 s of 1,058 is 5%"; at today's 542 s job it is **11.8%**, and §2.8 is the correctness argument that is not about seconds at all. |
+| **Fix the mtime fingerprint** (already filed) | **−185 s** | −185 × 12 = **−37 min** | Nothing. It is a correctness fix that happens to be the largest latency item in CI. |
+| **A pinned prebuilt image on ghcr.io** — QEMU 11.0.3, `rustup`, the six apt packages baked in | **−64 s** (`deps` 56 + `rust` 8) | −64 × 12 = **−13 min** | A registry artifact to build and keep. `specs/ci-plan.md` §11.6 declined this at "53 s of 1,058 is 5%"; at today's 542 s job it is **11.8%**, and §2.8 is the correctness argument that is not about seconds at all. |
 | **Build the tree once and distribute it** | **+124 s** (derived) | **−41 min** | It is a *queue* lever wearing a latency lever's clothes — see below. |
 | **Slim the toolchain artifact** | −0 to −5 s | −1 min | 401 MiB already installs in 4–6 s. **Not a lever; do not spend a task on it.** |
 | **Shallower checkout** | 0 | 0 | `actions/checkout@v4` is 2 s. Nothing to win. |
@@ -351,7 +359,7 @@ is readable off any run. Across the three runs' 39 guest and `tcg` jobs:
 | **AMD / Intel** | **31 / 8 — 79% AMD** |
 
 **The good news is that the AMD class is gated in practice.** At 79% per job and
-thirteen jobs a run, a run drawing no AMD machine at all is about 1.5 × 10⁻⁹ —
+twelve guest jobs a run (thirteen before D1 moved `tcg` off this path), a run drawing no AMD machine at all is about 1.5 × 10⁻⁹ —
 the `STAR[63:48]` class §3.1 assigns to KVM CI is effectively certain to be
 executed on every pull request.
 
@@ -367,7 +375,7 @@ on.
 advisory sentence, which vendors this run actually drew.** Advisory and not a
 gate — a required check whose verdict is a lottery is exactly what §1's second
 clause forbids — but a run that executed one vendor is a run whose green means
-less, and today nobody can tell without opening thirteen job logs. It is also the
+less, and today nobody can tell without opening twelve job logs. It is also the
 only thing that would notice the fleet's mix shifting under us.
 
 ---
@@ -395,8 +403,8 @@ name going red.
 | **A device whose emulation declines the feature** | **metal** | QEMU reports zero xHCI scratchpad demand and answers `OP_PAGESIZE` bit 0, so a misaligned scratchpad array overlapping slot 2's output context is green everywhere. Found by reading the code against §4.20, not by a test | `specs/metal-track-history.md`, "What QEMU structurally could not find", `5bb673c`, `71940c1` |
 | **Firmware variance** | **metal** | The T14 hands over an uninitialised 8042 about one boot in seven; QEMU's controller never drops a config write and never resets itself. A rate only repeated boots on the machine can measure | `specs/issues/hardware/t14-hands-over-an-uninitialised-8042.md`: seven boots of one image, six read `cfg=0x77→0x64`, one read `cfg=0x30→0x60` |
 | **Undefined behaviour below the software layer** | **metal** | A memory-type alias on one physical page — WC on one CPU, WB in another's stale TLB — is invisible to TCG, which models no memory types at all, and is the one thing in the freeze window that can stop a machine with no panic, no schedule and no interrupt | `specs/issues/hardware/pulling-the-boot-stick-freezes-the-t14.md` |
-| **The emulated path itself, `-cpu qemu64`** | **the `tcg` job** — nominally | §3.3 |
-| **CPU state whose only consequence is timing on silicon** | **nothing** | §3.4 |
+| **The emulated path itself, `-cpu qemu64`** | **the nightly TCG shard** — D1, ruled 2026-08-12 | The one-test canary never named a tree defect in any role; a whole shard is what gives the class a reader | §3.3, §6.1 |
+| **CPU state whose only consequence is timing on silicon** | **the metal track** — D6, ruled 2026-08-12 | Both automated gates are green on it for opposite reasons — KVM clears the bit, TCG models no cache — so there is no automation to write and the owner is a session, not a job | §3.4, and the checklist in it |
 
 ### 3.2 What the two automated gates have actually caught, counted
 
@@ -432,7 +440,7 @@ row explicitly ruling load out — the gate that produced one of them ran at 1.0
 the reference boot and the failure was byte-identical to the ones taken at load
 11–16 (`specs/issues/diagnostics/screen-pager-keys-red-on-main.md`).
 
-### 3.3 The `tcg` job is a required check that has never named a tree defect
+### 3.3 The `tcg` job never named a tree defect, and it leaves the PR path
 
 Searched: `specs/ci-plan.md`, the whole issue estate, `.github/workflows/ci.yml`
 and the git log. **The `tcg` job appears in three roles and none of them is
@@ -450,21 +458,56 @@ and the git log. **The `tcg` job appears in three roles and none of them is
   purpose: "a configuration nothing runs is a configuration nobody finds out
   about", and it is the only thing in CI that boots `-cpu qemu64`.
 
-So its required status rests on the owner's rule — "everything should work under
+Its required status rested on the owner's rule — "everything should work under
 emulation and kvm if it doesnt something with the guest is wrong" — and not on a
-caught defect. It is also **the most expensive single required check**: 436 s in
+caught defect. It was also **the most expensive single required check**: 436 s in
 run `31601279765`, and 624 s cold / 409 s warm in `specs/ci-plan.md` §12.5. Two
-couplings before anyone proposes removing it: it very nearly *was* a vacuous
-required check (§11.1 — GitHub reads a job skipped by an unmet `needs:` as
+couplings had to be separated before it could move, and the ruling below is what
+separates them: it very nearly *was* a vacuous required check
+(`specs/ci-plan.md` §11.1 — GitHub reads a job skipped by an unmet `needs:` as
 satisfied, so it carries `if: always()` and a guard step), and **it is the job
 that writes the `actions/cache` entry the twelve shards only read**, worth
-3,036 s of runner time per run (§12.5). That is a coupling, not a justification.
+3,036 s of runner time per run (`specs/ci-plan.md` §12.5). Neither was ever a
+justification for the badge; the second is now an implementation constraint.
 
-**Owner decision point (D1).** The `tcg` job's honest description today is *an
-anti-rot declaration and a cache writer wearing a gate's badge*. Three ways to
-resolve it are in §7.
+**Ruled, 2026-08-12 (D1): the `tcg` job moves to nightly and leaves the
+pull-request path.** Its honest description was *an anti-rot declaration and a
+cache writer wearing a gate's badge*, and the ruling separates the three roles
+rather than arguing about which one justified the badge: the class it covers gets
+a real reader in the nightly tier — a whole TCG shard rather than one test
+(§6.1) — and the pull-request required set becomes four, `host`, `abi-split`,
+`gate-stage` and `guest-suite`.
 
-### 3.4 One class has no owner, and both automated gates are green on it for opposite reasons
+**What it is worth, stated precisely, because it is not a latency win.** At 436 s
+against a 542 s slowest guest job, `tcg` was never on the critical path. What
+leaving buys is **one job slot of the twenty a public repository may run at
+once** — nineteen per pull request becomes eighteen — and one machine's worth of
+runner time, which is the queue §2.4 measured at ~525 s on a three-pull-request
+day. It is a queue lever.
+
+**And it carries one implementation constraint, which is the finding above read
+forward.** `tcg` is the job that *writes* the `actions/cache` entry the twelve
+shards only read, worth 3,036 s of runner time per run (`specs/ci-plan.md`
+§12.5). The reasoning in `.github/workflows/ci.yml` is that it is the right
+writer because it is one job rather than twelve racing for a key, it builds
+exactly the shared set the shards pay for before their first boot, and it runs on
+every run. **A nightly `tcg` writes that entry once a night, on a tree that may be
+several merges behind the pull request reading it, so on the pull-request path
+nothing writes the cache at all after this change.** `restore-keys` is prefixed
+on the toolchain tag and cannot fall back across a sysroot change, so a branch
+that changes any of the four witness trees would find nothing and pay the cold
+build — 519 s against 282 s, measured, run `31385467644`.
+
+**So the agent implementing the nightly workflow must keep a per-run cache writer
+on the pull-request path.** The shape is not prescribed here — the obvious
+candidates are a dedicated one-job `cache` step that builds and saves without
+booting anything, or promoting one of the twelve shards to writer — but the
+property is: **exactly one job per run writes the entry, it runs on every run,
+and it is not the nightly one.** Losing this silently would cost more than
+everything D1 buys, and it would show up as a slow pull request rather than as a
+red, which is the failure mode nobody investigates.
+
+### 3.4 The emulator-invisible classes, and the metal track owns them
 
 Until 2026-08-08 an AP kept the `INIT` value of `CR0`: every core but cpu0 ran
 with caching disabled and `WP`, `NE`, `MP` clear, for the whole history of the
@@ -479,13 +522,57 @@ tree.
 Both readings are in `specs/issues/kernel/ap-control-registers-inherit-init.md`,
 from one commit. **A defect can be simultaneously invisible to both automated
 gates, in opposite ways — one masking it by fixing it, the other by not
-modelling it.** The instrument that would answer is built
-(`--kernel-param control-regs-bench`) and has never been run on silicon, which is
-why root `CLAUDE.md` records that every multi-CPU measurement this project has
-taken was of a machine that no longer exists.
+modelling it.**
+
+#### The doctrine, ruled 2026-08-12 (D6)
+
+> **A defect class whose observable exists only on silicon is owned by the metal
+> track, and every such class gets a named entry on the metal session
+> checklist.**
+
+The ruling is that the owner is a *session*, not a job, and the reason is that
+there is no automation to write: an instrument that neither accelerator can
+produce cannot be gated by either, and a class left to "somebody will notice" is
+the state §3.1 exists to make impossible. So the ownership is discharged the way
+metal time is actually spent — a checklist read at the start of a session, each
+entry naming what to boot, what to read off it, and what closes the entry.
+
+**Three properties, because a checklist that does not have them is a wish list.**
+
+- **An entry names a measurement, not a topic.** "Check the control registers" is
+  not an entry; "one boot with `no-ap-control-regs` armed against one without,
+  the delta recorded" is.
+- **An entry names what closes it.** Usually an issue in `specs/issues/`, so the
+  checklist shrinks by the same mechanism everything else in this tree does.
+- **An entry does not replace the automated tripwire, and the tripwire does not
+  replace the entry.** They answer different questions: the gates assert the
+  *values*, the metal session measures the *consequence*. Keeping both named is
+  what stops either being read as cover for the other.
+
+#### The checklist
+
+| # | class | the measurement owed | what closes it |
+|---|---|---|---|
+| **1** | **AP control-register state, and what it costs** | **One T14 boot with the `no-ap-control-regs` actuator armed, one without, on the same image in the same session; the delta recorded.** `--kernel-param control-regs-bench` is built and has never been run on silicon — which is why root `CLAUDE.md` records that every multi-CPU measurement this project has taken was of a machine that no longer exists, and why the cost of the defect is still owed rather than known | `specs/issues/kernel/ap-control-registers-inherit-init.md` closed with the two numbers in it |
+
+**The automated tripwire for entry 1, named so it is not confused with the
+entry.** `control_regs` asserts that the BSP and every AP agree on the register
+state, `control_regs_verdict` is the verdict's own gate, and
+`control_regs_negative` boots the `no-ap-control-regs` kernel and holds the
+verdict against a genuinely divergent AP — so a *recurrence* of the divergence
+reds automatically, on both accelerators, and does so today. What no gate can
+answer is what the divergence cost, because the observable is a cache and neither
+accelerator has one. **Entry 1 is that second question and nothing else**; it is
+not a request for coverage the tripwire already provides.
+
+Two of the three are Nightly (`control_regs` at 83.3 s, `control_regs_negative`
+at 40.3 s) and `control_regs_verdict` boots no guest and is Fast — so the
+recurrence tripwire is, today, mostly in the tier with no reader, which is §6's
+argument in one line.
 
 **This is the reason the matrix above is written down at all.** A class with no
-owner is invisible unless somebody is keeping a list of owners.
+owner is invisible unless somebody is keeping a list of owners; the list is
+§3.1 and the classes it hands to silicon are this checklist.
 
 ### 3.5 The bound on all of this
 
@@ -691,8 +778,8 @@ than any other coverage in this document.**
 ### 5.1 The proposal
 
 **Keep a guest gate per pull request, and make it exactly the compute-bound
-core.** Concretely, the required checks stay the five they are today —
-`host`, `abi-split`, `gate-stage`, `tcg`, `guest-suite` — and the *contents* of
+core.** Concretely, the required checks become the four D1 leaves —
+`host`, `abi-split`, `gate-stage`, `guest-suite` — and the *contents* of
 `guest-suite` become the fast tier with the owner's real-time rule swept across
 all of it, not only across the tests that happened to cross ten seconds.
 
@@ -845,9 +932,10 @@ request and merges only what it tested, which is strictly better than
 re-run after each landing. At 13–14 merges a day that serialisation is most of
 the queue §2.4 measured.
 
-**Owner decision point (D2): if this repository moves under an organization, the
-merge queue is the first thing to turn on, and it is worth more than any tier
-change in this document.**
+**Ruled, 2026-08-12 (D2): no merge queue, and the repository does not move.** The
+point is closed so it is not re-proposed; what is written above stays as the
+record of what it would have bought, and `specs/ci-plan.md` §10.2's strict
+required checks remain how the merged result is gated.
 
 #### (vi) Run the QEMU suite locally as the gate
 
@@ -916,7 +1004,7 @@ has now.
 | | |
 |---|---|
 | **the relegated set** | `--nightly`, the exact set `src/tiers.rs`'s `RELEGATED` names, on the same twelve-shard `debian:sid`/KVM configuration the fast tier runs — so a nightly red and a fast red are the same instrument and comparable |
-| **the emulated breadth** | more than the one-test `tcg` canary: a whole shard under TCG, which is the arm `specs/ci-plan.md` §7.2 named as still available and never taken. **This is what would give the `tcg` job's class a real reader** (§3.3, D1) |
+| **the emulated breadth** | **ruled in by D1**: `tcg` leaves the pull-request path and its class arrives here as a whole shard under TCG rather than one test — the arm `specs/ci-plan.md` §7.2 named as available and never taken (§3.3). **Implementation constraint: a per-run cache writer has to stay on the pull-request path**, because `tcg` is what writes the entry the twelve shards read (§3.3, and `specs/ci-plan.md` §12.5) |
 | **gate A, thorough** | `gate-a.yml` at N=30, two jobs of about half an hour, dispatched against the ref. It is already in the shards' container as of `specs/ci-plan.md` §12.1, so it is the same instrument too |
 | **stress** | whatever the owner wants that a ten-second ceiling forbids by construction |
 
@@ -1001,16 +1089,30 @@ sentences.
 
 ---
 
-## 8. Open questions for the owner
+## 8. What the owner has ruled, and what is still his
+
+### 8.1 Ruled, 2026-08-12
+
+**All five in one place, because a doctrine scattered across the documents that
+happened to need it is a doctrine somebody re-opens.** Three are this document's
+decision points; two were ruled while it was being written and are applied
+elsewhere in it.
+
+| # | ruling | what it changes here |
+|---|---|---|
+| **D1** | **The `tcg` job moves to nightly and leaves the pull-request path.** | The required set becomes four — `host`, `abi-split`, `gate-stage`, `guest-suite` (§5.1). The emulated-path class gets a whole TCG shard nightly instead of a one-test canary (§6.1). **Implementation constraint, and it is load-bearing: a per-run cache writer must stay on the pull-request path**, because `tcg` is what writes the entry the twelve shards read — §3.3 has the property the replacement must satisfy. A separate agent is implementing it. |
+| **D2** | **No merge queue; the repository does not move under an organization.** | §5.4(v) is closed rather than open. What a queue would have bought stays written down as the record; `specs/ci-plan.md` §10.2's strict required checks remain how the merged result is gated. Larger runners go with it (§2.8). |
+| **D6** | **A defect class whose observable exists only on silicon is owned by the metal track**, and each such class gets a named entry on the metal session checklist. | §3.4 is the doctrine and the checklist. Entry 1 is the AP control-register measurement: one T14 boot with `no-ap-control-regs` armed against one without, the delta recorded, `specs/issues/kernel/ap-control-registers-inherit-init.md` closed. The value-assertions — `control_regs`, `control_regs_verdict`, `control_regs_negative` — stay named as the automated tripwire for a *recurrence*, which is a different question from what the divergence cost. |
+| — | **Self-hosted runners are ruled out.** | §2.6 opens with it, and everything in §2.6–§2.8 is priced against GitHub-hosted runners only. Recorded in one line so the proposal is not re-derived. |
+| — | **The 10 s Fast ceiling is hard, with no margin or hysteresis band** — a measured crossing reds `durations` however close. | It is `FAST_CEILING_MS`'s own doc comment on `wt/toyos-slowtests`, and §2.3 is an instance of it working: `audio_tone` measured 10,790 ms and 11,144 ms in run `31601279765` and was relegated by `118e3b7` because of that run. §5.3 and §4.2 rest on the companion rule from the same date, that only a compute-bound verdict stays Fast. |
+
+### 8.2 Still open, and still his
 
 | # | question | why it is his |
 |---|---|---|
-| **D1** | **What is the `tcg` job for?** It has never named a tree defect (§3.3), it is the most expensive required check at 436 s, and it also writes the cache the twelve shards read. Three options: keep it as an anti-rot declaration and say so in its own comment; promote its class by running a whole TCG shard nightly (§6.1); or drop it as a *required* check and keep the job for the cache, which makes the required set four. | It is his rule that put it there — "everything should work under emulation and kvm". |
-| **D2** | **Move the repository under an organization?** It buys the merge queue (§5.4(v)) and larger runners, both of which are worth more than any tier change here, and both are refused today by the User-account entitlement. | A repository-ownership decision. |
 | **D3** | **Should `Why` gain a `RealTime` variant** so a timer-anchored test cannot be dragged back into the fast tier by getting cheap (§6.4)? | It encodes his 2026-08-12 ruling in the type rather than in a comment. |
-| **D4** | **Is the nightly workflow this document's next task, or a separate one?** `nightly-tier-has-no-workflow` in `specs/issues/build/` is open and unassigned, and until it is built the tier is a bin (§6). This document proposes the contract; somebody has to build it. | It is a scheduling call about what gets an agent next. |
+| **D4** | **How much of §6's contract is in the nightly workflow's scope?** The workflow itself is assigned — a separate agent is building it, carrying D1's TCG shard and its cache-writer constraint. What is not settled is whether that agent also owns §6.3's reader obligation (a nightly red files or updates a `src/redlist.rs` row) and §6.1's duration merge, without which the withheld labels stay frozen and the tier cannot close downward. | A tier with a workflow and no reader is still a bin, so this is a coverage call rather than a scheduling one. |
 | **D5** | **Sweep the real-time rule across the rest of the fast tier now, or wait?** `src/tiers.rs` records the sweep as pending. §5.3 says it removes exactly the three standing flakes from the merge button; it will also relegate more tests, and every one of them lands in a tier with no reader until D4 is answered. **The two are coupled and the order matters.** | A coverage trade. |
-| **D6** | **Does the class in §3.4 get an owner?** `control-regs-bench` exists and has never been run on silicon, and no automated gate can produce or refute that class. The answer is either "metal, on a cadence somebody owns" or "nothing, declared". | Metal time is his. |
 | **D7** | **Which substrate levers, in which order?** §2.7 says the mtime fingerprint (−185 s, already filed) then a pinned prebuilt image (−64 s); build-once is +124 s of solo latency for −41 min of runner time and should wait. A pinned image is also a new registry artifact, which is a dependency-bar question (`specs/issues/build/nothing-checks-the-dependency-bar.md`). | The dependency bar is his, and so is the ordering against everything else in flight. |
 
 ### What this document deliberately does not propose
@@ -1029,3 +1131,7 @@ sentences.
 - **No new required check.** §2.9's vendor line and §6.3's redlist obligation are
   both advisory by construction. A required check whose verdict is a lottery, or
   whose input is a nightly job's mood, is the thing §1's second clause forbids.
+  D1 moves the required set in the other direction, from five to four.
+- **No metal session is scheduled here.** §3.4 writes the doctrine and opens the
+  checklist with the one measurement that is owed; when the T14 is next in front
+  of somebody is the owner's, as it has always been.

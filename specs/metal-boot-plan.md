@@ -20,6 +20,17 @@ two full metal boots and annotated with what ToyOS drives and what it skips. Rea
 it before planning any driver. It also answers, for M5, where the touchpad's I2C
 controller is not.
 
+**What a session owes before it starts is `specs/testing-strategy.md` §3.4.** The
+owner ruled on 2026-08-12 that a defect class whose observable exists only on
+silicon is owned by the metal track rather than by any gate — neither accelerator
+can produce the observable, so there is no automation to write — and that each
+such class carries a named entry on a session checklist. That checklist is in
+§3.4, and its first entry is a measurement this machine already owes: one boot
+with the `no-ap-control-regs` actuator armed against one without, on the same
+image in the same session, the delta recorded, and
+`specs/issues/kernel/ap-control-registers-inherit-init.md` closed with the two
+numbers in it.
+
 ## Starting position (verified 2026-07-30 — re-verify before acting, this ages)
 
 - **Display is already fine, and as of `06ce633` that is measured rather than
