@@ -685,7 +685,7 @@ fn kernel_features(
 ) -> String {
     let mut features: Vec<&str> = Vec::new();
     if debug {
-        features.push("debug-wait");
+        features.push(DEBUG_KERNEL_BUILD);
     }
     // A parameter names an actuator, and only a kernel compiled with them can
     // be told to arm one. This is the whole of what `--kernel-param` decides
@@ -755,6 +755,22 @@ fn declared_kernel_features(root: &Path) -> Vec<String> {
 /// second spelling of this set would be a second kernel and nothing would say
 /// so.
 pub const TEST_KERNEL: &[&str] = &["boot-actuators", "test-actuators"];
+
+/// Kernel builds the ordinary test suite is allowed to make.
+pub const TEST_SUITE_KERNEL_BUILDS: [&str; 3] =
+    ["", "boot-actuators,test-actuators", "fpu-save-nothing"];
+
+/// The kernel build used only by the harness's interactive debugger.
+pub const DEBUG_KERNEL_BUILD: &str = "debug-wait";
+
+/// Whether the test harness's current mode declares this kernel build.
+pub fn harness_kernel_build_is_declared(features: &str, debug_wait: bool) -> bool {
+    if debug_wait {
+        features == DEBUG_KERNEL_BUILD
+    } else {
+        TEST_SUITE_KERNEL_BUILDS.contains(&features)
+    }
+}
 
 /// Every actuator `kernel/src/actuator.rs` declares, read out of the file that
 /// declares them.
@@ -1424,6 +1440,26 @@ mod tests {
             kernel_key("test-actuators"),
             "the key ignores the features, so it cannot tell two kernels apart"
         );
+    }
+
+    /// Interactive debug mode deliberately builds one variant the ordinary
+    /// suite does not, and the mode bit must not become a blanket exemption.
+    #[test]
+    fn debug_mode_declares_only_its_debug_kernel() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let debug = kernel_features(root, true, &[], &[]);
+        assert_eq!(debug, DEBUG_KERNEL_BUILD);
+        assert!(!TEST_SUITE_KERNEL_BUILDS.contains(&debug.as_str()));
+        assert!(harness_kernel_build_is_declared(&debug, true));
+        assert!(!harness_kernel_build_is_declared(&debug, false));
+        assert!(!harness_kernel_build_is_declared(
+            "fpu-save-nothing,debug-wait",
+            true
+        ));
+        for suite_build in TEST_SUITE_KERNEL_BUILDS {
+            assert!(harness_kernel_build_is_declared(suite_build, false));
+            assert!(!harness_kernel_build_is_declared(suite_build, true));
+        }
     }
 
     /// **An actuator is a boot parameter and never a kernel build.**

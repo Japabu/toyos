@@ -83,3 +83,73 @@ those separately today, so the pairing is available. **Whatever it becomes it
 still has to be exactly two, still `Running`, and still fail if a recovery is
 missing**; the point is to stop counting a device the injection never touched,
 not to loosen the count.
+
+## Two more occurrences, on two unrelated PR branches
+
+Neither below touches `tests/common/usb.rs` or `kernel/src/drivers/xhci/`, so
+this is the same defect the section above already explains, not a new one —
+recorded because a branch-independent recurrence is itself evidence, and
+because the second one changes what "`ALONE: red again`" had been read to mean.
+
+**2026-08-10, PR #22 (`wt/toyos-endow`), run `31424496450` attempt 1, job
+`93586744461` ("guest (5)"), sha `73d0761b`.** The wide run failed this shape at
+20:35:41Z:
+
+```
+FAIL xhci_hid_break: 3 endpoint(s) were found Running after the break, want 2:
+["[kernel 2.592 cpu1] xHCI: slot 1 endpoint 3 is Running, recovering",
+ "[kernel 2.880 cpu1] xHCI: slot 1 endpoint 4 is Running, recovering",
+ "[kernel 3.758 cpu0] xHCI: slot 1 endpoint 3 is Running, recovering",
+ "[kernel 4.364 cpu0] xHCI: slot 2 endpoint 3 is Running, recovering"]
+```
+
+The harness's re-run-alone then failed too, at 20:38:43Z, but on a **different**
+assertion — the shape `specs/issues/build/parallel-tests-red-under-other-suites.md`
+already records on the dev host, here for the first time on CI:
+
+```
+FAIL xhci_hid_break: with the break staged at the fourth completion, after the
+device had been delivering, input never came back: no pointer event moved by
+(2560, -1920); deltas seen: [(256, 256), (256, 256)] — the boot-time tablet is
+absolute, so a relative move can only have come from the mouse that was
+plugged in
+```
+
+The harness printed `ALONE xhci_hid_break: red again — the defect is real.`
+and its `failures:` summary quoted the *first* (wide-run) message, because that
+line always carries the original failure text regardless of what the alone
+re-run actually hit. Read literally, "red again" here does not mean the same
+assertion fired twice — it means the test failed twice, on two different
+assertions, in the same job.
+
+**2026-08-12, PR #35 (`codex/debug-wait-census`), run `31601325987`, job
+`94129283847` ("guest (5)"), sha `d522424e`.** Both the wide run (51 s) and the
+alone re-run (9 s) failed on the byte-identical endpoint-count message:
+
+```
+FAIL xhci_hid_break: 3 endpoint(s) were found Running after the break, want 2:
+["[kernel 2.591 cpu0] xHCI: slot 1 endpoint 3 is Running, recovering",
+ "[kernel 3.175 cpu0] xHCI: slot 1 endpoint 4 is Running, recovering",
+ "[kernel 4.051 cpu0] xHCI: slot 1 endpoint 3 is Running, recovering",
+ "[kernel 4.660 cpu0] xHCI: slot 2 endpoint 3 is Running, recovering"]
+```
+
+This is the first recorded case of the isolated re-run reproducing this exact
+assertion rather than going green (as both `main` occurrences did) or landing
+on the other shape (as the Aug-10 occurrence did). A 9 s alone run is fast
+enough that host contention is not a candidate explanation for this instance —
+whatever stages the disk's transport break here is not timing-sensitive in the
+way the earlier occurrences suggested.
+
+## What these two add
+
+Four branches now (`main` twice, `wt/toyos-featcollapse` via run `31405969578`
+above, `wt/toyos-endow`, `codex/debug-wait-census`), none of which touch the
+test or the xHCI driver, confirms the shape is a property of the test's
+assertion and the boot-disk recovery path, not of any one branch's diff. The
+open question this leaves for whoever picks it up: is the count-any-dci-3 test
+assertion simply wrong (the fix `tests/common/usb.rs` needs), or does the boot
+disk's transport recovery have a timing dependency on the HID recovery path
+that a correct test would also want to catch? This write-up does not take a
+side — a recovery-path defect and a wrong test expectation both explain what
+was seen, and settling it is out of scope for the branches that found it.
