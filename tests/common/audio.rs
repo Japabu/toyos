@@ -341,8 +341,8 @@ pub fn wrong_pitch(wav: &Wav) -> Option<String> {
 
 /// Underrun histogram keyed by gap length in device periods (rounded,
 /// min 1): `gaps[n]` = number of mid-signal silent runs of ~n×2.902ms. This is
-/// the unit the scheduler-core migration gates on (spec §11 gate A): stages
-/// 1-6 must not regress the recorded baseline; Stage 7 requires zero.
+/// the unit gate A's thorough tier compares against the recorded sample in
+/// `tests/audio-baseline.toml` (specs/testing-strategy.md §5).
 pub fn gap_histogram(analysis: &Analysis, sample_rate: u32) -> BTreeMap<u32, u32> {
     let mut gaps = BTreeMap::new();
     for run in &analysis.underruns {

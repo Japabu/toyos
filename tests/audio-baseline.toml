@@ -1,5 +1,5 @@
 # Audio gate (gate A) baselines — one section per (test, smp) config.
-# specs/scheduler-core-spec.md §11, specs/audio-subsystem-spec.md §5.4/§5.9,
+# specs/testing-strategy.md §5, specs/audio-subsystem-spec.md §5.4/§5.9,
 # specs/assessments/audio-glitch-distribution-2026-07-28.md.
 #
 # Every config must appear here. A missing section is a hard error, not a
@@ -199,7 +199,7 @@
 #   What it CANNOT certify: any statement about a rate. One run is one sample.
 #
 # THOROUGH TIER — `cargo test --test toyos-build -- --audio-gate 30`, ~17 minutes.
-#   What a scheduler-migration stage transition gates on (spec §11 gate A).
+#   What the nightly runs (specs/testing-strategy.md §5).
 #   N iterations of all four configs; every per-run outcome becomes a rate or a
 #   distribution, and the fresh sample is compared against the RECORDED SAMPLE
 #   below — Mann-Whitney for the counters, Fisher exact for the yes/no

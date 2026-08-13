@@ -1,8 +1,8 @@
 # ToyOS Scheduler Core — Technical Specification
 
-Replacement for `kernel/src/scheduler.rs`. Codename `toyos-sched`. This spec is the synthesis of
-three competing designs and three judge reports; it is the authoritative design for the rewrite.
-The concurrent stabilization track keeps the current scheduler alive until the cutover stage.
+Codename `toyos-sched`: the scheduling core the kernel and a host simulator both drive.
+`kernel/src/scheduler.rs` is the kernel-facing API over it; `kernel/src/sched/` is the driver
+half.
 
 ## 1. Goals and the prime directive
 
@@ -25,8 +25,8 @@ The concurrent stabilization track keeps the current scheduler alive until the c
 
 ## 2. Bug-class ledger (evidence → mechanism)
 
-Every class is empirical — from the crash dossier (`scratchpad/crash.md`) and the verified wake
-machinery audit. CT = compile-time impossible, RT = runtime fail-fast, SIM/LOOM = explored.
+Every class is empirical — from the crash dossier and the wake-machinery audit. CT = compile-time
+impossible, RT = runtime fail-fast, SIM/LOOM = explored.
 
 | # | Bug (observed) | Today's mechanism | Fate in this design |
 |---|---|---|---|
@@ -39,7 +39,7 @@ machinery audit. CT = compile-time impossible, RT = runtime fail-fast, SIM/LOOM 
 | B7 | RT wake does not preempt promptly (up to 10 ms); broadcast kick IPIs | no wake→preempt path | **Protocol + SIM**: claim-then-post wake, targeted IPI, pass at IRQ exit (§7.4); invariant I4 |
 | B8 | Silent wake drops on event-queue overflow (`EVENT_QUEUE_SIZE`) | fixed-size per-CPU queues | **CT**: intrusive embedded mailbox nodes — overflow has no representation (§7.2) |
 | B9 | Scheduler untestable off-target; panic recursion destroyed the crash evidence | logic interleaved with hardware | **Architecture**: sans-IO core crate + deterministic sim + loom (§10); panic-reentry hardening in the driver (§9.4) |
-| B10 | DLL fed drain-time, not IRQ-time timestamps; completion delivery quantized to 10 ms | ISR sets a flag; drain_events stamps later | **Front-loaded fix**: per-CPU IRQ ring with IRQ-time timestamps, landed under the OLD scheduler (§11 Stage 2) |
+| B10 | DLL fed drain-time, not IRQ-time timestamps; completion delivery quantized to 10 ms | ISR sets a flag; drain_events stamps later | **Front-loaded fix**: per-CPU IRQ ring with IRQ-time timestamps (`kernel/src/irq_ring.rs`, §8.6) |
 
 ## 3. Architecture overview
 
@@ -106,7 +106,8 @@ kernel/src/sched/                # driver half; kernel/src/scheduler.rs survives
   payload.rs                     # KernelPayload/ThreadSched — the kernel's SchedPayload
   waitqs.rs                      # WaitQueue instances owned by pipe/futex/listener/audio/io_uring/hid/net
 kernel/src/hw.rs                 # KernelHw: LAPIC one-shot (TSC-deadline later), targeted x2APIC.
-                                 # At kernel/src/, NOT kernel/src/sched/ — §11 Stage 6 has this right
+                                 # At kernel/src/, NOT kernel/src/sched/: it is the machine surface,
+                                 #   implementable before anything names a task (§10.1)
 ```
 
 ARM64 portability: only `hw.rs` implementors and `driver.rs` asm are arch-specific (GIC timer,
@@ -297,13 +298,6 @@ from `with_cpu` indexing by the *calling* CPU's own id, plus the `IN_PASS` reent
 safety comment at `:104` states exactly that, and `CpuSched` being `!Sync` is what stops
 anything inside escaping by another route.
 
-> This section previously read "There is **no global array of `CpuSched`** — a `static` of a
-> `!Sync` type does not compile." The conclusion the reader draws — that the compiler is
-> holding this invariant — is wrong, and it is the kind of wrong that stops people checking.
-> An `unsafe impl Sync` is exactly how a `!Sync` type goes in a `static`. What actually holds
-> it is `with_cpu` + `IN_PASS`, and those are runtime checks that a future edit can break
-> silently.
-
 `driver::with_cpu(f)` panics on reentry (`IN_PASS` — the typed replacement for `IN_SCHEDULE`;
 a nested pass is a bug, not a deferral).
 
@@ -337,7 +331,7 @@ impl<'c, X> SchedPass<'c, X, Undisposed> {
     pub fn begin(cpu: &'c mut CpuSched<H::Payload>, env: Env<'e, H, P>, now: Nanos) -> Self;
     // `Env.steal` is a runtime FIELD, not a cfg — whether an idle pass probes and a
     // loaded pass answers (§7.7, §9.4's pull half). A field so that both settings stay
-    // compiled and simulatable; Stage 7a shipped with it false and 7b turned it on.
+    // compiled and simulatable.
 
     // Exactly one disposition; each consumes the pass:
     pub fn dispose_yield(self)                     -> SchedPass<'c, X, Disposed>;
@@ -397,8 +391,8 @@ special-cased unlock tail (the `loader.rs` `scheduler_unlock` path is deleted).
 4. **Kick IPI** (targeted x2APIC vector): handler sets `need_resched` only; the pass runs at IRQ
    exit. Broadcast kicks are gone.
 
-IRQ handlers never touch `CpuSched`. They may only: push records into driver-owned rings (§11
-Stage 2's `irq_ring`), call the wake entry (§8), and set `need_resched`. This is what makes
+IRQ handlers never touch `CpuSched`. They may only: push records into driver-owned rings
+(`irq_ring`, §8.6), call the wake entry (§8), and set `need_resched`. This is what makes
 `&mut CpuSched` sound with IRQs enabled.
 
 ### 6.4 The lock-across-switch tripwire
@@ -423,19 +417,17 @@ Every kernel `Lock` guard increments the preempt count, so *calling the schedule
 any spinlock panics immediately at every present and future call site*. Runtime, but exhaustive —
 it uses the counter every lock already maintains. Combined with §6.2 this closes B2 twice over.
 
-**Landed, with two corrections learned by doing**, recorded in the scheduler
-migration log kept during the cutover — folded into git history once it
-landed, not a live file:
+Two things the assert needs that do not follow from the rule alone:
 
-1. `SCHED_BASELINE` is two constants, not one. A syscall or fault handler runs one level deep
-   for its whole body; the deferred-preempt poll runs past that level, at zero. Both were
-   measured, not derived.
-2. The assert has a prerequisite the spec did not state: the preempt count must be *conserved*
-   across a context switch, which it was not. Contexts owe different numbers of `enable`s, so the
-   depth belongs to the context — `KernelCtx` carries it and `Hw::switch` swaps it with the
-   per-CPU word.
+1. The baseline is two constants, not one: `BASELINE_TRAP` (1) for a syscall or fault handler,
+   which runs one level deep for its whole body, and `BASELINE_IRQ_EXIT` (0) for the
+   deferred-preempt poll, which runs past that level. Both are measured, never derived.
+2. The preempt count must be *conserved* across a context switch. Contexts owe different numbers
+   of `enable`s, so the depth belongs to the context — `KernelCtx` carries it and `Hw::switch`
+   swaps it with the per-CPU word.
 
-Wake paths and the panic-path exit `schedule_no_return` do not assert; the log says why.
+Wake paths and the panic-path exit `schedule_no_return` do not assert, and
+`kernel/src/scheduler.rs` says why at each of them.
 
 ## 7. Cross-CPU messages
 
@@ -595,15 +587,11 @@ environment's finalize sink instead, which runs once per task and after the payl
 Deleted wholesale: `KILLED[16]`, `mark_killed`'s 16-concurrent-retire panic, `WAKE_TRANSITS`,
 `TransitGuard`, `scan_remove`, poison-set rescheduling filters.
 
-Panic recovery leaves through `scheduler::schedule_no_return()` (`kernel/src/scheduler.rs:449`).
-
-> This paragraph used to say recovery "marks the kill bit and abandons via
-> `driver::abandon_current()`". **Neither half is true and neither ever was.**
-> `abandon_current` does not exist anywhere in the tree outside this line and §12's table;
-> `mark_kill` has zero kernel callers (`toyos-sched` uses it internally from `waitq.rs`, and
-> the simulator calls it). The faulted context dies through an ordinary `Running → Dead`
-> transition on its own CPU. A reader implementing panic recovery from this section would go
-> hunting for a mechanism that was never built.
+Panic recovery leaves through `scheduler::schedule_no_return()` (`kernel/src/scheduler.rs:449`);
+the faulted context dies through an ordinary `Running → Dead` transition on its own CPU. Neither
+`mark_kill` nor an `abandon_current` mechanism is involved — `mark_kill` has zero kernel callers
+(`toyos-sched` uses it internally from `waitq.rs`, and the simulator calls it), and no
+`abandon_current` exists anywhere in the tree outside §12's table.
 
 ### 7.7 StealRequest node recycling
 
@@ -738,10 +726,7 @@ second time, and every pass that ends a park has to retire both copies; the one 
 standing — a CPU reporting a deadline nothing will fire, indistinguishable from health to
 `sched::dump` and to anything else that reads it. `earliest_deadline` and `next_due` scan
 `parked`, which is O(parked-on-this-CPU) and sits on the pass path; the number that would change
-this decision is a machine with hundreds of threads blocked on one CPU, and it is not this one
-(the scheduler migration log recorded the `DeadlineHeap`/`DeadlineOracle`
-removal this cost bought and the same reversal number; it is git history now,
-not a live file).
+this decision is a machine with hundreds of threads blocked on one CPU, and it is not this one.
 
 Fire path: pass start walks for a due entry → CAS `Blocked(c) → WakeQueued(c)` *locally*. CAS
 success → the owner wakes it with `WakeReason::Timeout` (dequeue from its waitq under the leaf
@@ -781,7 +766,7 @@ pub struct BoostWindow { pub until: Nanos }
 - Expiry is a **time bound**, not "until next block": `preempt`/`park` clear `inherited` when
   `now >= until`. This upgrades today's unbounded "spinning boosted client keeps RT forever" hole
   into the spec's ~one-period bound. Sim invariant I9.
-- **The bound is on time *held*, not on wall clock since the lend** (amended 2026-07-29). A task
+- **The bound is on time *held*, not on wall clock since the lend.** A task
   waiting in a run queue holds no priority, so queue time spends none of the window: `dispatch`
   **arms** it — a window already lapsed when the task is picked is re-armed to `now + QUANTUM_NS`
   — and `preempt`/`park` clear it as above. The pick does **not** check it and never demotes a
@@ -829,7 +814,7 @@ pub struct BoostWindow { pub until: Nanos }
 | waitpid / join / sleep | `waitq::wake_direct(&shared, cause, ..)` | zombify / timer |
 
 IRQ timestamps are recorded **at IRQ time** in the ring entry and ride the wake into the CQE —
-the audio DLL gets hardware-completion time, not drain time (B10; front-loaded, §11 Stage 2).
+the audio DLL gets hardware-completion time, not drain time (B10).
 
 ## 9. Fairness: policy relocated, not changed
 
@@ -859,9 +844,11 @@ per-thread EEVDF with weight division — a fairness *policy* change bundled int
 cutover would confound the audio glitch A/B. Policy upgrades (true EEVDF virtual-deadline
 ordering) are later, sim-gated, `queue.rs`/`fair.rs`-only changes.
 
-`min_vruntime` frontier: global `AtomicU64` `fetch_max` at dispatch — kept identical through
-cutover for attributability, replaced by a per-CPU frontier in a **scheduled, sim-gated stage**
-(§11 Stage 9), not an open-ended "later".
+`min_vruntime` frontier: global `AtomicU64` `fetch_max` at dispatch. Replacing it with a per-CPU
+frontier whose epoch reconciliation rides the `Adopt` messages (§11) is gated on I5's fairness
+bounds against the global-frontier reference across `fairness_storm` at 1–128 vcpus, and on
+I13 — whose reach falls as the machine widens, so `SweepResult::thread_coverage_pct` is read
+beside that verdict and never the verdict alone.
 
 ### 9.2 Ordering, RT band, quanta
 
@@ -873,14 +860,6 @@ thread has to land *behind* its equal-vruntime siblings, or the same thread can 
 and the others only run when it blocks. `queue.rs:18-24` carries this next to the field.
 Related: `pop_surplus` takes the *last* fair task (`keys().next_back()`), so a steal never
 hands away the next-to-run one.
-
-> This section previously specified `BTreeMap<(u64, TaskKey), ReadyTask>` and called it
-> "today's ordering, deliberately". That is not the ordering the code uses, so anyone
-> implementing from the old text would have written something else. An interim correction
-> then justified the rule by saying an identity tie-break *starves siblings* — measurement
-> says it does not, for the reason set out below. **The rule was right and the reason was
-> wrong**, which is the harder failure to catch: a correct rule with a false justification
-> survives review, and gets discarded the moment someone tests the justification.
 
 **What that rule is worth today is smaller than the paragraph above reads, and it is now
 measured rather than asserted.** The share's pot is charged for every nanosecond any of its
@@ -965,13 +944,11 @@ pub trait Hw: Machine {                         // the two members that name a t
 }
 ```
 
-**Why three traits and not one** (settled at stage 6, against the kernel). `switch` and `release`
-are the only members that need `Payload`, and the kernel has no `SchedPayload` until the cutover —
-so a single trait would have made stage 6's whole purpose, meeting real interrupts before anything
-depends on the surface, impossible to reach without importing stage 7's task record. `Kicker` was
-already this split's first cut. `idle_wait` splits for the same reason: its `SleepToken` is
-unforgeable outside a `SchedPass`, so a stage-6 driver could never call it; the token is proof,
-`halt` is the effect, and separating them is what let the halt ship a stage early.
+**Why three traits and not one.** `switch` and `release` are the only members that need
+`Payload`, so a driver implements `Kicker` and `Machine` — and meets real interrupts — without
+naming a task at all. `idle_wait` splits for the same reason: its `SleepToken` is unforgeable
+outside a `SchedPass`, so the token is the proof and `halt` is the effect, and a `Machine`
+implementor can perform the effect without being able to construct the proof.
 
 **`irq_guard` has no user in either world, and its RAII shape is wrong for the site this spec
 named for it.** The kernel's pre-halt recheck must *set* IF on both exits — the halt exit because
@@ -1020,8 +997,8 @@ max pass duration as the on-target counterpart.
 ### 10.4 Shared trace format and QEMU replay
 
 `TraceEvent` (schedule, wake, block, park-commit, migrate, adopt, retire, idle-enter/exit, IRQ,
-timer-fire) is defined once in `hw.rs`. **One vocabulary, two representations** — settled at
-stage 6. `hw::TraceEvent` is the vocabulary: a closed Rust enum the sim holds by value and asserts
+timer-fire) is defined once in `hw.rs`. **One vocabulary, two representations.**
+`hw::TraceEvent` is the vocabulary: a closed Rust enum the sim holds by value and asserts
 on, with no layout guarantee, so it cannot be what goes on the wire. `kernel/src/trace.rs`'s
 `Record` is the wire form: `repr(C)`, 24 bytes, hand-fixed discriminants, because its readers are
 `memory read` in LLDB and `replay --from-qemu`, neither of which can parse a Rust enum.
@@ -1065,62 +1042,21 @@ The simulator proves that the protocol above linearizable primitives keeps I1–
 schedules. Neither overpromises: loom does not scale to the whole scheduler; the sim does not
 model weak memory.
 
-## 11. Migration plan — always-green stages
+## 11. Migration state
 
-**Current state: stage 7c is done** — the legacy scheduler body is deleted and the kernel runs
-on `toyos-sched` exclusively; stages 8 (consolidation) and 9 (the scale stage) are open.
-
-Gate legend: **B** = `cargo run -- --build-only` clean; **T** = `cargo test` (QEMU integration,
-run in background per CLAUDE.md, full output read; includes gate A's **fast tier**); **A** =
-gate A's **thorough tier**, `cargo test --test toyos-build -- --audio-gate 30`, ~17 min, at `-smp 1` and `-smp 8`;
-**H** = host `cargo test -p toyos-sched` incl. loom; **S** = sim corpus + seed sweep green.
-
-**Honest baseline for gate A** (rewritten 2026-07-28 after the distribution was measured; the
-original text here assumed a per-run histogram comparison would work). A single audio run is one
-Bernoulli trial against a 0–7% per-config dropout rate: it reds an unmodified tree on 12.8% of
-invocations and cannot see a doubling of that rate. **No stage may be gated on it.** The gate is
-therefore two-tiered, and only the thorough tier states anything about a rate:
-
-- **Fast tier** (inside every `cargo test`): instrument-alive checks and a *confirmed* harm bar —
-  a mid-tone gap or a period submitted with no client audio re-boots once, and only a second
-  occurrence fails. The per-run counter ceilings are measured and printed here but decide
-  nothing (owner's ruling, 2026-08-04; `tests/audio-baseline.toml` documents it). Certifies
-  that this build is not catastrophically broken. Certifies no rate.
-- **Thorough tier** (`--audio-gate N`, what **A** means in the table): N iterations of all four
-  configs, every per-run outcome converted to a rate or a distribution and compared against the
-  recorded 30-run sample in `tests/audio-baseline.toml` — Mann-Whitney for soundd's counters,
-  Fisher exact for the yes/no outcomes. At N=30 it detects a 25% shift in wake lateness 99.9% of
-  the time, a 5% drop in soundd's wake count 99.9%, and a 10× rise in the dropout rate 100%,
-  with a 0.25% false-red rate on a clean tree.
-
-What it still cannot do: resolve a **doubling of the dropout rate**. Separating 3% from 7% at
-this confidence needs ~600 runs per config, five hours per config, and no choice of N a human
-waits for changes that. The audible symptom is the weak instrument; soundd's counters are the
-strong one, and they are strong because they fire on every run. Stage 7 keeps the strict target —
-**zero mid-playback gaps** — as the *recorded rate going to zero*, not as one green run.
-
-| Stage | Content | Gate |
-|---|---|---|
-| 0 | **Harness first.** Finish and land the in-flight audio glitch test (`tests/common/audio.rs`, `audio_tone*` bins): wav-backend QEMU + tone + n×2.902 ms zero-run scan; record the baseline histogram. Scaffold `toyos-sched` + `sim` packages (empty logic). | B, T, A(baseline) |
-| 1 | **Policy extraction.** Move fairness math into `fair.rs` (`FairShare`, lag clamp, frontier, constants); old `scheduler.rs` calls it, semantics unchanged. Pure relocation, rebase-friendly with the stabilization branch. | B, T, A, H |
-| 2 | **IRQ ring under the old scheduler** (standalone win, B10). Per-CPU `irq_ring` of `(IrqSourceId, ts)` with **IRQ-time timestamps**; ISRs push + set `need_resched`; old `drain_events` consumes the ring; audio completion records carry IRQ-time stamps end-to-end (`kernel/src/audio.rs`). Kill the single `COMPLETION_TS`. | B, T, A (DLL fed real completion times) |
-| 3 | **Primitives + loom.** `mailbox.rs` (incl. preempt-disabled push), `waitq.rs` (state word, ticket, wake_one retry), sleep handshake, retire CAS. Kernel untouched. | H (all loom suites) |
-| 4 | **Core machine + simulator + validation gate.** `cpu.rs`, `queue.rs`, `timer.rs`, `invariants.rs`; VM, ChoiceStream (seed/fuzz/PCT), shrinker, replay emitter, corpus. Scenarios: crash_md_exit_race, the five lost-wake windows, idle_hlt_race, rt_wake_latency, audio_pipeline (soundd-shaped RT daemon + hog + clients, `cpus=1` first-class), futex/fork storms. **Exit criterion: `old_steal_port` fails; new protocol passes 10⁴ seeds + 10⁷ fuzz steps per scenario class with zero violations.** | H, S |
-| 5 | **Per-source WaitQueue conversion under the OLD scheduler** — one green commit per source: pipes, futex (delete `FUTEX_WAKE_GEN` + `FUTEX_LOCK` dance), listener, audio fd, io_uring, join (`wake_task`). Each site adopts the `prepare_wait`/`cancel`/`block_on` shape via a shim that parks in the existing pool; the shim generalizes the IoUring-only `handle_outgoing` recheck into one `ticket.fired()` recheck applied to **every** converted source after pool insertion. *Honesty note:* this closes each source's practical decide-to-park window via the recheck; the structural (message-serialized) closure lands at Stage 7 — the claim "window closed" is scoped accordingly. | B, T, A per commit |
-| 6 | **KernelHw under the old scheduler.** ✅ Done. `kernel/src/hw.rs` implements `Machine` (not `Hw` — see §10.1; it gained `Hw` at 7a, and today implements `Kicker`, `Machine` and `Hw`); `arm_one_shot`/`stop_timer`/`kick_cpu`/`now`/idle `hlt`/`need_resched` and the trace ring route through it. Broadcast kicks were already dead: `kick_cpu` had been a targeted ICR since before this stage, and the two surviving broadcasts (`tlb_shootdown`, `halt_all_cpus`) are not on the scheduler path. De-risked the surface on real interrupts before cutover, and caught one real regression doing it (see §10.1 and the accounting note in `run_task_on_self`). | B, T, A |
-| 7 | **Cutover, sub-staged** (each sub-stage boots and gates): **7a** ✅ Done — percpu `CpuSched`, driver idle loop + asm switch + trampoline, park-before-switch, message wakes, with `StealRequest`/balance **disabled** via `Env::steal` (wake-time push placement only). Scope correction learned by doing: 7a cannot leave the legacy body compiled, because the kernel builds with `-D warnings` and dead code is an error — so it deleted everything the cutover orphaned and 7c inherits only `EventSource`/`source_ready` and `Lock::force_unlock`. `retire_task` stayed synchronous (post `Msg::Retire`, then yield until the word reads `Dead`) because process teardown frees memory the target's page tables still map. **7b** ✅ Done — `Env::steal` on, so an idle pass probes and a loaded pass answers from surplus; and `retire_task` posts its message and then *parks*, on a wait queue owned by the target's own `TaskHandle` and woken by `Hw::release`. The wait condition moved from "the word reads `Dead`" to "the payload has been dropped", which is what the callers need and what `Dead` never guaranteed — it is published one pass earlier, while the dying CPU is still on that thread's kernel stack. §7.6's `notify` field was deliberately not added: a running target dies at a later safe point, so the notify would need stashing for whichever site kills it, and `Hw::release` already is that single site on the kernel side. Measured result, honestly: 7b moved **none** of the smp=8 counter breaches 7a was red on, and the same wake-lateness outlier occurs at `-smp 1`, so §9.4's pull half is not what that tail was about — see the known-issue entry in CLAUDE.md. **7c** ✅ Done — the legacy body is gone: `handle_outgoing`, `park_outgoing`, `finish_fresh_thread_switch`, `wake_by_event`/`EventSource`, `drain_events`, `PERCPU_EVENTS`, `IN_SCHEDULE`, `KILLED`, `CTX_TRANSITS`, `CpuQueueGuard::into_raw`, `Lock::force_unlock`, `loader.rs` trampoline unlock, global blocked pool, `sched_state` map — most died at 7a (dead code is a build error, so the cutover deleted what it orphaned), the rest (`EventSource` → `io_uring::Source`, `source_ready` → `Source::is_ready`, `Lock::force_unlock`) at 7c. **Correction: `POISONED` was *not* deleted** — this list said it was. It is live panic-recovery machinery: `scheduler.rs:398` declares it, `:402`/`:418` use it, and `driver.rs:568` reaps it every idle-loop iteration. Only the *scan* died. A reader taking this list literally would delete working code. `SHARES` (`scheduler.rs:96`) likewise still exists. `scheduler.rs` is **not** removed: it survives as the kernel-facing API with the driver half under `kernel/src/sched/` — the accepted divergence recorded in the scheduler migration log, now git history rather than a live file. The §6.4 preempt-count baseline asserts did **not** land at any sub-stage; they landed after 7c as their own task, and closing them first required making the preempt count conserved across a switch (§6.4, and that log). | B, T, **A(strict)** per sub-stage, S |
-| 8 | **Consolidation.** Remove shims (callers hold `WaitQueue`s directly, converging on io_uring-only blocking); privilege-gate `SYS_SET_RT_PRIORITY`; wire sim fuzz into CI (fixed corpus + N seeded runs, seeds logged; nightly long fuzz with auto-minimized corpus PRs); panic-path reentry flag hardening; update CLAUDE.md architecture + `specs/issues/`. | B, T, A, H, S |
-| 9 | **Scale stage (sim-gated).** Per-CPU vruntime frontier with epoch reconciliation piggybacked on Adopt messages (replaces the global `fetch_max`) — gated on I5 fairness bounds vs the global-frontier reference across FairnessStorm at 1–128 vcpus — and on I13's, with the caveat that **I13's reach falls with width** (96% of executed time at one CPU, 69% at two, 55% at four, 45% at eight, because threads exit at slightly different moments and unbalance a wide machine sooner), so at the widths this stage targets it certifies less than half the run and `SweepResult::thread_coverage_pct` has to be read beside its verdict; TSC-deadline `set_timer`; 128-vcpu sim sweeps as the standing scheduling-overhead benchmark; QEMU `-smp` sweep. | B, T, A, S |
-
-Every stage leaves the tree shippable. Stage 7a is the only large diff, and it lands against a
-simulator that has already refused the old bug classes and a per-source conversion that already
-shrank the cutover surface to the machinery itself.
-
-**Scoped out — dual-scheduler feature flag** (Design 1's Stage 2/3): maintaining two schedulers
-plus an `EventSource` compat registry across several stages buys bisectability that Stages 5–7a
-already provide with less standing surface: the per-source conversions are individually
-revertable, and 7a/7b/7c are each a bootable bisection point. Zero-legacy principle: we do not
-carry a parallel old world one stage longer than the conversion requires.
+The kernel runs on `toyos-sched` exclusively, through stage 7c: every piece of legacy machinery
+this design replaces is deleted, `kernel/src/scheduler.rs` survives as the kernel-facing API and
+`kernel/src/sched/` is the driver half. `SYS_SET_RT_PRIORITY` is retired at number 96, its
+authority now `SYS_RT_ENTER` gated on `Rights::RT`. The host gate is `cargo test --manifest-path
+toyos-sched/Cargo.toml` — the workspace's default members are the core, the simulator and the loom
+package — run in CI by `.github/workflows/host-tests.yml`; it carries the four loom suites, the
+corpus replays, budgeted seed and fuzz-byte sweeps, and nine negative gates against two controls.
+Stage 4's full exit criterion, `toyos-sched-sim gate 10000` and `fuzz-sweep 10000000`, runs from
+the CLI and no workflow invokes it. The scale stage (9) is open: the vruntime frontier is one
+global `AtomicU64` advanced by `fetch_max` rather than per-CPU with epoch reconciliation (§9.1),
+`Machine::set_timer` arms the LAPIC one-shot rather than `IA32_TSC_DEADLINE`, and
+`scenarios::all()` carries `fairness_storm` only at widths 1 and 2 — wider runs are
+`fairness_storm:<cpus>` from the CLI. Stage-by-stage history is `git log`.
 
 ## 12. Failure-mode table
 
@@ -1173,7 +1109,11 @@ today's contract.
 9. **Per-thread EEVDF / weight-division fairness at cutover** (Design 1): policy change bundled
    into machinery replacement; discards the just-debugged stored-lag semantics. Deferred to a
    sim-gated policy stage.
-10. **Dual-scheduler feature-flag coexistence**: see §11 scope-out.
+10. **Dual-scheduler feature-flag coexistence**: two schedulers plus an `EventSource` compat
+    registry buy bisectability the per-source conversions and the sub-staged cutover already
+    provide with less standing surface — each conversion is individually revertable and each
+    sub-stage individually bootable. Zero-legacy principle: we do not carry a parallel old world
+    one stage longer than the conversion requires.
 11. **Enum state field on one task struct**: every invalid transition compiles. Five types give
     each transition a signature.
 12. **`Copy`/bitwise-movable task records**: address instability made raw pointers across
@@ -1193,15 +1133,11 @@ today's contract.
   measured by sim latency histograms before any tuning.
 - **`SpinSmall` per `FairShare`**: a process with hundreds of threads bounces one line —
   acceptable now; shardable later behind the same API.
-- **Stage-5 shim fidelity**: the transitional `ticket.fired()` recheck had to be reviewed
-  per source; the shim (`kernel/src/waitq.rs`) died with the 7a cutover, so this risk is
-  retired.
 - **Kernel preempt-off sections** bound RT wake latency exactly as today; `KernelSection` budgets
   make the bound visible in sim, and kernel check builds assert max pass duration — but the
   budget numbers themselves need empirical calibration on TCG vs KVM vs hardware.
-- **Glitch-gate dependence on the stabilization track**: Stage 7's strict gate assumes the audio
-  userland (soundd DLL fixes) is healthy enough that remaining gaps are scheduler-attributable;
-  if not, Stage 7 gates on the sim's `audio_pipeline` scenario plus non-regression, and the
-  strict wav gate moves to Stage 8.
+- **Glitch-gate attribution**: gate A can charge a remaining gap to the scheduler only while the
+  audio userland is healthy enough that nothing else explains it. When it is not, a scheduler
+  change is judged on the sim's `audio_pipeline` scenario plus non-regression instead.
 - **PCID/INVPCID and TSC-deadline untestable under TCG** (known issue): the `Hw` seams keep both
   CPUID-gated with fallbacks; needs KVM/bare-metal validation.

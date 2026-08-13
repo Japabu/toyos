@@ -1537,8 +1537,8 @@ const TONE_MIN_ACTIVE_SECS: f64 = 2.5;
 /// signal path is broken even if technically "active".
 const TONE_MIN_PEAK: i32 = 4000;
 
-/// Recorded per-(test, smp) baselines — the scheduler-core migration's gate A
-/// (specs/scheduler-core-spec.md §11). Two independent instruments per config:
+/// Recorded per-(test, smp) baselines — gate A's thorough tier
+/// (specs/testing-strategy.md §5). Two independent instruments per config:
 /// the wav underrun histogram (`gaps`, keyed by gap length in device periods)
 /// and ceilings on soundd's own counters. The wav is a rare-event detector;
 /// the counters fire on nearly every run and carry the statistical power. Both
@@ -2028,8 +2028,8 @@ fn rate_verdict(
 }
 
 /// Thorough tier — N iterations of all four configs, gating on *rates* and
-/// *distributions* rather than on single outcomes. This is what a
-/// scheduler-migration stage transition must pass (spec §11 gate A).
+/// *distributions* rather than on single outcomes. The nightly runs it
+/// (specs/testing-strategy.md §5).
 ///
 /// Certifies, at N=30 and the measured clean-tree distributions:
 ///   * wake lateness has not shifted by 25% (detected 99.9% of the time) or
