@@ -509,7 +509,7 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("i8042_budget_expiry", Sched::Parallel, Tier::Nightly),
     ("i8042_fadt_denial", Sched::Parallel, Tier::Fast),
     ("i8042_kbd_echo", Sched::Parallel, Tier::Fast),
-    ("i8042_undecoded_bytes", Sched::Parallel, Tier::Fast),
+    ("i8042_undecoded_bytes", Sched::Parallel, Tier::Nightly),
     // Its verdict is a cadence, and its absence is the assertion — both read
     // off the guest's own `last byte at Nms` stamps. The gap it injects is
     // 3 s against a 500 ms period, so six periods of margin decide whether the

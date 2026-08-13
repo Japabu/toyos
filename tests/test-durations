@@ -182,7 +182,7 @@ i8042_keyboard 94611
 i8042_mouse 2053
 i8042_no_spurious_wake 5019
 i8042_quarantine 9355
-i8042_undecoded_bytes 9477
+i8042_undecoded_bytes 10328
 idle_stack_guard 52822
 input_merge 4452
 io_uring_cancel_wakes 522

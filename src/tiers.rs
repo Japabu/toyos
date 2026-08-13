@@ -8,10 +8,10 @@
 //! [`RELEGATED`] is exactly the set the nightly job selects, and `tests/toyos.rs`
 //! writes [`Tier::Nightly`] against each of those names in its own registration.
 //!
-//! **This is interim and it is a loss.** Fifty-five registered tests have a CI
+//! **This is interim and it is a loss.** Fifty-six registered tests have a CI
 //! execution over the line (loaded audio and ordinary `audio_tone` each have two
 //! measured SMP labels), and six more ride a shared boot with one that is.
-//! Between them they account for 4,105.7 s of the effective 4,439.1 s CI
+//! Between them they account for 4,116.0 s of the effective 4,439.9 s CI
 //! profile, and none is gated per pull request. `guards` on every row says what
 //! stopped being gated, because a run that quietly does less is the whole
 //! failure mode here — `specs/test-cost-audit.md` §7 is the long form.
@@ -614,6 +614,16 @@ pub const RELEGATED: &[Relegated] = &[
                  underrun ceilings, with a harm verdict confirmed by a second boot before it \
                  fails. `audio_tone_load` runs the same check with two busy-spin burners \
                  added and was already Nightly.",
+    },
+    Relegated {
+        test: "i8042_undecoded_bytes",
+        ci_ms: 10_328,
+        why: Why::Cost,
+        guards: "A staged Pause keystroke decodes to zero events across its whole six-byte \
+                 sequence, and the driver's report names the undecoded byte rather than only \
+                 a count; a plain letter typed afterward proves the verdict revises instead \
+                 of freezing on the half-arrived sequence — the ambiguity the T14's own \
+                 `1 interrupts, 1 bytes, 0 keys` verdict could not resolve.",
     },
 ];
 
