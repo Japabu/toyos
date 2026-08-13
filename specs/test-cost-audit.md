@@ -2015,9 +2015,8 @@ the flashed one.
 ci path. the nightly may be slower because of tcg and because of long running
 tests like the audio one and stress tests."** The fast per-PR path therefore
 runs tests taking ten seconds or less, and everything above it goes to a
-manually invoked nightly tier. The command exists now; scheduled CI is separate,
-unassigned work tracked by
-`specs/issues/build/nightly-tier-has-no-workflow.md`. This section is the "write
+nightly tier, reachable manually through `--nightly` and, since 2026-08-12,
+scheduled every night by `.github/workflows/ci.yml`. This section is the "write
 it down" half. It is the record the owner reads to decide whether the interim is
 acceptable, so it names every test by what the tree loses while that test is not
 gated per pull request — not by what the test does.
@@ -2059,8 +2058,8 @@ better than a nightly job.
   duration job, so the merge button cannot ignore the measurement; it does not
   depend on a filtered unit-test name that could match zero tests.
 - `cargo test --test toyos-build -- --nightly` runs them manually. It is also
-  the flag the future scheduled workflow takes; that workflow is still open in
-  `specs/issues/build/nightly-tier-has-no-workflow.md`.
+  the flag `.github/workflows/ci.yml`'s `03:00 UTC` schedule takes, which
+  `specs/testing-strategy.md` §5 is the contract for.
 - **Every run says what it held back**, by name, in the header and again above
   the result line, and the result line itself carries `N held back for the
   nightly tier` — which is the line CI's per-shard job summary extracts.
