@@ -20,6 +20,13 @@ two full metal boots and annotated with what ToyOS drives and what it skips. Rea
 it before planning any driver. It also answers, for M5, where the touchpad's I2C
 controller is not.
 
+**The session checklist.** A session walks this table before anything else. An
+entry names a measurement, not a topic, and names what closes it.
+
+| # | measurement | closes |
+|---|---|---|
+| 1 | one boot with `no-ap-control-regs` armed against one without, same image, same session; record the delta | `specs/issues/kernel/ap-control-registers-inherit-init.md` |
+
 ## Starting position (verified 2026-07-30 — re-verify before acting, this ages)
 
 - **Display is already fine, and as of `06ce633` that is measured rather than
