@@ -29,6 +29,14 @@ on:
       ref:
         description: branch to run against
         required: false
+  # `03:10 UTC` — `ci.yml`'s nightly is `03:00`, `host-tests.yml`'s is `03:05`;
+  # this stays clear of both. `specs/testing-strategy.md` §5 names gate A's
+  # thorough tier as part of what the nightly runs; nothing scheduled it until
+  # now. A `schedule` event carries no `inputs`, so `iterations` below falls
+  # back to the same 30 `workflow_dispatch` already defaults to — the N=30
+  # thorough configuration the two jobs below run against `main`.
+  schedule:
+    - cron: '10 3 * * *'
 
 concurrency:
   group: gate-a-${{ github.ref }}
@@ -91,11 +99,12 @@ jobs:
             | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # **This workflow builds no toolchain and never waits for one.** It is
-      # dispatch-only, so by the time anyone runs it the branch has been through
-      # `toolchain.yml` on its pull request; a missing release is a mistake about
-      # which ref was dispatched, and the script says so rather than sitting in
-      # a loop.
+      # **This workflow builds no toolchain and never waits for one.** A
+      # dispatch runs after the branch has already been through
+      # `toolchain.yml` on its pull request; a scheduled run targets `main`,
+      # whose own push already triggers `toolchain.yml`. Either way a missing
+      # release is a mistake about which ref was dispatched or a race with
+      # that push, and the script says so rather than sitting in a loop.
       - name: install the toolchain
         env:
           GH_TOKEN: ${{ github.token }}
@@ -103,10 +112,15 @@ jobs:
 
       # The host conditions line every run prints is the point of running it
       # here, so nothing is captured away from it.
+      #
+      # `inputs.iterations || '30'`: a `schedule` event carries no `inputs` at
+      # all, where `workflow_dispatch`'s `required: true, default: '30'` always
+      # populates it, so the fallback is reached only on the trigger that has
+      # no other way to say 30.
       - name: gate
         run: |
           cargo test --test toyos-build -- \
-            --audio-gate ${{ inputs.iterations }} \
+            --audio-gate ${{ inputs.iterations || '30' }} \
             --shard ${{ matrix.shard }}/2 --host-slots 0 2>&1 | tee /tmp/gate-a.log
           exit "${PIPESTATUS[0]}"
 
@@ -117,3 +131,32 @@ jobs:
           name: gate-a-shard-${{ matrix.shard }}
           path: /tmp/gate-a.log
           retention-days: 30
+
+  # **A nightly red must surface somewhere a human actually looks**, the same
+  # reason `ci.yml`'s `nightly-red` and `host-tests.yml`'s `nightly-red-host`
+  # exist. Only on `schedule`: a `workflow_dispatch` of this workflow is
+  # somebody watching the run directly.
+  #
+  # Named `nightly-red-gate-a`, not `nightly-red`: a job id becomes a check
+  # run name, and `ci.yml` already has a job called `nightly-red` — two jobs
+  # sharing that id across workflows would produce two check runs under one
+  # context.
+  nightly-red-gate-a:
+    needs: [gate]
+    if: ${{ !cancelled() && github.event_name == 'schedule' && needs.gate.result != 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: file or update "nightly is red"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_RESULT: ${{ needs.gate.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          export TITLE="nightly is red"
+          export BODY="Run: $RUN_URL"$'\n'"Failed jobs: gate-a($GATE_RESULT)"
+          .github/nightly-red.sh
