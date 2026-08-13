@@ -1,20 +1,19 @@
 name: toolchain
 
-# A toolchain is 1.1 GB of product out of an hour of x.py, and it is a function
-# of the rust fork plus the three trees that end up inside the sysroot — which
-# is `toolchain::witness`'s own question, asked of git so a shell can ask it
-# too. Nearly every branch changes none of them and this workflow does nothing.
+# A toolchain is a function of the rust fork plus the three trees that end up
+# in the sysroot — `toolchain::witness`'s own question, asked of git so a
+# shell can ask it too. Nearly every branch changes none of them and this
+# workflow does nothing.
 #
-# **Its own workflow because it must never be cancelled.** `ci.yml` cancels a
-# superseded run by design; a second push during an hour-long bootstrap would
-# throw that hour away and the next run would start it again.
-
-# **On pull requests too, and that is not optional.** `ci.yml` waits up to two
-# hours for the release keyed on the four trees it is about to build against, and
-# a branch is no longer pushed *and* opened as a pull request — it is one event.
-# A branch that changes one of those trees and never got a `push` event would
-# have every shard wait that out and then fail. A pull-request checkout is the
-# merge of head and base, which is the commit `ci.yml` keys on, so the two agree.
+# Its own workflow because it must never be cancelled: `ci.yml` cancels a
+# superseded run by design, and a second push during an hour-long bootstrap
+# would throw that hour away.
+#
+# Runs on pull requests too: `ci.yml` waits up to two hours for the release
+# keyed on the four trees it is about to build against, and a branch that
+# changed one of them but never got a bare `push` event would wait that out
+# and fail. A pull-request checkout is the merge of head and base, the same
+# commit `ci.yml` keys on.
 
 on:
   push:
@@ -78,12 +77,11 @@ jobs:
           git submodule update --init rust
           echo "SUBMODULE-SECONDS: $(( $(date +%s) - t0 ))"
 
-      # GITHUB_ACTIONS=true puts bootstrap on its own CI path, where it assumes
+      # `GITHUB_ACTIONS=true` puts bootstrap on its own CI path, which assumes
       # HEAD is a PR merge commit and takes HEAD^1 as the upstream commit whose
-      # LLVM to fetch. In this fork HEAD^1 is our own merge of upstream, which
-      # rust-lang CI never built: four 404s and `failed to download llvm from
-      # ci`. Unset, it walks back to a real bors commit as it does on the dev
-      # host.
+      # LLVM to fetch; in this fork HEAD^1 is our own merge of upstream, which
+      # rust-lang CI never built. Unset, bootstrap walks back to a real bors
+      # commit as it does on the dev host.
       - name: build
         id: build
         if: steps.have.outputs.build == 'yes'
@@ -95,14 +93,10 @@ jobs:
           df -h /
           du -sh rust/build
 
-      # **The first error, on the run's own front page.** The real failure of
-      # pull request #22 was four lines of `error[E0433]` among four
-      # pre-existing std warnings, an hour into a 2,300-line log, and reaching
-      # it took `gh run view --log-failed | grep`. The build system now stops on
-      # the first compile error rather than 83 seconds later on a missing file
-      # (`src/toolchain.rs`), so the two lines worth lifting out are that error
-      # and the panic that ended the run.
-      - name: what failed
+      # The first compile error and the panic that ended the run, lifted onto
+      # the run's own front page rather than left for `gh run view --log-failed`
+      # to find inside an hour-long log.
+      - name: compile error
         if: failure() && steps.build.outcome == 'failure'
         run: |
           {
@@ -142,14 +136,12 @@ jobs:
             /tmp/toyos-toolchain.tar.zst \
             || gh release view "${{ steps.key.outputs.tag }}"
 
-      # **A release without its asset is not a publication, and the line above
-      # cannot tell that from being second.** `create` makes the release and
-      # then uploads 401 MiB to it, so a failed upload leaves a tag that answers
-      # 200 and nothing to install — while this job reports success, which is
-      # the verdict `ci.yml` reads to decide that thirteen shards may start. The
-      # wait is for the *other* branch's upload, in the idempotent case the
-      # `||` above exists for.
-      - name: the artifact is on the release
+      # `create` makes the release and then uploads to it, so a failed upload
+      # leaves a tag that answers 200 with nothing installable — and this job
+      # reporting success either way is the verdict `ci.yml` reads before
+      # starting the shards. The wait here is for the *other* branch's upload,
+      # in the idempotent case the `publish` step's `||` exists for.
+      - name: release asset
         if: steps.have.outputs.build == 'yes'
         env:
           GH_TOKEN: ${{ github.token }}
