@@ -109,7 +109,7 @@ Slot size is per-client: `client_period_bytes = client_period_frames × client_f
 
 Available for soundd to read: `write_idx - read_idx`. Available for client to fill: `slot_count - (write_idx - read_idx)`.
 
-Slot count is the device's DMA buffer count — `TX_INFLIGHT_MAX = 8` (`kernel/src/drivers/virtio_sound.rs:175`), passed through as `num_buffers`. The client ring is therefore exactly as deep as the DMA pipeline, which is what §5.10 relies on: a client that kept up costs no silence at all during a drain. One slot is always the one soundd is reading, so a client can fill **7 ahead**.
+Slot count is the device's DMA buffer count — `toyos_abi::virtio_sound::PERIODS = 8`, the same 8 the HDA backend uses — passed through as `num_buffers`. The client ring is therefore exactly as deep as the DMA pipeline, which is what §5.10 relies on: a client that kept up costs no silence at all during a drain. One slot is always the one soundd is reading, so a client can fill **7 ahead**.
 
 Total per client: `128 + N × client_period_bytes`. Allocation is `SharedMemory::allocate`, which goes through `alloc_shared` to the kernel's page allocator — and ToyOS maps 2 MiB pages only, so **every client costs one 2 MiB page** regardless of how little of it the ring uses. That is the unit to reason about for per-client cost, not the ring's nominal size.
 
@@ -138,7 +138,7 @@ client:          │          signal ── wake ── fill slots ── done
 
 soundd signals clients **before** reading their slots, then waits briefly (one period duration) for them to fill. The kernel's priority inheritance mechanism ensures that when soundd (running at real-time priority) blocks on the client's response, the client thread is temporarily boosted to soundd's priority level. This guarantees the client gets scheduled immediately — even on a single CPU with many runnable threads — and fills its slots within the deadline.
 
-Each cycle, soundd consumes all available client slots (up to however many DMA buffers are free). With 4 slots, the client can fill up to 3 slots ahead. When soundd wakes and finds 2 DMA completions, it consumes 2 client slots — both have real audio, no silence padding needed. If a client misses the deadline, soundd proceeds with whatever is in the ring (possibly silence) and moves on. No client can stall the pipeline.
+Each cycle, soundd consumes all available client slots (up to however many DMA buffers are free). With 8 slots, the client can fill up to 7 slots ahead. When soundd wakes and finds 2 DMA completions, it consumes 2 client slots — both have real audio, no silence padding needed. If a client misses the deadline, soundd proceeds with whatever is in the ring (possibly silence) and moves on. No client can stall the pipeline.
 
 ## 5. soundd
 
@@ -146,9 +146,7 @@ soundd is a privileged userspace daemon. It is the sole owner of the audio hardw
 
 ### 5.1 DLL Timer Scheduling
 
-soundd wakes on **both** the DMA completion interrupt and a DLL-predicted timeout, and the interrupt is the primary edge. Every cycle it arms an io_uring poll on the audio device (`poller.poll_add(&audio_dev, IORING_POLL_IN, TOKEN_AUDIO)`, `userland/soundd/src/main.rs:710`) and then waits with the DLL's prediction as the *timeout*. The delay-locked loop predicts when each DMA period will complete; that prediction is the backstop for a completion that does not arrive, not the thing that normally wakes the process.
-
-> This paragraph used to say soundd "does not wake directly on DMA completion interrupts". That was true of an earlier design and is backwards for the shipped one. It stopped being true at `aeeaa01`: `tests/audio-baseline.toml` records the reason — a timer racing completions it received no CQE for produced an unexplained second timing mode (three runs at 22-33ms), and waking on the IRQ removed the mechanism.
+soundd wakes on **both** the DMA completion interrupt and a DLL-predicted timeout, and the interrupt is the primary edge. Every cycle it arms an io_uring poll on the audio device (`poller.poll_add_fd(backend.handle(), IORING_POLL_IN, TOKEN_AUDIO)`, `userland/soundd/src/main.rs:1030`) and then waits with the DLL's prediction as the *timeout*. The delay-locked loop predicts when each DMA period will complete; that prediction is the backstop for a completion that does not arrive, not the thing that normally wakes the process.
 
 The DLL works as follows:
 
@@ -274,7 +272,7 @@ Transitions:
 
 The idle predicate is "no client streams", not "all clients silent": a paused client (§6.4) resumes by writing shared memory, which produces no kernel event soundd could block on, so suspending under an open stream would leave soundd with no wake edge. A paused client keeps the device hot; that is correct.
 
-The grace between the drain completing and the STOP is a policy constant in soundd (`SUSPEND_AFTER_DRAIN_NANOS`), currently zero: virtio STOP does not RELEASE — stream parameters and the prepared state survive, resume is one control verb inline with the first submit — so there is no codec pop or renegotiation for grace to amortize. A hardware backend that pops on stop is the one event that justifies a nonzero value, implemented as a clock comparison at the idle wakes that still arrive during the drain — never an armed timer.
+The grace between the drain completing and the STOP is zero, unconditionally, and that is policy — like `refill_floor_nanos` (§5.10) — not physics: virtio STOP does not RELEASE — SET_PARAMS and PREPARE stay valid and resume is one control verb inline with the first submit — so there is no codec pop or renegotiation for grace to amortize. A hardware backend that pops on stop is the one event that would justify a nonzero grace, implemented as a clock comparison against a drain timestamp at the idle wakes that still arrive while buffers play out — never an armed timer, which would put a periodic wake back into the idle path this state exists to empty.
 
 While SUSPENDED, soundd holds zero timers and takes zero wakes; its CPU cost is exactly zero until a client connects.
 
@@ -312,13 +310,11 @@ The audio subsystem must produce glitch-free audio on a single-CPU system runnin
 
 On a single CPU, steps 6-7 happen sequentially — each client fills its slots and blocks, yielding the CPU to the next boosted client or back to soundd. The total client fill time is bounded: N clients × callback_time. As long as this fits within one period, no underruns occur.
 
-**Priority inheritance is implemented.** `Pipe::rt_boost_pending` (`kernel/src/pipe.rs:105-109`) records that an RT thread wrote to a pipe; the next thread to consume data claims the boost (`:192-193`), which covers the case the wake-time boost in `wake_pipe_readers` misses. `set_rt_boost_pending` is at `:246`.
-
-> This paragraph used to describe a "fallback without priority inheritance" in which soundd ran "a larger slot count (8 slots)" as a "degraded mode". No such mode ever existed. The ring *is* 8 slots, but because that is the device's DMA pipeline depth (§4.1), not because anything is degraded — a reader comparing the two would conclude the shipped system is in the fallback, which it is not.
+**Priority inheritance is implemented.** `Pipe::rt_boost_pending` (`kernel/src/pipe.rs:153`) records that an RT thread wrote to a pipe; the next thread to consume data claims the boost (`:263-264`), which covers the case the wake-time boost in `wake_pipe_readers` misses. `set_rt_boost_pending` is at `:320`. There is no fallback mode without it: the ring is 8 slots because that is the device's DMA pipeline depth (§4.1), the same 8 in every configuration.
 
 **Deferral: what soundd does when a client is mid-refill.** The mix loop may hold a free buffer back for a client that has not finished filling, rather than mixing without it — this is what keeps a slow client from becoming a hole in the output, and it is the fix for the ring-depth dropout class.
 
-It is bounded, and the bound is policy rather than physics — the same standing as the kernel's `MAX_USER_STR`. soundd defers only while at least `refill_floor_nanos = 5 × period_nanos` of unplayed audio is still on the wire: of the pipeline's 8 periods it will spend at most 3 waiting for a client and always keeps 5 in reserve. `assert!(num_buffers > 5, "soundd: pipeline too shallow to defer safely")` (`userland/soundd/src/main.rs:581`) refuses to run the policy on a pipeline that cannot afford it.
+It is bounded, and the bound is policy rather than physics — the same standing as the kernel's `MAX_USER_STR`. soundd defers only while at least `refill_floor_nanos = 5 × period_nanos` of unplayed audio is still on the wire: of the pipeline's 8 periods it will spend at most 3 waiting for a client and always keeps 5 in reserve. `assert!(num_buffers > 5, "soundd: pipeline too shallow to defer safely")` (`userland/soundd/src/main.rs:891`) refuses to run the policy on a pipeline that cannot afford it.
 
 The floor cannot be derived from worst-case wake lateness: the recorded worst exceeds two whole pipeline depths (`tests/audio-baseline.toml`), so no floor *inside* the pipeline covers it. Move the number only with a full re-baseline.
 
@@ -351,9 +347,9 @@ cpal is the client-side audio library. Applications link against cpal and provid
 
 ### 6.1 Stream Creation
 
-1. Connect to soundd via the service registry
+1. Connect to soundd (`endow::service("soundd")`)
 2. Send `MSG_STREAM_OPEN` with the requested sample rate, channels, and format
-3. Receive `MSG_STREAM_OPENED` from soundd containing the shared memory token, signal pipe read fd, the client's negotiated period size in frames, and the slot count
+3. Receive the shared memory and signal pipe handles, then `MSG_STREAM_OPENED` giving the client's negotiated period size in frames and the slot count
 4. Map the shared memory
 5. Spawn the stream thread
 
@@ -399,15 +395,15 @@ If a client's callback exceeds the deadline, soundd's wait expires and it procee
 
 ### 7.1 Stream Open
 
-1. Client connects to soundd via the service registry
+1. Client connects to soundd (`endow::service("soundd")`)
 2. Client sends: `MSG_STREAM_OPEN { sample_rate, channels, format }`
 3. soundd computes the client's period size: `ceil(device_period_frames × client_rate / device_rate)`
 4. soundd allocates shared memory (header + slot_count × client_period_bytes), creates a signal pipe, adds the client to the active list with gain 0.0
-5. soundd responds: `MSG_STREAM_OPENED { shm_token, signal_pipe_read_fd, client_period_frames, slot_count, device_sample_rate, device_channels }`
+5. soundd responds: the shared memory and the signal pipe's read end, as handles sent ahead of the frame, then `MSG_STREAM_OPENED { client_period_frames, client_period_bytes, device_sample_rate, device_channels, slot_count }`
 6. Client maps the shared memory and begins its stream thread
 7. soundd begins gain ramp from 0.0 to 1.0 (§5.5)
 
-soundd allocates the shared memory because it knows both the device parameters and the client's requested format, which together determine the slot size. The slot count is determined by soundd based on system load and the client's latency class (default: 4).
+soundd allocates the shared memory because it knows both the device parameters and the client's requested format, which together determine the slot size. The slot count is the device's DMA buffer count (§4.1) — not requested by the client and not a function of system load.
 
 ### 7.2 Stream Close
 
@@ -450,9 +446,9 @@ The kernel exposes audio hardware to userspace through a uniform interface, inde
 - **Completion notification:** kernel signals userspace via io_uring poll when one or more buffers finish playback. Userspace reads a completion record containing the buffer index bitmask and a monotonic timestamp (nanos_since_boot at interrupt time) for DLL synchronization.
 - **DMA shared memory:** a physically contiguous memory region mapped into both kernel and userspace, containing the DMA buffers. soundd writes mixed audio directly into these buffers before submission.
 
-### 9.2 Driver Trait
+### 9.2 Driver interface
 
-Each sound card driver implements:
+The kernel has no `dyn` audio-driver object: `virtio_sound` and `hda` are two modules with the same shape, selected by an enum match at each call site (`kernel/src/device.rs`, `kernel/src/io_uring.rs`). Each backend implements the same operations:
 
 | Operation | Description |
 |---|---|
