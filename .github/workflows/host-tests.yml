@@ -1,22 +1,16 @@
 name: host tests
 
-# Everything that needs no ToyOS toolchain and boots no guest, so it answers
-# before the toolchain job has finished restoring one.
+# The host suites (specs/testing-strategy.md §2): everything that needs no
+# ToyOS toolchain and boots no guest, so it answers before the toolchain job
+# has finished restoring one.
 #
-# macOS because the dev host is macOS and because `toyos-fat32` still builds its
-# volumes with `newfs_msdos` and `hdiutil` — the *judge* is ours now
-# (`toyos-fat32-check`, written from fatgen103), so that is the only macOS-only
-# thing left here and the only reason this job is not on Linux.
-
-# **And once a night, `03:05 UTC`** — the nightly tier's stated scope is "tcg +
-# long-running tests like audio + stress" (the owner), and this job runs the
-# same host suite every push already runs; nightly's value here is one more
-# data point taken at a time nothing else is queued for it, not new coverage.
-# Five minutes behind `ci.yml`'s `03:00 UTC`, though that offset does not keep
-# the two scheduled runs from racing to open `nightly-red`'s standing issue —
-# each files only after its own workflow's jobs finish, which differ by whole
-# workflow durations, not five minutes. `nightly-red.sh`'s find-by-title
-# idempotency is the actual guard against a duplicate.
+# macOS because the dev host is macOS and `toyos-fat32` still builds its
+# volumes with `newfs_msdos` and `hdiutil` — the judge is ours now
+# (`toyos-fat32-check`), so that is the only macOS-only thing left here.
+#
+# `03:05 UTC`, five minutes behind `ci.yml`'s `03:00`; `nightly-red.sh`'s
+# find-by-title idempotency, not the offset, is what guards against the two
+# scheduled runs racing to open the same standing issue.
 on:
   push:
     branches: [main]
@@ -26,9 +20,7 @@ on:
     - cron: '5 3 * * *'
 
 # The nightly run gets its own group, same reason as `ci.yml`'s: a push to
-# `main` at `03:07` has no business being cancelled by, or waiting behind, a
-# scheduled run that only exists because nothing else was competing for the
-# runner.
+# `main` must not be cancelled by, or wait behind, a scheduled run.
 concurrency:
   group: host-tests-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   cancel-in-progress: true
@@ -106,9 +98,9 @@ jobs:
             | tee -a /tmp/host.log
 
       # Fifteen `cargo test` invocations in three steps, and a red is one line
-      # somewhere among them. The summary is what a reader sees before opening
-      # anything: which crate, and the first thing that failed in it.
-      - name: what failed
+      # somewhere among them; the summary names which crate and the first
+      # thing that failed in it.
+      - name: failure summary
         if: failure()
         run: |
           {
@@ -120,15 +112,10 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # The same standing issue `ci.yml`'s `nightly-red` files or updates, and the
-  # same reason: a scheduled red must surface somewhere a human looks rather
-  # than in a workflow-failure email nobody here reads. Only on `schedule` — a
-  # dispatched run is somebody watching it directly.
-  #
-  # Named `nightly-red-host` and not `nightly-red`: a job id becomes a check
-  # run name, and `ci.yml` already has a job called `nightly-red` — two jobs
-  # sharing that id across workflows would produce two check runs under one
-  # context.
+  # The same standing issue `ci.yml`'s `nightly-red` files or updates. Only on
+  # `schedule` — a dispatched run is somebody watching it directly. Named
+  # `nightly-red-host`, not `nightly-red`: a job id becomes a check run name,
+  # and two jobs sharing one id across workflows would collide under it.
   nightly-red-host:
     needs: [host]
     if: ${{ !cancelled() && github.event_name == 'schedule' && needs.host.result != 'success' }}
