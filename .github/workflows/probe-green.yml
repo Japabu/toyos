@@ -1,7 +1,8 @@
 name: green-probe
 
 # Counts a named test's red rate: ten reps, one `cargo test` per name per job
-# so a stall in one costs the others nothing (specs/ci-plan.md §9.1, §10.9).
+# so a stall in one costs the others nothing
+# (specs/assessments/ci-plan-assessment-2026-08.md §9.1, §10.9).
 # The current name list answered its question there; `git log` on this file
 # has each prior target. `specs/issues/hardware/metal-sim-pointer-churn-red-again-on-main.md`
 # is the open question this shape is next aimed at — edit the name list below

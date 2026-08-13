@@ -109,5 +109,5 @@ one crate of the 176 `eprintln!` sites in `userland/`, `compositor: ready` and
 
 The general fix belongs in `toyos/`, and the reason it was not put there is
 worth knowing: `toyos/src` is one of the four trees in the content-addressed
-toolchain witness (`specs/ci-plan.md` §3), so touching it rebuilds the sysroot
+toolchain witness (`specs/testing-strategy.md` §9), so touching it rebuilds the sysroot
 and `--pr` refuses a branch that mixes it with other work.

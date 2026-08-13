@@ -7,9 +7,10 @@ name: gate A, thorough
 # Same `debian:sid`/QEMU 11.1.0 container the twelve shards run, since a QEMU
 # version this job does not share with the rest of CI and the dev host would
 # make the one arm that exists to be compared a third instrument
-# (specs/ci-plan.md §7.3, §12.1). What still differs from the dev host,
-# deliberately, is the accelerator (KVM against cross-arch TCG) and the host
-# CPU — the axis this configuration is arranged to isolate (§8).
+# (specs/assessments/ci-plan-assessment-2026-08.md §7.3, §12.1). What still
+# differs from the dev host, deliberately, is the accelerator (KVM against
+# cross-arch TCG) and the host CPU — the axis this configuration is arranged
+# to isolate (specs/testing-strategy.md §2).
 
 on:
   workflow_dispatch:

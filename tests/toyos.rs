@@ -9176,7 +9176,8 @@ fn run_machine_test(
             // is. On a KVM runner it had not — the last two cycles' bindings were
             // still on their way out when the count was taken, and the test read
             // six of eight as a driver that missed them (run `31246245541`,
-            // `specs/ci-plan.md` §7.3). The assertion is the same one; what
+            // `specs/assessments/ci-plan-assessment-2026-08.md` §7.3). The
+            // assertion is the same one; what
             // changed is that a console behind the guest costs wall clock instead
             // of a verdict.
             let bindings = |text: &str| text.matches("merges as source").count();
@@ -11602,7 +11603,8 @@ fn durations_path() -> std::path::PathBuf {
 /// A machine with no measurement at all prices every test the same, and
 /// [`Shard::keep`]'s LPT then degenerates to round-robin — which is what put 191
 /// of 268 tests on one CI shard and cut it off at its job timeout while another
-/// finished in sixteen minutes (`specs/ci-plan.md` §7.2). Every runner is that
+/// finished in sixteen minutes (`specs/assessments/ci-plan-assessment-2026-08.md`
+/// §7.2). Every runner is that
 /// machine on every push, because a fresh clone has no `target/`.
 ///
 /// Measured on a runner rather than here, deliberately: it is read by the

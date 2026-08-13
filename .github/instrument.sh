@@ -1,10 +1,11 @@
 #!/bin/sh
 # What this job is about to measure with, named before it measures anything.
 # Three variables a verdict from this job must be read against
-# (specs/ci-plan.md §2, §7, §7.3): the QEMU version against
-# `.github/qemu-version` — a disagreement reds, since `debian:sid` is a
-# rolling release and the remedy is to record the new version, not to carry
-# on; the host CPU vendor, since `kvm_amd` and `kvm_intel` are both in play
+# (specs/assessments/ci-plan-assessment-2026-08.md §2, §7, §7.3): the QEMU
+# version against `.github/qemu-version` — a disagreement reds, since
+# `debian:sid` is a rolling release and the remedy is to record the new
+# version, not to carry on; the host CPU vendor, since `kvm_amd` and
+# `kvm_intel` are both in play
 # and not selectable; and whether `/dev/kvm` is there, the only difference
 # between a `guest` shard and the `tcg` canary.
 #
@@ -32,10 +33,10 @@ echo "cpu: ${cpu:-unknown}, $cores core(s)"
 
 if [ "$have" != "$want" ]; then
   echo "::error::this job runs QEMU '${have:-$first}' and .github/qemu-version declares $want."
-  echo "::error::specs/ci-plan.md 7.3: the QEMU version decides test outcomes, so a number"
-  echo "::error::taken on one is not a number about the other, and the dev host's baseline is"
-  echo "::error::recorded on $want. debian:sid is a rolling release and this is what it"
-  echo "::error::moving looks like — nothing here is about the tree."
+  echo "::error::specs/assessments/ci-plan-assessment-2026-08.md §7.3: the QEMU version decides"
+  echo "::error::test outcomes, so a number taken on one is not a number about the other, and"
+  echo "::error::the dev host's baseline is recorded on $want. debian:sid is a rolling release"
+  echo "::error::and this is what it moving looks like — nothing here is about the tree."
   echo "::error::The remedy is one line: put the new version in .github/qemu-version, in a"
   echo "::error::commit that says the instrument changed."
   exit 1

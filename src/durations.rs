@@ -16,7 +16,8 @@
 //! property the merged file's usefulness rests on. A repeated name means two
 //! shards claimed one test or one shard ran the same label twice — the first is
 //! exactly the failure
-//! `specs/ci-plan.md` §4 records, three shards of `nvme_` where one test ran
+//! `specs/assessments/ci-plan-assessment-2026-08.md` §4 records, three shards
+//! of `nvme_` where one test ran
 //! twice and one ran nowhere, and all three reported green. A concatenation
 //! cannot see it; this refuses it by name.
 
@@ -171,7 +172,8 @@ fn merged_profile(
 ///
 /// **The other half of the partition, and it was not being checked.** The
 /// merge already refuses any duplicate execution label, including the
-/// `specs/ci-plan.md` §4 defect where two shards claimed one name. From the
+/// `specs/assessments/ci-plan-assessment-2026-08.md` §4 defect where two
+/// shards claimed one name. From the
 /// other side a shard
 /// that measured *nothing* — cancelled at its timeout, or an artifact upload
 /// that failed — leaves eleven files, and merging them wrote a profile missing

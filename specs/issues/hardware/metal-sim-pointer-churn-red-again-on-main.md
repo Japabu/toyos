@@ -32,7 +32,7 @@ Three things separate it from everything already written down.
   during boot:` is the harness reporting that the guest never got as far as the
   test. Whatever the console-ordering fix closed, it was not this.
 - **244 s in the phase on a machine with one guest on it.** CI is `--jobs 1`,
-  one guest per runner (`specs/ci-plan.md` §8), so the dev host's contention
+  one guest per runner (`specs/testing-strategy.md` §2), so the dev host's contention
   reading is unavailable here by construction.
 - **The harness says the classifier cannot help.** `ALONE: GREEN` on a shard is
   two runs of the same width, so the line prints the rate reading rather than

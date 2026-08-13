@@ -92,3 +92,29 @@ anything else.
 - The pull-request gate's wall clock is bounded by its slowest required job.
   Setup cost is attacked before coverage is: a setup cut needs a measurement,
   a coverage cut needs an invariant-level justification.
+
+## 9. CI mechanics
+
+- **The instrument is declared, not read off the image.** `.github/qemu-version`
+  names the one QEMU version every guest — CI's and the dev host's — is
+  measured against. Every gate workflow that boots a guest runs
+  `.github/instrument.sh` after checkout, which prints the version, the host
+  CPU model and whether `/dev/kvm` is present, and reds on a version
+  disagreement; `cargo test --lib` (`src/ci.rs`) refuses a gate workflow that
+  installs QEMU and never runs it. The dev host reads the same declaration and
+  answers a disagreement with a `Note:`, never a refusal — its QEMU moves on
+  its own schedule and a build must not stop for that.
+- **A shard writes only its own name.** The Fast tier's shard partition (§4)
+  is measured against `tests/test-durations`, the profile a machine with
+  nothing measured starts from. A shard writes
+  `test-durations.shard-<i>-of-<n>` and never the committed file itself;
+  `cargo run -- --merge-durations`, run once per CI run over the whole shard
+  set, is the only writer of `tests/test-durations`, and it refuses a name two
+  shards both measured as well as a set missing a shard.
+- **Publishing the toolchain is idempotent.** The release tag is the hash of
+  the four trees that compile into the sysroot — `rust`, `toyos-abi/src`,
+  `toyos/src`, `userland/libc/src` — so two branches carrying the same four
+  trees both build the same tag safely, and being second is not an error. A
+  job that needs the toolchain waits for the *asset* to be attached, not for
+  the release tag to answer: `gh release create` makes the tag before the
+  upload finishes, so a tag that exists is not evidence the asset does.

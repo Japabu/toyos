@@ -10,7 +10,7 @@ tests on PR CI, and run the QEMU suite locally? What is the optimal setup?* This
 document answers it from the instruments' own record. **It proposes; every
 decision point is marked.** Nothing here changes an assertion, a tier or a
 workflow — `specs/assessments/test-cost-audit.md` is what the suite costs,
-`specs/ci-plan.md` is what CI is, and this is the policy those two are evidence
+`specs/assessments/ci-plan-assessment-2026-08.md` is what CI is, and this is the policy those two are evidence
 for.
 
 Every number below came off a command that was run, and the run ids are given so
@@ -54,18 +54,18 @@ verdict is deterministic for its author.**
 
 Two clauses, and they are not the same claim.
 
-- **One owner per class.** `specs/ci-plan.md` §8 already says the dev host and a
+- **One owner per class.** `specs/assessments/ci-plan-assessment-2026-08.md` §8 already says the dev host and a
   CI shard are two instruments and not two readings of one quantity. The goal
   extends that: for every class of defect this tree can suffer, exactly one gate
   is *responsible* for catching it, and that gate's red is the class's alarm.
   Where a class has no owner it is named as unowned rather than left to whichever
   instrument happens to trip over it. The failure this prevents is the one
-  `specs/ci-plan.md` §8.3 records twice — a red read as being about the tree when
+  `specs/assessments/ci-plan-assessment-2026-08.md` §8.3 records twice — a red read as being about the tree when
   it was about the difference between two machines.
 - **A deterministic PR verdict.** A red on a pull request must be a statement
   about the author's diff. A gate that reds at a rate is not a gate; it is a
   coin the author has to flip until it lands, and every flip costs the runner
-  budget that makes the next author wait. `specs/ci-plan.md` §9.2 already sets
+  budget that makes the next author wait. `specs/assessments/ci-plan-assessment-2026-08.md` §9.2 already sets
   this bar — *green means green, red means a real defect, and a re-run tells you
   which* — and records that one run in five is "far above the one in fifty that
   bar treats as tolerable".
@@ -136,7 +136,7 @@ external-dep-fingerprint-is-mtime-not-content issue, since fixed by #37) — eve
 job rebuilds `toyos-ld` from the same sources to the same bytes, the mtime moves,
 and `invalidate_stale` then cleans the kernel, the bootloader, userland and the
 Rust test crates. The eight `external deps changed: cleaning` lines are in shard
-1's own log of run `31601279765`, and `specs/ci-plan.md` §12.5 measured them in
+1's own log of run `31601279765`, and `specs/assessments/ci-plan-assessment-2026-08.md` §12.5 measured them in
 both arms of the cache probe.
 
 ### 2.3 What the nightly relegation actually bought, and what it was advertised as
@@ -179,7 +179,7 @@ The other required checks on the same head, run by run for `31601279765`:
 
 **So a pull request cannot conclude faster than the `host` job no matter what is
 removed from it**, because it is on a macOS runner and is compilation almost end
-to end (`specs/ci-plan.md` §5: 594 s cold, 442 s warm, on a shorter crate list
+to end (`specs/assessments/ci-plan-assessment-2026-08.md` §5: 594 s cold, 442 s warm, on a shorter crate list
 than today's).
 
 **That floor is itself variable and the range is worth stating: 274–580 s over
@@ -207,7 +207,7 @@ own slowest job was 542 s: shards 1, 2, 3, 5, 7, 8 and 11 did not start until
 `codex/debug-wait-census`, `wt/toyos-std` and `wt/toyos-logd` had runs open at
 the same time and a public repository on the free plan runs twenty jobs at once.
 **Queueing cost that pull request ~525 s — more than three times what its entire
-guest gate cost it.** `specs/ci-plan.md` §5 recorded the same effect from the
+guest gate cost it.** `specs/assessments/ci-plan-assessment-2026-08.md` §5 recorded the same effect from the
 other end: a required three-second check queued twenty-two minutes behind twelve
 advisory shards.
 
@@ -271,7 +271,7 @@ clean removes `396 files, 570.5MiB` from `tls-cranelift` alone, plus three more
 crates, and then rebuilds all of it — and the cause was the
 external-dep-fingerprint-is-mtime-not-content issue (since fixed by #37):
 `external_fingerprint` keying on `toyos-ld`'s `len:mtime` when every job rebuilds
-that binary from the same sources to the same bytes. `specs/ci-plan.md` §12.5
+that binary from the same sources to the same bytes. `specs/assessments/ci-plan-assessment-2026-08.md` §12.5
 measured the same eight `cleaning` lines in the *warm* arm of the cache probe, so
 it is unconditional and the restored cache cannot help it.
 
@@ -283,7 +283,7 @@ Critical path today, unqueued: `toolchain-ready` 12 s → slowest guest job 542 
 | lever | critical path | runner time | what it costs |
 |---|---:|---:|---|
 | **Fix the mtime fingerprint** (already filed) | **−185 s** | −185 × 12 = **−37 min** | Nothing. It is a correctness fix that happens to be the largest latency item in CI. |
-| **A pinned prebuilt image on ghcr.io** — QEMU 11.0.3, `rustup`, the six apt packages baked in | **−64 s** (`deps` 56 + `rust` 8) | −64 × 12 = **−13 min** | A registry artifact to build and keep. `specs/ci-plan.md` §11.6 declined this at "53 s of 1,058 is 5%"; at today's 542 s job it is **11.8%**, and §2.8 is the correctness argument that is not about seconds at all. |
+| **A pinned prebuilt image on ghcr.io** — QEMU 11.0.3, `rustup`, the six apt packages baked in | **−64 s** (`deps` 56 + `rust` 8) | −64 × 12 = **−13 min** | A registry artifact to build and keep. `specs/assessments/ci-plan-assessment-2026-08.md` §11.6 declined this at "53 s of 1,058 is 5%"; at today's 542 s job it is **11.8%**, and §2.8 is the correctness argument that is not about seconds at all. |
 | **Build the tree once and distribute it** | **+124 s** (derived) | **−41 min** | It is a *queue* lever wearing a latency lever's clothes — see below. |
 | **Slim the toolchain artifact** | −0 to −5 s | −1 min | 401 MiB already installs in 4–6 s. **Not a lever; do not spend a task on it.** |
 | **Shallower checkout** | 0 | 0 | `actions/checkout@v4` is 2 s. Nothing to win. |
@@ -335,7 +335,7 @@ a latency argument in the first place. §5.4 folds this in.
   buys more and costs less.
 - **More shards.** Already at the floor. 1,646.2 / 12 = 137 s per shard against a
   largest indivisible unit of 166.7 s — the shared boot, which
-  `specs/ci-plan.md` §7.3 measured and declined to split for a different reason.
+  `specs/assessments/ci-plan-assessment-2026-08.md` §7.3 measured and declined to split for a different reason.
   A thirteenth shard buys nothing.
 - **Cutting coverage further.** This is the arithmetic that should settle it. The
   *entire* guest gate is 161 s of the pull request; the 320–340 s of per-shard
@@ -344,7 +344,7 @@ a latency argument in the first place. §5.4 folds this in.
   161 s, the nightly relegation has already spent 206 s of the 367 s that was
   available, and the two substrate levers are worth 249 s.** Substrate work is
   worth more than everything left to cut, and it costs no coverage at all.
-- **Larger runners.** Not purchasable: `specs/ci-plan.md` §9.4 measured three
+- **Larger runners.** Not purchasable: `specs/assessments/ci-plan-assessment-2026-08.md` §9.4 measured three
   larger labels sitting `queued` for thirty minutes against a control that
   finished in four seconds, because the labels do not resolve for a User-owned
   repository. Same cause as D2.
@@ -397,11 +397,11 @@ name going red.
 
 | class | owner | why nothing else can | receipt |
 |---|---|---|---|
-| **Which vendor's reading of an instruction the kernel depends on** — `syscall`/`sysret`, segment loads, `iret`'s privilege checks | **KVM CI** | QEMU's helpers implement Intel's wording, so a TCG guest gives you one vendor and the dev host has no other. The vendor a job draws is a lottery, so the gate is *the matrix*, not one job | `specs/ci-plan.md` §7: `STAR[63:48]` green on the dev host in every run there had ever been; eight EPYC runners lost **64 boots of 64**, two Xeon runners passed. `specs/issues/kernel/sysret-ss-attrs-unfixed.md` |
-| **CPU state leaking between processes at native FPU speed** | **KVM CI** | The x87 `#MF` reproduced 5 of 5 on KVM and never on the dev host; the isolating probe changed one control word and nothing else | `specs/ci-plan.md` §9.3, §10.8; `probe-x87` run `31260763462`, arms `0x037E` 3/3 red and `0x037F` 3/3 green; `src/redlist.rs` rows for `std_unwind`, `std_unwind_so` |
+| **Which vendor's reading of an instruction the kernel depends on** — `syscall`/`sysret`, segment loads, `iret`'s privilege checks | **KVM CI** | QEMU's helpers implement Intel's wording, so a TCG guest gives you one vendor and the dev host has no other. The vendor a job draws is a lottery, so the gate is *the matrix*, not one job | `specs/assessments/ci-plan-assessment-2026-08.md` §7: `STAR[63:48]` green on the dev host in every run there had ever been; eight EPYC runners lost **64 boots of 64**, two Xeon runners passed. `specs/issues/kernel/sysret-ss-attrs-unfixed.md` |
+| **CPU state leaking between processes at native FPU speed** | **KVM CI** | The x87 `#MF` reproduced 5 of 5 on KVM and never on the dev host; the isolating probe changed one control word and nothing else | `specs/assessments/ci-plan-assessment-2026-08.md` §9.3, §10.8; `probe-x87` run `31260763462`, arms `0x037E` 3/3 red and `0x037F` 3/3 green; `src/redlist.rs` rows for `std_unwind`, `std_unwind_so` |
 | **Device races the guest only reaches at native speed** | **KVM CI** | KVM runs the guest ~50× further between the host's two QMP writes. `usb_transport_break` was 5 of 5 red on CI, green on the dev host *and* green under TCG on the same runner image and the same QEMU | `probe-xhci-break.yml` run `31264371902`: control arm 3/3 red, fixed arm 3/3 green, one runner, one session. `specs/issues/hardware/xhci-flap-wedges-under-kvm.md` |
 | **When two runnable tasks first run** | **KVM CI** | Two siblings spawned 1–3 ms apart reach their first line 0.53–0.56 s apart with the order flipping between reps; on the dev host the same pair is ~30 ms apart in spawn order every time, because its TCG runs one vCPU at a time | `specs/issues/hardware/process-start-skew-on-a-runner.md` |
-| **Contention: two guests on one machine, the whole `ALONE: GREEN` class** | **the dev host, loaded** | A shard is one guest per machine at `--jobs 1`. There is never a second guest for the first to contend with, so the class is untestable on a runner *by construction* | `specs/ci-plan.md` §8.2; `specs/issues/build/parallel-tests-red-under-other-suites.md`; nine of the ten dev-host-only red names in `src/redlist.rs` are `Instrument::DevHostLoaded` |
+| **Contention: two guests on one machine, the whole `ALONE: GREEN` class** | **the dev host, loaded** | A shard is one guest per machine at `--jobs 1`. There is never a second guest for the first to contend with, so the class is untestable on a runner *by construction* | `specs/assessments/ci-plan-assessment-2026-08.md` §8.2; `specs/issues/build/parallel-tests-red-under-other-suites.md`; nine of the ten dev-host-only red names in `src/redlist.rs` are `Instrument::DevHostLoaded` |
 | **Concurrent unmaps deadlocking two shootdown initiators** | **the dev host, loaded** — found; **loom** — gated | Every one of the seven wide-phase failures was green run alone. The field signature is not a gate; the gate is the model that replays the schedule | `specs/issues/audio/wide-phase-reds-under-load.md`; `0c79fb5`; loom's `an_initiator_answers_while_it_waits` |
 | **Memory ordering** | **loom, or nobody** | x86's TSO makes every load an acquire and every store a release, so **no guest test on the only architecture ToyOS boots can fail on a missing edge**. `Lock::try_lock` loaded with `Relaxed` and CASed with `Acquire` — no synchronizes-with edge ever formed, through a `Lock<T>` that is `unsafe impl Sync`, at eight call sites | `cdc971d`; the negative control reverts the two tokens and loom reports `Causality violation: Concurrent write accesses to UnsafeCell`. Second instance, `3b3d238`: the log shard's reader accepted an uncommitted record 0 on every shard on every boot |
 | **A device whose emulation declines the feature** | **metal** | QEMU reports zero xHCI scratchpad demand and answers `OP_PAGESIZE` bit 0, so a misaligned scratchpad array overlapping slot 2's output context is green everywhere. Found by reading the code against §4.20, not by a test | `specs/assessments/metal-track-history.md`, "What QEMU structurally could not find", `5bb673c`, `71940c1` |
@@ -446,11 +446,11 @@ the reference boot and the failure was byte-identical to the ones taken at load
 
 ### 3.3 The `tcg` job never named a tree defect, and it leaves the PR path
 
-Searched: `specs/ci-plan.md`, the whole issue estate, `.github/workflows/ci.yml`
+Searched: `specs/assessments/ci-plan-assessment-2026-08.md`, the whole issue estate, `.github/workflows/ci.yml`
 and the git log. **The `tcg` job appears in three roles and none of them is
 "found a defect in the guest".**
 
-- **As a control arm in a probe**, where it earned its keep — `specs/ci-plan.md`
+- **As a control arm in a probe**, where it earned its keep — `specs/assessments/ci-plan-assessment-2026-08.md`
   §7.3's 2×2 isolated `desktop_typing_damage` as the *QEMU version* rather than
   the tree, and the two TCG cells are the strongest thing in that table because
   their boots are the same speed and one is green throughout. But that was a
@@ -465,13 +465,13 @@ and the git log. **The `tcg` job appears in three roles and none of them is
 Its required status rested on the owner's rule — "everything should work under
 emulation and kvm if it doesnt something with the guest is wrong" — and not on a
 caught defect. It was also **the most expensive single required check**: 436 s in
-run `31601279765`, and 624 s cold / 409 s warm in `specs/ci-plan.md` §12.5. Two
+run `31601279765`, and 624 s cold / 409 s warm in `specs/assessments/ci-plan-assessment-2026-08.md` §12.5. Two
 couplings had to be separated before it could move, and the ruling below is what
 separates them: it very nearly *was* a vacuous required check
-(`specs/ci-plan.md` §11.1 — GitHub reads a job skipped by an unmet `needs:` as
+(`specs/assessments/ci-plan-assessment-2026-08.md` §11.1 — GitHub reads a job skipped by an unmet `needs:` as
 satisfied, so it carries `if: always()` and a guard step), and **it is the job
 that writes the `actions/cache` entry the twelve shards only read**, worth
-3,036 s of runner time per run (`specs/ci-plan.md` §12.5). Neither was ever a
+3,036 s of runner time per run (`specs/assessments/ci-plan-assessment-2026-08.md` §12.5). Neither was ever a
 justification for the badge; the second is now an implementation constraint.
 
 **Ruled, 2026-08-12 (D1): the `tcg` job moves to nightly and leaves the
@@ -491,7 +491,7 @@ day. It is a queue lever.
 
 **And it carries one implementation constraint, which is the finding above read
 forward.** `tcg` is the job that *writes* the `actions/cache` entry the twelve
-shards only read, worth 3,036 s of runner time per run (`specs/ci-plan.md`
+shards only read, worth 3,036 s of runner time per run (`specs/assessments/ci-plan-assessment-2026-08.md`
 §12.5). The reasoning in `.github/workflows/ci.yml` is that it is the right
 writer because it is one job rather than twelve racing for a key, it builds
 exactly the shared set the shards pay for before their first boot, and it runs on
@@ -714,7 +714,7 @@ Two things fall out and neither is this document's to fix:
 - **`null_sink_client_exits` runs twice under two names** — once as a shared-boot
   member at 2,216 ms and again inside the machine test `null_sink_shipped_client`
   at 6,860 ms on the `Metal` profile. `check_no_collisions` cannot see it because
-  the names differ. `specs/ci-plan.md` §7's "four tests were running twice under
+  the names differ. `specs/assessments/ci-plan-assessment-2026-08.md` §7's "four tests were running twice under
   one name" is the same shape one level along.
 
 Also stale and worth a line from whoever next touches the file:
@@ -766,7 +766,7 @@ runs**, filed as
 
 `toyos-manifest`'s round trip is the thing that makes the build system's renderer
 and `/bin/init`'s parser one format, and nothing runs it per pull request. This
-is the same defect `specs/ci-plan.md` §5 recorded when four pure crates were
+is the same defect `specs/assessments/ci-plan-assessment-2026-08.md` §5 recorded when four pure crates were
 missing from the same loop until 2026-08-08 — "CI was skipping the cheapest tests
 it had" — and it recurred because the list lives in two places with nothing
 holding them against each other.
@@ -846,7 +846,7 @@ three, plus two disputed:
 | `screen_blocked_dump` | `FIRES 1 of 2` on CI (PR #33 run `31472702284`) | the verdict is a decoded panel after a keystroke — the keystroke crosses host wall clock |
 | `usb_disk_index_stable` | `FIRES 1 of 5` on CI (probe-rate run `31258202923`) | "nothing enumerated on the first controller" — enumeration timing |
 | `xhci_hotplug` | `SEEN`, red again alone (run `31247206462`) | `device_add`/`device_del` against a 100 ms debounce |
-| `std_unwind`, `std_unwind_so` | `DISPUTED` | `specs/ci-plan.md` §9.3 says closed by `wt/toyos-fpu`; the cited write-up says not re-measured on CI |
+| `std_unwind`, `std_unwind_so` | `DISPUTED` | `specs/assessments/ci-plan-assessment-2026-08.md` §9.3 says closed by `wt/toyos-fpu`; the cited write-up says not re-measured on CI |
 
 **All three of the standing ones are timer-anchored, and every one of them would
 leave the fast tier under the owner's 2026-08-12 rule.** That is not a
@@ -885,7 +885,7 @@ days since landing moved to GitHub). That is the bisection denominator throughou
 | **(a) latency** | 748 s slowest job, 786 s run wall (run `31472065811`). **+367 s over unit-only.** 134 runner-minutes a run, which is the queue pressure §2.4 measured. |
 | **(b) detection** | Best possible for every automated class. |
 | **(c) bisection** | Best possible — one diff. |
-| **(d) flake** | Worst. All 37 real names in `src/redlist.rs` on the button, six of them firing at 20–40% in the rate probe. `specs/ci-plan.md` §9.2's own verdict: "one run in five is far above the one in fifty that bar treats as tolerable." |
+| **(d) flake** | Worst. All 37 real names in `src/redlist.rs` on the button, six of them firing at 20–40% in the rate probe. `specs/assessments/ci-plan-assessment-2026-08.md` §9.2's own verdict: "one run in five is far above the one in fifty that bar treats as tolerable." |
 | **verdict** | **Rejected on (d), not on (a).** The latency is affordable; the flake rate is what makes the merge button a coin. |
 
 #### (iii) Compute-bound guest core — the proposal
@@ -921,7 +921,7 @@ job at all, and then only the longest shard. **Rejected — it is the worst poin
 #### (v) Merge queue or batch gating
 
 **Closed by an entitlement, and measured rather than read off a page.**
-`specs/ci-plan.md` §10.1: `gh api -X POST .../rulesets` with a `merge_queue` rule
+`specs/assessments/ci-plan-assessment-2026-08.md` §10.1: `gh api -X POST .../rulesets` with a `merge_queue` rule
 answers `Validation Failed … Invalid rule 'merge_queue'`, and the GraphQL
 `mergeQueue(branch:"main")` is `null`, while a control ruleset carrying
 `non_fast_forward` was accepted on the same repository seconds earlier. The cause
@@ -931,28 +931,28 @@ document's §9.4 larger runners.
 **It would change the answer if it were available**, and the spec should say so
 rather than pretend otherwise: a queue builds base + entries ahead + this pull
 request and merges only what it tested, which is strictly better than
-`specs/ci-plan.md` §10.2's strict-required-checks arrangement — it keeps the gate-the-merged-result property
+`specs/assessments/ci-plan-assessment-2026-08.md` §10.2's strict-required-checks arrangement — it keeps the gate-the-merged-result property
 *and* removes the serialisation that makes every open pull request re-merge and
 re-run after each landing. At 13–14 merges a day that serialisation is most of
 the queue §2.4 measured.
 
 **Ruled, 2026-08-12 (D2): no merge queue, and the repository does not move.** The
 point is closed so it is not re-proposed; what is written above stays as the
-record of what it would have bought, and `specs/ci-plan.md` §10.2's strict
+record of what it would have bought, and `specs/assessments/ci-plan-assessment-2026-08.md` §10.2's strict
 required checks remain how the merged result is gated.
 
 #### (vi) Run the QEMU suite locally as the gate
 
 **Already refused by a decision the owner made**, and the reasons are three:
 
-- **It cannot execute the class.** `specs/ci-plan.md` §10: "The dev host is arm64
+- **It cannot execute the class.** `specs/assessments/ci-plan-assessment-2026-08.md` §10: "The dev host is arm64
   emulating x86 and gives you one vendor's reading of every instruction it
   emulates… A gate that cannot execute a class of defect is not a gate against
   it." `cargo run -- --land` is retired for exactly this.
 - **It is not available when it is needed.** The shared sysroot claim refuses
   every other worktree for the length of an ABI change — measured at 35 and 50
   minutes of nobody being able to build, and observed taking the local guest
-  suite away entirely (`specs/ci-plan.md` §8.1).
+  suite away entirely (`specs/assessments/ci-plan-assessment-2026-08.md` §8.1).
 - **Its verdicts expire on the host's clock.** `specs/issues/build/the-gate-is-a-full-suite.md`
   has three shapes of it — a boot timeout, a host-staged window the guest slid
   past, and a staged image that was not there — and
@@ -1008,8 +1008,8 @@ has now.
 | | |
 |---|---|
 | **the relegated set** | `--nightly`, the exact set `src/tiers.rs`'s `RELEGATED` names, on the same twelve-shard `debian:sid`/KVM configuration the fast tier runs — so a nightly red and a fast red are the same instrument and comparable |
-| **the emulated breadth** | **ruled in by D1**: `tcg` leaves the pull-request path and its class arrives here as a whole shard under TCG rather than one test — the arm `specs/ci-plan.md` §7.2 named as available and never taken (§3.3). **Implementation constraint: a per-run cache writer has to stay on the pull-request path**, because `tcg` is what writes the entry the twelve shards read (§3.3, and `specs/ci-plan.md` §12.5) |
-| **gate A, thorough** | `gate-a.yml` at N=30, two jobs of about half an hour, dispatched against the ref. It is already in the shards' container as of `specs/ci-plan.md` §12.1, so it is the same instrument too |
+| **the emulated breadth** | **ruled in by D1**: `tcg` leaves the pull-request path and its class arrives here as a whole shard under TCG rather than one test — the arm `specs/assessments/ci-plan-assessment-2026-08.md` §7.2 named as available and never taken (§3.3). **Implementation constraint: a per-run cache writer has to stay on the pull-request path**, because `tcg` is what writes the entry the twelve shards read (§3.3, and `specs/assessments/ci-plan-assessment-2026-08.md` §12.5) |
+| **gate A, thorough** | `gate-a.yml` at N=30, two jobs of about half an hour, dispatched against the ref. It is already in the shards' container as of `specs/assessments/ci-plan-assessment-2026-08.md` §12.1, so it is the same instrument too |
 | **stress** | whatever the owner wants that a ten-second ceiling forbids by construction |
 
 ### 6.2 When
@@ -1032,7 +1032,7 @@ Proposed, and this is the shape the tree already has for exactly this problem:
   that a row nobody re-measures is deleted rather than believed. A nightly tier
   whose output is redlist rows is a tier with a reader by construction.
 - **A nightly red does not block a merge, and does not become an
-  `EXPECTED_FAILURES` entry either.** `specs/ci-plan.md` §10.4 already refuses
+  `EXPECTED_FAILURES` entry either.** `specs/assessments/ci-plan-assessment-2026-08.md` §10.4 already refuses
   that trade by name: an exemption names a defect and its write-up, and "fires
   40% of the time for reasons nobody has looked at" is not one.
 - **A nightly green is not evidence a relegated test is fixed.** One green of an
@@ -1105,7 +1105,7 @@ elsewhere in it.
 | # | ruling | what it changes here |
 |---|---|---|
 | **D1** | **The `tcg` job moves to nightly and leaves the pull-request path.** | The required set becomes four — `host`, `abi-split`, `gate-stage`, `guest-suite` (§5.1). The emulated-path class gets a whole TCG shard nightly instead of a one-test canary (§6.1). **Implementation constraint, and it is load-bearing: a per-run cache writer must stay on the pull-request path**, because `tcg` is what writes the entry the twelve shards read — §3.3 has the property the replacement must satisfy. A separate agent is implementing it. |
-| **D2** | **No merge queue; the repository does not move under an organization.** | §5.4(v) is closed rather than open. What a queue would have bought stays written down as the record; `specs/ci-plan.md` §10.2's strict required checks remain how the merged result is gated. Larger runners go with it (§2.8). |
+| **D2** | **No merge queue; the repository does not move under an organization.** | §5.4(v) is closed rather than open. What a queue would have bought stays written down as the record; `specs/assessments/ci-plan-assessment-2026-08.md` §10.2's strict required checks remain how the merged result is gated. Larger runners go with it (§2.8). |
 | **D6** | **A defect class whose observable exists only on silicon is owned by the metal track**, and each such class gets a named entry on the metal session checklist. | §3.4 is the doctrine and the checklist. Entry 1 is the AP control-register measurement: one T14 boot with `no-ap-control-regs` armed against one without, the delta recorded, `specs/issues/kernel/ap-control-registers-inherit-init.md` closed. The value-assertions — `control_regs`, `control_regs_verdict`, `control_regs_negative` — stay named as the automated tripwire for a *recurrence*, which is a different question from what the divergence cost. |
 | — | **Self-hosted runners are ruled out.** | §2.6 opens with it, and everything in §2.6–§2.8 is priced against GitHub-hosted runners only. Recorded in one line so the proposal is not re-derived. |
 | — | **The 10 s Fast ceiling is hard, with no margin or hysteresis band** — a measured crossing reds `durations` however close. | It is `FAST_CEILING_MS`'s own doc comment on `wt/toyos-slowtests`, and §2.3 is an instance of it working: `audio_tone` measured 10,790 ms and 11,144 ms in run `31601279765` and was relegated by `118e3b7` because of that run. §5.3 and §4.2 rest on the companion rule from the same date, that only a compute-bound verdict stays Fast. |

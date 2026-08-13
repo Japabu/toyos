@@ -56,7 +56,7 @@ the only difference is `fault_gate_child`'s x87 control word.
 | `masked` (`cw = 0x037F`) | PASS ×3 | PASS ×3 | PASS ×3 |
 
 `fault_gates` passing in both arms is what proves the probe is not vacuous.
-Written up in full at `specs/ci-plan.md` §9.3.
+Written up in full at `specs/assessments/ci-plan-assessment-2026-08.md` §9.3.
 
 **The victim instruction is `FLDCW`**, a *waiting* x87 instruction: it checks for
 a pending unmasked exception before it executes. It sits in the unwinder's
@@ -352,7 +352,7 @@ branch as a whole.
 ## 10. Gating
 
 `fault_gates` is not touched here and no `EXPECTED_FAILURES` entry is added.
-`specs/ci-plan.md` §9.3 already ruled on both: giving `fault_gates` its own boot
+`specs/assessments/ci-plan-assessment-2026-08.md` §9.3 already ruled on both: giving `fault_gates` its own boot
 would delete the only observation of the defect this tree has, and an exemption
 would be one bought to make a run green while a process can kill its neighbour.
 Its `mf` arm became `Expect::Killed` once `CR0.NE` was declared on every CPU,
