@@ -1,6 +1,6 @@
 //! Identifiers a tree may not name, and the exceptions that are named instead.
 //!
-//! `specs/capability-handles-spec.md` §12.2 asks for this as
+//! `specs/assessments/capability-handles-spec.md` §12.2 asks for this as
 //! `kernel/clippy.toml`'s `disallowed-methods`. **Nothing in this repository
 //! runs clippy** — not CI, not `cargo test`, not the build — so a `clippy.toml`
 //! would be a wall with nothing behind it. A scan in `cargo test --lib` runs on

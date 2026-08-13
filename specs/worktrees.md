@@ -41,7 +41,7 @@ that can disagree with the tree; this cannot go stale because it is not stored.
 shared tree, and a linked worktree takes an early return that only *checks*.
 `link_stale` is reached from the primary alone. **A non-owner finding the rustup
 link pointing elsewhere is reading correct state, not staleness** — which is the
-whole of `specs/test-cost-audit.md` §4.1 constraint 1.
+whole of `specs/assessments/test-cost-audit.md` §4.1 constraint 1.
 
 `rust/` in a linked worktree stays the empty stub `git worktree add` leaves.
 Two things were tried and rejected:
@@ -466,22 +466,22 @@ audio timing that gate A is calibrated on are shared by every worktree exactly
 as they were shared by every agent.
 
 - **Cores: 14.** Intra-suite parallelism and inter-worktree parallelism spend
-  the same budget (`specs/test-cost-audit.md` §4.1 constraint 3). Four agents
+  the same budget (`specs/assessments/test-cost-audit.md` §4.1 constraint 3). Four agents
   each running a 12-wide suite is 48 QEMUs on 14 cores — slower than serial and
   mismeasuring everything. **Built:** `buildlock::guest_slot` is that counting
   semaphore, `HOST_GUESTS` = 12 lock files in the global lock directory, one
-  slot per task and never per boot. `specs/test-cost-audit.md` §5.6 has the
+  slot per task and never per boot. `specs/assessments/test-cost-audit.md` §5.6 has the
   mechanism and the four measured numbers. **And it counted the wrong thing on
   its own**: a worker holds its guest slot from the moment it takes a task, and
   the first part of that task is compiling a kernel variant, so twelve workers
   are twelve concurrent `cargo build`s and no guest at all — load 49.9 on
   fourteen cores with one guest live, measured 2026-08-07.
   `buildlock::build_slot` is the second count, four across every worktree,
-  `specs/test-cost-audit.md` §5.7.
+  `specs/assessments/test-cost-audit.md` §5.7.
 - **Gate A.** `tests/audio-baseline.toml`'s numbers were recorded with one QEMU
   at a time and no concurrent agents. Worktrees make that condition rarer, not
   differently rare — six agents in one tree already broke it. The options and
-  their costs are `specs/test-cost-audit.md` §4.1 constraint 4. **The owner
+  their costs are `specs/assessments/test-cost-audit.md` §4.1 constraint 4. **The owner
   ruled on 2026-08-04: no measurement locks and no quiet-host scheduling**, so
   gate A takes one slot like everything else and reserves nothing. Its fast
   tier's verdict is harm — a gap, an underrun, a dropout — and a load-coincident

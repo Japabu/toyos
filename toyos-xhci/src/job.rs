@@ -5,7 +5,7 @@
 //! That is all this is: what ends the wait, when the wait stops being worth
 //! having, and the answer once one arrives.
 //!
-//! `specs/xhci-port-machine-plan.md` X2 is the design.
+//! `specs/plans/xhci-port-machine-plan.md` X2 is the design.
 
 use crate::port::Nanos;
 

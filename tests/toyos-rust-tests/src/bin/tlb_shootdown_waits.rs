@@ -17,7 +17,7 @@
 //! landed within microseconds, so the window it left open is far below anything
 //! a guest can schedule into. What is gated instead is the property that closes
 //! the window — the free happens after the flush — measured where it is
-//! observable. `specs/memory-boundary-spec.md` §3.3 carries that reasoning.
+//! observable. `specs/plans/memory-boundary-spec.md` §3.3 carries that reasoning.
 
 use toyos_abi::syscall::{self, MmapFlags, MmapProt, SYS_DEBUG};
 

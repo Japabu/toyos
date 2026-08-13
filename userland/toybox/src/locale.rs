@@ -5,7 +5,7 @@ use toyos_keymap::detect::{Detector, Step};
 /// The names come from the same table every translator selects on, so this
 /// cannot offer a layout that would be refused or hide one that exists. There
 /// is still no way to ask which is *currently* active: that needs a read
-/// syscall, and the one `specs/introspection-plan.md` reserves for it
+/// syscall, and the one `specs/plans/introspection-plan.md` reserves for it
 /// (`SYS_QUERY`) is not built.
 fn layouts() -> impl Iterator<Item = &'static str> {
     toyos_keymap::LAYOUTS.iter().map(|l| l.name)

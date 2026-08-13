@@ -1,6 +1,6 @@
 //! The Intel HDA stub: bring-up, one output stream, and the allow-list.
 //!
-//! `specs/hda-driver-plan.md` §4.1 is the design and §4.1.6 is the shape this
+//! `specs/plans/hda-driver-plan.md` §4.1 is the design and §4.1.6 is the shape this
 //! file implements. **The line is who touches a register.** The kernel resets
 //! the controller, allocates the PCM ring and the buffer descriptor list,
 //! programs every register whose value is an address or indexes one of those

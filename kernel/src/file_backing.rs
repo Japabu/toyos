@@ -48,7 +48,7 @@ pub trait FileBacking: Send + Sync {
 /// belongs to somebody else. Refcounting the blocks — keeping a deleted file's
 /// data alive for as long as something can read it — is the POSIX answer to a
 /// question ToyOS has not been asked, and it would need
-/// `specs/capability-handles-spec.md` to be honest about it.
+/// `specs/assessments/capability-handles-spec.md` to be honest about it.
 pub struct FileBlocks {
     /// `None` once the filesystem has taken the blocks back.
     extents: Lock<Option<Vec<Extent>>>,

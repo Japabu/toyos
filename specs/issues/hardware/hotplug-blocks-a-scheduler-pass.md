@@ -15,7 +15,7 @@ microseconds — the whole hotplug sequence in `xhci_hotplug` is inside one
 millisecond of guest time — so nothing in the suite can measure the real cost.
 The one hardware figure there is says the T14's five boot-time devices took
 346 ms including 5×55 ms of port reset, so roughly **14 ms each** for everything
-`configure` does (`specs/metal-hardware-inventory.md`). That is a scheduler pass
+`configure` does (`specs/reference/metal-hardware-inventory.md`). That is a scheduler pass
 of that length on the CPU that services the plug, with preemption disabled under
 the `XHCI` lock — the same order as `log_file`'s flush, which `specs/issues/boot-media/` measures at
 2.0–9.7 ms and calls out for the same reason. The port reset was the dominant

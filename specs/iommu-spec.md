@@ -2,7 +2,7 @@
 
 The kernel subsystem that gives a device its own address space, its own interrupt
 namespace, and no way out of either. It exists so that a device driver can be an
-ordinary userland process; `specs/userspace-drivers-spec.md` is the plan that
+ordinary userland process; `specs/plans/userspace-drivers-spec.md` is the plan that
 spends it, and this file is the layer underneath.
 
 Split into its own file because the lifetimes differ. The driver migration is a
@@ -108,7 +108,7 @@ backtrace over its own explanation.
   development-ergonomics cost, not a security one:** on the day the refusal lands,
   a `cargo run` without `-device intel-iommu` stops booting. §9 sequences the
   refusal last for exactly this reason, and stage 0 of
-  `specs/userspace-drivers-spec.md` puts the flag into every profile long before it
+  `specs/plans/userspace-drivers-spec.md` puts the flag into every profile long before it
   is load-bearing.
 - **ARM64**, until an SMMU backend exists. Same seam, no code here.
 
@@ -341,7 +341,7 @@ than invented, and it does three things at once:
 3. **It makes an identity-bypass failure loud instead of silent.** If a device is
    not actually behind the unit — QEMU's virtio devices bypass the vIOMMU unless
    `iommu_platform=on`, which is the exact vacuity trap
-   `specs/userspace-drivers-spec.md` §8 is built around — then the IOVA the driver
+   `specs/plans/userspace-drivers-spec.md` §8 is built around — then the IOVA the driver
    writes into a descriptor is not a valid physical address and the transaction
    fails visibly. A test that would have passed by accident now cannot.
 
@@ -425,7 +425,7 @@ unrepresentable** (there is no other way to obtain the `Vec<PhysPage>`);
 **releasing against the wrong range is checked at runtime** and the check is a
 kernel-bug assert, because ranges are values and no type system here will relate
 them. Tests cover neither — they cover the mechanism working end to end (§8 of
-`specs/userspace-drivers-spec.md`).
+`specs/plans/userspace-drivers-spec.md`).
 
 **And now the caveat CLAUDE.md requires asking of every safety type: which paths does
 this bind, and is the failing one among them?** `Unmapped` binds *ordering inside one
@@ -433,7 +433,7 @@ function*, and it is not a `Drop` guard — dropping it leaks pages, which is th
 direction, and `#[must_use]` catches the accident at compile time. The path that
 matters — a driver process killed by another CPU — never touches an `Unmapped` on the
 victim's stack, because reclaim does not run there. See §7.5 and
-`specs/userspace-drivers-spec.md` §5.
+`specs/plans/userspace-drivers-spec.md` §5.
 
 ### 5.7 One domain for kernel-owned devices, identity-mapped
 
@@ -543,7 +543,7 @@ Two smaller traps in the same step:
 ### 6.4 Storms
 
 An interrupt the kernel cannot mask at the source is an interrupt a driver can
-generate in a loop. The stub ISR (`specs/userspace-drivers-spec.md` §4.4) counts, and
+generate in a loop. The stub ISR (`specs/plans/userspace-drivers-spec.md` §4.4) counts, and
 past a rate ceiling the kernel clears `IRTE.P` for that binding — which the driver
 cannot undo, because the IRTE is kernel memory — and kills the process. **The ceiling
 check does not log per interrupt.** CLAUDE.md's rule applies with unusual force here:
@@ -668,7 +668,7 @@ immediately. Step 2's wait is up to 100 ms by the PCIe specification. Steps 3–
 page tables and poll a hardware queue.
 
 **Therefore reclaim does not run from the deferred zero-handle queue, and does not run
-from the idle loop.** `specs/capability-handles-spec.md` §5.2 drains that queue at
+from the idle loop.** `specs/assessments/capability-handles-spec.md` §5.2 drains that queue at
 syscall exit, at `do_schedule` entry, and in the idle loop — and putting an
 unbounded, uninterruptible device operation in front of `pass()` is precisely the
 `esp_log` defect (`specs/issues/boot-media/`, and the flush that costs 2.0–9.7 ms against
@@ -839,7 +839,7 @@ descriptions.
 | **I2** | **Translation on, one identity domain** (not "everything passthrough" — §8.1). Root/context tables for every enumerated function, second-level tables over `[0, top)`, queued invalidation, the fault-event MSI, `SRTP`, `TE`. Behaviour unchanged by construction. | full `cargo test` green with `TES=1` asserted; plus `iommu_context_absent` and `iommu_empty_domain`, actuators that strand one function above and below the context entry and assert the boot dies with a DMA fault naming it |
 | **I3** | **Interrupt remapping on.** Remappable IOAPIC RTEs and remappable `pci::enable_msi`/`enable_msix`; IRTA, `SIRTP`, `IRE=1`, `CFI=0`; every IRTE `SVT`-verified. | `cargo test -- metal_sim_input xhci audio nvme esp` green — every one of these depends on an interrupt arriving. Teeth: an IRTE written with the wrong source-id must red the corresponding test |
 | **I4** | **Domains, mapping, invalidation, faults.** `create_domain`/`attach`/`map`/`unmap`/`flush`, the `Unmapped`/`Flushed` pair, IOVA allocator, fault MSI and the kill-on-fault path. No syscall yet; driven by an actuator self-test. | `cargo test -- iommu_selftest`, which maps, reads back through a device, unmaps, and asserts a stale access faults. Teeth: deleting the unmap-side invalidation must red it |
-| **I5** | **The refusal.** Sequenced deliberately after `specs/userspace-drivers-spec.md`'s first driver has moved, because before that a refusal costs every machine and protects nothing. | `cargo test -- iommu_refusal` — three variants (no `intel-iommu`; `intremap=off`; a unit whose `SAGAW` we reject via actuator), each asserting its own message and that userland is never reached |
+| **I5** | **The refusal.** Sequenced deliberately after `specs/plans/userspace-drivers-spec.md`'s first driver has moved, because before that a refusal costs every machine and protects nothing. | `cargo test -- iommu_refusal` — three variants (no `intel-iommu`; `intremap=off`; a unit whose `SAGAW` we reject via actuator), each asserting its own message and that userland is never reached |
 
 **I0 and I1 are done**, `82a69a8..9eab2f2`. Every profile in `tests/common/qemu.rs`
 and `src/qemu.rs` carries the unit; `kernel/src/iommu/` inventories it and refuses
@@ -905,7 +905,7 @@ above had said something else:
 
 I0–I4 are independent of the capability-handles migration. I4's teardown path assumes
 `process::exit` gains an explicit reclaim phase (§7.5); if
-`specs/capability-handles-spec.md` stage B2 has landed, `DeviceClaim`'s
+`specs/assessments/capability-handles-spec.md` stage B2 has landed, `DeviceClaim`'s
 `on_zero_handles` is where step 1 of §7.5 lives and exit runs the rest. If it has not,
 `device.rs`'s existing release path is. **Neither ordering blocks the other**; what is
 not negotiable is that the slow half never runs from the deferred queue.
@@ -966,7 +966,7 @@ driver. The only panics are for kernel bugs and for hardware that will not answe
 12. **A no-IOMMU fallback.** §2. This is the decision the rest of the file rests on.
 13. **Per-device IOVA-space randomization.** IOVAs index a domain the owning process
     already exclusively holds; there is nothing to guess. (The same argument
-    `specs/capability-handles-spec.md` §14.9 makes about handle values.)
+    `specs/assessments/capability-handles-spec.md` §14.9 makes about handle values.)
 14. **Reclaim on a dedicated kernel thread.** The kernel has no in-kernel thread
     mechanism today — `process::spawn_kernel` (`loader.rs:1119`) spawns a *userland*
     process — and adding one is a kernel addition needing its own discussion. §7.5's

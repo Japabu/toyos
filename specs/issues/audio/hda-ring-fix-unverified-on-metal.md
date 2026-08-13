@@ -15,5 +15,5 @@ client stalls.
 
 A `the engine completed 0x.., which is no walk of an 8-period ring` panic would
 be **new**, and would be the first evidence that `SDnLPIB` is the wrong position
-source there — `specs/hda-driver-plan.md` §2.4's `position_fix` paragraph is
+source there — `specs/plans/hda-driver-plan.md` §2.4's `position_fix` paragraph is
 what it would put in question.

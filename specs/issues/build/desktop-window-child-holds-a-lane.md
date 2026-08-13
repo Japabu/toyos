@@ -60,7 +60,7 @@ Consequences worth stating separately:
 
 Not fixed here, and the fix is not obviously "reclassify": `Sched::Serial` for
 all three desktops moves ~5 minutes into the serial tail, which
-`specs/test-cost-audit.md` §5.4 spent a wave getting out of. Candidates worth
+`specs/assessments/test-cost-audit.md` §5.4 spent a wave getting out of. Candidates worth
 pricing: cap what a lane will spend on an `EXPECTED_FAILURES` test, exclude a
 test's contention wait from what the profile records, or give the profile a
 notion of how much host a task wants so two eight-CPU guests do not pair.

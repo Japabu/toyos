@@ -42,7 +42,7 @@ icons; a desktop's do.
 
 **The panic console's repaint is ~460 ms on the T14**, measured from inter-line
 gaps in both boot logs (461 ms and 459 ms) in
-`specs/metal-hardware-inventory.md`; five of the six `boot_checkpoint`
+`specs/reference/metal-hardware-inventory.md`; five of the six `boot_checkpoint`
 repaints fall inside the reported 3422 ms boot, which is most of it.
 
 This is *not* the same defect. `kernel/src/drivers/panic_console/mod.rs` never

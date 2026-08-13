@@ -7,7 +7,7 @@ spawn hands capabilities, channels queue, global connect-by-name is retired,
 compat layer, and least authority becomes something a process can be asked to
 demonstrate. This is that design.
 
-`specs/capability-handles-spec.md` is not a parallel track. The ruling's fifth
+`specs/assessments/capability-handles-spec.md` is not a parallel track. The ruling's fifth
 point is that this work *realizes* it: a namespace whose entries are names is
 the defect being deleted, so its entries must be refcounted kernel objects
 behind typed handles, which is that spec. Every place this deviates from it is
@@ -2444,7 +2444,7 @@ neither may the one process the machine cannot lose*.
 **Chunk 9 — audit, deletion and documentation. Green.**
 The grep gate (§8.4); `[u32; 64]` sized from the ABI; dead constants and any
 surviving `_ =>` arms in object-layer code; the twelve closed `specs/issues/`
-files deleted and the six re-scoped ones rewritten; `specs/capability-handles-spec.md`
+files deleted and the six re-scoped ones rewritten; `specs/assessments/capability-handles-spec.md`
 annotated with what this delivered and what it did not; `forks.toml` deltas;
 **one line** in the root `CLAUDE.md` — it has 2,678 bytes of headroom against its
 40,000 budget (`wc -c CLAUDE.md` → 37,322), so anything longer displaces
@@ -2658,7 +2658,7 @@ because nothing in the tree supervises a daemon, and a re-arm with no caller is
 a mechanism built for a plan.
 
 **`SYS_SYSINFO`/`SYS_SCHED_INFO`** — read-only, ambient, and a read surface is
-`specs/introspection-plan.md`'s subject rather than this one's.
+`specs/plans/introspection-plan.md`'s subject rather than this one's.
 
 ---
 
@@ -2687,10 +2687,10 @@ that instruction is the one to follow.
 | **§15 row 12: the bad-handle kill-process flip needs its §7 to be safe from a parked thread** | Chunk 7 flips it before that exists. The residual is the pre-existing wait-queue leak (§1.1), not a new one, and the flip is not held for it |
 | **Landing order: this branch first** | Its own §15 says so, and its C0 merges `origin/main` after |
 
-### 13.2 `specs/introspection-plan.md` — stale, and it collides
+### 13.2 `specs/plans/introspection-plan.md` — stale, and it collides
 
 That plan allocates `SYS_QUERY = 97`, `SYS_LOG_READ = 98` and
-`SYS_DISK_ADOPT = 99` (`specs/introspection-plan.md:78`, `:414`, `:694`, restated
+`SYS_DISK_ADOPT = 99` (`specs/plans/introspection-plan.md:78`, `:414`, `:694`, restated
 together at `:824`). **All three are wrong on today's tree**: 97 and 98 are
 `SYS_DEVICE_REG_READ`/`SYS_DEVICE_REG_WRITE`, allocated after that plan was
 written, and 99 is `SYS_ENDOWMENTS` here. Its allocation must be re-based off
@@ -2699,7 +2699,7 @@ written, and 99 is `SYS_ENDOWMENTS` here. Its allocation must be re-based off
 row exists so the next agent to implement it does not build a third
 `SYS_DISK_ADOPT = 99`.
 
-### 13.3 `specs/capability-handles-spec.md`
+### 13.3 `specs/assessments/capability-handles-spec.md`
 
 Not a parallel track — this work realizes it, §11 lists the seven deviations, and
 chunk 9 annotates it with what was delivered. The one thing to carry forward: its

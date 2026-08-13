@@ -676,7 +676,7 @@ impl Boot {
 /// than listed here, so the check cannot drift from what cargo would accept —
 /// and, more to the point, so that deleting a feature takes its own command
 /// lines down with it. That is what a temporary feature needs: when
-/// `hda-probe` goes at `specs/hda-driver-plan.md` H9, an invocation still
+/// `hda-probe` goes at `specs/plans/hda-driver-plan.md` H9, an invocation still
 /// asking for it fails saying so instead of quietly producing a kernel with no
 /// probe in it, which is the same image and a different machine.
 ///
@@ -1012,7 +1012,7 @@ pub fn designate_for_format(path: &Path, len: u64) {
 /// A `cargo test` run boots ~76 machines, and most of those boots ask for an
 /// image some earlier boot already built; the three `cargo` invocations then
 /// take ~1.4 s between them to answer "nothing changed"
-/// (`specs/test-cost-audit.md` §1.4). In memory and never on disk, so a run gets
+/// (`specs/assessments/test-cost-audit.md` §1.4). In memory and never on disk, so a run gets
 /// one answer for the tree it started against and the next run asks cargo
 /// again.
 ///
@@ -1472,7 +1472,7 @@ mod tests {
     ///
     /// A name that reappears in `kernel/Cargo.toml` is a 46th kernel, and the
     /// suite would build it without anything saying so — which is the state
-    /// `specs/test-cost-audit.md` §5.9.7 replaced. The two lists are read from
+    /// `specs/assessments/test-cost-audit.md` §5.9.7 replaced. The two lists are read from
     /// the two files that declare them, so neither can be satisfied by editing
     /// this test.
     #[test]
@@ -1510,7 +1510,7 @@ mod tests {
                 "sched-check",
                 "test-actuators",
             ],
-            "the kernel declares a feature `specs/test-cost-audit.md` §5.9.7 does not account for"
+            "the kernel declares a feature `specs/assessments/test-cost-audit.md` §5.9.7 does not account for"
         );
     }
 

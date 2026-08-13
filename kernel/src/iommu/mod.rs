@@ -143,7 +143,7 @@ pub fn init(rsdp_addr: u64, devices: &[crate::drivers::pci::PciDevice]) {
 
 /// What this machine's remapping hardware says about one device.
 ///
-/// `specs/hda-driver-plan.md` H0's handoff half, and the only reader: I2 keeps
+/// `specs/plans/hda-driver-plan.md` H0's handoff half, and the only reader: I2 keeps
 /// no inventory of units, so this re-reads firmware's table rather than making
 /// it keep one for a diagnostic. Deleted with H0's probe.
 #[cfg(feature = "boot-actuators")]
@@ -164,7 +164,7 @@ pub struct UnitFacts {
     /// catch-all for everything on its segment.
     pub explicit: bool,
     /// `ECAP.SC`: the unit can force a device's DMA to snoop the CPU cache,
-    /// whatever the device itself asked for. `specs/hda-driver-plan.md` §4.4
+    /// whatever the device itself asked for. `specs/plans/hda-driver-plan.md` §4.4
     /// item 4 spends this to avoid a config-space write path.
     pub snoop_control: bool,
 }

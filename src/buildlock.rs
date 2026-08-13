@@ -30,7 +30,7 @@
 //! [`guest_slot`] and [`build_slot`] are not modes of anything — they are
 //! counts. The host's cores are spent by intra-suite width and by inter-worktree
 //! suites alike, and nothing was handing them out
-//! (`specs/test-cost-audit.md` §4.1 constraint 3), so a second suite on the
+//! (`specs/assessments/test-cost-audit.md` §4.1 constraint 3), so a second suite on the
 //! machine timed the first one's boots out. A guest slot counts guests; a worker
 //! that is *compiling* holds one and is not a guest, which is what
 //! [`build_slot`] adds and what twelve simultaneous kernel builds on fourteen
@@ -235,7 +235,7 @@ fn integration_path(root: &Path) -> PathBuf {
 /// How many guests may be up on this host at once, across every worktree.
 ///
 /// The suite's own width is twelve, measured on this host against eight in one
-/// session (`specs/test-cost-audit.md` §5.4.7), so one suite alone gets exactly
+/// session (`specs/assessments/test-cost-audit.md` §5.4.7), so one suite alone gets exactly
 /// the machine it was measured on and N suites divide it. Without this the two
 /// parallelisms spend the same 14 cores twice over: four agents at twelve is 48
 /// guests, which is slower than serial and mismeasures everything (§4.1

@@ -48,7 +48,7 @@ with `% size` (`virtio.rs:346`) so it silently aliases another submission's
 descriptors instead of failing.
 
 **Standing.** Audited and explicitly never filed:
-`specs/type-safety-audit/kernel-drivers.md` F1 has the full analysis and the
+`specs/assessments/type-safety-audit/kernel-drivers.md` F1 has the full analysis and the
 proposed fix at the primitive — `submit` records each chain's byte total, and
 `poll_used` answers `None` on an id past `size` or a length past the chain — and
 its closing line reads "**Standing.** … Not filed." This is that filing. Two of

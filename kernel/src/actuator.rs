@@ -23,7 +23,7 @@
 //! It is our own bootloader's string and crosses no trust boundary, so an
 //! unknown token is a bug in this build system and panics by name.
 //!
-//! `specs/test-cost-audit.md` §5.9.5 is the design and §3.6 is the trade the
+//! `specs/assessments/test-cost-audit.md` §5.9.5 is the design and §3.6 is the trade the
 //! owner took.
 
 #[cfg(feature = "boot-actuators")]
@@ -190,7 +190,7 @@ actuators! {
     /// the backtrace that got there. The one number that says how much of the
     /// kernel is holding a spinlock while a device is being waited for, and one
     /// no static read of the call graph produces: it is 5 on an ordinary boot.
-    /// The instrument every stage of `specs/blocking-io-plan.md` is judged on.
+    /// The instrument every stage of `specs/plans/blocking-io-plan.md` is judged on.
     /// It measures and stages nothing — no driver behaviour changes with it on.
     io_depth_probe = "io-depth-probe";
 
@@ -400,11 +400,11 @@ actuators! {
     /// passthrough, which would fault identically for the first.
     iommu_empty_domain = "iommu-empty-domain";
 
-    /// Stage H0 of `specs/hda-driver-plan.md`: take every class-0403 function
+    /// Stage H0 of `specs/plans/hda-driver-plan.md`: take every class-0403 function
     /// out of reset once, at the end of the peripheral phase, and report what is
     /// behind it. Nothing else can reach those questions — a codec is not on the
     /// PCI bus, and the capability that would let a userland process touch one is
-    /// `specs/userspace-drivers-spec.md` stage 4, unbuilt, and whether it should
+    /// `specs/plans/userspace-drivers-spec.md` stage 4, unbuilt, and whether it should
     /// ever be given this device is exactly what H0 asks. No shipped path takes
     /// an audio controller out of reset, and the whole actuator is deleted at H9.
     /// See `kernel/src/drivers/hda_probe.rs`.

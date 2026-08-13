@@ -27,7 +27,7 @@ installer. `cc` is stated with its scope attached wherever it appears — no gue
 binary links through it — because *"ToyOS needs a C compiler"* is false and
 reads as a far larger claim than the truth.
 
-`specs/dependency-audit-2026-08-08.md` §3–§4 is the full inventory; this is the
+`specs/assessments/dependency-audit-2026-08-08.md` §3–§4 is the full inventory; this is the
 entry that says the two largest holes in *"Rust and QEMU, one command"* are real.
 
 `src/toolchain.rs:749` picks `./x` when `rust/x` exists, which it does. That file

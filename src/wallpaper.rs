@@ -40,7 +40,7 @@ pub const HEIGHT: u32 = 1080;
 ///
 /// Not 100, which is the same file size to within 0.2% and worse on every other
 /// measure. The sweep both readings come from is
-/// `specs/dependency-audit-2026-08-08.md` §7f.1.
+/// `specs/assessments/dependency-audit-2026-08-08.md` §7f.1.
 pub const QUALITY: u8 = 99;
 
 /// The sky, top to horizon, as sRGB.

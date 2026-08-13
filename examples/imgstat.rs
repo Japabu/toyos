@@ -2,7 +2,7 @@
 //!
 //! `cargo run --example imgstat -- target/bootable.img`
 //!
-//! Every size in `specs/boot-image-split.md` comes from here, and each of that
+//! Every size in `specs/plans/boot-image-split.md` comes from here, and each of that
 //! plan's stages changes one of them — so the claim "the image is N bytes and
 //! M% of it is X" stays a command anyone can re-run rather than a figure that
 //! was true once. It parses the GPT, both FAT32 volumes and the initrd's

@@ -240,7 +240,7 @@ are `build-essential` and `python3`.
 else — including `df`, `ps` and `find`, which cost one feature each rather than
 the build. The full accounting of everything this project depends on that it
 did not write, with a verdict on each, is
-`specs/dependency-audit-2026-08-08.md`.
+`specs/assessments/dependency-audit-2026-08-08.md`.
 
 Linux and macOS. Windows is a goal, not a claim — the build system still
 assumes Unix in places, and nothing should be advertised until a clean Windows

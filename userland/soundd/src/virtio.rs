@@ -1,6 +1,6 @@
 //! soundd as the driver of a virtio-sound device.
 //!
-//! `specs/hda-driver-plan.md` §4.1: the kernel negotiated the device's features,
+//! `specs/plans/hda-driver-plan.md` §4.1: the kernel negotiated the device's features,
 //! built its virtqueues and owns their descriptors, and answers one register
 //! write per queue doorbell. Everything that is a *decision* is here — which
 //! stream, at what rate and format, when a period goes out and when the stream
