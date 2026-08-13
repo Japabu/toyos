@@ -1,6 +1,6 @@
 //! A thread killed while blocked on a handle still gives the handle back.
 //!
-//! **`specs/capability-endowment-spec.md` §8.6 calls this "the one that matters
+//! **`specs/capability-endowment-spec.md` §8 calls this "the one that matters
 //! most for this architecture", and nothing in the tree executed it.**
 //!
 //! `handle_count` is deliberately not the `Arc` count (`kernel/src/object/`).
@@ -126,7 +126,7 @@ fn a_connection_peer_killed_in_the_read() {
     let _ = child.wait();
 
     // **`NotFound` and not `Gone`**, which `specs/capability-endowment-spec.md`
-    // §3.5 asks for and
+    // §5 asks for and
     // `specs/issues/isolation/a-broken-pipe-answers-not-found.md` is about;
     // `connect_before_serve` asserts the same word for the same reason. What
     // this arm is for is the *release* — on a kernel where the killed thread's

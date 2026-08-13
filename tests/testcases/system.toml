@@ -7,7 +7,7 @@ serves = ["soundd"]
 devices = ["hda-audio", "virtio-sound"]
 syscap = ["rt"]
 
-# The test estate's authority (`specs/capability-endowment-spec.md` §6.7a).
+# The test estate's authority (`specs/capability-endowment-spec.md` §4).
 # `device` because five of the guest binaries claim the keyboard or the mouse
 # and no manifest row can name them — they are not `[programs]` keys — and `dup`
 # because a claim moves and one boot runs several of them.

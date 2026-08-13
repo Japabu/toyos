@@ -37,7 +37,6 @@ the T14, the machine where it matters — `t14-lost-every-integrated-input`,
 indistinguishable between "the input devices are there" and "there are none",
 and init's log says the same thing either way.
 
-`specs/capability-endowment-spec.md` §7.2 records that this row was written into
-the closes-this table by mistake and taken out again: inventing a presence
-signal for two input classes is its own piece of work and no part of that
-branch needed it.
+The capability endowment migration considered gating `keyboard` and `mouse`
+the same way and did not: inventing a presence signal for two input classes
+is its own piece of work, and no part of that migration needed it.
