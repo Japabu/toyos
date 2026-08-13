@@ -36,7 +36,7 @@ The rule is in the root file; the mechanics are here. `EXPECTED_FAILURES` names 
 
 **A guest binary cannot ask what a handle it does not hold does.** `BadHandle`, `Stale` and `WrongType` end the caller with exit 139, so an arm probing one is a **child** — one fault per child, the parent asserting the death. Give each child a `println!` marker before the call and require it: without one, a child that died on the way to the thing under test passes while asserting nothing. `handle_kill_policy` is the matrix and the pattern.
 
-**A test binary holds what `test-runner` holds** (`specs/capability-endowment-spec.md` §6.7a) — the 90 guest binaries are not `[programs]` keys, so no manifest row can name what any of them needs. Its namespace travels to every child by inheritance and its `SysCap` is endowed explicitly at `SYSCAP_LABEL`. A test that needs a *server* builds one: a port, a namespace over its connector, and a child spawned holding it, all inside one binary — `endowment_denied`.
+**A test binary holds what `test-runner` holds** (`specs/capability-endowment-spec.md` §4) — the 90 guest binaries are not `[programs]` keys, so no manifest row can name what any of them needs. Its namespace travels to every child by inheritance and its `SysCap` is endowed explicitly at `SYSCAP_LABEL`. A test that needs a *server* builds one: a port, a namespace over its connector, and a child spawned holding it, all inside one binary — `endowment_denied`.
 
 ## Waiting for a program's line
 

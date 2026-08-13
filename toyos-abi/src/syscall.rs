@@ -221,7 +221,7 @@ pub const SYS_DEVICE_CLAIM: u64 = 111;
 pub const SYS_RT_ENTER: u64 = 112;
 
 // Number 113 is **reserved, not free**: it is `SYS_PORT_REARM`
-// (`specs/capability-endowment-spec.md` §12), which mints a fresh `Acceptor`
+// (`specs/capability-endowment-spec.md` §7), which mints a fresh `Acceptor`
 // for a port whose server died and is the one thing that would make any
 // `serves` daemon restartable. Nothing needs it yet, so nothing is built.
 //

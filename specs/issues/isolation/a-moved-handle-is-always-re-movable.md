@@ -12,10 +12,10 @@ into the destination unchanged. So every handle that arrives by a move arrives
 carrying `TRANSFER`, and its new holder can move it on. There is no way to
 express "you may map this and nobody else may".
 
-`specs/capability-endowment-spec.md` §6.3 asks for one: soundd is supposed to
-send its per-client audio ring as a `shm_h_with_MAP_only`. That handle cannot be
-sent, because sending needs `TRANSFER`. The same hole is in spawn endowment,
-where it has been since chunk 4.
+soundd's per-client audio ring would ideally travel as a `shm_h_with_MAP_only`,
+so that a client cannot re-send it on. `specs/capability-endowment-spec.md`
+§5 rules that out: sending needs `TRANSFER`, so that handle cannot be sent.
+The same hole is in spawn endowment.
 
 ## What it costs
 
@@ -35,11 +35,12 @@ recording.
 A rights word per moved handle, on **both** paths: `EndowEntry` gains one and
 `SYS_HANDLE_SEND` takes `[TransferEntry { handle, rights }]` instead of
 `[RawHandle]`, with `RIGHTS_UNCHANGED` as the wire encoding
-`SYS_HANDLE_DUP` already uses. §3.6 argues against a rights word on a move —
-"a second place to shrink rights and the first one already exists" — and that
-argument is wrong for exactly this case: dup-then-move cannot express a set
-without `TRANSFER`, because the move needs it.
+`SYS_HANDLE_DUP` already uses. `specs/capability-endowment-spec.md` §6 argues
+against a rights word on the endow path — "a second place to shrink rights
+and the first one already exists" — and that argument is wrong for exactly
+this case: dup-then-move cannot express a set without `TRANSFER`, because the
+move needs it.
 
-Not done in chunk 6 because doing it on the send path alone would make the two
-move verbs disagree, and doing it on both is an ABI change to a struct chunk 4
+Not done because doing it on the send path alone would make the two move
+verbs disagree, and doing it on both is an ABI change to a struct already
 shipped.

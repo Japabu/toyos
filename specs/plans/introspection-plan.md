@@ -826,7 +826,7 @@ owner's instruction and also what the section deserves.
 > **These three numbers are stale and all three collide — checked 2026-08-09.**
 > 97 and 98 are `SYS_DEVICE_REG_READ`/`SYS_DEVICE_REG_WRITE`
 > (`toyos-abi/src/syscall.rs:99`, `:101`), allocated after this plan was written,
-> and 99 is `SYS_ENDOWMENTS` in `specs/capability-endowment-spec.md` §3.1 — which
+> and 99 is `SYS_ENDOWMENTS` in `specs/capability-endowment-spec.md` §5 — which
 > takes 99–112 and reserves 113, while `specs/completion-architecture-spec.md`
 > §14.2 takes 116–127. **Re-allocate all three from 128 up** and say so here when
 > it is done. The argument for three syscalls rather than eight or one is
