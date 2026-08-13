@@ -515,7 +515,14 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // Two boots of one machine compared on the guest's own `Boot: complete`
     // with a 300 ms allowance, which is the whole assertion.
     ("i8042_absent", Sched::Serial, Tier::Nightly),
-    ("i8042_quarantine", Sched::Parallel, Tier::Fast),
+    // The fault quarantines (masks) the controller's GSI within milliseconds
+    // of readiness — confirmed from the serial log, before a host round trip
+    // could land anything — so no sentinel can ever reach the guest and the
+    // run necessarily pays `test_rs_i8042_keyboard`'s full fallback deadline.
+    // A fixed wall-clock window is the verdict's floor, not its cost:
+    // timer-anchored, and its price straddles the ceiling run to run (9,355 /
+    // 10,568 / 11,073 ms across three measurements) for exactly that reason.
+    ("i8042_quarantine", Sched::Parallel, Tier::Nightly),
     ("i8042_budget_expiry", Sched::Parallel, Tier::Fast),
     ("i8042_fadt_denial", Sched::Parallel, Tier::Fast),
     ("i8042_kbd_echo", Sched::Parallel, Tier::Fast),

@@ -8,16 +8,18 @@
 //! [`RELEGATED`] is exactly the set the nightly job selects, and `tests/toyos.rs`
 //! writes [`Tier::Nightly`] against each of those names in its own registration.
 //!
-//! **This is interim and it is a loss.** Fifty-one registered tests are
+//! **This is interim and it is a loss.** Fifty-two registered tests are
 //! Nightly: twenty-six for [`Why::Cost`] — a CI execution over the line
 //! (loaded audio and ordinary `audio_tone` each have two measured SMP labels,
-//! all four over it) — twenty-one for [`Why::TimerAnchored`], Nightly by
-//! classification rather than by cost and mostly nowhere near the line, and
-//! four for [`Why::RidesTheBootOf`], riding `metal_sim_compositor`'s shared
-//! boot. Between them they account for 1,769.1 s of the effective 2,109.2 s CI
-//! profile, and none is gated per pull request. `guards` on every row says what
-//! stopped being gated, because a run that quietly does less is the whole
-//! failure mode here — `specs/test-cost-audit.md` §7 is the long form.
+//! all four over it) — twenty-two for [`Why::TimerAnchored`], Nightly by
+//! classification rather than by cost, mostly nowhere near the line and one
+//! (`i8042_quarantine`) straddling it run to run for the classification's own
+//! reason — and four for [`Why::RidesTheBootOf`], riding
+//! `metal_sim_compositor`'s shared boot. Between them they account for
+//! 1,780.1 s of the effective 2,124.4 s CI profile, and none is gated per pull
+//! request. `guards` on every row says what stopped being gated, because a run
+//! that quietly does less is the whole failure mode here —
+//! `specs/test-cost-audit.md` §7 is the long form.
 //!
 //! **Nothing here is an optimisation and nothing here changes an assertion.**
 //! A relegated test measures exactly what it measured; the manual nightly
@@ -564,6 +566,21 @@ pub const RELEGATED: &[Relegated] = &[
         why: Why::TimerAnchored,
         guards: "thread::sleep(5 s) is the measurement: the assertion is literally that the \
                  log is still on the panel five seconds after the boot finished.",
+    },
+    // 2026-08-13, second pass: the sweep above kept `i8042_quarantine` Fast on
+    // the strength of one under-ceiling committed number; CI found otherwise.
+    Relegated {
+        test: "i8042_quarantine",
+        ci_ms: 11_073,
+        why: Why::TimerAnchored,
+        guards: "The fault quarantines (masks) the controller's GSI within milliseconds of \
+                 `===I8042_READY===` — confirmed from the serial log, before a host round trip \
+                 could land anything — so no sentinel `test_rs_i8042_keyboard` might send can \
+                 ever reach the guest, and every run necessarily pays the binary's full 5 s \
+                 fallback deadline. That fixed wall-clock window is the verdict's floor, not \
+                 an incidental cost, which is why the price straddles the 10,000 ms line run \
+                 to run rather than sitting on one side of it: 9,355 ms committed, 10,568 ms \
+                 in nightly run 31680778730, 11,073 ms in run 31704997228.",
     },
 ];
 
