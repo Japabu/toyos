@@ -194,7 +194,7 @@ mod tests {
         /// one, because it is the only file every dispatch pays for whether or not the
         /// agent ever goes near the subtree it describes.
         const BUDGETS: &[(&str, usize)] = &[
-            ("CLAUDE.md", 40_000),
+            ("CLAUDE.md", 30_000),
             ("kernel/CLAUDE.md", 24_000),
             ("userland/CLAUDE.md", 12_000),
             ("tests/CLAUDE.md", 10_000),
@@ -203,7 +203,7 @@ mod tests {
 
         /// What all of them may weigh together.
         ///
-        /// Strictly below the sum of `BUDGETS` (96,000), because five per-file
+        /// Strictly below the sum of `BUDGETS` (86,000), because five per-file
         /// budgets can each be honoured while the set grows past what a session
         /// spanning the tree would tolerate, and nothing prices the set.
         ///
@@ -211,7 +211,7 @@ mod tests {
         /// comment has no gate on it and drifts; this one drifted 1,943 bytes,
         /// which is enough for an agent budgeting an addition against it to red
         /// the gate it was trying to respect. The assertion prints it instead.
-        const TOTAL_BUDGET: usize = 80_000;
+        const TOTAL_BUDGET: usize = 72_000;
 
         fn issue_files() -> Vec<PathBuf> {
             let root = repo_root().join("specs/issues");
