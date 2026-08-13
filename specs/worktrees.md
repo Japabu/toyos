@@ -349,7 +349,7 @@ never rewrites history. **It happens on GitHub.**
 `cargo run -- --land` used to be the whole protocol: an integration lock on this
 host, `git merge --no-ff main`, the whole suite as a gate, `git -C <primary>
 merge --ff-only`. It is retired, and the reason is the gate rather than the
-mechanism — the dev host is arm64 emulating x86, `specs/ci-plan.md` §7 is a
+mechanism — the dev host is arm64 emulating x86, `specs/assessments/ci-plan-assessment-2026-08.md` §7 is a
 class of defect it cannot execute at all, and a gate blind to a class is not a
 gate against it. The gate is twelve KVM shards on x86_64 now, and the merge went
 with it.
@@ -373,8 +373,9 @@ contains `origin/main` — so the checks that run on the branch head are checks 
 the merged result. That is what catches a semantic conflict between two branches
 that each pass alone, and it is the one property a naive "CI on the pull request"
 setup throws away. GitHub's native merge queue is the feature that restores it
-properly; it is **not available on this repository** and `specs/ci-plan.md` §10.1
-has the two API answers that say so.
+properly; it is **not available on this repository** and
+`specs/assessments/ci-plan-assessment-2026-08.md` §10.1 has the two API
+answers that say so.
 
 **Serialization comes from the same place.** The first merge moves `main`, and
 from that instant every other open pull request is out of date and has to merge
@@ -382,8 +383,9 @@ again and re-run. That is the integration lock, enforced by the thing that
 actually moves `main` — where the old one was an advisory `flock` on one laptop
 that two landings got past, both recorded below.
 
-`specs/ci-plan.md` §10.3 is the table of where each of `--land`'s invariants
-went, and §10.4 is the two-stage switch and its trigger.
+`specs/assessments/ci-plan-assessment-2026-08.md` §10.3 is the table of where
+each of `--land`'s invariants went, and §10.4 is the two-stage switch and its
+trigger.
 
 ### What `--pr` refuses rather than guesses at
 
@@ -536,5 +538,5 @@ nine tests of the desktop and metal-sim families in every brand-new worktree
 until somebody copied that file across. Closed 2026-08-08, and not by copying it:
 the SoundFont a worktree needs is `assets/soundfont.sf2` and git carries it, so a
 checkout has it like every other asset. There is nothing left to copy —
-`specs/ci-plan.md` §6 is the account, and its own SoundFont paragraph predates
-this.
+`specs/assessments/ci-plan-assessment-2026-08.md` §6 is the account, and its
+own SoundFont paragraph predates this.

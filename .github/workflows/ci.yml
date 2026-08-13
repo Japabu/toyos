@@ -37,7 +37,8 @@ jobs:
   # (an hour-long bootstrap thrown away by the next push starts from nothing),
   # and `needs:` does not reach across workflows — so this job waits for the
   # release instead of depending on it directly, once, so a broken toolchain
-  # strands one runner rather than every shard (specs/ci-plan.md §5).
+  # strands one runner rather than every shard
+  # (specs/assessments/ci-plan-assessment-2026-08.md §5).
   toolchain-ready:
     runs-on: ubuntu-latest
     timeout-minutes: 150
@@ -58,8 +59,8 @@ jobs:
           api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
           # The asset, not the tag: `gh release create` makes the release
           # before uploading 401 MiB to it, and publishing is idempotent
-          # (specs/ci-plan.md §3), so a tag answering 200 does not mean the
-          # asset is there yet.
+          # (specs/testing-strategy.md §9), so a tag answering 200 does not
+          # mean the asset is there yet.
           published() {
             curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api/releases/tags/$tag" \
               | jq -e '.assets[]? | select(.name=="toyos-toolchain.tar.zst")' >/dev/null
@@ -103,8 +104,8 @@ jobs:
     needs: [toolchain-ready]
     runs-on: ubuntu-24.04
     # A wedge guard, not a budget: the harness answers a dead shared boot with
-    # a new one (specs/ci-plan.md §7.3), so a shard that cannot finish inside
-    # this ceiling measures nothing.
+    # a new one (specs/assessments/ci-plan-assessment-2026-08.md §7.3), so a
+    # shard that cannot finish inside this ceiling measures nothing.
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -112,7 +113,8 @@ jobs:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     # `debian:sid` ships QEMU 11.0.3, the dev host's exact version and the one
     # `.github/qemu-version` declares; `ubuntu-24.04` ships 8.2.2 and the two
-    # disagree about test outcomes (specs/ci-plan.md §7.3). The firmware, boot
+    # disagree about test outcomes
+    # (specs/assessments/ci-plan-assessment-2026-08.md §7.3). The firmware, boot
     # image and host CPU are unchanged from a bare runner — only the QEMU
     # binary and libraries under it differ.
     #
@@ -185,7 +187,8 @@ jobs:
       # cache eliminates third-party crate compiles; `actions/checkout` writes
       # every source with the current time, so our own crates rebuild
       # regardless — the direction of error a restore can cause is always more
-      # rebuilding, never a false green (specs/ci-plan.md §12.5).
+      # rebuilding, never a false green
+      # (specs/assessments/ci-plan-assessment-2026-08.md §12.5).
       #
       # `cache-writer` is the single writer; the twelve shards only read.
       # `actions/cache/save` never overwrites an existing key, so a second
@@ -215,8 +218,9 @@ jobs:
       #
       # `--jobs 1`, and the shard count replaces the width: a lane whose guest
       # shares cores with a sibling pays lock-holder preemption a solo guest
-      # does not, which is the `ALONE: GREEN` class (specs/ci-plan.md §7.2).
-      # One lane removes it by construction, at no cost — this repository is
+      # does not, which is the `ALONE: GREEN` class
+      # (specs/assessments/ci-plan-assessment-2026-08.md §7.2). One lane
+      # removes it by construction, at no cost — this repository is
       # public, so minutes are unmetered.
       #
       # `--nightly` widens the selection to the withheld tier, on the schedule
@@ -257,7 +261,7 @@ jobs:
           fi
 
       # Always, not only on a red: a shard may not write the profile it
-      # partitioned on (specs/ci-plan.md §4), so this writes
+      # partitioned on (specs/testing-strategy.md §9), so this writes
       # `test-durations.shard-<i>-of-<n>`, which `load_durations` never reads.
       # `--merge-durations` is the deliberate act that turns the twelve into
       # `tests/test-durations`.
@@ -597,7 +601,7 @@ jobs:
           if [ "${{ needs.guest.result }}" != success ]; then
             echo "::error::a guest shard reported ${{ needs.guest.result }}. The run summary"
             echo "::error::names the shard, the test and whether it survived being re-run"
-            echo "::error::alone; specs/ci-plan.md §9.2 is the rate to read that against."
+            echo "::error::alone; \`cargo run -- --known-red <test>\` is the rate to read that against."
             exit 1
           fi
           if [ "${{ needs.durations.result }}" != success ]; then

@@ -137,7 +137,8 @@ fn record_boot(took: Duration) {
 /// corrected for how fast the machine *is*, and that is the other half of the
 /// same mistake: a number reasoned about on an M4 Pro is not a liveness ceiling
 /// on a four-core Azure vCPU, it is a verdict about which of the two is running
-/// the test. `specs/ci-plan.md` §7.1 counted 307 bare timeouts in one CI run and
+/// the test. `specs/assessments/ci-plan-assessment-2026-08.md` §7.1 counted
+/// 307 bare timeouts in one CI run and
 /// every one of them was that.
 ///
 /// **Only ever upward.** On a faster host the number in the source stands,

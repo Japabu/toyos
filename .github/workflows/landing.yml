@@ -61,7 +61,7 @@ jobs:
 
   # What protects `main` is configured outside the repository, and this job
   # reads it back into VCS: half of it is readable from an endpoint that needs
-  # no token (specs/ci-plan.md §10.5).
+  # no token (specs/assessments/ci-plan-assessment-2026-08.md §10.5).
   #
   # The name is fixed: a required-check context is matched by job name, and
   # renaming it is a ruleset change with a window in which a required check
@@ -115,8 +115,8 @@ jobs:
             esac
           done
           # Strict is what makes a check on this head a check on the merged
-          # result — §10.2, and the property `--land`'s `git merge --no-ff main`
-          # used to carry.
+          # result — specs/assessments/ci-plan-assessment-2026-08.md §10.2, and
+          # the property `--land`'s `git merge --no-ff main` used to carry.
           if [ "$strict" != true ]; then
             echo "::error::required checks are not strict, so a branch could merge without"
             echo "::error::containing main and its checks would not be about the merged result"
@@ -142,4 +142,4 @@ jobs:
           done
 
           test "$bad" = 0
-          echo "main is protected the way specs/ci-plan.md §10.4 and §10.5 say it is."
+          echo "main is protected the way specs/assessments/ci-plan-assessment-2026-08.md §10.4 and §10.5 say it is."

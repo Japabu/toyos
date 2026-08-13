@@ -6,7 +6,8 @@ opened: 2026-08-08
 
 # A userland process reaches its first line half a second after its sibling on a runner, and ~30 ms after it here
 
-Fell out of the null-sink probe (`specs/ci-plan.md`) and is not what it closed.
+Fell out of the null-sink probe (`specs/assessments/ci-plan-assessment-2026-08.md`
+§9.2) and is not what it closed.
 On all three reps the two
 programs `tests/testcases` starts — soundd and test-runner, spawned 1–3 ms apart
 — printed their first lines **0.53–0.56 s apart**, and which of the two was

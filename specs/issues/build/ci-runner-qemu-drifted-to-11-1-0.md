@@ -21,7 +21,8 @@ recorded on 11.0.3. debian:sid is a rolling release and this is what it
 moving looks like — nothing here is about the tree.
 ```
 
-This commit is the deliberate act `specs/ci-plan.md` §7.3 asks for: the
+This commit is the deliberate act
+`specs/assessments/ci-plan-assessment-2026-08.md` §7.3 asks for: the
 declaration moves to `11.1.0` in the same commit that records why, so no
 number taken after it is silently read as comparable to one taken before —
 any comparison spanning the two is cross-instrument. Whether any test's

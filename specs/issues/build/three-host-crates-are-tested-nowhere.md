@@ -38,7 +38,8 @@ Counted 2026-08-12 with `grep -rho '#\[test\]' <crate>/src <crate>/tests`:
 renderer and `/bin/init`'s parser one format — root `CLAUDE.md` says so — and
 nothing runs it on a pull request.
 
-**This is the same defect `specs/ci-plan.md` §5 already recorded once**: four
+**This is the same defect `specs/assessments/ci-plan-assessment-2026-08.md` §5
+already recorded once**: four
 pure crates were missing from the same loop until 2026-08-08, "so CI was
 skipping the cheapest tests it had". It recurred because the list is in two
 places and nothing holds them against each other.

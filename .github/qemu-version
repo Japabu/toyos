@@ -1,7 +1,8 @@
 # The QEMU version every CI guest and the dev host run — read by `ci.yml`'s
 # shards, `tcg` and `cache-writer`, `gate-a.yml`, and the build system's
-# prerequisite check. The version decides test outcomes (specs/ci-plan.md
-# §7.3), and `debian:sid` is a rolling release, so this is a declaration
-# rather than a fact `instrument.sh` could read off the image. Changing it is
-# a deliberate act: it says the instrument moved.
+# prerequisite check. The version decides test outcomes
+# (specs/assessments/ci-plan-assessment-2026-08.md §7.3), and `debian:sid` is
+# a rolling release, so this is a declaration rather than a fact
+# `instrument.sh` could read off the image. Changing it is a deliberate act:
+# it says the instrument moved.
 11.1.0
