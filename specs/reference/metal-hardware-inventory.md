@@ -379,8 +379,9 @@ mouse: rel scale x=36 y=64 (screen 1920x1080)
 
 `format=1` is BGR (`bootloader/src/main.rs`: `PixelFormat::Rgb => 0, Bgr => 1`),
 so the panel is BGRX8888 at 1920×1080, 8,294,400 bytes at physical
-`0x4000000000`. **`stride == width`** — the divergence the pre-flash gate flagged
-as read-verified-only (§3.3, "QEMU's `stride == width`") is *also* stride == width
+`0x4000000000`. **`stride == width`** — the divergence
+`specs/plans/metal-boot-plan.md`'s pre-flash checklist flags as
+read-verified-only (§3.3, "QEMU's `stride == width`") is *also* stride == width
 on this machine, so the padded-stride path remains unexercised everywhere.
 
 The mode is firmware's and cannot be changed after ExitBootServices. The Iris Xe

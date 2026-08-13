@@ -2218,8 +2218,9 @@ lines.
   for.** It asserted `be604ef`'s residual — a peer that only ever connected
   could open any pipe the creator ever made — and carried the message saying to
   delete it when the residual closed. Chunk 3 closed it: a client's connection
-  records no peer. `specs/spec-staleness-sweep.md` §"The inverse" is updated to
-  say so rather than to keep pointing at a file that is gone.
+  records no peer. It was the model for the note on a test asserting a known
+  limitation on purpose in `specs/README.md`'s spec-checking method; deleting
+  it is the ending that pattern is for.
 - **`abuse_listener_hijack`, `abuse_connect_flood`, `fd_lifetime`,
   `window_refusal`, `device_claim_lifetime`, `abuse_gpu_resolution`,
   `sched_stress` and `locale_gate` are rewritten here rather than in chunk 8**,
