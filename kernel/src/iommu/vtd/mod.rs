@@ -592,7 +592,7 @@ impl Capabilities {
     /// The widest depth this kernel implements that the unit advertises.
     ///
     /// `None` is a unit offering neither, which §2.2 refuses at I5. 57-bit is
-    /// not considered even when advertised: §11.5, a fifth level of page
+    /// not considered even when advertised: §10.5, a fifth level of page
     /// tables for an address space nothing here needs, and an unused level is
     /// an untested one.
     fn address_width(&self) -> Option<AddressWidth> {

@@ -252,7 +252,7 @@ Two things stated rather than assumed:
   PCD/PWT/PAT bit). It works because firmware's MTRRs make the PCI hole
   uncacheable and the effective memory type is the stronger of the two. Mapping a
   BAR into a user address space inherits that dependency. Recorded in
-  `specs/iommu-spec.md` §12 as an open risk; it is the kind of thing that is true
+  `specs/iommu-spec.md` §11 as an open risk; it is the kind of thing that is true
   until a machine where it is not.
 
 ### 4.4 DMA memory and IOVAs
@@ -432,9 +432,9 @@ slow half of teardown never runs from the deferred queue (§5.3).
 ## 6. The migration
 
 Stages, each leaving the tree green: `cargo run -- --build-only` clean and
-`cargo test` green including gate A's fast tier. `specs/iommu-spec.md` §9's
-stages I0–I4 are prerequisites for stage 5 here and can proceed in parallel with
-stages 1–4.
+`cargo test` green including gate A's fast tier. `specs/plans/iommu-plan.md`'s
+stages up to I4 are prerequisites for stage 5 here and can proceed in parallel
+with stages 1–4.
 
 | Stage | Content | Exit criterion (runnable) |
 |---|---|---|
@@ -446,7 +446,7 @@ stages 1–4.
 | **6** | **virtio-gpu moves.** Compositor. `virtio_gpu.rs`, `gpu.rs`'s registry and the four `SYS_GPU_*` syscalls deleted; `main.rs:464-466`'s panic-console suppression goes with it. | `cargo test -- screen compositor`; the panic-console tests are the ones that must not move |
 | **7** | **virtio-sound moves.** soundd. `virtio_sound.rs`, `audio.rs`'s registry, `SYS_AUDIO_SUBMIT`, vector 0x23 deleted. | **gate A's thorough tier**, `cargo test --test toyos-build -- --audio-gate 30`, same-session A/B against the pre-stage tree. Same rule as a scheduler-migration stage transition, and for the same reason: this is the one stage that can move a latency distribution |
 | **8** | **virtio-console deleted (§3.4).** Console on the 16550 for every profile; `serial.rs`'s fifteen lines and `virtio.rs` itself go. | full suite; boot-time and log-throughput A/B recorded in the commit message |
-| **9** | **The refusal.** `specs/iommu-spec.md` §9 stage I5. Sequenced here because before this point a refusal costs every machine and protects nothing that has moved. | `cargo test -- iommu_refusal` |
+| **9** | **The refusal.** `specs/plans/iommu-plan.md` stage I5. Sequenced here because before this point a refusal costs every machine and protects nothing that has moved. | `cargo test -- iommu_refusal` |
 | **10** | **i8042 moves** — needs a port-IO capability, and that is a separate discussion: an unrestricted IOPB would reach 0xCF8/0xCFC and every other port on the machine, so it has to be a per-port bitmap. Optional; the exception-set criterion permits the i8042 to stay if a "press a key to page the panic screen" feature is ever wanted, because that is the kernel needing a keyboard while userspace is dead. | `cargo test -- metal_sim_input i8042` |
 | **11** | **Audit and the end condition.** §7.4's mechanical checks in CI; CLAUDE.md architecture updated; `specs/issues/` entries closed. | the §7.4 commands, in CI |
 
@@ -633,7 +633,7 @@ A plan that cannot say no is not a plan.
 
 ## 10. Open risks
 
-- **The `IRE` cutover can black-screen the machine** (`iommu-spec.md` §12). It is a
+- **The `IRE` cutover can black-screen the machine** (`iommu-spec.md` §11). It is a
   prerequisite here, so this plan inherits it.
 - **Isolation scopes and RMRRs on the T14** (`iommu-spec.md` §7.3–§7.4) could refuse
   a device this plan assumed would move. First real answer is a hardware boot.

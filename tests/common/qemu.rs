@@ -626,7 +626,7 @@ pub struct Iommu {
 
 /// What every profile but the three that vary it declares: the widest address
 /// width QEMU offers and interrupt remapping on, which is
-/// `specs/iommu-spec.md` §9 stage I0's configuration.
+/// `specs/iommu-spec.md` §8's configuration.
 pub const IOMMU_DEFAULT: Iommu = Iommu { aw_bits: 48, intremap: true };
 
 /// The controller every profile but [`Profile::MetalUsb`] gets. `nec-usb-xhci`
