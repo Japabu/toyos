@@ -51,9 +51,8 @@ verdicts.
 `git log <the commit the last pre-flash assessment covered>..HEAD --name-only`
 over `kernel/ bootloader/ src/ toyos-abi/ toyos/ userland/`, and add a
 "boot is unchanged" item — run, expect, false pass — for anything that
-touched the boot path. A section that lists commits by hash tells the next
-session exactly when it stopped being true; that is the point of writing it
-that way.
+touched the boot path. List the audited commits by hash, so the next session
+knows exactly when this section stopped being true.
 
 ### What this gate does NOT cover
 
