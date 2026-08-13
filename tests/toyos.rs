@@ -305,22 +305,28 @@ const AUDIO_SMP: &[u32] = &[1, 8];
 /// written.
 const SCREEN_TESTS: &[(&str, Sched, Tier)] = &[
     ("screen_decoder", Sched::Parallel, Tier::Fast),
-    ("screen_diag_boot", Sched::Parallel, Tier::Fast),
+    // `thread::sleep(5 s)` is the measurement, not a ceiling: the assertion is
+    // literally that the log is still on the panel five seconds after the boot
+    // finished, so a 2x slower machine changes nothing about the wait but the
+    // wait is the verdict either way — timer-anchored.
+    ("screen_diag_boot", Sched::Parallel, Tier::Nightly),
     ("screen_log_absent", Sched::Parallel, Tier::Fast),
     ("screen_console_shell", Sched::Parallel, Tier::Fast),
     ("screen_console_clear", Sched::Parallel, Tier::Fast),
     ("screen_console_scroll", Sched::Parallel, Tier::Nightly),
     ("screen_i8042_health", Sched::Parallel, Tier::Fast),
     // Ctrl+Alt+D with no console at all: the panel is the whole channel, and a
-    // compositor is holding it. Parallel — screendumps against markers, no
-    // clock in the verdict.
-    ("screen_blocked_dump", Sched::Parallel, Tier::Fast),
+    // compositor is holding it. A fixed 2 s settle sits inside the dump's own
+    // guest-timed 15 s hold, and the verdict is whether the report survived
+    // the desktop's next repaint — which only where that wait lands decides,
+    // so it is timer-anchored despite being a screendump-content check.
+    ("screen_blocked_dump", Sched::Parallel, Tier::Nightly),
     ("screen_recoverable_untouched", Sched::Parallel, Tier::Fast),
     ("screen_early_panic", Sched::Parallel, Tier::Fast),
     ("screen_late_panic", Sched::Parallel, Tier::Fast),
     ("screen_paged_scrollback", Sched::Parallel, Tier::Nightly),
     ("screen_panic_muted", Sched::Parallel, Tier::Fast),
-    ("screen_console_panic", Sched::Parallel, Tier::Nightly),
+    ("screen_console_panic", Sched::Parallel, Tier::Fast),
     ("screen_fatal_halt", Sched::Parallel, Tier::Fast),
     // The same fatal path with a compositor holding the panel, which is the
     // only configuration the owner's laptop is ever in and the one no screen
@@ -361,10 +367,10 @@ const GRAFFITI: [u8; 3] = [0x00, 0xC0, 0x00];
 /// tidy.
 const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("ioapic_topology", Sched::Parallel, Tier::Fast),
-    ("control_regs", Sched::Parallel, Tier::Nightly),
-    ("control_regs_negative", Sched::Parallel, Tier::Nightly),
+    ("control_regs", Sched::Parallel, Tier::Fast),
+    ("control_regs_negative", Sched::Parallel, Tier::Fast),
     ("input_merge", Sched::Parallel, Tier::Fast),
-    ("metal_sim_input", Sched::Parallel, Tier::Nightly),
+    ("metal_sim_input", Sched::Parallel, Tier::Fast),
     // One boot from here to `metal_sim_compositor_stall` (`METAL_SIM_DESKTOP`).
     ("metal_sim_compositor", Sched::Parallel, Tier::Nightly),
     // Reads the boot log this group already has, after the member above has
@@ -395,30 +401,31 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // A host-measured drain rate with an 8 s ceiling on a 3.3 s expectation.
     // Not gate A, but the same instrument: what it measures is how fast a
     // client's audio leaves the machine.
-    ("metal_sim_null_audio", Sched::Serial, Tier::Fast),
-    ("null_sink_shipped_client", Sched::Serial, Tier::Fast),
+    ("metal_sim_null_audio", Sched::Serial, Tier::Nightly),
+    ("null_sink_shipped_client", Sched::Serial, Tier::Nightly),
     // Parallel, and this one is argued rather than assumed: not a verdict in it
     // is a wall-clock margin. The flood's size is asserted against the audio
     // callback's own period counter standing still, both playback checks are
     // counted in periods, and the capture is read for amplitude and never for
     // timing. Its own boot, its own config, and the only client its soundd has.
     ("doom_sound_flood", Sched::Parallel, Tier::Nightly),
-    // Parallel on the same argument: the play is bounded by the audio
-    // callback's own period count, and the capture is read for amplitude and
-    // for what fraction of it carries signal — never for when.
+    // Reads a device capture and requires at least MIN_SIGNAL_SECS = 0.8 s of
+    // it to carry signal at peak >= 6000 — an absolute seconds-of-signal
+    // floor on audio recorded in real time, not a fraction of the capture and
+    // not compute-bound: timer-anchored, and Nightly for that reason.
     ("doom_music", Sched::Parallel, Tier::Nightly),
-    ("netd_connection_caps", Sched::Parallel, Tier::Nightly),
+    ("netd_connection_caps", Sched::Parallel, Tier::Fast),
     // Its own boot with a NIC under it, because sshd leaves at the bind on
     // every other config. Every verdict is a line of text; no clock in any.
-    ("sshd_fail_closed", Sched::Parallel, Tier::Nightly),
+    ("sshd_fail_closed", Sched::Parallel, Tier::Fast),
     // Serial: it measures netd's 2 s handshake deadline against the host's
     // clock, and counts how many connections survived a 48 ms paced burst
     // before that deadline could expire any of them. Both are wall-clock
     // margins, which is the definition of [`Sched::Serial`].
-    ("netd_hostile_peer", Sched::Serial, Tier::Fast),
-    ("launcher_refusals", Sched::Parallel, Tier::Nightly),
+    ("netd_hostile_peer", Sched::Serial, Tier::Nightly),
+    ("launcher_refusals", Sched::Parallel, Tier::Fast),
     ("foreign_disk_untouched", Sched::Parallel, Tier::Fast),
-    ("boot_partition_identity", Sched::Parallel, Tier::Nightly),
+    ("boot_partition_identity", Sched::Parallel, Tier::Fast),
     ("double_fault_stack", Sched::Parallel, Tier::Fast),
     // Its own boot, its own feature, and it drives the guest only through
     // stdin — nothing it touches is shared with another test.
@@ -451,8 +458,8 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("readdir_bound", Sched::Parallel, Tier::Fast),
     // Two boots, and the verdict is that they answer differently. Nothing in it
     // is timed: every arm is a process exit code or a byte comparison.
-    ("fpu_isolation", Sched::Parallel, Tier::Nightly),
-    ("short_sleep_livelock", Sched::Parallel, Tier::Nightly),
+    ("fpu_isolation", Sched::Parallel, Tier::Fast),
+    ("short_sleep_livelock", Sched::Parallel, Tier::Fast),
     ("i8042_health", Sched::Parallel, Tier::Nightly),
     // And one from here to `i8042_mouse` (`I8042_TRACE`), which is why all
     // three carry the answer the last of them needs.
@@ -488,7 +495,7 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // The wizard on the two surfaces the machine actually has, rather than on
     // the stand-in `locale_gate` is. Each costs a boot of a different image.
     ("console_locale_detect", Sched::Parallel, Tier::Fast),
-    ("desktop_locale_detect", Sched::Parallel, Tier::Nightly),
+    ("desktop_locale_detect", Sched::Parallel, Tier::Fast),
     // Typing at the same desktop, measured rather than transcribed: it waits
     // for its eight echoes instead of asserting how many arrived in a window,
     // so a guest that is slow costs seconds and not a verdict, and the verdict
@@ -504,12 +511,12 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // verdicts are counts the report has to agree with itself about, not a
     // wall-clock margin — the one duration in it is the dump's own 250 ms
     // ceiling, which the guest spends and the host never measures.
-    ("blocked_dump", Sched::Parallel, Tier::Nightly),
+    ("blocked_dump", Sched::Parallel, Tier::Fast),
     // Two boots of one machine compared on the guest's own `Boot: complete`
     // with a 300 ms allowance, which is the whole assertion.
     ("i8042_absent", Sched::Serial, Tier::Nightly),
     ("i8042_quarantine", Sched::Parallel, Tier::Fast),
-    ("i8042_budget_expiry", Sched::Parallel, Tier::Nightly),
+    ("i8042_budget_expiry", Sched::Parallel, Tier::Fast),
     ("i8042_fadt_denial", Sched::Parallel, Tier::Fast),
     ("i8042_kbd_echo", Sched::Parallel, Tier::Fast),
     // Returned 2026-08-13: relegated on this branch for the same 5 s fixed
@@ -522,10 +529,10 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // report is on the pin or on a timer.
     ("i8042_health_cadence", Sched::Parallel, Tier::Nightly),
     ("xhci_xecp_walk", Sched::Parallel, Tier::Fast),
-    ("xhci_slot_exhaustion", Sched::Parallel, Tier::Nightly),
+    ("xhci_slot_exhaustion", Sched::Parallel, Tier::Fast),
     ("usb_storage_gate", Sched::Parallel, Tier::Nightly),
     ("usb_storage_shapes", Sched::Parallel, Tier::Nightly),
-    ("usb_refused_disk_first", Sched::Parallel, Tier::Fast),
+    ("usb_refused_disk_first", Sched::Parallel, Tier::Nightly),
     // The owner's freeze, staged: `device_del` on the stick carrying `/boot`
     // and `/log` while the desktop draws. Serial because both verdicts are
     // liveness ceilings — two 2 s compositor reporting intervals inside 20 s,
@@ -534,11 +541,12 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("usb_boot_stick_pulled", Sched::Serial, Tier::Nightly),
     ("usb_pool_exhausted", Sched::Parallel, Tier::Fast),
     ("usb_short_read", Sched::Parallel, Tier::Fast),
-    // A plug over QMP and two host-side verdicts, neither of them a duration:
-    // the disk that arrives comes back byte-identical, and the log on the boot
-    // stick carries a line printed after it. The 1.2 s wait is against a 100 ms
-    // debounce the driver finishes in microseconds under TCG.
-    ("usb_disk_index_stable", Sched::Parallel, Tier::Fast),
+    // A plug over QMP and two host-side verdicts, neither of them a byte
+    // comparison alone: the fixed 1.2 s wait against a 100 ms debounce is a
+    // staged latency window the LATE_READY assertion is waited out before
+    // being read, which is timer-anchored regardless of how comfortable the
+    // margin looks under TCG.
+    ("usb_disk_index_stable", Sched::Parallel, Tier::Nightly),
     ("usb_storage_write_error", Sched::Parallel, Tier::Fast),
     ("usb_flush_optional", Sched::Parallel, Tier::Nightly),
     ("xhci_deaf_registers", Sched::Parallel, Tier::Nightly),
@@ -558,15 +566,18 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // One staged break and no other, which puts the driver's recovery finishing
     // on its first try in the verdict: a retried command that reaches an
     // endpoint still halted from the staged break logs a second `transport
-    // broke`, and how many tries it takes is how much of the host the guest had.
-    ("usb_transport_break", Sched::Serial, Tier::Fast),
-    ("xhci_full_speed_device", Sched::Parallel, Tier::Nightly),
-    ("xhci_superspeed_ports", Sched::Parallel, Tier::Nightly),
-    // Two of the three below stage plug and unplug with fixed waits, and both
-    // waits are 600-800 ms against a 100 ms debounce the driver finishes in
-    // microseconds under TCG — a margin, not a race, and every verdict either
-    // makes is a count of what the guest logged.
-    ("xhci_hotplug", Sched::Parallel, Tier::Fast),
+    // broke`, and how many tries it takes is how much of the host the guest
+    // had — its own doc says one break under KVM and two under TCG off the
+    // same tree, which is the race timer-anchored, not a margin, describes.
+    ("usb_transport_break", Sched::Serial, Tier::Nightly),
+    ("xhci_full_speed_device", Sched::Parallel, Tier::Fast),
+    ("xhci_superspeed_ports", Sched::Parallel, Tier::Fast),
+    // Two of the three below stage plug and unplug with fixed waits, 600-800 ms
+    // against a 100 ms debounce, plus 20-200 ms sleeps pacing the input pokes
+    // that follow — staged latency windows gating the verdict, so timer-
+    // anchored even though every individual check is a count of what the
+    // guest logged.
+    ("xhci_hotplug", Sched::Parallel, Tier::Nightly),
     // `xhci_flap` is the one that genuinely races the host against the guest:
     // its two QMP writes have to land inside *one* 100 ms debounce or the state
     // under test never happens, and it says so — `no replug collapsed inside a
