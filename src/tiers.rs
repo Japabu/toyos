@@ -8,13 +8,18 @@
 //! [`RELEGATED`] is exactly the set the nightly job selects, and `tests/toyos.rs`
 //! writes [`Tier::Nightly`] against each of those names in its own registration.
 //!
-//! **This is interim and it is a loss.** Fifty-five registered tests have a CI
-//! execution over the line (loaded audio and ordinary `audio_tone` each have two
-//! measured SMP labels), and six more ride a shared boot with one that is.
-//! Between them they account for 4,105.7 s of the effective 4,439.1 s CI
-//! profile, and none is gated per pull request. `guards` on every row says what
-//! stopped being gated, because a run that quietly does less is the whole
-//! failure mode here — `specs/test-cost-audit.md` §7 is the long form.
+//! **This is interim and it is a loss.** Fifty-three registered tests are
+//! Nightly: twenty-seven for [`Why::Cost`] — a CI execution over the line
+//! (loaded audio and ordinary `audio_tone` each have two measured SMP labels,
+//! all four over it) — twenty-two for [`Why::TimerAnchored`], Nightly by
+//! classification rather than by cost, mostly nowhere near the line and one
+//! (`i8042_quarantine`) straddling it run to run for the classification's own
+//! reason — and four for [`Why::RidesTheBootOf`], riding
+//! `metal_sim_compositor`'s shared boot. Between them they account for
+//! 1,791.2 s of the effective 2,126.6 s CI profile, and none is gated per pull
+//! request. `guards` on every row says what stopped being gated, because a run
+//! that quietly does less is the whole failure mode here —
+//! `specs/test-cost-audit.md` §7 is the long form.
 //!
 //! **Nothing here is an optimisation and nothing here changes an assertion.**
 //! A relegated test measures exactly what it measured; the manual nightly
@@ -41,8 +46,10 @@ use std::collections::{BTreeMap, BTreeSet};
 /// to real time — it plays or records in real time, waits out a staged latency
 /// window, or measures a rate, such that a 2x slower machine would change its
 /// verdict or price — belongs Nightly; only a compute-bound verdict stays Fast.
-/// The full sweep applying this to the rest of the fast tier is pending as its
-/// own change.
+/// **2026-08-13: the sweep applying this to the rest of the fast tier landed**
+/// — [`Why::TimerAnchored`] is the classification it needed, and every
+/// borderline name `specs/test-cost-audit.md` §7 raised has one of the three
+/// `Why` rows now.
 pub const FAST_CEILING_MS: u64 = 10_000;
 
 /// A committed profile row that exists only to put a new registration into one
@@ -65,8 +72,8 @@ pub enum Tier {
     Nightly,
 }
 
-/// Why a name is not in the fast tier. The two are not interchangeable and the
-/// gates below check different things of each.
+/// Why a name is not in the fast tier. The three are not interchangeable and
+/// the gates below check different things of each.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Why {
     /// Over [`FAST_CEILING_MS`] by itself.
@@ -80,6 +87,14 @@ pub enum Why {
     /// This is the collateral the record has to name: six tests here cost 11.3 s
     /// between them and go dark with their two slow carrier boots.
     RidesTheBootOf(&'static str),
+    /// **Nightly by classification, not by cost** — its verdict or duration is
+    /// anchored to real time (`FAST_CEILING_MS`'s 2026-08-12 boundary): it plays
+    /// or records in real time, waits out a staged latency window, or measures a
+    /// rate, such that a 2x slower machine would change its verdict or price.
+    /// No ceiling requirement in either direction: a row's label may measure
+    /// anything at all, over the line or nowhere near it, and neither moves it —
+    /// only reclassifying the verdict itself would.
+    TimerAnchored,
 }
 
 /// One test that the fast tier does not run.
@@ -114,23 +129,24 @@ pub const RELEGATED: &[Relegated] = &[
                  expires on 2026-09-06 whether or not the test has run since.",
     },
     Relegated {
-        test: "sshd_fail_closed",
-        ci_ms: 73_258,
-        why: Why::Cost,
-        guards: "sshd once accepted every credential. This is the gate for that class: it \
-                 mints a host identity under /home, finds no authorized_keys, \
-                 authenticates nobody, and — the half a missing-file check passes without \
-                 — never holds port 22 while it cannot accept a key.",
-    },
-    Relegated {
         test: "fpu_isolation",
-        ci_ms: 67_692,
+        ci_ms: 11_075,
         why: Why::Cost,
         guards: "The whole user machine state surviving every exit from Ring 3, on a \
                  one-CPU machine, against a second boot of an `fpu-save-nothing` kernel \
-                 that must fail the same three arms. A negative gate: without the second \
-                 boot the first proves only that the machine works, which it did before \
-                 the gate existed.",
+                 that must fail the same three arms: a leaked FP register value entering \
+                 the next process, a masked x87 exception surviving a switch, and \
+                 bit-identity across 20,000 syscalls, two page faults and a preemption \
+                 spin. A negative gate: without the second boot the first proves only \
+                 that the machine works, which it did before the gate existed. What still \
+                 runs per pull request: the compute-bound `fault_gates`/`std_unwind`/ \
+                 `std_unwind_so` trio (specs/user-machine-state.md §2, specs/ci-plan.md \
+                 §9.3), ~51 ms riding an existing shared boot, still catches a pending x87 \
+                 control word killing the next process — the one shape that put this \
+                 defect on CI in the first place — but proves nothing about a leaked \
+                 register value, sustained preservation under scheduling churn, or \
+                 whether an assertion has any teeth at all: the trio carries no negative \
+                 control.",
     },
     Relegated {
         test: "desktop_audio_client",
@@ -152,22 +168,25 @@ pub const RELEGATED: &[Relegated] = &[
     },
     Relegated {
         test: "screen_fatal_halt_composited",
-        ci_ms: 231_761,
-        why: Why::Cost,
-        guards: "Whether a fatal panic can paint the panel once a compositor owns the \
-                 scanout. That is the T14's only configuration and the assumption three \
-                 freeze investigations rested on; no other screen test asks it.",
+        ci_ms: 7_424,
+        why: Why::TimerAnchored,
+        guards: "metal-panic-probe fires once at framebuffer-claim + 5 s (kernel/src/heartbeat.rs); \
+                 the test waits that staged window out and then the pager's cycling on top of \
+                 it. Whether a fatal panic can paint the panel once a compositor owns the \
+                 scanout is the T14's only configuration and the assumption three freeze \
+                 investigations rested on; no other screen test asks it.",
     },
     Relegated {
         test: "metal_sim_compositor",
-        ci_ms: 230_812,
-        why: Why::Cost,
-        guards: "The four daemons surviving the T14's device shape, each in its own words: \
-                 the compositor naming the firmware framebuffer it claimed, netd exiting \
-                 rather than panicking with no NIC, soundd staying up on a null sink, sshd \
-                 saying it found no netd. Nothing supervises any of them, so the message \
-                 is the entire diagnostic. First of a six-test shared boot, whose tier \
-                 closes upward as one unit.",
+        ci_ms: 8_625,
+        why: Why::TimerAnchored,
+        guards: "Waits for three `compositor: frames=` batches at STATS_INTERVAL = 2 s, so \
+                 ~6 s of its run is a guest reporting timer. The four daemons surviving the \
+                 T14's device shape, each in its own words: the compositor naming the \
+                 firmware framebuffer it claimed, netd exiting rather than panicking with no \
+                 NIC, soundd staying up on a null sink, sshd saying it found no netd. \
+                 Nothing supervises any of them, so the message is the entire diagnostic. \
+                 First of a six-test shared boot, whose tier closes upward as one unit.",
     },
     Relegated {
         test: "metal_sim_compositor_stall",
@@ -211,21 +230,24 @@ pub const RELEGATED: &[Relegated] = &[
     },
     Relegated {
         test: "doom_music",
-        ci_ms: 145_669,
-        why: Why::Cost,
-        guards: "That doom opened the SoundFont this tree committed, played to the end of \
-                 the check, and that what it rendered reached the device. The three links \
+        ci_ms: 7_543,
+        why: Why::TimerAnchored,
+        guards: "Reads a device capture and requires at least 0.8 s of it to carry signal at \
+                 peak >= 6000 — an absolute seconds-of-signal floor on audio recorded in real \
+                 time. That doom opened the SoundFont this tree committed, played to the end \
+                 of the check, and that what it rendered reached the device. The three links \
                  src/soundfont.rs's host tests cannot make, and the three `b8b0749` broke \
                  for a cycle with the suite green.",
     },
     Relegated {
         test: "doom_sound_flood",
-        ci_ms: 117_839,
-        why: Why::Cost,
-        guards: "doom's sound producer outrunning its audio callback without the game \
-                 dying. The first domino of the T14 freeze: an `extern \"C\"` frame with \
-                 no unwind path turned the overflow panic into abort, and the kernel and \
-                 compositor followed it down.",
+        ci_ms: 5_714,
+        why: Why::TimerAnchored,
+        guards: "check_playback bounds tone and probe within [ceil(frames/128), 4x] of the \
+                 device's own period clock, and the capture is read for active samples: a rate \
+                 assertion on whether the guest kept up. It is the first domino of the T14 \
+                 freeze: an `extern \"C\"` frame with no unwind path turned the overflow panic \
+                 into abort, and the kernel and compositor followed it down.",
     },
     Relegated {
         test: "screen_console_scroll",
@@ -236,15 +258,6 @@ pub const RELEGATED: &[Relegated] = &[
                  text survive in the middle of a cleared screen.",
     },
     Relegated {
-        test: "launcher_refusals",
-        ci_ms: 76_081,
-        why: Why::Cost,
-        guards: "The capability architecture's own enforcement gate, and endowment landed \
-                 the day before this: sixteen malformed launches at /bin/init, which is \
-                 the one process the machine cannot lose, with init still launching, the \
-                 kernel's live-object count unchanged, and init naming what it refused.",
-    },
-    Relegated {
         test: "xhci_msi_only",
         ci_ms: 35_223,
         why: Why::Cost,
@@ -252,15 +265,6 @@ pub const RELEGATED: &[Relegated] = &[
                  using polled mode` on a real boot when there was no polled mode. Every \
                  other controller in this suite has MSI-X, so `msix=off` is the only way \
                  this branch executes at all.",
-    },
-    Relegated {
-        test: "control_regs_negative",
-        ci_ms: 40_323,
-        why: Why::Cost,
-        guards: "The negative control for the control-register verdict: a \
-                 `no-ap-control-regs` kernel with a genuinely divergent AP, which \
-                 `control_regs` has to refuse. Without it, whether the verdict would \
-                 recognise a real one is answered in prose.",
     },
     Relegated {
         test: "desktop_typing_damage",
@@ -363,28 +367,23 @@ pub const RELEGATED: &[Relegated] = &[
                  plausible constant satisfies any single-machine assertion.",
     },
     Relegated {
-        test: "boot_partition_identity",
-        ci_ms: 233_792,
-        why: Why::Cost,
-        guards: "The boot volume is selected by partition identity rather than by whatever \
-                 disk enumeration happened to put first. It is the regression gate for \
-                 moving the same image among differently ordered devices.",
-    },
-    Relegated {
         test: "kernel_heartbeat",
-        ci_ms: 200_026,
-        why: Why::Cost,
-        guards: "After the first full mask, no CPU may disappear from two consecutive \
-                 heartbeat samples, no sample gap may exceed 1 s, and at least one ran \
-                 field must be nonzero. One-sample KVM scheduling blips remain allowed.",
+        ci_ms: 6_794,
+        why: Why::TimerAnchored,
+        guards: "Serial: its verdict is a cadence — a fixed 3 s drain against a 250 ms \
+                 heartbeat period demanding at least four whole beats and no sample gap \
+                 over 1 s — and a guest sharing the host with eleven others reaches its \
+                 idle loop late for reasons that are not the defect.",
     },
     Relegated {
         test: "metal_sim_window_drag",
-        ci_ms: 164_363,
-        why: Why::Cost,
-        guards: "Injected pointer packets move a real compositor window by the requested \
-                 coordinates. Each step depends on the prior painted position, so this is \
-                 the end-to-end gate for input ordering and desktop geometry.",
+        ci_ms: 8_240,
+        why: Why::TimerAnchored,
+        guards: "Injects pointer packets on 25-120 ms sleeps where each packet's effect must \
+                 be on screen before the next is sent — a guest one batch behind aims at the \
+                 content instead, which is a different verdict rather than a slower one. Each \
+                 step depends on the prior painted position, so this is the end-to-end gate \
+                 for input ordering and desktop geometry.",
     },
     Relegated {
         test: "usb_storage_shapes",
@@ -404,67 +403,39 @@ pub const RELEGATED: &[Relegated] = &[
     },
     Relegated {
         test: "hda_tone",
-        ci_ms: 87_881,
-        why: Why::Cost,
-        guards: "soundd drives an Intel HDA stream through DMA and the host capture contains \
-                 the expected tone. Host-side codec tests do not connect ring programming, \
-                 interrupts, the daemon, and samples on the wire.",
-    },
-    Relegated {
-        test: "control_regs",
-        ci_ms: 83_255,
-        why: Why::Cost,
-        guards: "The BSP and every AP agree on the control-register state user isolation \
-                 relies on. A machine can boot with one divergent AP and fail only when a \
-                 task later lands there.",
-    },
-    Relegated {
-        test: "i8042_budget_expiry",
-        ci_ms: 80_146,
-        why: Why::Cost,
-        guards: "With the init budget deliberately spent before probe on an otherwise \
-                 answering controller, the driver names which stage lacked budget, does \
-                 not misreport `did not take`, and completes boot without a keyboard.",
-    },
-    Relegated {
-        test: "short_sleep_livelock",
-        ci_ms: 75_208,
-        why: Why::Cost,
-        guards: "Repeated sub-tick sleeps still allow runnable work to make progress. It is \
-                 the dedicated machine for a scheduler livelock that would otherwise kill \
-                 the shared boot and be blamed on the next binary.",
+        ci_ms: 9_220,
+        why: Why::TimerAnchored,
+        guards: "soundd drives a real HDA stream and the host analyses the captured wav for \
+                 dropouts, gap histogram and phase breaks — recorded in real time. Host-side \
+                 codec tests do not connect ring programming, interrupts, the daemon, and \
+                 samples on the wire.",
     },
     Relegated {
         test: "i8042_health_cadence",
-        ci_ms: 70_975,
-        why: Why::Cost,
-        guards: "The keyboard controller's health report is driven by the device's own byte \
-                 cadence, including a staged multi-period silence, rather than by a host \
-                 timeout that can certify a starved guest.",
+        ci_ms: 9_683,
+        why: Why::TimerAnchored,
+        guards: "Injects a 3 s silence against a 500 ms report period and asserts exactly two \
+                 counter lines for two keystrokes three seconds apart: the verdict is a \
+                 cadence and the absence of lines is the assertion. The keyboard controller's \
+                 health report is driven by the device's own byte cadence rather than by a \
+                 host timeout that can certify a starved guest.",
     },
     Relegated {
         test: "xhci_slow_connect",
-        ci_ms: 64_579,
-        why: Why::Cost,
-        guards: "A root hub whose ports stay empty during the controller's discovery window \
-                 still notices the device when it appears. This is the delayed-enumeration \
-                 shape real hubs impose after reset.",
-    },
-    Relegated {
-        test: "desktop_locale_detect",
-        ci_ms: 62_293,
-        why: Why::Cost,
-        guards: "The locale wizard works on the compositor surface the shipped desktop uses, \
-                 and its physical-key answer reaches the installed layout. Console-only \
-                 coverage cannot see focus, surface input, or desktop persistence.",
+        ci_ms: 4_999,
+        why: Why::TimerAnchored,
+        guards: "Bounds the first port line from both sides at 0.400 s +/- 0.150 s, and \
+                 refuses outright when a slow boot reaches the controller after the 300 ms \
+                 held-empty window — a slower machine changes the verdict, not the price. \
+                 This is the delayed-enumeration shape real hubs impose after reset.",
     },
     Relegated {
         test: "late_storage_connect",
-        ci_ms: 53_778,
-        why: Why::Cost,
-        guards: "A disk held absent through the boot scan is bound after it appears instead \
-                 of being mistaken for a device the initial scan already owned. It is the \
-                 storage-side delayed-port regression gate.",
+        ci_ms: 6_229,
+        why: Why::TimerAnchored,
+        guards: "The same SLOW_CONNECT_NS window applied to the disk's port: a boot that \
+                 outgrows it binds the disk in the port scan and the gate reds with \"the port \
+                 was not held empty\". It is the storage-side delayed-port regression gate.",
     },
     Relegated {
         test: "audio_tone_load",
@@ -493,43 +464,23 @@ pub const RELEGATED: &[Relegated] = &[
     },
     Relegated {
         test: "xhci_flap",
-        ci_ms: 38_496,
-        why: Why::Cost,
-        guards: "An unplug and replug collapsed inside one debounce window leaves one \
-                 coherent device rather than a ghost or a lost port. The test refuses if \
-                 the race was not actually staged.",
-    },
-    Relegated {
-        test: "xhci_slot_exhaustion",
-        ci_ms: 37_338,
-        why: Why::Cost,
-        guards: "With driver DMA device blocks clamped to one while the controller \
-                 advertises more slots, excess devices are refused and slot 1 still binds \
-                 as a disk.",
+        ci_ms: 8_201,
+        why: Why::TimerAnchored,
+        guards: "Its two QMP writes must land inside one 100 ms debounce or the state under \
+                 test never happens; a host that delays the second write reds a green machine \
+                 with a sentence indistinguishable from the defect. An unplug and replug \
+                 collapsed inside one debounce window leaves one coherent device rather than a \
+                 ghost or a lost port.",
     },
     Relegated {
         test: "screen_paged_scrollback",
-        ci_ms: 37_144,
-        why: Why::Cost,
-        guards: "Without input, the automatic panic pager shows the first boot line and \
-                 final panic marker on different pages and exposes at least two distinct \
-                 page footers. A single-page panic test cannot establish cycling.",
-    },
-    Relegated {
-        test: "blocked_dump",
-        ci_ms: 33_140,
-        why: Why::Cost,
-        guards: "On a live eight-CPU compositor boot, Ctrl+Alt+D produces a complete 8/8 \
-                 report whose parked count equals its deadline classes, whose process \
-                 census covers those tasks, and whose final verdict is present.",
-    },
-    Relegated {
-        test: "metal_sim_input",
-        ci_ms: 32_603,
-        why: Why::Cost,
-        guards: "The T14-shaped machine without virtio input still binds its PS/2 devices \
-                 and delivers input to the shipped stack. The normal virtual-machine shape \
-                 would silently take a different driver path.",
+        ci_ms: 8_279,
+        why: Why::TimerAnchored,
+        guards: "Must watch the panic pager cycle at PAGE_HOLD_NS = 3 s per page until the \
+                 first boot line comes round again — two distinct footers plus HEAD cannot be \
+                 obtained without waiting out several of those periods. Without input, the \
+                 automatic panic pager shows the first boot line and final panic marker on \
+                 different pages; a single-page panic test cannot establish cycling.",
     },
     Relegated {
         test: "usb_storage_gate",
@@ -541,69 +492,12 @@ pub const RELEGATED: &[Relegated] = &[
                  metal-sim.",
     },
     Relegated {
-        test: "netd_connection_caps",
-        ci_ms: 14_785,
-        why: Why::Cost,
-        guards: "A burst admits at least two black-hole connects up to one boundary, then \
-                 answers every request at and beyond it with ResourceExhausted. Both sides \
-                 refuse an implementation that rejects everything or at random.",
-    },
-    Relegated {
-        test: "screen_console_panic",
-        ci_ms: 11_103,
-        why: Why::Cost,
-        guards: "A panic reached through the interactive console replaces the live text \
-                 surface with the fatal report. It joins input delivery to panic painting, \
-                 a path neither an early panic nor an ordinary shell tests.",
-    },
-    Relegated {
-        test: "xhci_superspeed_ports",
-        ci_ms: 10_639,
-        why: Why::Cost,
-        guards: "SuperSpeed protocol ports are discovered and kept distinct from USB2 \
-                 companion ports. A controller can enumerate ordinary devices while its \
-                 USB3 half is absent or misrouted.",
-    },
-    Relegated {
         test: "i8042_absent",
         ci_ms: 10_410,
         why: Why::Cost,
         guards: "A normal boot is paired with i8042=off: the latter clears the FADT bit, \
                  exposes the floating 0xff bus refusal, and must complete within the 300 ms \
                  comparison bound.",
-    },
-    Relegated {
-        test: "xhci_full_speed_device",
-        ci_ms: 10_088,
-        why: Why::Cost,
-        guards: "A full-speed device behind xHCI receives the correct slot and endpoint \
-                 context rather than the high-speed defaults. High- and SuperSpeed devices \
-                 do not exercise that context encoding.",
-    },
-    Relegated {
-        test: "i8042_keyboard",
-        ci_ms: 94_611,
-        why: Why::Cost,
-        guards: "The expected PS/2 translations and usages reach userland, selected \
-                 press/release counts balance, no modifier remains stuck, and an i8042 \
-                 drain is observed. It carries the two cheaper observations below on the \
-                 same boot.",
-    },
-    Relegated {
-        test: "i8042_no_spurious_wake",
-        ci_ms: 5_019,
-        why: Why::RidesTheBootOf("i8042_keyboard"),
-        guards: "Pause supplies real bytes that decode into zero events: those drains must \
-                 not wake the reader or fabricate Pause input, while interleaved A-key \
-                 drains must wake and reach userland.",
-    },
-    Relegated {
-        test: "i8042_mouse",
-        ci_ms: 2_053,
-        why: Why::RidesTheBootOf("i8042_keyboard"),
-        guards: "Paced PS/2 mouse packets preserve button and displacement state through the \
-                 merged input path. It reuses the initialized controller trace boot and \
-                 cannot be selected independently without paying that boot again.",
     },
     Relegated {
         test: "audio_tone",
@@ -614,6 +508,99 @@ pub const RELEGATED: &[Relegated] = &[
                  underrun ceilings, with a harm verdict confirmed by a second boot before it \
                  fails. `audio_tone_load` runs the same check with two busy-spin burners \
                  added and was already Nightly.",
+    },
+    // 2026-08-13 sweep: the rest of the fast tier graded against
+    // `FAST_CEILING_MS`'s 2026-08-12 boundary. Every row below is under the
+    // line — none was relegated for cost — and moves for the same reason: its
+    // verdict or duration is anchored to real time.
+    Relegated {
+        test: "metal_sim_null_audio",
+        ci_ms: 9_712,
+        why: Why::TimerAnchored,
+        guards: "A host-measured drain rate with an 8 s ceiling on a 3.3 s expectation: what \
+                 it measures is how fast a client's audio leaves the machine. The last two \
+                 audio tests gated per pull request — after this, the claim \"sound comes out \
+                 of this machine\" is gated nightly only, alongside its sibling below.",
+    },
+    Relegated {
+        test: "null_sink_shipped_client",
+        ci_ms: 6_590,
+        why: Why::TimerAnchored,
+        guards: "Two 1 s tones drained at soundd's real 2.902 ms period grid, each guarded by \
+                 a 15 s wall-clock stuck-detector — real audio playing in real time, the other \
+                 half of the last-two-audio-tests loss `metal_sim_null_audio` names.",
+    },
+    Relegated {
+        test: "netd_hostile_peer",
+        ci_ms: 4_195,
+        why: Why::TimerAnchored,
+        guards: "Times netd's 2 s handshake deadline against the clock and counts what \
+                 survived a 1 ms-paced burst plus a fixed 100 ms settle before reading how \
+                 many netd kept — both wall-clock margins.",
+    },
+    Relegated {
+        test: "usb_transport_break",
+        ci_ms: 5_382,
+        why: Why::TimerAnchored,
+        guards: "`breaks > 2` counts who won the race between the device's late answer to the \
+                 abandoned transfer and the Bulk-Only reset — its own doc says one break under \
+                 KVM and two under TCG off the same tree. Dynamic USB goes nightly-only with \
+                 the three below: what stays gated per pull request is enumeration, \
+                 descriptors, slots, PORTSC, short reads, write errors and pool exhaustion — \
+                 every static shape — but no pull request exercises a device arriving or \
+                 leaving while the machine runs.",
+    },
+    Relegated {
+        test: "xhci_hotplug",
+        ci_ms: 7_711,
+        why: Why::TimerAnchored,
+        guards: "Stages every plug and unplug on fixed 800 ms waits against the driver's \
+                 100 ms debounce, with 20-200 ms sleeps pacing the input pokes that follow.",
+    },
+    Relegated {
+        test: "usb_refused_disk_first",
+        ci_ms: 7_286,
+        why: Why::TimerAnchored,
+        guards: "Two fixed 1,200 ms settles around the device_del and the blockdev_add/\
+                 device_add, then a fixed 20 s drain that every asserted line must arrive \
+                 inside.",
+    },
+    Relegated {
+        test: "usb_disk_index_stable",
+        ci_ms: 6_649,
+        why: Why::TimerAnchored,
+        guards: "A fixed 1,200 ms hotplug settle staged against a 100 ms debounce — \"this is \
+                 that with room\" — waited out before the LATE_READY assertion is read.",
+    },
+    Relegated {
+        test: "screen_blocked_dump",
+        ci_ms: 4_679,
+        why: Why::TimerAnchored,
+        guards: "A fixed 2 s settle placed inside the dump's own guest-timed 15 s hold, and \
+                 the verdict is whether the report survived the desktop's next repaint — \
+                 which only where that wait lands decides.",
+    },
+    Relegated {
+        test: "screen_diag_boot",
+        ci_ms: 6_952,
+        why: Why::TimerAnchored,
+        guards: "thread::sleep(5 s) is the measurement: the assertion is literally that the \
+                 log is still on the panel five seconds after the boot finished.",
+    },
+    // 2026-08-13, second pass: the sweep above kept `i8042_quarantine` Fast on
+    // the strength of one under-ceiling committed number; CI found otherwise.
+    Relegated {
+        test: "i8042_quarantine",
+        ci_ms: 11_073,
+        why: Why::TimerAnchored,
+        guards: "The fault quarantines (masks) the controller's GSI within milliseconds of \
+                 `===I8042_READY===` — confirmed from the serial log, before a host round trip \
+                 could land anything — so no sentinel `test_rs_i8042_keyboard` might send can \
+                 ever reach the guest, and every run necessarily pays the binary's full 5 s \
+                 fallback deadline. That fixed wall-clock window is the verdict's floor, not \
+                 an incidental cost, which is why the price straddles the 10,000 ms line run \
+                 to run rather than sitting on one side of it: 9,355 ms committed, 10,568 ms \
+                 in nightly run 31680778730, 11,073 ms in run 31704997228.",
     },
 ];
 
@@ -659,8 +646,6 @@ pub fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
     let mut errors = Vec::new();
     let mut seen = BTreeSet::new();
     let nightly = relegated_names();
-    let cost: BTreeSet<&str> =
-        RELEGATED.iter().filter(|r| r.why == Why::Cost).map(|r| r.test).collect();
 
     for (label, &ms) in ci {
         let name = canonical_profile_name(label);
@@ -721,14 +706,14 @@ pub fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
                         row.test
                     ));
                 }
-                if !cost.contains(carrier) {
+                if !nightly.contains(carrier) {
                     errors.push(format!(
-                        "{} rides {carrier}, but {carrier} has no current Cost row",
+                        "{} rides {carrier}, but {carrier} is not Nightly",
                         row.test
                     ));
                 }
             }
-            Why::Cost => {}
+            Why::Cost | Why::TimerAnchored => {}
         }
     }
 

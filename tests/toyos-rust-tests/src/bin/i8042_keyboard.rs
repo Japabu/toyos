@@ -1,9 +1,9 @@
 //! Claims the keyboard fd and prints what arrives, one line per event.
 //!
-//! Driven by the `i8042_keyboard` and `i8042_no_spurious_wake` host tests,
-//! which boot a guest with no USB HID at all and inject through QMP once the
-//! ready line appears. Not a standalone test: on its own it would time out
-//! with nothing to report, which is why it is in RUST_SKIP.
+//! Driven by eight host tests that boot a guest with no USB HID at all and
+//! inject through QMP once the ready line appears. Not a standalone test: on
+//! its own it would time out with nothing to report, which is why it is in
+//! RUST_SKIP.
 //!
 //! It holds a [`Translator`] because the kernel no longer does: the fd carries
 //! a HID usage and a modifier mask, and what those type is a layout, which is
@@ -20,18 +20,27 @@ use toyos_abi::input::RawKeyEvent;
 
 const EVENT_SIZE: usize = std::mem::size_of::<RawKeyEvent>();
 
+/// The host's end-of-run marker: the HID usage for the End key. None of this
+/// binary's eight callers' own injections presses it, so its release is
+/// unambiguous — the same shape as `input_events.rs`'s right-button release
+/// and `i8042_mouse.rs`'s own `ended`. The one caller whose verdict is a
+/// report cadence rather than a delivered key (`i8042_health_cadence`) sends
+/// no sentinel and runs out the deadline below instead.
+const SENTINEL: u8 = 0x4D;
+
 fn main() {
     let keyboard: Keyboard =
         capability().claim(DeviceType::Keyboard).expect("i8042_keyboard: no keyboard device");
     let mut translator = window::configured_translator();
     println!("===I8042_READY===");
 
-    // Long enough for the host to inject and for the events to land; short
-    // enough that a driver that delivers nothing fails rather than hangs.
+    // A liveness ceiling, not the measurement: the normal path exits on the
+    // sentinel below, and this only bounds a run that lost it.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut buf = [0u8; 512];
     let mut seen = 0;
-    while Instant::now() < deadline {
+    let mut ended = false;
+    while !ended && Instant::now() < deadline {
         let n = keyboard.read_nonblock(&mut buf).unwrap_or(0);
         if n == 0 {
             std::thread::sleep(Duration::from_millis(5));
@@ -51,6 +60,9 @@ fn main() {
                 translated.as_str()
             );
             seen += 1;
+            if key.keycode == SENTINEL && !key.pressed() {
+                ended = true;
+            }
         }
     }
     println!("kev done seen={seen}");

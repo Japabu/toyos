@@ -229,6 +229,24 @@ pub const KNOWN_RED: &[Red] = &[
         source: "specs/issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
+    // ---------------------------------------------------------------------
+    // A different assertion (`breaks > 2`, not the retired `breaks != 1`) on the
+    // same test, `1cb11e7`'s re-issue budget. The injected disk never left its
+    // two-break budget; the third line is the boot stick's own unrelated,
+    // cleanly-recovered transport break, which the count does not scope out.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "usb_transport_break",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "the transport broke 3 times off one abandoned transfer, which can undo one \
+               recovery and no more",
+        evidence: "PR #41 (`wt/toyos-i8042tier`), run 31684437719, job 94397136494 \
+                   (\"guest (4)\"), sha 711730204800d7173558f7dd96644c5910fb8cf0",
+        source: "specs/issues/hardware/usb-transport-break-counts-the-boot-sticks-recovery.md",
+        measured: "2026-08-13",
+    },
     Red {
         test: "std_unwind",
         instrument: Instrument::Ci,
