@@ -8,15 +8,15 @@
 //! [`RELEGATED`] is exactly the set the nightly job selects, and `tests/toyos.rs`
 //! writes [`Tier::Nightly`] against each of those names in its own registration.
 //!
-//! **This is interim and it is a loss.** Fifty-two registered tests are
-//! Nightly: twenty-six for [`Why::Cost`] — a CI execution over the line
+//! **This is interim and it is a loss.** Fifty-three registered tests are
+//! Nightly: twenty-seven for [`Why::Cost`] — a CI execution over the line
 //! (loaded audio and ordinary `audio_tone` each have two measured SMP labels,
 //! all four over it) — twenty-two for [`Why::TimerAnchored`], Nightly by
 //! classification rather than by cost, mostly nowhere near the line and one
 //! (`i8042_quarantine`) straddling it run to run for the classification's own
 //! reason — and four for [`Why::RidesTheBootOf`], riding
 //! `metal_sim_compositor`'s shared boot. Between them they account for
-//! 1,780.1 s of the effective 2,124.4 s CI profile, and none is gated per pull
+//! 1,791.2 s of the effective 2,126.6 s CI profile, and none is gated per pull
 //! request. `guards` on every row says what stopped being gated, because a run
 //! that quietly does less is the whole failure mode here —
 //! `specs/test-cost-audit.md` §7 is the long form.
@@ -127,6 +127,26 @@ pub const RELEGATED: &[Relegated] = &[
                  answers afterwards. The only reproduction #156 has anywhere. Its \
                  EXPECTED_FAILURES entry is Stale::OnThisDate, so the declaration still \
                  expires on 2026-09-06 whether or not the test has run since.",
+    },
+    Relegated {
+        test: "fpu_isolation",
+        ci_ms: 11_075,
+        why: Why::Cost,
+        guards: "The whole user machine state surviving every exit from Ring 3, on a \
+                 one-CPU machine, against a second boot of an `fpu-save-nothing` kernel \
+                 that must fail the same three arms: a leaked FP register value entering \
+                 the next process, a masked x87 exception surviving a switch, and \
+                 bit-identity across 20,000 syscalls, two page faults and a preemption \
+                 spin. A negative gate: without the second boot the first proves only \
+                 that the machine works, which it did before the gate existed. What still \
+                 runs per pull request: the compute-bound `fault_gates`/`std_unwind`/ \
+                 `std_unwind_so` trio (specs/user-machine-state.md §2, specs/ci-plan.md \
+                 §9.3), ~51 ms riding an existing shared boot, still catches a pending x87 \
+                 control word killing the next process — the one shape that put this \
+                 defect on CI in the first place — but proves nothing about a leaked \
+                 register value, sustained preservation under scheduling churn, or \
+                 whether an assertion has any teeth at all: the trio carries no negative \
+                 control.",
     },
     Relegated {
         test: "desktop_audio_client",

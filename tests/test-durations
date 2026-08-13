@@ -160,7 +160,7 @@ expected_failure_verdicts 0
 fault_gates 20
 fd_lifetime 17
 foreign_disk_untouched 5093
-fpu_isolation 8876
+fpu_isolation 11075
 fs_large_file 97
 fs_truncate_persist 14
 handle_basic 12

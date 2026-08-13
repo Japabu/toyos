@@ -457,8 +457,11 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("iommu_discovery", Sched::Parallel, Tier::Nightly),
     ("readdir_bound", Sched::Parallel, Tier::Fast),
     // Two boots, and the verdict is that they answer differently. Nothing in it
-    // is timed: every arm is a process exit code or a byte comparison.
-    ("fpu_isolation", Sched::Parallel, Tier::Fast),
+    // is timed: every arm is a process exit code or a byte comparison — still
+    // compute-bound, still Nightly: 11,075 ms in the sweep's final shard
+    // packing (run 31705986758) is a Cost row, the same shape
+    // `desktop_window_child` carries, not a reclassification.
+    ("fpu_isolation", Sched::Parallel, Tier::Nightly),
     ("short_sleep_livelock", Sched::Parallel, Tier::Fast),
     ("i8042_health", Sched::Parallel, Tier::Nightly),
     // And one from here to `i8042_mouse` (`I8042_TRACE`), which is why all
