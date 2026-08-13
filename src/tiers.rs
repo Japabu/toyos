@@ -581,31 +581,6 @@ pub const RELEGATED: &[Relegated] = &[
                  do not exercise that context encoding.",
     },
     Relegated {
-        test: "i8042_keyboard",
-        ci_ms: 94_611,
-        why: Why::Cost,
-        guards: "The expected PS/2 translations and usages reach userland, selected \
-                 press/release counts balance, no modifier remains stuck, and an i8042 \
-                 drain is observed. It carries the two cheaper observations below on the \
-                 same boot.",
-    },
-    Relegated {
-        test: "i8042_no_spurious_wake",
-        ci_ms: 5_019,
-        why: Why::RidesTheBootOf("i8042_keyboard"),
-        guards: "Pause supplies real bytes that decode into zero events: those drains must \
-                 not wake the reader or fabricate Pause input, while interleaved A-key \
-                 drains must wake and reach userland.",
-    },
-    Relegated {
-        test: "i8042_mouse",
-        ci_ms: 2_053,
-        why: Why::RidesTheBootOf("i8042_keyboard"),
-        guards: "Paced PS/2 mouse packets preserve button and displacement state through the \
-                 merged input path. It reuses the initialized controller trace boot and \
-                 cannot be selected independently without paying that boot again.",
-    },
-    Relegated {
         test: "audio_tone",
         ci_ms: 21_934,
         why: Why::Cost,
@@ -614,16 +589,6 @@ pub const RELEGATED: &[Relegated] = &[
                  underrun ceilings, with a harm verdict confirmed by a second boot before it \
                  fails. `audio_tone_load` runs the same check with two busy-spin burners \
                  added and was already Nightly.",
-    },
-    Relegated {
-        test: "i8042_undecoded_bytes",
-        ci_ms: 10_328,
-        why: Why::Cost,
-        guards: "A staged Pause keystroke decodes to zero events across its whole six-byte \
-                 sequence, and the driver's report names the undecoded byte rather than only \
-                 a count; a plain letter typed afterward proves the verdict revises instead \
-                 of freezing on the half-arrived sequence — the ambiguity the T14's own \
-                 `1 interrupts, 1 bytes, 0 keys` verdict could not resolve.",
     },
 ];
 

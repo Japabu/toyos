@@ -460,10 +460,13 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // None of the three measures a rate. All three keep fewer bytes in flight
     // than QEMU's PS/2 device holds — `i8042_mouse` by pacing against the
     // guest's own report, within [`MOUSE_LEAD`] — so a guest with less of the
-    // host is a longer run and not a smaller count.
-    ("i8042_keyboard", Sched::Parallel, Tier::Nightly),
-    ("i8042_no_spurious_wake", Sched::Parallel, Tier::Nightly),
-    ("i8042_mouse", Sched::Parallel, Tier::Nightly),
+    // host is a longer run and not a smaller count. `i8042_keyboard` itself
+    // held the group Nightly on a cost that was really the fixed 5 s
+    // collection deadline in `test_rs_i8042_keyboard`; now that the binary
+    // exits on a sentinel instead, all three return.
+    ("i8042_keyboard", Sched::Parallel, Tier::Fast),
+    ("i8042_no_spurious_wake", Sched::Parallel, Tier::Fast),
+    ("i8042_mouse", Sched::Parallel, Tier::Fast),
     // A boot each, and deliberately not a group: every one of them changes
     // the machine's layout, which `i8042_keyboard` asserts against, and a
     // wizard that exits the instant it has its answer leaves the guest with
@@ -509,7 +512,10 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("i8042_budget_expiry", Sched::Parallel, Tier::Nightly),
     ("i8042_fadt_denial", Sched::Parallel, Tier::Fast),
     ("i8042_kbd_echo", Sched::Parallel, Tier::Fast),
-    ("i8042_undecoded_bytes", Sched::Parallel, Tier::Nightly),
+    // Returned 2026-08-13: relegated on this branch for the same 5 s fixed
+    // collection deadline the rest of the family crossed on, now fixed at
+    // the source (`test_rs_i8042_keyboard` exits on a sentinel).
+    ("i8042_undecoded_bytes", Sched::Parallel, Tier::Fast),
     // Its verdict is a cadence, and its absence is the assertion — both read
     // off the guest's own `last byte at Nms` stamps. The gap it injects is
     // 3 s against a 500 ms period, so six periods of margin decide whether the
@@ -4619,6 +4625,16 @@ fn compositor_screen_size(console: &str) -> Result<(u32, u32), String> {
     Ok((w, h))
 }
 
+/// End's release: the sentinel `test_rs_i8042_keyboard` exits on
+/// (`tests/toyos-rust-tests/src/bin/i8042_keyboard.rs`). No caller of that
+/// binary injects End itself, so every caller but `i8042_health_cadence` —
+/// whose verdict is a report cadence over a real span, not a delivered key —
+/// sends this after its last injection instead of running out the binary's
+/// fallback deadline.
+fn send_i8042_sentinel(socket: &Path) {
+    qemu::qmp_send_keys(socket, &[("end", true), ("end", false)]);
+}
+
 /// A key injected at the controller, decoded, mapped and delivered to a
 /// userland process — IRQ delivery, set-1 decode, the HID mapping and the
 /// shared translate/layout path, in one run.
@@ -4651,6 +4667,8 @@ fn i8042_keyboard(boot: &mut Boot) -> Result<(), String> {
             qemu::qmp_send_keys(socket, &[("shift", true)]);
             thread::sleep(Duration::from_millis(20));
             qemu::qmp_send_keys(socket, &[("shift", false)]);
+            thread::sleep(Duration::from_millis(20));
+            send_i8042_sentinel(socket);
         },
     );
     if let Some(err) = &result.error {
@@ -5987,6 +6005,7 @@ fn i8042_no_spurious_wake(boot: &mut Boot) -> Result<(), String> {
                 qemu::qmp_send_keys(socket, &[("a", true), ("a", false)]);
                 thread::sleep(Duration::from_millis(50));
             }
+            send_i8042_sentinel(socket);
         },
     );
     if let Some(err) = &result.error {
@@ -8514,6 +8533,8 @@ fn run_machine_test(
                 "===I8042_READY===",
                 |socket| {
                     qemu::qmp_send_keys(socket, &[("a", true), ("a", false)]);
+                    thread::sleep(Duration::from_millis(100));
+                    send_i8042_sentinel(socket);
                 },
             );
             if let Some(err) = &result.error {
@@ -8744,6 +8765,7 @@ fn run_machine_test(
                         qemu::qmp_send_keys(socket, &[(key, true), (key, false)]);
                         thread::sleep(Duration::from_millis(20));
                     }
+                    send_i8042_sentinel(socket);
                 },
             );
             if let Some(err) = &result.error {
@@ -8813,6 +8835,7 @@ fn run_machine_test(
                         qemu::qmp_send_keys(socket, &[(key, true), (key, false)]);
                         thread::sleep(Duration::from_millis(20));
                     }
+                    send_i8042_sentinel(socket);
                 },
             );
             if let Some(err) = &result.error {
@@ -8871,6 +8894,8 @@ fn run_machine_test(
                     qemu::qmp_send_keys(socket, &[("pause", true), ("pause", false)]);
                     thread::sleep(Duration::from_millis(200));
                     qemu::qmp_send_keys(socket, &[("a", true), ("a", false)]);
+                    thread::sleep(Duration::from_millis(100));
+                    send_i8042_sentinel(socket);
                 },
             );
             if let Some(err) = &result.error {
@@ -9005,6 +9030,13 @@ fn run_machine_test(
             }
             // The in-guest reader keeps a CPU doing work, so a livelocked
             // one is visible as a dead test rather than as a quiet pass.
+            //
+            // No sentinel here: the log below shows quarantine landing within
+            // milliseconds of `===I8042_READY===`, before a host round trip
+            // could possibly deliver anything, and quarantine masks the GSI —
+            // so nothing sent afterward, sentinel included, ever reaches the
+            // guest. This is `test_rs_i8042_keyboard`'s fallback deadline by
+            // design, not a lost sentinel.
             let result = qemu.run_test_hooked(
                 "test_rs_i8042_keyboard",
                 Duration::from_secs(30),

@@ -178,11 +178,11 @@ i8042_fadt_denial 9589
 i8042_health 47121
 i8042_health_cadence 70975
 i8042_kbd_echo 9498
-i8042_keyboard 94611
-i8042_mouse 2053
-i8042_no_spurious_wake 5019
+i8042_keyboard 18446744073709551615
+i8042_mouse 18446744073709551615
+i8042_no_spurious_wake 18446744073709551615
 i8042_quarantine 9355
-i8042_undecoded_bytes 10328
+i8042_undecoded_bytes 18446744073709551615
 idle_stack_guard 52822
 input_merge 4452
 io_uring_cancel_wakes 522
