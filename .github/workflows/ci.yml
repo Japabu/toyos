@@ -1,26 +1,18 @@
 name: ci
 
-# The guest suite on Linux x86_64, twelve machines at once — which is the shape
-# the dev host does not have, and the one that costs nobody a shared sysroot.
-#
-# `ci/**` is where throwaway probe branches live; they trigger their own
+# The guest suite: twelve KVM shards on Linux x86_64 (specs/testing-strategy.md
+# §4). `ci/**` is where throwaway probe branches live; they trigger their own
 # workflows and not this one.
 #
-# **A pull request and `main`, and nothing in between.** `main` moves only
-# through a merged pull request now (`specs/worktrees.md` §5), so a branch push
-# and the pull request on it were two runs of the same twelve shards. `main`
-# itself still runs: it is what `landing.yml`'s `gate-stage` reads, and its
+# `main` moves only through a merged pull request (specs/worktrees.md §5), so a
+# branch push and the pull request on it are two runs of the same twelve
+# shards. `main`'s own run is what `landing.yml`'s `gate-stage` reads, and its
 # `actions/cache` entries are the only ones every branch can restore.
 #
-# **And once a night, on a schedule.** `cargo test --test toyos-build --
-# --nightly` runs the tier the fast shards hold back — `src/tiers.rs`'s
-# `RELEGATED` — and until 2026-08-12 nothing scheduled it, so the coverage a
-# withheld test still carries had nobody actually running it. `schedule`
-# generalizes the `workflow_dispatch` precedent below rather than duplicating
-# it — the same `SUITE_TIER_ARGS` line that already added `--nightly` for a
-# manual dispatch does it for `03:00 UTC` too. `schedule` always runs the
-# default branch's copy of this file against its own tip, so a nightly red is a
-# red about `main`, never about a branch.
+# `schedule` runs the tier the fast shards withhold (specs/testing-strategy.md
+# §5) by widening `SUITE_TIER_ARGS`, the same way `workflow_dispatch` already
+# could. `schedule` always runs the default branch's copy of this file against
+# its own tip, so a nightly red is about `main`, never about a branch.
 
 on:
   push:
@@ -30,40 +22,22 @@ on:
   schedule:
     - cron: '0 3 * * *'
 
-# **A superseded pull-request run is thrown away; a run on `main` never is.**
-# Cancelling a pull request's previous run is free — the newer push is the
-# question anyone is asking. `main` is not that: every merged state is a state
-# somebody will bisect through, and `landing.yml`'s `gate-stage` counts only the
-# runs that *concluded*, so a cancelled one is not a sample and the trigger for
-# promoting the guest gate never advances on it. Measured 2026-08-08: five pull
-# requests merged inside ninety minutes left `e4b7279`, `782b9e5` and `aaa7a7a`
-# each cancelled by the merge behind it, and the newest verdict `main` had was
-# from before any of them.
-# The nightly run gets its own group so it never queues behind, or ahead of, a
-# pull request's or a push's — `cancel-in-progress` staying false for `main`
-# already means the two would never cancel each other, but they would still
-# serialize in the same group, and a merge landing at `03:04` has no business
-# waiting behind a run that is exercising the withheld tier.
+# A superseded pull-request run is thrown away — the newer push is the
+# question anyone is asking. `main` is not that: `landing.yml`'s `gate-stage`
+# counts only concluded runs, so a cancelled one is not a sample. The nightly
+# run gets its own concurrency group so it never queues behind, or ahead of, a
+# pull request or a push exercising the withheld tier.
 concurrency:
   group: ci-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
-  # **Nothing here may run against a tree whose toolchain does not build.**
-  #
+  # Nothing here may run against a tree whose toolchain does not build.
   # `toolchain.yml` is a separate workflow because it must never be cancelled
-  # (an hour-long bootstrap thrown away by the next push starts again from
-  # nothing), and `needs:` does not reach across workflows. So the shards waited
-  # for the release instead of depending on it — and a wait cannot tell "not yet"
-  # from "never". Pull request #22 measured what that costs: std failed to
-  # compile, no release was ever published, and **thirteen jobs sat for 46
-  # minutes each** — 10 hours of runner time, and the whole 20-job concurrency
-  # budget, spent on a tree that could not build. `specs/ci-plan.md` §5 already
-  # recorded the other end of that: a *required* three-second check queued
-  # twenty-two minutes behind twelve advisory shards.
-  #
-  # This is that wait, once, in one job that also watches the workflow doing the
-  # building. One runner waits; thirteen do not start.
+  # (an hour-long bootstrap thrown away by the next push starts from nothing),
+  # and `needs:` does not reach across workflows — so this job waits for the
+  # release instead of depending on it directly, once, so a broken toolchain
+  # strands one runner rather than every shard (specs/ci-plan.md §5).
   toolchain-ready:
     runs-on: ubuntu-latest
     timeout-minutes: 150
@@ -77,20 +51,15 @@ jobs:
           tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
                 HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
           echo "toolchain: $tag"
-          # The workflow run is keyed on the *head* sha even though the tag is
-          # computed from the merge ref: `toolchain.yml` checks out the same
-          # merge ref this job did, so the two agree about the tag and disagree
-          # only about the name the run is filed under.
+          # The tag is computed from the merge ref, and this looks the run up
+          # by the head sha instead: `toolchain.yml` checks out the same merge
+          # ref, so the two agree about the tag regardless.
           sha="${{ github.event.pull_request.head.sha || github.sha }}"
           api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
-          # **The asset and not the tag.** What every job below installs is
-          # `toyos-toolchain.tar.zst`, and the release that carries it is
-          # created first and uploaded to afterwards — 401 MiB of it. Publishing
-          # is idempotent by design (§3), so two branches with the same four
-          # trees both build and there is a window where the tag answers 200 and
-          # the artifact is not there. A gate that reads the tag releases
-          # thirteen shards into that window and each of them reds on a missing
-          # asset: a red whose name is the shard and whose cause is this job.
+          # The asset, not the tag: `gh release create` makes the release
+          # before uploading 401 MiB to it, and publishing is idempotent
+          # (specs/ci-plan.md §3), so a tag answering 200 does not mean the
+          # asset is there yet.
           published() {
             curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api/releases/tags/$tag" \
               | jq -e '.assets[]? | select(.name=="toyos-toolchain.tar.zst")' >/dev/null
@@ -133,49 +102,31 @@ jobs:
   guest:
     needs: [toolchain-ready]
     runs-on: ubuntu-24.04
-    # A shard that cannot finish measures nothing, and 90 minutes was reached by
-    # one test taking the shared boot down (run `31241099454`, shard 1: five
-    # tests passed, `abuse_gpu_resolution` went, and the 150 behind it each paid
-    # a full ceiling for a guest that was gone). The harness answers a dead
-    # shared boot with a new one now, so this is a wedge guard again and not a
-    # budget.
+    # A wedge guard, not a budget: the harness answers a dead shared boot with
+    # a new one (specs/ci-plan.md §7.3), so a shard that cannot finish inside
+    # this ceiling measures nothing.
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-    # **QEMU 11.0.3, the dev host's exact version, because 8.2.2 is not.**
-    # `ubuntu-24.04` ships 8.2.2 and nothing on a runner can install anything
-    # newer; `debian:sid` ships 11.0.3 (measured, run `31245897225`: trixie
-    # 10.0.11, ubuntu:25.10 10.1.0, ubuntu:24.04 8.2.2). Run `31246245541` is
-    # why it is worth a container: `desktop_typing_damage` is red on 8.2.2 under
-    # KVM and green on 11.0.3 under the same accelerator on the same runner
-    # image. Injection is a QMP path through emulated devices, and three major
-    # versions of it was a variable this suite had never had a second data point
-    # on.
+    # `debian:sid` ships QEMU 11.0.3, the dev host's exact version and the one
+    # `.github/qemu-version` declares; `ubuntu-24.04` ships 8.2.2 and the two
+    # disagree about test outcomes (specs/ci-plan.md §7.3). The firmware, boot
+    # image and host CPU are unchanged from a bare runner — only the QEMU
+    # binary and libraries under it differ.
     #
-    # A container changes less than it looks like it does. The firmware is
-    # `ovmf/` in this repository on every host, the boot image is built here,
-    # and the host CPU is the same Azure vCPU. What differs is the QEMU binary
-    # and the libraries under it — and the cost is one `apt-get` and one
-    # `rustup-init` per job, which the ubuntu image would otherwise have given
-    # for free.
-    #
-    # `--device=/dev/kvm` and root inside the container is how the accelerator is
-    # reached: the node ships `crw-rw---- root:kvm` and root opens it, so there
-    # is no chmod here. `kvm_usable` opens the device and every boot follows.
+    # `--device=/dev/kvm` and root inside the container reach the accelerator
+    # with no chmod: the node ships `crw-rw---- root:kvm` and root opens it.
+    # `kvm_usable` opens the device and every boot follows.
     container:
       image: debian:sid
       options: --device=/dev/kvm
     steps:
-      # Before the checkout, because `actions/checkout` wants git and this image
-      # has none.
-      #
-      # **Three attempts, because `sid` is a rolling release and its mirror is
-      # not a fixed artifact.** Shard 1 of run `31270581874` failed here and ran
-      # no test at all, which reads as a red shard and is not one. Advisory
-      # today; once `guest-suite` is required (§10.4) an apt mirror would be able
-      # to block a merge, and that is not a gate anyone chose.
+      # Before the checkout: `actions/checkout` wants git and this image has
+      # none. Three attempts, since `sid` is a rolling release and its mirror
+      # is not a fixed artifact — `guest-suite` is required, so a mirror blip
+      # must not be able to block a merge.
       - name: deps
         run: |
           got=no
@@ -190,11 +141,7 @@ jobs:
             echo "apt attempt $attempt failed"
             [ "$attempt" = 3 ] || sleep 20
           done
-          # **Named, because three failures used to be reported as
-          # `qemu-system-x86_64: command not found`** three lines later, which
-          # reads as a broken image rather than as a mirror. `sid` is a rolling
-          # release and its mirror is not a fixed artifact; this says nothing
-          # about the tree, and `guest-suite` is a required check now.
+          # Named, so a mirror blip reads as one and not as a broken image.
           if [ "$got" != yes ]; then
             echo "::error::apt failed three times against sid's mirror. Nothing here is about"
             echo "::error::the tree — re-run the job."
@@ -203,10 +150,8 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      # The QEMU version, the host CPU vendor and whether `/dev/kvm` is there —
-      # the three variables a verdict from this job has to be read against, and
-      # the first of them is now a declaration this checks rather than a line in
-      # a log nobody reads. `.github/instrument.sh` says why each is here.
+      # `.github/instrument.sh` names the variables a verdict from this job
+      # must be read against.
       - name: the instrument
         env:
           MATRIX_LABEL: shard ${{ matrix.shard }}/12
@@ -226,50 +171,28 @@ jobs:
             | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      # The same key `toolchain.yml` publishes under. **A short retry and not a
-      # two-hour wait**: `toolchain-ready` has already established that the
-      # release is there, so anything this loop is still waiting for is the API
-      # rather than a build. Fetched through the API rather than `gh`, which
-      # this image has not.
       - name: install the toolchain
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.key.outputs.tag }}
         run: .github/install-toolchain.sh
 
-      # **The build below is the same build on thirteen machines, and it was
-      # 435 s of the widest shard's 1,058 s.** Measured cold against warm in one
-      # run on one image, `probe-cache.yml` run `31385467644`: 519 s against
-      # **282 s**, 177 crate compiles against 10, a 786 MB entry and a 7 s
-      # restore. What the cache eliminates is every third-party crate; what it
-      # cannot is our own, because `actions/checkout` writes every source with
-      # the current time and cargo's fingerprint for a path crate is an mtime
-      # comparison. **That is the direction of error worth stating: a fresh
-      # checkout makes cargo rebuild more than it needs to, never less.**
+      # The key is the toolchain tag first, the lockfiles second: cargo cannot
+      # see the sysroot (`toyos-abi`, `toyos`, `userland/libc`), so its
+      # `rustc -vV` does not change when they do and `restore-keys` cannot fall
+      # back across a sysroot change unless the tag is the prefix.
+      # `src/build.rs`'s `external_fingerprint` is the belt to that brace. The
+      # cache eliminates third-party crate compiles; `actions/checkout` writes
+      # every source with the current time, so our own crates rebuild
+      # regardless — the direction of error a restore can cause is always more
+      # rebuilding, never a false green (specs/ci-plan.md §12.5).
       #
-      # **The key is the toolchain tag first and the lockfiles second.** The one
-      # thing cargo cannot see is the sysroot — `toyos-abi`, `toyos` and
-      # `userland/libc` are compiled into it, and its `rustc -vV` does not change
-      # when they do — so the tag is in the *prefix* and `restore-keys` cannot
-      # fall back across a sysroot change. `src/build.rs`'s `external_fingerprint`
-      # is the belt to that brace and it fires either way: 8 `external deps
-      # changed: cleaning` lines in both arms of the probe.
-      #
-      # **`cache-writer` writes it and the twelve shards only read it.** Until
-      # 2026-08-12 `tcg` did — `specs/testing-strategy.md` §4 found that job
-      # carrying two unrelated roles, an emulator smoke test and this cache's
-      # writer, and the owner's ruling sent the first to nightly and named the
-      # property the second had to keep: "exactly one job per run writes the
-      # entry, it runs on every run, and it is not the nightly one" —
-      # `actions/cache/save` never overwrites an existing key, so whichever
-      # job's save call reaches a key first owns it for good; a nightly writer
-      # could win that race with a tree the day's pull requests are several
-      # merges behind, and nothing afterward could write over it. Twelve
-      # concurrent uploads of the same content would race for one key, and
-      # none of them would benefit from a sibling anyway — the twelve start
-      # together, so the win is across runs. A cache written on `main` is the
-      # only one every branch can restore (§8.4), and a branch's own second
-      # push restores its first.
+      # `cache-writer` is the single writer; the twelve shards only read.
+      # `actions/cache/save` never overwrites an existing key, so a second
+      # writer could not benefit a sibling and a nightly writer could
+      # permanently win the key with a tree several merges behind
+      # (specs/testing-strategy.md §4). A cache written on `main` is the one
+      # every branch can restore.
       - uses: actions/cache/restore@v4
         with:
           path: |
@@ -287,30 +210,18 @@ jobs:
           key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: guest-${{ steps.key.outputs.tag }}-
 
-      # `--host-slots 0`: the semaphore arbitrates between worktrees on one
-      # host, and a shard is a host with one suite on it.
+      # `--host-slots 0`: the semaphore arbitrates worktrees on one host, and a
+      # shard is a whole host with one suite on it.
       #
-      # **`--jobs 1`, and the shard count is what replaces the width.** Run
-      # `31233476555` ran four lanes on four cores and the width, not the
-      # accelerator, was what was left: every profile boots `-smp 2` and six
-      # tests boot `-smp 8`, so four lanes is eight to thirty-two vCPUs on four,
-      # and a guest whose kernel spins with `IF` clear pays lock-holder
-      # preemption for the difference. `--jobs 2` halved it and left a named
-      # class behind — eight `ALONE: GREEN` verdicts in run `31238056513`, every
-      # one a test that fails only beside another guest, and the whole i8042
-      # family red in run `31241099454` where the probe then ran every one of
-      # them green alone on the same runner image.
+      # `--jobs 1`, and the shard count replaces the width: a lane whose guest
+      # shares cores with a sibling pays lock-holder preemption a solo guest
+      # does not, which is the `ALONE: GREEN` class (specs/ci-plan.md §7.2).
+      # One lane removes it by construction, at no cost — this repository is
+      # public, so minutes are unmetered.
       #
-      # One lane removes that class by construction: there is never a second
-      # guest on the machine. It costs nothing, because a shard is a whole
-      # machine and this repository is public — twenty jobs may run at once and
-      # the minutes are unmetered.
-      #
-      # `--nightly` restores the withheld tier: on the `03:00 UTC` schedule
-      # every night, and on a manual `workflow_dispatch` the same way it always
-      # could — a withheld label can be refreshed without temporarily putting it
-      # back into every pull request. Pull requests and ordinary pushes to
-      # `main` stay Fast.
+      # `--nightly` widens the selection to the withheld tier, on the schedule
+      # and on a manual dispatch alike, without putting it back into every
+      # pull request (specs/testing-strategy.md §5).
       - name: suite
         env:
           SUITE_TIER_ARGS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '--nightly' || '' }}
@@ -321,22 +232,13 @@ jobs:
             $SUITE_TIER_ARGS 2>&1 \
             | tee /tmp/suite.log
 
-      # **`--land` wrote "gate ok" or "gate ok, NOT clean" into the landing
-      # commit, and only the suite can tell those apart.** A run carrying
-      # declared `EXPECTED_FAILURES` exits 0 and says so in one line; a merge
-      # that accepted one has to say so somewhere a reader will find it, and the
-      # merge commit is not written on this side any more.
-      #
-      # The filter is `--land`'s: `cargo test` runs several binaries and the last
-      # `test result:` is the doc-tests', so the suite's own line is the one that
-      # counts a total, which libtest's never does.
-      #
-      # **And the names, because a count is not a finding.** A red run's real
-      # error took `gh run view --log-failed | grep` to reach; the summary is one
-      # page for all twelve shards, so what belongs in it is the sentence the
-      # harness already wrote — the name, why it failed, and its `ALONE:`
-      # verdict, which is what says whether a re-run tells you anything.
-      - name: what the suite said
+      # `cargo test` runs several binaries and the last `test result:` line is
+      # the doc-tests'; the line grepped here is the suite's own, the one that
+      # counts a total and names any declared `EXPECTED_FAILURES`. The
+      # `ALONE:` verdicts say whether a re-run tells a reader anything, so they
+      # go in the summary beside the count rather than requiring
+      # `gh run view --log-failed`.
+      - name: suite summary
         if: always()
         run: |
           line=$(grep 'test result:' /tmp/suite.log | grep ' total (' | tail -1)
@@ -354,13 +256,12 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      # Always, and not only on a red: this is the measurement that fixes the
-      # partition. A shard writes `test-durations.shard-<i>-of-<n>`, which
-      # `load_durations` never reads — `specs/ci-plan.md` §4's rule that a shard
-      # may not write the profile it partitioned on is what keeps a twelfth of a
-      # measurement out of `tests/test-durations`. Merging the twelve is a
-      # deliberate act with a command behind it (`--merge-durations`).
-      - name: what this shard measured
+      # Always, not only on a red: a shard may not write the profile it
+      # partitioned on (specs/ci-plan.md §4), so this writes
+      # `test-durations.shard-<i>-of-<n>`, which `load_durations` never reads.
+      # `--merge-durations` is the deliberate act that turns the twelve into
+      # `tests/test-durations`.
+      - name: shard durations
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -369,28 +270,15 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # Every boot's 16550 log, and nothing else in the lane. A lane's scratch
-      # also holds a per-boot image of a few hundred megabytes, and uploading all
-      # of them took **44 minutes** and hit the job timeout on shard 9 of run
-      # `31247206462` — a suite that had finished in 556 s reported as a job
-      # cancelled at the hour.
+      # Every boot's 16550 log, and nothing else in the lane: `QemuInstance::Drop`
+      # removes the screendump and a lane's per-boot image with the guest, so
+      # this is what is left to keep. Firmware, the bootloader and the kernel
+      # write only to the 16550 before the console backend switches, so a boot
+      # that dies before virtio-console comes up still leaves this file.
       #
-      # **It uploaded nothing at all until now**, and that looked identical to a
-      # run that left nothing: `QemuInstance::Drop` removed the uart log and the
-      # screendump with the guest, so the glob always matched an empty lane. Run
-      # `31252989653` reds four shards and publishes twelve duration files and no
-      # scratch artifact.
-      #
-      # What is left to keep is small and specific: firmware, the bootloader and
-      # the kernel before the console backend switches all write to the 16550 and
-      # nowhere else, so a boot that dies before virtio-console comes up leaves
-      # this file and an empty capture. The screendump is still deleted with its
-      # instance, so this no longer claims to collect one, and what a failing
-      # test *said* is in this job's own log.
-      #
-      # `warn`, not `ignore`: a red shard that left no serial at all is itself a
-      # finding, and silence read as "there was nothing to keep" for three runs.
-      - name: what a red run left
+      # `warn`, not `ignore`: a red shard that left no serial at all is itself
+      # a finding.
+      - name: failure logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
@@ -399,36 +287,20 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  # The shards run natively, so this is the job that keeps the *emulator*
-  # exercised: no `/dev/kvm` in the container at all, `kvm_usable` says no, and
-  # the guest is TCG on an x86 host. That is not the same machine as the dev
-  # host's cross-arch TCG — the owner's rule is that everything works under
-  # emulation and under KVM, and a configuration nothing runs is a configuration
-  # nobody finds out about. One test, because this is a canary and not a
-  # measurement.
+  # The TCG shard (specs/testing-strategy.md §2): no `/dev/kvm` in the
+  # container, so `kvm_usable` says no and the guest runs emulated on an x86
+  # host. One test, since this is a canary and not a measurement — and the
+  # only place in CI that boots `-cpu qemu64`, since the shards ask for `-cpu
+  # host`.
   #
-  # It is also the arm that keeps `-cpu qemu64` alive: the shards ask for `-cpu
-  # host`, so nothing else in CI boots the model the emulated path presents.
+  # Nightly and dispatch only: across its history as a required check this job
+  # never named a tree defect, so the class moved to a whole TCG shard in the
+  # nightly tier instead (§5). It no longer writes the cache the twelve shards
+  # read — that write must happen on every run, so it is `cache-writer`, below.
   #
-  # **Nightly and dispatch only, since 2026-08-12 — the owner's ruling.**
-  # `specs/testing-strategy.md` §5: across its history as a required check
-  # this job never named a tree defect, and its badge rested on "everything
-  # should work under emulation and kvm" rather than on a caught one. The class
-  # gets a real reader in the nightly tier instead — a whole TCG shard, not one
-  # test — and the pull-request required set drops from five checks to
-  # four (`landing.yml`). What this job also did on every push and pull request
-  # — write the cache the twelve shards read — did not move with it; §4 is
-  # explicit that losing that silently costs more than the badge ever bought,
-  # and it would show up as a slow pull request rather than a red. It is
-  # `cache-writer`, below, now.
-  #
-  # Same image as the shards restore, so the accelerator is the only thing that
-  # differs between this job and one of them.
-  #
-  # **`if: always()` and a guard step, kept from when this was a required
-  # check.** It answers no protection rule now, but a nightly run that silently
-  # skipped instead of naming *why* the toolchain never arrived would be exactly
-  # the quiet loss `nightly-red` exists to catch.
+  # `if: always()` and a guard step, kept from when this was required: a
+  # nightly run that silently skipped instead of naming why the toolchain
+  # never arrived would be the quiet loss `nightly-red` exists to catch.
   tcg:
     needs: [toolchain-ready]
     if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
@@ -457,11 +329,7 @@ jobs:
             echo "apt attempt $attempt failed"
             [ "$attempt" = 3 ] || sleep 20
           done
-          # **Named, because three failures used to be reported as
-          # `qemu-system-x86_64: command not found`** three lines later, which
-          # reads as a broken image rather than as a mirror. `sid` is a rolling
-          # release and its mirror is not a fixed artifact; this says nothing
-          # about the tree, and `guest-suite` is a required check now.
+          # Named, so a mirror blip reads as one and not as a broken image.
           if [ "$got" != yes ]; then
             echo "::error::apt failed three times against sid's mirror. Nothing here is about"
             echo "::error::the tree — re-run the job."
@@ -495,13 +363,8 @@ jobs:
           TAG: ${{ steps.key.outputs.tag }}
         run: .github/install-toolchain.sh
 
-      # Restore only, since 2026-08-12 — `cache-writer` below is the writer now
-      # (`guest`'s own restore step carries the full argument for why it is a
-      # single job and not twelve). A once-nightly `tcg` would be the wrong
-      # writer for a pull request reading this cache anyway: `actions/cache/save`
-      # never overwrites an existing key, so it could only win the one save a
-      # key ever gets, permanently, with a tree the pull request is several
-      # merges behind.
+      # Restore only: `cache-writer` below is the single writer (`guest`'s own
+      # restore step has the full argument).
       - uses: actions/cache/restore@v4
         with:
           path: |
@@ -522,30 +385,13 @@ jobs:
       - name: one test, emulated
         run: cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats
 
-  # **What `tcg` used to write, kept alive on the trigger `tcg` no longer runs
-  # on.** `specs/testing-strategy.md` §4 names the property this job exists to
-  # hold: "exactly one job per run writes the entry, it runs on every run, and
-  # it is not the nightly one." Losing it silently is the failure mode named
-  # there — `restore-keys` is prefixed on the toolchain tag and cannot fall
-  # back across a sysroot change, so a branch touching any of the four witness
-  # trees would find nothing and pay the cold build without a red to say so:
-  # 519 s against 282 s, measured, run `31385467644`.
-  #
-  # Same build, same one fast test the old writer ran, under KVM instead of
-  # TCG: nothing about *what* gets cached depends on which accelerator produced
-  # it, and KVM is both faster to boot and the accelerator every reader of this
-  # cache actually uses.
-  #
-  # `if:` is "it is not the nightly one" written as code and not just as prose:
-  # without it the `03:00 UTC` schedule runs this job too, and `guest`'s own
-  # restore comment above is the argument for why that write must not happen.
-  #
-  # `guest-suite` needs this job now and reds if it did not succeed — a build
-  # that cannot produce what it caches is a real defect, not cache hygiene, and
-  # this job used to carry no consequence for failing at it. A bare
-  # `needs: [toolchain-ready]` is still enough: if the toolchain never arrived
-  # there is nothing to build and nothing to cache, and a skip says that as
-  # plainly as a guard step would.
+  # The cache's single writer (specs/testing-strategy.md §4): it runs on every
+  # non-nightly run, and `if:` is that rule written as code rather than only as
+  # prose beside `guest`'s restore step. Same build and the same one fast test
+  # as a shard, under KVM rather than TCG — what gets cached does not depend on
+  # which accelerator produced it, and KVM is the accelerator every reader of
+  # this cache uses. `guest-suite` needs this job and reds if it did not
+  # succeed: a build that cannot produce what it caches is a real defect.
   cache-writer:
     needs: [toolchain-ready]
     if: github.event_name != 'schedule'
@@ -617,7 +463,7 @@ jobs:
           key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: guest-${{ steps.key.outputs.tag }}-
 
-      - name: one test, to build and validate what gets cached
+      - name: one test, to validate the cache
         run: cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats
 
       # After the test and not before it: what is worth keeping is a tree that
@@ -639,42 +485,16 @@ jobs:
             tests/toyos-rust-tests/*/target
           key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
 
-  # **One name for twelve shards, because a required status check is matched by
-  # job name and a matrix produces twelve of them.** Twelve entries in a
-  # protection rule is twelve things that can silently disagree with the matrix;
-  # this is one, and `needs.guest.result` is `success` only when every shard was.
+  # The `durations` verdict (specs/testing-strategy.md §3): every test selected
+  # for Fast CI must measure at or under the ten-second ceiling, and this job
+  # is what enforces the tier declaration against the profile rather than
+  # letting it go stale. It also refuses any duplicate execution label, which
+  # catches a cross-shard partition defect (§4) as much as a same-shard one.
   #
-  # It is what `specs/ci-plan.md` §10's stage 2 makes required. Until then it
-  # runs, it reds when a shard reds, and `landing.yml`'s `gate-stage` is what
-  # stops that being a permanent arrangement.
-  # **The partition is only as good as the profile, and nothing was checking the
-  # profile.** `tests/test-durations` is what every runner reads, because a fresh
-  # clone has measured nothing (§4), and it had drifted: eight names of run
-  # `31331494794` were not in it at all — each costed by `Shard::keep` at the
-  # longest it *did* know, so eight phantom four-minute tests steered a twelve-way
-  # split — and names it did price were out by twentyfold in both directions
-  # (`foreign_disk_untouched` 87.0s recorded against 4.3s measured). That run's
-  # shards carried 228.7s to 508.8s of tests against an even split of 365.7s:
-  # **143.1 s of critical path, on every merge**, now that `guest-suite` is
-  # required.
-  #
-  # It used to go stale silently when a test had no profile entry. Registration
-  # and whole-run merge checks now refuse that absence, and the run that
-  # produces the measurement gates the policy it is the
-  # instrument for: every test selected for fast CI must finish in at most ten
-  # seconds. `guest-suite` consumes this job's result, so a green merge button
-  # cannot ignore a profile which disproves the tier declaration. The merge also
-  # refuses any duplicate execution label, which catches §4's cross-shard
-  # partition defect and same-shard duplicate registrations.
-  #
-  # **This is also how the nightly tier's own labels stay priced.** `guest`'s
-  # `SUITE_TIER_ARGS` widens the twelve shards' selection to include
-  # `RELEGATED` on a nightly run, so their `test-durations.shard-*` files carry
-  # fresh Nightly measurements the same way an ordinary run's carry Fast ones —
-  # this job does not need to know which trigger produced them. Without that, a
-  # withheld label would stay frozen at whatever it measured before the
-  # fast/nightly split and `tiers::validate_ci_profile` could never notice a
-  # Nightly test's CI cost changing.
+  # `guest`'s `SUITE_TIER_ARGS` widens the twelve shards to include `RELEGATED`
+  # on a nightly run, so their `test-durations.shard-*` files carry fresh
+  # Nightly measurements the same way an ordinary run's carry Fast ones — this
+  # job does not need to know which trigger produced them.
   durations:
     needs: [guest]
     if: always()
@@ -699,23 +519,15 @@ jobs:
           path: /tmp/durations
           merge-multiple: false
 
-      # **A run whose shards never finished measured nothing, and that is not a
-      # second finding when `guest` is already red.** `--merge-durations`
-      # refuses an empty directory by name; here a cancelled or gated-off run
-      # reports that fact and lets the required aggregate carry `guest`'s red.
-      # But a *green* guest job with no measurement is a false green in the
-      # ten-second gate, so that combination is refused below.
-      # **A run whose shards did not all finish is not a partition of anything,
-      # and `--merge-durations` refuses one.** Right for the human typing it —
-      # it writes the committed profile, and eleven files of twelve write one
-      # missing a twelfth of the suite, which every later run then prices at the
-      # longest it knows. Wrong here, where a shard cancelled at its timeout has
-      # already reddened required `guest`; inventing a second profile finding
-      # would obscure that cause. So the count is checked before the command is
-      # run, and a short set is reported rather than merged. The refusals that
-      # stay refusals are duplicate execution labels and disagreement between
-      # the merged profile and the tier policy.
-      - name: what the partition cost
+      # A run whose shards did not all finish is not a partition, and
+      # `--merge-durations` refuses one — right when a human runs it by hand,
+      # since eleven files of twelve would write a profile missing a twelfth
+      # of the suite. Wrong here, where `guest` is already red for that
+      # reason: the count is checked before the command runs, and a short set
+      # is reported rather than merged so this does not invent a second
+      # finding. A *green* `guest` with no measurement is refused, since that
+      # combination would be a false green in the ten-second gate.
+      - name: merge durations
         run: |
           set -o pipefail
           if ! ls /tmp/durations/*/test-durations.shard-* >/dev/null 2>&1; then
@@ -770,9 +582,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # `toolchain-ready` is named here as well as in the shards' `needs:`,
-      # because a skipped `guest` says nothing about why it was skipped and this
+      # since a skipped `guest` says nothing about why it was skipped and this
       # is the name a reader of the merge button sees.
-      - name: every shard
+      - name: aggregate
         run: |
           echo "toolchain: ${{ needs.toolchain-ready.result }}"
           echo "twelve shards: ${{ needs.guest.result }}"
@@ -782,10 +594,6 @@ jobs:
             echo "::error::the toolchain for this tree did not build, so no shard ran."
             exit 1
           fi
-          # This name is what a reader of the merge button sees, and
-          # `needs.guest.result` is an aggregate — the shard, the test and its
-          # `ALONE:` verdict are all in the run summary, which is the one place
-          # all twelve write.
           if [ "${{ needs.guest.result }}" != success ]; then
             echo "::error::a guest shard reported ${{ needs.guest.result }}. The run summary"
             echo "::error::names the shard, the test and whether it survived being re-run"
@@ -799,10 +607,8 @@ jobs:
             exit 1
           fi
           # `cache-writer` is `if: github.event_name != 'schedule'`, so a
-          # nightly run reports it `skipped` by design — that is the trigger
-          # `specs/testing-strategy.md` §4 says must not write. Anything else
-          # means the write itself failed, and a cold cache for the next branch
-          # to touch a witness tree used to be invisible here.
+          # nightly run reports it `skipped` by design (specs/testing-strategy.md
+          # §4); anything else means the write itself failed.
           if [ "${{ needs.cache-writer.result }}" != success ] \
              && [ "${{ needs.cache-writer.result }}" != skipped ]; then
             echo "::error::cache-writer reported ${{ needs.cache-writer.result }}. Its build is"
@@ -811,20 +617,11 @@ jobs:
             exit 1
           fi
 
-  # **A nightly red must surface somewhere a human actually looks.** A
-  # scheduled job nobody reads is worse than none, because it converts "we do
-  # not gate this" into "we gate this" without changing anything. Files or
-  # updates one standing issue rather than leaning on GitHub's own
-  # workflow-failure email, which nobody here reads either.
-  #
-  # Only on `schedule`. A `workflow_dispatch` of the nightly tier is somebody
-  # watching the run directly — `--nightly` exists for refreshing a withheld
-  # label on demand — and an issue comment would just be noise to the same
-  # person who is already looking at the log.
-  #
+  # Files or updates the standing "nightly is red" issue (specs/testing-strategy.md
+  # §5). Only on `schedule` — a `workflow_dispatch` of the nightly tier is
+  # somebody watching the run directly, so an issue comment would be noise.
   # `tcg` and `guest-suite` are enough: `guest-suite` already reds if
-  # `toolchain-ready`, `guest` or `durations` did (its own body checks each), so
-  # naming those two here would be redundant with what it already refuses.
+  # `toolchain-ready`, `guest` or `durations` did.
   nightly-red:
     needs: [tcg, guest-suite]
     if: ${{ !cancelled() && github.event_name == 'schedule' && (needs.tcg.result != 'success' || needs.guest-suite.result != 'success') }}

@@ -1,21 +1,13 @@
 name: green-probe
 
-# **The four names standing between `main` and a green `ci` run, counted.**
+# Counts a named test's red rate: ten reps, one `cargo test` per name per job
+# so a stall in one costs the others nothing (specs/ci-plan.md §9.1, §10.9).
+# The current name list answered its question there; `git log` on this file
+# has each prior target. `specs/issues/hardware/metal-sim-pointer-churn-red-again-on-main.md`
+# is the open question this shape is next aimed at — edit the name list below
+# and push to `ci/probe-green` to run it.
 #
-# `specs/ci-plan.md` §9.2 measured the whole suite five times and gave every red
-# a rate. Four names have appeared on `main` since and none of them is in that
-# table with a number anyone can act on: `kernel_heartbeat` and `dump_nmi_probe`
-# were 1 of 5 there, `desktop_audio_client` and `desktop_window_child` were 0 of
-# 5. A name red 5/5 is a defect and a name red 1/5 needs its rate known before
-# anyone can say a fix worked, so this counts them before anything is changed.
-#
-# One job per rep rather than one per (name, rep): the `cargo build` is the
-# fixed cost and four boots amortise it. `arm` is what makes a fix measurable in
-# one session — `control` checks out this branch's parent, `fixed` checks out the
-# branch, and both run on one runner image against one toolchain, which is the
-# shape `probe-xhci-break.yml` established.
-#
-# It never fails. A probe that reds is a probe whose own summary nobody reads.
+# It never fails: a probe that reds is a probe whose own summary nobody reads.
 
 on:
   push:
@@ -80,10 +72,8 @@ jobs:
           zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
           rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
 
-      # `|| true`: a red is the datum, not the job's verdict. Each name is its
-      # own `cargo test` so one stalling for its whole liveness guard does not
-      # take the other three's samples with it.
-      - name: the four names
+      # `exit 0`: a red is the datum, not the job's verdict.
+      - name: named tests
         run: |
           set +e
           for name in kernel_heartbeat dump_nmi_probe desktop_audio_client \
@@ -95,7 +85,7 @@ jobs:
           done
           exit 0
 
-      - name: the logs
+      - name: logs
         if: always()
         uses: actions/upload-artifact@v4
         with:

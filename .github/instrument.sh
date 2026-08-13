@@ -1,19 +1,12 @@
 #!/bin/sh
 # What this job is about to measure with, named before it measures anything.
-#
-# Three readings, and each is a variable somebody has already been caught by:
-#
-# - **The QEMU version**, against `.github/qemu-version`. `specs/ci-plan.md`
-#   §7.3 settled that three major versions of it changes test outcomes, and
-#   `debian:sid` is a rolling release — so an undeclared version is an
-#   instrument that can move out from under every recorded measurement with
-#   nothing saying so. A disagreement reds, because the remedy is to record the
-#   new version and not to carry on.
-# - **The host CPU model.** §2: `kvm_amd` and `kvm_intel` are both in play, the
-#   vendor is not selectable, and §7 was an AMD-only defect — so a job that does
-#   not say which one it drew cannot be read afterwards.
-# - **Whether `/dev/kvm` is there at all**, which is the only difference between
-#   a `guest` shard and the `tcg` canary.
+# Three variables a verdict from this job must be read against
+# (specs/ci-plan.md §2, §7, §7.3): the QEMU version against
+# `.github/qemu-version` — a disagreement reds, since `debian:sid` is a
+# rolling release and the remedy is to record the new version, not to carry
+# on; the host CPU vendor, since `kvm_amd` and `kvm_intel` are both in play
+# and not selectable; and whether `/dev/kvm` is there, the only difference
+# between a `guest` shard and the `tcg` canary.
 #
 # Run from the repository root, after the checkout, by every job that boots a
 # guest.
