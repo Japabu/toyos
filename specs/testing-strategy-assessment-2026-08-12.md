@@ -131,8 +131,8 @@ and the tier does not touch either.** They are the price of *having a guest job
 at all*. The harness column is the only one that responds to what the tier
 holds back.
 
-The build's 230 s is not mysterious and is already filed:
-`specs/issues/build/external-dep-fingerprint-is-mtime-not-content.md` — every
+The build's 230 s is not mysterious and was already filed (the
+external-dep-fingerprint-is-mtime-not-content issue, since fixed by #37) — every
 job rebuilds `toyos-ld` from the same sources to the same bytes, the mtime moves,
 and `invalidate_stale` then cleans the kernel, the bootloader, userland and the
 Rust test crates. The eight `external deps changed: cleaning` lines are in shard
@@ -268,8 +268,8 @@ And the build inside the suite step, from shard 1's own log of `31601279765`:
 
 **185 of the 239 seconds are one filed defect.** The log names it exactly: the
 clean removes `396 files, 570.5MiB` from `tls-cranelift` alone, plus three more
-crates, and then rebuilds all of it — and the cause is
-`specs/issues/build/external-dep-fingerprint-is-mtime-not-content.md`,
+crates, and then rebuilds all of it — and the cause was the
+external-dep-fingerprint-is-mtime-not-content issue (since fixed by #37):
 `external_fingerprint` keying on `toyos-ld`'s `len:mtime` when every job rebuilds
 that binary from the same sources to the same bytes. `specs/ci-plan.md` §12.5
 measured the same eight `cleaning` lines in the *warm* arm of the cache probe, so
