@@ -1621,7 +1621,6 @@ Per test, seconds, across the four suites of each arm:
 |---|---|---|
 | `desktop_audio_client` | 17, 14, **FAIL 307**, **FAIL 305** | 20, 17, 17, 17 |
 | `desktop_typing_damage` | 18, **FAIL 303**, 18, 16 | 15, 17, 17, 16 |
-| `blocked_dump` | 4, 8, 5, 3 | 5, **FAIL 2**, 5, **FAIL 2** |
 | `screen_pager_keys` | 14, 14, 14, 14 | 14, 14, 14, 14 |
 | `screen_console_scroll` | 14, 9, 15, 13 | 16, 15, 11, 13 |
 | `screen_blocked_dump` | 8, 5, 6, 7 | 6, 4, 6, 7 |
@@ -1957,7 +1956,6 @@ test-only.
 
 | gate | the verdict under test | the actuator | after |
 |---|---|---|---|
-| `control_regs_negative` | `control_regs`' per-CPU line and its two assertions | skip the two register writes on an AP | **unchanged in kind.** The verdict is shipping source; `control_regs` and `control_regs_verdict` run it on the shipping *binary* |
 | `iommu_context_absent`, `iommu_empty_domain` | the DMA-fault handler and its report | leave one function out of the root table / give it an empty domain | **unchanged in kind**, same reason |
 | `xhci_deaf_controller`, `xhci_deaf_port` | `settles`' deadline and refusal | starve one register wait | **unchanged in kind** |
 | `i8042_fault` | the ISR's 16-byte bound and the quarantine path | make the output-buffer check lie | **unchanged in kind** |
@@ -2137,7 +2135,6 @@ this is the index and the reason each one is worth a reader's attention.
 | test | effective CI | what is no longer gated per PR |
 |---|---:|---|
 | `metal_sim_pointer_churn` | 260.607 s | Repeated pointer pull/replug while the compositor holds the merged fd — the owner's freeze. |
-| `boot_partition_identity` | 233.792 s | Selecting the boot volume by partition identity instead of disk enumeration order. |
 | `screen_fatal_halt_composited` | 231.761 s | Painting a fatal panic after the compositor owns the T14's scanout. |
 | `metal_sim_compositor` | 230.812 s | All four daemons surviving the T14 device shape, with each unsupervised daemon naming its state. |
 | `kernel_heartbeat` | 200.026 s | Full first mask; no CPU missing twice consecutively; ≤1 s sample gaps; a nonzero ran field. |
@@ -2148,21 +2145,13 @@ this is the index and the reason each one is worth a reader's attention.
 | `doom_sound_flood` | 117.839 s | The T14 freeze's first domino: doom outrunning its audio callback without aborting. |
 | `wall_clock_refusals` | 103.987 s | Five boots: stuck update, disagreeing reads, absent/explicit century, and timezone conversion. |
 | `xhci_deaf_registers` | 103.332 s | Deadlines on five controller/port register spins that used to hang silently. |
-| `i8042_keyboard` | 94.611 s | Expected translations/usages, balanced selected keys, no stuck modifier, and an observed drain. |
 | `usb_storage_shapes` | 90.409 s | Raw 4 KiB-sector read/write with host verification; an unaddressable 3 TB READ(10) disk is refused. |
 | `usb_flush_optional` | 89.705 s | Optional flush refusal remaining usable without hiding a real write failure. |
 | `hda_tone` | 87.881 s | HDA DMA, interrupts, soundd, and the expected samples in the host capture. |
-| `control_regs` | 83.255 s | BSP/AP agreement on the control-register state user isolation relies on. |
 | `desktop_typing_damage` | 81.197 s | Eight typed lines echo; the largest reported damage frame remains ≤2% of the panel. |
-| `i8042_budget_expiry` | 80.146 s | A pre-spent init budget names its stage and completes boot on an answering controller. |
-| `launcher_refusals` | 76.081 s | Sixteen malformed launches at init, with init and live-object counts intact. |
-| `short_sleep_livelock` | 75.208 s | Runnable work progressing while another task hammers sub-tick sleeps. |
-| `sshd_fail_closed` | 73.258 s | The daemon accepting nobody and not holding port 22 when no authorised key exists. |
 | `i8042_health_cadence` | 70.975 s | Health diagnosis following guest byte cadence through a staged long silence. |
-| `fpu_isolation` | 67.692 s | Ring-3 machine state against an `fpu-save-nothing` negative-control kernel. |
 | `desktop_window_child` | 65.217 s | #156's only reproduction: close a shell-opened window and require the desktop to answer. |
 | `xhci_slow_connect` | 64.579 s | Device discovery after a root-hub port remains empty through reset. |
-| `desktop_locale_detect` | 62.293 s | The locale wizard on the shipped compositor surface, through focus and persistence. |
 | `xhci_hid_break` | 61.704 s | HID recovery from the endpoint completion code that silenced a real Logitech mouse. |
 | `late_storage_connect` | 53.778 s | A disk absent from the boot scan binding correctly when it appears later. |
 | `idle_stack_guard` | 52.822 s | The otherwise invisible guard page below every per-CPU idle stack. |
@@ -2170,41 +2159,31 @@ this is the index and the reason each one is worth a reader's attention.
 | `audio_tone_load` | 51.645 s | Valid loaded tone/capture on one and eight CPUs; confirmed dropout or silent-period harm. |
 | `i8042_health` | 47.121 s | Untouched silence versus one key's nonzero interrupts/bytes/keys without a spinning CPU. |
 | `kernel_log_file` | 43.056 s | Kernel diagnostics reaching the persistent log volume, not just serial output. |
-| `control_regs_negative` | 40.323 s | A truly divergent AP proving the control-register verdict has teeth. |
 | `xhci_flap` | 38.496 s | Unplug/replug inside one debounce window leaving one coherent device. |
-| `xhci_slot_exhaustion` | 37.338 s | One DMA device block admits slot 1 as a disk and refuses excess devices. |
 | `screen_paged_scrollback` | 37.144 s | Automatic paging exposes the first boot line, final panic, and two distinct page footers. |
 | `xhci_msi_only` | 35.223 s | The no-MSI-X branch used by the T14's Thunderbolt controller. |
-| `blocked_dump` | 33.140 s | A complete 8/8 compositor dump with consistent deadline/task census and final verdict. |
-| `metal_sim_input` | 32.603 s | The T14-shaped, no-virtio-input machine reaching the shipped input stack. |
 | `dump_nmi_probe` | 24.625 s | Non-responding CPUs probed by NMI with their RIPs symbolised. |
 | `audio_tone` | 21.934 s | The real-time glitch check per config, unloaded: dropouts, wake-lateness and underrun ceilings, confirmed on a second boot. |
 | `toybox_cp_volume` | 18.735 s | The real `/bin/cp` against FAT32, including filling the volume. |
 | `iommu_discovery` | 17.594 s | Capability-by-capability remapping-unit discovery across four machine shapes. |
 | `usb_storage_gate` | 17.558 s | Raw USB reads/writes, host byte verification, unstamped-disk interlock, and one-stick bind. |
 | `hda_client_stall` | 16.901 s | A stalled client producing different correct answers on HDA and virtio queues. |
-| `netd_connection_caps` | 14.785 s | At least two requests admitted before one stable ResourceExhausted boundary. |
 | `screen_console_scroll` | 13.401 s | Every panel row after a workload designed to leave stale glyphs. |
 | `swiss_german_layout` | 12.645 s | Physical-position input through modifiers, ISO key, and dead-key state. |
 | `metal_sim_compositor_stall` | 11.639 s | A stalled/hostile client not stopping compositor replies or painting. |
-| `screen_console_panic` | 11.103 s | Interactive console input joining correctly to fatal-report painting. |
-| `xhci_superspeed_ports` | 10.639 s | USB3 protocol ports remaining distinct from their USB2 companions. |
 | `i8042_absent` | 10.410 s | Paired normal/i8042=off boots: FADT denial, floating bus, and a 300 ms bound. |
-| `xhci_full_speed_device` | 10.088 s | Correct xHCI context encoding for a full-speed device. |
 
-**And six that are at or under the line go anyway**, because `group_of` makes a
+**And four that are at or under the line go anyway**, because `group_of` makes a
 run of adjacent names one guest and a group cannot be split. On the metal-sim
 boot, `metal_sim_client_death` (3.908 s: five cases, inherited connection, two
 later frame batches), `metal_sim_window_caps` (0.161 s),
 `metal_sim_ipc_hostile_peer` (0.112 s), and `metal_sim_scanout_wc` (0.000 s:
 PAT MSR, MTRR combination, and the read-back compositor PDE)
-ride `metal_sim_compositor`. On the PS/2 trace boot,
-`i8042_no_spurious_wake` (5.019 s: Pause bytes make zero-event drains without a
-wake while interleaved A keys do wake) and `i8042_mouse` (2.053 s) ride
-`i8042_keyboard`. `check_registration` refuses a group whose tiers disagree or
-whose declared carrier is not the rider's actual group. That is 11.253 s of
-explicit collateral; keeping a rider Fast would put its carrier's entire boot
-back in Fast.
+ride `metal_sim_compositor`. `check_registration` refuses a group whose tiers
+disagree or whose declared carrier is not the rider's actual group. That is
+4.181 s of explicit collateral; keeping a rider Fast would put its carrier's
+entire boot back in Fast. (The PS/2 trace boot's two riders left with their
+carrier in §7.5 below — one boot cannot be in two tiers.)
 
 ### 7.4 What was deliberately not touched
 
@@ -2222,9 +2201,76 @@ back in Fast.
   entry been `OnAPass`, relegating it would have disabled its own staleness
   detection, and that is the trap to check before relegating anything else.
 - **Every assertion, every negative gate, every actuator control.** The larger
-  Nightly set includes negative controls such as `control_regs_negative` and
-  `fpu_isolation`; relegating one is a scheduling decision and none was
-  weakened.
+  Nightly set included negative controls such as `control_regs_negative` and
+  `fpu_isolation` at the time this was written; both returned to Fast in the
+  2026-08-13 sweep (§7.5) on fresh CI evidence, not by weakening either gate.
 - **`hda_probe`.** It returns to Fast rather than being weakened or removed:
   the decisive CI measurement is 6.133 s. Its two-build negative control still
   asks that the diagnostic probe stays out of an ordinary kernel.
+
+### 7.5 The 2026-08-13 sweep: `Why::TimerAnchored`, and the rest of the fast tier
+
+§7.2's 2026-08-12 ruling — a verdict or duration anchored to real time belongs
+Nightly regardless of price, and only a compute-bound verdict stays Fast — had
+not yet been applied past `audio_tone`. This sweep applied it to every
+remaining name, added the `Why::TimerAnchored` variant `validate_ci_profile`
+grades with no ceiling requirement in either direction, and re-read every
+Nightly-for-cost row's fresh CI evidence (run `31680778730`'s durations
+artifact) rather than trusting whatever number happened to be committed.
+
+**Sixteen `Why::Cost` rows plus `i8042_budget_expiry` returned to Fast** —
+`sshd_fail_closed`, `fpu_isolation`, `launcher_refusals`, `control_regs`,
+`control_regs_negative`, `boot_partition_identity`, `short_sleep_livelock`,
+`desktop_locale_detect`, `xhci_slot_exhaustion`, `xhci_superspeed_ports`,
+`xhci_full_speed_device`, `blocked_dump`, `metal_sim_input`,
+`netd_connection_caps`, `screen_console_panic`, and `i8042_budget_expiry` —
+because each one's committed `ci_ms` was a stale price from whenever it was
+first relegated: every fresh label in the same run measured comfortably under
+the line (worst case `fpu_isolation` at 8.876 s), and every one of them was
+already classified compute-bound, not timer-anchored. The stale numbers had
+sat unrefreshed because a Nightly test is only ever measured by the nightly
+job, never by the fast-tier CI that would have caught the drop.
+
+**The i8042 family got the same finding but a different fix.** `i8042_keyboard`,
+`i8042_no_spurious_wake`, `i8042_mouse`, `i8042_kbd_echo`, `i8042_quarantine`,
+`i8042_fadt_denial` and `i8042_undecoded_bytes` all drive one guest binary
+(`tests/toyos-rust-tests/src/bin/i8042_keyboard.rs`) whose main loop was a hard
+`Instant::now() + Duration::from_secs(5)` collection deadline — the actual
+defect the near-line and over-line prices in this family's whole history trace
+back to. Rather than relegate the four that measured over 10 s in some run, the
+binary now exits on a sentinel (the End key's release, which nothing any of
+its eight harness callers inject produces) with the fixed deadline kept only
+as a fallback for a lost sentinel. Every member of the family stays or returns
+Fast, `i8042_undecoded_bytes` included — reverting the relegation an earlier
+commit on this branch made for exactly this deadline.
+
+**Nine names moved to Nightly for `Why::TimerAnchored`**, none of them over the
+line: `metal_sim_null_audio` (9.712 s) and `null_sink_shipped_client` (6.590 s),
+the last two audio tests gated per pull request, both draining real audio at a
+real rate; `netd_hostile_peer` (4.195 s), a wall-clock handshake deadline and a
+paced burst; `usb_transport_break` (5.382 s), `xhci_hotplug` (7.711 s),
+`usb_refused_disk_first` (7.286 s) and `usb_disk_index_stable` (6.649 s), the
+last plug/unplug USB tests in the fast tier, each staging a fixed settle
+against a real debounce; and `screen_blocked_dump` (4.679 s) and
+`screen_diag_boot` (6.952 s), each a fixed host-side sleep that is itself part
+of the verdict. Dynamic USB is now nightly-only in its entirety; what stays
+gated per pull request is every static shape — enumeration, descriptors,
+slots, PORTSC, short reads, write errors, pool exhaustion — plus
+`xhci_slot_exhaustion`, `xhci_superspeed_ports` and `xhci_full_speed_device`
+returning above. Audio coverage on a pull request is now `hda_probe` and
+`hda_two_live_refused`, neither of which plays a sample; the owner accepted
+this gap rather than relax a rate assertion, and a per-PR audio canary (if
+wanted) is separate work whose verdict must not itself be a rate.
+
+**Twelve rows already `Why::Cost` reclassified `Why::TimerAnchored` in place**,
+`ci_ms` refreshed from the same run and none of them owing anything to the
+10,000 ms line any more: `i8042_health_cadence`, `hda_tone`, `doom_music`,
+`doom_sound_flood`, `kernel_heartbeat`, `xhci_slow_connect`,
+`late_storage_connect`, `xhci_flap`, `metal_sim_window_drag`,
+`screen_fatal_halt_composited`, `screen_paged_scrollback` and
+`metal_sim_compositor` — each already timer-anchored by the 2026-08-12 rule
+before this sweep gave that a `Why` variant of its own to say so.
+
+`src/tiers.rs` is authoritative for the current row set, `why` and `ci_ms`;
+this section is the narrative, not a second copy of the table in §7.3, which
+now lists only the `Why::Cost` rows that predate this sweep.
