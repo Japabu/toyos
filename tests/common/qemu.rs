@@ -36,7 +36,7 @@ pub fn live_instances() -> u32 {
 /// A registration is not a boot — several tests boot two machines and one boots
 /// four — so the count that decides whether a scheduling or build change worked
 /// cannot be read off the test lists. It was static analysis until now, and
-/// `specs/test-cost-audit.md` §6 records that as a lower bound.
+/// `specs/assessments/test-cost-audit.md` §6 records that as a lower bound.
 ///
 /// **The third is the one this run is judged on.** A kernel build is ~6.9 s of
 /// wall clock and ~29.6 s of CPU after any edit to `kernel/` (§5.9.2), and
@@ -63,7 +63,7 @@ pub fn boot_census() -> (u32, u32, Vec<String>) {
 /// actuator compiled in, armed by boot parameter. `fpu-save-nothing` is the one
 /// actuator that could not become a parameter — it takes the `fxsave64` out of
 /// `arch::entry`'s `naked_asm!` bracket, which is the path its own gate is
-/// about — and `specs/test-cost-audit.md` §5.9.7 is where that is argued.
+/// about — and `specs/assessments/test-cost-audit.md` §5.9.7 is where that is argued.
 ///
 /// A fourth entry is a decision to pay a kernel build per suite run forever, so
 /// it is made in the shared declaration rather than by adding a
@@ -523,7 +523,7 @@ pub enum Profile {
     ///
     /// The T14's shape for the one thing no profile stages: its Thunderbolt
     /// xHCI at 00:0d.0 has five ports and has never had a device on them
-    /// (`specs/metal-hardware-inventory.md`), so the controller a user plugs
+    /// (`specs/reference/metal-hardware-inventory.md`), so the controller a user plugs
     /// into is the one that enumerated nothing at boot. Here the second
     /// controller is that one and the boot stick is on the first.
     ///
@@ -560,7 +560,7 @@ pub enum Profile {
     /// that cannot are different facts a user can act on differently.
     IommuNoIntremap,
     /// metal-sim with three Intel HDA controllers, shaped so that one boot
-    /// runs both arms of every question `specs/hda-driver-plan.md` H0 asks.
+    /// runs both arms of every question `specs/plans/hda-driver-plan.md` H0 asks.
     ///
     /// A machine nobody ships, and deliberately so: H0's probe is a diagnostic
     /// aimed at one laptop, and the only thing the harness can certify is that
@@ -797,7 +797,7 @@ struct Shape {
     ///
     /// Presence of a class-0403 *function* is the shape dimension, and it is
     /// separate from whether anything answers on the link behind it — which is
-    /// `specs/hda-driver-plan.md` H0's question (b), and what the codec
+    /// `specs/plans/hda-driver-plan.md` H0's question (b), and what the codec
     /// arguments in this list decide per controller.
     hda: &'static [&'static str],
     /// The unit that decodes this machine's DMA, or its absence. Stated per
@@ -2501,7 +2501,7 @@ fn qemu_command(
     // Ahead of every other `-device`: QEMU gives a PCI function the bypassing
     // address space unless the unit exists when the function is created, so a
     // unit emitted after the devices it is meant to decode is a unit that
-    // decodes nothing — the vacuity trap `specs/userspace-drivers-spec.md` §7.2
+    // decodes nothing — the vacuity trap `specs/plans/userspace-drivers-spec.md` §7.2
     // is built around, in its harness-side form.
     if let Some(unit) = shape.iommu {
         qemu.arg("-device").arg(format!(
@@ -2784,7 +2784,7 @@ fn wait_for_ready(
     let panic_aborts = ready == DEFAULT_READY;
     // Ten seconds per guest this phase may have up, and never fewer than two
     // guests' worth — the tree runs 15-25 suites a day across several agents
-    // (`specs/test-cost-audit.md` §4), so one guest on a quiet host stopped being
+    // (`specs/assessments/test-cost-audit.md` §4), so one guest on a quiet host stopped being
     // the regime some time before this did. Measured on 2026-08-03 with other
     // agents building: two boots exceeded the flat ten seconds, one of them in a
     // phase running a single guest.

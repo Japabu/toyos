@@ -3,7 +3,7 @@
 //! Everything a driver has to *decide* before it touches a register: what a
 //! codec said about itself, and which converter and pins carry sound to a
 //! speaker. No I/O, no register writes, no allocation of device memory — the
-//! effects are soundd's. `specs/hda-driver-plan.md` §5.2 is why this is a
+//! effects are soundd's. `specs/plans/hda-driver-plan.md` §5.2 is why this is a
 //! crate: the traversal is the least-covered code in that plan, and here it is
 //! testable against the graph of the machine that has to work.
 //!

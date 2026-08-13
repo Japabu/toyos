@@ -14,7 +14,7 @@ constant, so changing the driver's rate aborts every cpal app.
 Deferred to the quiet-tree window, not neglected: editing that fork needs
 `.cargo/config.toml` path overrides, which redirect cpal for **every** agent in
 the tree. Same scheduling constraint as the fork lint audit
-(`specs/fork-lint-audit-plan.md`).
+(`specs/plans/fork-lint-audit-plan.md`).
 
 **Client liveness is blocked on this, not on soundd.** The ambiguity between a
 paused and a wedged client is *specified*: `specs/audio-subsystem-spec.md` §6.4

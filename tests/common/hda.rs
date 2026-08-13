@@ -1,4 +1,4 @@
-//! Stage H0 of `specs/hda-driver-plan.md`, in the harness.
+//! Stage H0 of `specs/plans/hda-driver-plan.md`, in the harness.
 //!
 //! What this can certify and what it cannot is the honest half. The probe's
 //! *branches* are certifiable here — every arm of every one of H0's four
@@ -217,7 +217,7 @@ fn ordinary_boot_is_untouched() -> Result<(), String> {
 /// flashed diagnostic image is built with `boot-actuators` alone; the suite has
 /// only two kernels and the one carrying actuators carries `test-actuators`
 /// too, so what boots here has a debug syscall the flashed one does not
-/// (`specs/test-cost-audit.md` §5.9.7). Everything the probe touches is the
+/// (`specs/assessments/test-cost-audit.md` §5.9.7). Everything the probe touches is the
 /// same code either way.
 fn probe_boot(params: &'static [&'static str]) -> Result<Serial, String> {
     let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("diag");
@@ -248,7 +248,7 @@ fn probe_boot(params: &'static [&'static str]) -> Result<Serial, String> {
 /// asserted here is **harm** — the tone is present, continuous, and dithered —
 /// which is the fast tier's verdict. This is not a gate-A arm: it has no
 /// recorded distribution behind it, and §5.3's four baseline sections are
-/// unrecorded (`specs/hda-driver-plan.md` §6.6).
+/// unrecorded (`specs/plans/hda-driver-plan.md` §6.6).
 pub fn hda_tone(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],

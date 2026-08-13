@@ -11,7 +11,7 @@ The implementers were not careless. Read the commit messages in
 `0d2a324..b33b231`: measured A/Bs, in-guest traces, negative-teeth
 demonstrations. The defects were invisible *from inside the change* — a claim
 about method, recorded here with evidence so it does not become folklore.
-Companion to `specs/audio-gate-history.md`, whose lesson (the instrument is wrong
+Companion to `specs/assessments/audio-gate-history.md`, whose lesson (the instrument is wrong
 before the subject is) was re-confirmed here about ten times; the forward-looking
 half is `specs/device-test-strategy.md`, and this file is its evidence.
 
@@ -51,7 +51,7 @@ precedent itself: "the same reading-the-database-not-the-code failure that
 previously misreported the PT_TLS overflow as live."
 
 Same class, other direction, same arc: `0cdbaba` found
-`specs/boot-image-split.md` still describing `OFF_KB_INT_RING`, a "0xD000-byte
+`specs/plans/boot-image-split.md` still describing `OFF_KB_INT_RING`, a "0xD000-byte
 pool" and a panic past three devices — all deleted by `5bb673c` hours earlier —
 and still listing removing that panic as work to do. An agent picking up the
 image split would have re-derived a fix that had shipped.
@@ -213,7 +213,7 @@ One claim was half-wrong in a way worth keeping: the xHCI wave's reviewer held
 that a keyboard survives the one-block pool. It does not — the survivor is the
 boot stick, because QEMU puts a SuperSpeed `usb-storage` on the first SuperSpeed
 port register ahead of every USB2 one, so no HID gets the block and "and
-delivers" stays untested. `4b3cbd9` corrected `specs/metal-boot-plan.md`, which
+delivers" stays untested. `4b3cbd9` corrected `specs/plans/metal-boot-plan.md`, which
 had claimed the test proved the overflow "costs the extra devices and nothing
 else", to say what is proved and what is not.
 

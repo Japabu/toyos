@@ -35,7 +35,7 @@ slots enabled with a zero DCBAA entry every run, which makes the entry's own
 test the largest producer of the leak it describes.
 
 **The count is 11, not four plus three**, enumerated in
-`specs/type-safety-audit/usb-storage.md` F12 by reading every path between the
+`specs/assessments/type-safety-audit/usb-storage.md` F12 by reading every path between the
 successful Enable Slot and a bound device. Three of them are named nowhere
 else: SET_CONFIGURATION failing (`device.rs`), Configure Endpoint failing for
 the bulk pair (`msc.rs`) and for the HID interrupt endpoint (`device.rs`), plus

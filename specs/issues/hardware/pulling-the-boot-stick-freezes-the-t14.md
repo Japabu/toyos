@@ -47,7 +47,7 @@ aims all of them at a dead device on one event.
 **What it does not close, stated so a green suite does not imply otherwise:**
 
 - ~~Teardown and `recover_endpoints` still block a pass~~ — **closed by X2a**
-  (`specs/xhci-port-machine-plan.md`). Both are submit-and-return against one
+  (`specs/plans/xhci-port-machine-plan.md`). Both are submit-and-return against one
   outstanding operation per controller: the pass that starts one gives itself
   back, and the completion arrives through the event ring the poll already
   drains. What is left on that path is `device::configure`, which is X2b; the
@@ -421,7 +421,7 @@ absent from QEMU by construction, and can produce the observed state without
 reaching any software error path.
 
 **Corroborated independently, and the other reading goes further — read it
-before touching any of this.** `specs/memory-boundary-spec.md` §2.3 reached the
+before touching any of this.** `specs/plans/memory-boundary-spec.md` §2.3 reached the
 same conclusion from the memory-safety track on the same day, and it is the
 authority for the fix: it names the same `ipi_all_excluding_self` one-ICR-write,
 states that **the six existing call sites are therefore already wrong** rather
@@ -466,7 +466,7 @@ so *by name* turns the freeze's own precondition into a printed line — on a
 machine where, as of the probe, a fatal report reaches the panel.
 
 That change is not made here, and it is **not** M3 being started early: M3 is
-`specs/memory-boundary-spec.md` §3.3 and it belongs to the memory-safety track,
+`specs/plans/memory-boundary-spec.md` §3.3 and it belongs to the memory-safety track,
 which has already priced it, enumerated the sites and written the deadlock rule.
 Whoever builds this A/B builds a throwaway to test a hypothesis about the
 freeze, obeys §3.3's rule about `log!` between issue and ack, and lands nothing.

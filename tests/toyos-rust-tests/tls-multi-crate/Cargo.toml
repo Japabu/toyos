@@ -12,7 +12,7 @@ tls-dep = { path = "dep" }
 [lints.rust]
 warnings = "deny"
 
-# The guest profile — `specs/boot-image-split.md` §6. A test binary runs on the
+# The guest profile — `specs/plans/boot-image-split.md` §6. A test binary runs on the
 # same machine as the programs it tests, so it is built the same way.
 [profile.toyos]
 inherits = "dev"

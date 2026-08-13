@@ -948,7 +948,7 @@ enum RegTarget {
 ///
 /// The fd is the authorization and the device behind it owns the allow-list, so
 /// this function knows nothing about codecs or virtqueues — which is the test
-/// `specs/hda-driver-plan.md` §4.4 sets for it being a device-register call
+/// `specs/plans/hda-driver-plan.md` §4.4 sets for it being a device-register call
 /// rather than a device protocol back in the syscall table. Two stubs answer it
 /// now, which is the first evidence for that claim rather than a restatement of
 /// it.

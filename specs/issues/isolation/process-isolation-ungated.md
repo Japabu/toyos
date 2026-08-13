@@ -33,7 +33,7 @@ Two answers, and neither is this branch's to pick:
   `specs/capability-endowment-spec.md` §6.3 already assumes soundd sends, and
   the rights model cannot express it because sending needs `TRANSFER`. That is a
   bound on delegation rather than a revocation, and it is the cheaper of the two.
-- **Revocation proper**, which `specs/capability-handles-spec.md` §14.5 rejects
+- **Revocation proper**, which `specs/assessments/capability-handles-spec.md` §14.5 rejects
   by name: unmapping a running process's pages is the `gpu::set_resolution`
   hazard — freeing memory a consumer may hold pointers into. A capability system
   may refuse to hand out a new mapping; taking one back from a running process is

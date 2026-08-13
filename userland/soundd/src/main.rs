@@ -68,7 +68,7 @@ enum Pipeline {
 
 /// The device half of the mix loop.
 ///
-/// Two implementations and no more: `specs/hda-driver-plan.md` §8 item 10
+/// Two implementations and no more: `specs/plans/hda-driver-plan.md` §8 item 10
 /// forbids a framework before there are three. Both are drivers in this process
 /// now, and what differs between the two devices is exactly the methods below;
 /// the mixer, the ramps, the DLL, the underrun accounting and the

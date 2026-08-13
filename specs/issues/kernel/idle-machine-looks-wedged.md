@@ -14,7 +14,7 @@ its elimination of the log-shape argument is what made the heartbeat build worth
 flashing, and because it is the record of three rounds that read the ending of a
 quiescent machine's log as a wedge.
 
-**The evidence is committed**: `specs/metal-logs/2026-08-07-freeze/`, seven
+**The evidence is committed**: `specs/assessments/metal-logs/2026-08-07-freeze/`, seven
 consecutive boots of one image off the owner's stick, 22:26–22:33 on
 2026-08-07, five of them frozen with Ctrl+Alt+D producing nothing on every one.
 Its `README.md` has the table. This entry is what the seven establish, what they

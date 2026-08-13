@@ -15,5 +15,5 @@ it. That is a small piece of work nobody has done.
 What no file can answer is what each *translator* is actually using. There is
 one per surface and each re-reads the config when its host says so, so a
 terminal that missed the notification disagrees with the file and nothing can
-see it. `specs/introspection-plan.md` §1's `SYS_QUERY` is still the shape that
+see it. `specs/plans/introspection-plan.md` §1's `SYS_QUERY` is still the shape that
 answers "what is this process holding", and it is still not built.

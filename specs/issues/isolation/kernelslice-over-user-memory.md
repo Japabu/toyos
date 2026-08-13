@@ -7,7 +7,7 @@ opened: 2026-08-07
 # `KernelSlice` is the last `&[u8]` over memory userland can write
 
 `user_ptr` hands out no reference to user memory any more (M1b of
-`specs/memory-boundary-spec.md`), but that is a statement about addresses
+`specs/plans/memory-boundary-spec.md`), but that is a statement about addresses
 *userland chose*. `mm::region::KernelSlice::as_slice` (`mm/region.rs:52-54`) is
 the other direction: a kernel allocation the loader later maps into a process,
 so the borrow is created before the aliasing exists. `elf.rs:973` builds a

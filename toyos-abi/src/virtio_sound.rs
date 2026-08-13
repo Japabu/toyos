@@ -1,6 +1,6 @@
 //! What the kernel's virtio-sound stub hands its driver.
 //!
-//! `specs/hda-driver-plan.md` §4.1 is the design, and the line through this
+//! `specs/plans/hda-driver-plan.md` §4.1 is the design, and the line through this
 //! device is the one HDA's is: **the kernel writes every address.** A split
 //! virtqueue names memory in exactly one place, its descriptor table, and the
 //! three tables here live in a page no process maps. What a driver gets is the

@@ -225,7 +225,7 @@ fn main() {
 /// `--kernel-param <name>`, repeatable: one actuator this *boot* arms, and the
 /// ordinary way to ask for one. `--kernel-feature <name>`, repeatable: one
 /// cargo feature this *build* carries, which after
-/// `specs/test-cost-audit.md` §5.9.7 is `fpu-save-nothing` and `sched-check`
+/// `specs/assessments/test-cost-audit.md` §5.9.7 is `fpu-save-nothing` and `sched-check`
 /// and nothing else. Unknown names are refused by name in [`build::build`],
 /// before any lock.
 ///

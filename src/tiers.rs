@@ -19,7 +19,7 @@
 //! 1,791.2 s of the effective 2,126.6 s CI profile, and none is gated per pull
 //! request. `guards` on every row says what stopped being gated, because a run
 //! that quietly does less is the whole failure mode here —
-//! `specs/test-cost-audit.md` §7 is the long form.
+//! `specs/assessments/test-cost-audit.md` §7 is the long form.
 //!
 //! **Nothing here is an optimisation and nothing here changes an assertion.**
 //! A relegated test measures exactly what it measured; the manual nightly
@@ -48,7 +48,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// verdict or price — belongs Nightly; only a compute-bound verdict stays Fast.
 /// **2026-08-13: the sweep applying this to the rest of the fast tier landed**
 /// — [`Why::TimerAnchored`] is the classification it needed, and every
-/// borderline name `specs/test-cost-audit.md` §7 raised has one of the three
+/// borderline name `specs/assessments/test-cost-audit.md` §7 raised has one of the three
 /// `Why` rows now.
 pub const FAST_CEILING_MS: u64 = 10_000;
 

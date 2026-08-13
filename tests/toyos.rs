@@ -25,7 +25,7 @@ struct TestDef {
 /// Whether a test may run while other guests are up.
 ///
 /// Every entry of [`MACHINE_TESTS`] and [`SCREEN_TESTS`] answers this or does
-/// not compile. That is `specs/test-cost-audit.md` §3.3's serial-by-default rule
+/// not compile. That is `specs/assessments/test-cost-audit.md` §3.3's serial-by-default rule
 /// in its stronger form: the rule's whole safety argument is that *forgetting*
 /// must cost a slow suite rather than a wrong measurement, and a name that
 /// cannot be added without an answer cannot be forgotten at all.
@@ -56,7 +56,7 @@ enum Sched {
 ///
 /// **Twelve is the number for one suite on this host**, and [`HostSlots`] is
 /// what stops four agents at twelve being 48 guests on 14 cores.
-/// `specs/test-cost-audit.md` §5.4.7 carries the tables, including the one that
+/// `specs/assessments/test-cost-audit.md` §5.4.7 carries the tables, including the one that
 /// said eight, which was taken while `drain_serial` was still width-scaled and
 /// `metal_sim_pointer_churn`'s twenty-four paced drains *were* the phase.
 const DEFAULT_WIDTH: usize = 12;
@@ -64,7 +64,7 @@ const DEFAULT_WIDTH: usize = 12;
 /// This run's claim on the host's guest budget.
 ///
 /// [`DEFAULT_WIDTH`] is a number for *one* suite, and nothing was handing out
-/// the cores that two suites both spend (`specs/test-cost-audit.md` §4.1
+/// the cores that two suites both spend (`specs/assessments/test-cost-audit.md` §4.1
 /// constraint 3). A second suite on this machine is not a slower first suite, it
 /// is a wrong one: `screen_fatal_halt` red at 11 s against 3.3 s alone, and an
 /// agent's hour spent chasing that as a regression.
@@ -300,7 +300,7 @@ const AUDIO_SMP: &[u32] = &[1, 8];
 // bitmap it rendered itself, before anything points it at a real screen.
 /// The order was once about kernel rebuilds — every actuator was a build, and a
 /// feature-carrying test last left the plain-kernel ones above it untouched by
-/// the thrash. Since `specs/test-cost-audit.md` §5.9.7 there are two kernels and
+/// the thrash. Since `specs/assessments/test-cost-audit.md` §5.9.7 there are two kernels and
 /// nothing to thrash; the order is kept because these are read the way they are
 /// written.
 const SCREEN_TESTS: &[(&str, Sched, Tier)] = &[
@@ -436,7 +436,7 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // wall-clock margin on the host as much as on the guest: at width 12 the
     // probe missed the window and reported the NMI as never delivered, which
     // reads exactly like the defect it hunts, and it was green alone in the
-    // same run and three times after it. Serial by `specs/test-cost-audit.md`
+    // same run and three times after it. Serial by `specs/assessments/test-cost-audit.md`
     // §3.3 — a verdict that is a duration does not go in the parallel phase.
     ("dump_nmi_probe", Sched::Serial, Tier::Nightly),
     ("diskless_boot", Sched::Parallel, Tier::Fast),
@@ -676,7 +676,7 @@ enum Stale {
     OnAPass,
     /// **A date, because a pass proves nothing.** For a failure that does not
     /// fire every run. One green of an intermittent test is one sample of a
-    /// rate, and `specs/audio-gate-history.md` is the standing evidence that a
+    /// rate, and `specs/assessments/audio-gate-history.md` is the standing evidence that a
     /// verdict taken from one sample is a verdict about nothing — so
     /// [`Stale::OnAPass`] here would red a tree with nothing wrong with it, on
     /// the first lucky run, and teach everybody to re-run until it went away.
@@ -1674,7 +1674,7 @@ impl AudioRun {
 /// A switch and not a test of its own, because it changes no verdict: it makes
 /// the four audio configs measure a machine the host cannot otherwise present,
 /// and what it produces is an A/B against the same command without it in the
-/// same session. `specs/blocking-io-plan.md` is what the numbers are for and
+/// same session. `specs/plans/blocking-io-plan.md` is what the numbers are for and
 /// which stage turns one of them into an assertion.
 static SLOW_USB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -6617,7 +6617,7 @@ fn run_machine_test(
     // temp dir, so a guest still running when the next one starts takes that
     // one's socket and it exits before its first line — which is what every
     // test after a group reported the first time a group outlived its members.
-    // (It is also what `specs/test-cost-audit.md` §3.3's parallel boots would
+    // (It is also what `specs/assessments/test-cost-audit.md` §3.3's parallel boots would
     // have to fix first.)
     if group_of(name) != held.as_ref().map(|up| up.group) {
         *held = None;
@@ -7993,7 +7993,7 @@ fn run_machine_test(
             // of the owner's T14 caught it twice by NMI, at
             // `arm_one_shot+0x8d` and at `timer_entry+0x0`, which are the two
             // instruction boundaries of exactly that loop
-            // (`specs/metal-logs/2026-08-08-cpu0/`).
+            // (`specs/assessments/metal-logs/2026-08-08-cpu0/`).
             //
             // Its own boot because the failure is a CPU that never runs
             // anything again: on the shared boot it would be reported against
@@ -10572,7 +10572,7 @@ fn nightly_tier_is_announced() -> Result<(), String> {
         "not run — the nightly tier",
         "desktop_window_child, sshd_fail_closed",
         "`cargo test --test toyos-build -- --nightly` runs them",
-        "specs/test-cost-audit.md",
+        "specs/assessments/test-cost-audit.md",
         "2 held back for the nightly tier",
     ] {
         if !announced.contains(want) {
@@ -10871,7 +10871,7 @@ impl Tally {
             say(format!("    {}", self.relegated.join(", ")));
             say(
                 "    `cargo test --test toyos-build -- --nightly` runs them. \
-                 specs/test-cost-audit.md §7 says what each one guarded and why it is not \
+                 specs/assessments/test-cost-audit.md §7 says what each one guarded and why it is not \
                  gated per pull request."
                     .to_string(),
             );
@@ -11421,7 +11421,7 @@ fn expected_failure_entries() -> Result<(), String> {
 /// kernel, and one the suite has no other way to notice.
 ///
 /// **A green retry does not turn the run green.** A rerun-only pass counting as
-/// a pass is `specs/test-cost-audit.md` §3.7 by the back door; the failure line
+/// a pass is `specs/assessments/test-cost-audit.md` §3.7 by the back door; the failure line
 /// says which of the two it was and the run stays red until somebody fixes the
 /// classification. That is the whole safety argument for widening the parallel
 /// phase: getting a scheduling answer wrong costs a red run, never a quiet one.
@@ -12435,7 +12435,7 @@ fn main() {
             "[toyos] nightly tier: {} test(s) NOT run, {:.1} s of effective CI test time. \
              `cargo test --test toyos-build -- --nightly` runs them manually; \
              .github/workflows/ci.yml runs them every night at 03:00 UTC. \
-             specs/test-cost-audit.md §7 says what each one guards.",
+             specs/assessments/test-cost-audit.md §7 says what each one guards.",
             held_back.len(),
             ms as f64 / 1000.0,
         );
@@ -12483,7 +12483,7 @@ fn main() {
     //
     // No longest-first heuristic, deliberately: the phase's wall clock is set by
     // its longest job and the durations that would order it are not in the tree
-    // — see `specs/test-cost-audit.md` §5.3, which measures the deficit and says
+    // — see `specs/assessments/test-cost-audit.md` §5.3, which measures the deficit and says
     // what it would take to close it.
     if !tests_to_run.is_empty() {
         let actuator_count =
@@ -12693,7 +12693,7 @@ fn main() {
     // A run with both real failures and invalidated tests exits 1: a red that
     // survives is still a red, and re-running the suspended ones does not make
     // it green.
-    // What this run cost cargo, and the number `specs/test-cost-audit.md` §5.9.7
+    // What this run cost cargo, and the number `specs/assessments/test-cost-audit.md` §5.9.7
     // is about: a kernel build is ~6.9 s of wall clock and ~29.6 s of CPU after
     // any edit under `kernel/`, and a full run used to make 45 of them.
     let (boots, feature_boots, kernels) = qemu::boot_census();

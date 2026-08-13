@@ -9,7 +9,7 @@ make sense to move all of the QEMU tests into the nightly tier, run only unit
 tests on PR CI, and run the QEMU suite locally? What is the optimal setup?* This
 document answers it from the instruments' own record. **It proposes; every
 decision point is marked.** Nothing here changes an assertion, a tier or a
-workflow — `specs/test-cost-audit.md` is what the suite costs,
+workflow — `specs/assessments/test-cost-audit.md` is what the suite costs,
 `specs/ci-plan.md` is what CI is, and this is the policy those two are evidence
 for.
 
@@ -1122,7 +1122,7 @@ elsewhere in it.
 ### What this document deliberately does not propose
 
 - **No change to any assertion, machine shape or negative gate.** §5's proposal
-  moves names between tiers; it deletes nothing. `specs/test-cost-audit.md`'s
+  moves names between tiers; it deletes nothing. `specs/assessments/test-cost-audit.md`'s
   standing position (§3.7) — that selective running trades confidence for speed
   and the audit's answer is no — is unchanged, and this document agrees with it:
   the argument here is that the *guest gate stays*, not that it shrinks.

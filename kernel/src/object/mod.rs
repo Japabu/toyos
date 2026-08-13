@@ -15,7 +15,7 @@
 //! killer's CPU. The stranded `Arc` leaks memory: bounded, visible in the
 //! [`census`], and unable to delay a semantic event.
 //!
-//! `specs/capability-endowment-spec.md` §1, `specs/capability-handles-spec.md`
+//! `specs/capability-endowment-spec.md` §1, `specs/assessments/capability-handles-spec.md`
 //! §3–§5.
 
 use alloc::sync::Arc;

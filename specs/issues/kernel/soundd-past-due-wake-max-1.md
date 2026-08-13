@@ -11,7 +11,7 @@ opened: 2026-08-08
 because `0` is the kernel's non-blocking sentinel. But non-blocking is exactly
 what a grid point already in the past wants, so `0` is the right answer and `1`
 is a park on a deadline that has passed. It is the trigger on boot 5 of
-`specs/metal-logs/2026-08-08-cpu0/`, where cpu0 and cpu1 both stopped within
+`specs/assessments/metal-logs/2026-08-08-cpu0/`, where cpu0 and cpu1 both stopped within
 100 ms of `soundd: resumed`.
 
 Not fixed here, and deliberately: it is one line in the mix loop, `apic::OneShot`'s
