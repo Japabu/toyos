@@ -168,8 +168,7 @@ A device class is claimed by at most one program; two programs declaring the
 same `devices` entry is refused when the image is built, never arbitrated
 first-come at runtime.
 
-**The test estate's authority is a manifest fact like any other, stated
-once.** The guest binaries under `tests/toyos-rust-tests/src/bin/` are not
+**The test estate's authority is a manifest fact.** The guest binaries under `tests/toyos-rust-tests/src/bin/` are not
 `[programs]` entries, so no manifest row can name what any single one of them
 needs. `test-runner` is the one program whose `receives` is the union of what
 its binaries need in a given boot config; every binary it spawns inherits
@@ -200,9 +199,8 @@ answers `PermissionDenied` without it, and there is no default. In outline:
 Number 113 is reserved for a port-rearm call that does not exist yet (§7);
 nothing is built at it. A retired number — `SYS_WAITPID`, `SYS_LISTEN`,
 `SYS_CONNECT`, `SYS_OPEN_DEVICE`, `SYS_KILL`, the shared-memory token quartet,
-among others — is never reused, and its comment in `toyos-abi/src/syscall.rs`
-states why in the same terms as this document, because that file is where an
-agent allocating the next number looks.
+among others — is never reused, and its gravestone comment in
+`toyos-abi/src/syscall.rs` states why.
 
 `SYS_CLOSE` needs nothing on the handle it drops — dropping is not an
 operation on the object it names. `SYS_FSTAT` and `SYS_MARK_TTY` need
@@ -314,10 +312,8 @@ follows them in order:
    label itself, std's `Command` duplicates the caller's own namespace handle
    and endows the duplicate under `svc` — a duplicate rather than the handle
    itself, since an endowment is a move and a parent that gave its namespace
-   away could not spawn a second child. This is a different guarantee from
-   clause 2's, not a weaker one: a program init never launched gets what its
-   parent chose to give it, which is what a program endowed nothing by the
-   manifest should get.
+   away could not spawn a second child. A program init never launched gets
+   what its parent chose to give it.
 
 An acceptor is endowed by move, so a `serves` program can be launched through
 init at most once per boot: once init hands over the acceptor for a name, it
