@@ -96,8 +96,9 @@ was right about the mechanism and wrong about the cause: nothing was wrong with
 the read, its writer had been told to go.
 
 The fix is `note_closed` in the compositor plus a harness that waits on that
-event instead of sampling `windows=N` every two seconds
-(`scheduler-migration-log.md`). **`desktop_window_child` now passes end to end,
+event instead of sampling `windows=N` every two seconds — recorded in the
+scheduler migration log, now git history rather than a live file.
+**`desktop_window_child` now passes end to end,
 alone and in the 12-wide phase** — both windowed-child probes and all three
 snake rounds, snake leaving `code=0` each time.
 
@@ -147,8 +148,9 @@ pointer to this section beside every `XFAIL` line for exactly that reason.
 deadline was stored twice — `ParkedEntry.deadline` and `DeadlineHeap` — and
 `fire_deadlines`' lost claim discarded one copy, so a CPU could halt with
 `TimerPlan::Stop` while its report said `1 pending, 0 OVERDUE`. That is why the
-dump taken off the frozen guest could not be read, and it is fixed
-(`scheduler-migration-log.md`, 2026-08-06): a deadline lives in one place and
+dump taken off the frozen guest could not be read, and it is fixed (recorded
+in the scheduler migration log 2026-08-06, now git history): a deadline lives
+in one place and
 invariant T reads what arms the timer. **This entry stays open.** Nothing
 established that the divergence is what froze the guest — the claim's
 `Msg::Wake` follows it within two instructions and `SleepArm::confirm` refuses

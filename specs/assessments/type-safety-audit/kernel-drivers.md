@@ -28,7 +28,7 @@ reported as fact — what it touches, what could break — because sequencing ne
 it, never as a reason to soften a recommendation. Findings that were only "this
 could be a newtype", with no bug and no readability gain, were dropped; §6 lists
 them, because a list of only hits is a monument rather than a record
-(`specs/metal-track-history.md` rule 7).
+(`specs/assessments/metal-track-history.md` rule 7).
 
 `specs/issues/` was read in full first. Where a finding extends a filed
 class it says so and points at the entry; nothing here re-files what is there.
@@ -72,7 +72,7 @@ roughly 50 lines and unifies three copies that have already drifted.
 
 ## 2. The correlation: what the recorded defects say about types
 
-`specs/metal-track-history.md`'s "What QEMU structurally could not find" table is
+`specs/assessments/metal-track-history.md`'s "What QEMU structurally could not find" table is
 the best available sample of hardware-shaped defects in this tree — every one
 found by reading code against a spec, none by a test. Scoring each against
 "would a type have made this unrepresentable?":
@@ -546,7 +546,7 @@ believes a buffer it should not.
   `:656`, `:660`, `:714`, `:737`, `:741`.
 
 **Bug permitted.** The one the tree already paid for. `442f3e8`, verbatim from
-`specs/metal-track-history.md`: *"'Every i8042 write is read back' was false for
+`specs/assessments/metal-track-history.md`: *"'Every i8042 write is read back' was false for
 the one write that arms the pin. A controller that drops `CFG_PORT1_IRQ` still
 fills the output buffer and never asserts — invisible from every angle."* The fix
 added a read-back at that one site (`i8042/mod.rs:791-807`). Fourteen sibling
@@ -1225,7 +1225,7 @@ Read in full: all 17 files under `kernel/src/drivers/` and all 16 under
 patterns only — it is the ABI boundary, has had its own hardening passes, and its
 findings would duplicate `specs/issues/isolation/`). Also read for context: `mm/mod.rs`,
 `mm/mmio.rs`, `mm/region.rs`, `block.rs`, `page_cache.rs` and `usb_gate.rs` (read
-paths), CLAUDE.md, `specs/issues/` in full, `specs/metal-track-history.md`
+paths), CLAUDE.md, `specs/issues/` in full, `specs/assessments/metal-track-history.md`
 in full.
 
 **Nothing was built or run.** No `cargo build`, `cargo test` or `cargo run` —

@@ -38,8 +38,9 @@ all has not been run properly.
 
 ## Records that lied
 
-`77fc62d`: `specs/scheduler-migration-log.md` recorded that spec §6.4's
-preempt-count baseline asserts "landed with the shims at 7a". No such assert
+`77fc62d`: the scheduler migration log — now git history, not a live file —
+recorded that spec §6.4's preempt-count baseline asserts "landed with the
+shims at 7a". No such assert
 existed anywhere — `driver::pass` only raises and lowers the count, and
 `with_cpu`'s nested-pass check is §6.2's `IN_SCHEDULE` replacement, a different
 mechanism. Three stages had been signed off against a guarantee that was never

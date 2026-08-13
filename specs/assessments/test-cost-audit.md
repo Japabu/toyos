@@ -475,7 +475,7 @@ The house rule is that every worker runs everything. Changing it trades
 confidence for speed.
 
 **What it would have missed, from this tree's own evidence.**
-`specs/metal-track-history.md` records ~70 defects found in code whose own suites
+`specs/assessments/metal-track-history.md` records ~70 defects found in code whose own suites
 were green, and states the reusable form: mutating your implementation tests the
 paths you wrote, never the states you did not think to construct. The failure
 counts mined from this session's transcripts say the same thing from the other

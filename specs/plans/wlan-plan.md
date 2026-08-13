@@ -630,7 +630,7 @@ where they restate a measured C line count.
 | Stage | Content | Size (est.) | Gate |
 |---|---|---|---|
 | **W0** | **Handoff feasibility.** No driver. A kernel diagnostic that, for `09:00.0`, reports: its DMAR device scope, whether its isolation scope is a singleton (§3.1), whether it carries an RMRR, whether it offers MSI-X and how many vectors, and its BAR sizes and 2 MiB relocatability. Read on a `--diag-boot`. | ~200 lines kernel | The log carries a named line per item, photographed off the panel. **If scope or RMRR refuses the device, the track stops here and is re-decided.** |
-| **W1** | **`toyos-80211`.** Frame parse/build for management, control and data; the IE parser; channel/frequency maps; the 658-constant protocol surface written from the standard. | ~3,500 lines Rust | `cargo test` in-crate. **State-space attacks, not just teeth**: truncated frames, an IE whose length runs past the buffer, a zero-length IE, duplicate IEs, an element chain that never terminates. Per `specs/metal-track-history.md`, mutating the parser tests the paths written; these test the states not thought of. |
+| **W1** | **`toyos-80211`.** Frame parse/build for management, control and data; the IE parser; channel/frequency maps; the 658-constant protocol surface written from the standard. | ~3,500 lines Rust | `cargo test` in-crate. **State-space attacks, not just teeth**: truncated frames, an IE whose length runs past the buffer, a zero-length IE, duplicate IEs, an element chain that never terminates. Per `specs/assessments/metal-track-history.md`, mutating the parser tests the paths written; these test the states not thought of. |
 | **W2** | **`toyos-wpa`, WPA2-PSK.** PBKDF2-HMAC-SHA1, PMK→PTK/GTK derivation, the 4-way handshake state machine, CCMP encrypt/decrypt, replay windows, key install and rekey. | ~2,500 lines Rust | `cargo test` against published vectors. Negative gates with teeth: a tampered MIC must fail, a replayed message 3 must not re-install, an out-of-window packet number must be dropped. **A green run with the MIC check deleted must go red**, or the gate is decoration. |
 | **W3** | **`toyos-sme`.** Scan, auth, assoc, disconnect, roam; the 20 MLME upcalls of §3.3 are its inputs. | ~2,500 lines Rust | `cargo test` with a scripted peer: assoc timeout, deauth mid-handshake, a beacon that changes the country IE, an AP that never answers. |
 | **W4** | **Firmware pipeline.** TLV container parse, API-revision pin, `.pnvm` handling, blob + notice into the image at §2.4's paths, SHA-256 assertion. | ~800 lines Rust + build | A test parses the real 1,678,860-byte blob and asserts its section inventory and API revision 89; a test asserts `LICENSES/LICENCE.iwlwifi_firmware` is in the built image. **Independently valuable — HDA and every later firmware device reuse it.** |
@@ -740,7 +740,7 @@ the architecture rather than merely cost time.
   It was applied by one rule and it will be wrong somewhere. W7 checks it.
 - **W7 and W8 together are ~18,000 lines of estimated Rust with no harness.**
   That is the largest untested-until-metal body of work this project has
-  attempted. `specs/metal-track-history.md` records ~70 defects found in code
+  attempted. `specs/assessments/metal-track-history.md` records ~70 defects found in code
   whose own suites were green — and these two stages will not even have suites.
   If the plan fails, it fails here.
 - **`toyos-cc` cannot process the fork's headers today, and the failure is

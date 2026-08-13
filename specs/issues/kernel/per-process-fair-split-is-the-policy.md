@@ -106,7 +106,7 @@ trusting the answer, this one is a hole where the answer would be.
    to 0% and reds the test. **A/B that number across the redesign; a collapse is
    as loud as a violation.** Named as the third gate-failure shape in
    `specs/spec-staleness-sweep.md`, with the evidence in
-   `specs/metal-track-history.md`.
+   `specs/assessments/metal-track-history.md`.
 3. **The margin at 32 CPUs is 1.2× and trending up** — 10 ms at one CPU to
    50 ms at 32 against a 60 ms bound — with nothing measured above 32, while
    spec §11 Stage 9 gates on 1–128. Measure 64 and 128 first, or a red at high

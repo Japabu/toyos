@@ -851,7 +851,7 @@ That is `wlan-plan.md` §5.1's L1 move applied where it pays most, and it is the
 single most valuable structural decision in this section.
 
 State-space attacks, listed separately from teeth because
-`specs/metal-track-history.md`'s lesson is that mutating your implementation
+`specs/assessments/metal-track-history.md`'s lesson is that mutating your implementation
 tests the paths you wrote and never the states you did not construct:
 
 - A connection list that cycles, and one that points outside the function

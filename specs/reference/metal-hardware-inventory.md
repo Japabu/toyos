@@ -183,7 +183,7 @@ Both controllers reported identically on capabilities: `max_slots=64`,
 only), and a DMA pool of `2048 KiB: scratchpad=34 device blocks=64 of 12288 B`.
 
 - **34 scratchpad buffers each.** This is the first hardware confirmation of what
-  `specs/metal-track-history.md` argued from the spec: QEMU demands zero
+  `specs/assessments/metal-track-history.md` argued from the spec: QEMU demands zero
   scratchpad, Intel's controllers demand a real number, and the bug class that
   fixed (a single unaligned buffer written however many were asked for) was
   invisible on the dev host. 34 buffers at 4 KiB is 136 KiB per controller.

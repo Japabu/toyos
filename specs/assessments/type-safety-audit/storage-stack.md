@@ -10,7 +10,7 @@ re-confirmed at that commit. Crates read at `124c2ac`
 all three unchanged in the working tree at the time of the audit.
 
 Why this one is stricter than a normal audit: `toyos-fat32` writes to the ESP of
-the USB stick the owner boots the T14 from. `specs/metal-track-history.md`
+the USB stick the owner boots the T14 from. `specs/assessments/metal-track-history.md`
 records ~70 confirmed defects in code whose own suites were green, and both of
 these crates were audited by their own author.
 

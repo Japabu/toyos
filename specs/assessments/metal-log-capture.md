@@ -1,6 +1,6 @@
 # Getting kernel logs off the ThinkPad T14 Gen 2
 
-The machine boots (`README.md`, `specs/metal-track-history.md`) and we are nearly
+The machine boots (`README.md`, `specs/assessments/metal-track-history.md`) and we are nearly
 blind on it. This is what the channels cost and which one to build.
 
 ## What we are actually short of
