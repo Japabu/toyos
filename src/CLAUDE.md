@@ -33,3 +33,7 @@ Loads when you read a file under `src/` — the root cargo project, package name
 ## Documentation budgets
 
 `src/docs.rs` holds the byte budget for every `CLAUDE.md` in the tree and `cargo test --lib` asserts it. Bytes rather than lines, because a line-count limit cannot see growth when one line can be an essay. Raising a number is a decision with a reason, not a way to make a red go away: the file is loaded into every session and every subagent, and the subdirectory files exist so the root does not have to carry what only one subtree needs.
+
+## Caveats that bite every agent
+
+- **A red build may be the build system — re-run in isolation before believing any single red.** A `stage1-std/<target>/dist/deps` temp-dir error means a concurrent build, never a broken checkout; never repair or force-rebuild the toolchain. A refusal that your worktree and the shared sysroot disagree about `toyos-abi/src` is correct — the build it stops links against another checkout's struct layouts and no test catches that.

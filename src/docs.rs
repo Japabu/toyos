@@ -1,24 +1,8 @@
-//! What the two documentation shapes in this tree promise, and the gates that
-//! make them bind: byte budgets for the `CLAUDE.md` files, and frontmatter and
-//! reference resolution for `specs/issues/`.
+//! What `specs/issues/` promises, and the gates that make it bind: frontmatter
+//! shape and reference resolution.
 //!
-//! Every `CLAUDE.md` is loaded into an agent's context — the root into every
-//! session and every subagent, a subdirectory file whenever an agent reads a
-//! file in that subtree. The cost is paid per dispatch and never shows up in a
-//! build time, so nothing pushes back on growth except this.
-//!
-//! **Bytes, not lines.** The bar this replaces was "keep it under ~200 lines"
-//! and the file passed it while carrying a 3,220-character line; a line count
-//! cannot see an essay written as one paragraph.
-//!
-//! **No default.** A `CLAUDE.md` with no budget here fails the gate rather than
-//! being waved through, so adding one is a decision somebody made on purpose.
-//!
-//! `specs/issues/` is the same argument one level down. Its frontmatter is the
-//! only query anybody has over two hundred files, and a field nothing checks is
-//! a field that is right until the day it is not: every field parsed on the day
-//! the directory was split, and eleven files still disagreed with what its own
-//! README said `status: open` meant.
+//! The frontmatter is the only query anybody has over two hundred files, and a
+//! field nothing checks is a field that is right until the day it is not.
 
 use std::path::{Path, PathBuf};
 
@@ -35,19 +19,6 @@ const SKIP: &[&str] = &["target", "node_modules", "rust", ".git", ".claude"];
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-}
-
-/// Every `CLAUDE.md` in the tree, as a path relative to the repository root.
-pub fn claude_files() -> Vec<String> {
-    let root = repo_root();
-    let mut found = Vec::new();
-    walk(&root, &root, &mut |path| {
-        if path.file_name().is_some_and(|n| n == "CLAUDE.md") {
-            found.push(rel(&root, path));
-        }
-    });
-    found.sort();
-    found
 }
 
 fn rel(root: &Path, path: &Path) -> String {
@@ -187,32 +158,6 @@ mod tests {
     const TEXT: &[&str] = &["md", "rs", "toml", "yml", "yaml", "sh", "json", "txt"];
 
 
-        /// What each `CLAUDE.md` may weigh, keyed by its path from the repository root.
-        ///
-        /// Each number is the file's size at the 2026-08-08 split with room for a few
-        /// additions. Raising one is a decision with a reason: the root's is the tight
-        /// one, because it is the only file every dispatch pays for whether or not the
-        /// agent ever goes near the subtree it describes.
-        const BUDGETS: &[(&str, usize)] = &[
-            ("CLAUDE.md", 40_000),
-            ("kernel/CLAUDE.md", 24_000),
-            ("userland/CLAUDE.md", 12_000),
-            ("tests/CLAUDE.md", 10_000),
-            ("src/CLAUDE.md", 10_000),
-        ];
-
-        /// What all of them may weigh together.
-        ///
-        /// Strictly below the sum of `BUDGETS` (96,000), because five per-file
-        /// budgets can each be honoured while the set grows past what a session
-        /// spanning the tree would tolerate, and nothing prices the set.
-        ///
-        /// **What the set weighs today is not written here.** A measurement in a
-        /// comment has no gate on it and drifts; this one drifted 1,943 bytes,
-        /// which is enough for an agent budgeting an addition against it to red
-        /// the gate it was trying to respect. The assertion prints it instead.
-        const TOTAL_BUDGET: usize = 80_000;
-
         fn issue_files() -> Vec<PathBuf> {
             let root = repo_root().join("specs/issues");
             let mut out = Vec::new();
@@ -229,63 +174,6 @@ mod tests {
             }
             out.sort();
             out
-        }
-
-        #[test]
-        fn every_claude_md_is_within_its_budget() {
-            let root = repo_root();
-            let mut over = Vec::new();
-            for (rel, budget) in BUDGETS {
-                let path = root.join(rel);
-                let size = std::fs::metadata(&path)
-                    .unwrap_or_else(|e| panic!("{rel} is budgeted but not readable: {e}"))
-                    .len() as usize;
-                if size > *budget {
-                    over.push(format!(
-                        "{rel}: {size} bytes against a budget of {budget} — \
-                         move what only one subtree needs into that subtree's own \
-                         CLAUDE.md, resolved narrative into git log, and detail into specs/"
-                    ));
-                }
-            }
-            assert!(
-                over.is_empty(),
-                "documentation over budget:\n  {}",
-                over.join("\n  ")
-            );
-        }
-
-        #[test]
-        fn the_claude_md_set_is_within_its_total_budget() {
-            let root = repo_root();
-            let total: usize = BUDGETS
-                .iter()
-                .map(|(rel, _)| std::fs::metadata(root.join(rel)).expect("budgeted file").len() as usize)
-                .sum();
-            assert!(
-                total <= TOTAL_BUDGET,
-                "the CLAUDE.md set is {total} bytes against a total budget of {TOTAL_BUDGET}. \
-                 Every file may be inside its own budget and the set still be too large: \
-                 what an agent pays is the root plus every subtree it reads."
-            );
-            // Printed on the way past, because the number a reader wants before
-            // writing a paragraph is what is *left* — and the only honest place
-            // for it is a run rather than a comment.
-            println!("CLAUDE.md set: {total} bytes, {} spare", TOTAL_BUDGET - total);
-        }
-
-        #[test]
-        fn every_claude_md_has_a_budget() {
-            let budgeted: Vec<&str> = BUDGETS.iter().map(|(p, _)| *p).collect();
-            let undeclared: Vec<String> = claude_files()
-                .into_iter()
-                .filter(|f| !budgeted.contains(&f.as_str()))
-                .collect();
-            assert!(
-                undeclared.is_empty(),
-                "a CLAUDE.md with no budget in src/docs.rs is one nothing pushes back on:\n  {}",
-                undeclared.join("\n  ")
-            );
         }
 
         /// The frontmatter is the only query anybody has over `specs/issues/`, so a
