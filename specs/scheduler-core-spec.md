@@ -165,8 +165,7 @@ from a re-arm.
 no `blocked_on`, no `enqueued_at`** — but it does have `since`, one timestamp reused across
 states (enqueue time while ready, dispatch time while running, park time while blocked),
 precisely because a task is in exactly one state at a time. Data meaningful only in one lifecycle state lives in that
-state's container (§6.1) — a task that is not parked *structurally cannot have* a deadline. This
-removes the duplicate-truth field that Design 0 originally carried.
+state's container (§6.1) — a task that is not parked *structurally cannot have* a deadline.
 
 **Linearity enforcement:** `impl Drop for TaskInner` panics. The only legal death is
 `DeadTask::finalize()`, which disassembles via `ManuallyDrop`. An accidentally dropped or leaked
@@ -359,8 +358,7 @@ pub enum Action<X> {
 
 **`Action` has three variants, not two** (`cpu.rs:100-110`). `Resume` exists so that "the pass
 decided not to switch" is its own answer rather than a `Run` whose `restore` and `save` are the
-same context — which would make a self-switch representable. That is the same
-make-it-unrepresentable argument the rest of this section is built on, so it belongs here.
+same context — which would make a self-switch representable.
 
 **No guard across the switch — structurally.** `finish` consumes the pass; when `Action` is
 returned every borrow of `CpuSched` has ended. The entire kernel switch path:
@@ -776,9 +774,8 @@ pub struct BoostWindow { pub until: Nanos }
   slow to reach a CPU is demoted to the fair band *before it has run at all*, which inverts the
   lend: the task lands behind exactly the normal-priority work the lend existed to jump, and the
   only paths that re-grant a lend (a wake, or the consume point) are both unreachable from a
-  starved-ready task. That implementation existed and was measured — one demotion starved a
-  boosted audio client for 93 ms behind a CPU hog and produced a 70 ms dropout, the largest
-  recorded on this tree.
+  starved-ready task — a demotion under that design starves a boosted audio client behind a
+  CPU hog for the hog's whole slice.
 
   Correspondingly, **`park` releases the window unconditionally** — it does not ask whether the
   window has run out, because parking *is* the end of holding it. This is audio spec §9.4's "the

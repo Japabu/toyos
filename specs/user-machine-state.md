@@ -25,8 +25,8 @@ The state a Ring 3 thread can observe and a Ring 0 excursion can disturb:
 | general-purpose registers | yes | every entry already saves what it clobbers |
 | `RIP`, `RSP`, `RFLAGS`, `CS`, `SS` | yes | the `iretq` frame or `sysretq`'s `rcx`/`r11` |
 | `FS.base` (TLS) | yes | `hw.rs` swaps it with `rdfsbase`/`wrfsbase` on every context switch |
-| XMM0–15, `MXCSR` | yes | the bracket (§4.1) saves it on all five Ring 3-reachable entries — §3 has the two that used not to |
-| x87 registers, `FCW`, `FSW`, `FTW`, `FIP`, `FDP`, `FOP` | yes | the bracket body is `fxsave64`/`fxrstor64` (§9) — §2 has the entry that used to save neither |
+| XMM0–15, `MXCSR` | yes | the bracket (§4.1) saves it on all five Ring 3-reachable entries (§3) |
+| x87 registers, `FCW`, `FSW`, `FTW`, `FIP`, `FDP`, `FOP` | yes | the bracket body is `fxsave64`/`fxrstor64` (§9) |
 | YMM/ZMM, opmask | not yet | `XCR0` is 1, so they do not exist — §5 |
 
 `XCR0` is 1 because `CR4.OSXSAVE` is set nowhere: neither `kernel/src` nor
@@ -46,7 +46,7 @@ design (§6.4) and is therefore asserted at build time (§8).
 
 ---
 
-## 2. Defect 1 — a pending x87 exception kills the next unrelated process
+## 2. A pending x87 exception must never cross a switch
 
 Provable by toggling one bit: boot two children differing only in
 `fault_gate_child`'s x87 control word (masked vs. IM unmasked), and only the
@@ -66,33 +66,23 @@ special; it is the only test that panics on a thread often enough to be caught.
 
 ---
 
-## 3. Defect 2 — two Ring 3-reachable entries save no FP state at all
+## 3. Every Ring 3-reachable entry saves FP state
 
 Five shapes reach Ring 3, and every one but `nmi_entry` can switch to a
 different task before getting there: `syscall_entry`, `timer_entry`'s Ring 3
 arm, `device_irq_entry!`'s six copies, `common_entry` (all 19 exception
-vectors, #PF included) and `tlb_flush_entry`. Before the bracket in §4, two of
-the five saved nothing: `common_entry` and `tlb_flush_entry` both call
-`kernel_exit_to_user_check` on the Ring 3 return path, which reaches
-`scheduler::do_preempt`, so **a Ring 3 demand-paging fault could return to
-userland holding another thread's XMM registers and MXCSR.** It corrupted
-data instead of faulting, which is why nothing had noticed: an `MXCSR`
+vectors, #PF included) and `tlb_flush_entry`. Every one of the five carries
+the §4 bracket. An entry outside it returns to userland holding another
+thread's XMM registers and MXCSR — and the failure is silent: an `MXCSR`
 carrying the wrong rounding mode or a stale `xmm0` produces a wrong number,
 not a signal.
 
-**A third instance surfaced while writing the bracket.** `syscall_entry`
-restored the user state *before* calling `kernel_exit_to_user_check`, which
-reaches `do_preempt`. A switch in that window returned to Ring 3 carrying
-whatever the task that ran in between had left in the registers — the same
-defect through a narrower window, on the busiest entry there is.
-
-`tlb_flush_entry`'s own comment used to point at `xhci_entry` for its
-register-save rationale and then not follow it: `xhci_entry` expands
-`device_irq_entry!`, which parks XMM+MXCSR across the epilogue and documents
-why; `tlb_flush_entry` pushed ten GPRs and called the same epilogue with
-nothing parked. That is CLAUDE.md's *a doc comment is a claim to verify*
-catching a live bug — the comment was the only thing asserting the two
-agreed, and it was wrong.
+Two orderings inside an entry are load-bearing. `syscall_entry` restores the
+user state only *after* `kernel_exit_to_user_check` — a restore before it
+reaches `do_preempt`, and a switch in that window hands Ring 3 whatever the
+task that ran in between left in the registers. `tlb_flush_entry` parks
+XMM+MXCSR itself, the same as every `device_irq_entry!` expansion — a shared
+epilogue is not a shared save.
 
 ---
 
@@ -238,14 +228,9 @@ less. `XSAVE` and `OSXSAVE` read 0 on every CPU on every instrument this
 kernel runs on — which is what makes §1's completeness claim hold across the
 whole machine, not just the boot CPU.
 
-Whether an AP's *control registers* agreed with the BSP's was a separate
-question this line's first readings raised — `CR0` and `CR4` used to be part
-of this same log line. Root `CLAUDE.md`'s "CPU state" section and
-`specs/issues/kernel/ap-control-registers-inherit-init.md` have that story and
-what it still owes; the fact load-bearing here is that `CR4.OSXSAVE` is
-cleared by the same whole-register declaration that closed it
-(`arch/control_regs.rs`), so no CPU can hold the bit this section exists to
-rule out, and `CR0`/`CR4` moved to that file's own log line beside this one.
+`CR4.OSXSAVE` is cleared by the whole-register declaration every CPU applies
+and asserts (`arch/control_regs.rs`), so no CPU can hold the bit this section
+rules out; `CR0`/`CR4` print on that file's own log line beside this one.
 
 ---
 

@@ -113,7 +113,7 @@ backtrace over its own explanation.
   parts. The 2020+ Core targets this project names all have it.
 - **Every virtual machine whose hypervisor exposes no vIOMMU** — which is the
   default for QEMU, VirtualBox, VMware, Parallels, and essentially every cloud
-  instance type. **This is the largest cost in this document and it is a
+  instance type. **This is the design's largest cost, and it is a
   development-ergonomics cost, not a security one:** on the day the refusal lands,
   a `cargo run` without `-device intel-iommu` stops booting. That is why the
   refusal is sequenced last, and why every profile in the harness and in
@@ -779,7 +779,7 @@ position, not only the presence.
 - Both address widths (`aw-bits=39` and `48`), which is the only way the §5.3 base
   formula gets exercised at more than one value.
 
-**Not certifiable here, and the list is the honest part of this document:**
+**Not certifiable under QEMU:**
 
 - **A unit whose page-table walks snoop the CPU cache.** QEMU's does not. §5.2's
   unconditional flush exists because a branch here cannot be tested on both arms,
