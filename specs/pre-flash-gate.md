@@ -4,7 +4,7 @@ Run this before flashing anything to the ThinkPad T14. It is a **written
 verdict**, not a test run: record each result and sign off, or do not flash.
 
 **A green suite is not this gate.** A green suite says the tests pass, not that
-the change is right — `specs/metal-track-history.md` records twelve
+the change is right — `specs/assessments/metal-track-history.md` records twelve
 certifications that could not fail, and one session alone produced three more
 (`specs/spec-staleness-sweep.md`, "Break it and run it"). Every item below
 therefore has a **false pass** column: the way the check can report success while

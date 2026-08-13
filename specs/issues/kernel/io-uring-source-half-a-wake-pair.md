@@ -23,8 +23,9 @@ History, because it is what makes this worth a line. Stage **7a** (f4d8fa7,
 not 7c as this entry and aeeaa01's commit message first said) deleted the
 audio and network `complete_pending_for_event` calls out of `drain_events`
 while explicitly preserving the keyboard/mouse pair in `hid.rs` — collateral
-of the cutover's `EventSource` removal, not an intended deletion; see
-`specs/scheduler-migration-log.md`. Neither loss was visible for two months.
+of the cutover's `EventSource` removal, not an intended deletion; the
+scheduler migration log recorded it and is git history now, not a live file.
+Neither loss was visible for two months.
 soundd polls the audio fd every cycle but its streaming wakes came from its
 own armed DLL timer, so only the idle path depended on the missing half —
 and there was no idle path until suspend-on-idle. netd polls its NIC fd every

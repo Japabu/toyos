@@ -158,8 +158,10 @@ was measuring the 8.5 ms refill, not the boost policy. *Rate*: same-session A/B,
 that session was 30%, not the 22% above — see the drift warning at the top.)
 
 Two real defects were found on that path anyway and fixed (`9c2fc4d`,
-`78b7bfb`); both are tails, not the rate. See
-`specs/scheduler-migration-log.md`.
+`78b7bfb`); both are tails, not the rate. The scheduler migration log recorded
+both — a queued task's RT lend spent by waiting rather than running, and a
+park that kept a lapsed lend forever — and is git history now, not a live
+file.
 
 ### Suspect 2, wrong: `underruns`/`drains` were "just counter artifacts"
 

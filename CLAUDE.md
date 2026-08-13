@@ -177,7 +177,7 @@ Read the spec before touching the subsystem it covers.
 - `specs/plans/introspection-plan.md` — the read surface (`SYS_QUERY`/`SYS_LOG_READ`), daemon status protocol, toybox diag tools, disk adopt-by-witness. W7 is gated on the owner's review of its §4.
 - `specs/plans/blocking-io-plan.md` — "a CPU never waits for a device", stages B1–B5, and the measurement that says the xHCI driver is not where it is lost. Upstream of the spec above: its waits belong to a thread that asked to wait, these belong to one that asked to write a file.
 - `specs/device-test-strategy.md` — ground truth at the hardware boundary, the harness as actuator, device *shape and lifecycle* before protocol depth.
-- `specs/metal-track-history.md` — ~70 defects confirmed in code whose own suites were green. **Teeth are necessary and not sufficient: mutating your implementation tests the paths you wrote, never the states you did not think to construct.**
+- `specs/assessments/metal-track-history.md` — ~70 defects confirmed in code whose own suites were green. **Teeth are necessary and not sufficient: mutating your implementation tests the paths you wrote, never the states you did not think to construct.**
 - `specs/assessments/type-safety-audit/` — where each area sits on the unrepresentable > checked > tested ladder.
 
 ### Diagnostics roadmap

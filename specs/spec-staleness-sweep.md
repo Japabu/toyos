@@ -68,7 +68,7 @@ and `invariant_i13_is_measured_and_holds` gates on it against the recorded 96% /
 with a halving as the threshold. Proven in both directions: forcing the balance condition
 false takes the reach to 0% and the test reds with `its *reach* has collapsed`, while the
 sweep line printed beside it still reads `clean`. Evidence and per-scenario figures in
-`specs/metal-track-history.md`; the A/B across the redesign is an entry criterion in
+`specs/assessments/metal-track-history.md`; the A/B across the redesign is an entry criterion in
 `specs/issues/`.
 
 Generalised: whenever a change touches the machinery a gate's *precondition* depends on,
@@ -101,7 +101,7 @@ coverage reads exactly the same whether the coverage exists or not, and the
 passing run is taken as confirmation rather than as the thing that was never
 tested.
 
-`specs/metal-track-history.md` records the same class from the other direction —
+`specs/assessments/metal-track-history.md` records the same class from the other direction —
 twelve certifications that could not fail. This is the method that would have
 caught them.
 
@@ -256,13 +256,13 @@ spec that states what without why invites someone to "fix" the code back.
 
 - **Live specs** must be true: fix them.
 - **Dated records** (`forks-audit-2026-07-27.md`, `metal-track-history.md`,
-  `scheduler-migration-log.md`, `audio-gate-history.md`, `cpu-attribution.md`,
-  the `*-2026-*.md` files) are history. **Never rewrite the body** — a dated
-  audit's value is being an accurate account of its date, and editing it
-  falsifies a record rather than fixing a document. If a reader could act on a
-  resolved finding, add a **superseded header** at the top (see
-  `forks-audit-2026-07-27.md`) or a **bracketed annotation** in place (see the
-  Stage 2 paragraph of `scheduler-migration-log.md`).
+  `audio-gate-history.md`, `cpu-attribution.md`, the `*-2026-*.md` files) are
+  history. **Never rewrite the body** — a dated audit's value is being an
+  accurate account of its date, and editing it falsifies a record rather than
+  fixing a document. If a reader could act on a resolved finding, add a
+  **superseded header** at the top (see `forks-audit-2026-07-27.md`) or a
+  **bracketed annotation** in place — the scheduler migration log's Stage 2
+  paragraph did this, before that log was folded into git history.
 - A doc whose *filename* misleads gets its warning at the **top**, not the
   bottom: `bcachefs-reference.md` documents upstream bcachefs and not one byte
   this repo reads. A reader who scrolls is already lost.
@@ -272,7 +272,7 @@ spec that states what without why invites someone to "fix" the code back.
 Five parallel agents, one slice each, opus (this is judgment work). They report;
 they do not edit — the owner of the file applies the fix.
 
-1. `scheduler-core-spec.md`, `scheduler-migration-log.md`
+1. `scheduler-core-spec.md`
 2. `iouring-blocking-spec.md`, `capability-handles-spec.md`
 3. `audio-subsystem-spec.md`, `production-audio-baselines.md`,
    `tests/audio-baseline.toml`, the two audio records

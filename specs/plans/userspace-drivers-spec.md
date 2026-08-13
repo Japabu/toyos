@@ -457,7 +457,7 @@ proceeds.
 
 Per `specs/device-test-strategy.md`: ground truth at the hardware boundary, the
 harness as actuator, device shape and lifecycle before protocol depth. And per
-`specs/metal-track-history.md`: **teeth are necessary and not sufficient** —
+`specs/assessments/metal-track-history.md`: **teeth are necessary and not sufficient** —
 mutating the implementation tests the paths written, never the states not thought
 of — so the state-space attacks are listed separately from the teeth.
 

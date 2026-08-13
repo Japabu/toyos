@@ -303,7 +303,7 @@ as well. So the `C=0` path would be dead code on every machine anybody here can 
 log line.** One `clflush` (or `clflushopt` + `sfence`) per modified table cache line,
 on every path, always. The cost is a cache-line flush per 2 MiB of mapping, which is
 nothing next to the mapping itself. The alternative — a branch whose false arm no
-machine in reach executes — is precisely the class `specs/metal-track-history.md`
+machine in reach executes — is precisely the class `specs/assessments/metal-track-history.md`
 records seventy instances of.
 
 If a profile ever shows this to matter, the branch can be added *by somebody with a
