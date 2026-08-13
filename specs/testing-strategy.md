@@ -4,7 +4,7 @@
 
 1. **Every defect class has exactly one owning instrument.** The owner's red is
    the class's alarm. A class with no owning instrument is recorded as
-   unowned.
+   unowned in `specs/issues/`.
 2. **A pull-request verdict is deterministic for its author.** Green means the
    merged result is clean. Red means the diff is defective. A gate that reds at
    a rate independent of the diff is itself the defect, and is fixed or
@@ -41,7 +41,7 @@ changes its verdict or its price — is **Nightly**.
 
 ## 4. The pull-request gate
 
-Required checks: `host`, `abi-split`, `gate-stage`, `guest-suite`.
+Required checks: `host`, `abi-split`, `gate-stage`, `guest-suite`, `build`.
 
 - `host` runs every host suite.
 - `guest-suite` aggregates the KVM shards, which run exactly the Fast tier,
@@ -52,6 +52,7 @@ Required checks: `host`, `abi-split`, `gate-stage`, `guest-suite`.
   pull-request run.
 - The boot image is built once per run. A dependency is never rebuilt because
   a timestamp moved.
+- `build` builds and publishes the toolchain every guest shard installs.
 
 A pull-request red that is not about the author's diff is adjudicated in
 `src/redlist.rs` and fixed at its owner; it is never re-run away.
@@ -59,8 +60,8 @@ A pull-request red that is not about the author's diff is adjudicated in
 ## 5. The nightly
 
 The scheduled run executes what the pull-request gate withholds: the Nightly
-tier on the same KVM shard configuration, the TCG shard, gate A's thorough
-tier, and stress.
+tier on the same KVM shard configuration, the TCG shard, and gate A's
+thorough tier.
 
 - It runs once nightly and on manual dispatch; never on push.
 - A red updates the single standing alarm issue. The alarm is not the record:
@@ -68,8 +69,9 @@ tier, and stress.
   `src/redlist.rs` row, or a tier correction.
 - A nightly red standing unadjudicated for three days is a process defect and
   takes priority over feature work.
-- Nightly measurements refresh the recorded Nightly costs; they are validated
-  against the tier rule, never against equality with a past measurement.
+- A nightly run uploads the measured profile; the recorded Nightly costs are
+  refreshed from it by commit and validated against the tier rule, never
+  against equality with a past measurement.
 
 ## 6. The local suite
 
