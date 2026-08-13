@@ -27,6 +27,221 @@ entry names a measurement, not a topic, and names what closes it.
 |---|---|---|
 | 1 | one boot with `no-ap-control-regs` armed against one without, same image, same session; record the delta | `specs/issues/kernel/ap-control-registers-inherit-init.md` |
 
+## Pre-flash checklist (verified 2026-08-13 — re-verify before acting, this ages)
+
+Run before flashing any image to the T14. It is a **written verdict**, not a
+test run: record each result and sign off, or do not flash. Freeze the
+filled-in results as a new dated file under `specs/assessments/`, named for
+that flash's date — see `specs/assessments/pre-flash-gate-2026-08-01.md` for
+the shape of one.
+
+**A green suite is not this gate.** A green suite says the tests pass, not
+that the change is right — `specs/assessments/metal-track-history.md` records
+a dozen certifications that could not fail. Every item below has a **false
+pass** column: the way the check can report success while the property is
+broken. If you cannot rule out the false pass, the item is a no-go regardless
+of what the terminal printed. `specs/README.md`'s spec-checking method is how
+to find more false passes than the ones already listed here.
+
+Run on a **quiet tree** — no other agent building or booting. Contention
+produces failures that look like defects and, worse, passes that look like
+verdicts.
+
+**Audit the delta before running the items below.** Run
+`git log <the commit the last pre-flash assessment covered>..HEAD --name-only`
+over `kernel/ bootloader/ src/ toyos-abi/ toyos/ userland/`, and add a
+"boot is unchanged" item — run, expect, false pass — for anything that
+touched the boot path. A section that lists commits by hash tells the next
+session exactly when it stopped being true; that is the point of writing it
+that way.
+
+### What this gate does NOT cover
+
+State these to the owner before he flashes. They are not gaps to be closed
+here; they are things only the hardware can answer.
+
+1. **Whether the T14's EC lands in scancode set 2 with translation on.** QEMU
+   cannot decide it. The driver's `0xF0 0x00` read-back determines the wire
+   format and refuses to attach to one it did not ask for, so the answer
+   appears as one line on the laptop's own screen rather than as a bisect. **A
+   refusal to attach is the driver working**, not a regression.
+2. **The touchpad is I2C-HID and unbuilt.** A dead touchpad is the expected
+   outcome. Do not treat it as a regression, and do not let it consume
+   debugging time on the machine.
+3. **Real-hardware performance.** TCG cannot measure the 2× bar. The T14 is
+   the first honest instrument; nothing here substitutes.
+4. **Anything the on-screen console cannot show.** Input is dead on that
+   machine and there is no serial, so the console is the entire diagnostic
+   channel. If it is broken, every other failure this boot becomes silent —
+   which is why §4 is the gate's highest-severity section.
+
+### 1. Storage: nothing may write to a disk it was not given
+
+**The highest-consequence section.** This cannot be caught by the harness:
+every scratch image the harness creates *is* designated, so a regression that
+widens the write path stays green through the entire suite and only
+misbehaves on a disk that is not ours — his. Defeating that property is what
+§1.1 and §1.2 exist to do. Do not substitute "the storage tests pass".
+
+#### 1.1 The designation stamp is still the only gate
+
+| | |
+|---|---|
+| **Run** | Read `bcachefs/src/superblock.rs`. Confirm `DESIGNATION_MAGIC = b"TOYOS-FORMAT-ME\0"` at `:24` and `DESIGNATION_BLOCKS_OFFSET = 16` still exist, and that the `const` assert keeping `DESIGNATION_MAGIC`'s first four bytes distinct from `MAGIC` (`:30-33`) still compiles. Then `git log -p --since=<last flash> -- bcachefs/src/superblock.rs kernel/src/bcachefs_adapter.rs` and read **every** hunk. |
+| **Expect** | The stamp is checked before any write path is reachable, and no commit in the range adds a second way to reach `format()`. |
+| **False pass** | A new caller reaches a write path *without* consulting the stamp — the stamp is intact and simply no longer the only gate. Reading the constant proves the constant; only reading the callers proves the interlock. Also: a commit that makes the check permissive (warn-and-continue instead of refuse) leaves both the constant and the call site looking correct. |
+
+#### 1.2 `format()` and `mount()` are still private behind `probe`
+
+| | |
+|---|---|
+| **Run** | `git grep -n "pub fn format\|pub fn mount\|pub fn probe" -- kernel/src/bcachefs_adapter.rs` |
+| **Expect** | `fn format()` and `fn mount()` **without** `pub` (currently `:421`, `:436`), and every public route to `format()` passing through `probe()` (currently `:473`). The module has three public entries, not one — `probe`, `open_home` and `mount_initrd` — and the property is that `open_home` reaches `format()` only through `probe`'s `Designated` arm, not that `probe` stands alone. |
+| **False pass** | `pub(crate)` reads as "not public" to a skim but opens the whole kernel. Grep for `pub(` too. Equally: `probe` itself gaining a parameter that lets a caller skip the designation check — the signature is public API, so a new argument is a widened gate that this grep will not show. And the grep alone cannot see a *new* public wrapper that reaches `format()`: list the module's `pub` items, do not just match the three names above. |
+
+#### 1.3 No write path bypasses `probe`
+
+| | |
+|---|---|
+| **Run** | `git grep -n "raw_block_write\|write_block\|NvmeBlockDevice" -- kernel/src` and enumerate every caller. For each, establish it is downstream of `probe`. |
+| **Expect** | Every writer is reached only via a `Storage` returned by `probe`. |
+| **False pass** | An enumeration that covered only `kernel/src`. Per `specs/plans/fork-lint-audit-plan.md`, **"I enumerated the call sites" is only true if the enumeration covered `~/.cargo/git/checkouts/`.** Check there too. |
+
+#### 1.4 Present the disk read-only for the first boot, if the owner accepts
+
+| | |
+|---|---|
+| **Run** | Ask the owner whether the boot can run with the internal NVMe physically or firmware-disabled. |
+| **Expect** | A decision, recorded. |
+| **False pass** | n/a — this is a recommendation, not a check. It is the only item that makes §1's failure survivable rather than merely unlikely, so record his answer either way. |
+
+### 2. The image is flashable
+
+#### 2.1 Sector alignment
+
+| | |
+|---|---|
+| **Run** | `cargo run -- --build-only`, then `ls -l target/bootable.img` and `python3 -c "import os;n=os.path.getsize('target/bootable.img');print(n, n%512)"` |
+| **Expect** | Remainder `0`. `src/image.rs:362`'s `assert_eq!(total_size % 512, 0, ...)` should also still be present. |
+| **False pass** | The assert covers the *computed* `total_size`, not the bytes actually written. If a later step appends or truncates, the assert passes and the file is still misaligned — **measure the file on disk, not the constant.** |
+
+#### 2.2 The backup GPT is present at the very end
+
+| | |
+|---|---|
+| **Run** | Read the last 512 bytes and confirm the GPT backup header signature (`EFI PART`). |
+| **Expect** | Signature present in the final sector. |
+| **False pass** | A primary GPT at the front makes `fdisk -l` look entirely healthy while the backup is missing. Check the **tail** specifically. |
+
+#### 2.3 It still fits, and boots without the hosted rustc
+
+| | |
+|---|---|
+| **Run** | Record image size. Then set `hosted-rustc = false` in `system.toml` (currently `:7`), rebuild, and boot the resulting image under a metal-sim-equivalent profile. **Revert `system.toml` afterwards.** |
+| **Expect** | Boots to `Boot: complete` without the hosted rustc in the initrd. |
+| **False pass** | Testing only the `hosted-rustc = true` image proves nothing about the smaller one, and a stale `target/` can leave the old initrd in place — confirm the image size actually dropped before believing the boot. Nothing in this tree boots the root `system.toml`'s image: every `cargo test` boot builds from `tests/metalcase/system.toml` or `tests/testcases/system.toml`, neither of which carries the key. So this item's boot half needs `cargo run`, which opens a window on the owner's desktop — treat it as inspection plus a size measurement, and record the boot itself as unchecked. |
+
+### 3. Boot-time panics stay closed
+
+For each, the check is the **same shape**: confirm the guard exists *and* that
+a test exercises the absent-device path. A guard with no test is a guard
+nobody has seen fail.
+
+#### 3.1 NVMe absence
+
+| | |
+|---|---|
+| **Run** | `cargo test -- diskless` (`Profile::Diskless`, `tests/common/qemu.rs`). |
+| **Expect** | Boots to completion with no NVMe controller present. |
+| **False pass** | The profile silently still attaching a disk. Confirm from the QEMU command line that no NVMe device is passed, not from the test name. |
+
+#### 3.2 CR4's required features are checked against CPUID, not assumed
+
+| | |
+|---|---|
+| **Run** | Read `kernel/src/arch/control_regs.rs`. Confirm `CR4_REQUIRED` (`:77`) includes `FSGSBASE`, and `declaration()` (`:159`) computes `missing = CR4_REQUIRED & !supported()` and asserts it is zero before any CPU applies the register. |
+| **Expect** | A CPU lacking a required bit is refused by a named assert (`control_regs: cpu{cpu_id} lacks CR4 bits ...`), never left to `#UD` at the first `rdfsbase`/`wrfsbase`. |
+| **False pass** | **QEMU's TCG always reports every bit in `CR4_REQUIRED` present**, so the refusal branch never executes in any test on any profile — untestable here by construction. The `control_regs`, `control_regs_verdict` and `control_regs_negative` gates (`tests/toyos.rs`) exercise the declaration and its self-check on the CPUs QEMU does present; record the missing-bit path itself as read-verified only. |
+
+#### 3.3 Framebuffer extent
+
+| | |
+|---|---|
+| **Run** | Read `kernel/src/drivers/gop.rs` and confirm the extent assert is against `stride × height × 4` (currently `:50`), not `width × height × 4`. |
+| **Expect** | The check uses `stride`. |
+| **False pass** | **On QEMU, `stride == width` on most modes**, so a regression to `width` is invisible in every emulated boot and only faults on hardware whose stride exceeds its width — which is the common case on real panels. Read the expression; do not infer it from a passing boot. |
+
+#### 3.4 xHCI with no HID device
+
+| | |
+|---|---|
+| **Run** | `cargo test -- xhci` including the `MetalUsb` profile. Read `kernel/src/drivers/xhci/wait/boot.rs`'s `init` (currently `:154`). |
+| **Expect** | `init` returns `()` unconditionally: a controller that enumerates zero HID devices logs `xHCI: no HID devices on the controller at ...` and is kept in the controller list, not panicked on; a machine with no controller at all logs and returns. |
+| **False pass** | Every USB profile in the harness attaches at least one HID except `MetalUsb`. Confirm the zero-HID log line actually printed in a `MetalUsb` boot, not just that the test name ran. |
+
+### 4. The on-screen console — the only diagnostic channel
+
+**If this section fails, do not flash.** With no serial and dead input, a
+broken console means every other failure is silent and the boot is
+uninterpretable.
+
+#### 4.1 It renders on GOP
+
+| | |
+|---|---|
+| **Run** | `cargo test -- screen` — the suite in `tests/toyos.rs`: `screen_decoder`, `screen_recoverable_untouched`, `screen_early_panic`, `screen_late_panic`, `screen_paged_scrollback`, `screen_panic_muted`, `screen_fatal_halt`. |
+| **Expect** | All pass. These decode the framebuffer glyph-by-glyph against `font8x16.bin`; they are the only pixel-reading tests in the tree. |
+| **False pass** | **`screen_late_panic` passes with `panic_console::capture`'s body replaced by `return`** — a known dead gate (`specs/issues/`). So a green `screen` suite does **not** establish that capture works. Treat these as covering *rendering*, not capture. |
+
+#### 4.2 Scrollback is retained and pages on a timer
+
+| | |
+|---|---|
+| **Run** | `cargo test -- screen_paged_scrollback`. Confirm paging is driven by a timer, not a keypress. |
+| **Expect** | Multiple pages rendered with no input. |
+| **False pass** | A test that supplies a keypress, or one that asserts only the first page. **Input is dead on the T14** — if paging needs a key, the owner sees page one forever and nothing indicates more exists. Confirm the test injects no input at all. |
+
+#### 4.3 A fatal panic reaches the screen with no serial
+
+| | |
+|---|---|
+| **Run** | `cargo test -- screen_panic_muted` (the `--mute` shape: metal-sim with the 16550 removed — the T14's literal configuration). |
+| **Expect** | The panic report renders on the framebuffer with no serial present. |
+| **False pass** | Passing under a profile that still has serial. Confirm the muted profile actually removes the UART, since this is the single most important behaviour on the machine. |
+
+### Verdict
+
+Record, per section: **pass / fail / read-verified-only**, and name who
+checked.
+
+**Go only if:**
+
+- §1 is pass, with §1.1–§1.3 confirmed by *reading callers*, not by a green
+  suite.
+- §2 is pass, with alignment and the backup GPT measured **on the file**.
+- §4 is pass — no exceptions; it is the only channel that reports anything
+  else.
+- §3 and the delta audit above are pass or explicitly recorded as
+  read-verified with the reason (§3.2 and §3.3 are expected to be
+  read-verified; QEMU cannot exercise either).
+
+**No-go on any unresolved false pass**, even where the command printed
+success. That is the entire purpose of this checklist.
+
+Two items this gate cannot close on its own, to be recorded rather than
+resolved:
+
+- **§2.3's boot half.** `hosted-rustc` lives in the root `system.toml`, which
+  governs `target/bootable.img` alone, and nothing in this tree boots that
+  image except `cargo run`, which opens a window on the owner's desktop. The
+  size drop is measurable; the boot is not, short of the owner's own machine.
+- **§1.4 is the owner's decision, not a check.** Record his answer; absence
+  of an answer is not a fail.
+
+State the three uncovered items from "What this gate does NOT cover" to the
+owner before he boots, so a scancode-set refusal or a dead touchpad is not
+mistaken for a regression on a machine where debugging is nearly blind.
+
 ## Starting position (verified 2026-07-30 — re-verify before acting, this ages)
 
 - **Display is already fine, and as of `06ce633` that is measured rather than

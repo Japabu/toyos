@@ -5143,7 +5143,7 @@ const SNAKE_TURNS: usize = 8;
 ///
 /// **The wiring is all this measures, and the wiring is the part nothing else
 /// can.** `src/soundfont.rs`'s host tests say the committed bank covers every
-/// instrument `assets/DOOM1.WAD` selects, and `specs/doom-music-soundfont.md`
+/// instrument `assets/DOOM1.WAD` selects, and `specs/assessments/doom-music-soundfont.md`
 /// §4 says the subset renders bit-exact against the full bank through this same
 /// `mus2mid.c` and this same rustysynth. Neither can say the file got into an
 /// initrd, that doom opened it, or that what came out reached an audio device.
