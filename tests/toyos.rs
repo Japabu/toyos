@@ -10329,6 +10329,7 @@ fn run_debug_mode(c_tests: &[(String, Vec<u8>)], rust_bins: &[(String, Vec<u8>)]
 /// test name, because [`group_boot`] makes adjacency in [`MACHINE_TESTS`]
 /// load-bearing and a group split across two workers would boot two machines
 /// and drain one console between them.
+#[derive(Clone)]
 enum Task<'a> {
     /// Rust and C tests on one guest, and the kernel that guest boots.
     ///
@@ -11533,9 +11534,12 @@ impl Task<'_> {
 
 /// Where the last run in this worktree left what each test cost it.
 ///
-/// Under `target/`, so it is per-worktree: it is a *hint* about how to order a
-/// queue and never an input to a verdict. A wrong number costs some idle lane
-/// time; a missing one costs nothing at all.
+/// Under `target/`, so it is per-worktree: on a single dev host repeating runs
+/// it is a *hint* about how to order a queue and never an input to a verdict,
+/// where a wrong number costs some idle lane time and a missing one costs
+/// nothing at all. **A sharded run does not read it** — [`shard_pricing`]
+/// says why the same claim does not hold once `target/` is a cache twelve
+/// separate processes restore.
 fn durations_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-durations")
 }
@@ -11575,6 +11579,28 @@ fn load_durations() -> BTreeMap<String, Duration> {
     let mut out = BTreeMap::new();
     read_durations(&committed_durations_path(), &mut out);
     read_durations(&durations_path(), &mut out);
+    out
+}
+
+/// What [`longest_first`] and [`Shard::keep`] price a task against.
+///
+/// **Committed only — never [`durations_path`]'s worktree overlay.** That
+/// overlay lives under `target/`, which a sharded CI run restores from one
+/// build cache a sibling job can still be writing: `cache-writer` here and a
+/// same-commit sibling workflow's `cache-writer` both race the twelve shards'
+/// own restores for the identical key, so one shard can land on a fresh save
+/// and another on an older prefix match. `durations_path`'s own doc says a
+/// wrong number "costs some idle lane time" — true only when every shard
+/// prices a task the same wrong way. `Shard::keep` assumes exactly that
+/// agreement, twelve independent processes over it do not have it to give,
+/// and run `31617589126` is what two of them disagreeing on one number looks
+/// like: shard 1 and shard 9 both priced `abuse_kernel_addr`'s task low
+/// enough to take it, and `--merge-durations` refused the run for measuring
+/// it twice. `tests/test-durations` is `actions/checkout`, not
+/// `actions/cache`, and every shard checks out the identical bytes.
+fn shard_pricing() -> BTreeMap<String, Duration> {
+    let mut out = BTreeMap::new();
+    read_durations(&committed_durations_path(), &mut out);
     out
 }
 
@@ -11765,6 +11791,144 @@ fn machine_tasks(selected: &[(&'static str, Sched)]) -> Vec<(Sched, Vec<&'static
         }
     }
     out
+}
+
+/// Every test with a boot, split into the parallel and serial phases.
+///
+/// Pulled out of `main` so [`check_shard_partition`] builds the identical
+/// lists a real run would rather than a second, hand-written approximation
+/// that could pass its own check while the real path still disagreed with
+/// itself — which is exactly the shape of the defect run `31617589126` found.
+fn build_tasks<'a>(
+    tests_to_run: &[&'a TestDef],
+    machine_to_run: &[(&'static str, Sched)],
+    screen_to_run: &[(&'static str, Sched)],
+) -> (Vec<Task<'a>>, Vec<Task<'a>>) {
+    let mut parallel: Vec<Task> = Vec::new();
+    let mut serial: Vec<Task> = Vec::new();
+    if !tests_to_run.is_empty() {
+        let (actuator, shipping): (Vec<&TestDef>, Vec<&TestDef>) =
+            tests_to_run.iter().copied().partition(|t| ACTUATOR_TESTS.contains(&t.name.as_str()));
+        for tests in [shipping, actuator] {
+            if tests.is_empty() {
+                continue;
+            }
+            let features = shared_kernel(&tests[0].name);
+            let task = Task::Shared(tests, features);
+            match SHARED_BLOCK {
+                Sched::Parallel => parallel.push(task),
+                Sched::Serial => serial.push(task),
+            }
+        }
+    }
+    for (sched, names) in machine_tasks(machine_to_run) {
+        let task = Task::Machine(names);
+        match sched {
+            Sched::Parallel => parallel.push(task),
+            Sched::Serial => serial.push(task),
+        }
+    }
+    for &(name, sched) in screen_to_run {
+        let task = Task::Screen(name);
+        match sched {
+            Sched::Parallel => parallel.push(task),
+            Sched::Serial => serial.push(task),
+        }
+    }
+    (parallel, serial)
+}
+
+/// **The property every merged CI run depends on, checked before any of the
+/// twelve processes that would otherwise each discover it separately.** Every
+/// name [`Shard::keep`] is handed for `count` must land in exactly one of
+/// `1..=count`'s shards — run `31617589126` is what a violation costs: shard 1
+/// and shard 9 each priced the same task low enough to take it, and
+/// `--merge-durations` refused the run for measuring `abuse_kernel_addr`
+/// twice.
+///
+/// This cannot reproduce *why* two real processes disagreed — that needs
+/// [`shard_pricing`]'s fix, not a test, because the defect was two machines
+/// pricing a task from two different `target/test-durations` a shared build
+/// cache handed them. What this can and does check is the part a shared-fate
+/// bug would otherwise hide behind: that pricing every task from the
+/// committed profile alone — the one input every process is guaranteed to
+/// agree on — still yields a clean partition, for real registration data, at
+/// the width CI actually runs.
+fn check_shard_partition(all_tests: &[TestDef]) {
+    let pricing = shard_pricing();
+    for &nightly in &[false, true] {
+        let in_tier = |tier: Tier| nightly || tier == Tier::Fast;
+        let tests_to_run: Vec<&TestDef> =
+            all_tests.iter().filter(|_| in_tier(SHARED_TIER)).collect();
+        let machine_to_run: Vec<(&str, Sched)> = MACHINE_TESTS
+            .iter()
+            .filter(|(_, _, tier)| in_tier(*tier))
+            .map(|(n, s, _)| (*n, *s))
+            .collect();
+        let screen_to_run: Vec<(&str, Sched)> = SCREEN_TESTS
+            .iter()
+            .filter(|(_, _, tier)| in_tier(*tier))
+            .map(|(n, s, _)| (*n, *s))
+            .collect();
+        let audio_names: Vec<&str> = AUDIO_TESTS
+            .iter()
+            .filter(|(_, tier)| in_tier(*tier))
+            .map(|(name, _)| *name)
+            .collect();
+
+        let (parallel, serial) = build_tasks(&tests_to_run, &machine_to_run, &screen_to_run);
+        // Owned, not borrowed: each shard below clones `parallel`/`serial` into
+        // a scratch `Vec` that does not outlive its own loop iteration, so what
+        // accumulates across iterations cannot hold a reference into it.
+        let want: BTreeSet<String> =
+            parallel.iter().chain(&serial).flat_map(Task::names).map(str::to_string).collect();
+
+        const COUNT: usize = 12;
+        let cost = |task: &Task<'_>| -> Option<Duration> {
+            task.names().iter().try_fold(Duration::ZERO, |a, n| Some(a + *pricing.get(*n)?))
+        };
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        let mut audio_seen: BTreeSet<String> = BTreeSet::new();
+        for index in 1..=COUNT {
+            let shard = Shard { index, count: COUNT };
+            let mut mine_p = parallel.clone();
+            let mut mine_s = serial.clone();
+            let mut mine_a = audio_names.clone();
+            shard.keep(&mut mine_p, cost);
+            shard.keep(&mut mine_s, cost);
+            shard.keep(&mut mine_a, |name| {
+                AUDIO_SMP.iter().try_fold(Duration::ZERO, |a, smp| {
+                    Some(a + *pricing.get(&format!("{name} (smp={smp})"))?)
+                })
+            });
+            for name in mine_p.iter().chain(&mine_s).flat_map(Task::names) {
+                assert!(
+                    seen.insert(name.to_string()),
+                    "nightly={nightly}: {name} lands in shard {index}/{COUNT} and at least \
+                     one earlier shard too — every execution label must belong to exactly one"
+                );
+            }
+            for name in mine_a {
+                assert!(
+                    audio_seen.insert(name.to_string()),
+                    "nightly={nightly}: audio config {name} lands in shard {index}/{COUNT} \
+                     and at least one earlier shard too"
+                );
+            }
+        }
+        assert_eq!(
+            seen, want,
+            "nightly={nightly}: the twelve shards together do not equal the full selection — \
+             {:?} present in the selection and missing from every shard",
+            want.difference(&seen).collect::<Vec<_>>()
+        );
+        let want_audio: BTreeSet<String> = audio_names.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            audio_seen, want_audio,
+            "nightly={nightly}: the twelve shards' audio configs do not equal the full \
+             selection"
+        );
+    }
 }
 
 /// The conservative half of the CI cutoff: a Fast registration must have a
@@ -12148,6 +12312,7 @@ fn main() {
 
     let all_tests = build_test_registry(&rust_bins, &c_compiled);
     check_no_collisions(&all_tests);
+    check_shard_partition(&all_tests);
     // Every name this process could produce a verdict for, which is what an
     // EXPECTED_FAILURES entry has to be one of. Taken before the filter, so a
     // filtered run cannot make a stale entry look well-formed.
@@ -12215,8 +12380,8 @@ fn main() {
             .sum();
         eprintln!(
             "[toyos] nightly tier: {} test(s) NOT run, {:.1} s of effective CI test time. \
-             `cargo test --test toyos-build -- --nightly` runs them manually; scheduled CI \
-             is not built: specs/issues/build/nightly-tier-has-no-workflow.md. \
+             `cargo test --test toyos-build -- --nightly` runs them manually; \
+             .github/workflows/ci.yml runs them every night at 03:00 UTC. \
              specs/test-cost-audit.md §7 says what each one guards.",
             held_back.len(),
             ms as f64 / 1000.0,
@@ -12267,45 +12432,19 @@ fn main() {
     // its longest job and the durations that would order it are not in the tree
     // — see `specs/test-cost-audit.md` §5.3, which measures the deficit and says
     // what it would take to close it.
-    let mut parallel: Vec<Task> = Vec::new();
-    let mut serial: Vec<Task> = Vec::new();
     if !tests_to_run.is_empty() {
-        let (actuator, shipping): (Vec<&TestDef>, Vec<&TestDef>) =
-            tests_to_run.iter().copied().partition(|t| ACTUATOR_TESTS.contains(&t.name.as_str()));
+        let actuator_count =
+            tests_to_run.iter().filter(|t| ACTUATOR_TESTS.contains(&t.name.as_str())).count();
         eprintln!(
             "[toyos] The shared boot carries {} C + {} Rust binaries: {} on the shipping \
              kernel, {} on the actuator one",
             c_bins.len(),
             rust_bins.len(),
-            shipping.len(),
-            actuator.len(),
+            tests_to_run.len() - actuator_count,
+            actuator_count,
         );
-        for tests in [shipping, actuator] {
-            if tests.is_empty() {
-                continue;
-            }
-            let features = shared_kernel(&tests[0].name);
-            let task = Task::Shared(tests, features);
-            match SHARED_BLOCK {
-                Sched::Parallel => parallel.push(task),
-                Sched::Serial => serial.push(task),
-            }
-        }
     }
-    for (sched, names) in machine_tasks(&machine_to_run) {
-        let task = Task::Machine(names);
-        match sched {
-            Sched::Parallel => parallel.push(task),
-            Sched::Serial => serial.push(task),
-        }
-    }
-    for (name, sched) in &screen_to_run {
-        let task = Task::Screen(name);
-        match sched {
-            Sched::Parallel => parallel.push(task),
-            Sched::Serial => serial.push(task),
-        }
-    }
+    let (mut parallel, mut serial) = build_tasks(&tests_to_run, &machine_to_run, &screen_to_run);
 
     // Every red the wide phase produced, re-run by itself before anything is
     // believed about it. See [`retry_task`] for why both answers are findings
@@ -12315,21 +12454,25 @@ fn main() {
     // divides is the work, and a task's answer to `Sched` is a property of the
     // test rather than of how many machines are running it.
     if let Some(shard) = shard {
+        // [`shard_pricing`], and not `known`: every process partitioning the
+        // same run must price a task identically, which only the committed
+        // profile guarantees.
+        let pricing = shard_pricing();
         // A task whose every name has been timed costs their sum; one carrying
         // a name the profile has never seen is unmeasured, which is the same
         // all-or-nothing rule [`longest_first`] states with `Duration::MAX`.
         let cost = |task: &Task<'_>| -> Option<Duration> {
             task.names()
                 .iter()
-                .try_fold(Duration::ZERO, |a, n| Some(a + *known.get(*n)?))
+                .try_fold(Duration::ZERO, |a, n| Some(a + *pricing.get(*n)?))
         };
-        longest_first(&mut parallel, &known);
-        longest_first(&mut serial, &known);
+        longest_first(&mut parallel, &pricing);
+        longest_first(&mut serial, &pricing);
         shard.keep(&mut parallel, cost);
         shard.keep(&mut serial, cost);
         shard.keep(&mut audio_to_run, |name| {
             AUDIO_SMP.iter().try_fold(Duration::ZERO, |a, smp| {
-                Some(a + *known.get(&format!("{name} (smp={smp})"))?)
+                Some(a + *pricing.get(&format!("{name} (smp={smp})"))?)
             })
         });
         eprintln!(

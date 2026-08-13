@@ -113,7 +113,15 @@ jobs:
           curl -sSL --fail "$api" -o /tmp/rules.json
           jq . /tmp/rules.json
 
-          required="host abi-split gate-stage tcg guest-suite"
+          # **Four, not five, since 2026-08-12.** `tcg` left the pull-request
+          # path for the nightly schedule (`ci.yml`, `specs/testing-strategy.md`
+          # §5), and this list is what a pull request is actually gated on
+          # now. It does not by itself retire `tcg` at GitHub — that ruleset
+          # edit is outside this diff, at the remote (§10.5) — but the loop
+          # below is a minimum and not an equality (see its own comment), so a
+          # `tcg` still configured as required there is reported in the job
+          # summary rather than refused.
+          required="host abi-split gate-stage guest-suite"
           live=$(jq -r '[.[] | select(.type=="required_status_checks")
                             | .parameters.required_status_checks[].context] | join(" ")' \
                    /tmp/rules.json)
