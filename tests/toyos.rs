@@ -893,8 +893,7 @@ enum Why {
     /// failure nobody is assigned to is a disabled test, and a *decline* is
     /// not owed to anybody by construction.
     Declined(&'static str),
-    /// Held open by a write-up, which is where the reason lives. `docs.rs`
-    /// resolves the path.
+    /// Held open by a write-up, which is where the reason lives.
     Open(&'static str),
 }
 

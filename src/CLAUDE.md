@@ -35,10 +35,6 @@ Loads when you read a file under `src/` — the root cargo project, package name
 - Everything under a worktree — targets, images, `.build-locks/` — is its own; the object store, `rust/` and the rustup link are the primary checkout's, and ownership is derived from `git rev-parse --git-common-dir`, never recorded. A linked worktree's `rust/` stays the empty stub `git worktree add` leaves: initialising the submodule clones ~1.4 GiB from GitHub, and git refuses a symlink where a gitlink belongs.
 - **Type-checking a std edit without touching the shared sysroot** (seconds, against the rebuild's minutes): point `__CARGO_TESTS_ONLY_SRC_ROOT` at a tree holding an APFS clone of `rust/library` (`cp -Rc`, instant), a workspace `Cargo.toml` naming `library/std`, and symlinks to `toyos-abi`/`toyos`; then `CARGO_TARGET_DIR=<scratch> cargo +toyos build -Z build-std=std,panic_abort --target x86_64-unknown-toyos --offline`. Delete `<scratch>/**/.fingerprint/std-*` between runs — cargo does not re-fingerprint std under `-Zbuild-std` — and it is a compile, not a boot.
 
-## Documentation budgets
-
-`src/docs.rs` holds the byte budget for every `CLAUDE.md` in the tree and `cargo test --lib` asserts it. Bytes rather than lines, because a line-count limit cannot see growth when one line can be an essay. Raising a number is a decision with a reason, not a way to make a red go away: the file is loaded into every session and every subagent, and the subdirectory files exist so the root does not have to carry what only one subtree needs.
-
 ## Caveats that bite every agent
 
 - **A red build may be the build system — re-run in isolation before believing any single red.** A `stage1-std/<target>/dist/deps` temp-dir error means a concurrent build, never a broken checkout; never repair or force-rebuild the toolchain. A refusal that your worktree and the shared sysroot disagree about `toyos-abi/src` is correct — the build it stops links against another checkout's struct layouts and no test catches that.
