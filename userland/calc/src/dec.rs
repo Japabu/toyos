@@ -385,8 +385,48 @@ impl Dec {
         Ok((sin.rounded(prec), cos.rounded(prec)))
     }
 
-    /// `self^other` through `exp(other · ln self)`. Callers handle an exact
-    /// integer exponent before reaching here.
+    /// `self^exp` for a whole `exp`, by squaring.
+    ///
+    /// **A whole exponent is repeated multiplication and asks nothing of the
+    /// base's sign.** [`Dec::pow`] cannot answer for a negative base at all,
+    /// because a logarithm has none — so sending `(cos 2)^2` through it turned
+    /// the Pythagorean identity into a domain error.
+    pub fn pow_int(&self, exp: i64, prec: usize) -> Result<Dec, EvalError> {
+        if self.is_zero() {
+            return if exp > 0 { Ok(Dec::zero()) } else { Err(EvalError::ZeroToNonPositivePower) };
+        }
+        if exp == 0 {
+            return Ok(Dec::one());
+        }
+        let wp = prec + 10;
+        let mut acc = Dec::one();
+        let mut base = self.rounded(wp);
+        let mut left = exp.unsigned_abs();
+        loop {
+            if left & 1 == 1 {
+                acc = acc.mul(&base, wp);
+                if acc.exp10().abs() > MAX_EXP10 {
+                    return Err(EvalError::Overflow);
+                }
+            }
+            left >>= 1;
+            if left == 0 {
+                break;
+            }
+            base = base.mul(&base, wp);
+            if base.exp10().abs() > MAX_EXP10 {
+                return Err(EvalError::Overflow);
+            }
+        }
+        if exp < 0 {
+            Dec::one().div(&acc, prec)
+        } else {
+            Ok(acc.rounded(prec))
+        }
+    }
+
+    /// `self^other` through `exp(other · ln self)`, for the fractional exponents
+    /// that genuinely need a logarithm. A whole one goes to [`Dec::pow_int`].
     pub fn pow(&self, other: &Dec, prec: usize) -> Result<Dec, EvalError> {
         let wp = prec + 10;
         if self.is_zero() {
@@ -695,6 +735,37 @@ mod tests {
         assert!(agree(
             &Dec::from_i64(2).pow(&dec("0.5"), PREC).unwrap(),
             &Dec::from_i64(2).sqrt(PREC),
+            DISPLAY_DIGITS
+        ));
+    }
+
+    /// A whole exponent asks nothing of the base's sign, which is the half
+    /// `pow` cannot do and the half the Pythagorean identity needs.
+    #[test]
+    fn a_whole_power_works_on_a_negative_base() {
+        let minus = dec("-0.4161468365471423869975682295007621897660");
+        assert!(agree(
+            &minus.pow_int(2, PREC).unwrap(),
+            &minus.mul(&minus, PREC),
+            DISPLAY_DIGITS
+        ));
+        assert!(!minus.pow_int(2, PREC).unwrap().is_negative());
+        assert!(minus.pow_int(3, PREC).unwrap().is_negative());
+        assert_eq!(dec("-2").pow_int(10, PREC), Ok(dec("1024")));
+        assert_eq!(dec("-2").pow_int(3, PREC), Ok(dec("-8")));
+        assert_eq!(dec("2").pow_int(-3, PREC), Ok(dec("0.125")));
+        assert_eq!(dec("-2").pow_int(0, PREC), Ok(Dec::one()));
+        assert_eq!(dec("7").pow_int(1, PREC), Ok(dec("7")));
+        // The refusals it owns.
+        assert_eq!(Dec::zero().pow_int(0, PREC), Err(EvalError::ZeroToNonPositivePower));
+        assert_eq!(Dec::zero().pow_int(-1, PREC), Err(EvalError::ZeroToNonPositivePower));
+        assert_eq!(Dec::zero().pow_int(3, PREC), Ok(Dec::zero()));
+        assert_eq!(dec("10").pow_int(i64::MAX, PREC), Err(EvalError::Overflow));
+        assert_eq!(dec("0.1").pow_int(i64::MAX, PREC), Err(EvalError::Overflow));
+        // And it agrees with the logarithmic path wherever that path can answer.
+        assert!(agree(
+            &dec("2.5").pow_int(17, PREC).unwrap(),
+            &dec("2.5").pow(&dec("17"), PREC).unwrap(),
             DISPLAY_DIGITS
         ));
     }
