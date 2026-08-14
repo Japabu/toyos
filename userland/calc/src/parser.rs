@@ -6,6 +6,13 @@
 //! other multiply, which is what makes `2π`, `3(1+2)` and `(1+2)(3+4)` mean
 //! what they look like.
 //!
+//! **An application finishes before `^` and `%` do.** A function and its
+//! argument are one completed value, so `cos(2)^2` is `(cos 2)²` and never
+//! `cos(2²)` — and the rule is the same whether the argument wears parentheses
+//! or not, so `ln 2^2` is `(ln 2)²`. The argument itself is a sign and a
+//! primary and nothing looser, which is what leaves `√-1` reaching the root
+//! rather than the parser.
+//!
 //! Nothing here can panic on any string: the depth bound below is what stops a
 //! wall of open parentheses from ending the program instead of being refused.
 
@@ -193,6 +200,29 @@ impl Parser {
         Ok(value)
     }
 
+    /// What a function is applied to: a sign and a primary, and nothing looser.
+    ///
+    /// **This is the whole of why `cos(2)^2` is `(cos 2)²`.** It used to be
+    /// `unary`, which reaches `power` — so the `^` after the closing bracket was
+    /// swallowed into the argument and `cos(2)^2` meant `cos(4)`. The owner
+    /// typed the Pythagorean identity and got `cos 4 + sin 4`.
+    fn argument(&mut self) -> Result<Num, EvalError> {
+        self.enter()?;
+        let out = match self.peek() {
+            Some(Tok::Minus) => {
+                self.pos += 1;
+                self.argument().map(|v| v.neg())
+            }
+            Some(Tok::Plus) => {
+                self.pos += 1;
+                self.argument()
+            }
+            _ => self.primary(),
+        };
+        self.depth -= 1;
+        out
+    }
+
     fn primary(&mut self) -> Result<Num, EvalError> {
         self.enter()?;
         let out = self.primary_inner();
@@ -227,9 +257,9 @@ impl Parser {
                     _ => {
                         // A function binds tighter than an implicit product, so
                         // `sin 2π` is `sin(2)·π` and `sin(2π)` is what it says.
-                        // Its argument is a full unary, so `√-1` reaches the
-                        // root rather than the parser.
-                        let arg = self.unary()?;
+                        // The call is a finished value: `postfix` and `power`
+                        // above this apply to what it returned.
+                        let arg = self.argument()?;
                         apply(&name, &arg, self.angle)
                     }
                 }
@@ -350,6 +380,48 @@ mod tests {
         assert!(show("cos(1)").starts_with("≈0.54030230586813971740"));
         assert!(show("tan(1)").starts_with("≈1.55740772465490223050"));
         assert_eq!(show("sin(0)"), "≈0");
+    }
+
+    /// A call is a finished value, so what follows it acts on the answer.
+    ///
+    /// The defect this pins: the argument used to be parsed at `unary`, which
+    /// reaches `power`, so `cos(2)^2` swallowed the `^2` into the argument and
+    /// meant `cos(4)`. Every row below was wrong by that amount.
+    #[test]
+    fn an_application_finishes_before_a_power_does() {
+        // (cos 2)² = 0.1731781895681940...; cos(2²) = cos 4 = -0.6536436208636119
+        assert!(show("cos(2)^2").starts_with("≈0.17317818956819"), "{}", show("cos(2)^2"));
+        assert!(show("sin(2)^2").starts_with("≈0.82682181043180"), "{}", show("sin(2)^2"));
+        assert_eq!(show("sqrt(4)^2"), "4");
+        assert_eq!(show("sqrt(4)^3"), "8");
+        // The bracket is not what does it: an application without one obeys the
+        // same rule.
+        assert_eq!(show("sqrt 4^2"), "4");
+        assert!(show("ln 2^2").starts_with("≈0.48045301391820"), "{}", show("ln 2^2"));
+        assert_eq!(show("log 100^2"), "≈4");
+        // Postfix `%` lands on the answer too.
+        assert_eq!(show("sqrt(4)%"), "0.02");
+        // And nothing else in the table moved.
+        assert_eq!(show("-2^2"), "-4");
+        assert_eq!(show("2^3^2"), "512");
+        assert_eq!(show("2^-2"), "0.25");
+        assert_eq!(show("√-1"), "!square root of a negative number");
+        assert_eq!(show("3(1+2)"), "9");
+        assert!(show("2π").starts_with("≈6.28318530717958"));
+    }
+
+    /// The owner's literal typo, which the fix turns into a refusal rather than
+    /// a number: `(cos 2)` is negative and `(sin 2)²` is not a whole number.
+    #[test]
+    fn a_negative_base_under_a_fractional_power_is_named() {
+        assert_eq!(
+            show("cos(2)^+sin(2)^2"),
+            "!a negative base needs a whole exponent"
+        );
+        assert_eq!(
+            show("cos(2)^sin(2)^2"),
+            "!a negative base needs a whole exponent"
+        );
     }
 
     #[test]
