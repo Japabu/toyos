@@ -45,6 +45,11 @@ const MAX_KERNEL_TASKS: usize = 3;
 /// nothing an entry can hold.
 const NO_TASK: u64 = u64::MAX;
 
+/// A row somebody is filling in. Collides with nothing for [`NO_TASK`]'s reason
+/// — its high word is `u32::MAX` too — and it is what lets the identity be the
+/// **last** thing published rather than the first.
+const CLAIMING: u64 = u64::MAX - 1;
+
 /// One kernel thread, and whether a panic inside it may be recovered from.
 ///
 /// **The column exists because the ordinary predicate is not merely wrong for
@@ -57,9 +62,52 @@ const NO_TASK: u64 = u64::MAX;
 /// ran on *this* CPU left behind. The same panic on the same build therefore
 /// recovers or halts depending on which CPU the thread happened to be
 /// scheduled on. The row is what makes the answer a property of the thread.
+///
+/// **[`Row::task`] is the last word written and the first word read**, and that
+/// is the whole publication protocol. A reader searches on the identity, so
+/// publishing it before the policy beside it leaves a window where the row is
+/// findable and answers with a default nobody chose — which is a second way to
+/// get the nondeterminism this type exists to remove. The identity is stored
+/// `Release` after the payload and loaded `Acquire` before it.
 struct Row {
     task: AtomicU64,
     recoverable: AtomicU64,
+}
+
+/// A row reserved before its thread exists, to be published before that thread
+/// can run.
+///
+/// **Two phases because the two failures are at opposite ends.** Reserving
+/// needs no [`TaskId`] and must happen before the process table is locked, so
+/// that "there is room for a fourth kernel thread" is answered by a panic that
+/// holds no lock. Publishing must happen before `enqueue_new`, because from
+/// that call the task is runnable, stealable, and able to panic — and a panic
+/// on a task whose row does not exist yet is answered by the coin toss above.
+struct Claim(&'static Row);
+
+impl Claim {
+    /// Reserve a row, or die naming the thread that had nowhere to go.
+    fn take(name: &str) -> Self {
+        for row in &ROWS {
+            if row
+                .task
+                .compare_exchange(NO_TASK, CLAIMING, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Self(row);
+            }
+        }
+        panic!("kthread: {name} is the {}th kernel thread and there is room for {MAX_KERNEL_TASKS}", MAX_KERNEL_TASKS + 1);
+    }
+
+    /// Fill the payload, then publish the identity. In that order, and the
+    /// order is the point.
+    fn publish(self, id: TaskId, on_panic: OnPanic) {
+        self.0
+            .recoverable
+            .store(u64::from(on_panic == OnPanic::Recover), Ordering::Relaxed);
+        self.0.task.store(id.pack(), Ordering::Release);
+    }
 }
 
 /// Every kernel thread, registered at spawn and never removed: these do not
@@ -86,7 +134,7 @@ pub enum OnPanic {
 
 /// The row of the task this CPU is running, if it is a kernel thread.
 ///
-/// **Two per-CPU words and at most [`MAX_KERNEL_TASKS`] relaxed loads**, and
+/// **Two per-CPU words and at most [`MAX_KERNEL_TASKS`] acquire loads**, and
 /// the cheapness is a requirement rather than a nicety: one caller is the panic
 /// handler, which may hold any lock and may not fault, and the other is
 /// `scheduler::blocking_baseline`, which runs on every blocking call in the
@@ -104,7 +152,10 @@ fn current_row() -> Option<&'static Row> {
         return None;
     };
     let packed = TaskId(pid, tid).pack();
-    ROWS.iter().find(|row| row.task.load(Ordering::Relaxed) == packed)
+    // `Acquire` against `Claim::publish`'s `Release`: what the pair orders is
+    // the policy word beside the identity, not the identity. A relaxed load here
+    // could find the row and then read a `recoverable` nobody had written yet.
+    ROWS.iter().find(|row| row.task.load(Ordering::Acquire) == packed)
 }
 
 /// Is the task this CPU is running a kernel thread?
@@ -139,6 +190,11 @@ pub fn spawn(name: &str, body: extern "C" fn(u64) -> !, arg: u64, on_panic: OnPa
     )
     .unwrap_or_else(|| panic!("kthread: no kernel stack for {name}"));
 
+    // **Reserved here, before the table lock, and published before
+    // `enqueue_new`.** Its refusal is a panic, and a panic holding the process
+    // table is `specs/issues/panic-path/panic-holding-process-table-hangs.md`.
+    let claim = Claim::take(name);
+
     let mut short = [0u8; THREAD_NAME_LEN];
     let len = name.len().min(THREAD_NAME_LEN - 1);
     short[..len].copy_from_slice(&name.as_bytes()[..len]);
@@ -158,6 +214,11 @@ pub fn spawn(name: &str, body: extern "C" fn(u64) -> !, arg: u64, on_panic: OnPa
         )
     });
     let tid = table.get(pid).expect("kthread: the entry just inserted is gone").main_tid();
+    // **Before `enqueue_new` and not after it.** That call is where the task
+    // becomes runnable, stealable and able to panic, and a panic on a task whose
+    // row is not published yet is answered by the coin toss the row exists to
+    // replace. It was after until 2026-08-15.
+    claim.publish(TaskId(pid, tid), on_panic);
     let sched = scheduler::enqueue_new(TaskId(pid, tid), stack, entry_rsp, None, 0);
     table
         .get_mut(pid)
@@ -166,7 +227,6 @@ pub fn spawn(name: &str, body: extern "C" fn(u64) -> !, arg: u64, on_panic: OnPa
         .set_sched(sched.clone());
     drop(guard);
 
-    register(TaskId(pid, tid), on_panic, name);
     crate::log!(
         "kthread: {name} pid={} tid={} runs in the kernel address space; a panic in it {}",
         pid,
@@ -177,22 +237,6 @@ pub fn spawn(name: &str, body: extern "C" fn(u64) -> !, arg: u64, on_panic: OnPa
         }
     );
     sched
-}
-
-fn register(id: TaskId, on_panic: OnPanic, name: &str) {
-    let packed = id.pack();
-    for row in &ROWS {
-        if row
-            .task
-            .compare_exchange(NO_TASK, packed, Ordering::Release, Ordering::Relaxed)
-            .is_ok()
-        {
-            row.recoverable
-                .store(u64::from(on_panic == OnPanic::Recover), Ordering::Relaxed);
-            return;
-        }
-    }
-    panic!("kthread: {name} is the {}th kernel thread and there is room for {MAX_KERNEL_TASKS}", MAX_KERNEL_TASKS + 1);
 }
 
 /// A process record for a thread that has no user half at all.
