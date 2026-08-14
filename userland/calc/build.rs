@@ -16,8 +16,12 @@ const SIZES: &[(usize, usize)] = &[(6, 12), (8, 16), (10, 20), (12, 24)];
 ///
 /// Every one is asserted to rasterize below: a glyph the font does not carry
 /// would otherwise be baked as a blank cell and the button would read empty.
+/// Sorted, because `font::Font` looks a codepoint up by binary search.
+/// `src/main.rs`'s `DRAWABLE_NON_ASCII` is the same set from the other side,
+/// and its test is what keeps a label from naming a glyph nothing baked.
 const EXTRA: &[u32] = &[
     0x03C0, // GREEK SMALL LETTER PI
+    0x2190, // LEFTWARDS ARROW — the backspace key
     0x2212, // MINUS SIGN
     0x221A, // SQUARE ROOT
     0x2248, // ALMOST EQUAL TO

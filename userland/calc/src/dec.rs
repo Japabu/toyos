@@ -239,13 +239,15 @@ impl Dec {
         Dec { sig: root, exp: exp / 2 - (k / 2) as i64 }.rounded(prec)
     }
 
-    /// Nearest integer, halves away from zero.
+    /// Nearest integer, halves away from zero. The caller has already refused
+    /// a value too large to write one out for.
     pub fn round_int(&self) -> Int {
         if self.is_zero() {
             return Int::zero();
         }
         if self.exp >= 0 {
-            return self.sig.mul_pow10(u32::try_from(self.exp).unwrap_or(u32::MAX));
+            assert!(self.exp <= MAX_SHIFT, "round_int on a value with 10^{}", self.exp);
+            return self.sig.mul_pow10(self.exp as u32);
         }
         let drop = -self.exp;
         if drop > self.sig.decimal_len() as i64 + 1 {
@@ -428,11 +430,20 @@ impl PartialOrd for Dec {
     }
 }
 
+/// How far [`scale_to`] and [`Dec::round_int`] may shift. Every caller has
+/// already bounded itself well inside this; the assertions are here because the
+/// failure mode of an unbounded one is a computation that never returns rather
+/// than an answer that is wrong.
+const MAX_SHIFT: i64 = 4096;
+
 /// `sig · 10^from` re-expressed at `10^to`, truncating what falls off the end.
 fn scale_to(sig: &Int, from: i64, to: i64) -> Int {
     match from.cmp(&to) {
         Ordering::Equal => sig.clone(),
-        Ordering::Greater => sig.mul_pow10(u32::try_from(from - to).unwrap_or(u32::MAX)),
+        Ordering::Greater => {
+            assert!(from - to <= MAX_SHIFT, "a caller asked to scale by 10^{}", from - to);
+            sig.mul_pow10((from - to) as u32)
+        }
         Ordering::Less => {
             let drop = to - from;
             if drop > sig.decimal_len() as i64 {

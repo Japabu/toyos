@@ -651,9 +651,64 @@ fn main() {
     event_loop.run_app(App { context, ui: None }).unwrap();
 }
 
+/// Every character outside ASCII that the panel can put on the screen.
+///
+/// The same set `build.rs` bakes beyond Latin-1, plus the Latin-1 signs the
+/// font always carries. A glyph nothing baked draws as `?`, which is a button
+/// with a wrong face on it and nothing that fails — so the test below is what
+/// makes the two lists agree.
+#[cfg(test)]
+const DRAWABLE_NON_ASCII: &[char] = &['\u{00B1}', '\u{00D7}', '\u{00F7}', 'π', '←', '−', '√', '≈'];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use calc::app::{CALC_BUTTONS, PROG_BUTTONS};
+    use calc::error::EvalError;
+    use calc::prog::Base;
+
+    /// Nothing the panel can draw names a glyph the font does not carry.
+    #[test]
+    fn every_face_the_panel_shows_was_baked() {
+        let mut faces: Vec<String> = Vec::new();
+        for layout in [&CALC_BUTTONS, &PROG_BUTTONS] {
+            faces.extend(layout.iter().map(|b| b.label.to_string()));
+        }
+        faces.extend(["Calc", "Prog", "RAD", "DEG"].map(String::from));
+        faces.extend([Base::Hex, Base::Dec, Base::Bin].map(|b| b.label().to_string()));
+        faces.push(APPROX.to_string());
+        for error in [
+            EvalError::Parse("× needs a value before it".into()),
+            EvalError::DivisionByZero,
+            EvalError::NegativeRoot,
+            EvalError::LogOfNonPositive,
+            EvalError::ZeroToNonPositivePower,
+            EvalError::NegativeBaseFractionalExponent,
+            EvalError::Overflow,
+            EvalError::ArgumentTooLarge,
+            EvalError::NotAnInteger,
+            EvalError::OutOfRange,
+            EvalError::NegativeShift,
+            EvalError::TooDeep,
+            EvalError::TooLong,
+        ] {
+            faces.push(error.message());
+        }
+        for face in &faces {
+            for ch in face.chars() {
+                let baked = ch.is_ascii_graphic() || ch == ' ' || DRAWABLE_NON_ASCII.contains(&ch);
+                assert!(baked, "{ch:?} (U+{:04X}) in {face:?} is not in the baked font", ch as u32);
+            }
+        }
+        // And the set is not idle: every character in it is on a face, so a
+        // codepoint that stops being drawn stops being baked.
+        for &ch in DRAWABLE_NON_ASCII {
+            assert!(
+                faces.iter().any(|f| f.contains(ch)),
+                "{ch:?} is baked and nothing draws it"
+            );
+        }
+    }
 
     /// The thirty-two keys tile the two blocks without overlapping and without
     /// leaving the panel.
