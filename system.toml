@@ -64,6 +64,11 @@ receives = ["compositor", "soundd"]
 [programs.snake]
 receives = ["compositor", "filepicker"]
 
+# calc opens a window and reads nothing off the disk, so a connector to the
+# compositor is the whole of its authority.
+[programs.calc]
+receives = ["compositor"]
+
 [programs.editor]
 receives = ["compositor", "filepicker"]
 
