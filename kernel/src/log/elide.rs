@@ -223,9 +223,14 @@ mod tests {
         }
     }
 
-    /// A cut inside a character would render as mojibake on the one panel this
-    /// exists for, so the head stops short of the boundary rather than through
-    /// it. `€` is three bytes; `HEAD` is 16, so the sixth one straddles it.
+    /// The head stops short of a character boundary rather than through it, and
+    /// what that buys is **the head itself**. `write_str` slices with
+    /// `s.get(..fit)`, and a `fit` inside a character makes that `None`, so the
+    /// caller writes `""` — the whole head is lost, not a mangled byte of it.
+    /// The failure is silent and total rather than visible and small, which is
+    /// the harder kind to notice on a photograph of a panel.
+    ///
+    /// `€` is three bytes; `HEAD` is 16, so the sixth one straddles it.
     #[test]
     fn a_head_cut_inside_a_character_stops_before_it() {
         let value = format!("{}{}", "€".repeat(40), "T".repeat(TAIL));

@@ -49,11 +49,14 @@ const RING_SIZE: usize = 64 * 1024;
 /// through.
 ///
 /// It was 4096, and the buffer is a local on the panic path — which on a
-/// double fault runs on IST1, a 4096-byte stack. Measured with `ist1_report`:
+/// double fault runs on IST1, **a 4096-byte stack at the time**. Measured with
+/// `ist1_report`:
 /// the report used **9968 bytes**, so it ran 5872 bytes past the end of the
 /// stack and into the heap underneath while writing the explanation for the
 /// fault that had just happened. (The first estimate was ~1.4 KiB; it was
-/// four times that.)
+/// four times that.) That measurement is what grew IST1 to **16384**, which is
+/// what it is now; `percpu.rs`'s `IST1_STACK_SIZE` carries the current number,
+/// 7,488.
 ///
 /// 512 is what `drain_chunk_to_serial` already used for the bounded-latency
 /// callers, so this is one number where there were two. The cost is 128 passes

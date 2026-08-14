@@ -650,8 +650,9 @@ fn live_tail() -> View<'static> {
 // saturating arithmetic only -- overflow-checks are on, so an overflow here is
 // a panic inside a panic. Every framebuffer write is clamped to the published
 // byte count. Stack budget is 256 bytes plus the one wrap array; the double
-// fault path runs on IST1, which is 4096 bytes and already partly consumed by
-// kernel_backtrace_safe.
+// fault path runs on IST1, which is 16384 bytes and already partly consumed by
+// kernel_backtrace_safe -- `percpu.rs`'s `IST1_STACK_SIZE` carries the 7,488 of
+// it the whole report was measured using.
 
 /// What a fatal path paints: the captured report, or -- for a path that
 /// reached `halt_all_cpus` without the panic handler, a fatal exception or the

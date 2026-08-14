@@ -30,7 +30,7 @@ pub static PERCPU_READY: AtomicBool = AtomicBool::new(false);
 /// handoff to get wrong**, and today's `boot` label in the prefix becomes
 /// [`FLAG_EARLY`] on a record in this same shard.
 ///
-/// Zeroed, so it costs `.bss` and not 128 KiB of kernel image.
+/// Zeroed, so it costs `.bss` and not 512 KiB of kernel image.
 pub static BOOT_SHARD: Shard = Shard::new();
 
 /// The ABI fixes how many shards a cursor can name, so the kernel is what must

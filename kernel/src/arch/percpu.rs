@@ -280,11 +280,17 @@ const IDLE_GUARD_SIZE: usize = 4096;
 /// merge and the paint included. The margin the gate asserts still holds:
 /// 7,488 doubled is 14,976 of 16,384.
 ///
-/// Where it went, largest first, at `RECORD_BYTES` of 1024: `emit`'s
-/// `LogRecord` (1,024) beside `SerialWriter`'s line buffer (1,024) and the `Body`
-/// its `commit` stores (1,016); `snapshot_committed`'s one materialised record
-/// (1,024) and its eight `Descent`s (384); `paint`'s row table (768). The
-/// elision's tail buffer (451) is on a branch no symbol in this tree reaches.
+/// **What is large on that path — type sizes, not a decomposition of the
+/// measurement.** These are what `size_of` says, not what `ist1_report`
+/// counted, and they come to 5,240 against the measured 7,488; the 2,248
+/// between them is frames, spills, alignment and everything the path does that
+/// is not one of these. Largest first, at `RECORD_BYTES` of 1024: `emit`'s
+/// `LogRecord` (1,024) beside `SerialWriter`'s line buffer (1,024) and the
+/// `Body` its `commit` stores (1,016); `snapshot_committed`'s one materialised
+/// record (1,024) and its eight `Descent`s (384); `paint`'s row table (768).
+/// The elision's tail buffer (452 — its head is streamed and buffers nothing)
+/// is on a branch no symbol in this tree reaches.
+///
 /// It was 4,512 before the record ring, so the ring cost 2,976 bytes of a
 /// stack with 8,896 still free.
 const IST1_STACK_SIZE: usize = 16384;

@@ -31,8 +31,9 @@ pub trait RecordSink {
 /// One shard's descent, and the candidate it is offering the merge.
 ///
 /// It carries a sequence number and a timestamp rather than a record, which is
-/// what keeps eight candidates inside 256 bytes: a [`LogRecord`] is a kilobyte
-/// and the double-fault stack is 16 KiB with a crash report already on it.
+/// what keeps eight candidates inside the 384 bytes the assertion below pins:
+/// a [`LogRecord`] is a kilobyte, so eight of those would be 8 KiB of a
+/// double-fault stack that has 16 KiB and a crash report already on it.
 #[derive(Clone, Copy)]
 struct Descent {
     shard: Option<&'static Shard>,

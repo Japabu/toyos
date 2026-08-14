@@ -489,7 +489,7 @@ it the tail. `const` assertions in `kernel/src/symbols.rs` hold the arithmetic.
 
 **No guest test reaches it at the shipped bound, and that is stated rather than
 implied.** The tree's own widest symbol is `late_panic::Nest` at 288 bytes
-against a budget of 928, so `screen_late_panic` proves the panel keeps a
+against a budget of 944, so `screen_late_panic` proves the panel keeps a
 symbol's tail and proves nothing about the elision. The seams — a character
 straddling the head cut, a character straddling the start of the tail, a value
 arriving one character at a time — are checked on the host by `kernel-elide`,
@@ -722,6 +722,27 @@ and §2.6a is where that bracket is argued.
 makes "no other CPU writes `head`" true rather than hopeful. Loom has no CPU
 flags or strict same-CPU preemption, so it carries a `LogCommitGuard` witness and
 the negative control belongs to §9.2's guest actuator.
+
+### 2.3b The fatal path's stack, measured
+
+**7,488 bytes of IST1's 16,384**, `ist1_report` off a real #DF on three
+consecutive `double_fault_stack` runs, identical each time, guard intact. It is
+taken after `render` and after `panic_flush` (`apic.rs`'s `halt_all_cpus` fixes
+that order and says why), so it covers the deepest the report goes — the record
+merge and the paint included. `double_fault_stack`'s own margin is that the
+report must fit in half the stack, and it does: 14,976 of 16,384.
+
+It was **4,512** before the record ring, so the ring cost 2,976 bytes and left
+8,896 free. What is large on that path is type sizes rather than a
+decomposition of the measurement — `emit`'s `LogRecord` and `SerialWriter`'s
+line buffer at 1,024 each, `commit`'s `Body` at 1,016, `snapshot_committed`'s
+one materialised record at 1,024 and its eight `Descent`s at 384, `paint`'s row
+table at 768 — and those come to 5,240 of the 7,488.
+`kernel/src/arch/percpu.rs`'s `IST1_STACK_SIZE` is where the number lives,
+beside the constant it is a budget against.
+
+**This is the number a chunk that widens the fatal path re-measures**, and it is
+cheap: one `cargo test -- double_fault_stack`.
 
 ### 2.4 What makes atomicity unrepresentable to violate
 
@@ -1147,10 +1168,14 @@ pub fn log_read(cursor: &mut LogCursor, out: &mut [u8]) -> Result<usize, Syscall
 - **The kernel keeps no per-reader state at all.** No object, no handle
   lifecycle, no cursor to leak or go stale, and a second reader costs nothing.
   That is `specs/introspection-plan.md` §3.3's argument and it is adopted whole.
-- **Fixed stride, not packed.** The kernel copies whole 256-byte records and
+- **Fixed stride, not packed.** The kernel copies whole 1024-byte records and
   userland indexes by shift. At the measured 100.2-byte mean payload (§2.1) the
-  waste is real and irrelevant — a few hundred records per second is under
-  100 KB/s — and packing would put length arithmetic in the kernel for nothing.
+  waste is nine tenths of what moves, and it is still the right trade: a few
+  hundred records per second is around 300 KB/s over a syscall that already
+  copies, against putting length arithmetic in the kernel and "is this record
+  whole?" back into every reader. **The figure moved with the record** — it was
+  under 100 KB/s at the drafted 256 bytes, and the ruling in §13.3 is what
+  changed it.
 - **`lost` lives in the cursor**, so a reader that ignores loss has to actively
   ignore a field it is already passing.
 - **The stream is not consumed.** Two readers see the same records. `logd` and a
@@ -1174,7 +1199,10 @@ pub fn log_read(cursor: &mut LogCursor, out: &mut [u8]) -> Result<usize, Syscall
   sixth instance of a mechanism that is about to be unified is the honest cost of
   landing first**, and it is one static and one match arm.
 
-**`MAX_LOG_SHARDS` is `MAX_CPUS`** and the cursor is 1 KiB at the shipped 8. A
+**`MAX_LOG_SHARDS` is `MAX_CPUS`** and the cursor is **88 bytes** at the
+shipped 8 — `24 + 8 * MAX_LOG_SHARDS`, which `toyos-abi/src/log.rs` asserts. It
+does not scale with `RECORD_BYTES`: a cursor carries one sequence number per
+shard and no records at all. A
 caller passing a smaller buffer than `shards` requires gets `InvalidArgument` —
 untrusted input that cannot be satisfied, never a truncation.
 
