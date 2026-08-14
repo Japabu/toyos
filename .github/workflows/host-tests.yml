@@ -89,6 +89,25 @@ jobs:
             cargo test --manifest-path "$crate/Cargo.toml" 2>&1 | tee -a /tmp/host.log
           done
 
+      # **`kernel-loom`'s supported matrix is two commands, and the loop above
+      # is one of them.** The `loom` feature is default-on and is what makes the
+      # crate's atomics loom's instrumented ones; `log_zeroed_init` is about
+      # byte-zeroability, which loom's atomics do not have, so it is gated
+      # `cfg(not(feature = "loom"))` and the default invocation runs *nothing*
+      # from it — which read as a pass for as long as nobody counted.
+      #
+      # Scoped to that one target rather than the crate:
+      # specs/issues/build/kernel-loom-ungated-models-red-without-loom.md
+      # records that `tlb_shootdown.rs` reds deterministically under
+      # --no-default-features, on main as much as here.
+      - name: kernel-loom without loom
+        run: |
+          set -e -o pipefail
+          echo "=== kernel-loom --no-default-features --test log_zeroed_init" \
+            | tee -a /tmp/host.log
+          cargo test --manifest-path kernel-loom/Cargo.toml --no-default-features \
+            --test log_zeroed_init 2>&1 | tee -a /tmp/host.log
+
       # `userland/.cargo/config.toml` cross-compiles by default, so a userland
       # crate's host tests have to name the host. `calc` is here for the reason
       # the pure crates above are: its arithmetic is decided without a guest,

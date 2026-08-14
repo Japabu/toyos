@@ -3,6 +3,14 @@
 //! Loom atomics are deliberately not byte-zeroable, so this test runs with
 //! `--no-default-features` and exercises the real `core` layout and the real
 //! in-place constructor used after `alloc_zeroed`.
+//!
+//! **The gate below therefore runs under exactly one of this crate's two
+//! invocations, and the other one runs nothing from this file.** That is the
+//! shape, not an accident — but it was silent until 2026-08-14, when CI ran
+//! only the default invocation and this file's `running 0 tests` looked
+//! identical to a pass. `.github/workflows/host-tests.yml` names both commands
+//! now, and `specs/issues/build/kernel-loom-ungated-models-red-without-loom.md`
+//! is why the second one is scoped to this target rather than to the crate.
 
 #![cfg(not(feature = "loom"))]
 

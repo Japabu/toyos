@@ -112,5 +112,11 @@ pub mod shootdown;
 #[path = "../../kernel/src/log/shard.rs"]
 pub mod log_shard;
 
+/// `registry.rs` names its shard as `super::shard`, which in the kernel is
+/// `crate::log::shard`. Here `super` is the crate root, so this is what makes
+/// the one path resolve in both builds — and it holds whether or not the `loom`
+/// feature is on, which the crate's other invocation depends on.
+pub use log_shard as shard;
+
 #[path = "../../kernel/src/log/registry.rs"]
 pub mod log_registry;

@@ -539,6 +539,16 @@ because it can materialise 512 KiB on the BSP's 16 KiB stack. The host-fast
 `log_zeroed_init` test allocates the real layout with `alloc_zeroed`, runs this
 constructor, and proves the first reservation is `FIRST_SEQ`.
 
+**It runs under `cargo test --manifest-path kernel-loom/Cargo.toml
+--no-default-features --test log_zeroed_init` and under nothing else.** Loom's
+atomics are not byte-zeroable, so the file is gated `cfg(not(feature =
+"loom"))` and the crate's default invocation compiles it to nothing — which
+CI read as a pass from L1 until 2026-08-14, because `running 0 tests` and a
+green run are the same line. Both commands are in
+`.github/workflows/host-tests.yml` now; the second is scoped to this target
+because `specs/issues/build/kernel-loom-ungated-models-red-without-loom.md`
+records that the crate as a whole reds without loom.
+
 **Why 512, re-derived — the first derivation measured the wrong thing and got
 the wrong number.** It said "the measured worst cpu0 boot in `specs/metal-logs/`
 is 257 records". **CONFIRMED false**: over the eighteen committed logs the worst

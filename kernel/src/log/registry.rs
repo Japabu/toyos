@@ -18,10 +18,12 @@ use loom::sync::atomic::{AtomicPtr, Ordering};
 
 use toyos_abi::log::MAX_LOG_SHARDS;
 
-#[cfg(not(feature = "loom"))]
+/// One path in both builds: in the kernel `super` is `crate::log`, and in
+/// `kernel-loom` it is the crate root, which re-exports `log_shard` under this
+/// name for exactly that reason. A `cfg` here instead would have to be the
+/// *harness's* cfg rather than loom's, and the two are not the same question —
+/// which is how the harness's non-loom invocation stopped compiling.
 use super::shard::Shard;
-#[cfg(feature = "loom")]
-use crate::log_shard::Shard;
 
 /// Every CPU's shard but cpu0's, published as the BSP builds that CPU's
 /// `PerCpu`.
