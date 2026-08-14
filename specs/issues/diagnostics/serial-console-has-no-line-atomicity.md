@@ -104,8 +104,8 @@ then `inner.write(lines)` for the rest
 (`library/alloc/src/io/buffered/linewritershim.rs`) — so the splice point moves
 and does not go away. What does work is building the line and issuing one
 `write_all`, which is what `userland/soundd`'s local `say!` does now. That is
-one crate of the 176 `eprintln!` sites in `userland/`, `compositor: ready` and
-`terminal: ready` among them.
+one crate of the `eprintln!` sites in `userland/` (176 when filed, 135 on
+2026-08-14), `compositor: ready` and `terminal: ready` among them.
 
 The general fix belongs in `toyos/`, and the reason it was not put there is
 worth knowing: `toyos/src` is one of the four trees in the content-addressed
