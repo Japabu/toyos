@@ -1,10 +1,16 @@
-//! The window: a fixed-size panel of buttons over a display strip.
+//! The window: a strip of keys under a display, laid out from whatever size the
+//! surface happens to be.
 //!
 //! Snake's shape, for the same reason snake has it — one program that runs on
 //! the development host and on ToyOS with nothing in it that knows the
 //! difference. winit gives it a window and its events, softbuffer gives it a
 //! wall of pixels, and everything the calculator actually decides lives in the
 //! library beside this file.
+//!
+//! **Nothing here is a fixed pixel.** [`Layout`] is computed from the surface
+//! every frame, so the window resizes: the eight columns and four rows divide
+//! what there is and carry the remainder a pixel at a time, and the type is
+//! chosen per region from the four cell sizes `build.rs` bakes.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -21,35 +27,23 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, OwnedDisplayHan
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-// --- the panel, in pixels. Every number below is a fixed layout: the window
-// does not resize, and where a compositor hands over a different surface the
-// panel is centred in it rather than stretched.
+/// The size the window opens at.
+const OPEN_W: u32 = 600;
+const OPEN_H: u32 = 440;
 
-const PANEL_W: i32 = 600;
-const PANEL_H: i32 = 434;
-const MARGIN: i32 = 20;
+/// Below this the keys stop being keys. Asked of the window as a minimum, and
+/// applied to the layout as a floor as well, because a compositor is free to
+/// ignore the request.
+const MIN_W: i32 = 460;
+const MIN_H: i32 = 360;
 
-const TAB_Y: i32 = 10;
-const TAB_H: i32 = 34;
-const TAB_W: i32 = 76;
-const TAB_GAP: i32 = 8;
+const COLS: usize = 8;
+const ROWS: usize = 4;
+/// Columns in the scientific block; the pad is the rest.
+const LEFT_COLS: usize = 3;
 
-const DISPLAY_Y: i32 = 52;
-const DISPLAY_H: i32 = 132;
-const DISPLAY_PAD: i32 = 10;
-
-const MSG_Y: i32 = 188;
-const MSG_H: i32 = 20;
-
-const GRID_Y: i32 = 216;
-const BTN_W: i32 = 62;
-const BTN_H: i32 = 44;
-const BTN_GAP: i32 = 7;
-/// The gap between the scientific block and the pad, wider than the rest so the
-/// two read as two.
-const BLOCK_GAP: i32 = 22;
-const LEFT_COLS: i32 = 3;
-const COLS: i32 = 8;
+/// The longest key face, in characters — what the key type has to fit.
+const KEY_CHARS: i32 = 3;
 
 // --- the palette, snake's ---
 
@@ -73,28 +67,157 @@ fn as_font_color(p: Pixel) -> font::Color {
     font::Color { r: p.r, g: p.g, b: p.b }
 }
 
+fn as_pixel(c: font::Color) -> Pixel {
+    Pixel::new_rgb(c.r, c.g, c.b)
+}
+
 /// Lighten or darken a key, which is what hovering and pressing it look like.
 fn shade(base: Pixel, by: Pixel, up: bool) -> Pixel {
     let mix = |a: u8, b: u8| if up { a.saturating_add(b) } else { a.saturating_sub(b) };
     Pixel::new_rgb(mix(base.r, by.r), mix(base.g, by.g), mix(base.b, by.b))
 }
 
-/// Where a button sits, from its index in the row-major thirty-two.
-fn button_rect(index: usize) -> (i32, i32, i32, i32) {
-    let col = index as i32 % COLS;
-    let row = index as i32 / COLS;
-    let block = if col >= LEFT_COLS { BLOCK_GAP - BTN_GAP } else { 0 };
-    let x = MARGIN + col * (BTN_W + BTN_GAP) + block;
-    let y = GRID_Y + row * (BTN_H + BTN_GAP);
-    (x, y, BTN_W, BTN_H)
+/// Half-open, like every other rectangle in this repository.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Rect {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
 }
 
-fn tab_rect(index: i32) -> (i32, i32, i32, i32) {
-    (MARGIN + index * (TAB_W + TAB_GAP), TAB_Y, TAB_W, TAB_H)
+impl Rect {
+    fn contains(&self, x: i32, y: i32) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+
+    fn inset(&self, by: i32) -> Rect {
+        Rect { x: self.x + by, y: self.y + by, w: self.w - 2 * by, h: self.h - 2 * by }
+    }
 }
 
-fn inside(rect: (i32, i32, i32, i32), x: i32, y: i32) -> bool {
-    x >= rect.0 && x < rect.0 + rect.2 && y >= rect.1 && y < rect.1 + rect.3
+/// Divide `total` into `gaps.len() + 1` tracks separated by those gaps.
+///
+/// The remainder is handed out a pixel at a time to the leading tracks rather
+/// than left at one end, so the last track ends exactly where the space does at
+/// every window size — which is the whole of what "the keys still line up"
+/// means once nothing is a constant.
+fn tracks(start: i32, total: i32, gaps: &[i32]) -> Vec<(i32, i32)> {
+    let n = gaps.len() as i32 + 1;
+    let total = total.max(n);
+    let mut gaps: Vec<i32> = gaps.to_vec();
+    let mut gap_sum: i32 = gaps.iter().sum();
+    // **Gaps give way before tracks do.** A one-pixel key is still a key; a gap
+    // that pushes the last key past the end of the row is not a gap. Without
+    // this the eight columns overflowed their strip on any window narrow enough
+    // that the seams cost more than the keys.
+    if gap_sum > total - n {
+        let each = (total - n).max(0) / gaps.len().max(1) as i32;
+        for g in gaps.iter_mut() {
+            *g = (*g).min(each);
+        }
+        gap_sum = gaps.iter().sum();
+    }
+    let avail = total - gap_sum;
+    let size = avail / n;
+    let extra = avail % n;
+    let mut out = Vec::with_capacity(n as usize);
+    let mut at = start;
+    for i in 0..n {
+        let w = size + i32::from(i < extra);
+        out.push((at, w));
+        at += w + gaps.get(i as usize).copied().unwrap_or(0);
+    }
+    out
+}
+
+fn clamp(v: i32, lo: i32, hi: i32) -> i32 {
+    v.max(lo).min(hi)
+}
+
+/// Where everything goes, for one surface size.
+struct Layout {
+    tabs: [Rect; 2],
+    /// The right end of the tab strip, where the mode's own note sits.
+    strip: Rect,
+    display: Rect,
+    message: Rect,
+    panel: Rect,
+    keys: [Rect; COLS * ROWS],
+    pad: i32,
+}
+
+impl Layout {
+    fn new(width: i32, height: i32) -> Layout {
+        let w = width.max(MIN_W);
+        let h = height.max(MIN_H);
+        let margin = clamp(w.min(h) / 28, 8, 22);
+        let cw = w - 2 * margin;
+        let ch = h - 2 * margin;
+
+        let vgap = clamp(ch / 45, 4, 12);
+        let tab_h = clamp(ch * 10 / 100, 24, 44);
+        let msg_h = clamp(ch * 7 / 100, 14, 26);
+        let rest = (ch - tab_h - msg_h - 3 * vgap).max(4 * ROWS as i32);
+        let grid_h = rest * 3 / 5;
+        let display_h = rest - grid_h;
+
+        let tab_y = margin;
+        let display_y = tab_y + tab_h + vgap;
+        let message_y = display_y + display_h + vgap;
+        let grid_y = message_y + msg_h + vgap;
+
+        let tab_w = clamp(cw / 7, 52, 96);
+        let tab_gap = clamp(cw / 80, 4, 10);
+        let tabs = [
+            Rect { x: margin, y: tab_y, w: tab_w, h: tab_h },
+            Rect { x: margin + tab_w + tab_gap, y: tab_y, w: tab_w, h: tab_h },
+        ];
+
+        let gap = clamp(cw / 80, 4, 9);
+        // The scientific block and the pad read as two, so the seam between
+        // them is wider than the seams inside either.
+        let block = gap * 3;
+        let col_gaps: Vec<i32> =
+            (0..COLS - 1).map(|i| if i == LEFT_COLS - 1 { block } else { gap }).collect();
+        let cols = tracks(margin, cw, &col_gaps);
+        let rows = tracks(grid_y, grid_h, &vec![gap; ROWS - 1]);
+
+        let mut keys = [Rect { x: 0, y: 0, w: 0, h: 0 }; COLS * ROWS];
+        for (i, key) in keys.iter_mut().enumerate() {
+            let (x, kw) = cols[i % COLS];
+            let (y, kh) = rows[i / COLS];
+            *key = Rect { x, y, w: kw, h: kh };
+        }
+
+        // The keys sit on a panel that stands a little proud of them. Never
+        // more than half the vertical gap, or on a short window the panel
+        // reaches up into the message line.
+        let outset = clamp(vgap / 2, 2, gap);
+        Layout {
+            tabs,
+            strip: Rect { x: margin, y: tab_y, w: cw, h: tab_h },
+            display: Rect { x: margin, y: display_y, w: cw, h: display_h },
+            message: Rect { x: margin, y: message_y, w: cw, h: msg_h },
+            panel: Rect {
+                x: margin - outset,
+                y: grid_y - outset,
+                w: cw + 2 * outset,
+                h: grid_h + 2 * outset,
+            },
+            keys,
+            pad: clamp(cw / 60, 6, 14),
+        }
+    }
+
+    fn hit(&self, x: i32, y: i32) -> Option<Target> {
+        for (i, mode) in [Mode::Calc, Mode::Prog].into_iter().enumerate() {
+            if self.tabs[i].contains(x, y) {
+                return Some(Target::Tab(mode));
+            }
+        }
+        self.keys.iter().position(|k| k.contains(x, y)).map(Target::Key)
+    }
 }
 
 /// What the pointer is over.
@@ -102,20 +225,6 @@ fn inside(rect: (i32, i32, i32, i32), x: i32, y: i32) -> bool {
 enum Target {
     Tab(Mode),
     Key(usize),
-}
-
-fn hit(calc: &Calc, x: i32, y: i32) -> Option<Target> {
-    for (i, mode) in [Mode::Calc, Mode::Prog].into_iter().enumerate() {
-        if inside(tab_rect(i as i32), x, y) {
-            return Some(Target::Tab(mode));
-        }
-    }
-    for i in 0..calc.buttons().len() {
-        if inside(button_rect(i), x, y) {
-            return Some(Target::Key(i));
-        }
-    }
-    None
 }
 
 /// The pixel buffer, as something that can be drawn on.
@@ -126,14 +235,11 @@ struct Canvas {
     ptr: *mut Pixel,
     width: usize,
     height: usize,
-    /// Where the panel's origin sits inside the surface.
-    ox: i32,
-    oy: i32,
 }
 
 impl Canvas {
-    fn new(pixels: &mut [Pixel], width: usize, height: usize, ox: i32, oy: i32) -> Canvas {
-        Canvas { ptr: pixels.as_mut_ptr(), width, height, ox, oy }
+    fn new(pixels: &mut [Pixel], width: usize, height: usize) -> Canvas {
+        Canvas { ptr: pixels.as_mut_ptr(), width, height }
     }
 
     fn set(&self, x: i32, y: i32, color: Pixel) {
@@ -142,35 +248,33 @@ impl Canvas {
         }
     }
 
-    fn fill(&self, x: i32, y: i32, w: i32, h: i32, color: Pixel) {
-        for row in 0..h {
-            for col in 0..w {
-                self.set(self.ox + x + col, self.oy + y + row, color);
+    fn fill(&self, r: Rect, color: Pixel) {
+        for row in 0..r.h {
+            for col in 0..r.w {
+                self.set(r.x + col, r.y + row, color);
             }
         }
     }
 
     /// A one-pixel outline, which is how a pressed key says so.
-    fn outline(&self, x: i32, y: i32, w: i32, h: i32, color: Pixel) {
-        self.fill(x, y, w, 1, color);
-        self.fill(x, y + h - 1, w, 1, color);
-        self.fill(x, y, 1, h, color);
-        self.fill(x + w - 1, y, 1, h, color);
+    fn outline(&self, r: Rect, color: Pixel) {
+        self.fill(Rect { h: 1, ..r }, color);
+        self.fill(Rect { y: r.y + r.h - 1, h: 1, ..r }, color);
+        self.fill(Rect { w: 1, ..r }, color);
+        self.fill(Rect { x: r.x + r.w - 1, w: 1, ..r }, color);
     }
 
     fn text(&self, f: &Font, x: i32, y: i32, s: &str, fg: font::Color, bg: Pixel) {
-        let px = self.ox + x;
-        let py = self.oy + y;
-        if px < 0 || py < 0 {
+        if x < 0 || y < 0 {
             return;
         }
-        f.draw_string(self, px as usize, py as usize, s, fg, as_font_color(bg));
+        f.draw_string(self, x as usize, y as usize, s, fg, as_font_color(bg));
     }
 
-    fn text_centred(&self, f: &Font, rect: (i32, i32, i32, i32), s: &str, fg: font::Color, bg: Pixel) {
+    fn text_centred(&self, f: &Font, r: Rect, s: &str, fg: font::Color, bg: Pixel) {
         let chars = s.chars().count() as i32;
-        let x = rect.0 + (rect.2 - chars * f.width() as i32) / 2;
-        let y = rect.1 + (rect.3 - f.height() as i32) / 2;
+        let x = r.x + (r.w - chars * f.width() as i32) / 2;
+        let y = r.y + (r.h - f.height() as i32) / 2;
         self.text(f, x, y, s, fg, bg);
     }
 }
@@ -211,13 +315,16 @@ impl Fonts {
         }
     }
 
-    /// The one every button and label is drawn in.
-    fn ui(&self) -> &Font {
-        &self.scaled[2]
-    }
-
     fn smallest(&self) -> &Font {
         &self.scaled[3]
+    }
+
+    /// The largest cell that puts `chars` characters inside `w` by `h`.
+    fn fitting(&self, chars: i32, w: i32, h: i32) -> &Font {
+        self.scaled
+            .iter()
+            .find(|f| chars * f.width() as i32 <= w && f.height() as i32 <= h)
+            .unwrap_or_else(|| self.smallest())
     }
 
     /// The largest cell that draws `text` whole in as few rows as it can, up to
@@ -268,15 +375,13 @@ impl Ui {
     fn new(elwt: &dyn ActiveEventLoop, context: &Context<OwnedDisplayHandle>) -> Ui {
         let attrs = WindowAttributes::default()
             .with_title("Calculator")
-            .with_surface_size(PhysicalSize::new(PANEL_W as u32, PANEL_H as u32))
-            .with_resizable(false);
+            .with_surface_size(PhysicalSize::new(OPEN_W, OPEN_H))
+            .with_min_surface_size(PhysicalSize::new(MIN_W as u32, MIN_H as u32));
         let window: Arc<dyn Window> = elwt.create_window(attrs).unwrap().into();
         let size = window.surface_size();
         let mut surface = Surface::new(context, window.clone()).unwrap();
         let (w, h) = (size.width.max(1), size.height.max(1));
-        surface
-            .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
-            .unwrap();
+        surface.resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap()).unwrap();
         Ui {
             window,
             surface,
@@ -293,23 +398,11 @@ impl Ui {
         let (w, h) = (width.max(1), height.max(1));
         self.width = w;
         self.height = h;
-        self.surface
-            .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
-            .unwrap();
+        self.surface.resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap()).unwrap();
     }
 
-    /// The panel's origin inside the surface, so a surface that is not the size
-    /// asked for shows a centred panel rather than a stretched one.
-    fn origin(&self) -> (i32, i32) {
-        (
-            (self.width as i32 - PANEL_W).max(0) / 2,
-            (self.height as i32 - PANEL_H).max(0) / 2,
-        )
-    }
-
-    fn point(&self, x: f64, y: f64) -> (i32, i32) {
-        let (ox, oy) = self.origin();
-        (x as i32 - ox, y as i32 - oy)
+    fn layout(&self) -> Layout {
+        Layout::new(self.width as i32, self.height as i32)
     }
 
     fn key(&mut self, key: &Key) {
@@ -343,20 +436,21 @@ impl Ui {
     }
 
     fn redraw(&mut self) {
-        let (ox, oy) = self.origin();
+        let layout = self.layout();
         let (w, h) = (self.width as usize, self.height as usize);
         // The scene borrows the fields the drawing reads; the buffer borrows
         // the surface. Two disjoint halves of one `Ui`.
         let scene = Scene {
             calc: &self.calc,
             fonts: &self.fonts,
+            layout: &layout,
             hover: self.hover,
             pressed: self.pressed,
         };
         let mut buffer = self.surface.next_buffer().unwrap();
         let pixels = buffer.pixels();
-        let canvas = Canvas::new(pixels, w, h, ox, oy);
-        canvas.fill(-ox, -oy, w as i32, h as i32, BG);
+        let canvas = Canvas::new(pixels, w, h);
+        canvas.fill(Rect { x: 0, y: 0, w: w as i32, h: h as i32 }, BG);
 
         scene.draw_tabs(&canvas);
         scene.draw_display(&canvas);
@@ -371,6 +465,7 @@ impl Ui {
 struct Scene<'a> {
     calc: &'a Calc,
     fonts: &'a Fonts,
+    layout: &'a Layout,
     hover: Option<Target>,
     pressed: Option<Target>,
 }
@@ -378,7 +473,7 @@ struct Scene<'a> {
 impl Scene<'_> {
     fn draw_tabs(&self, canvas: &Canvas) {
         for (i, mode) in [Mode::Calc, Mode::Prog].into_iter().enumerate() {
-            let rect = tab_rect(i as i32);
+            let rect = self.layout.tabs[i];
             let active = self.calc.mode() == mode;
             let mut base = if active { KEY_EQUALS } else { KEY_FN };
             if self.hover == Some(Target::Tab(mode)) {
@@ -387,15 +482,16 @@ impl Scene<'_> {
             if self.pressed == Some(Target::Tab(mode)) {
                 base = shade(base, PRESSED, false);
             }
-            canvas.fill(rect.0, rect.1, rect.2, rect.3, base);
+            canvas.fill(rect, base);
             if active {
-                canvas.outline(rect.0, rect.1, rect.2, rect.3, KEY_ACTIVE);
+                canvas.outline(rect, KEY_ACTIVE);
             }
             let label = match mode {
                 Mode::Calc => "Calc",
                 Mode::Prog => "Prog",
             };
-            canvas.text_centred(self.fonts.ui(), rect, label, if active { TEXT } else { DIM }, base);
+            let f = self.fonts.fitting(label.len() as i32, rect.w - 8, rect.h - 8);
+            canvas.text_centred(f, rect, label, if active { TEXT } else { DIM }, base);
         }
 
         // What the layout is standing on, right-aligned in the same strip.
@@ -403,70 +499,67 @@ impl Scene<'_> {
             Mode::Calc => self.calc.angle_label(),
             Mode::Prog => self.calc.base().label(),
         };
-        let f = self.fonts.ui();
-        let x = PANEL_W - MARGIN - note.chars().count() as i32 * f.width() as i32;
-        canvas.text(f, x, TAB_Y + (TAB_H - f.height() as i32) / 2, note, DIM, BG);
+        let strip = self.layout.strip;
+        let f = self.fonts.fitting(KEY_CHARS, strip.w / 4, strip.h - 8);
+        let x = strip.x + strip.w - note.chars().count() as i32 * f.width() as i32;
+        canvas.text(f, x, strip.y + (strip.h - f.height() as i32) / 2, note, DIM, BG);
     }
 
     fn draw_display(&self, canvas: &Canvas) {
-        canvas.fill(MARGIN, DISPLAY_Y, PANEL_W - 2 * MARGIN, DISPLAY_H, SUNKEN);
-        let x0 = MARGIN + DISPLAY_PAD;
-        let inner = PANEL_W - 2 * MARGIN - 2 * DISPLAY_PAD;
+        canvas.fill(self.layout.display, SUNKEN);
+        let inner = self.layout.display.inset(self.layout.pad);
         match self.calc.mode() {
-            Mode::Calc => self.draw_calc_display(canvas, x0, inner),
-            Mode::Prog => self.draw_prog_display(canvas, x0, inner),
+            Mode::Calc => self.draw_calc_display(canvas, inner),
+            Mode::Prog => self.draw_prog_display(canvas, inner),
         }
     }
 
-    fn draw_calc_display(&self, canvas: &Canvas, x0: i32, inner: i32) {
-        // The expression, on one line, scrolled so the caret is always on it.
+    /// The entry line, scrolled so the caret is always on it, and the caret.
+    /// Returns the height it took.
+    fn draw_entry(&self, canvas: &Canvas, inner: Rect, f: &Font) -> i32 {
         let expr = self.calc.expr();
-        let (f, _) = self.fonts.fit(expr, inner, 1);
-        let per = (inner / f.width() as i32).max(1) as usize;
+        let per = (inner.w / f.width() as i32).max(1) as usize;
         let caret_at = expr[..self.calc.caret()].chars().count();
         let scroll = caret_at.saturating_sub(per.saturating_sub(1));
         let shown: String = expr.chars().skip(scroll).take(per).collect();
-        let y = DISPLAY_Y + 12;
-        canvas.text(f, x0, y, &shown, TEXT, SUNKEN);
-        let caret_x = x0 + (caret_at - scroll) as i32 * f.width() as i32;
-        canvas.fill(caret_x, y - 2, 2, f.height() as i32 + 4, as_pixel(TEXT));
+        canvas.text(f, inner.x, inner.y, &shown, TEXT, SUNKEN);
+        let caret_x = inner.x + (caret_at - scroll) as i32 * f.width() as i32;
+        canvas.fill(
+            Rect { x: caret_x, y: inner.y - 2, w: 2, h: f.height() as i32 + 4 },
+            as_pixel(TEXT),
+        );
+        f.height() as i32
+    }
+
+    fn draw_calc_display(&self, canvas: &Canvas, inner: Rect) {
+        let (f, _) = self.fonts.fit(self.calc.expr(), inner.w, 1);
+        self.draw_entry(canvas, inner, f);
 
         // The result, as large as it fits and wrapped rather than cut.
-        match self.calc.preview() {
-            None => {}
-            Some(text) => {
-                let (rf, lines) = self.fonts.fit(&text, inner, 2);
-                let colour = if text.starts_with(APPROX) { DIM } else { TEXT };
-                let top = DISPLAY_Y + DISPLAY_H - DISPLAY_PAD - lines.len() as i32 * rf.height() as i32;
-                for (i, line) in lines.iter().enumerate() {
-                    let width = line.chars().count() as i32 * rf.width() as i32;
-                    canvas.text(
-                        rf,
-                        x0 + inner - width,
-                        top + i as i32 * rf.height() as i32,
-                        line,
-                        colour,
-                        SUNKEN,
-                    );
-                }
-            }
+        let Some(text) = self.calc.preview() else { return };
+        let (rf, lines) = self.fonts.fit(&text, inner.w, 2);
+        let colour = if text.starts_with(APPROX) { DIM } else { TEXT };
+        let top = inner.y + inner.h - lines.len() as i32 * rf.height() as i32;
+        for (i, line) in lines.iter().enumerate() {
+            let width = line.chars().count() as i32 * rf.width() as i32;
+            canvas.text(
+                rf,
+                inner.x + inner.w - width,
+                top + i as i32 * rf.height() as i32,
+                line,
+                colour,
+                SUNKEN,
+            );
         }
     }
 
-    fn draw_prog_display(&self, canvas: &Canvas, x0: i32, inner: i32) {
-        let f = self.fonts.ui();
+    fn draw_prog_display(&self, canvas: &Canvas, inner: Rect) {
+        // Four rows of panes under the entry line, all in one cell size: the
+        // binary pane is 35 characters and the widest thing here, so it decides.
+        let f = self.fonts.fitting(40, inner.w, inner.h / 6);
         let cell = f.height() as i32;
-        let expr = self.calc.expr();
-        let per = (inner / f.width() as i32).max(1) as usize;
-        let caret_at = expr[..self.calc.caret()].chars().count();
-        let scroll = caret_at.saturating_sub(per.saturating_sub(1));
-        let shown: String = expr.chars().skip(scroll).take(per).collect();
-        let y = DISPLAY_Y + 8;
-        canvas.text(f, x0, y, &shown, TEXT, SUNKEN);
-        let caret_x = x0 + (caret_at - scroll) as i32 * f.width() as i32;
-        canvas.fill(caret_x, y - 2, 2, cell + 4, as_pixel(TEXT));
+        self.draw_entry(canvas, inner, f);
 
-        // Three panes over the same sixty-four bits.
         let value = self.calc.value();
         let (high, low) = prog::pane_bin(value);
         let rows: [(&str, &str); 4] = [
@@ -476,36 +569,31 @@ impl Scene<'_> {
             ("", &low),
         ];
         let label_w = 4 * f.width() as i32;
+        let step = ((inner.h - cell) / rows.len() as i32).max(cell);
         for (i, (label, text)) in rows.iter().enumerate() {
-            let ry = DISPLAY_Y + 34 + i as i32 * (cell + 6);
+            let y = inner.y + cell + 4 + i as i32 * step;
             let active = self.calc.base().label() == *label;
-            canvas.text(f, x0, ry, label, if active { TEXT } else { DIM }, SUNKEN);
+            canvas.text(f, inner.x, y, label, if active { TEXT } else { DIM }, SUNKEN);
             let width = text.chars().count() as i32 * f.width() as i32;
-            canvas.text(f, x0 + label_w + (inner - label_w - width).max(0), ry, text, TEXT, SUNKEN);
+            canvas.text(f, inner.x + (inner.w - width).max(label_w), y, text, TEXT, SUNKEN);
         }
     }
 
     fn draw_message(&self, canvas: &Canvas) {
-        let f = self.fonts.ui();
-        let y = MSG_Y + (MSG_H - f.height() as i32) / 2;
-        if let Some(message) = self.calc.message() {
-            canvas.text(f, MARGIN, y, message, ERROR, BG);
-        }
+        let Some(message) = self.calc.message() else { return };
+        let r = self.layout.message;
+        let (f, lines) = self.fonts.fit(message, r.w, 1);
+        canvas.text(f, r.x, r.y + (r.h - f.height() as i32) / 2, &lines[0], ERROR, BG);
     }
 
     fn draw_keys(&self, canvas: &Canvas) {
-        canvas.fill(
-            MARGIN - 6,
-            GRID_Y - 6,
-            PANEL_W - 2 * MARGIN + 12,
-            PANEL_H - GRID_Y - MARGIN + 12,
-            PANEL,
-        );
-        let f = self.fonts.ui();
+        canvas.fill(self.layout.panel, PANEL);
+        let first = self.layout.keys[0];
+        let f = self.fonts.fitting(KEY_CHARS, first.w - 8, first.h - 8);
         for (i, button) in self.calc.buttons().iter().enumerate() {
-            let rect = button_rect(i);
+            let rect = self.layout.keys[i];
             let live = enabled(button, self.calc.mode(), self.calc.base());
-            let on = is_on(button, &self.calc);
+            let on = is_on(button, self.calc);
             let mut colour = if on { KEY_EQUALS } else { key_colour(button) };
             if !live {
                 colour = KEY_FN;
@@ -515,22 +603,17 @@ impl Scene<'_> {
             if self.pressed == Some(Target::Key(i)) && live {
                 colour = shade(colour, PRESSED, false);
             }
-            canvas.fill(rect.0, rect.1, rect.2, rect.3, colour);
+            canvas.fill(rect, colour);
             if self.pressed == Some(Target::Key(i)) && live {
-                canvas.outline(rect.0, rect.1, rect.2, rect.3, KEY_ACTIVE);
+                canvas.outline(rect, KEY_ACTIVE);
             }
             let label = match button.action {
                 Action::ToggleAngle => self.calc.angle_label(),
                 _ => button.label,
             };
-            let fg = if live { TEXT } else { OFF };
-            canvas.text_centred(f, rect, label, fg, colour);
+            canvas.text_centred(f, rect, label, if live { TEXT } else { OFF }, colour);
         }
     }
-}
-
-fn as_pixel(c: font::Color) -> Pixel {
-    Pixel::new_rgb(c.r, c.g, c.b)
 }
 
 /// Whether this button shows the state it selects, rather than an action.
@@ -581,6 +664,9 @@ impl ApplicationHandler for App {
             }
             WindowEvent::SurfaceResized(size) => {
                 ui.resize(size.width, size.height);
+                // Whatever the pointer was over is somewhere else now.
+                ui.hover = None;
+                ui.pressed = None;
                 dirty = true;
             }
             WindowEvent::RedrawRequested => {
@@ -594,8 +680,7 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::PointerMoved { position, .. } => {
-                let (x, y) = ui.point(position.x, position.y);
-                let over = hit(&ui.calc, x, y);
+                let over = ui.layout().hit(position.x as i32, position.y as i32);
                 if over != ui.hover {
                     ui.hover = over;
                     dirty = true;
@@ -612,8 +697,7 @@ impl ApplicationHandler for App {
                 if button.mouse_button() != Some(MouseButton::Left) {
                     return;
                 }
-                let (x, y) = ui.point(position.x, position.y);
-                let over = hit(&ui.calc, x, y);
+                let over = ui.layout().hit(position.x as i32, position.y as i32);
                 ui.hover = over;
                 match state {
                     ElementState::Pressed => ui.pressed = over,
@@ -670,6 +754,92 @@ mod tests {
     use calc::error::EvalError;
     use calc::prog::Base;
 
+    /// Sizes the layout has to hold: the one it opens at, its own floor, one
+    /// below that floor, a tall narrow one, a wide short one, and a screen.
+    const SIZES: &[(i32, i32)] = &[
+        (OPEN_W as i32, OPEN_H as i32),
+        (MIN_W, MIN_H),
+        (320, 240),
+        (480, 900),
+        (1400, 400),
+        (1920, 1080),
+    ];
+
+    /// At every size the keys tile their strip: inside the panel, no two
+    /// overlapping, and the last column ending exactly where the space does.
+    #[test]
+    fn the_keys_tile_the_panel_at_every_size() {
+        for &(w, h) in SIZES {
+            let l = Layout::new(w, h);
+            let (fw, fh) = (w.max(MIN_W), h.max(MIN_H));
+            for (i, a) in l.keys.iter().enumerate() {
+                assert!(a.w > 0 && a.h > 0, "key {i} is empty at {w}x{h}");
+                assert!(a.x >= l.panel.x, "key {i} left of the panel at {w}x{h}");
+                assert!(a.x + a.w <= l.panel.x + l.panel.w, "key {i} past the panel at {w}x{h}");
+                assert!(a.y + a.h <= fh, "key {i} past the bottom at {w}x{h}");
+                for (j, b) in l.keys.iter().enumerate().skip(i + 1) {
+                    let apart = a.x + a.w <= b.x
+                        || b.x + b.w <= a.x
+                        || a.y + a.h <= b.y
+                        || b.y + b.h <= a.y;
+                    assert!(apart, "keys {i} and {j} overlap at {w}x{h}");
+                }
+            }
+            // The row spans the content exactly, remainder pixels and all.
+            let first = l.keys[0];
+            let last = l.keys[COLS - 1];
+            assert_eq!(first.x, l.display.x, "the grid and the display disagree at {w}x{h}");
+            assert_eq!(
+                last.x + last.w,
+                l.display.x + l.display.w,
+                "the grid stops short of the display at {w}x{h}"
+            );
+            let bottom = l.keys[COLS * ROWS - 1];
+            assert!(bottom.y + bottom.h <= fh, "the grid runs off the bottom at {w}x{h}");
+            // And the strips above it are in order and do not overlap.
+            assert!(l.strip.y + l.strip.h <= l.display.y, "tabs into the display at {w}x{h}");
+            assert!(l.display.y + l.display.h <= l.message.y, "display into the message at {w}x{h}");
+            assert!(l.message.y + l.message.h <= l.panel.y, "message into the keys at {w}x{h}");
+            assert!(l.panel.x >= 0 && l.panel.x + l.panel.w <= fw, "the panel escapes at {w}x{h}");
+        }
+    }
+
+    #[test]
+    fn hit_testing_follows_the_layout_at_every_size() {
+        for &(w, h) in SIZES {
+            let l = Layout::new(w, h);
+            for i in 0..COLS * ROWS {
+                let k = l.keys[i];
+                assert_eq!(l.hit(k.x + k.w / 2, k.y + k.h / 2), Some(Target::Key(i)));
+            }
+            assert_eq!(l.hit(l.tabs[0].x + 2, l.tabs[0].y + 2), Some(Target::Tab(Mode::Calc)));
+            assert_eq!(l.hit(l.tabs[1].x + 2, l.tabs[1].y + 2), Some(Target::Tab(Mode::Prog)));
+            assert_eq!(l.hit(l.display.x, l.display.y + 2), None);
+            assert_eq!(l.hit(-1, -1), None);
+            // The seam between the two blocks belongs to neither.
+            let seam = l.keys[LEFT_COLS - 1];
+            assert_eq!(l.hit(seam.x + seam.w + 1, seam.y + seam.h / 2), None);
+        }
+    }
+
+    /// A forty-digit answer is drawn whole at some cell size, which is the
+    /// whole point of carrying four of them.
+    #[test]
+    fn the_longest_answer_is_never_cut() {
+        let fonts = Fonts::load();
+        let longest = format!("{APPROX}-1.{}e-100", "9".repeat(39));
+        for &(w, h) in SIZES {
+            let inner = Layout::new(w, h).display.inset(Layout::new(w, h).pad);
+            let (_, lines) = fonts.fit(&longest, inner.w, 2);
+            assert_eq!(lines.concat(), longest, "digits went missing at {w}x{h}");
+            assert!(lines.len() <= 2, "the answer needed {} lines at {w}x{h}", lines.len());
+        }
+        // One that genuinely cannot fit is wrapped rather than shortened.
+        let absurd = "8".repeat(400);
+        let (_, lines) = fonts.fit(&absurd, 200, 2);
+        assert_eq!(lines.concat(), absurd);
+    }
+
     /// Nothing the panel can draw names a glyph the font does not carry.
     #[test]
     fn every_face_the_panel_shows_was_baked() {
@@ -706,61 +876,47 @@ mod tests {
         // And the set is not idle: every character in it is on a face, so a
         // codepoint that stops being drawn stops being baked.
         for &ch in DRAWABLE_NON_ASCII {
+            assert!(faces.iter().any(|f| f.contains(ch)), "{ch:?} is baked and nothing draws it");
+        }
+    }
+
+    /// No key face is wider than the cell it is drawn in, at any size.
+    #[test]
+    fn every_key_face_fits_its_key() {
+        let fonts = Fonts::load();
+        let widest = CALC_BUTTONS
+            .iter()
+            .chain(PROG_BUTTONS.iter())
+            .map(|b| b.label.chars().count())
+            .max()
+            .expect("both layouts have keys");
+        assert!(widest as i32 <= KEY_CHARS, "a key face is {widest} characters wide");
+        for &(w, h) in SIZES {
+            let key = Layout::new(w, h).keys[0];
+            let f = fonts.fitting(KEY_CHARS, key.w - 8, key.h - 8);
             assert!(
-                faces.iter().any(|f| f.contains(ch)),
-                "{ch:?} is baked and nothing draws it"
+                KEY_CHARS * f.width() as i32 <= key.w,
+                "a three-character face does not fit a {}x{} key at {w}x{h}",
+                key.w,
+                key.h
             );
         }
     }
 
-    /// The thirty-two keys tile the two blocks without overlapping and without
-    /// leaving the panel.
+    /// The tracks a row divides into span it exactly, whatever the remainder.
     #[test]
-    fn the_keys_tile_the_panel() {
-        let rects: Vec<(i32, i32, i32, i32)> = (0..32).map(button_rect).collect();
-        for (i, a) in rects.iter().enumerate() {
-            assert!(a.0 >= MARGIN, "key {i} starts left of the margin");
-            assert!(a.0 + a.2 <= PANEL_W - MARGIN, "key {i} runs past the right margin");
-            assert!(a.1 + a.3 <= PANEL_H - MARGIN, "key {i} runs past the bottom");
-            assert!(a.1 >= GRID_Y);
-            for (j, b) in rects.iter().enumerate().skip(i + 1) {
-                let apart = a.0 + a.2 <= b.0 || b.0 + b.2 <= a.0 || a.1 + a.3 <= b.1 || b.1 + b.3 <= a.1;
-                assert!(apart, "keys {i} and {j} overlap");
+    fn tracks_never_lose_a_pixel() {
+        for total in 40..400 {
+            for gap in [0, 1, 4, 9] {
+                let gaps = vec![gap; COLS - 1];
+                let out = tracks(7, total, &gaps);
+                assert_eq!(out.len(), COLS);
+                let last = out[COLS - 1];
+                assert_eq!(last.0 + last.1, 7 + total, "total={total} gap={gap}");
+                let spread = out.iter().map(|t| t.1).max().unwrap()
+                    - out.iter().map(|t| t.1).min().unwrap();
+                assert!(spread <= 1, "tracks differ by {spread} at total={total} gap={gap}");
             }
         }
-        // The right block is flush with the right margin.
-        let last = button_rect(7);
-        assert_eq!(last.0 + last.2, PANEL_W - MARGIN);
-    }
-
-    #[test]
-    fn hit_testing_answers_where_the_keys_are() {
-        let calc = Calc::new();
-        for i in 0..32 {
-            let (x, y, w, h) = button_rect(i);
-            assert_eq!(hit(&calc, x + w / 2, y + h / 2), Some(Target::Key(i)));
-            // The gap between two keys belongs to neither.
-            assert_eq!(hit(&calc, x - 3, y + h / 2), None, "the gap left of key {i}");
-        }
-        assert_eq!(hit(&calc, MARGIN + 2, TAB_Y + 2), Some(Target::Tab(Mode::Calc)));
-        assert_eq!(hit(&calc, MARGIN + TAB_W + TAB_GAP + 2, TAB_Y + 2), Some(Target::Tab(Mode::Prog)));
-        assert_eq!(hit(&calc, PANEL_W - 2, TAB_Y + 2), None);
-        assert_eq!(hit(&calc, 0, DISPLAY_Y + 2), None);
-    }
-
-    /// A forty-digit answer is drawn whole at some cell size, which is the
-    /// whole point of carrying four of them.
-    #[test]
-    fn the_longest_answer_fits_on_one_line() {
-        let fonts = Fonts::load();
-        let inner = PANEL_W - 2 * MARGIN - 2 * DISPLAY_PAD;
-        let longest = format!("{APPROX}-1.{}e-100", "9".repeat(39));
-        let (_, lines) = fonts.fit(&longest, inner, 2);
-        assert_eq!(lines.len(), 1, "an answer wrapped that had no need to");
-        assert_eq!(lines[0], longest);
-        // And one that genuinely cannot fit is wrapped rather than shortened.
-        let absurd = "8".repeat(400);
-        let (_, lines) = fonts.fit(&absurd, inner, 2);
-        assert_eq!(lines.concat(), absurd);
     }
 }
