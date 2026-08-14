@@ -15,12 +15,15 @@ use std::path::{Path, PathBuf};
 /// git's own store. `.claude` is per-developer and git does not track it, so a
 /// budget on anything inside it would be red on one machine and green on the
 /// next.
+#[cfg(test)]
 const SKIP: &[&str] = &["target", "node_modules", "rust", ".git", ".claude"];
 
+#[cfg(test)]
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+#[cfg(test)]
 fn rel(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -28,6 +31,7 @@ fn rel(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
+#[cfg(test)]
 fn walk(root: &Path, dir: &Path, visit: &mut impl FnMut(&Path)) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
