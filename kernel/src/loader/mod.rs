@@ -15,7 +15,7 @@ mod symbols;
 mod tls;
 
 pub use start::{build_child_handles, PendingHandles, SLOT_PAIR_LEN};
-pub(crate) use start::{alloc_kernel_stack, process_start, thread_start};
+pub(crate) use start::{alloc_kernel_stack, kernel_start, process_start, thread_start};
 pub use tls::{setup_combined_tls, setup_tls, DTV_INITIAL_CAPACITY};
 
 use alloc::string::String;

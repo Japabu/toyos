@@ -70,6 +70,31 @@ const BASELINE_TRAP: u32 = 1;
 /// `reap_poisoned`'s `PROCESS_TABLE` guard drop — not as a route of its own.
 const BASELINE_IRQ_EXIT: u32 = 0;
 
+/// The depth a *blocking* site is entitled to, which is not the same for every
+/// context and was assumed to be until a kernel thread existed.
+///
+/// [`BASELINE_TRAP`] for a user thread: `common_entry`'s `lock add` covers the
+/// whole of every syscall and exception, so a park reached from one starts a
+/// level up. **Zero for a kernel thread's body**, which is not a trap at all —
+/// `driver::trampoline_entry` discharged the single level `spawn` put in its
+/// context and nothing has raised one since.
+///
+/// Reading the entitlement from the context rather than assuming the trap is
+/// what keeps §6.4's tripwire a tripwire for both: a kernel thread that parks
+/// holding a `Lock` still trips it, one level lower.
+///
+/// **Answered from `sched::kthread`'s rows and never from the `CpuSched`.**
+/// This runs on every blocking call in the machine and `prepare_wait` has not
+/// raised the preempt count yet, so a reader that walked the running task
+/// would be aliasing the `&mut CpuSched` a preempting pass takes.
+fn blocking_baseline() -> u32 {
+    if crate::sched::kthread::current_is_kernel_thread() {
+        0
+    } else {
+        BASELINE_TRAP
+    }
+}
+
 /// Process-scoped thread identity. Tids are per-process, so the scheduler
 /// needs the pair to name a thread system-wide.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -168,7 +193,7 @@ pub fn enqueue_new(
 #[must_use = "a wait ticket must be blocked on or cancelled"]
 #[track_caller]
 pub fn prepare_wait(queue: &KWaitQueue) -> Ticket<'_> {
-    assert_baseline(BASELINE_TRAP);
+    assert_baseline(blocking_baseline());
     Ticket::register(queue)
 }
 
@@ -179,9 +204,10 @@ pub fn prepare_wait(queue: &KWaitQueue) -> Ticket<'_> {
 /// is no other way to construct one. `deadline = 0` means no timeout.
 #[track_caller]
 pub fn block_on(ticket: Ticket<'_>, deadline: u64) {
-    // One level above the trap baseline: the ticket has held the registration
-    // window's own level since `prepare_wait`, and `pass_block` inherits it.
-    assert_baseline(BASELINE_TRAP + 1);
+    // One level above the calling context's baseline: the ticket has held the
+    // registration window's own level since `prepare_wait`, and `pass_block`
+    // inherits it.
+    assert_baseline(blocking_baseline() + 1);
     driver::pass_block(ticket, (deadline > 0).then(|| Nanos(deadline)));
 }
 

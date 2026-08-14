@@ -208,6 +208,11 @@ fn placement() -> CpuId {
 
 /// Everything a new thread needs. `entry_rsp` points at the trampoline frame
 /// `alloc_kernel_stack` built.
+///
+/// **`address_space: None` is a kernel thread and not an error.** It was one
+/// until L3 of `specs/log-architecture-spec.md`: `spawn` expected the `Option`
+/// and the field has always been one, so the whole of "the scheduler cannot
+/// host a kernel task" was a single `.expect` in the line below.
 pub struct NewTask {
     pub id: TaskId,
     pub kernel_stack: OwnedAlloc,
@@ -220,12 +225,15 @@ pub struct NewTask {
 /// Place a new task by message — never by reaching into the destination's
 /// queue (spec §9.4). Returns what the process table keeps.
 pub fn spawn(new: NewTask) -> ThreadSched {
-    let cr3 = new
-        .address_space
-        .as_ref()
-        .expect("spawn: task without an address space")
-        .lock()
-        .cr3();
+    // A task with no address space of its own runs in the kernel's, which is
+    // the address space every CPU is already in between two user threads —
+    // `idle_ctx` above names the same `cr3` for the same reason. There is
+    // nothing to take a reference to and nothing to release: the kernel's
+    // page tables outlive every task by construction.
+    let cr3 = match new.address_space.as_ref() {
+        Some(space) => space.lock().cr3(),
+        None => crate::mm::paging::kernel_cr3(),
+    };
     let kernel_stack_top = new.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64;
     let ctx = KernelCtx {
         rsp: new.entry_rsp,

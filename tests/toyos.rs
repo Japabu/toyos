@@ -463,6 +463,9 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // `desktop_window_child` carries, not a reclassification.
     ("fpu_isolation", Sched::Parallel, Tier::Nightly),
     ("short_sleep_livelock", Sched::Parallel, Tier::Fast),
+    // The kernel thread and the row that says what its panic means. Two
+    // boots, both headless: the second one halts on purpose.
+    ("klogd_hosted", Sched::Parallel, Tier::Fast),
     ("i8042_health", Sched::Parallel, Tier::Nightly),
     // And one from here to `i8042_mouse` (`I8042_TRACE`), which is why all
     // three carry the answer the last of them needs.
@@ -8023,6 +8026,73 @@ fn run_machine_test(
                 "  [fpu] fpu-save-nothing: exit {:?}, which is the gate having teeth",
                 negative.exit_code
             );
+            Ok(())
+        }
+        "klogd_hosted" => {
+            // The machine's first kernel thread, and the two things about it
+            // no other test in the suite can see.
+            //
+            // **That it is hosted at all.** `klogd` runs on the ordinary
+            // scheduler with no address space of its own — `driver::spawn`
+            // names the kernel's `cr3` — through a trampoline that never
+            // issues an `iretq`. It gets a process-table entry rather than a
+            // bare task, and that is what makes it nameable: without one a
+            // crash report would print a pid nothing in the machine resolves.
+            //
+            // **That its panic is not recoverable, deterministically.** The
+            // ordinary predicate is `syscall_rip() != 0 &&
+            // current_tid().is_some()`, and `syscall_rip` is never cleared —
+            // so a kernel task reads whatever user thread last ran on *that*
+            // CPU left behind, and recovers or halts by accident of work
+            // stealing. The row in `sched::kthread` is what replaces the
+            // accident with an answer. `specs/log-architecture-spec.md` §4.3.
+            let qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions::default(),
+            );
+            let boot = serial::Serial::boot(&qemu);
+            boot.must_be_clean()?;
+            let line = boot.must_say("kthread: klogd")?;
+            if !line.contains("halts the machine") {
+                return Err(format!("klogd is hosted but claims the wrong panic row: {line:?}"));
+            }
+            eprintln!("  [klogd] {}", line.trim());
+            drop(qemu);
+
+            // The marker is a line of the crash *report* rather than `PANIC:`
+            // itself, because `boot_log` stops at the marker and the name is
+            // printed after the header — a boot stopped at the header would
+            // have nothing left to assert the process table against.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    kernel_params: &["klogd-panic"],
+                    ready_marker: "Process: klogd",
+                    ..Default::default()
+                },
+            );
+            let mut dead = serial::Serial::boot(&qemu);
+            dead.must_say("PANIC:")?;
+            dead.must_say("klogd-panic: the console drainer died")?;
+            // The process table answered for a task with no address space.
+            dead.must_say("Process: klogd")?;
+
+            // The verdict. A *recovered* panic kills the thread and lets the
+            // machine carry on into userland, which announces itself; the
+            // fatal branch halts every CPU. The window is a liveness margin
+            // and not a threshold: `klogd` panics as the scheduler starts, and
+            // the arm this must never become reaches the marker a few hundred
+            // milliseconds later — so three seconds is a tenfold margin over
+            // the state it refuses, and it is the whole of this test's fixed
+            // cost against the Fast ceiling.
+            const CARRIED_ON: Duration = Duration::from_secs(3);
+            dead.push(&qemu.drain_serial(CARRIED_ON));
+            dead.must_not_say(qemu::DEFAULT_READY)?;
+            eprintln!("  [klogd] a kernel thread's panic halted the machine rather than recovering");
             Ok(())
         }
         "short_sleep_livelock" => {

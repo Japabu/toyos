@@ -99,6 +99,46 @@ pub(crate) extern "C" fn thread_start() {
     );
 }
 
+/// Entry point for a **kernel** thread: the one trampoline that never reaches
+/// Ring 3.
+///
+/// It is strictly simpler than the two above and the absences are the point —
+/// no `initial_user_state!`, no `iretq`, no `USER_CS`/`USER_DS` — because
+/// nothing about this context is a user context. r12 carries the body, r14 its
+/// argument, and `alloc_kernel_stack` put both there.
+///
+/// **The `sti` is load-bearing and there is nowhere else to put it.**
+/// `alloc_kernel_stack` writes RFLAGS with `IF` clear into the frame
+/// `context_switch` pops, and the two Ring 3 trampolines set `IF` in the
+/// `iretq` frame instead. A kernel thread that skipped this would run with
+/// interrupts masked forever: no timer, no preemption, no wake. It comes
+/// *after* `trampoline_entry`, whose `kernel_exit_to_user_check` requires
+/// `IF` clear on entry and returns with it clear.
+///
+/// A body that returns is a kernel bug, and it dies as one rather than falling
+/// off the end of a stack that has no return address on it.
+#[unsafe(naked)]
+pub(crate) extern "C" fn kernel_start() {
+    core::arch::naked_asm!(
+        "call {unlock}",
+        "sti",
+        "mov rdi, r14",
+        "call r12",
+        "call {returned}",
+        unlock = sym crate::sched::driver::trampoline_entry,
+        returned = sym kernel_thread_returned,
+    );
+}
+
+/// What [`kernel_start`] calls when a kernel thread's body returns.
+///
+/// Loud rather than a `hlt`: a body that returns has left the machine without
+/// whatever it was there to do, and a silent halt of one CPU is exactly the
+/// kind of quiet this branch exists to remove.
+extern "C" fn kernel_thread_returned() -> ! {
+    panic!("a kernel thread's body returned; nothing runs on this stack now");
+}
+
 /// The last path component, truncated to what a process entry can hold.
 pub(crate) fn make_name(path: &str) -> [u8; crate::process::THREAD_NAME_LEN] {
     let filename = path.rsplit('/').next().unwrap_or(path);

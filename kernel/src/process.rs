@@ -503,6 +503,35 @@ pub struct ElfInfo {
     pub lib_paths: Vec<String>,
 }
 
+impl ElfInfo {
+    /// The state of a process that has no ELF at all — a kernel thread
+    /// (`sched::kthread`).
+    ///
+    /// Not `Default`, because the only honest default of `next_tls_module_id`
+    /// is 1 rather than 0 and a derive would silently pick the other. Written
+    /// here rather than at the one call site so that a field added to
+    /// [`ElfInfo`] stops *this* build too.
+    pub fn none() -> Self {
+        Self {
+            elf_alloc: None,
+            tls_template: None,
+            tls_memsz: 0,
+            tls_modules: Vec::new(),
+            tls_total_memsz: 0,
+            tls_max_align: 0,
+            next_tls_module_id: 1,
+            dynamic_tls_blocks: alloc::collections::BTreeMap::new(),
+            loaded_libs: Vec::new(),
+            reloc_index: None,
+            elf_base: UserAddr::new(0),
+            exe_eh_frame_hdr_vaddr: 0,
+            exe_eh_frame_hdr_size: 0,
+            exe_vaddr_max: 0,
+            lib_paths: Vec::new(),
+        }
+    }
+}
+
 /// Process-level data shared across all threads via `Arc<Lock<ProcessData>>`.
 /// Contains handles, memory mappings, ELF state, accounting — everything that belongs to the process.
 /// Accessed via `with_fd_owner_data`. All threads of a process share the same Arc.

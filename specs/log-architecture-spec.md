@@ -1387,13 +1387,26 @@ enum Drain { Inline, Thread }
 
 | phase | who drains to the console | why it is the only thing that can |
 |---|---|---|
-| boot, up to `scheduler::init` (`main.rs:501`) | **`Drain::Inline`** — `emit` writes the record to the backend synchronously, after committing it | there is no scheduler and no thread; one CPU, nothing else running |
+| boot, up to `klogd`'s spawn — the last statement of `kernel_main` before `smp::set_ready()` | **`Drain::Inline`** — `emit` writes the record to the backend synchronously, after committing it | nothing else can run yet: there is no thread until this statement, and no CPU reaches a pass until the two statements after it |
 | steady state | **`Drain::Thread`** — `klogd`, a kernel thread, made runnable at the commit of the record it will drain, by the producer's own `wake_direct` (§2.6a) | it must run on an idle machine, and a runnable task is what stops a CPU halting (`toyos-sched` Invariant T) — including a record committed inside the pass that was about to halt, which the doorbell's own handshake catches |
 | panic and shutdown | `drain_inline()` called directly | `klogd` will never run again |
 
 A fallback is a path taken when another fails. These are phases: exactly one is
-active, the transition is a single statement at `scheduler::init`, and it is
+active, the transition is a single statement — `klogd`'s spawn — and it is
 logged. `drain_inline` is one function with three callers, not a degradation.
+
+**The transition is not at `scheduler::init`, and that draft answer was wrong
+against the code rather than merely imprecise.** L3 measured it: `smp::boot_aps`
+leaves every AP spinning on `SMP_READY` (`arch/smp.rs:280`), which
+`smp::set_ready()` publishes as the *second to last* statement of `kernel_main`,
+and the BSP reaches no scheduler pass before `enter_idle_loop()` after it. So a
+`klogd` spawned at `scheduler::init` sits in a run queue for the whole of phases
+5, 6 and 7 — xHCI, the i8042, the GPU, `spawn_init` — while a `Drain::Thread`
+`emit` believed it had a drainer. That window is the one a machine with no
+console wedges in, and §4.1's second constraint says it may not get quieter. The
+mode is therefore derived from the one fact that settles it: **`klogd`'s
+published `Arc<KShared>` is null until the spawn**, which §2.6a already needed
+for the wake, so there is no second flag to disagree with the first.
 
 **`Drain::Inline` closes `pre-idle-wedge-says-nothing` completely** — not "says
 less", the entry's own wording — because every record reaches the wire as it is
@@ -1429,6 +1442,24 @@ re-parks.
   - `sched::dump` naming it, and the recoverable-panic predicate
     (`syscall_rip() != 0 && current_tid().is_some()`) gaining `klogd`'s row — the
     non-recoverable one, below.
+
+  **As built, three things about that list are sharper than it is.** The
+  `.expect` was the *whole* of the refusal — `NewTask::address_space` has always
+  been an `Option`, and `KernelCtx.id: Option<TaskId>` already documented `None`
+  as the idle context, so the scheduler was already shaped for a context with no
+  address space. The trampoline (`loader::start::kernel_start`) has one thing the
+  two Ring 3 ones do not, and it is not an absence: **`sti`**.
+  `alloc_kernel_stack` writes RFLAGS with `IF` clear into the frame
+  `context_switch` pops and the Ring 3 trampolines set `IF` in their `iretq`
+  frame instead, so a kernel thread that skipped it would run with interrupts
+  masked forever — no timer, no preemption, no wake. And **a blocking site's
+  preempt-count baseline is not the same in both contexts**:
+  `scheduler::assert_baseline`'s `BASELINE_TRAP` is one because
+  `common_entry`'s `lock add` covers the whole of every syscall, and a kernel
+  thread's body is not a trap — `trampoline_entry` discharged the single level
+  `spawn` gave its context, so it parks at zero. `scheduler::blocking_baseline`
+  reads the entitlement from the context; §6.4's tripwire keeps its teeth in
+  both, one level apart.
 
   **compl C6 then shrinks to spawning `usbd` and `iod` on machinery that already
   exists**, their two rows in the predicate, and the
@@ -1466,6 +1497,25 @@ a requirement:
    Ring 0 fault fatal. **L3 owns the predicate now** — it is the first caller —
    and compl C6 adds `usbd`'s and `iod`'s rows to it, which are the recoverable
    ones.
+
+   **And the reason the row must exist is sharper than "the predicate is wrong
+   for a kernel thread": without it the outcome is NOT DETERMINED.** The
+   predicate is `percpu::syscall_rip() != 0 && percpu::current_tid().is_some()`
+   (`main.rs:237`), and `syscall_rip` is **never cleared** — `exceptions.rs:243`
+   says so in its own comment and
+   `specs/issues/panic-path/syscall-rip-never-cleared.md` is the entry. A kernel
+   thread has a tid, so the second clause always holds; the first reads whatever
+   *user* thread last ran on that CPU left behind. Work stealing is on, so the
+   same panic on the same build takes the recoverable branch on a CPU that has
+   served a syscall and the fatal branch on one that has not. A row that merely
+   corrected a wrong answer would be a tidiness argument; this one replaces a
+   coin toss, and `sched::kthread` is where it lives. The one thing that could
+   have replaced it — asking the running task whether `spawn` gave it an address
+   space — is unavailable to the two callers that need it: the panic handler may
+   be inside a pass, and `blocking_baseline` runs with preemption on, where
+   reading the `CpuSched` aliases the `&mut` a preempting pass takes. **Measured,
+   not reasoned**: the first draft did read it there, and a full suite produced
+   two CPUs in `!!! PANIC REENTRY !!!` on one boot.
 
 ### 4.4 The console object, and where line atomicity actually comes from
 

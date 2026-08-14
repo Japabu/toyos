@@ -234,7 +234,18 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // If in syscall context: kill the process, rejoin scheduler. This panic
     // is fully handled — reset the reentry guard so a future, independent
     // panic on this CPU still reports.
-    if percpu::syscall_rip() != 0 && percpu::current_tid().is_some() {
+    //
+    // **A kernel thread answers from its own row and never from the two words
+    // below**, because for one of them the words do not merely give the wrong
+    // answer — they give a *nondeterministic* one. `syscall_rip` is never
+    // cleared (`specs/issues/panic-path/syscall-rip-never-cleared.md`), so a
+    // kernel task reads whatever user thread last ran on this CPU left behind:
+    // the same panic on the same build would recover or halt depending on which
+    // CPU work stealing had put the thread on. `sched::kthread` is where the
+    // answer is a property of the thread instead.
+    let recoverable = sched::kthread::panic_recovers_here()
+        .unwrap_or_else(|| percpu::syscall_rip() != 0 && percpu::current_tid().is_some());
+    if recoverable {
         depth.store(0, core::sync::atomic::Ordering::SeqCst);
         // The captured report dies with the panic it belongs to. Left set, it
         // outlives a panic the machine survived, and the next fatal path —
@@ -678,6 +689,14 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
             late_panic::Nest<late_panic::Nest<late_panic::Nest<late_panic::Nest<
             late_panic::Nest<late_panic::Nest<()>>>>>>>>>>::on_screen_console_check();
     }
+
+    // The last thing before the machine hands itself to the scheduler, because
+    // that is the first moment anything can run: the APs spin on `SMP_READY`
+    // below and the BSP reaches no pass before `enter_idle_loop`. A `klogd`
+    // spawned earlier would sit in a run queue through phases 5, 6 and 7 —
+    // which is the window a machine with no console wedges in — while the boot
+    // believed it had a drainer. `specs/log-architecture-spec.md` §4.2.
+    log::console::start();
 
     smp::set_ready();
     crate::scheduler::enter_idle_loop();
