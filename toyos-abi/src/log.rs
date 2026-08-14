@@ -17,17 +17,21 @@
 
 /// Message bytes a record carries.
 ///
-/// **Measured over every committed T14 log** (`specs/assessments/metal-logs/`), message
-/// length after the `[kernel … ] ` prefix: 12,497 lines, min 14, p50 59, p90
-/// 111, p99 154, p999 857, max 863. Everything above 200 is one call site — a
-/// `{:?}` of `KernelArgs`, 18 lines of the 12,497 — so this covers 99.86% of
-/// the tree's own output and the one site that exceeds it is split rather than
-/// truncated.
-pub const MAX_RECORD_MESSAGE: usize = 224;
+/// **Sized to the next power-of-two record that holds the measured maximum
+/// line.** `specs/assessments/metal-logs/` measured 12,497 committed T14
+/// boot-log lines, message length after the `[kernel … ] ` prefix: min 14,
+/// p50 59, p90 111, p99 154, p999 857, max 863. The record's other fields are
+/// 32 bytes fixed, so [`RECORD_BYTES`] — a power of two by its own derivation
+/// — is 32 plus this constant; 1024 is the smallest power of two past 32 +
+/// 863, which makes this 992, covering the measured maximum with headroom at
+/// zero alignment padding. The unbounded case — a demangled backtrace symbol
+/// — is not solved by any fixed bound and is handled separately by
+/// head-and-tail elision at the producer (log architecture L2).
+pub const MAX_RECORD_MESSAGE: usize = 992;
 
 /// One record on the wire, and one slot in a shard. A power of two so a reader
 /// indexes by shift and the kernel never does length arithmetic.
-pub const RECORD_BYTES: usize = 256;
+pub const RECORD_BYTES: usize = 1024;
 
 /// Shards a cursor can name, which is the machine's CPU count.
 ///
