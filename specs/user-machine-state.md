@@ -1,352 +1,54 @@
 # The user machine state
 
-**The invariant:**
-
-> A transition out of Ring 3 that can reach another task must save and restore
-> **the whole** user machine state, and a task that has never been in Ring 3
-> must start from a **declared** state.
-
----
-
-## 1. The whole state, on this machine
-
-The state a Ring 3 thread can observe and a Ring 0 excursion can disturb:
-
-| component | in the state? | why |
-|---|---|---|
-| general-purpose registers | yes | every entry already saves what it clobbers |
-| `RIP`, `RSP`, `RFLAGS`, `CS`, `SS` | yes | the `iretq` frame or `sysretq`'s `rcx`/`r11` |
-| `FS.base` (TLS) | yes | `hw.rs` swaps it with `rdfsbase`/`wrfsbase` on every context switch |
-| XMM0–15, `MXCSR` | yes | the bracket (§4.1) saves it on all five Ring 3-reachable entries (§3) |
-| x87 registers, `FCW`, `FSW`, `FTW`, `FIP`, `FDP`, `FOP` | yes | the bracket body is `fxsave64`/`fxrstor64` (§9) |
-| YMM/ZMM, opmask | not yet | `XCR0` is 1, so they do not exist — §5 |
-
-`XCR0` is 1 because `CR4.OSXSAVE` is set nowhere: neither `kernel/src` nor
-`bootloader/src` contains an `xsetbv`, and the one `xgetbv` (`arch/fpu.rs`,
-gated `if osxsave`) is read-only diagnostics that never executes on this
-machine. So the machine runs with the reset value of `XCR0`, which permits
-x87 and SSE and nothing else. AVX `#UD`s. Therefore **`FXSAVE64`/`FXRSTOR64`
-is a *complete* save of everything this kernel permits to exist.**
-
-The kernel itself contributes nothing to that state: it is soft-float by
-compiler guarantee. `rustc +toyos --print cfg --target x86_64-unknown-none`
-reports `target_feature="fxsr"` and `target_feature="x87"` and **no `sse`, no
-`sse2`** — `rust/compiler/rustc_target/src/spec/targets/x86_64_unknown_none.rs`
-sets `RustcAbi::Softfloat` and `+soft-float`. That is load-bearing for the whole
-design (§6.4) and is therefore asserted at build time (§8).
-
----
-
-## 2. A pending x87 exception must never cross a switch
-
-Provable by toggling one bit: boot two children differing only in
-`fault_gate_child`'s x87 control word (masked vs. IM unmasked), and only the
-unmasked arm loses `std_unwind`/`std_unwind_so` while `fault_gates` itself
-passes in both — proof the probe exercises the path rather than passing
-vacuously. `specs/assessments/ci-plan-assessment-2026-08.md` §9.3 has the run.
-
-**The victim instruction is `FLDCW`**, a *waiting* x87 instruction: it checks
-for a pending unmasked exception before it executes.
-`unwinding::unwinder::arch::x86_64::save_context` executes one `fnstcw`, and
-`restore_context`'s `fldcw`, reached from each of `__Unwind_RaiseException`,
-`__Unwind_ForcedUnwind`, `__Unwind_Resume_or_Rethrow` and `__Unwind_Resume`,
-is in every ToyOS binary that links the unwinder.
-
-**Every ToyOS process executes one on every panic.** `std_unwind` is not
-special; it is the only test that panics on a thread often enough to be caught.
-
----
-
-## 3. Every Ring 3-reachable entry saves FP state
-
-Five shapes reach Ring 3, and every one but `nmi_entry` can switch to a
-different task before getting there: `syscall_entry`, `timer_entry`'s Ring 3
-arm, `device_irq_entry!`'s six copies, `common_entry` (all 19 exception
-vectors, #PF included) and `tlb_flush_entry`. Every one of the five carries
-the §4 bracket. An entry outside it returns to userland holding another
-thread's XMM registers and MXCSR — and the failure is silent: an `MXCSR`
-carrying the wrong rounding mode or a stale `xmm0` produces a wrong number,
-not a signal.
-
-Two orderings inside an entry are load-bearing. `syscall_entry` restores the
-user state only *after* `kernel_exit_to_user_check` — a restore before it
-reaches `do_preempt`, and a switch in that window hands Ring 3 whatever the
-task that ran in between left in the registers. `tlb_flush_entry` parks
-XMM+MXCSR itself, the same as every `device_irq_entry!` expansion — a shared
-epilogue is not a shared save.
-
----
-
-## 4. The design
-
-### 4.1 One bracket
-
-`kernel/src/arch/entry.rs` exports `save_user_state!()` and
-`restore_user_state!()`. They are the **only text in the kernel naming an FP
-instruction**, and all five Ring 3-reachable shapes use them. A partial save is
-not expressible, because no other kernel text can name an FP instruction.
-
-### 4.2 A type owns the state
-
-`kernel/src/arch/fpu.rs`:
-
-```rust
-#[repr(C, align(16))]
-pub struct UserFpState([u8; 512]);
-```
-
-Exactly two constructors and one consumer:
-
-- `saved_from_cpu()` — what the macro produces, and the only way to make one
-  from live registers;
-- `INITIAL` — a `const` FXSAVE image: `FCW = 0x037F`, `FTW = 0`,
-  `MXCSR = 0x1F80`, everything else zero. This is the *declared* state the
-  invariant's second clause names, and the loader's trampolines load it so a
-  task that has never been in Ring 3 starts from it. `FNINIT` would not do:
-  it marks the x87 registers empty without clearing them, so an `FXSAVE`
-  reads the old data back out, and it does not touch XMM at all;
-- the restore, which consumes one.
-
-The size and alignment reach the assembly as `const { size_of::<UserFpState>() }`
-and `const { align_of::<UserFpState>() }` operands, so a reservation cannot
-disagree with the type. §5 is why that matters.
-
-### 4.3 The IDT accepts two entry types and no third
-
-`Ring3Entry` and `Ring0Entry` are the two things `IdtEntry` accepts, and its
-raw-pointer constructor is private. Every `direct` row of `idt_vectors!` answers
-which it is — the same column the error-code form already is, one level down —
-with no third spelling and no default; `syscall::init` takes one too, because
-`LSTAR` is an IDT slot by another name. Two rows are `ring0` and each says why:
-the NMI arrives between arbitrary instructions, including inside another entry's
-own save, and reschedules nothing; the halt IPI never returns.
-
-**The type does not prove the bracket is present** — nothing short of reading
-the assembly does. What it makes unrepresentable is installing a handler
-without answering the Ring 3 question at all.
-
-### 4.4 Not a `Drop` guard
-
-The failing path is naked assembly that returns through `iretq`/`sysretq`, and
-a task killed by another CPU never returns through it at all. This kernel does
-not unwind, so a `Drop` guard binds only paths where the value is actually
-dropped: an RAII guard here would bind the paths that already work and miss
-the one that does not. The bracket is two macro invocations in the same naked
-block, where there is no Rust scope to hang a destructor on.
-
----
-
-## 5. AVX-512 is a future requirement
-
-The kernel must eventually support AVX-512 (owner requirement).
-
-**`FXSAVE64` is the interim, and it is complete for the machine as configured
-today** (§1). Enabling any `XCR0` component beyond x87+SSE — AVX, AVX-512,
-anything — **requires switching to XSAVE in the same commit**: the moment
-`XCR0` names a component, `FXSAVE64` becomes a silent partial save.
-
-The constraint is enforced in types rather than prose: the save area's size
-and alignment come from `UserFpState` through `const {}` asm operands, so
-growing the state means growing the type, and growing the type moves every
-reservation with it — a mismatch is a compile error.
-
-## 6. Decisions
-
-### 6.1 `FXSAVE64`/`FXRSTOR64`, unconditionally, no runtime branch
-
-`FXSAVE64` is complete for this machine (§1) and is the only save that exists
-on all three instruments. The dev host's guest has no XSAVE at all: QEMU's
-`qemu64` model, selected whenever KVM is unusable, reports
-`fxsr: true, xsave: false, avx: false`; CI's KVM guest and the T14 both have
-it. Choosing XSAVE would mean `cargo test` exercises a *different kernel* from
-CI and metal on this exact path.
-
-Two details:
-
-- **REX.W forms.** Plain `FXSAVE` saves only the low 32 bits of `FIP`/`FDP`.
-  `FXSAVE64` is the one that saves a 64-bit address.
-- **`FXSAVE`/`FXRSTOR` are non-waiting.** They do not check for a pending
-  unmasked exception, which is precisely what lets the kernel save a poisoned
-  FPU without faulting in Ring 0. `FSAVE`/`FRSTOR` are waiting and would trap
-  on entry — the wrong family for this job. This is why defect 1's fix cannot
-  be "just `fninit` on entry" either: `FNINIT` discards the state instead of
-  preserving it.
-
-### 6.2 No runtime depth counter
-
-The type gate in §4.3 makes the mistake uncompilable; a runtime counter would
-re-check at run time what the compiler already refuses, at two extra
-instructions on the syscall path.
-
-### 6.3 Eager restore; lazy ruled out
-
-Lazy FP restore — leave `CR0.TS` set, restore on the first `#NM` — is ruled
-out three times over:
-
-1. It is **CVE-2018-3665** (LazyFP). Speculative execution reads the stale
-   register file across the `#NM` boundary. Every major kernel removed lazy FPU
-   switching over it.
-2. It **buys ToyOS nothing.** The saving is for kernel threads that never touch
-   FP state, and this kernel is soft-float: the only non-FP context is the idle
-   loop, which does not context-switch through a Ring 3 entry.
-3. It would **corrupt `#NM`'s meaning.** Vector 0x07 currently kills the
-   process, which is correct — nothing legitimate raises it. Under lazy restore
-   it would mean "the kernel deferred work", and the vector could no longer tell
-   a kernel mechanism from a userland bug.
-
-### 6.4 The state lives on the kernel stack
-
-Per *ring transition*, not per task: a task can be inside several nested
-transitions and each owes its own predecessor a restore. `context_switch`
-already swaps kernel stacks, so the stack is the thing whose lifetime matches.
-512 bytes on a 128 KiB stack (`KERNEL_STACK_SIZE`, `process.rs`) is free while a
-transition is in flight, and costs nothing while one is not.
-
----
-
-## 7. Per-CPU verification
-
-`percpu::init` logs each CPU's FPU-relevant state (`arch/fpu.rs::log_state`):
-`XSAVE`, `OSXSAVE`, `XCR0` when `OSXSAVE` permits reading it, and the relevant
-`CPUID` leaves. Per CPU rather than once for the machine, because "every CPU
-answers this identically" is an assumption to check, not a reason to print
-less. `XSAVE` and `OSXSAVE` read 0 on every CPU on every instrument this
-kernel runs on — which is what makes §1's completeness claim hold across the
-whole machine, not just the boot CPU.
-
-`CR4.OSXSAVE` is cleared by the whole-register declaration every CPU applies
-and asserts (`arch/control_regs.rs`), so no CPU can hold the bit this section
-rules out; `CR0`/`CR4` print on that file's own log line beside this one.
-
----
-
-## 8. The soft-float build assertion
-
-§1's soft-float guarantee is load-bearing — it is the whole reason the FPU
-may be left dirty between a save and its restore. So it is asserted where
-`assert_overflow_checked` is, in `src/build.rs`: the kernel target must still
-report no `sse` in its cfg. A future target-spec edit that turns hardware float
-back on for the kernel stops the build rather than quietly making every bracket
-in `entry.rs` insufficient.
-
----
-
-## 9. The shipped pieces
-
-`UserFpState` and its self-check (§4.2); all five Ring 3-reachable entries
-bracketed (§3); the bracket body on `fxsave64`/`fxrstor64` (§2, §6.1); the
-loader's trampolines loading the declared state; `Ring3Entry`/`Ring0Entry` as
-the IDT's only accepted shapes (§4.3); the `fpu_isolation` test (§10); the
-soft-float build assertion (§8).
-
----
-
-## 10. Gating
-
-`fault_gates` is not touched here and no `EXPECTED_FAILURES` entry is added.
-`specs/assessments/ci-plan-assessment-2026-08.md` §9.3 already ruled on both: giving `fault_gates` its own boot
-would delete the only observation of the defect this tree has, and an exemption
-would be one bought to make a run green while a process can kill its neighbour.
-Its `mf` arm became `Expect::Killed` once `CR0.NE` was declared on every CPU,
-and it still shares that boot, which is the half the ruling protects.
-
-New permanent `fpu_isolation`, three halves, all positive assertions:
-
-1. **Leak.** Child A pins a distinctive full FP state and exits without
-   restoring it; child B asserts architectural defaults at entry. Fails on
-   today's tree for XMM as well as x87.
-2. **Fault.** Child A is `fault_gate_child mf`; child B executes `FLDCW` and
-   must survive.
-3. **Preservation.** One process pins a state, forces many transitions of each
-   kind — 20,000 syscalls, two demand page faults, a preemption spin — against
-   an FP-heavy sibling, and asserts bit-identity.
-
-**`smp=1` is the stronger configuration for this test.** Two of the arms are
-about a register file carrying from one process to the next, which needs the
-two to share a CPU; on two CPUs that is a coin flip.
-
-**An unbracketed transition only corrupts if it switches**, and arm 3 arranges
-that rather than hoping for it. Kernel code is soft-float, so a `#PF` that
-allocates a page and returns disturbs nothing however unbracketed it is; what
-does the damage is another task running Ring 3 code in between. The sibling
-sleeps 100 µs between bursts, so several wakes land inside a single 2 MiB fault
-— hundreds of microseconds, off the kernel's own fault trace — and
-`need_resched` is set by the time `common_entry` reaches its exit.
-
-**Negative control:** a `fpu-save-nothing` kernel feature under which
-`fpu_isolation` must fail. Per CLAUDE.md the feature **replaces the behaviour,
-never the verdict** — the reservation, the alignment, the `rsp` bookkeeping and
-every assertion are the shipped ones, and what is absent is the `fxsave64`, the
-`fxrstor64` and the trampoline's load. QEMU has no device, machine property or
-`-cpu` flag that makes a guest's FPU carry over, so there is no other way to
-have a control at all.
-
-The driver collects every arm's verdict rather than stopping at the first,
-because the control's job is to show that *each* arm has teeth. Measured on that
-kernel, all seven fail and each says why:
-
-```
-FAILED: leak, round 0..2: a process started with the previous one's FP registers
-FAILED: fault, round 0..2: FLDCW took an exception the process never caused
-FAILED: preservation: the x87 control word did not survive … 0x0c7f became 0x037f
-```
-
----
-
-## 11. Cost
-
-34 register-moving instructions become 2 — a count of the existing sequence,
-not a claim about time: `stmxcsr` + 16 `movdqu` on the way in and 16 `movdqu`
-+ `ldmxcsr` on the way out, per bracket, replaced by `fxsave64`/`fxrstor64`.
-Instruction count falls; µop count and latency very plausibly rise, because
-`FXSAVE64` is a microcoded 512-byte store. §12 has the one measurement this
-tree has taken of it.
-
-- **TCG is not evidence and will mislead.** QEMU implements `FXSAVE` as a
-  helper call. A TCG delta is recorded anyway and **labelled**, so nobody
-  bisects a boot-time regression that is not one on real silicon.
-- **A microbenchmark**: a userland loop of N `SYS_CLOCK` calls timed with
-  `rdtsc`, reporting cycles per syscall (`tests/toyos-rust-tests/src/bin/`
-  `syscall_cost.rs`; read it with `cargo test -- syscall_cost --nocapture`). It
-  **prints, never asserts** — a TCG threshold is meaningless and a metal one
-  drifts.
-- CI's KVM guest is the second real instrument. **Metal is the verdict**, and
-  that needs the owner.
-
-**There is no page-fault arm.** `sys_mmap` allocates and maps its whole
-region up front, so a first touch of a fresh anonymous mapping is an ordinary
-store, and `toyos-ld` writes `.bss` into the file, so the loader's `Anonymous`
-tail is always empty. What is left is a writable file-backed page, at 2 MiB of
-test image per fault — too expensive for a benchmark, which is why
-`fpu_isolation` buys two transitions and `syscall_cost` buys none. Both are
-recorded in `specs/issues/hardware/`. The exception entry pays the same two
-instructions the syscall arm measures.
-
----
-
-## 12. Measurements
-
-Every number here comes from a command that was run, on **TCG on the dev
-host** — `FXSAVE` is a QEMU helper call there, so this is a labelled
-distortion, not a claim about the T14. **It also predates the AP
-control-register fix**: both
-arms below ran with three of four cores caching-disabled, so this is a
-measurement of a machine that no longer exists, and by how much is unmeasured
-(`specs/issues/kernel/ap-control-registers-inherit-init.md`).
-
-Cycles per `SYS_CLOCK`, minimum across six interleaved before/after pairs
-(`kernel/` at the merge base vs. this branch): **870 before, 993 after — +123
-cycles, +14%.** The refactor that reorganised the save sites (§4.1) changed
-nothing about what was saved; the switch to `fxsave64`/`fxrstor64` (§2, §9)
-changed the body, so the +123 is attributable to that change alone.
-
-A boot-time figure is not offered: the suite's own boot times move by more
-between runs on this host than the whole effect.
-
----
-
-## 13. Owed
-
-`arch/entry.rs` and `arch/fpu.rs` are x86-64 and live in `arch/` beside every
-other x86-64 file in this kernel. The `arch/x86_64/` split is a rename of a
-dozen files and belongs to one change that moves all of them.
+> A transition out of Ring 3 that can reach another task must save and
+> restore **the whole** user machine state, and a task that has never been in
+> Ring 3 must start from a **declared** state.
+
+## 1. The state
+
+The user machine state on this machine is exactly:
+
+- the general-purpose registers;
+- `RIP`, `RSP`, `RFLAGS`, `CS`, `SS`;
+- `FS.base`;
+- XMM0–15 and `MXCSR`;
+- the full x87 state: registers, control, status and tag words, opcode, and
+  the instruction and data pointers.
+
+`XCR0` is 1 — x87 and SSE, nothing else — on every CPU: no CPU sets
+`CR4.OSXSAVE`, every CPU's FP configuration is checked at boot, and AVX
+instructions `#UD`. Kernel code executes no floating-point instructions, so
+nothing disturbs a task's FP state between its save and its restore.
+
+## 2. Rules
+
+1. **Every transition out of Ring 3 that can reach another task saves the
+   full FP state, and restores it as the transition's last act before
+   returning to Ring 3** — after any point at which the task could have been
+   switched. A transition that cannot reach another task before returning is
+   exempt; every other one is not.
+2. **The save must not raise a pending exception.** A task may enter the
+   kernel with an unmasked x87 exception pending; the save uses the
+   non-waiting forms, and the pending exception reaches only the task that
+   caused it.
+3. **A task that has never run in Ring 3 starts from the declared state:**
+   `FCW = 0x037F`, `FTW = 0`, `MXCSR = 0x1F80`, every other field and
+   register zero. The image is loaded whole; the hardware's init instruction
+   does not produce it.
+4. **The save is `FXSAVE64`/`FXRSTOR64`, unconditionally** — the 64-bit
+   forms, preserving the full instruction and data pointers. Every machine
+   this kernel runs on executes the same save, and on this machine it is a
+   complete save of everything `XCR0` permits to exist.
+5. **`XCR0` never names a component the save does not cover.** Enabling any
+   component beyond x87+SSE — AVX-512 is the standing candidate — requires
+   the save to become XSAVE at the same moment; `FXSAVE64` over a wider
+   `XCR0` is a silent partial save and never ships.
+6. **Vector 0x07 (`#NM`) kills the faulting process.** No kernel mechanism
+   defers work behind that vector.
+
+## 3. Exclusions
+
+- **Lazy FP restore** — it defers the restore behind `#NM`, leaking the
+  previous task's register file speculatively across the deferral boundary.
+- **An XSAVE path or any capability branch in the save** (§2.4): one save,
+  every machine.
