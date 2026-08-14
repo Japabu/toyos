@@ -183,7 +183,12 @@ pub fn request() {
 
     let cpus = online_cpus();
     let me = percpu::cpu_id() as usize;
-    let from = crate::drivers::log_ring::mark();
+    // The bracket is two instants rather than two byte positions in one stream,
+    // because there is no one stream any more: a byte position has no meaning
+    // across shards. It is also exact where a byte range was not — the dump's
+    // own records are stamped by this same clock, so nothing a sibling CPU logs
+    // meanwhile can widen it.
+    let from = crate::clock::nanos_since_boot();
     log!("=== blocked-task dump: {cpus} cpu(s), and this report takes the screen ===");
 
     for cpu in 0..cpus {
@@ -227,7 +232,7 @@ pub fn request() {
 
     let census = census();
     summary(cpus, silent, census);
-    crate::drivers::panic_console::paint_report(from, crate::drivers::log_ring::mark());
+    crate::drivers::panic_console::paint_report(from, crate::clock::nanos_since_boot());
     IN_PROGRESS.store(false, Ordering::Release);
 }
 

@@ -330,6 +330,14 @@ fn alloc_log_shard(cpu_id: u32) -> u64 {
     // SAFETY: this is a fresh zeroed, 64-byte-aligned allocation which is not
     // published into `PerCpu` until this function returns.
     unsafe { log::Shard::initialize_zeroed(ptr) };
+    // A writer finds its shard through `gs:` and a reader cannot, so the shard
+    // is published to `log::shards` here — before the CPU it belongs to has
+    // executed an instruction, which is the same window `PerCpu` itself is
+    // built in.
+    //
+    // SAFETY: the allocation above is live for the life of the machine and is
+    // initialised.
+    unsafe { log::publish_shard(cpu_id, ptr) };
     ptr as u64
 }
 

@@ -172,7 +172,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
     // Early boot: percpu not ready, just halt (single CPU at this point)
     if !log::PERCPU_READY.load(core::sync::atomic::Ordering::Relaxed) {
-        alert!("!!! EARLY PANIC !!!: {}", info);
+        alert!("EARLY PANIC: {}", info);
         // This branch halts directly and never reaches halt_all_cpus, so it
         // owns both halves itself — and inverts halt_all_cpus' order. It runs
         // before idt::init, the one window with no exception handlers at all,
@@ -206,7 +206,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let prev = percpu::swap_fault_state(percpu::CpuFaultState::Panic);
     if prev != percpu::CpuFaultState::Normal {
         // Nested: Panic→Panic, Fatal→Panic, PageFault→Panic. Escalate.
-        alert!("!!! DOUBLE PANIC !!!");
+        alert!("DOUBLE PANIC");
         apic::halt_all_cpus();
     }
 
@@ -296,9 +296,9 @@ fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
 /// once, in the middle of phase 5, in white, among sixty-seven other rows.
 ///
 /// `alert!` is what says the row is red, and it is used here for the two states
-/// in which this boot leaves no readable account of itself anywhere. The `!!!`
-/// is still in the text because the panel still finds a red row by scanning for
-/// it; L2 re-points the panel at `Level` and the marker goes with that.
+/// in which this boot leaves no readable account of itself anywhere. Nothing in
+/// the text says so any more: the panel reads `Level` off the record, so a
+/// refusal wears the colour without having to spell it.
 ///
 /// ASCII throughout, unlike the rest of the kernel's prose: the panel's font is
 /// codepoints 0x20..=0x7E and `draw_glyph` renders everything else as a dot, so
@@ -310,10 +310,10 @@ fn report_log_destination() {
             log!("log: no serial console - this boot is in {path} and on the screen")
         }
         (true, None) => {
-            alert!("!!! log: no /log - this boot is on the console only, and nothing outlives the power !!!")
+            alert!("log: no /log - this boot is on the console only, and nothing outlives the power")
         }
         (false, None) => {
-            alert!("!!! log: no serial console and no /log - this boot is on this screen and nowhere else !!!")
+            alert!("log: no serial console and no /log - this boot is on this screen and nowhere else")
         }
     }
 }
@@ -378,7 +378,42 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         }
     }
 
-    log!("{:?}", kernel_args);
+    // **Six records rather than one `{:?}`.** The derived debug of `KernelArgs`
+    // is the one call site in the tree whose message exceeds the record bound —
+    // everything above 200 characters in the measured corpus is this line, 18
+    // of 12,497 — and unlike a demangled symbol it is a producer the kernel can
+    // split. So it is split, grouped by the question each field answers, rather
+    // than truncated with a count of what was lost
+    // (`specs/log-architecture-spec.md` §2.1).
+    log!(
+        "boot: memory map {:#x}+{:#x}, kernel {:#x}+{:#x}, stack {:#x}+{:#x}",
+        kernel_args.memory_map_addr, kernel_args.memory_map_size,
+        kernel_args.kernel_memory_addr, kernel_args.kernel_memory_size,
+        kernel_args.kernel_stack_addr, kernel_args.kernel_stack_size
+    );
+    log!(
+        "boot: initrd {:#x}+{:#x}, kernel elf {:#x}+{:#x}, rsdp {:#x}, boot pml4 {:#x}",
+        kernel_args.initrd_addr, kernel_args.initrd_size,
+        kernel_args.kernel_elf_addr, kernel_args.kernel_elf_size,
+        kernel_args.rsdp_addr, kernel_args.boot_pml4_addr
+    );
+    log!(
+        "boot: gop {:#x}+{:#x} {}x{} stride {} format {}",
+        kernel_args.gop_framebuffer, kernel_args.gop_framebuffer_size,
+        kernel_args.gop_width, kernel_args.gop_height,
+        kernel_args.gop_stride, kernel_args.gop_pixel_format
+    );
+    log!(
+        "boot: boot partition present={} lba {} +{} blocks guid {:02x?}",
+        kernel_args.boot_partition_present, kernel_args.boot_partition_start_lba,
+        kernel_args.boot_partition_blocks, kernel_args.boot_partition_guid
+    );
+    log!("boot: log partition guid {:02x?}", kernel_args.log_partition_guid);
+    log!(
+        "boot: rtc utc offset {} minutes (known={}), cmdline {:#x}+{}",
+        kernel_args.rtc_utc_offset_minutes, kernel_args.rtc_utc_offset_known,
+        kernel_args.cmdline_addr, kernel_args.cmdline_len
+    );
 
     let initrd = core::slice::from_raw_parts(
         DirectMap::from_phys(kernel_args.initrd_addr).as_ptr::<u8>(),

@@ -186,9 +186,81 @@ fn named_in_code(needle: &str) -> Vec<String> {
     found
 }
 
+/// Every line of `kernel/src` under a relative path, with its number.
+fn kernel_lines() -> Vec<(String, usize, String)> {
+    let root = repo_root();
+    let mut files = Vec::new();
+    rust_files(&root, &root.join("kernel/src"), &mut files);
+    let mut out = Vec::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        for (n, line) in text.lines().enumerate() {
+            out.push((rel(&root, &path), n + 1, line.to_string()));
+        }
+    }
+    out
+}
+
+/// The three log macros and the function they all expand to.
+const LOG_PRODUCERS: &[&str] = &["log!(", "alert!(", "boot_phase!(", "log::emit("];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Two clauses, one rule each, and neither is checkable any other way.**
+    ///
+    /// The first: the NMI handler must not log. It would reenter its own CPU's
+    /// log shard — the reservation is sound only because the CPU that owns the
+    /// shard has `IF` and `TF` masked through publication, and an NMI is the one
+    /// interrupt that ignores `IF`. `dump_nmi_probe` is what makes the handler
+    /// *useful*; this is what keeps it silent.
+    ///
+    /// The second: no log producer in `kernel/` carries `!!!` in its format
+    /// string. `panic_console::has_alert` used to scan every display row for
+    /// three exclamation marks, and its own comment enumerated the messages that
+    /// happened to match; the panel reads `Level` off the record now, so a `!!!`
+    /// put back into a message would be a marker marking nothing — a second,
+    /// silent alert channel beside the typed one. The two `!!!` still in
+    /// `kernel/` write raw bytes straight to the UART, never enter the ring, and
+    /// were never `has_alert`'s business either
+    /// (`specs/log-architecture-spec.md` §2.1).
+    #[test]
+    fn nmi_does_not_log() {
+        let lines = kernel_lines();
+        assert!(
+            lines.iter().any(|(file, _, _)| file == "kernel/src/arch/idt/nmi.rs"),
+            "the NMI handler moved: this gate is scanning a file that is not there"
+        );
+
+        let silent: Vec<_> = lines
+            .iter()
+            .filter(|(file, _, line)| {
+                file == "kernel/src/arch/idt/nmi.rs"
+                    && LOG_PRODUCERS.iter().any(|p| code_only(line).contains(p))
+            })
+            .map(|(file, n, line)| format!("{file}:{n}: {}", line.trim()))
+            .collect();
+        assert!(
+            silent.is_empty(),
+            "the NMI handler logs, and it reenters its own CPU's shard to do it:\n{}",
+            silent.join("\n")
+        );
+
+        let marked: Vec<_> = lines
+            .iter()
+            .filter(|(_, _, line)| {
+                line.contains("!!!") && LOG_PRODUCERS.iter().any(|p| line.contains(p))
+            })
+            .map(|(file, n, line)| format!("{file}:{n}: {}", line.trim()))
+            .collect();
+        assert!(
+            marked.is_empty(),
+            "a log producer carries the deleted `!!!` sentinel; the panel paints a red row \
+             from `Level::Alert` and reads nothing out of the text:\n{}",
+            marked.join("\n")
+        );
+    }
 
     #[test]
     fn nothing_in_the_kernel_counts_a_reference_by_hand() {

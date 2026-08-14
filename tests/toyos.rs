@@ -1362,7 +1362,7 @@ fn check_panic_recovery(result: &TestResult) -> bool {
     }
 
     let checks: &[(&str, &str)] = &[
-        ("!!! PANIC !!!", "expected PANIC header"),
+        ("PANIC:", "expected PANIC header"),
         ("SYS_DEBUG", "expected SYS_DEBUG in panic message"),
         ("Syscall: num=92", "expected syscall context in panic report"),
         ("User backtrace:", "expected user backtrace in panic report"),
@@ -1434,7 +1434,7 @@ fn check_disk_backtrace(result: &TestResult) -> bool {
 /// after the message, so it cannot supply the answer either.
 fn check_tripwire_attribution(serial: &str) -> Result<(), String> {
     const MSG: &str = "scheduler entered while a lock is held";
-    const HEADER: &str = "!!! PANIC !!!";
+    const HEADER: &str = "PANIC:";
     let msg_at = serial
         .find(MSG)
         .ok_or("expected the §6.4 lock-across-switch tripwire to fire")?;
@@ -2281,7 +2281,13 @@ fn report_is_photographable(dump: &screen::Ppm, what: &str) -> Result<(), String
 }
 
 /// Assert the two colour decisions `text()` cannot see: the fill, and the
-/// alert highlight on a `!!!` line against white everywhere else.
+/// alert highlight on an `alert!` row against white everywhere else.
+///
+/// **Nothing in the text says "alert" any more.** The seven `alert!` messages
+/// used to carry `!!!` and the panel found its red row by scanning for it; the
+/// colour is the record's `Level` now, so the ordinary row this compares
+/// against is the first one the panel did *not* paint red rather than the first
+/// one without a marker in it.
 fn check_colors(dump: &screen::Ppm, fill: [u8; 3], alert_line: &str) -> Result<(), String> {
     if dump.fill() != fill {
         return Err(format!("fill is {:?}, want {fill:?}", dump.fill()));
@@ -2296,7 +2302,8 @@ fn check_colors(dump: &screen::Ppm, fill: [u8; 3], alert_line: &str) -> Result<(
             dump.row_fg(cy)
         ));
     }
-    let Some(plain) = rows.iter().position(|r| !r.is_empty() && !r.contains("!!!")) else {
+    let Some(plain) = (0..rows.len()).find(|&i| !rows[i].is_empty() && dump.row_fg(i) != Some(ALERT))
+    else {
         return Err("no ordinary row to compare the highlight against".to_string());
     };
     if dump.row_fg(plain) != Some(WHITE) {
@@ -2413,10 +2420,11 @@ fn run_screen_test(
             // mounted, so nothing here may be wearing the alert marker — a
             // kernel that painted it unconditionally would satisfy that gate
             // and mean nothing.
-            if let Some(row) = dump.rows().iter().find(|r| r.contains("!!!")) {
+            if let Some(row) = (0..dump.rows().len()).find(|&i| dump.row_fg(i) == Some(ALERT)) {
                 return Err(format!(
-                    "an alert row on a boot where everything worked: {row:?}\n\
-                     decoded screen:\n{text}"
+                    "an alert row on a boot where everything worked: {:?}\n\
+                     decoded screen:\n{text}",
+                    dump.rows()[row]
                 ));
             }
 
@@ -3242,17 +3250,17 @@ fn run_screen_test(
             // Nothing announces the panic here — there is no console for a
             // marker to arrive on — so the screen is polled until it carries
             // the report. 30s covers firmware plus the initrd read off USB.
-            let dump = qemu.screendump_until("!!! PANIC !!!", Duration::from_secs(30));
+            let dump = qemu.screendump_until("PANIC:", Duration::from_secs(30));
             let text = dump.text();
             print_screen(name, &text);
-            for want in ["!!! PANIC !!!", "test-late-panic: on-screen console check"] {
+            for want in ["PANIC:", "test-late-panic: on-screen console check"] {
                 if !text.contains(want) {
                     return Err(format!(
                         "{want:?} not on screen of a guest with no serial port at all\ndecoded screen:\n{text}"
                     ));
                 }
             }
-            check_colors(&dump, FILL_FATAL, "!!! PANIC !!!")?;
+            check_colors(&dump, FILL_FATAL, "PANIC:")?;
             Ok(())
         }
         "screen_early_panic" => {
@@ -3268,19 +3276,19 @@ fn run_screen_test(
                     profile: qemu::Profile::Gop,
                     qmp: true,
                     kernel_params: &["test-early-panic"],
-                    ready_marker: "!!! EARLY PANIC !!!",
+                    ready_marker: "EARLY PANIC:",
                     ..Default::default()
                 },
             );
             let dump = qemu.screendump();
             let text = dump.text();
             print_screen(name, &text);
-            for want in ["!!! EARLY PANIC !!!", "test-early-panic: on-screen console check"] {
+            for want in ["EARLY PANIC:", "test-early-panic: on-screen console check"] {
                 if !text.contains(want) {
                     return Err(format!("{want:?} not on screen\ndecoded screen:\n{text}"));
                 }
             }
-            check_colors(&dump, FILL_FATAL, "!!! EARLY PANIC !!!")?;
+            check_colors(&dump, FILL_FATAL, "EARLY PANIC:")?;
             Ok(())
         }
         "screen_late_panic" => {
@@ -3296,7 +3304,7 @@ fn run_screen_test(
                     profile: qemu::Profile::Gop,
                     qmp: true,
                     kernel_params: &["test-late-panic"],
-                    ready_marker: "!!! PANIC !!!",
+                    ready_marker: "PANIC:",
                     ..Default::default()
                 },
             );
@@ -3306,15 +3314,15 @@ fn run_screen_test(
             // pager cycles it, so the window in which any given page is up is
             // `PAGE_HOLD_NS`, not forever: the timeout has to cover a whole
             // cycle rather than just the paint.
-            let dump = qemu.screendump_until("!!! PANIC !!!", Duration::from_secs(30));
+            let dump = qemu.screendump_until("PANIC:", Duration::from_secs(30));
             let text = dump.text();
             print_screen(name, &text);
-            for want in ["!!! PANIC !!!", "test-late-panic: on-screen console check"] {
+            for want in ["PANIC:", "test-late-panic: on-screen console check"] {
                 if !text.contains(want) {
                     return Err(format!("{want:?} not on screen\ndecoded screen:\n{text}"));
                 }
             }
-            check_colors(&dump, FILL_FATAL, "!!! PANIC !!!")?;
+            check_colors(&dump, FILL_FATAL, "PANIC:")?;
             check_wrap(&dump)?;
             Ok(())
         }
@@ -3333,7 +3341,7 @@ fn run_screen_test(
                     profile: qemu::Profile::Gop,
                     qmp: true,
                     kernel_params: &["test-late-panic"],
-                    ready_marker: "!!! PANIC !!!",
+                    ready_marker: "PANIC:",
                     ..Default::default()
                 },
             );
@@ -3341,7 +3349,7 @@ fn run_screen_test(
             // The first kernel line of the boot, and the one a photograph of
             // the final screen has never been able to show.
             const HEAD: &str = "panic console: armed";
-            const TAIL: &str = "!!! PANIC !!!";
+            const TAIL: &str = "PANIC:";
 
             let mut pages: Vec<String> = Vec::new();
             let mut report: Option<String> = None;
@@ -3414,7 +3422,7 @@ fn run_screen_test(
                     profile: qemu::Profile::Metal,
                     qmp: true,
                     kernel_params: &["test-late-panic"],
-                    ready_marker: "!!! PANIC !!!",
+                    ready_marker: "PANIC:",
                     ..Default::default()
                 },
             );
@@ -3723,7 +3731,7 @@ fn run_screen_test(
                      death\ndecoded screen:\n{text}"
                 ));
             }
-            if !text.contains("!!! PANIC !!!") {
+            if !text.contains("PANIC:") {
                 return Err(format!(
                     "the marker is on the panel without the panic banner, so this painted \
                      something other than a fatal report\ndecoded screen:\n{text}"
@@ -3750,7 +3758,7 @@ fn run_screen_test(
                     on_device.len()
                 ));
             }
-            if !on_device.contains("!!! PANIC !!!") {
+            if !on_device.contains("PANIC:") {
                 return Err(format!(
                     "/log/{name} carries the marker without the panic banner, so what reached \
                      the stick is not the report"
@@ -8066,7 +8074,7 @@ fn run_machine_test(
             // is the message, which names the ceiling rather than the page
             // source's own request.
             let serial = serial::Serial::named("test serial", result.serial.as_str());
-            serial.must_say("!!! PANIC !!!")?;
+            serial.must_say("PANIC:")?;
             let line = serial.must_say("exceeds MAX_HEAP_ALLOC")?;
             eprintln!("  [heap] {}", line.trim());
             Ok(())

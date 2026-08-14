@@ -208,7 +208,7 @@ fn boot(
     );
     let mut log = qemu.boot_log().to_string();
     log.push_str(&qemu.drain_serial(std::time::Duration::from_millis(500)));
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} during the boot:\n{log}"));
         }

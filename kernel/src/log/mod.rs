@@ -7,11 +7,12 @@
 //!
 //! `specs/log-architecture-spec.md` §2.
 
+pub mod read;
 pub mod shard;
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use toyos_abi::log::{LogRecord, FLAG_EARLY, MAX_RECORD_MESSAGE};
+use toyos_abi::log::{LogRecord, FLAG_EARLY, MAX_LOG_SHARDS, MAX_RECORD_MESSAGE};
 
 pub use shard::Shard;
 pub use toyos_abi::log::Level;
@@ -30,6 +31,56 @@ pub static PERCPU_READY: AtomicBool = AtomicBool::new(false);
 /// Zeroed, so it costs `.bss` and not 128 KiB of kernel image.
 pub static BOOT_SHARD: Shard = Shard::new();
 
+/// Every other CPU's shard, published as the BSP builds that CPU's `PerCpu`.
+///
+/// **A reader cannot find a shard the way a writer does.** `emit` reads its own
+/// through `gs:`, and there is no `gs:` for somebody else's CPU — so the shards
+/// a merge walks have to be reachable from a plain static. cpu0's is
+/// [`BOOT_SHARD`] and needs no slot here: it is reachable from the kernel's
+/// first instruction, which is where the boot the panel exists to report
+/// begins.
+///
+/// Written once per CPU, before that CPU executes an instruction, and never
+/// cleared — a CPU does not stop having said what it said.
+static AP_SHARDS: [AtomicPtr<Shard>; MAX_LOG_SHARDS - 1] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_LOG_SHARDS - 1];
+
+/// The ABI fixes how many shards a cursor can name, so the kernel is what must
+/// agree with it rather than the other way round.
+const _: () = assert!(crate::sched::MAX_CPUS <= MAX_LOG_SHARDS);
+
+/// Make `cpu`'s shard reachable to a reader. Called once per CPU from
+/// `alloc_percpu`, on the BSP.
+///
+/// # Safety
+/// `shard` must be a live, initialised [`Shard`] that is never freed.
+pub unsafe fn publish_shard(cpu: u32, shard: *mut Shard) {
+    if cpu == 0 {
+        // cpu0's shard *is* the boot shard, so there is no handoff and nothing
+        // to publish; `shards` returns it unconditionally.
+        debug_assert!(core::ptr::eq(shard, &raw const BOOT_SHARD as *mut Shard));
+        return;
+    }
+    let slot = AP_SHARDS
+        .get(cpu as usize - 1)
+        .unwrap_or_else(|| panic!("log: cpu{cpu} has no shard slot in an ABI of {MAX_LOG_SHARDS}"));
+    slot.store(shard, Ordering::Release);
+}
+
+/// Every shard a reader can reach, cpu0 first. `None` is a CPU this machine
+/// does not have.
+pub fn shards() -> [Option<&'static Shard>; MAX_LOG_SHARDS] {
+    let mut out = [None; MAX_LOG_SHARDS];
+    out[0] = Some(&BOOT_SHARD);
+    for (slot, published) in out[1..].iter_mut().zip(AP_SHARDS.iter()) {
+        let ptr = published.load(Ordering::Acquire);
+        // SAFETY: `publish_shard`'s contract is a live shard that is never
+        // freed, and the pointer is only ever written once.
+        *slot = (!ptr.is_null()).then(|| unsafe { &*ptr });
+    }
+    out
+}
+
 /// One format pass, two sinks: the record's bounded message and — until L3
 /// deletes it — the byte ring.
 ///
@@ -47,8 +98,11 @@ pub static BOOT_SHARD: Shard = Shard::new();
 /// `specs/issues/diagnostics/a-record-cannot-hold-a-demangled-frame.md` is the
 /// entry, and it has to be answered before L2 makes records what the panel
 /// renders.
-struct Tee {
-    msg: [u8; MAX_RECORD_MESSAGE],
+struct Tee<'a> {
+    /// The record's own message bytes, written in place. **Borrowed rather than
+    /// owned**: a second buffer here and a copy out of it put two message-sized
+    /// arrays on `emit`'s frame, and `emit` runs on the double-fault stack.
+    msg: &'a mut [u8; MAX_RECORD_MESSAGE],
     len: usize,
     /// Bytes past the record's bound, saturating. **Counted rather than
     /// dropped** — the difference between a bound and a lie.
@@ -56,7 +110,7 @@ struct Tee {
     wire: crate::drivers::serial::SerialWriter,
 }
 
-impl Tee {
+impl<'a> Tee<'a> {
     /// The legacy prefix, byte for byte what `log!` produced before this chunk.
     ///
     /// Its `cpu` and `tid` come from an unbracketed `gs:` read, exactly as the
@@ -64,7 +118,7 @@ impl Tee {
     /// mislabel this line and not the record. That is today's behaviour, it
     /// goes away with the byte ring at L3, and the record's own identity is
     /// read inside the bracket where it cannot be wrong.
-    fn open(at_ns: u64) -> Self {
+    fn open(at_ns: u64, msg: &'a mut [u8; MAX_RECORD_MESSAGE]) -> Self {
         use core::fmt::Write;
         let mut wire = crate::drivers::serial::SerialWriter::lock();
         let secs = at_ns / 1_000_000_000;
@@ -79,7 +133,7 @@ impl Tee {
         } else {
             let _ = write!(wire, "[kernel {secs}.{millis:03} boot] ");
         }
-        Self { msg: [0; MAX_RECORD_MESSAGE], len: 0, elided: 0, wire }
+        Self { msg, len: 0, elided: 0, wire }
     }
 
     fn finish(mut self) {
@@ -88,7 +142,7 @@ impl Tee {
     }
 }
 
-impl core::fmt::Write for Tee {
+impl core::fmt::Write for Tee<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         self.wire.write_bytes(s.as_bytes());
 
@@ -145,13 +199,7 @@ fn reserve(guard: &crate::arch::LogCommitGuard) -> (Origin, u64) {
         //
         // SAFETY: nothing else is running, so this CPU owns the boot shard.
         let seq = unsafe { BOOT_SHARD.reserve(guard) };
-        let origin = Origin {
-            shard: &BOOT_SHARD,
-            cpu: 0,
-            tid: u32::MAX,
-            pid: u32::MAX,
-            flags: FLAG_EARLY,
-        };
+        let origin = Origin { shard: &BOOT_SHARD, cpu: 0, tid: 0, pid: 0, flags: FLAG_EARLY };
         return (origin, seq);
     }
 
@@ -161,7 +209,23 @@ fn reserve(guard: &crate::arch::LogCommitGuard) -> (Origin, u64) {
     // `alloc_percpu` gives every CPU a shard before that CPU executes an
     // instruction — so this is a live `Shard` and it is ours.
     let shard: &'static Shard = unsafe { &*shard };
-    (Origin { shard, cpu: cpu as u16, tid, pid, flags: 0 }, seq)
+    (Origin { shard, cpu: cpu as u16, tid: on_a_thread(tid), pid: on_a_thread(pid), flags: 0 }, seq)
+}
+
+/// `PerCpu`'s "no thread here" is `u32::MAX`; a record's is zero, because that
+/// is what the ABI's one formatter renders as absent.
+///
+/// **Translated at the boundary rather than carried inward**, so no consumer
+/// has to know what an idle CPU looks like from inside the kernel — a panel
+/// that rendered the raw sentinel would print `tid=4294967295` on every line a
+/// kernel thread logged.
+///
+/// It costs the tid of a process's *first* thread, which is `Tid(0)` and
+/// therefore also renders as absent:
+/// `specs/issues/diagnostics/a-record-cannot-name-thread-zero.md` is the entry,
+/// and its fix is in the ABI's formatter rather than here.
+fn on_a_thread(id: u32) -> u32 {
+    if id == u32::MAX { 0 } else { id }
 }
 
 /// The only producer.
@@ -171,21 +235,17 @@ fn reserve(guard: &crate::arch::LogCommitGuard) -> (Origin, u64) {
 pub fn emit(level: Level, args: core::fmt::Arguments) {
     let at_ns = crate::clock::nanos_since_boot();
 
-    let mut tee = Tee::open(at_ns);
-    let _ = core::fmt::Write::write_fmt(&mut tee, args);
+    let mut record = LogRecord { at_ns, level: level as u8, ..LogRecord::EMPTY };
 
-    let mut record = LogRecord {
-        seq: 0,
-        at_ns,
-        pid: 0,
-        tid: 0,
-        cpu: 0,
-        len: tee.len as u16,
-        elided: tee.elided.min(u16::MAX as usize) as u16,
-        level: level as u8,
-        flags: 0,
-        msg: tee.msg,
-    };
+    // The byte ring's line is finished before the bracket opens, which is what
+    // keeps the serial lock *out* of the interrupts-off window rather than
+    // putting one inside it. Both sinks are fed from the one format pass either
+    // way; L3 deletes this half.
+    let mut tee = Tee::open(at_ns, &mut record.msg);
+    let _ = core::fmt::Write::write_fmt(&mut tee, args);
+    record.len = tee.len as u16;
+    record.elided = tee.elided.min(u16::MAX as usize) as u16;
+    tee.finish();
 
     let guard = crate::arch::LogCommitGuard::close();
     let (origin, seq) = reserve(&guard);
@@ -200,8 +260,6 @@ pub fn emit(level: Level, args: core::fmt::Arguments) {
     // state unchanged.
     unsafe { origin.shard.commit(seq, &record, &guard) };
     drop(guard);
-
-    tee.finish();
 }
 
 /// A line of ordinary kernel log. 658 sites.

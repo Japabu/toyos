@@ -160,7 +160,7 @@ fn boot_and_read(
     qemu.flush_stdin();
     log.push_str(&qemu.drain_serial(Duration::from_secs(20)));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} on the way down\n{log}"));
         }

@@ -320,7 +320,7 @@ pub fn esp_filesystem(
     qemu.flush_stdin();
     let tail = qemu.drain_serial(Duration::from_secs(20));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if tail.contains(bad) {
             return Err(format!("{bad:?} on the way down\n{tail}"));
         }
@@ -569,7 +569,7 @@ pub fn kernel_log_file(
     qemu.flush_stdin();
     let tail = qemu.drain_serial(Duration::from_secs(20));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if tail.contains(bad) {
             return Err(format!("{bad:?} on the way down\n{tail}"));
         }
@@ -831,7 +831,7 @@ pub fn late_storage_connect(
     qemu.flush_stdin();
     let tail = qemu.drain_serial(Duration::from_secs(20));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if tail.contains(bad) {
             return Err(format!("{bad:?} on the way down\n{tail}"));
         }
@@ -958,7 +958,7 @@ pub fn log_backing_read_error(
     qemu.flush_stdin();
     log.push_str(&qemu.drain_serial(Duration::from_secs(20)));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} on the boot\n{log}"));
         }
@@ -1100,7 +1100,7 @@ pub fn boot_volume_metadata_error(
     qemu.flush_stdin();
     log.push_str(&qemu.drain_serial(Duration::from_secs(20)));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} on the boot\n{log}"));
         }
@@ -1400,9 +1400,10 @@ pub fn image_with_unnamed_log_partition(
 }
 
 /// What the kernel says on the panel when this boot leaves nothing to read
-/// afterwards. `!!!` is the panic console's alert marker, so the row paints
-/// red; `screen_log_absent` is the gate that it does.
-pub const NO_LOG_ALERT: &str = "!!! log: no /log";
+/// afterwards. It is an `alert!`, so the panel paints the row red off the
+/// record's `Level` — nothing in the text says so — and `screen_log_absent` is
+/// the gate that it does.
+pub const NO_LOG_ALERT: &str = "log: no /log";
 
 /// The log partition is named, never discovered — proved by moving the name.
 ///
@@ -1443,7 +1444,7 @@ pub fn log_partition_identity(
     qemu.flush_stdin();
     log.push_str(&qemu.drain_serial(Duration::from_secs(20)));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} on a stick whose log partition is not named\n{log}"));
         }

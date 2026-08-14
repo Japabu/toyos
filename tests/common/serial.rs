@@ -6,7 +6,7 @@
 //! `contains` against a `String`, and seven of them do it in the shape
 //!
 //! ```ignore
-//! for bad in ["!!! PANIC !!!", "panicked at"] {
+//! for bad in ["PANIC:", "panicked at"] {
 //!     if log.contains(bad) { return Err(..) }
 //! }
 //! ```
@@ -28,7 +28,7 @@
 use super::qemu::{is_kernel_line, QemuInstance};
 
 /// Panic markers. One list, so a test cannot scan for two of the three.
-const FATAL: &[&str] = &["!!! PANIC !!!", "KERNEL PANIC", "panicked at"];
+const FATAL: &[&str] = &["PANIC:", "KERNEL PANIC", "panicked at"];
 
 pub struct Serial {
     text: String,
@@ -144,7 +144,7 @@ pub fn self_check() -> Result<(), String> {
     let mute = Serial::named("test capture", "hello from userland\n");
     let panicking = Serial::named(
         "test capture",
-        "[kernel 0.001 cpu0] NVMe: found\n[kernel 0.002 cpu0] !!! PANIC !!!: nope\n",
+        "[kernel 0.001 cpu0] NVMe: found\n[kernel 0.002 cpu0] PANIC: nope\n",
     );
 
     let cases: &[(&str, bool, &dyn Fn() -> Result<(), String>)] = &[

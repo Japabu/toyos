@@ -293,6 +293,38 @@ impl Shard {
         slot.seq.store(seq, Ordering::Release);
     }
 
+    /// The timestamp of record `seq`, under exactly [`Shard::read`]'s validity
+    /// test and without copying the body.
+    ///
+    /// **It exists so a merge does not cost a kilobyte per candidate.** A
+    /// newest-first merge across [`MAX_LOG_SHARDS`] shards holds one candidate
+    /// per shard at all times, and a candidate is only ever compared by its
+    /// `at_ns` — so holding whole [`LogRecord`]s would put 8 KiB on a stack the
+    /// double-fault path has 16 KiB of. The chosen record is copied once, by
+    /// [`Shard::read`], after the comparison has picked it.
+    ///
+    /// [`MAX_LOG_SHARDS`]: toyos_abi::log::MAX_LOG_SHARDS
+    pub fn at_ns(&self, seq: u64) -> Option<u64> {
+        if seq < self.oldest_readable() || seq >= self.head() {
+            return None;
+        }
+        let slot = &self.slots[(seq % SHARD_RECORDS as u64) as usize];
+        if slot.seq.load(Ordering::Acquire) != seq {
+            return None;
+        }
+
+        // SAFETY: the slot is live for the whole of this read, nothing here
+        // forms a reference to the body, and `at_ns` is its first field — the
+        // `offset_of` assertion above is what says so.
+        let at_ns: u64 = unsafe { core::ptr::read_volatile(slot.body.get().cast::<u64>()) };
+
+        fence(Ordering::Acquire);
+        if slot.seq.load(Ordering::Relaxed) != seq {
+            return None;
+        }
+        Some(at_ns)
+    }
+
     /// Copy record `seq` out, or `None` if this shard cannot answer for it.
     ///
     /// **The window, not just the upper bound.** `head` counts reservations, so

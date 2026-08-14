@@ -1,17 +1,17 @@
 //! On-screen panic console.
 //!
-//! Log text rendered as an 8x16 text grid onto the UEFI GOP framebuffer, armed
-//! before `serial::init`. It formats nothing: `crash_report` already produced
-//! the text and every ring line already carries `[kernel 12.481 cpu3 tid=7]`. A
-//! second formatter for a second device would be a terminal subsystem, and it
-//! would drift from the first.
+//! Log records rendered as an 8x16 text grid onto the UEFI GOP framebuffer,
+//! armed before `serial::init`. It has no formatter of its own: a record's line
+//! is `toyos_abi::log::LogRecord`'s `Display`, the same one `logd` and any
+//! diagnostic tool render through, so a second formatter for a second device
+//! cannot drift from the first.
 //!
-//! **Which text differs by caller, and that is a decision rather than an
-//! accident.** A fatal path and a boot checkpoint show the *tail* of the ring,
-//! because what they are reporting is the last thing the machine did. Ctrl+Alt+D
-//! shows the log between two marks (see [`paint_report`]), because what it is
-//! reporting is one report and a tail would paginate it against a whole boot's
-//! logging.
+//! **Which records differ by caller, and that is a decision rather than an
+//! accident.** A fatal path and a boot checkpoint show the *newest* records,
+//! because what they are reporting is the last thing the machine did.
+//! Ctrl+Alt+D shows a bracket of two instants (see [`paint_report`]), because
+//! what it is reporting is one report and a tail would paginate it against a
+//! whole boot's logging.
 //!
 //! It exists because a laptop has no serial port. On such a machine the
 //! screen is the only channel a kernel panic can reach, and today a panic
@@ -86,12 +86,24 @@ const GLYPH_H: usize = 16;
 const MAX_COLS: usize = 320;
 const MAX_ROWS: usize = 96;
 
-/// Half the log ring, sized by the assertion below: one screenful must never
-/// exceed what was captured, or the top of a page would show text the snapshot
-/// never held. Paging spends the rest — at the ~70 bytes per display row a
-/// kernel log actually averages, 32 KiB is around five 96-row pages.
+/// How much rendered log a buffer here holds, sized by the assertion below:
+/// one screenful must never exceed what was captured, or the top of a page
+/// would show text the snapshot never held. Paging spends the rest — at the
+/// ~70 bytes per display row a kernel log actually averages, 32 KiB is around
+/// five 96-row pages.
 const SNAPSHOT_CAP: usize = 32 * 1024;
 const _: () = assert!(SNAPSHOT_CAP >= MAX_ROWS * MAX_COLS);
+
+/// The shortest line the record formatter can produce — `[0.000 cpu0]` and the
+/// space and newline around it — so no buffer here can hold more lines than
+/// this.
+///
+/// It is what sizes `Rendered::alert`, and it is a floor rather than an
+/// average: a bitmap that ran out of bits would silently stop painting rows
+/// red.
+const MIN_LINE: usize = "[0.000 cpu0] \n".len();
+const MAX_LINES: usize = SNAPSHOT_CAP / MIN_LINE;
+const ALERT_WORDS: usize = MAX_LINES.div_ceil(64);
 
 /// How long each page stays up. Long enough to photograph, short enough that
 /// a five-page report cycles inside a 15-second video.
@@ -144,8 +156,141 @@ impl Fb {
 struct FbCell(UnsafeCell<Fb>);
 unsafe impl Sync for FbCell {}
 
-struct SnapshotCell(UnsafeCell<[u8; SNAPSHOT_CAP]>);
-unsafe impl Sync for SnapshotCell {}
+/// A screenful-and-then-some of rendered log, and which of its lines an
+/// `alert!` produced.
+///
+/// **The red row is a `Level` now, and that is what deletes a magic value.**
+/// `has_alert` used to scan each display row for three consecutive `!` bytes,
+/// and its own comment enumerated the strings that happened to match — the
+/// comment root `CLAUDE.md` says is the type you should have written. Nothing
+/// in the text says "alert" any more; the record does, and this is where the
+/// record's answer survives being rendered to text.
+struct Rendered {
+    text: [u8; SNAPSHOT_CAP],
+    /// One bit per line, **counted back from the last one**, because [`Fill`]
+    /// writes the buffer from its end: a panel shows the newest records and
+    /// drops the oldest, so a line's distance from the end is the only index
+    /// that is fixed while the buffer is still filling.
+    alert: [u64; ALERT_WORDS],
+    /// Bytes of `text` in use, at its end.
+    len: usize,
+    lines: usize,
+}
+
+impl Rendered {
+    const EMPTY: Self =
+        Self { text: [0; SNAPSHOT_CAP], alert: [0; ALERT_WORDS], len: 0, lines: 0 };
+
+    /// Render the newest records stamped in `from..=to` that fit, and return
+    /// how many bytes that came to.
+    ///
+    /// Everything older than the buffer holds is dropped, which is the same
+    /// rule the byte ring's tail had and for the same reason: a report is read
+    /// from its end.
+    fn render(&mut self, from: u64, to: u64) -> usize {
+        self.alert = [0; ALERT_WORDS];
+        self.lines = 0;
+        self.len = 0;
+        let mut fill = Backfill { at: SNAPSHOT_CAP, into: self };
+        log::read::snapshot_committed(from, to, &mut fill);
+        let at = fill.at;
+        self.len = SNAPSHOT_CAP - at;
+        self.len
+    }
+
+    fn view(&self) -> View<'_> {
+        View {
+            text: self.text.get(SNAPSHOT_CAP - self.len..).unwrap_or(&[]),
+            alert: &self.alert,
+            lines: self.lines,
+        }
+    }
+}
+
+/// A rendered log as a painter sees it.
+#[derive(Clone, Copy)]
+struct View<'a> {
+    text: &'a [u8],
+    alert: &'a [u64; ALERT_WORDS],
+    lines: usize,
+}
+
+impl View<'_> {
+    const NOTHING: View<'static> = View { text: &[], alert: &[0; ALERT_WORDS], lines: 0 };
+
+    /// Whether line `n`, counted from the first, came from an `alert!`.
+    fn is_alert(&self, n: usize) -> bool {
+        let Some(from_end) = self.lines.checked_sub(n + 1) else { return false };
+        self.alert.get(from_end / 64).is_some_and(|word| word & (1 << (from_end % 64)) != 0)
+    }
+}
+
+/// Writes records into a [`Rendered`] back to front, so the newest are the ones
+/// that survive a full buffer.
+struct Backfill<'a> {
+    into: &'a mut Rendered,
+    /// Where the next — older — line starts.
+    at: usize,
+}
+
+impl log::read::RecordSink for Backfill<'_> {
+    fn put(&mut self, record: &toyos_abi::log::LogRecord) -> bool {
+        let line = rendered_len(record).saturating_add(1);
+        let Some(at) = self.at.checked_sub(line) else { return false };
+        if self.into.lines == MAX_LINES {
+            return false;
+        }
+        let Some(out) = self.into.text.get_mut(at..self.at) else { return false };
+        // The same formatter measured the line, so this fills the slot exactly.
+        // A disagreement would leave zeroes rather than run past the end, which
+        // is the only direction a paint can afford to be wrong in.
+        let mut into = Into { out, at: 0 };
+        let _ = core::fmt::write(&mut into, format_args!("{record}\n"));
+        if record.level() == Some(log::Level::Alert) {
+            if let Some(word) = self.into.alert.get_mut(self.into.lines / 64) {
+                *word |= 1 << (self.into.lines % 64);
+            }
+        }
+        self.into.lines += 1;
+        self.at = at;
+        true
+    }
+}
+
+/// What one record's line costs, without rendering it anywhere.
+fn rendered_len(record: &toyos_abi::log::LogRecord) -> usize {
+    struct Count(usize);
+    impl core::fmt::Write for Count {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            self.0 = self.0.saturating_add(s.len());
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    let _ = core::fmt::write(&mut count, format_args!("{record}"));
+    count.0
+}
+
+/// A `fmt::Write` over a fixed slot that drops what does not fit instead of
+/// panicking, because the one caller is a crash report.
+struct Into<'a> {
+    out: &'a mut [u8],
+    at: usize,
+}
+
+impl core::fmt::Write for Into<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let end = self.at.saturating_add(s.len());
+        if let Some(slot) = self.out.get_mut(self.at..end) {
+            slot.copy_from_slice(s.as_bytes());
+            self.at = end;
+        }
+        Ok(())
+    }
+}
+
+struct RenderedCell(UnsafeCell<Rendered>);
+unsafe impl Sync for RenderedCell {}
 
 /// Seqlock over `FB`. Even means stable, odd means a publisher is inside.
 /// Not a `Lock` and not even a `try_lock`: `Lock::lock` panics after 500M
@@ -168,29 +313,28 @@ static FB: FbCell = FbCell(UnsafeCell::new(Fb::DETACHED));
 /// [`boot_checkpoint`] does release it, because the machine keeps running.
 static PAINTING: AtomicBool = AtomicBool::new(false);
 
-static SNAPSHOT: SnapshotCell = SnapshotCell(UnsafeCell::new([0; SNAPSHOT_CAP]));
+static SNAPSHOT: RenderedCell = RenderedCell(UnsafeCell::new(Rendered::EMPTY));
 
-/// Non-zero means, and only means, "a panic that has *not* been recovered
-/// captured this report". [`capture`] establishes the first half and
+/// True means, and only means, "a panic that has *not* been recovered captured
+/// this report". [`capture`] establishes the first half and
 /// [`discard_capture`] the second: without it a survived panic's report stays
 /// here and a later, unrelated fatal path paints it as the cause of death.
-static SNAPSHOT_LEN: AtomicUsize = AtomicUsize::new(0);
+static CAPTURED: AtomicBool = AtomicBool::new(false);
 
-/// Scratch for the readers that peek the *live* ring: a boot checkpoint, and
-/// a fatal path that never ran the panic handler. Separate from `SNAPSHOT`
+/// Scratch for the readers that render the *live* shards: a boot checkpoint,
+/// and a fatal path that never ran the panic handler. Separate from `SNAPSHOT`
 /// because a checkpoint sharing it would erase a report another CPU had
 /// already captured and not yet painted.
-static LIVE: SnapshotCell = SnapshotCell(UnsafeCell::new([0; SNAPSHOT_CAP]));
+static LIVE: RenderedCell = RenderedCell(UnsafeCell::new(Rendered::EMPTY));
 
-/// Ctrl+Alt+D's report, copied out of the ring the moment it is complete.
+/// Ctrl+Alt+D's report, rendered the moment it is complete.
 ///
-/// A third buffer and not a third reader of the ring, because the report has
+/// A third buffer and not a third reader of the shards, because the report has
 /// to survive being repainted: [`hold_report`] puts it back on the panel for
 /// [`REPORT_HOLD_NS`], and by then the ring holds whatever the machine has said
 /// since. A screenful is all a repaint can show and `SNAPSHOT_CAP` is five of
 /// those, so nothing here is sized for the paging the report does not do.
-static REPORT: SnapshotCell = SnapshotCell(UnsafeCell::new([0; SNAPSHOT_CAP]));
-static REPORT_LEN: AtomicUsize = AtomicUsize::new(0);
+static REPORT: RenderedCell = RenderedCell(UnsafeCell::new(Rendered::EMPTY));
 
 /// When the report gives the panel back. 0 means it does not hold it.
 static HOLD_UNTIL: AtomicU64 = AtomicU64::new(0);
@@ -440,12 +584,13 @@ pub fn remap() {
     rearm();
 }
 
-/// Copy the newest ring bytes into the console's static scratch.
+/// Render the newest records into the console's static scratch.
 ///
 /// Called at the top of the panic handler, before `panic_flush` drains the
-/// ring. No pixels, no lock, no mutation -- one memcpy on a path that is
-/// about to halt. Skipped entirely when no framebuffer is armed, which is
-/// every headless boot, so a panic storm on a server pays nothing.
+/// byte ring. No pixels, no lock, no mutation of the shards -- one bounded
+/// newest-first walk on a path that is about to halt. Skipped entirely when no
+/// framebuffer is armed, which is every headless boot, so a panic storm on a
+/// server pays nothing.
 ///
 /// **Its original reason is gone, and it was kept anyway.** It existed because
 /// `panic_flush` drained the ring out from under the renderer, so a reader
@@ -472,26 +617,23 @@ pub fn capture() {
     if snapshot().is_none() {
         return;
     }
-    let buf = unsafe { &mut *SNAPSHOT.0.get() };
-    let n = unsafe { crate::drivers::log_ring::peek_tail(buf) };
-    SNAPSHOT_LEN.store(n, Ordering::Relaxed);
+    let into = unsafe { &mut *SNAPSHOT.0.get() };
+    CAPTURED.store(into.render(0, u64::MAX) > 0, Ordering::Relaxed);
 }
 
 /// Drop the captured report: this panic was survived, so it is no longer
 /// anyone's cause of death. Called on the recovery branch, which is the only
 /// exit from the panic handler that does not paint.
 pub fn discard_capture() {
-    SNAPSHOT_LEN.store(0, Ordering::Relaxed);
+    CAPTURED.store(false, Ordering::Relaxed);
 }
 
-/// The tail of the live ring, for callers with nothing captured. Mutates
-/// nothing in the ring, so a later `panic_flush` reports byte-identically.
-fn live_tail() -> &'static [u8] {
-    let base = LIVE.0.get().cast::<u8>();
-    let n = unsafe {
-        crate::drivers::log_ring::peek_tail(core::slice::from_raw_parts_mut(base, SNAPSHOT_CAP))
-    };
-    unsafe { core::slice::from_raw_parts(base, n) }
+/// The tail of the live shards, for callers with nothing captured. Consumes
+/// nothing, so a later `panic_flush` reports the byte ring identically.
+fn live_tail() -> View<'static> {
+    let into = unsafe { &mut *LIVE.0.get() };
+    into.render(0, u64::MAX);
+    unsafe { &*LIVE.0.get() }.view()
 }
 
 // DESIGN RULE: render and everything it calls acquires NO synchronization
@@ -513,11 +655,9 @@ fn live_tail() -> &'static [u8] {
 /// repeatedly: `SNAPSHOT` is written once and never again. The live branch
 /// re-peeks, and tolerates a sibling still logging for the same reason
 /// [`live_tail`] always did.
-fn fatal_text() -> &'static [u8] {
-    let captured = SNAPSHOT_LEN.load(Ordering::Relaxed).min(SNAPSHOT_CAP);
-    if captured > 0 {
-        let base = SNAPSHOT.0.get().cast::<u8>();
-        unsafe { core::slice::from_raw_parts(base, captured) }
+fn fatal_text() -> View<'static> {
+    if CAPTURED.load(Ordering::Relaxed) {
+        unsafe { &*SNAPSHOT.0.get() }.view()
     } else {
         live_tail()
     }
@@ -555,7 +695,7 @@ pub fn page_forever() {
     let text = fatal_text();
     let Some(fb) = snapshot() else { return };
     let Some((cols, grid_rows)) = geometry(&fb) else { return };
-    let (_, pages, _) = pagination(text, cols, grid_rows);
+    let (_, pages, _) = pagination(text.text, cols, grid_rows);
     if pages < 2 {
         return;
     }
@@ -650,7 +790,7 @@ pub fn boot_checkpoint() {
 /// question into a log file nothing is left running to flush. The keystroke is
 /// the consent.
 ///
-/// The second difference is the marks. A tail of the ring is whatever the
+/// The second difference is the bracket. A tail of the ring is whatever the
 /// machine last said, and a boot log is mostly not an answer to the question
 /// the key asked — worse, the tail paginates over the *whole* ring, so the
 /// panel shows one slice of a log and the verdict is on it by luck. A bracket
@@ -662,10 +802,15 @@ pub fn boot_checkpoint() {
 /// composing and has no idea the kernel drew, so what a photograph catches is
 /// whatever survived the next client frame. The paint therefore arms a hold,
 /// and [`hold_report`] is the other half.
-pub fn paint_report(from: crate::drivers::log_ring::Mark, to: crate::drivers::log_ring::Mark) {
-    let buf = unsafe { &mut *REPORT.0.get() };
-    let n = unsafe { crate::drivers::log_ring::peek_range(from, to, buf) };
-    REPORT_LEN.store(n, Ordering::Relaxed);
+/// **The bracket is two timestamps and not two byte positions**, and that is
+/// better rather than a concession. A byte position has no meaning across
+/// shards — there is no single stream for it to be a position in — and the
+/// dump's own records are stamped by the same clock the bracket is taken from,
+/// so the report is exactly the records the dump produced. A byte range could
+/// be widened by any concurrent writer.
+pub fn paint_report(from: u64, to: u64) {
+    let into = unsafe { &mut *REPORT.0.get() };
+    into.render(from, to);
     HOLD_UNTIL.store(
         crate::clock::nanos_since_boot().saturating_add(REPORT_HOLD_NS),
         Ordering::Relaxed,
@@ -675,9 +820,8 @@ pub fn paint_report(from: crate::drivers::log_ring::Mark, to: crate::drivers::lo
 
 /// The report as it was when the dump finished, for however long the hold
 /// lasts. Empty until one has been asked for.
-fn report_text() -> &'static [u8] {
-    let n = REPORT_LEN.load(Ordering::Relaxed).min(SNAPSHOT_CAP);
-    unsafe { core::slice::from_raw_parts(REPORT.0.get().cast::<u8>(), n) }
+fn report_text() -> View<'static> {
+    unsafe { &*REPORT.0.get() }.view()
 }
 
 fn paint_held_report() {
@@ -791,25 +935,40 @@ fn pagination(text: &[u8], cols: usize, grid_rows: usize) -> (usize, usize, usiz
     (total, total.div_ceil(per), per)
 }
 
-/// Byte offsets of display rows `first ..`, one per slot in `out`. Rows past
-/// the end get `text.len()`, which draws nothing.
-fn row_offsets(text: &[u8], cols: usize, first: usize, out: &mut [u32]) {
+/// Where a display row starts, and which log line it is part of.
+///
+/// The second half is what carries [`Level`] through the wrap: a line wider
+/// than the grid occupies several display rows, and the colour is a property of
+/// the record rather than of any one row of it.
+#[derive(Clone, Copy)]
+struct Row {
+    at: u32,
+    line: u32,
+}
+
+/// Display rows `first ..`, one per slot in `out`. Rows past the end get
+/// `text.len()`, which draws nothing.
+fn row_offsets(text: &[u8], cols: usize, first: usize, out: &mut [Row]) {
     let len = text.len();
     for slot in out.iter_mut() {
-        *slot = len as u32;
+        *slot = Row { at: len as u32, line: 0 };
     }
     if first == 0 {
         if let Some(slot) = out.first_mut() {
-            *slot = 0;
+            *slot = Row { at: 0, line: 0 };
         }
     }
     let mut row = 0usize;
     let mut col = 0usize;
     let mut i = 0usize;
+    let mut line = 0u32;
     while i < len {
         let newline = text[i] == b'\n';
         i += 1;
         col += 1;
+        if newline {
+            line += 1;
+        }
         if newline || col == cols {
             row += 1;
             col = 0;
@@ -818,7 +977,7 @@ fn row_offsets(text: &[u8], cols: usize, first: usize, out: &mut [u32]) {
                 if slot >= out.len() {
                     return;
                 }
-                out[slot] = i as u32;
+                out[slot] = Row { at: i as u32, line };
             }
         }
     }
@@ -863,12 +1022,13 @@ static PROBE_AT: [AtomicU32; PROBES] = [const { AtomicU32::new(0) }; PROBES];
 static PROBE_PX: [AtomicU32; PROBES] = [const { AtomicU32::new(0) }; PROBES];
 static PROBE_N: AtomicUsize = AtomicUsize::new(0);
 
-fn paint(fill: Fill, text: &[u8], page: Page, watch: Watch) {
+fn paint(fill: Fill, view: View, page: Page, watch: Watch) {
     let Some(fb) = snapshot() else { return };
     if !mapped(&fb) {
         return;
     }
     let Some((cols, grid_rows)) = geometry(&fb) else { return };
+    let text = view.text;
     let len = text.len();
     let (total, pages, per) = pagination(text, cols, grid_rows);
     // `Last` is the newest `per` rows rather than page `pages - 1`, so the two
@@ -892,7 +1052,7 @@ fn paint(fill: Fill, text: &[u8], page: Page, watch: Watch) {
 
     // The only array in this module and the one place the stack budget
     // stretches; `per <= MAX_ROWS` is what keeps the slice in bounds.
-    let mut row_start = [0u32; MAX_ROWS];
+    let mut row_start = [Row { at: 0, line: 0 }; MAX_ROWS];
     let draw = per.min(total - first).min(MAX_ROWS);
     row_offsets(text, cols, first, &mut row_start[..draw]);
 
@@ -902,9 +1062,12 @@ fn paint(fill: Fill, text: &[u8], page: Page, watch: Watch) {
     let mut inked = 0usize;
     let mut probes = 0usize;
     for r in 0..draw {
-        let start = row_start[r] as usize;
-        let color = if has_alert(text, start, len, cols) { alert } else { white };
-        let mut off = start;
+        let row = row_start[r];
+        // **The colour comes from the record's `Level`**, so it holds for every
+        // display row a wrapped line occupies rather than only the one the
+        // marker happened to land on.
+        let color = if view.is_alert(row.line as usize) { alert } else { white };
+        let mut off = row.at as usize;
         let mut c = 0;
         while c < cols && off < len {
             let byte = text[off];
@@ -1030,27 +1193,6 @@ fn write_num(out: &mut [u8], v: usize) -> usize {
         out[i] = digits[n - 1 - i];
     }
     n.min(out.len())
-}
-
-/// Every fatal marker the kernel emits already matches this: `!!! PANIC !!!`,
-/// `!!! DOUBLE PANIC !!!`, `!!! FAULT ... RECURSIVE`, the reentry line. Three
-/// bytes per column is what makes a phone photo of 50 lines of text usable.
-fn has_alert(text: &[u8], start: usize, len: usize, cols: usize) -> bool {
-    let mut run = 0;
-    let mut off = start;
-    let mut c = 0;
-    while c < cols && off < len {
-        if text[off] == b'\n' {
-            break;
-        }
-        run = if text[off] == b'!' { run + 1 } else { 0 };
-        if run == 3 {
-            return true;
-        }
-        off += 1;
-        c += 1;
-    }
-    false
 }
 
 /// Whether the first and last framebuffer pages resolve in the *current* CR3.
