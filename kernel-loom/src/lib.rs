@@ -111,3 +111,6 @@ pub mod shootdown;
 
 #[path = "../../kernel/src/log/shard.rs"]
 pub mod log_shard;
+
+#[path = "../../kernel/src/log/registry.rs"]
+pub mod log_registry;

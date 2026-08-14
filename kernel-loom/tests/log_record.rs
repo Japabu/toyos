@@ -214,3 +214,54 @@ fn a_concurrent_reader_sees_head_grow_and_never_shrink() {
         assert_eq!(shard.head(), FIRST_SEQ + 1);
     });
 }
+
+/// **W4b — a key and the record it names are one generation.**
+///
+/// `Shard::at_ns` is a second reader over the same slot, and it exists because
+/// the merge compares timestamps: holding whole records instead would put eight
+/// kilobytes on a stack the double-fault path has sixteen of. A second reader is
+/// a second chance to get the seqlock wrong, and this is the model that says so
+/// — every other model here drives `read`, so all five of them stay green with
+/// `at_ns`'s `Acquire` weakened to `Relaxed`.
+///
+/// The slot is filled with an older generation first, so "stale" and "fresh"
+/// are distinguishable rather than merely plausible: a reader that answers with
+/// generation one's timestamp for generation two's sequence number would order
+/// the merge by a key the record it then copies does not have.
+#[test]
+fn a_key_and_the_record_it_names_come_from_one_generation() {
+    loom::model(|| {
+        let shard = Arc::new(Shard::new());
+        // One full lap, so the slot `target` lands in already holds a record
+        // with a different timestamp in it.
+        for _ in 0..SHARD_RECORDS {
+            commit_one(&shard);
+        }
+        let target = FIRST_SEQ + SHARD_RECORDS as u64;
+
+        let writer = shard.clone();
+        let w = loom::thread::spawn(move || {
+            // SAFETY: this thread is the shard's sole writer.
+            let guard = kernel_loom::arch::LogCommitGuard::close();
+            let seq = unsafe { writer.reserve(&guard) };
+            let r = record(seq);
+            unsafe { writer.commit(seq, &r, &guard) };
+        });
+
+        // Racing the recycle: nothing, or this generation's own key.
+        if let Some(at_ns) = shard.at_ns(target) {
+            assert_eq!(
+                at_ns,
+                record(target).at_ns,
+                "a key from the generation the slot used to hold"
+            );
+        }
+
+        w.join().unwrap();
+        assert_eq!(shard.at_ns(target), Some(record(target).at_ns));
+        // And the key the merge orders by is the one the copy it then makes
+        // carries, which is the property the two readers exist to share.
+        let got = shard.read(target).expect("committed once the writer has joined");
+        assert_eq!(shard.at_ns(target), Some(got.at_ns));
+    });
+}

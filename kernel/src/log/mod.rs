@@ -7,10 +7,12 @@
 //!
 //! `specs/log-architecture-spec.md` §2.
 
+pub mod elide;
 pub mod read;
+pub mod registry;
 pub mod shard;
 
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use toyos_abi::log::{LogRecord, FLAG_EARLY, MAX_LOG_SHARDS, MAX_RECORD_MESSAGE};
 
@@ -31,46 +33,18 @@ pub static PERCPU_READY: AtomicBool = AtomicBool::new(false);
 /// Zeroed, so it costs `.bss` and not 128 KiB of kernel image.
 pub static BOOT_SHARD: Shard = Shard::new();
 
-/// Every other CPU's shard, published as the BSP builds that CPU's `PerCpu`.
-///
-/// **A reader cannot find a shard the way a writer does.** `emit` reads its own
-/// through `gs:`, and there is no `gs:` for somebody else's CPU — so the shards
-/// a merge walks have to be reachable from a plain static. cpu0's is
-/// [`BOOT_SHARD`] and needs no slot here: it is reachable from the kernel's
-/// first instruction, which is where the boot the panel exists to report
-/// begins.
-///
-/// Written once per CPU, before that CPU executes an instruction, and never
-/// cleared — a CPU does not stop having said what it said.
-static AP_SHARDS: [AtomicPtr<Shard>; MAX_LOG_SHARDS - 1] =
-    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_LOG_SHARDS - 1];
-
 /// The ABI fixes how many shards a cursor can name, so the kernel is what must
 /// agree with it rather than the other way round.
 const _: () = assert!(crate::sched::MAX_CPUS <= MAX_LOG_SHARDS);
 
-/// Make an AP's shard reachable to a reader. Called once per AP from
-/// `alloc_percpu`, on the BSP, before that AP executes an instruction.
-///
-/// **cpu0 is not a caller and does not get an arm here.** Its shard *is*
-/// [`BOOT_SHARD`], which `shards` returns unconditionally, so `alloc_log_shard`
-/// returns before reaching this — and a zero arriving anyway is a caller that
-/// has changed its mind about that, which is a kernel bug and dies as one
-/// rather than being quietly absorbed.
-///
-/// The store is `Release` against `shards`' `Acquire`, and it publishes more
-/// than a pointer: the allocation was zeroed and its `head` written before this
-/// runs, and a reader that saw the pointer without that would read whatever the
-/// heap held under a slot's sequence number.
+/// Make an AP's shard reachable to a reader. `registry` is the mechanism and
+/// carries the argument; this is the kernel's registry bound to it.
 ///
 /// # Safety
 /// `shard` must be a live, initialised [`Shard`] that is never freed.
 pub unsafe fn publish_ap_shard(cpu: u32, shard: *mut Shard) {
-    let slot = (cpu as usize)
-        .checked_sub(1)
-        .and_then(|ap| AP_SHARDS.get(ap))
-        .unwrap_or_else(|| panic!("log: cpu{cpu} has no shard slot in an ABI of {MAX_LOG_SHARDS}"));
-    slot.store(shard, Ordering::Release);
+    // SAFETY: the caller's contract is this one.
+    unsafe { registry::publish(registry::kernel_slots(), cpu, shard) };
 }
 
 /// Every shard a reader can reach, cpu0 first. `None` is a CPU this machine
@@ -78,11 +52,8 @@ pub unsafe fn publish_ap_shard(cpu: u32, shard: *mut Shard) {
 pub fn shards() -> [Option<&'static Shard>; MAX_LOG_SHARDS] {
     let mut out = [None; MAX_LOG_SHARDS];
     out[0] = Some(&BOOT_SHARD);
-    for (slot, published) in out[1..].iter_mut().zip(AP_SHARDS.iter()) {
-        let ptr = published.load(Ordering::Acquire);
-        // SAFETY: `publish_shard`'s contract is a live shard that is never
-        // freed, and the pointer is only ever written once.
-        *slot = (!ptr.is_null()).then(|| unsafe { &*ptr });
+    for (ap, slot) in out[1..].iter_mut().enumerate() {
+        *slot = registry::published(registry::kernel_slots(), ap);
     }
     out
 }

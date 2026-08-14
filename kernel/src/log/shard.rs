@@ -27,7 +27,8 @@ use toyos_abi::log::{LogRecord, MAX_RECORD_MESSAGE};
 #[cfg(not(feature = "loom"))]
 use toyos_abi::log::RECORD_BYTES;
 
-/// Slots per CPU: 128 KiB, and 1 MiB at the shipped eight.
+/// Slots per CPU: 512 KiB at `RECORD_BYTES` of 1024, and 4 MiB at the shipped
+/// eight. `specs/log-architecture-spec.md` §13.3 is the ruling that bought it.
 ///
 /// **Sized by records emitted before a reader exists**, which is the only
 /// quantity this bound has to cover — after that `klogd` and `/bin/logd` are
@@ -201,8 +202,8 @@ impl Shard {
     ///
     /// Zero is the valid empty state of every slot, but it is not the initial
     /// reservation counter: issued sequence numbers start at [`FIRST_SEQ`].
-    /// Keeping this as an in-place constructor avoids materialising a 128 KiB
-    /// [`Shard`] on the BSP's stack.
+    /// Keeping this as an in-place constructor avoids materialising a 512 KiB
+    /// [`Shard`] on the BSP's 16 KiB stack.
     ///
     /// # Safety
     /// `ptr` must point to a zeroed, properly aligned, unpublished allocation
@@ -333,7 +334,7 @@ impl Shard {
     /// either been overwritten or was never issued. Both ends are checked
     /// against a word the reader loads anyway.
     ///
-    /// Zeroed slots rather than a filled sentinel is what keeps a 128 KiB shard
+    /// Zeroed slots rather than a filled sentinel is what keeps a 512 KiB shard
     /// in `.bss` instead of in the kernel image, and what gives the static and
     /// the allocated shards one initialisation story. [`FIRST_SEQ`] is what
     /// stops the zeroed state colliding with an issued number.

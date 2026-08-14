@@ -326,8 +326,8 @@ sink and `klogd`).
 
 ```rust
 // toyos-abi/src/log.rs — one layout, two types over it
-pub const MAX_RECORD_MESSAGE: usize = 224;
-pub const RECORD_BYTES: usize = 256;
+pub const MAX_RECORD_MESSAGE: usize = 992;
+pub const RECORD_BYTES: usize = 1024;
 
 /// What a reader gets. Plain POD, `Copy`, no interior mutability: this is what
 /// `SYS_LOG_READ` copies out and what the `Display` in §3.3 renders.
@@ -375,15 +375,26 @@ field named `commit` that commits nothing. The layout is one thing and the two
 `const` assertions above are what keep it one; the *types* say which side is
 which. §10's L4 delivers both.
 
-**Why 224 bytes of message.** Measured over every committed T14 log
+**Why 992 bytes of message.** Measured over every committed T14 log
 (`cat specs/metal-logs/*/*.log`, message length after the `[kernel … ] ` prefix):
 12,497 lines, min 14, p50 **59**, p90 **111**, p99 **154**, p999 **857**,
 max **863**. Everything above 200 characters is one call site — a `{:?}` of
-`KernelArgs`, 18 lines of the 12,497 (0.14%). So 224 covers 99.86% of the tree's
-own output, and the one site that exceeds it is a struct dump that L1 splits into
-several records rather than being truncated. A message past the bound is
-truncated **and says by how much**; `elided` is not decoration, it is the
-difference between a bound and a lie.
+`KernelArgs`, 18 lines of the 12,497 (0.14%), and L2 splits it into six records
+because it is a producer the kernel can split.
+
+**224 was this document's first answer and it was wrong for the corpus it was
+derived from.** That corpus is boots, and **none of them contains a panic
+backtrace** — a frame carries a demangled Rust symbol whose width nothing in the
+kernel bounds. 992 is the next power-of-two record above the measured maximum
+(863), so every ordinary line in the corpus now fits *whole*; `RECORD_BYTES`
+stays a power of two, which is the shift-indexing invariant a reader depends on.
+Ruled 2026-08-14 under the owner's delegation, recorded in
+`specs/issues/diagnostics/a-record-cannot-hold-a-demangled-frame.md` and landed
+as #57. **It does not bound a symbol** — nothing does — so a backtrace frame
+elides its symbol head-and-tail at the producer (§2.1a).
+
+A message past the bound is truncated **and says by how much**; `elided` is not
+decoration, it is the difference between a bound and a lie.
 
 **Why fixed-size.** A variable-length record needs a descriptor ring and a data
 ring and an argument about the two staying consistent. A fixed-size POD record
@@ -392,8 +403,9 @@ figures it is priced against are different quantities that both land near 90 —
 **CONFIRMED**: the mean *rendered line* over the corpus is **89.4 bytes**
 (prefix included, which is what a byte ring stores and what §14's 2.8× compares
 against), and the mean *record payload* is 32 bytes of header plus a 68.2-byte
-mean message, **100.2 bytes** of the 256 (which is what §3.2's copy-out waste is
-measured against).
+mean message, **100.2 bytes** of the 1024 (which is what §3.2's copy-out waste
+is measured against, and the waste grew with the record: the bound is sized by
+the tail of the distribution, not by its mean).
 
 **`Level` has three variants and each has callers today.**
 
@@ -450,6 +462,39 @@ may be merged out of order by the skew; nothing breaks and the reader cannot tel
 Stated rather than assumed, and it is the same assumption `clock.rs` already makes
 machine-wide.
 
+### 2.1a A symbol nothing bounds keeps both its ends
+
+`kernel/src/log/elide.rs`. A backtrace frame renders
+`    {addr:#x}  {symbol}+{offset:#x}`, and the symbol is the only part of it
+whose width the kernel does not choose: `late_panic::Nest` is a generic nested
+in itself and nothing stops it being nested again. So the *record* bound cannot
+be the answer — raising it moves the cliff and never removes it — and the
+question is instead which bytes of an over-wide name survive.
+
+**Both ends.** The head is the crate and the module path; the tail is the
+function, which is the half a backtrace is read for and the half plain
+truncation drops. `screen_late_panic`'s `check_wrap` asserts on the tail for
+that reason.
+
+**At the producer, and that is what keeps everything else honest.** The record
+then holds a whole message, `elided` still means "bytes past the bound" rather
+than "bytes out of the middle", and the ABI's one formatter needs no second
+convention. `...[N bytes elided]...` is ASCII because the panel's font is
+codepoints 0x20..=0x7E.
+
+The budget is `MAX_RECORD_MESSAGE` minus the frame's own text, and **the marker
+comes out of it first** — a split that spent the whole budget on head and tail
+and then wrote the marker between them put the line back over the bound and cost
+it the tail. `const` assertions in `kernel/src/symbols.rs` hold the arithmetic.
+
+**No guest test reaches it at the shipped bound, and that is stated rather than
+implied.** The tree's own widest symbol is `late_panic::Nest` at 288 bytes
+against a budget of 928, so `screen_late_panic` proves the panel keeps a
+symbol's tail and proves nothing about the elision. The seams — a character
+straddling the head cut, a character straddling the start of the tail, a value
+arriving one character at a time — are checked on the host by `kernel-elide`,
+which compiles the kernel file itself rather than a transliteration of it.
+
 ### 2.2 The shard
 
 ```rust
@@ -462,7 +507,7 @@ pub struct Shard {
     slots: [Slot; SHARD_RECORDS],
 }
 
-pub const SHARD_RECORDS: usize = 512;      // 128 KiB per CPU
+pub const SHARD_RECORDS: usize = 512;      // 512 KiB per CPU
 ```
 
 One shard per CPU. cpu0's is a `static` in `.bss`, because `log!` runs before the
@@ -490,7 +535,7 @@ issued sequence 0, collided with every slot's empty-state word, and was
 deterministically unreadable. `Shard::initialize_zeroed` now writes
 `AtomicU64::new(FIRST_SEQ)` into the unpublished allocation in place; the slots
 stay zero. Constructing a full `Shard::new()` value and moving it is rejected
-because it can materialise 128 KiB on the BSP's 16 KiB stack. The host-fast
+because it can materialise 512 KiB on the BSP's 16 KiB stack. The host-fast
 `log_zeroed_init` test allocates the real layout with `alloc_zeroed`, runs this
 constructor, and proves the first reservation is `FIRST_SEQ`.
 
@@ -526,11 +571,20 @@ loses its oldest records slightly sooner than today. What it gains in exchange i
 that it loses *only its own*, and that §2.6 makes the loss exact. Recorded as a
 trade rather than a win.
 
-**Memory.** 128 KiB per CPU; at the shipped `sched::MAX_CPUS = 8`, **1 MiB**,
+**Memory.** 512 KiB per CPU; at the shipped `sched::MAX_CPUS = 8`, **4 MiB**,
 against today's single 64 KiB ring. At the 128-core target root `CLAUDE.md` sets
-it is 16 MiB, which is 0.2% of an 8 GiB machine; the escape, if that is ever
+it is **64 MiB**, which is 0.8% of an 8 GiB machine; the escape, if that is ever
 judged too much, is to scale `SHARD_RECORDS` down above 16 CPUs, and it is one
 line. Named so the number is a decision and not a discovery.
+
+**These are the ruled figures and not the drafted ones.** This section was
+written against a 256-byte record, and the ruling recorded in
+`specs/issues/diagnostics/a-record-cannot-hold-a-demangled-frame.md` raised
+`MAX_RECORD_MESSAGE` to 992 and `RECORD_BYTES` to 1024 — landed as #57, closed
+by this branch's `b9b0857`. The +3 MiB at eight CPUs was bought deliberately
+under that delegation; what was not done at the time was to carry the number
+into every place this document states it, which is what the figures above and in
+§13.3 now do.
 
 **`MAX_CPUS` is declared three times in this kernel** — `sched/mod.rs:19`,
 `trace.rs:41`, `shootdown.rs:34`, all `8`. The shard array uses `sched::MAX_CPUS`
@@ -546,14 +600,14 @@ pub fn emit(level: Level, args: core::fmt::Arguments);
 
 `log!`, `alert!` and `boot_phase!` expand to exactly this. Steps:
 
-1. **Format into a stack buffer.** `MessageBuf` is 224 bytes plus a counter, on
+1. **Format into a stack buffer.** `MessageBuf` is 992 bytes plus a counter, on
    the caller's stack, implementing `core::fmt::Write`; overflow increments
    `elided` and writes nothing. Formatting is *outside* every critical section —
    today it happens inside `SerialWriter`, which is at least a lock the code
    claims to hold.
    Stack budget: the smallest kernel stack in the machine is IST1 and the idle
-   stack, both **16384** bytes (`percpu.rs:246`, `:204`), and 224 bytes is 1.4%
-   of one. The 512-byte drain buffers that used to live on those stacks go away
+   stack, both **16384** bytes (`percpu.rs:246`, `:204`), and 992 bytes is 6.1%
+   of one. §2.3b is the measured budget for the whole fatal path. The 512-byte drain buffers that used to live on those stacks go away
    entirely (§8).
 2. **Close one publication guard.** `LogCommitGuard::close()` saves RFLAGS and
    clears both `IF` and `TF`. Inside it, read this CPU's shard pointer and
@@ -562,10 +616,12 @@ pub fn emit(level: Level, args: core::fmt::Arguments);
    *interrupt-atomic, not SMP-atomic; sound only for a counter one CPU writes*.
 3. **Write and commit before reopening the guard.** Fill the record's five
    identity fields, store `WRITING`, perform the release fence, copy the
-   248-byte body into `shard.slots[seq % SHARD_RECORDS]`, and finally
+   1016-byte body into `shard.slots[seq % SHARD_RECORDS]`, and finally
    `slot.seq.store(seq, Release)`. Only then restore the caller's complete
-   RFLAGS. Formatting and the 224-byte message copy into the local `LogRecord`
-   remain outside; §2.3a says why reservation through final publication cannot.
+   RFLAGS. Formatting remains outside; §2.3a says why reservation through final
+   publication cannot. **The timestamp does not** — it is read inside the guard,
+   one instruction from the `xadd`, which is what makes a shard's sequence order
+   its timestamp order and `read.rs`'s descent sound.
 4. **Read the waiter flag after the guarded commit**: `signal_after_commit()` —
    `fence(SeqCst)`, `LOG_WAITER.load(Relaxed)`, and on `true` the swap that
    admits one poster per park (§2.5, §2.6a).
@@ -1873,7 +1929,7 @@ stronger under review, not weaker.**
 
 | cost | size |
 |---|---|
-| reserved RAM | one shard's worth, 128 KiB, is the natural unit |
+| reserved RAM | one shard's worth, 512 KiB, is the natural unit |
 | bootloader | a new `KernelArgs::pstore_{addr,len}`, and a memory-map entry the kernel must not hand to the allocator |
 | kernel | a panic-path copy that takes no lock and allocates nothing (it already has `snapshot_committed`, so this is a memcpy and a CRC), plus a boot-path validate |
 | ABI | one flag on `SYS_LOG_READ` selecting the previous-boot region |
@@ -2360,7 +2416,7 @@ rebase, never amend.
 | **L0** | merge `origin/main` (**post-endowment, and that is the whole of it** — completions lands after this branch, §12). Re-derive every number in this spec against the merged tree; re-check §12.5's endowment rows against the merged *code* and not only its plan; compute the first clean syscall number. **Nothing about the completion core is confirmable here and L0 must not wait on it** — §2.6a needs nothing from it. **Done 2026-08-11 against `f1724a9`; §0.0 is the walk** | suite green; §0.0 accounts for every moved row; the baselines of §9.3 recorded here |
 | **L-ABI** | **its own branch off `main`, landed before L1** (§11). `toyos-abi/src/log.rs` — `LogRecord`, `Level`, `LogCursor` with its clamped `durable`, `MAX_LOG_SHARDS`, the two layout `const` assertions and the `Display` of §3.3; `SYS_LOG_READ = 114`; `Rights::LOG`; the `toyos` SDK wrapper. **No kernel dispatch**: there is no shard to read until L1, so the number falls to the dispatch's default and answers `InvalidArgument`, which is what an unassigned number answers | `cargo test` in `toyos-abi/`: the layout asserts, and the `Display` rendering a known record byte for byte |
 | **L1** | `kernel/src/log/`: `Slot` over L-ABI's `LogRecord` and `Level`, `Shard`, `emit` with §2.3a's bracket, `log!`/`alert!`/`boot_phase!`, the seven `alert!` conversions **carrying the level with their text unchanged** (below). Wired **behind** the existing byte ring — every `emit` also does today's `write_chunk`, so nothing observable changes. The AP shard in `alloc_percpu` (§2.2) | `kernel-loom/tests/log_record.rs` (W1, W2, W4); host-fast `log_zeroed_init`; the full suite indistinguishable from `main`'s; the boot A/B of §9.6. W2b's CPU-flags negative arrives with `log_nested_emit` at L4 |
-| **L2** | `snapshot_committed`; `panic_console`, `boot_checkpoint` and `sched::dump` re-pointed at records and at `Level`; **the `!!!` sentinel deleted from the seven `alert!` texts and from the ~20 assertions that read it**; the `KernelArgs` `{:?}` site split into several records; `Mark` → a pair of instants; the backtrace producer's head-and-tail elision, and `nmi_does_not_log`'s two clauses with it | `screen_panic_muted`, `screen_fatal_halt`, `screen_fatal_halt_composited`, `blocked_dump`, `screen_blocked_dump`, `dump_nmi_probe`, `screen_console_*` all green; `screen_late_panic`, whose stimulus is a symbol wider than any grid |
+| **L2** | `snapshot_committed`; `panic_console`, `boot_checkpoint` and `sched::dump` re-pointed at records and at `Level`; **the `!!!` sentinel deleted from the seven `alert!` texts and from the ~20 assertions that read it**; the `KernelArgs` `{:?}` site split into several records; `Mark` → a pair of instants; the backtrace producer's head-and-tail elision (§2.1a), and `nmi_does_not_log`'s two clauses with it | `screen_panic_muted`, `screen_fatal_halt`, `screen_fatal_halt_composited`, `blocked_dump`, `screen_blocked_dump`, `dump_nmi_probe`, `screen_console_*` all green; `screen_late_panic`, whose stimulus is a symbol wider than any grid — **it gates the panel keeping a tail and not the elision**, which is `kernel-elide`'s nine host tests |
 | **L3** | `drain_ordered`, with the first caller that streams; `Drain::{Inline,Thread}`; **the kernel-thread machinery for one thread** (§4.3) — trampoline, kernel-address-space `ProcessObject`, `driver::spawn`, dump naming, the recoverable-panic predicate with `klogd`'s non-recoverable row; `klogd`'s body and §2.6a's wake (`signal_after_commit`/`arm_waiter`, the IRQ-off `PreemptGuard` witness, `wake_direct`, the park-lot park); `panic_flush`/`flush_final` on records; `log_file::poll` re-pointed at a `drain_ordered` cursor so the file sink survives; **`object/ops.rs:469`'s console arm re-pointed straight at `BackendGuard`** (§8.1) so the chunk builds. **Delete `log_ring.rs` whole**, `SerialWriter`, `drain_serial` and the idle loop's serial statement; **delete the `:523` pre-`hlt` condition** | `kernel-loom/tests/log_wake.rs` (W3, with its negative case); `pre_idle_wedge_speaks`; the `--slow-usb` A/B unmoved (nothing about the disk has changed yet); §9.6's `Drain::Inline` measurement and the fence's A/B |
 | **L4** | the kernel's half of L-ABI, which touches no sysroot source: the `SYS_LOG_READ` dispatch over `drain_ordered`, `Source::Log` and its watcher static (§3.2), `logread` in `toyos_manifest`'s `SYSCAP_RIGHTS` and on `test-runner`'s row in the six test configs that have one | `test-runner` reads its own kernel log and §9.1's conservation law holds across the syscall |
 | **L5** | one `ConsoleObject` per endowment over one backend, its line buffer, `Console` losing `DUP`; the ANSI strip moves; `MAX_CONSOLE_LINE` | `console_line_atomicity`; `console-unbuffered` reds both its clauses; `one_console_holder` |
@@ -2741,7 +2797,7 @@ under each is what binds. Nothing in §13 is an open question any more.
 with the metal arm filed as owed.** The gate it can have proves the format and
 the code path and says nothing about firmware, and the case it covers is the four
 panics where the panel is the only copy — which on the T14 means a photograph.
-The costs are 128 KiB of reserved RAM, a `KernelArgs` field, a bootloader change,
+The costs are 512 KiB of reserved RAM, a `KernelArgs` field, a bootloader change,
 one `SYS_LOG_READ` flag, and a promise that is best-effort on real hardware.
 
 ### 13.2 One pull request, or an ABI-only one first — §11
@@ -2761,16 +2817,21 @@ false claim. Recommended: an ABI-only pull request at the L4 boundary, then the
 rest on the same branch. The alternative is to accept the trailer with a reason
 that is not true, which is worse than the extra landing.
 
-### 13.3 Memory — 1 MiB of per-CPU record ring at the shipped 8 CPUs
+### 13.3 Memory — 4 MiB of per-CPU record ring at the shipped 8 CPUs
 
-**Ruled 2026-08-09: accepted.** The 16 MiB at 128 cores is accepted with it, and
-the named escape stays available rather than pre-emptively taken.
+**Ruled 2026-08-09: accepted, at 1 MiB.** **Re-ruled 2026-08-14 at 4 MiB**, by
+the owner-delegated call recorded in
+`specs/issues/diagnostics/a-record-cannot-hold-a-demangled-frame.md`: the record
+holds 992 message bytes rather than 224 so that every ordinary line measured in
+§2.1 fits whole, which is a 1024-byte record and therefore 512 KiB a CPU. The
+64 MiB at 128 cores is accepted with it, and the named escape stays available
+rather than pre-emptively taken.
 
 §2.2. Today's log costs 64 KiB. The increase buys fixed-size records (which is
 where the atomicity property comes from) times eight CPUs, and 512 slots so
 cpu0's whole boot survives until logd runs — 185 records measured, 2.7× headroom.
-16 MiB at the 128-core target. The escape is one line and is named. Note that
-seven eighths of it is seven 128 KiB `alloc_zeroed`s from the kernel heap at AP
+64 MiB at the 128-core target. The escape is one line and is named. Note that
+seven eighths of it is seven 512 KiB `alloc_zeroed`s from the kernel heap at AP
 bring-up, which is where the idle and IST1 stacks already come from.
 **Recorded rather than asked — and then put to him anyway; see this section's ruling above.**
 

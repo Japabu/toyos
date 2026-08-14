@@ -83,7 +83,8 @@ jobs:
           set -e -o pipefail
           for crate in toyos-sched toyos-ps2 toyos-gpt toyos-elf toyos-cc \
                        toyos-ld toyos-hda toyos-pci toyos-xhci toyos-desktop \
-                       kernel-loom kernel-span toyos-fat32 toyos-fat32-check; do
+                       kernel-loom kernel-span kernel-elide toyos-fat32 \
+                       toyos-fat32-check; do
             echo "=== $crate" | tee -a /tmp/host.log
             cargo test --manifest-path "$crate/Cargo.toml" 2>&1 | tee -a /tmp/host.log
           done

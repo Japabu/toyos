@@ -272,6 +272,21 @@ const IDLE_GUARD_SIZE: usize = 4096;
 /// double, which is the margin `double_fault_stack` asserts. It costs 20 KiB
 /// per CPU with the guard, against the 16 KiB each already pays for an idle
 /// stack.
+///
+/// **The record ring widened this path and the number is re-measured, not
+/// re-argued: 7,488 bytes**, `ist1_report` off a real #DF on three consecutive
+/// runs of `double_fault_stack`, guard intact. It is taken after `render` and
+/// after `panic_flush`, so it covers the deepest the report goes — the record
+/// merge and the paint included. The margin the gate asserts still holds:
+/// 7,488 doubled is 14,976 of 16,384.
+///
+/// Where it went, largest first, at `RECORD_BYTES` of 1024: `emit`'s
+/// `LogRecord` (1,024) beside `SerialWriter`'s line buffer (1,024) and the `Body`
+/// its `commit` stores (1,016); `snapshot_committed`'s one materialised record
+/// (1,024) and its eight `Descent`s (384); `paint`'s row table (768). The
+/// elision's tail buffer (451) is on a branch no symbol in this tree reaches.
+/// It was 4,512 before the record ring, so the ring cost 2,976 bytes of a
+/// stack with 8,896 still free.
 const IST1_STACK_SIZE: usize = 16384;
 
 /// Filled with [`STACK_FILL`] and never written by anything legitimate, so an

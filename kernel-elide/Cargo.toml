@@ -1,0 +1,21 @@
+[package]
+name = "kernel-elide"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# This package exists only to run `kernel/src/log/elide.rs` — the head-and-tail
+# rendering of a name wider than a log record can carry — on the host, where a
+# seam falling inside a four-byte character costs milliseconds to check and no
+# guest at all. The file is compiled into this crate rather than transliterated:
+# a transliteration is a second copy of the seam arithmetic, and this exists
+# because the first copy is the one that must be right.
+#
+# `kernel-span`'s arrangement, for `kernel-span`'s reason: it sits beside
+# `kernel/` rather than inside it because `kernel/.cargo/config.toml`
+# cross-compiles everything below it to `x86_64-unknown-none`, and cargo refuses
+# to merge an inherited `build.target` away.
+[workspace]
+
+[dependencies]
