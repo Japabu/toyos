@@ -18,6 +18,23 @@ hardware inventories.
 Work narration is not committed to `specs/`; it belongs in commit messages
 and pull-request bodies.
 
+## What a spec contains
+
+A document in `specs/` proper states the system, and only that: invariants
+and requirements, interface and protocol semantics, failure semantics,
+exclusions. Diagrams are welcome. A policy number appears when the number
+itself is the policy.
+
+It contains no code — no snippets or pseudocode, no type, function or test
+names as exposition, no file paths or line numbers. No goals, purpose
+sections, or justification prose; a rule carries one clause of reason only
+where its removal would make the rule ambiguous. No history, measurements,
+dates, or provenance. No references into `plans/`, `assessments/`,
+`issues/`, a `CLAUDE.md`, or the source tree — a sibling spec may be
+referenced, and a plan references its spec, never the reverse. No
+self-reference and no slogans. The testing documents are the one exception
+for naming instruments and tests: there, the instruments are the subject.
+
 ## Checking a spec against the tree it describes
 
 A spec is read before its subsystem is touched, so a false claim propagates

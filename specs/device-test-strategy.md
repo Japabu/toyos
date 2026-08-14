@@ -1,8 +1,7 @@
 # Device and driver testing strategy
 
 Rules for testing code that talks to hardware. Gate A (audio) and gate N
-(`specs/plans/net-gate-plan.md`) are instances; the staged build-out is
-`specs/plans/device-test-plan.md`.
+(network) are instances.
 
 ## Ground truth and actuation
 
@@ -81,7 +80,7 @@ reproducible from a seed, and has negative gates proving it can still fail
 
 **Load the guest, never the host.** Host load degrades the instrument, not
 the system under test. Guest load is a first-class configuration:
-`audio_tone_load` runs CPU burners inside ToyOS (audio spec §5.10).
+`audio_tone_load` runs CPU burners inside ToyOS.
 
 **No distributional tier per device.** Gate A's exists because audio failures
 are statistical. Storage and USB failures are deterministic: a per-run
@@ -91,8 +90,7 @@ assertion catches them, and a distribution is expensive noise.
 
 Certify every new observer against a known-good and a known-bad capture
 before trusting a green run, and prove each new assertion by breaking what it
-guards and watching it go red (`specs/assessments/audio-gate-history.md`
-records the instrument defects this rule exists for).
+guards and watching it go red.
 
 An absence test asserts on the mechanism, not on a name: a profile that
 certifies "no USB HID" by grepping argv for `usb-kbd` passes with a
