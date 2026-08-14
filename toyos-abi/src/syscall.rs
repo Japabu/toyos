@@ -220,13 +220,14 @@ pub const SYS_DEVICE_CLAIM: u64 = 111;
 /// [`Rights::RT`]: crate::handle::Rights::RT
 pub const SYS_RT_ENTER: u64 = 112;
 
-// Number 113 is **reserved, not free**: it is `SYS_PORT_REARM`
-// (`specs/capability-endowment-spec.md` §12), which mints a fresh `Acceptor`
-// for a port whose server died and is the one thing that would make any
-// `serves` daemon restartable. Nothing needs it yet, so nothing is built.
+// Number 113 is **reserved, not free**: it is held for `SYS_PORT_REARM`,
+// which would mint a fresh `Acceptor` for a port whose server died and is
+// the one thing that would make any `serves` daemon restartable
+// (`specs/capability-endowment-spec.md` reserves the number). Nothing needs
+// it yet, so nothing is built.
 //
 // 115 is likewise held, for `SYS_SLEEP_UNTIL`
-// (`specs/completion-architecture-spec.md`), which replaces a retired
+// (`specs/plans/iouring-blocking-spec.md`), which replaces a retired
 // `SYS_NANOSLEEP`.
 //
 // **Both are recorded here rather than in those specs alone**, because this
