@@ -49,20 +49,26 @@ static AP_SHARDS: [AtomicPtr<Shard>; MAX_LOG_SHARDS - 1] =
 /// agree with it rather than the other way round.
 const _: () = assert!(crate::sched::MAX_CPUS <= MAX_LOG_SHARDS);
 
-/// Make `cpu`'s shard reachable to a reader. Called once per CPU from
-/// `alloc_percpu`, on the BSP.
+/// Make an AP's shard reachable to a reader. Called once per AP from
+/// `alloc_percpu`, on the BSP, before that AP executes an instruction.
+///
+/// **cpu0 is not a caller and does not get an arm here.** Its shard *is*
+/// [`BOOT_SHARD`], which `shards` returns unconditionally, so `alloc_log_shard`
+/// returns before reaching this — and a zero arriving anyway is a caller that
+/// has changed its mind about that, which is a kernel bug and dies as one
+/// rather than being quietly absorbed.
+///
+/// The store is `Release` against `shards`' `Acquire`, and it publishes more
+/// than a pointer: the allocation was zeroed and its `head` written before this
+/// runs, and a reader that saw the pointer without that would read whatever the
+/// heap held under a slot's sequence number.
 ///
 /// # Safety
 /// `shard` must be a live, initialised [`Shard`] that is never freed.
-pub unsafe fn publish_shard(cpu: u32, shard: *mut Shard) {
-    if cpu == 0 {
-        // cpu0's shard *is* the boot shard, so there is no handoff and nothing
-        // to publish; `shards` returns it unconditionally.
-        debug_assert!(core::ptr::eq(shard, &raw const BOOT_SHARD as *mut Shard));
-        return;
-    }
-    let slot = AP_SHARDS
-        .get(cpu as usize - 1)
+pub unsafe fn publish_ap_shard(cpu: u32, shard: *mut Shard) {
+    let slot = (cpu as usize)
+        .checked_sub(1)
+        .and_then(|ap| AP_SHARDS.get(ap))
         .unwrap_or_else(|| panic!("log: cpu{cpu} has no shard slot in an ABI of {MAX_LOG_SHARDS}"));
     slot.store(shard, Ordering::Release);
 }
@@ -230,24 +236,45 @@ fn on_a_thread(id: u32) -> u32 {
 
 /// The only producer.
 ///
-/// Steps, in order: format on the stack, prepare the body, then reserve and
-/// publish under one IF/TF-off bracket.
+/// Steps, in order: format on the stack, prepare the body, then stamp, reserve
+/// and publish under one IF/TF-off bracket.
 pub fn emit(level: Level, args: core::fmt::Arguments) {
-    let at_ns = crate::clock::nanos_since_boot();
-
-    let mut record = LogRecord { at_ns, level: level as u8, ..LogRecord::EMPTY };
+    let mut record = LogRecord { level: level as u8, ..LogRecord::EMPTY };
 
     // The byte ring's line is finished before the bracket opens, which is what
     // keeps the serial lock *out* of the interrupts-off window rather than
     // putting one inside it. Both sinks are fed from the one format pass either
     // way; L3 deletes this half.
-    let mut tee = Tee::open(at_ns, &mut record.msg);
+    //
+    // **Its timestamp is a second reading and is deliberately not the
+    // record's.** A prefix has to be written before the message it introduces,
+    // so this one is taken before the format pass — where the record's is taken
+    // inside the bracket, one instruction from the reservation it has to agree
+    // with. Today's prefix already reads its `cpu` and `tid` unbracketed for the
+    // same reason, and all three go with the byte ring at L3.
+    let mut tee = Tee::open(crate::clock::nanos_since_boot(), &mut record.msg);
     let _ = core::fmt::Write::write_fmt(&mut tee, args);
     record.len = tee.len as u16;
     record.elided = tee.elided.min(u16::MAX as usize) as u16;
     tee.finish();
 
     let guard = crate::arch::LogCommitGuard::close();
+    // **Stamped inside the bracket, and that is what makes a shard's records
+    // ordered by their timestamps at all.**
+    //
+    // Read outside it, a producer could be interrupted between the clock and
+    // the `xadd`: the handler's record then takes the *lower* sequence number
+    // and carries the *later* timestamp, so a descent by sequence number is not
+    // a descent by `at_ns` and `read.rs`'s reader would stop a shard on a record
+    // older than its window with live records still below it. IF and TF are
+    // clear across both here, so nothing on this CPU can come between them and
+    // the two orders are the same one. The NMI handler does not log (its own
+    // gate) and #MC halts rather than returning, which is what closes the two
+    // paths a bracket cannot.
+    //
+    // The cost is one `rdtsc` and one `__udivti3` inside the window, against a
+    // 1 KiB publication that is already in it.
+    record.at_ns = crate::clock::nanos_since_boot();
     let (origin, seq) = reserve(&guard);
     record.seq = seq;
     record.pid = origin.pid;

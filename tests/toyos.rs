@@ -2280,31 +2280,51 @@ fn report_is_photographable(dump: &screen::Ppm, what: &str) -> Result<(), String
     Ok(())
 }
 
-/// Assert the two colour decisions `text()` cannot see: the fill, and the
-/// alert highlight on an `alert!` row against white everywhere else.
+/// Assert the colour decisions `text()` cannot see: the fill, every row an
+/// `alert!` produced, and one row it did not.
 ///
-/// **Nothing in the text says "alert" any more.** The seven `alert!` messages
-/// used to carry `!!!` and the panel found its red row by scanning for it; the
-/// colour is the record's `Level` now, so the ordinary row this compares
-/// against is the first one the panel did *not* paint red rather than the first
-/// one without a marker in it.
-fn check_colors(dump: &screen::Ppm, fill: [u8; 3], alert_line: &str) -> Result<(), String> {
+/// **Both rows are named by their text, and that is the whole assertion.**
+/// Nothing in the message says "alert" any more — the colour is the record's
+/// `Level` — so a version of this that picked the ordinary row as "the first
+/// one that is not red" asserted only that the palette has two colours in it,
+/// and passed on a panel where every row was red. The comparison row has to be
+/// chosen by something the paint cannot influence, so the caller names it.
+///
+/// `alert_lines` is a list because **a record is not a line**: `PanicInfo`'s
+/// `Display` writes `panicked at <site>:`, a newline, and then the panic's own
+/// text, so one `alert!` produces two rows and both of them are the record's.
+/// A renderer that counted records where the panel counts newlines painted the
+/// first red and the second white, and shifted every bit below it.
+fn check_colors(
+    dump: &screen::Ppm,
+    fill: [u8; 3],
+    alert_lines: &[&str],
+    plain_line: &str,
+) -> Result<(), String> {
     if dump.fill() != fill {
         return Err(format!("fill is {:?}, want {fill:?}", dump.fill()));
     }
     let rows = dump.rows();
-    let Some(cy) = dump.row_index(alert_line) else {
-        return Err(format!("{alert_line:?} not on screen"));
-    };
-    if dump.row_fg(cy) != Some(ALERT) {
-        return Err(format!(
-            "{alert_line:?} drawn in {:?}, want alert {ALERT:?}",
-            dump.row_fg(cy)
-        ));
+    for alert_line in alert_lines {
+        let Some(cy) = dump.row_index(alert_line) else {
+            return Err(format!("{alert_line:?} not on screen\n{}", dump.text()));
+        };
+        if dump.row_fg(cy) != Some(ALERT) {
+            return Err(format!(
+                "{alert_line:?} drawn in {:?}, want alert {ALERT:?} — every row of an \
+                 `alert!` record wears its level, including the ones its message wrapped \
+                 or newlined onto\n{}",
+                dump.row_fg(cy),
+                dump.text()
+            ));
+        }
     }
-    let Some(plain) = (0..rows.len()).find(|&i| !rows[i].is_empty() && dump.row_fg(i) != Some(ALERT))
-    else {
-        return Err("no ordinary row to compare the highlight against".to_string());
+    let Some(plain) = dump.row_index(plain_line) else {
+        return Err(format!(
+            "{plain_line:?} is not on screen, so there is no ordinary row to compare the \
+             highlight against\n{}",
+            dump.text()
+        ));
     };
     if dump.row_fg(plain) != Some(WHITE) {
         return Err(format!(
@@ -2571,7 +2591,7 @@ fn run_screen_test(
             // Red, and the rest of the screen white. `text()` throws hue away
             // by construction, so this is the only place the difference between
             // "the line is there" and "the line stands out" exists.
-            check_colors(&dump, FILL_BOOT, common::volumes::NO_LOG_ALERT)?;
+            check_colors(&dump, FILL_BOOT, &[common::volumes::NO_LOG_ALERT], "Boot: complete")?;
             // And it is a boot checkpoint's paint rather than a panic's: the
             // fill above says so, and the machine is still running.
             if !text.contains("Boot: complete") {
@@ -3260,7 +3280,12 @@ fn run_screen_test(
                     ));
                 }
             }
-            check_colors(&dump, FILL_FATAL, "PANIC:")?;
+            check_colors(
+                &dump,
+                FILL_FATAL,
+                &["PANIC:", "test-late-panic: on-screen console check"],
+                "late_panic::Nest",
+            )?;
             Ok(())
         }
         "screen_early_panic" => {
@@ -3288,7 +3313,12 @@ fn run_screen_test(
                     return Err(format!("{want:?} not on screen\ndecoded screen:\n{text}"));
                 }
             }
-            check_colors(&dump, FILL_FATAL, "EARLY PANIC:")?;
+            check_colors(
+                &dump,
+                FILL_FATAL,
+                &["EARLY PANIC:", "test-early-panic: on-screen console check"],
+                "PAT:",
+            )?;
             Ok(())
         }
         "screen_late_panic" => {
@@ -3322,7 +3352,12 @@ fn run_screen_test(
                     return Err(format!("{want:?} not on screen\ndecoded screen:\n{text}"));
                 }
             }
-            check_colors(&dump, FILL_FATAL, "PANIC:")?;
+            check_colors(
+                &dump,
+                FILL_FATAL,
+                &["PANIC:", "test-late-panic: on-screen console check"],
+                "late_panic::Nest",
+            )?;
             check_wrap(&dump)?;
             Ok(())
         }

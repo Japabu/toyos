@@ -337,7 +337,7 @@ fn alloc_log_shard(cpu_id: u32) -> u64 {
     //
     // SAFETY: the allocation above is live for the life of the machine and is
     // initialised.
-    unsafe { log::publish_shard(cpu_id, ptr) };
+    unsafe { log::publish_ap_shard(cpu_id, ptr) };
     ptr as u64
 }
 

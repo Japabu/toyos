@@ -94,16 +94,18 @@ const MAX_ROWS: usize = 96;
 const SNAPSHOT_CAP: usize = 32 * 1024;
 const _: () = assert!(SNAPSHOT_CAP >= MAX_ROWS * MAX_COLS);
 
-/// The shortest line the record formatter can produce — `[0.000 cpu0]` and the
-/// space and newline around it — so no buffer here can hold more lines than
-/// this.
+/// One bit of `Rendered::alert` per byte a buffer can hold.
 ///
-/// It is what sizes `Rendered::alert`, and it is a floor rather than an
-/// average: a bitmap that ran out of bits would silently stop painting rows
-/// red.
-const MIN_LINE: usize = "[0.000 cpu0] \n".len();
-const MAX_LINES: usize = SNAPSHOT_CAP / MIN_LINE;
-const ALERT_WORDS: usize = MAX_LINES.div_ceil(64);
+/// **A line is a newline, and a record can carry as many as it has bytes.** An
+/// earlier size here divided the buffer by the shortest line the *record*
+/// formatter produces, which assumed one record was one line — and the first
+/// message that matters breaks it: `PanicInfo`'s `Display` writes
+/// `panicked at <site>:`, a newline, then the panic's own text, so the panic
+/// record is two lines and every bit below it was off by one. A message of
+/// nothing but newlines is one line per byte, so this is the only bound that
+/// cannot be argued with. 4 KiB per buffer, 12 KiB for the three, and no
+/// arithmetic anybody has to re-check.
+const ALERT_WORDS: usize = SNAPSHOT_CAP.div_ceil(64);
 
 /// How long each page stays up. Long enough to photograph, short enough that
 /// a five-page report cycles inside a 15-second video.
@@ -216,8 +218,6 @@ struct View<'a> {
 }
 
 impl View<'_> {
-    const NOTHING: View<'static> = View { text: &[], alert: &[0; ALERT_WORDS], lines: 0 };
-
     /// Whether line `n`, counted from the first, came from an `alert!`.
     fn is_alert(&self, n: usize) -> bool {
         let Some(from_end) = self.lines.checked_sub(n + 1) else { return false };
@@ -237,21 +237,27 @@ impl log::read::RecordSink for Backfill<'_> {
     fn put(&mut self, record: &toyos_abi::log::LogRecord) -> bool {
         let line = rendered_len(record).saturating_add(1);
         let Some(at) = self.at.checked_sub(line) else { return false };
-        if self.into.lines == MAX_LINES {
-            return false;
-        }
         let Some(out) = self.into.text.get_mut(at..self.at) else { return false };
         // The same formatter measured the line, so this fills the slot exactly.
         // A disagreement would leave zeroes rather than run past the end, which
         // is the only direction a paint can afford to be wrong in.
         let mut into = Into { out, at: 0 };
         let _ = core::fmt::write(&mut into, format_args!("{record}\n"));
+
+        // **Counted in newlines and not in records**, because `paint` counts in
+        // newlines: a record whose message carries one — every panic, whose
+        // `PanicInfo` writes `panicked at <site>:` and then the message — is two
+        // rows on the panel and needs two bits, or the second renders white and
+        // every bit below it is off by one.
+        let lines = out.iter().filter(|&&byte| byte == b'\n').count();
         if record.level() == Some(log::Level::Alert) {
-            if let Some(word) = self.into.alert.get_mut(self.into.lines / 64) {
-                *word |= 1 << (self.into.lines % 64);
+            for line in self.into.lines..self.into.lines + lines {
+                if let Some(word) = self.into.alert.get_mut(line / 64) {
+                    *word |= 1 << (line % 64);
+                }
             }
         }
-        self.into.lines += 1;
+        self.into.lines += lines;
         self.at = at;
         true
     }

@@ -204,6 +204,29 @@ fn kernel_lines() -> Vec<(String, usize, String)> {
 /// The three log macros and the function they all expand to.
 const LOG_PRODUCERS: &[&str] = &["log!(", "alert!(", "boot_phase!(", "log::emit("];
 
+/// The two places in `kernel/` a `!!!` may still appear, and how many times.
+///
+/// **Named by file and count rather than tested against the same line as a
+/// `log!`.** A macro invocation is not a line — `rustfmt` puts a long one's
+/// format string on its own — so "this line has `!!!` and a `log!` on it" is
+/// defeated by a line break, and defeated silently. Every `!!!` in the tree is
+/// listed here instead, so a new one is a red wherever it is written and
+/// whatever it is written next to.
+///
+/// Both of these write raw bytes straight to the UART. They never enter the
+/// ring, so `panic_console`'s deleted scan could not see them either and
+/// `Level` was never their business
+/// (`specs/log-architecture-spec.md` §2.1).
+/// Counted in occurrences of `!!!` and not in lines, because each of these
+/// writes one at each end of its message.
+const SENTINEL_ALLOWED: &[(&str, usize)] = &[
+    // `\n!!! PANIC REENTRY: CPU halted !!!\n`, written with the IDT possibly
+    // gone.
+    ("kernel/src/main.rs", 2),
+    // `\n!!! DB TRAP !!!\n`, from the #DB handler before it clears DR7.
+    ("kernel/src/arch/idt/exceptions.rs", 2),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,18 +270,41 @@ mod tests {
             silent.join("\n")
         );
 
-        let marked: Vec<_> = lines
-            .iter()
-            .filter(|(_, _, line)| {
-                line.contains("!!!") && LOG_PRODUCERS.iter().any(|p| line.contains(p))
-            })
-            .map(|(file, n, line)| format!("{file}:{n}: {}", line.trim()))
-            .collect();
+        let mut found: Vec<(String, usize)> = Vec::new();
+        for (file, _, line) in &lines {
+            let n = line.matches("!!!").count();
+            if n == 0 {
+                continue;
+            }
+            match found.last_mut() {
+                Some((last, count)) if last == file => *count += n,
+                _ => found.push((file.clone(), n)),
+            }
+        }
+        let mut complaints = Vec::new();
+        for (file, count) in &found {
+            match SENTINEL_ALLOWED.iter().find(|(allowed, _)| allowed == file) {
+                Some((_, want)) if want == count => {}
+                Some((_, want)) => complaints.push(format!(
+                    "{file} has {count} `!!!` where this gate exempts {want} raw-UART ones"
+                )),
+                None => complaints.push(format!("{file} has {count} `!!!`")),
+            }
+        }
+        for (file, want) in SENTINEL_ALLOWED {
+            if !found.iter().any(|(f, _)| f == file) {
+                complaints.push(format!(
+                    "{file} no longer has the {want} raw-UART `!!!` this gate exempts, so the \
+                     exemption is stale"
+                ));
+            }
+        }
         assert!(
-            marked.is_empty(),
-            "a log producer carries the deleted `!!!` sentinel; the panel paints a red row \
-             from `Level::Alert` and reads nothing out of the text:\n{}",
-            marked.join("\n")
+            complaints.is_empty(),
+            "the `!!!` sentinel is deleted: the panel paints a red row from `Level::Alert` and \
+             reads nothing out of the text, so a marker put back into a message marks \
+             nothing.\n{}",
+            complaints.join("\n")
         );
     }
 
