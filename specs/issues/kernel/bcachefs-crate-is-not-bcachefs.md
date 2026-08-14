@@ -12,7 +12,7 @@ It shares a name with Linux bcachefs and nothing else: ours is `MAGIC = b"BCFS"`
 (`btree.rs:7`), against upstream's UUID-based `BCHFS_MAGIC` / `BSET_MAGIC ^ sb.uuid` /
 `JSET_MAGIC`.
 
-`specs/bcachefs-reference.md` — real research into the *upstream* format — now carries a
+`specs/reference/bcachefs-reference.md` — real research into the *upstream* format — now carries a
 warning saying so at the top, because its filename in this repo is a trap. That fixes the
 document; it does not fix the collision. A crate that does not implement the format it is
 named after is a hazard we keep paying for, in exactly this way. Renaming it is the owner's

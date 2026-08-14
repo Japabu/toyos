@@ -1,6 +1,7 @@
 //! The instrument every guest in this project is measured with, declared once.
 //!
-//! `specs/ci-plan.md` §7.3 is the measurement this exists for: on one runner
+//! `specs/assessments/ci-plan-assessment-2026-08.md` §7.3 is the measurement
+//! this exists for: on one runner
 //! image, one commit and one accelerator, `desktop_typing_damage` is red on
 //! QEMU 8.2.2 and green on 11.0.3, and `usb_storage_shapes` with it. So the
 //! QEMU version is not a detail of the environment — it decides verdicts, and
@@ -64,9 +65,9 @@ pub fn qemu_version_note(root: &Path) -> Option<String> {
     (have != want).then(|| {
         format!(
             "Note: this host runs QEMU {have} and .github/qemu-version declares {want} — \
-             CI's guests and tests/audio-baseline.toml are on {want}, and specs/ci-plan.md \
-             §7.3 measured that the version decides test outcomes. Nothing here is broken; \
-             a comparison across the two is."
+             CI's guests and tests/audio-baseline.toml are on {want}, and \
+             specs/assessments/ci-plan-assessment-2026-08.md §7.3 measured that the version \
+             decides test outcomes. Nothing here is broken; a comparison across the two is."
         )
     })
 }
@@ -81,16 +82,17 @@ mod tests {
     }
 
     /// The workflows whose verdict somebody acts on. `probe-*.yml` are the
-    /// throwaway measurement branches `specs/ci-plan.md` is made of and are not
+    /// throwaway measurement branches `specs/assessments/ci-plan-assessment-2026-08.md`
+    /// is made of and are not
     /// on this list; `toolchain.yml` installs QEMU for `check_prerequisites`
     /// and boots nothing.
     const GATES: &[&str] = &["ci.yml", "gate-a.yml"];
 
     /// Every `<job>:` block of a workflow, crudely and on purpose.
     ///
-    /// Deliberately not a YAML parser, for `docs.rs`'s reason: the shape is
-    /// fixed — two spaces, a name, a colon, end of line — and anything else is
-    /// a file to name rather than a shape to accommodate.
+    /// Deliberately not a YAML parser: the shape is fixed — two spaces, a
+    /// name, a colon, end of line — and anything else is a file to name
+    /// rather than a shape to accommodate.
     fn jobs(text: &str) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
         let mut in_jobs = false;
@@ -124,7 +126,7 @@ mod tests {
     /// this hides is that a workflow reads perfectly well and never says what
     /// it is comparing against — gate A ran QEMU 8.2.2 against every other
     /// guest in CI on 11.0.3 for as long as that file existed
-    /// (`specs/ci-plan.md` §12.1).
+    /// (`specs/assessments/ci-plan-assessment-2026-08.md` §12.1).
     fn nameless(text: &str) -> Vec<String> {
         jobs(text)
             .into_iter()

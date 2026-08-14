@@ -18,7 +18,7 @@
 //! read rather than guessed, and one function answers it for both the producer
 //! and the gate. Deleting a preset doom never selects costs nothing audible:
 //! all 13 tracks render bit-exact against the full bank
-//! (`specs/doom-music-soundfont.md` §4).
+//! (`specs/assessments/doom-music-soundfont.md` §4).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

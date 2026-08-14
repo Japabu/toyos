@@ -5,7 +5,7 @@
 //! lets a host simulator explore the port state space, which is where the
 //! T14's SuperSpeed wedge lives — a state QEMU cannot produce.
 //!
-//! `specs/xhci-port-machine-plan.md` is the design and the staging.
+//! `specs/plans/xhci-port-machine-plan.md` is the design and the staging.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]

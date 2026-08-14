@@ -1,6 +1,6 @@
 //! The verbs that turn a chosen path into a path that makes sound.
 //!
-//! `specs/hda-driver-plan.md` §2.3 step 6, as one pure function: power, the
+//! `specs/plans/hda-driver-plan.md` §2.3 step 6, as one pure function: power, the
 //! connection selects, pin control, EAPD, the amplifiers, the format and the
 //! stream tag. The driver sends what comes back and decides nothing on the way.
 //!

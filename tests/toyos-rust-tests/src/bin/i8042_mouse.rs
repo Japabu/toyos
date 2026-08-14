@@ -59,7 +59,7 @@ fn main() {
 }
 
 /// The device-minting capability the test estate is endowed
-/// (`specs/capability-endowment-spec.md` §6.7a). A claim is `/bin/init`'s to
+/// (`specs/capability-endowment-spec.md` §3). A claim is `/bin/init`'s to
 /// mint everywhere else; here test-runner passes a `DEVICE` duplicate down, so
 /// a boot can run several binaries that each need an input device.
 fn capability() -> SysCap {

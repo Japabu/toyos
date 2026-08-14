@@ -30,7 +30,7 @@ It becomes load-bearing the moment a codegen backend other than LLVM is
 attempted. `rustc_codegen_cranelift` has no inliner of its own — it does not
 call the one Cranelift gained in Wasmtime 36 — so with cg_clif and incremental
 on, nothing inlines anywhere. Measured on the bare-metal probe in
-`specs/cranelift-backend-assessment.md` §2.3: `CARGO_INCREMENTAL=0` visibly
+`specs/assessments/cranelift-backend-assessment.md` §2.3: `CARGO_INCREMENTAL=0` visibly
 changes the generated code, folding four `#[inline]` helpers into their caller
 that were four real calls with it on.
 

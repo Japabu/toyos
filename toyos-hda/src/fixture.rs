@@ -2,7 +2,7 @@
 //! in reach constructs.
 //!
 //! The real ones are the H0 probe's own `hda:` lines, committed verbatim. That
-//! is the second life `specs/hda-driver-plan.md` §5.2 designed that format for,
+//! is the second life `specs/plans/hda-driver-plan.md` §5.2 designed that format for,
 //! and it outlives the probe: H9 deletes the diagnostic and the fixtures stay
 //! as artifacts.
 

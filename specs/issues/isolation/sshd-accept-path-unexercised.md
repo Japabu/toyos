@@ -18,4 +18,4 @@ wiring between russh's auth callbacks and that decision — `auth_publickey`,
 `auth_publickey_offered`, and the `MethodSet` that stops password auth being
 offered at all — is certified by reading. Closing it needs an SSH client on the
 host talking to the guest through `hostfwd`, which is
-`specs/daemon-testability.md` §6's step 1 and belongs with gate N.
+`specs/plans/daemon-testability.md` §6's step 1 and belongs with gate N.

@@ -36,7 +36,7 @@ pub fn live_instances() -> u32 {
 /// A registration is not a boot — several tests boot two machines and one boots
 /// four — so the count that decides whether a scheduling or build change worked
 /// cannot be read off the test lists. It was static analysis until now, and
-/// `specs/test-cost-audit.md` §6 records that as a lower bound.
+/// `specs/assessments/test-cost-audit.md` §6 records that as a lower bound.
 ///
 /// **The third is the one this run is judged on.** A kernel build is ~6.9 s of
 /// wall clock and ~29.6 s of CPU after any edit to `kernel/` (§5.9.2), and
@@ -56,18 +56,22 @@ pub fn boot_census() -> (u32, u32, Vec<String>) {
     )
 }
 
-/// The kernel builds a run is allowed to make, and the whole list.
+/// The kernel builds an ordinary suite run is allowed to make, and the whole
+/// list.
 ///
 /// `""` is what an image ships. [`toyos_build::build::TEST_KERNEL`] is every
 /// actuator compiled in, armed by boot parameter. `fpu-save-nothing` is the one
 /// actuator that could not become a parameter — it takes the `fxsave64` out of
 /// `arch::entry`'s `naked_asm!` bracket, which is the path its own gate is
-/// about — and `specs/test-cost-audit.md` §5.9.7 is where that is argued.
+/// about — and `specs/assessments/test-cost-audit.md` §5.9.7 is where that is argued.
 ///
-/// A fourth entry is a decision to pay a kernel build per run forever, so it is
-/// made here and out loud rather than by adding a `kernel_features` to a
-/// `BootOptions`.
-pub const DECLARED_KERNEL_BUILDS: [&str; 3] = ["", "boot-actuators,test-actuators", "fpu-save-nothing"];
+/// A fourth entry is a decision to pay a kernel build per suite run forever, so
+/// it is made in the shared declaration rather than by adding a
+/// `kernel_features` to a `BootOptions`. Interactive debug mode is separate: it
+/// builds [`toyos_build::build::DEBUG_KERNEL_BUILD`] and returns before the
+/// suite.
+pub const DECLARED_KERNEL_BUILDS: [&str; 3] =
+    toyos_build::build::TEST_SUITE_KERNEL_BUILDS;
 
 /// How many guests the phase now running may have up at once.
 ///
@@ -133,7 +137,8 @@ fn record_boot(took: Duration) {
 /// corrected for how fast the machine *is*, and that is the other half of the
 /// same mistake: a number reasoned about on an M4 Pro is not a liveness ceiling
 /// on a four-core Azure vCPU, it is a verdict about which of the two is running
-/// the test. `specs/ci-plan.md` §7.1 counted 307 bare timeouts in one CI run and
+/// the test. `specs/assessments/ci-plan-assessment-2026-08.md` §7.1 counted
+/// 307 bare timeouts in one CI run and
 /// every one of them was that.
 ///
 /// **Only ever upward.** On a faster host the number in the source stands,
@@ -519,7 +524,7 @@ pub enum Profile {
     ///
     /// The T14's shape for the one thing no profile stages: its Thunderbolt
     /// xHCI at 00:0d.0 has five ports and has never had a device on them
-    /// (`specs/metal-hardware-inventory.md`), so the controller a user plugs
+    /// (`specs/reference/metal-hardware-inventory.md`), so the controller a user plugs
     /// into is the one that enumerated nothing at boot. Here the second
     /// controller is that one and the boot stick is on the first.
     ///
@@ -556,7 +561,7 @@ pub enum Profile {
     /// that cannot are different facts a user can act on differently.
     IommuNoIntremap,
     /// metal-sim with three Intel HDA controllers, shaped so that one boot
-    /// runs both arms of every question `specs/hda-driver-plan.md` H0 asks.
+    /// runs both arms of every question `specs/plans/hda-driver-plan.md` H0 asks.
     ///
     /// A machine nobody ships, and deliberately so: H0's probe is a diagnostic
     /// aimed at one laptop, and the only thing the harness can certify is that
@@ -621,7 +626,7 @@ pub struct Iommu {
 
 /// What every profile but the three that vary it declares: the widest address
 /// width QEMU offers and interrupt remapping on, which is
-/// `specs/iommu-spec.md` §9 stage I0's configuration.
+/// `specs/iommu-spec.md` §8's configuration.
 pub const IOMMU_DEFAULT: Iommu = Iommu { aw_bits: 48, intremap: true };
 
 /// The controller every profile but [`Profile::MetalUsb`] gets. `nec-usb-xhci`
@@ -793,7 +798,7 @@ struct Shape {
     ///
     /// Presence of a class-0403 *function* is the shape dimension, and it is
     /// separate from whether anything answers on the link behind it — which is
-    /// `specs/hda-driver-plan.md` H0's question (b), and what the codec
+    /// `specs/plans/hda-driver-plan.md` H0's question (b), and what the codec
     /// arguments in this list decide per controller.
     hda: &'static [&'static str],
     /// The unit that decodes this machine's DMA, or its absence. Stated per
@@ -1442,7 +1447,7 @@ pub fn build_boot_image(
 ) -> Vec<u8> {
     let kernel: &[&str] =
         if kernel_params.is_empty() { &[] } else { toyos_build::build::TEST_KERNEL };
-    build_boot_image_with(test_crate, c_tests, rust_tests, kernel, kernel_params)
+    build_boot_image_with(test_crate, c_tests, rust_tests, kernel, kernel_params, false)
 }
 
 /// Which of [`DECLARED_KERNEL_BUILDS`] this boot wants.
@@ -1470,6 +1475,7 @@ fn build_boot_image_with(
     rust_tests: &[(String, Vec<u8>)],
     kernel_features: &[&str],
     kernel_params: &[&str],
+    debug_wait: bool,
 ) -> Vec<u8> {
     // **The two fields have the same type, so swapping them compiles.** It
     // happened once, in this file's own conversion: the shared boot handed
@@ -1497,10 +1503,12 @@ fn build_boot_image_with(
 
     let joined = kernel_features.join(",");
     assert!(
-        DECLARED_KERNEL_BUILDS.contains(&joined.as_str()),
-        "this boot asks for the kernel build {joined:?}, which is not one of the {} a run may \
-         make: {DECLARED_KERNEL_BUILDS:?}",
+        toyos_build::build::harness_kernel_build_is_declared(&joined, debug_wait),
+        "this boot asks for the kernel build {joined:?}, which is not one of the {} an ordinary \
+         suite run may make: {DECLARED_KERNEL_BUILDS:?}; interactive debug mode may instead \
+         make {:?}",
         DECLARED_KERNEL_BUILDS.len(),
+        toyos_build::build::DEBUG_KERNEL_BUILD,
     );
     KERNELS.lock().expect("the kernel census").insert(joined);
     let mut extra_files: Vec<(String, Vec<u8>)> = Vec::new();
@@ -1572,14 +1580,20 @@ impl QemuInstance {
     ) -> Self {
         let mut features: Vec<&str> = kernel_of(&options);
         if options.debug_wait {
-            features.push("debug-wait");
+            features.push(toyos_build::build::DEBUG_KERNEL_BUILD);
         }
         BOOTS.fetch_add(1, Ordering::Relaxed);
         if !features.is_empty() {
             FEATURE_BOOTS.fetch_add(1, Ordering::Relaxed);
         }
-        let disk =
-            build_boot_image_with(test_crate, c_tests, rust_tests, &features, options.kernel_params);
+        let disk = build_boot_image_with(
+            test_crate,
+            c_tests,
+            rust_tests,
+            &features,
+            options.kernel_params,
+            options.debug_wait,
+        );
 
         let test_dir = super::lane::dir();
         let seq = BOOT_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -2488,7 +2502,7 @@ fn qemu_command(
     // Ahead of every other `-device`: QEMU gives a PCI function the bypassing
     // address space unless the unit exists when the function is created, so a
     // unit emitted after the devices it is meant to decode is a unit that
-    // decodes nothing — the vacuity trap `specs/userspace-drivers-spec.md` §7.2
+    // decodes nothing — the vacuity trap `specs/plans/userspace-drivers-spec.md` §7.2
     // is built around, in its harness-side form.
     if let Some(unit) = shape.iommu {
         qemu.arg("-device").arg(format!(
@@ -2771,7 +2785,7 @@ fn wait_for_ready(
     let panic_aborts = ready == DEFAULT_READY;
     // Ten seconds per guest this phase may have up, and never fewer than two
     // guests' worth — the tree runs 15-25 suites a day across several agents
-    // (`specs/test-cost-audit.md` §4), so one guest on a quiet host stopped being
+    // (`specs/assessments/test-cost-audit.md` §4), so one guest on a quiet host stopped being
     // the regime some time before this did. Measured on 2026-08-03 with other
     // agents building: two boots exceeded the flat ten seconds, one of them in a
     // phase running a single guest.

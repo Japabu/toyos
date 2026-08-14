@@ -592,7 +592,7 @@ impl Capabilities {
     /// The widest depth this kernel implements that the unit advertises.
     ///
     /// `None` is a unit offering neither, which §2.2 refuses at I5. 57-bit is
-    /// not considered even when advertised: §11.5, a fifth level of page
+    /// not considered even when advertised: §10.5, a fifth level of page
     /// tables for an address space nothing here needs, and an unused level is
     /// an untested one.
     fn address_width(&self) -> Option<AddressWidth> {
@@ -664,7 +664,7 @@ impl Capabilities {
 
     /// `ECAP.SC`: a second-level page-table entry may carry the snoop-force
     /// bit, which makes a device's DMA snoop the CPU cache whatever the device
-    /// itself requested. `specs/hda-driver-plan.md` §4.4 item 4 is why it is
+    /// itself requested. `specs/plans/hda-driver-plan.md` §4.4 item 4 is why it is
     /// read: an Intel HDA controller carries a vendor no-snoop control in its
     /// config space, and setting this bit in every mapping makes that control
     /// irrelevant — one layer down, with no config-write syscall.

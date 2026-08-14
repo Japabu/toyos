@@ -23,16 +23,17 @@ obey the rule. **Writing the unresolvable form is the way past it.**
 Measured 2026-08-11 on `9d535d6`, counting `` `specs/issues/<area>/` `` in
 `specs/`, `CLAUDE.md` and the four subdirectory `CLAUDE.md`s: **190 occurrences
 across 83 (file, area) pairs.** The heaviest are
-`specs/code-quality-review-2026-08.md` with 19 to `design-debt/`,
-`specs/type-safety-audit/crates.md` with 11 to `isolation/` and 9 to `kernel/`,
-and `specs/ci-plan.md` with 7 to `hardware/`. Twenty-two of them are inside
+`specs/assessments/code-quality-review-2026-08.md` with 19 to `design-debt/`,
+`specs/assessments/type-safety-audit/crates.md` with 11 to `isolation/` and 9 to `kernel/`,
+and `specs/assessments/ci-plan-assessment-2026-08.md` with 7 to `hardware/`. Twenty-two of them are inside
 `specs/issues/` files pointing at each other. `specs/issues/README.md` itself has
 one, as the example of what not to write, which any fix has to allow for.
 
 The cost is the one the README names and it has been paid: an area pointer
 survives the entry being closed, renamed or moved, so a reader following one
 lands in a directory of thirty files and picks whichever looks closest. The
-`hardware/` pointers in `specs/ci-plan.md` §9.2 and §9.4 are the worked example
+`hardware/` pointers in `specs/assessments/ci-plan-assessment-2026-08.md` §9.2
+and §9.4 are the worked example
 — each stands for a different entry and none says which.
 
 `src/redlist.rs` works around it rather than fixing it: a row's `source` must

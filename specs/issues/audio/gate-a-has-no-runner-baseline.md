@@ -9,10 +9,11 @@ opened: 2026-08-10
 `tests/audio-baseline.toml`'s recorded sample was taken on the dev host under
 cross-arch TCG. The thorough tier compares a fresh sample against *that*, so
 `gate-a.yml` on a GitHub runner — KVM, four Azure cores, the same QEMU 11.0.3
-since `specs/ci-plan.md` §12.1 — is comparing two instruments and calling the
-difference a regression.
+since `specs/assessments/ci-plan-assessment-2026-08.md` §12.1 — is comparing
+two instruments and calling the difference a regression.
 
-The measurement is §12.2, run `31386117376`, `iterations=30`, tree `99e47d9`.
+The measurement is `specs/assessments/ci-plan-assessment-2026-08.md` §12.2,
+run `31386117376`, `iterations=30`, tree `99e47d9`.
 Shard 1 drew an AMD EPYC 7763, shard 2 an Intel Xeon Platinum 8573C; both were
 quiet (`qemu 1-1`, `toyos-build 1-1` over 60 runs each). What differs:
 

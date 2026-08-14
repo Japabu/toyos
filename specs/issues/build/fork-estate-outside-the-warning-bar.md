@@ -20,5 +20,5 @@ upstream of anything `src/build.rs` does.
 The trap to avoid is `[lints]` inside a fork: it is a manifest change, so it
 lands in `git log <base>..toyos` and would put ToyOS lint policy into every
 upstream PR the estate sends. Plan, procedure and the standing-mechanism
-question: `specs/fork-lint-audit-plan.md`. It needs a quiet tree, because
+question: `specs/plans/fork-lint-audit-plan.md`. It needs a quiet tree, because
 path-overriding the forks changes what every build in the repo resolves.

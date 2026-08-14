@@ -7,14 +7,14 @@ opened: 2026-08-08
 # Metal boot is 1151 ms against QEMU's 196 ms, and the recorded accounting for it is stale
 
 **The numbers, taken out of the committed logs rather than re-measured.** Six
-healthy boots in `specs/metal-logs/2026-08-07-freeze/` report `Boot: complete` at
+healthy boots in `specs/assessments/metal-logs/2026-08-07-freeze/` report `Boot: complete` at
 1148, 1148, 1149, 1150, 1151 and 1154 ms; the seventh (`…-222741.log`) is 755 ms
 and is the control boot whose keyboard was refused, so its peripherals phase is
 448 ms instead of 842. The QEMU figure for the comparable shape is
 `Boot: complete (196ms)` on the `metal_sim_compositor` boot
 (`kernel-log-unreadable-once-userland-owns-the-screen` records the
 measurement), and `(234ms)` for the diag artifact booted
-headless. **So metal is ~5.9× QEMU, not the ~17× `specs/metal-hardware-inventory.md:392-395`
+headless. **So metal is ~5.9× QEMU, not the ~17× `specs/reference/metal-hardware-inventory.md:392-395`
 computes** — that ratio is against `(3422ms)`, and 2.30 s of those 3.42 s were
 the six `boot_checkpoint` framebuffer repaints (`metal-hardware-inventory.md:425-429`),
 which #138's write-combining change removed. Measuring the phase-boundary gaps in
@@ -47,7 +47,7 @@ PCI walk: `PCI: Enumerating devices...` at 0.065, last real function `0a:00.0` a
 that hold nothing, against 7 ms finding everything that is there.
 
 **What this entry is for.** Metal boot time has no heading of its own; the
-accounting lives in `specs/metal-hardware-inventory.md` against the superseded
+accounting lives in `specs/reference/metal-hardware-inventory.md` against the superseded
 3422 ms boot, and `framebuffer-clients-pay-the-scanout-price` points at "#65
 (boot time)" as its owner. Whatever #65 says, its numbers should come from this table:
 the two-thirds that motivated it were paints and are gone. Note also the NIC

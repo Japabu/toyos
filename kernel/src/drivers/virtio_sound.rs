@@ -1,6 +1,6 @@
 //! The virtio-sound stub: bring-up, the virtqueues, and the allow-list.
 //!
-//! `specs/hda-driver-plan.md` §4.1 is the design and this device is the second
+//! `specs/plans/hda-driver-plan.md` §4.1 is the design and this device is the second
 //! to take that shape. **The line is who writes an address**, and a split
 //! virtqueue puts every address a virtio driver ever programs in one place: the
 //! descriptor table. So the three tables here live in a page no process maps,

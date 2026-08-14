@@ -7,7 +7,7 @@ opened: 2026-07-30
 # CPU attribution: the recorded "half the CPU is unattributed" claim was wrong
 
 **Its sign was backwards.** Investigated 2026-07-29,
-`specs/cpu-attribution.md`. `stop_cpu_timer` adds *one* delta to both the
+`specs/assessments/cpu-attribution.md`. `stop_cpu_timer` adds *one* delta to both the
 per-thread `cpu_ns` that `ps` reads and the per-CPU `CPU_TIME_NS` that
 `SYS_SYSINFO` reports as busy — they are one accumulator, not two measurements.
 Genuinely unattributed kernel time is therefore absent from **both** numerators

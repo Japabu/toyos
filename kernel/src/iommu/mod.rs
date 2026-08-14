@@ -1,12 +1,12 @@
 //! The unit that decides what a device may reach.
 //!
-//! `specs/iommu-spec.md` is the design. This module is stage I2 of its §9: the
-//! machine's units are inventoried, every enumerated PCI function is given a
-//! context entry naming one identity-mapped domain, and translation is turned
-//! on. Interrupt remapping is I3, per-driver domains and mapping I4, and
-//! refusing a machine with no usable unit is I5 — sequenced last on purpose,
-//! because a refusal landed before the first userspace driver has moved costs
-//! every machine and protects nothing.
+//! `specs/iommu-spec.md` is the design and `specs/plans/iommu-plan.md` the
+//! stages. This module is the built half: the machine's units are inventoried,
+//! every enumerated PCI function is given a context entry naming one
+//! identity-mapped domain, and translation is turned on. Interrupt remapping is
+//! I3, per-driver domains and mapping I4, and refusing a machine with no usable
+//! unit is I5 — sequenced last on purpose, because a refusal landed before the
+//! first userspace driver has moved costs every machine and protects nothing.
 //!
 //! So this module *refuses nothing*. Every case §2.2 gives a refusal message
 //! for is reported here as a line naming the register it decided on, and the
@@ -38,7 +38,7 @@ use alloc::vec::Vec;
 /// both derived from it inside their own backends, and `specs/iommu-spec.md`
 /// §5.3's IOVA base is derived from it in the portable half.
 ///
-/// Two variants and not the three §3 sketches. §5.3 and §11.5 both rule 57-bit
+/// Two variants and not the three §3 sketches. §5.3 and §10.5 both rule 57-bit
 /// out — a fifth level of page tables for an address space nothing here needs
 /// — so a `Bits57` would be a variant with no producer and no consumer, which
 /// is the untested arm §5.2 spends a section arguing against.
@@ -143,7 +143,7 @@ pub fn init(rsdp_addr: u64, devices: &[crate::drivers::pci::PciDevice]) {
 
 /// What this machine's remapping hardware says about one device.
 ///
-/// `specs/hda-driver-plan.md` H0's handoff half, and the only reader: I2 keeps
+/// `specs/plans/hda-driver-plan.md` H0's handoff half, and the only reader: I2 keeps
 /// no inventory of units, so this re-reads firmware's table rather than making
 /// it keep one for a diagnostic. Deleted with H0's probe.
 #[cfg(feature = "boot-actuators")]
@@ -164,7 +164,7 @@ pub struct UnitFacts {
     /// catch-all for everything on its segment.
     pub explicit: bool,
     /// `ECAP.SC`: the unit can force a device's DMA to snoop the CPU cache,
-    /// whatever the device itself asked for. `specs/hda-driver-plan.md` §4.4
+    /// whatever the device itself asked for. `specs/plans/hda-driver-plan.md` §4.4
     /// item 4 spends this to avoid a config-space write path.
     pub snoop_control: bool,
 }

@@ -17,7 +17,7 @@
 
 /// Message bytes a record carries.
 ///
-/// **Measured over every committed T14 log** (`specs/metal-logs/`), message
+/// **Measured over every committed T14 log** (`specs/assessments/metal-logs/`), message
 /// length after the `[kernel … ] ` prefix: 12,497 lines, min 14, p50 59, p90
 /// 111, p99 154, p999 857, max 863. Everything above 200 is one call site — a
 /// `{:?}` of `KernelArgs`, 18 lines of the 12,497 — so this covers 99.86% of

@@ -277,7 +277,7 @@ pub fn init_timer_ap() {}
 /// count too small to outlast the interrupt it schedules is not one late tick
 /// but a livelock nothing recomputes its way out of. Ring 3 can ask for one — a
 /// deadline already past when the pass arms it — and did (`#156`,
-/// `specs/metal-logs/2026-08-08-cpu0/`).
+/// `specs/assessments/metal-logs/2026-08-08-cpu0/`).
 ///
 /// Policy, not physics, and it sits between two bounds. Below: an interrupt
 /// entry and `iretq`, which is what the interval has to be worth more than for

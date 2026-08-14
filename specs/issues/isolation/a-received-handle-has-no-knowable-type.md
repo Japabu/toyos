@@ -40,7 +40,7 @@ does not hold across a transfer.
 
 1. **Report the kind.** `SYS_HANDLE_RECV` writes `(RawHandle, kind)` pairs
    instead of bare handles. One ABI shape change, in-tree only — no fork names
-   `handle_recv` (`specs/dependency-audit-2026-08-08.md`'s estate was swept for
+   `handle_recv` (`specs/assessments/dependency-audit-2026-08-08.md`'s estate was swept for
    this branch and `handle_recv` is not in it). The receiver then refuses by
    name and the fail-fast policy is untouched.
 2. **A fifteenth syscall** answering the kind of a handle. Cheaper to write and
@@ -50,8 +50,8 @@ does not hold across a transfer.
    three quarters of its call sites really are a bug in the caller.
 
 (1) is the recommendation. It is not this review's to take — it is an ABI
-change, and `specs/capability-endowment-spec.md` §3.1's fourteen numbers were
-the owner's to approve.
+change, and `specs/capability-endowment-spec.md` §5's new syscalls were the
+owner's to approve.
 
 ## Ruled not a merge blocker, 2026-08-10
 
@@ -71,8 +71,8 @@ the next reader will ask why a class this wide was left open.
   when it is answered, and whether it is answered at all. Ending it with a
   `WrongType` is not a new capability.
 - **The fix is an ABI shape change and the ABI was the owner's to approve.** It
-  widens `SYS_HANDLE_RECV`'s answer from `n` to `n` pairs, which is a number of
-  the fourteen §3.1 lists changing shape after the fact.
+  widens `SYS_HANDLE_RECV`'s answer from `n` to `n` pairs, which is one of
+  §5's new syscalls changing shape after the fact.
 
 So it stays open, and what it is waiting on is a decision rather than an
 instrument.

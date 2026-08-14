@@ -7,7 +7,7 @@ use toyos::syscap::SysCap;
 
 fn main() {
     // **The test estate's authority, and the one place least authority is not
-    // enforced** (`specs/capability-endowment-spec.md` §6.7a). The 90 guest
+    // enforced** (`specs/capability-endowment-spec.md` §4). The guest
     // binaries are not `[programs]` keys, so no manifest row can name what any
     // of them holds: a test binary holds what test-runner holds. The namespace
     // travels by inheritance; this capability is handed over explicitly, as a

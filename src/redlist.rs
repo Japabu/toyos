@@ -2,8 +2,9 @@
 //! whose evidence — as data rather than as prose.
 //!
 //! **The failure this exists to stop.** The list used to be paragraphs in
-//! `specs/issues/hardware/eleven-names-red-on-ci.md` and `specs/ci-plan.md`
-//! §9.2, and a careful reader can read a paragraph backwards: `rg`ing a test
+//! `specs/issues/hardware/eleven-names-red-on-ci.md` and
+//! `specs/assessments/ci-plan-assessment-2026-08.md` §9.2, and a careful
+//! reader can read a paragraph backwards: `rg`ing a test
 //! name in it hits the sentence that names the twelve tests that came *off* the
 //! list as readily as the table of the eleven that are on it, and the hit looks
 //! the same either way. That happened, and the answer given to the owner was the
@@ -55,9 +56,10 @@ use crate::day::Day;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// Which machine took the measurement. `specs/ci-plan.md` §8 is the table of
-/// what each one can and cannot answer; a row without this is a row that will be
-/// read as being about whichever machine the reader is standing at.
+/// Which machine took the measurement. `specs/testing-strategy.md` §2 is the
+/// table of what each one can and cannot answer; a row without this is a row
+/// that will be read as being about whichever machine the reader is standing
+/// at.
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
 pub enum Instrument {
     /// A `guest` shard: KVM on four native x86-64 cores, `-cpu host`, **one
@@ -199,8 +201,8 @@ pub struct Red {
 /// `EXPECTED_FAILURES` entries use exactly this interval with exactly this
 /// justification — long enough that a fix already in flight lands first, short
 /// enough that nobody inherits it silently. The tree it is measured against
-/// bears it out: `specs/ci-plan.md` §10.10 has nine consecutive `ci` runs on
-/// `main`, one of them green.
+/// bears it out: `specs/assessments/ci-plan-assessment-2026-08.md` §10.10 has
+/// nine consecutive `ci` runs on `main`, one of them green.
 pub const SHELF_LIFE_DAYS: i64 = 31;
 
 /// Every measurement, grouped by the campaign that took it.
@@ -229,12 +231,31 @@ pub const KNOWN_RED: &[Red] = &[
         source: "specs/issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
+    // ---------------------------------------------------------------------
+    // A different assertion (`breaks > 2`, not the retired `breaks != 1`) on the
+    // same test, `1cb11e7`'s re-issue budget. The injected disk never left its
+    // two-break budget; the third line is the boot stick's own unrelated,
+    // cleanly-recovered transport break, which the count does not scope out.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "usb_transport_break",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "the transport broke 3 times off one abandoned transfer, which can undo one \
+               recovery and no more",
+        evidence: "PR #41 (`wt/toyos-i8042tier`), run 31684437719, job 94397136494 \
+                   (\"guest (4)\"), sha 711730204800d7173558f7dd96644c5910fb8cf0",
+        source: "specs/issues/hardware/usb-transport-break-counts-the-boot-sticks-recovery.md",
+        measured: "2026-08-13",
+    },
     Red {
         test: "std_unwind",
         instrument: Instrument::Ci,
         finding: Finding::fires(5, 5),
         standing: Standing::Disputed(
-            "`specs/ci-plan.md` §9.3 says closed by `wt/toyos-fpu` — `fxsave64`/`fxrstor64` on \
+            "`specs/assessments/ci-plan-assessment-2026-08.md` §9.3 says closed by `wt/toyos-fpu` \
+             — `fxsave64`/`fxrstor64` on \
              all five Ring 3-reachable entries, with `fpu_isolation` as the gate that asks the \
              question on purpose. The write-up this row cites still counts it among the nine \
              that stand, and says the fix landed after this probe and has not been re-measured \
@@ -253,7 +274,8 @@ pub const KNOWN_RED: &[Red] = &[
         instrument: Instrument::Ci,
         finding: Finding::fires(5, 5),
         standing: Standing::Disputed(
-            "the same disagreement as `std_unwind`: `specs/ci-plan.md` §9.3 says closed by \
+            "the same disagreement as `std_unwind`: \
+             `specs/assessments/ci-plan-assessment-2026-08.md` §9.3 says closed by \
              `wt/toyos-fpu`, the cited write-up says not re-measured on CI",
         ),
         what: "the same #MF, on the same sub-test — the one that panics on a thread",
@@ -296,7 +318,7 @@ pub const KNOWN_RED: &[Red] = &[
         standing: Standing::Retired(
             "what the actuator stages is an *ordering* — the disk arrives after the scan — so the \
              scan closes the window now and no host's boot speed can defeat it \
-             (`specs/ci-plan.md` §10.9)",
+             (`specs/assessments/ci-plan-assessment-2026-08.md` §10.9)",
         ),
         what: "the boot scan bound a disk, so the port was not held empty",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
@@ -348,7 +370,8 @@ pub const KNOWN_RED: &[Red] = &[
         finding: Finding::fires(1, 5),
         standing: Standing::Disputed(
             "two harness defects were fixed for it (the torn beat/pin pair, and a window that \
-             opens at the first full mask), and `specs/ci-plan.md` §10.9's fixed arm was **1 of 10 \
+             opens at the first full mask), and \
+             `specs/assessments/ci-plan-assessment-2026-08.md` §10.9's fixed arm was **1 of 10 \
              again**, on a *different* line — `cpu6 last reached one 0.349s ago`. The \
              no-CPU-missing-from-two-consecutive-lines rule was written for that line and its rate \
              has not been re-measured",
@@ -431,8 +454,8 @@ pub const KNOWN_RED: &[Red] = &[
         finding: Finding::quiet(5),
         standing: Standing::Stands,
         what: "came off the list with `wt/toyos-clock`'s waits. Distinct from the QEMU 8.2.2 red \
-               `specs/ci-plan.md` §8.3 records, which was closed by putting the dev host's own \
-               QEMU in the container",
+               `specs/assessments/ci-plan-assessment-2026-08.md` §8.3 records, which was closed \
+               by putting the dev host's own QEMU in the container",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
         source: "specs/issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
@@ -642,7 +665,7 @@ pub const KNOWN_RED: &[Red] = &[
                the compositor spawned at 0.347 s, the terminal at 0.349 s, and the terminal exiting \
                at 0.849 s one millisecond before the compositor maps its framebuffer",
         evidence: "probe-green run 31282019974, tree 98e7247, ten reps",
-        source: "specs/ci-plan.md §10.9",
+        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
         measured: "2026-08-09",
     },
     Red {
@@ -654,7 +677,7 @@ pub const KNOWN_RED: &[Red] = &[
         ),
         what: "`compiler_builtins::int::specialized_div_rem::u128_div_rem+0x99`",
         evidence: "probe-green run 31282019974, tree 98e7247, ten reps",
-        source: "specs/ci-plan.md §10.9",
+        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
         measured: "2026-08-09",
     },
     Red {
@@ -667,7 +690,7 @@ pub const KNOWN_RED: &[Red] = &[
         ),
         what: "2 of 11 beats dropped a CPU from the mask",
         evidence: "probe-green run 31282019974, tree 98e7247, ten reps",
-        source: "specs/ci-plan.md §10.9",
+        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
         measured: "2026-08-09",
     },
     Red {
@@ -699,7 +722,7 @@ pub const KNOWN_RED: &[Red] = &[
         standing: Standing::Stands,
         what: "0 of 10 against 2 of 10 in the arm before it",
         evidence: "probe-green fixed arm, run 31283095698, ten reps",
-        source: "specs/ci-plan.md §10.9",
+        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
         measured: "2026-08-09",
     },
     Red {
@@ -709,7 +732,7 @@ pub const KNOWN_RED: &[Red] = &[
         standing: Standing::Stands,
         what: "0 of 10 against 1 of 10 in the arm before it",
         evidence: "probe-green fixed arm, run 31283095698, ten reps",
-        source: "specs/ci-plan.md §10.9",
+        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
         measured: "2026-08-09",
     },
     Red {
@@ -721,11 +744,12 @@ pub const KNOWN_RED: &[Red] = &[
                green. It is the one name left between `main` and §10.4's three-consecutive-greens \
                trigger",
         evidence: "probe-green fixed arm, run 31283095698, ten reps",
-        source: "specs/ci-plan.md §10.9",
+        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
         measured: "2026-08-09",
     },
     // ---------------------------------------------------------------------
-    // Single `ci` runs on `main`, `specs/ci-plan.md` §10.9 and §10.10.
+    // Single `ci` runs on `main`, `specs/assessments/ci-plan-assessment-2026-08.md`
+    // §10.9 and §10.10.
     // ---------------------------------------------------------------------
     Red {
         test: "dump_nmi_probe",
@@ -740,7 +764,7 @@ pub const KNOWN_RED: &[Red] = &[
                100 ms for the victim to reach its idle loop and on that runner it took 251 ms. \
                0 of 20 probe reps and 2 of 2 in one shard job",
         evidence: "run 31284962381, `main` at 1ed6f39",
-        source: "specs/ci-plan.md §10.9",
+        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
         measured: "2026-08-09",
     },
     Red {
@@ -752,7 +776,7 @@ pub const KNOWN_RED: &[Red] = &[
                into a boot `scan_ports` runs, true at 253 ms on the dev host and false at 407 ms \
                on that runner",
         evidence: "run 31286199802, `main` at 8d3f5b7",
-        source: "specs/ci-plan.md §10.9",
+        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
         measured: "2026-08-09",
     },
     Red {
@@ -763,7 +787,7 @@ pub const KNOWN_RED: &[Red] = &[
         what: "keystroke 14 of 30. Bisected on the dev host to `f96d52e`, a merge whose two parents \
                are both green — see `specs/issues/diagnostics/screen-pager-keys-red-on-main.md`",
         evidence: "run 31287853270, `main` at 53d29d5",
-        source: "specs/ci-plan.md §10.10",
+        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.10",
         measured: "2026-08-09",
     },
     // ---------------------------------------------------------------------
@@ -798,6 +822,42 @@ pub const KNOWN_RED: &[Red] = &[
         evidence: "run 31422708833, `main` at 2572e4b, shard 10",
         source: "specs/issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-10",
+    },
+    // ---------------------------------------------------------------------
+    // The endpoint-count shape, seen on two PR branches rather than on `main`.
+    // Neither branch's diff touches the test or the xHCI driver, so this is
+    // the same defect the row above measures, on a denominator that row's
+    // "fifteen most recent `main` runs" does not cover — hence `Seen`, not a
+    // bump to that row's rate.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "xhci_hid_break",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`3 endpoint(s) were found Running after the break, want 2` — the wide run's message. \
+               The harness's re-run-alone failed too, but on a *different* assertion, the \
+               `input never came back` shape `parallel-tests-red-under-other-suites.md` records on \
+               the dev host — its first appearance on CI. `ALONE xhci_hid_break: red again` quoted \
+               the wide run's message regardless, because that line always carries the original text",
+        evidence: "PR #22 (`wt/toyos-endow`), run 31424496450 attempt 1, job 93586744461 \
+                   (\"guest (5)\"), sha 73d0761b",
+        source: "specs/issues/hardware/xhci-hid-break-counts-any-endpoint-3.md",
+        measured: "2026-08-10",
+    },
+    Red {
+        test: "xhci_hid_break",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`3 endpoint(s) were found Running after the break, want 2`, byte-identical between \
+               the wide run (51s) and the alone re-run (9s) — the first occurrence where isolation \
+               reproduces this exact assertion rather than going green or landing on the other \
+               shape. 9s alone rules out host contention for this instance",
+        evidence: "PR #35 (`codex/debug-wait-census`), run 31601325987, job 94129283847 \
+                   (\"guest (5)\"), sha d522424e",
+        source: "specs/issues/hardware/xhci-hid-break-counts-any-endpoint-3.md",
+        measured: "2026-08-12",
     },
     Red {
         test: "metal_sim_pointer_churn",
@@ -1020,6 +1080,33 @@ pub const KNOWN_RED: &[Red] = &[
         evidence: "four full suites on `wt/toyos-tlbfix`, 2026-08-07",
         source: "specs/issues/build/desktop-window-child-holds-a-lane.md",
         measured: "2026-08-07",
+    },
+    Red {
+        test: "screen_blocked_dump",
+        instrument: Instrument::Ci,
+        finding: Finding::fires(1, 2),
+        standing: Standing::Stands,
+        what: "`the report the keystroke painted does not carry \"== VERDICT:\"`; the decoded \
+               panel was the boot-log tail ending `[page 2/4]`, with none of the dump's three \
+               summary markers. The isolated re-run painted `0 overdue, 0 absurd, 0 unheld, 0 \
+               never ran` and passed in 6 s",
+        evidence: "PR #33 run 31472702284, job 93736011023, merge ref \
+                   1d19104d1b832da1aaad43906e0673cb87db93ba",
+        source: "specs/issues/diagnostics/blocked-dump-cannot-fire-on-a-total-freeze.md",
+        measured: "2026-08-11",
+    },
+    Red {
+        test: "screen_blocked_dump",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`the report the keystroke painted does not carry \"== VERDICT:\"`, after 520 s in \
+               the wide phase; the isolated re-run was green. This is the no-verdict shape, not \
+               the retired compositor-overlay red under the same test name",
+        evidence: "one 12-wide full suite on 2026-08-09 while a second worktree's suite was live, \
+                   then the harness's isolated re-run",
+        source: "specs/issues/diagnostics/blocked-dump-cannot-fire-on-a-total-freeze.md",
+        measured: "2026-08-09",
     },
     Red {
         test: "desktop_typing_damage",
@@ -1340,10 +1427,16 @@ impl Registry {
                 }
             }
         }
-        // `AUDIO_TESTS`, one line of bare string literals.
-        if let Some(line) = harness.lines().find(|l| l.starts_with("const AUDIO_TESTS")) {
-            for piece in line.split('"').skip(1).step_by(2) {
-                tests.insert(piece.to_string());
+        // `AUDIO_TESTS`, whose tuples carry the same explicit Tier as the
+        // machine and screen registries. Read the value block rather than a
+        // line: formatting it across lines must not make known-red rows stale.
+        if let Some(at) = harness.find("const AUDIO_TESTS:") {
+            let block = &harness[at..];
+            let end = block.find("];").unwrap_or(block.len());
+            for tuple in block[..end].split("(\"").skip(1) {
+                if let Some(name) = tuple.split('"').next() {
+                    tests.insert(name.to_string());
+                }
             }
         }
         // The shared boot's binaries are discovered from what is built, and the
@@ -1493,7 +1586,13 @@ mod tests {
     #[test]
     fn the_registry_is_read_out_of_the_harness_and_is_not_empty() {
         let r = registry();
-        for name in ["desktop_window_child", "hda_tone", "screen_pager_keys", "audio_tone_load"] {
+        for name in [
+            "desktop_window_child",
+            "hda_tone",
+            "screen_pager_keys",
+            "audio_tone",
+            "audio_tone_load",
+        ] {
             assert!(r.tests.contains(name), "the test-name scan missed `{name}`");
         }
         for name in ["std_unwind", "fpu_isolation"] {

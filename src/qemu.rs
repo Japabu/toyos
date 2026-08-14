@@ -36,7 +36,7 @@ struct Shape {
     /// A USB HID on the xHCI. The T14's keyboard is PS/2 and its touchpad
     /// I2C-HID; it has no USB HID at all.
     usb_hid: bool,
-    /// A vIOMMU, in the configuration `specs/iommu-spec.md` §9 stage I0 names:
+    /// A vIOMMU, in the configuration `specs/iommu-spec.md` §8 names:
     /// interrupt remapping on, caching mode on, 48-bit addresses. Every
     /// interactive profile has one, because the machine this project targets
     /// has one and a development shape without it is a shape where the

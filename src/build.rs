@@ -1,9 +1,12 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::Deserialize;
 
@@ -11,6 +14,60 @@ use crate::assets;
 use crate::buildlock;
 use crate::image;
 use crate::toolchain;
+
+thread_local! {
+    /// Time this worker has spent constructing memoized boot artifacts.
+    ///
+    /// A suite worker is also the thread that asks for its boot image, so a
+    /// cumulative thread-local clock lets the harness remove a cold build from
+    /// the test that happened to ask for it first. A process-wide counter would
+    /// subtract another worker's concurrent build instead.
+    static ARTIFACT_BUILD_TIME: Cell<Duration> = Cell::new(Duration::ZERO);
+}
+
+/// One reading of the artifact-build clock for the current thread.
+///
+/// Test duration profiles are execution prices, not ownership of a shared
+/// cache miss. Without this distinction, each CI shard charges its first
+/// shipping- and test-kernel users tens of seconds, relegating those names;
+/// the next run then charges the same builds to two different names. The raw
+/// suite wall clock still includes every build. Only per-test prices use this
+/// mark to remove construction of memoized kernel, bootloader, and initrd
+/// artifacts.
+#[derive(Clone, Copy)]
+pub struct ArtifactBuildMark(Duration, PhantomData<Rc<()>>);
+
+/// Read the current thread's cumulative artifact-build time.
+pub fn mark_artifact_build_time() -> ArtifactBuildMark {
+    ArtifactBuildMark(ARTIFACT_BUILD_TIME.get(), PhantomData)
+}
+
+impl ArtifactBuildMark {
+    /// Remove artifact construction since this mark from a raw elapsed time.
+    pub fn execution_part(self, raw: Duration) -> Duration {
+        let built = ARTIFACT_BUILD_TIME.get().saturating_sub(self.0);
+        raw.saturating_sub(built)
+    }
+}
+
+/// Charges the slow, cache-filling half of [`build_test_image`] to the build
+/// clock even if it unwinds. Image creation on a memo hit is deliberately
+/// outside this guard: every boot pays that work, so it is part of the test's
+/// repeatable execution price.
+struct ArtifactBuildTimer(Instant);
+
+impl ArtifactBuildTimer {
+    fn start() -> Self {
+        Self(Instant::now())
+    }
+}
+
+impl Drop for ArtifactBuildTimer {
+    fn drop(&mut self) {
+        let elapsed = self.0.elapsed();
+        ARTIFACT_BUILD_TIME.set(ARTIFACT_BUILD_TIME.get().saturating_add(elapsed));
+    }
+}
 
 // --- Config ---
 
@@ -122,15 +179,21 @@ fn external_fingerprint(root: &Path) -> String {
         }
     }
 
+    // Content, not `len:mtime`: `toyos-ld` relinks every CI job because a fresh
+    // `actions/checkout` gives its sources a mtime cargo's own path-dependency
+    // fingerprint has never seen, and the relink is a few MB — hashing it is
+    // milliseconds against the `cargo clean` a changed mtime used to trigger on
+    // every crate this fingerprint gates, `tests/toyos-rust-tests/tls-cranelift`
+    // among them at 570 MiB. The sysroot rlibs above stay on `len:mtime`: CI
+    // unpacks a byte-identical toolchain artifact with `tar`, which restores
+    // mtimes, so their triple is already stable across jobs of one toolchain
+    // tag and hashing every rlib would cost what the clean does today.
     let linker = toolchain::toyos_ld_binary(root);
-    if let Ok(meta) = linker.metadata() {
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        entries.push(format!("toyos-ld:{}:{mtime}", meta.len()));
+    if let Ok(data) = fs::read(&linker) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        data.hash(&mut h);
+        entries.push(format!("toyos-ld:{:016x}", h.finish()));
     }
 
     entries.sort();
@@ -570,8 +633,9 @@ fn build_and_assemble(
 #[derive(Clone, Copy, PartialEq)]
 pub enum Boot {
     Normal,
-    /// `diag/system.toml`: nothing in the image can claim the framebuffer, so
-    /// the kernel's last boot checkpoint stays on screen. `tests/toyos.rs`'s
+    /// `diag/system.toml`: the config declares no `devices`, so nothing
+    /// started there claims the framebuffer and the kernel's last boot
+    /// checkpoint stays on screen. `tests/toyos.rs`'s
     /// `screen_diag_boot` boots this same config, so the tested image and the
     /// flashed image are the same image.
     Diag,
@@ -613,7 +677,7 @@ impl Boot {
 /// than listed here, so the check cannot drift from what cargo would accept —
 /// and, more to the point, so that deleting a feature takes its own command
 /// lines down with it. That is what a temporary feature needs: when
-/// `hda-probe` goes at `specs/hda-driver-plan.md` H9, an invocation still
+/// `hda-probe` goes at `specs/plans/hda-driver-plan.md` H9, an invocation still
 /// asking for it fails saying so instead of quietly producing a kernel with no
 /// probe in it, which is the same image and a different machine.
 ///
@@ -628,7 +692,7 @@ fn kernel_features(
 ) -> String {
     let mut features: Vec<&str> = Vec::new();
     if debug {
-        features.push("debug-wait");
+        features.push(DEBUG_KERNEL_BUILD);
     }
     // A parameter names an actuator, and only a kernel compiled with them can
     // be told to arm one. This is the whole of what `--kernel-param` decides
@@ -698,6 +762,22 @@ fn declared_kernel_features(root: &Path) -> Vec<String> {
 /// second spelling of this set would be a second kernel and nothing would say
 /// so.
 pub const TEST_KERNEL: &[&str] = &["boot-actuators", "test-actuators"];
+
+/// Kernel builds the ordinary test suite is allowed to make.
+pub const TEST_SUITE_KERNEL_BUILDS: [&str; 3] =
+    ["", "boot-actuators,test-actuators", "fpu-save-nothing"];
+
+/// The kernel build used only by the harness's interactive debugger.
+pub const DEBUG_KERNEL_BUILD: &str = "debug-wait";
+
+/// Whether the test harness's current mode declares this kernel build.
+pub fn harness_kernel_build_is_declared(features: &str, debug_wait: bool) -> bool {
+    if debug_wait {
+        features == DEBUG_KERNEL_BUILD
+    } else {
+        TEST_SUITE_KERNEL_BUILDS.contains(&features)
+    }
+}
 
 /// Every actuator `kernel/src/actuator.rs` declares, read out of the file that
 /// declares them.
@@ -933,7 +1013,7 @@ pub fn designate_for_format(path: &Path, len: u64) {
 /// A `cargo test` run boots ~76 machines, and most of those boots ask for an
 /// image some earlier boot already built; the three `cargo` invocations then
 /// take ~1.4 s between them to answer "nothing changed"
-/// (`specs/test-cost-audit.md` §1.4). In memory and never on disk, so a run gets
+/// (`specs/assessments/test-cost-audit.md` §1.4). In memory and never on disk, so a run gets
 /// one answer for the tree it started against and the next run asks cargo
 /// again.
 ///
@@ -1031,6 +1111,12 @@ pub fn build_test_image(
         return image::create_boot_image(&kernel, &bl, &initrd, &cmdline);
     }
 
+    // A cache miss is shared setup, not a property of whichever test happened
+    // to be first on this shard. Keep it on a separate clock until all missing
+    // memo parts have been constructed. The fresh per-boot image below remains
+    // outside the charge because every execution needs one.
+    let build_timer = ArtifactBuildTimer::start();
+
     // **Below the memo's early return, so a boot that builds nothing queues for
     // nothing.** Above every build lock, per the module header. This is the
     // acquisition the eight-landing day was about: twelve suite workers each
@@ -1104,6 +1190,8 @@ pub fn build_test_image(
     let initrd_bytes = INITRD.get_or_build(initrd_key, || {
         build_and_assemble(root, &config, &path_env, extra_files, quiet)
     });
+
+    drop(build_timer);
 
     image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes, &cmdline)
 }
@@ -1300,6 +1388,37 @@ fn find_host_rlibs(root: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_artifact_build_is_not_part_of_a_test_execution_price() {
+        let before = mark_artifact_build_time();
+        ARTIFACT_BUILD_TIME.set(
+            ARTIFACT_BUILD_TIME
+                .get()
+                .saturating_add(Duration::from_millis(70)),
+        );
+        assert_eq!(
+            before.execution_part(Duration::from_millis(83)),
+            Duration::from_millis(13)
+        );
+
+        let after = mark_artifact_build_time();
+        assert_eq!(
+            after.execution_part(Duration::from_millis(13)),
+            Duration::from_millis(13)
+        );
+
+        // A coarse build clock must not underflow a very short failed outcome.
+        ARTIFACT_BUILD_TIME.set(
+            ARTIFACT_BUILD_TIME
+                .get()
+                .saturating_add(Duration::from_millis(70)),
+        );
+        assert_eq!(
+            after.execution_part(Duration::from_millis(13)),
+            Duration::ZERO
+        );
+    }
+
     /// A test that asks for no kernel feature boots the binary an image ships.
     ///
     /// **That claim is a file, not a resemblance.** A kernel is staged under
@@ -1330,11 +1449,31 @@ mod tests {
         );
     }
 
+    /// Interactive debug mode deliberately builds one variant the ordinary
+    /// suite does not, and the mode bit must not become a blanket exemption.
+    #[test]
+    fn debug_mode_declares_only_its_debug_kernel() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let debug = kernel_features(root, true, &[], &[]);
+        assert_eq!(debug, DEBUG_KERNEL_BUILD);
+        assert!(!TEST_SUITE_KERNEL_BUILDS.contains(&debug.as_str()));
+        assert!(harness_kernel_build_is_declared(&debug, true));
+        assert!(!harness_kernel_build_is_declared(&debug, false));
+        assert!(!harness_kernel_build_is_declared(
+            "fpu-save-nothing,debug-wait",
+            true
+        ));
+        for suite_build in TEST_SUITE_KERNEL_BUILDS {
+            assert!(harness_kernel_build_is_declared(suite_build, false));
+            assert!(!harness_kernel_build_is_declared(suite_build, true));
+        }
+    }
+
     /// **An actuator is a boot parameter and never a kernel build.**
     ///
     /// A name that reappears in `kernel/Cargo.toml` is a 46th kernel, and the
     /// suite would build it without anything saying so — which is the state
-    /// `specs/test-cost-audit.md` §5.9.7 replaced. The two lists are read from
+    /// `specs/assessments/test-cost-audit.md` §5.9.7 replaced. The two lists are read from
     /// the two files that declare them, so neither can be satisfied by editing
     /// this test.
     #[test]
@@ -1372,7 +1511,7 @@ mod tests {
                 "sched-check",
                 "test-actuators",
             ],
-            "the kernel declares a feature `specs/test-cost-audit.md` §5.9.7 does not account for"
+            "the kernel declares a feature `specs/assessments/test-cost-audit.md` §5.9.7 does not account for"
         );
     }
 

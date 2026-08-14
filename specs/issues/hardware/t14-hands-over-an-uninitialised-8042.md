@@ -6,7 +6,7 @@ opened: 2026-08-07
 
 # The T14's firmware hands over an *uninitialised* 8042 about one boot in seven, and the fallback has nothing to stand on there
 
-Found in `specs/metal-logs/2026-08-07-freeze/`, seven consecutive boots of one
+Found in `specs/assessments/metal-logs/2026-08-07-freeze/`, seven consecutive boots of one
 image. Six read `cfg=0x77->0x64`. `222741` reads `cfg=0x30->0x60`, and the
 driver disabled the keyboard by name:
 

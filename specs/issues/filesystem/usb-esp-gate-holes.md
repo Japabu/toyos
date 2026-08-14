@@ -6,7 +6,7 @@ opened: 2026-08-08
 
 # Three of the six USB/ESP gate holes the teeth audit demonstrated are still open
 
-`specs/type-safety-audit/usb-gate-teeth.md` is the record — it names each hole,
+`specs/assessments/type-safety-audit/usb-gate-teeth.md` is the record — it names each hole,
 gives the mutation that proved it, and its Part 3 is a ranked work list. It was
 written against `8d7044c`, which `git rev-list --count 8d7044c..HEAD` puts 738
 commits behind as of this entry, and three of its six have closed since. Filed

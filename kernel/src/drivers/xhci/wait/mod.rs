@@ -26,7 +26,7 @@
 //! - [`msc::bind`] — **the one door**, and the only blocking thing a scheduler
 //!   pass can still reach. A disk plugged in after boot has to be brought up by
 //!   somebody, its bring-up is Bulk-Only Transport, and that is a machine of
-//!   its own that `specs/xhci-port-machine-plan.md` X2c gives one to. Until
+//!   its own that `specs/plans/xhci-port-machine-plan.md` X2c gives one to. Until
 //!   then the claim above holds of everything except a disk arriving after
 //!   boot.
 
@@ -40,7 +40,7 @@ pub mod msc;
 /// does. It exists because the depth cannot be read off the call graph — the
 /// backtrace it prints beside it is what says which locks those are, and one of
 /// them is named nowhere in the chain of function names. Every stage of
-/// `specs/blocking-io-plan.md` is judged on this number falling.
+/// `specs/plans/blocking-io-plan.md` is judged on this number falling.
 ///
 /// Deepest-so-far rather than every wait, because a line per transfer on a
 /// machine whose log lives on the transfer's own device is the self-sustaining

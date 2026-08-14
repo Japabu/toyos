@@ -6,7 +6,7 @@ opened: 2026-08-10
 
 # Nothing checks that the test kernel with nothing armed is the shipping kernel
 
-`specs/test-cost-audit.md` §5.9.7 replaced 45 kernel builds with two: the one
+`specs/assessments/test-cost-audit.md` §5.9.7 replaced 45 kernel builds with two: the one
 every image ships and one carrying all 47 actuators, armed by boot parameter.
 The actuator kernel's every accessor is a load of a word that is zero unless the
 parameter names it, so an unarmed boot of it *should* take the shipped branch

@@ -6,7 +6,7 @@ opened: 2026-08-08
 
 # The residual T14 underruns are the *client's* CPU taking the log flush, not soundd's
 
-`specs/metal-logs/2026-08-08-audio-underruns/` is the boot: 54 windows, **686
+`specs/assessments/metal-logs/2026-08-08-audio-underruns/` is the boot: 54 windows, **686
 underruns, 5 drains**, on the tree that already carries
 `flush_log_file_if_affordable`. Drains fell 375 → 5; underruns did not.
 
