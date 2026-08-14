@@ -29,11 +29,16 @@ as a hexadecimal address, and nothing in the line says which.
 
 ## Measured, on the dev host
 
-`fault_gates` reds intermittently in a full `cargo test` — twice in four runs on
-`wt/toyos-logd` at `c1be7c4`+L3 step 2, green in the harness's own ALONE retry
-both times, which is the harness reporting a *host-load* classification. The
-`rs::fault_gates` message is *"expected the faulting function in the #DE
-backtrace"*, and the capture shows exactly the shape above:
+**Two different tests, one mechanism.** In five full `cargo test` runs on
+`wt/toyos-logd` at L3 step 2 (`72d88e6`), `fault_gates` reds twice —
+*"expected the faulting function in the #DE backtrace"* — and `disk_backtrace`
+once — *"expected the faulting function's demangled name — a process loaded off
+a disk got a backtrace with no names in it"*. Neither is on `--known-red`'s
+index. All three reds were **green in the harness's own ALONE retry**, which is
+the harness reporting a host-load classification rather than a defect in the
+code under test.
+
+The capture shows exactly the shape above:
 
 ```
 [kernel 3.884 cpu0 tid=0]   rip:
@@ -57,10 +62,21 @@ The report should say `(symbols unavailable: the process table is held)` rather
 than print a number that reads as a verdict, and a gate asserting on a symbol
 should then red on the *reason* rather than intermittently on the symptom.
 
-## What made it visible
+## What holds the lock, which is the other half
 
-Any change to machine-wide scheduling timing exposes it; the branch that found
-it wakes a kernel thread at every log record, which is a great many more passes
-during a crash report than before. **It is not that branch's defect** — the
-`try_lock` and the caller's reading of its `false` both predate it — and the
-entry is filed rather than fixed for that reason.
+`scheduler::reap_poisoned` takes `PROCESS_TABLE.lock()` — unconditionally, and
+on **every trip round the idle loop** (`sched/driver.rs`'s `idle_loop`). So the
+window a crash report's `try_lock` has to miss is not rare at all: it is
+whatever fraction of the time some CPU is between the top of that loop and its
+`pass`. Anything that makes CPUs go round the idle loop more often widens it,
+and heavy logging is exactly such a thing — today because a CPU declines to
+sleep while the byte ring owes bytes (`driver.rs`'s pre-`hlt` conditions, and
+`scheduler::log_health`'s own doc records that feedback), and after
+`specs/log-architecture-spec.md` L3 because a kernel thread is woken at every
+record and hands its CPU back to the loop when it parks.
+
+**It is not L3's defect.** The `try_lock`, the caller's reading of its `false`
+and `reap_poisoned`'s unconditional lock all predate it; what L3 changes is how
+often the two meet. The entry is filed rather than fixed for that reason, and
+because the fix is a *reporting* change — say why the symbol is missing — rather
+than a lock change.
