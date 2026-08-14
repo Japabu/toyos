@@ -185,14 +185,47 @@ pub fn block_on(ticket: Ticket<'_>, deadline: u64) {
     driver::pass_block(ticket, (deadline > 0).then(|| Nanos(deadline)));
 }
 
-/// Register, re-check, park — for a site whose condition is exactly `ready`.
+/// Register, re-check, park — for a site whose condition is exactly `ready` —
+/// and **hold the wait until that condition is true**.
+///
+/// A return from a park is not evidence that this queue is what woke the
+/// thread. A task is woken *by name* as well as by queue: every child thread's
+/// exit posts `wake_task` to its process's main thread (`process::thread_exit`),
+/// panic recovery wakes a joiner, a futex bucket is shared by every word that
+/// hashes into it, and a deadline fires on the task's own CPU. Checking once
+/// and returning made every caller's answer depend on which of those arrived
+/// first — `sys_process_wait` read an exit code that had not been published
+/// yet and killed the kernel from a plain `Child::wait()`. So the predicate is
+/// re-checked after every wake and the thread re-parks until it holds, which
+/// is what `sched::waitqs` already documents every blocking site as doing.
+///
+/// Looping does not weaken spec §2's no-lost-wake invariant, because each trip
+/// is the whole two-phase handshake again: the re-registration happens *before*
+/// the re-check, so a wake landing in between claims the new ticket and the
+/// commit refuses to park.
+///
+/// `deadline` still bounds the wait. It is absolute, so a re-park carries the
+/// same one and the wait ends no later than it was going to; an expiry returns
+/// with the condition false, which is what the one timed caller
+/// (`sys_read`'s console) needs — it re-derives its answer from the object
+/// rather than from this return, inside a loop of its own.
+///
+/// A killed task never comes back round: a retire that lands while it is
+/// deciding to park turns the block into an exit (`Commit::Killed`, spec §6.3),
+/// and one that lands while it is parked releases it where it lies (§2.7). No
+/// path here can hold a dying thread in a wait.
 #[track_caller]
 pub fn wait_until(queue: &KWaitQueue, deadline: u64, ready: impl Fn() -> bool) {
-    let ticket = prepare_wait(queue);
-    if ready() {
-        ticket.cancel();
-    } else {
+    loop {
+        let ticket = prepare_wait(queue);
+        if ready() {
+            ticket.cancel();
+            return;
+        }
         block_on(ticket, deadline);
+        if deadline != 0 && crate::hw::now_ns() >= deadline {
+            return;
+        }
     }
 }
 
