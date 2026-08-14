@@ -66,6 +66,36 @@ pub fn preempt_off<R>(f: impl FnOnce(&PreemptOff) -> R) -> R {
     result
 }
 
+/// The same proof, bought with `cli` instead of the preempt count.
+///
+/// **`log::emit` may pay neither of [`preempt_off`]'s two locked
+/// read-modify-writes.** `preempt::disable` is `lock add` and `enable` is a
+/// `lock sub` plus a `need_resched` poll that can reach `do_preempt`, which is
+/// a scheduling pass — and one locked RMW per log line cost 350 ms of boot
+/// (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`). `IrqGuard` is
+/// `pushfq`/`pop`/`cli` with `push`/`popfq` on drop: no locked operation at
+/// all, and on the dominant path `IF` is already clear.
+pub struct IrqOff(());
+
+// SAFETY: **preemption in this kernel is delivered at an interrupt.**
+// `do_preempt` has exactly three callers — the LAPIC timer
+// (`arch/idt/timer.rs:101`), the exit-to-user epilogue (`arch/idt/mod.rs:370`,
+// which `sti`s before it calls) and `preempt::enable`'s poll
+// (`preempt.rs:126`). With `IF` masked the first two are unreachable, and the
+// region `irq_off` brackets calls `wake_direct` and nothing else, so it reaches
+// neither `preempt::enable` nor a voluntary pass. A voluntary pass is the one
+// way to be descheduled with `IF` clear, which is why this type has no
+// constructor but the bracket below. The scheduler core grants the same impl to
+// an IRQ context in its own loom model and the trait's SAFETY paragraph names
+// one.
+unsafe impl PreemptGuard for IrqOff {}
+
+/// Run `f` with interrupts masked, holding [`IrqOff`] for exactly that region.
+pub fn irq_off<R>(f: impl FnOnce(&IrqOff) -> R) -> R {
+    let _guard = crate::hw::IrqGuard::close();
+    f(&IrqOff(()))
+}
+
 static CPUS: AtomicPtr<CpuHandles<KMsg>> = AtomicPtr::new(ptr::null_mut());
 static FRONTIER: Frontier = Frontier::new();
 static NEXT_KEY: AtomicU64 = AtomicU64::new(1);

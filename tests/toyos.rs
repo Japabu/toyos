@@ -8059,6 +8059,7 @@ fn run_machine_test(
                 return Err(format!("klogd is hosted but claims the wrong panic row: {line:?}"));
             }
             eprintln!("  [klogd] {}", line.trim());
+
             drop(qemu);
 
             // The marker is a line of the crash *report* rather than `PANIC:`

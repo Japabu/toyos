@@ -600,6 +600,12 @@ fn summary(cpus: usize, silent: u32, c: Census) {
              open, so nothing here can say what no cpu holds",
         );
     }
+    // The one thread the report cannot ask about by walking a queue, because
+    // what it is doing is the reason this report is readable at all. `lost` is
+    // the number a reader of the console can never derive: it names the lines
+    // that are not there.
+    let (drained, lost, parks) = crate::log::console::stats();
+    log!("== klogd: {drained} record(s) drained, {lost} lost, {parks} park(s)");
     let unprinted = tally::UNPRINTED.load(Ordering::Relaxed);
     if unprinted > 0 {
         log!("== {unprinted} ordinary parked task(s) not listed; every anomaly is");

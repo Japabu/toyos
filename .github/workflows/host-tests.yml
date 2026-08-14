@@ -115,6 +115,24 @@ jobs:
           cargo test --manifest-path kernel-loom/Cargo.toml --no-default-features \
             --test log_zeroed_init 2>&1 | tee -a /tmp/host.log
 
+      # **W3's teeth, run rather than recorded.** `wake-fence-off` removes the
+      # two `SeqCst` fences from `shard.rs`'s wake pair and `log_wake` must red
+      # under it; a model that has never failed proves nothing, and this is the
+      # only obligation in the tree whose *negative* no guest test can express —
+      # on x86 a build with either fence gone behaves identically, which is the
+      # whole reason it is a model. `specs/log-architecture-spec.md` §2.5.
+      - name: kernel-loom wake fences have teeth
+        run: |
+          set -o pipefail
+          echo "=== kernel-loom --features wake-fence-off --test log_wake (must red)" \
+            | tee -a /tmp/host.log
+          if cargo test --manifest-path kernel-loom/Cargo.toml \
+               --features wake-fence-off --test log_wake 2>&1 | tee -a /tmp/host.log; then
+            echo "log_wake passed with both fences removed: the model has no teeth" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+
       # `userland/.cargo/config.toml` cross-compiles by default, so a userland
       # crate's host tests have to name the host. `calc` is here for the reason
       # the pure crates above are: its arithmetic is decided without a guest,

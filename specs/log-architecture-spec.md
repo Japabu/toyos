@@ -890,10 +890,19 @@ impl Shard {
                      guard: &LogCommitGuard);
 }
 /// Fence, read the flag after commit. True means "a reader is parked; post".
-pub fn signal_after_commit() -> bool;
+pub fn signal_after_commit(waiter: &AtomicBool) -> bool;
 /// set the flag, fence, re-scan for a committed record. True means "do not park".
-pub fn arm_waiter(cursor: &Cursor) -> bool;
+pub fn arm_waiter(waiter: &AtomicBool, committed_record_waiting: impl Fn() -> bool) -> bool;
 ```
+
+**Two arguments rather than none, and each is what keeps the file shimmable.**
+The flag comes in because loom's atomics have no `const` constructor, so a
+`static` is unrepresentable in the modelled build — `registry.rs` already solves
+that the same way, with `#[cfg]`ed `log_waiter()`/`waiter()` beside the
+functions. The rescan comes in as a closure because the predicate lives in
+`read.rs` and names `log/mod.rs`'s shard registry, which is exactly the
+dependency this file may not grow: passing it means `arm_waiter` names no
+subject at all, and the model supplies its own.
 
 The caller does the post on a `true`, and never the ordering. The shimmed set for
 `shard.rs` is then `UnsafeCell`, `LogCommitGuard` and `percpu_fetch_add`, which
@@ -927,6 +936,26 @@ against a parked `klogd` and goes quiet with a committed record behind it; loom
 is the only instrument that sees it, which is why the model ships in the same
 chunk as the code.
 
+**As built it is `a_commit_and_an_arm_cannot_both_miss`, and its invariant is
+narrower than this section first wrote it.** The model asserts that after a
+commit and an arm, *at least one side has seen the other* — either the producer
+owns a post or the reader's rescan finds the record — and it asserts nothing
+about the park. **The first draft of the model did model the park, with a plain
+`parked` word, and it reported a lost wake that does not exist**: a producer
+clearing a word the reader has not set yet is a race the *rendezvous CAS*
+removes, because `klogd` registers before it arms and a producer that wins the
+flag from there on claims a `Committing` task whose own commit then refuses to
+park. That handshake is `toyos-sched`'s and has its own models; re-deriving it
+here only re-derived it badly. What is left is exactly the pair of fences, which
+nothing else in the tree models.
+
+**The negative control runs rather than being recorded.** `wake-fence-off` is a
+cargo feature that removes both fences, `kernel/Cargo.toml` declares it for
+`cfg`-checking exactly as it declares `loom`, and
+`.github/workflows/host-tests.yml` runs `log_wake` under it and fails the job if
+it *passes*. Measured 2026-08-14 on the dev host: green both tests with the
+fences, `a_commit_and_an_arm_cannot_both_miss` red without them.
+
 **W3's rescan is over committed records and never over `head`, and that is a
 liveness property rather than a taste.** `head[i] > next[i]` can mean one writer
 is inside the bounded publication window; it does not mean the next slot is
@@ -957,6 +986,14 @@ oldest_readable = head[i].saturating_sub(SHARD_RECORDS)
 lost[i]        += oldest_readable.saturating_sub(next[i])
 next[i]         = max(next[i], oldest_readable)
 ```
+
+**`next` starts at `FIRST_SEQ` and not at zero, and the clamp is applied on
+every call rather than at construction.** Sequence numbers start at 1 (§2.4), so
+a cursor sitting at 0 would compute one phantom loss per shard on its first
+call — and a cursor that crossed the syscall boundary arrives *zeroed*, which is
+the caller doing exactly that. `Cursor::new` gives the kernel's readers the
+right value and `Cursor::open` takes `max(FIRST_SEQ)` anyway, because the second
+of those two callers is untrusted input.
 
 **No producer-side drop counter exists.** Loss is exact, per reader, derived from
 the two numbers that already have to be right, and no counter can drift from the
@@ -1029,7 +1066,9 @@ region calls `wake_direct` and nothing else, so it reaches neither
 descheduled with `IF` clear, which is why the witness has no constructor but the
 bracket. The scheduler core grants the same impl to an IRQ context in its own
 loom model (`toyos-sched/loom/src/model.rs:105`) and the trait's own SAFETY
-paragraph names one.
+paragraph names one. As built it is `driver::IrqOff` and `driver::irq_off`,
+beside `PreemptOff` and `preempt_off`, and the pair reads as the two answers to
+one question.
 
 **`LOG_WAITER` is the gate, and it is what keeps the record path free of locked
 RMWs.** Without it every record would pay `claim_wake`'s CAS. §2.5's two
@@ -1067,6 +1106,12 @@ as the re-check.
 `Acquire` — the shape `CPUS` already has in the same file (`driver.rs:69`, read
 at `:78`, set once from a leaked `Box`). Null means "no `klogd` yet", which is
 `Drain::Inline`'s state and needs no branch of its own.
+
+**The leak is not tidiness either.** A producer reading this pointer is inside
+whatever lock it was already holding, and an `Arc` clone there is a refcount it
+could be the last owner of — so the `Arc<KShared>` is `Box::leak`ed once at
+spawn and the static holds a `&'static` to it. `klogd` never exits, so there is
+nothing for the leak to lose.
 
 **The RMW budget, counted from the code rather than measured.** Per record in
 `Drain::Thread`: **no locked RMW**, one `fence(SeqCst)`, one relaxed load. Per

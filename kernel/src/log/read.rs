@@ -1,22 +1,27 @@
-//! The reader a dying machine uses.
+//! The two readers, because a dying machine and a live one want different
+//! rules.
 //!
-//! One function, and it is the one the panic console and Ctrl+Alt+D call: every
-//! *committed* record in a window, merged across shards, taking no lock and
-//! never blocking. A slot a writer is inside is skipped rather than waited for,
+//! [`snapshot_committed`] is the panic console's and Ctrl+Alt+D's: every
+//! *committed* record in a window, newest first, taking no lock and never
+//! blocking. A slot a writer is inside is skipped rather than waited for,
 //! because the writer that would have finished it may be the CPU that just
 //! halted — and a reader that waits for it never reaches the line that says
 //! why.
 //!
-//! **The streaming reader is not here.** `drain_ordered` blocks a shard at its
-//! first uncommitted record, which is right for `klogd` and for the cursor
-//! syscall and wrong for a machine that has no "later"; it arrives with the
-//! first of those callers rather than as a function nothing calls.
+//! [`drain_ordered`] is `klogd`'s and, from L4, `SYS_LOG_READ`'s: in sequence
+//! order per shard, oldest first, stopping a shard at its first uncommitted
+//! record. On a live machine that stop is one bounded 1 KiB publication long;
+//! on a dying one it can be forever, which is exactly why the machine that is
+//! halting uses the other function instead.
+//!
+//! **Two names rather than one with a flag**, because each is correct for its
+//! caller and neither is a mode of the other.
 //!
 //! `specs/log-architecture-spec.md` §3.1.
 
 use toyos_abi::log::{LogRecord, MAX_LOG_SHARDS};
 
-use super::shard::Shard;
+use super::shard::{Shard, FIRST_SEQ};
 
 /// Somewhere a whole record goes.
 ///
@@ -90,6 +95,131 @@ impl Descent {
             return;
         }
     }
+}
+
+/// Where one reader has got to, and how much it never saw.
+///
+/// **The kernel holds none of these.** `klogd` owns one on its own stack and
+/// `SYS_LOG_READ`'s caller owns the other in its own memory, so there is no
+/// object, no handle lifecycle, nothing to leak or go stale, and a second
+/// reader costs nothing.
+pub struct Cursor {
+    /// The next sequence number wanted from each shard.
+    next: [u64; MAX_LOG_SHARDS],
+    /// Records this cursor never saw because they were overwritten.
+    ///
+    /// **Derived, never counted.** There is no producer-side drop counter
+    /// anywhere in this design: loss is `oldest_readable - next`, computed from
+    /// two numbers that already have to be right, so nothing can drift from the
+    /// ring. It also keeps the last `fetch_add` off the overflow path.
+    lost: u64,
+}
+
+impl Cursor {
+    /// A reader that has seen nothing. [`FIRST_SEQ`] and not zero: zero is the
+    /// state of a slot nothing has written, so a cursor starting there would
+    /// count one phantom loss per shard on its first call.
+    pub const fn new() -> Self {
+        Self { next: [FIRST_SEQ; MAX_LOG_SHARDS], lost: 0 }
+    }
+
+    pub fn lost(&self) -> u64 {
+        self.lost
+    }
+
+    /// Clamp this shard's position to what it can still answer for, counting
+    /// the difference as loss, and offer the candidate now sitting there.
+    ///
+    /// `None` is "nothing to take from this shard right now" and covers both
+    /// reasons at once — the shard is empty, or a writer is inside the slot —
+    /// because the caller does the same thing in either case.
+    fn open(&mut self, i: usize, shard: Option<&'static Shard>) -> Option<u64> {
+        let shard = shard?;
+        let oldest = shard.oldest_readable();
+        // `max(FIRST_SEQ)` rather than trusting the field: a cursor that
+        // crossed the syscall boundary arrives zeroed on its first call, and a
+        // zero here would read as "the reader has missed everything".
+        let want = self.next.get(i).copied().unwrap_or(FIRST_SEQ).max(FIRST_SEQ);
+        self.lost += oldest.saturating_sub(want);
+        let want = want.max(oldest);
+        *self.next.get_mut(i)? = want;
+        shard.at_ns(want)
+    }
+}
+
+impl Default for Cursor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Every record this cursor has not seen, **oldest first**, merged across
+/// shards by `at_ns`. Returns how many reached `out`.
+///
+/// **It blocks a shard, never the stream.** A shard stopped at an uncommitted
+/// record does not stop the merge: the others keep flowing, and that shard's
+/// records arrive on a later call once its writer commits. So the order is
+/// `at_ns` order *among what it emits*, which is the one ordering property this
+/// design does not give — and the alternative, stalling every shard on the
+/// slowest, is what turns one wedged CPU into a silent machine.
+///
+/// Allocation-free and bounded by [`MAX_LOG_SHARDS`], like its sibling.
+pub fn drain_ordered(cursor: &mut Cursor, out: &mut impl RecordSink) -> usize {
+    let shards = super::shards();
+    let mut cand = [None; MAX_LOG_SHARDS];
+    for (i, slot) in cand.iter_mut().enumerate() {
+        *slot = cursor.open(i, shards[i]);
+    }
+
+    let mut emitted = 0;
+    loop {
+        // Oldest first, which is the opposite of the snapshot's order and for
+        // the opposite reason: this reader has no fixed buffer to spend and its
+        // consumer wants the stream in the order it happened.
+        let mut best: Option<(usize, u64)> = None;
+        for (i, slot) in cand.iter().enumerate() {
+            if let Some(at_ns) = *slot {
+                if best.is_none_or(|(_, oldest)| at_ns < oldest) {
+                    best = Some((i, at_ns));
+                }
+            }
+        }
+        let Some((i, _)) = best else { return emitted };
+        let Some(shard) = shards[i] else { return emitted };
+
+        match shard.read(cursor.next[i]) {
+            Some(record) => {
+                if !out.put(&record) {
+                    return emitted;
+                }
+                emitted += 1;
+                cursor.next[i] += 1;
+            }
+            // The slot was recycled between the timestamp and the body. The
+            // record is gone; `open` below re-clamps and counts it, which is
+            // the same subtraction every other loss goes through.
+            None => {}
+        }
+        cand[i] = cursor.open(i, shards[i]);
+    }
+}
+
+/// Is there a committed record this cursor has not taken?
+///
+/// The predicate [`drain_ordered`] stops on, asked without taking anything —
+/// which is what `shard::arm_waiter`'s rescan needs and why the rescan is over
+/// *committed records* rather than over `head`.
+pub fn any_committed(cursor: &Cursor) -> bool {
+    super::shards()
+        .iter()
+        .enumerate()
+        .any(|(i, shard)| match shard {
+            Some(shard) => {
+                let want = cursor.next[i].max(FIRST_SEQ).max(shard.oldest_readable());
+                shard.at_ns(want).is_some()
+            }
+            None => false,
+        })
 }
 
 /// Every committed record stamped in `from..=to`, **newest first**, merged

@@ -23,6 +23,16 @@ publish = false
 [features]
 default = ["loom"]
 loom = []
+# The negative control for W3. It removes the two `SeqCst` fences from
+# `shard.rs`'s wake pair, and `log_wake.rs` must red under it — the one command
+# that proves the model has teeth:
+#
+#   cargo test --manifest-path kernel-loom/Cargo.toml --features wake-fence-off \
+#     --test log_wake
+#
+# Never on by default and never reachable from a kernel build, which declares
+# the same name only so `cfg` checking knows it.
+wake-fence-off = []
 
 [dependencies]
 loom = "0.7"

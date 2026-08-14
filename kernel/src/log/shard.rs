@@ -15,12 +15,12 @@
 #[cfg(not(feature = "loom"))]
 use core::cell::UnsafeCell;
 #[cfg(not(feature = "loom"))]
-use core::sync::atomic::{fence, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 
 #[cfg(feature = "loom")]
 use crate::cell::UnsafeCell;
 #[cfg(feature = "loom")]
-use loom::sync::atomic::{fence, AtomicU64, Ordering};
+use loom::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 
 use toyos_abi::log::{LogRecord, MAX_RECORD_MESSAGE};
 /// Only the layout assertions name it, and those are the kernel build's.
@@ -393,3 +393,68 @@ impl Shard {
 // and read only through `read`, whose exact-equality re-check rejects any body
 // a writer has begun to overwrite.
 unsafe impl Sync for Shard {}
+
+/// Is a reader parked on this machine's records?
+///
+/// **One bit, and it is what keeps the producer's path free of locked
+/// read-modify-writes.** Without it every commit would pay `claim_wake`'s CAS,
+/// and `specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md` measured what
+/// one of those per line costs under TCG: 350 ms of boot. What a producer pays
+/// here is a fence and a relaxed load; the five locked operations of the post
+/// are paid at most once per park, by whichever producer wins the swap.
+#[cfg(not(feature = "loom"))]
+static LOG_WAITER: AtomicBool = AtomicBool::new(false);
+
+/// The machine's one flag. `registry.rs`'s arrangement and its reason: loom's
+/// atomics have no `const` constructor, so the model builds its own and hands
+/// it to the two functions below.
+#[cfg(not(feature = "loom"))]
+pub fn log_waiter() -> &'static AtomicBool {
+    &LOG_WAITER
+}
+
+#[cfg(feature = "loom")]
+pub fn waiter() -> AtomicBool {
+    AtomicBool::new(false)
+}
+
+/// Read the waiter flag **after** the guarded commit store. `true` means "a
+/// reader is parked and this caller owns the post".
+///
+/// The caller does the post and never the ordering, which is the whole reason
+/// this lives here rather than in `mod.rs` with `emit`: `shard.rs` is the file
+/// `kernel-loom` compiles a second time, and an edge in a file no model reaches
+/// is an edge nothing checks. x86 TSO hides a missing one from every guest test.
+///
+/// The swap admits exactly one poster per park. It is an RMW and it is on the
+/// producer's path — but only on the path of the one producer that found the
+/// flag set, which is once per park rather than once per record.
+pub fn signal_after_commit(waiter: &AtomicBool) -> bool {
+    // **Load-bearing, and x86 cannot fail without it.** This half is a store
+    // (the commit) followed by a load (the flag), which is the one reordering
+    // TSO permits; the waiter's half is the mirror image. Drop either fence and
+    // both sides can miss, leaving a committed record under a parked reader —
+    // a machine that has gone quiet with something left to say.
+    #[cfg(not(feature = "wake-fence-off"))]
+    fence(Ordering::SeqCst);
+    if !waiter.load(Ordering::Relaxed) {
+        return false;
+    }
+    waiter.swap(false, Ordering::AcqRel)
+}
+
+/// Arm the flag, fence, and re-scan. `true` means "do not park".
+///
+/// **The rescan asks whether a record is committed and never whether `head`
+/// moved**, and that is a liveness property rather than a taste: `head` counts
+/// reservations, so `head > next` can mean a writer is inside the bounded
+/// publication window and busy-waiting on it spends a CPU until the copy
+/// finishes. The predicate is the one `drain_ordered` uses, and the caller may
+/// then park: a writer still inside its window wakes the waiter with its own
+/// post-commit signal, and one that already committed is caught here.
+pub fn arm_waiter(waiter: &AtomicBool, committed_record_waiting: impl Fn() -> bool) -> bool {
+    waiter.store(true, Ordering::Relaxed);
+    #[cfg(not(feature = "wake-fence-off"))]
+    fence(Ordering::SeqCst);
+    committed_record_waiting()
+}

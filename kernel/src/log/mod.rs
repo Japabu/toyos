@@ -259,6 +259,18 @@ pub fn emit(level: Level, args: core::fmt::Arguments) {
     // state unchanged.
     unsafe { origin.shard.commit(seq, &record, &guard) };
     drop(guard);
+
+    // **After the publication bracket closes, and in a bracket of its own.**
+    // The producer's whole contribution to the wake is a `SeqCst` fence and a
+    // relaxed load; the five locked operations of the post are paid at most
+    // once per `klogd` park, by whichever producer wins the swap. `emit` may
+    // take no lock — it runs inside `sync.rs`, inside IRQ handlers, inside the
+    // scheduler and inside every syscall's locked region — which is why the
+    // post is `wake_direct` and not an ordinary queue wake.
+    // `specs/log-architecture-spec.md` §2.6a.
+    if shard::signal_after_commit(shard::log_waiter()) {
+        console::post_wake();
+    }
 }
 
 /// A line of ordinary kernel log. 658 sites.
