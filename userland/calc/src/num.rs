@@ -122,18 +122,24 @@ impl Num {
     /// `self^other`, exact whenever the exponent is a whole number small enough
     /// that the exact answer is worth writing.
     pub fn pow(&self, other: &Num) -> Result<Num, EvalError> {
-        if let (Num::Exact(base), Some(exp)) = (self, other.to_i64_exact()) {
-            if base.is_zero() && exp <= 0 {
-                return Err(EvalError::ZeroToNonPositivePower);
+        if let Some(exp) = other.to_i64_exact() {
+            if let Num::Exact(base) = self {
+                if base.is_zero() && exp <= 0 {
+                    return Err(EvalError::ZeroToNonPositivePower);
+                }
+                let width = base
+                    .numerator()
+                    .decimal_len()
+                    .max(base.denominator().decimal_len())
+                    .saturating_mul(exp.unsigned_abs() as usize);
+                if width <= MAX_EXACT_POW_DIGITS {
+                    return base.pow_i64(exp).map(Num::Exact).ok_or(EvalError::Overflow);
+                }
             }
-            let width = base
-                .numerator()
-                .decimal_len()
-                .max(base.denominator().decimal_len())
-                .saturating_mul(exp.unsigned_abs() as usize);
-            if width <= MAX_EXACT_POW_DIGITS {
-                return base.pow_i64(exp).map(Num::Exact).ok_or(EvalError::Overflow);
-            }
+            // A whole exponent is repeated multiplication whatever the base's
+            // sign is. Only a fractional one needs a logarithm, and only a
+            // logarithm needs a positive base.
+            return Ok(Num::Approx(self.to_dec().pow_int(exp, PREC)?));
         }
         Ok(Num::Approx(self.to_dec().pow(&other.to_dec(), PREC)?))
     }
@@ -302,6 +308,30 @@ mod tests {
         assert_eq!(
             Num::from_i64(0).pow(&Num::from_i64(-1)),
             Err(EvalError::ZeroToNonPositivePower)
+        );
+    }
+
+    /// An approximation is squared by multiplying it, not by taking its
+    /// logarithm — so a negative one has a square.
+    #[test]
+    fn a_whole_power_of_an_approximation_does_not_need_a_positive_base() {
+        let cos2 = Num::from_i64(2).cos(Angle::Rad).unwrap();
+        assert!(cos2.to_dec().is_negative(), "cos 2 is negative");
+        let squared = cos2.pow(&Num::from_i64(2)).unwrap();
+        assert_eq!(squared, cos2.mul(&cos2));
+        assert!(squared.display().starts_with("≈0.1731781895681940"), "{}", squared.display());
+        // Past the square the two roads part in the last *working* digit and
+        // not before the displayed one: `pow_int` carries ten guard digits
+        // through the whole squaring and rounds once, where a chain of
+        // multiplications rounds at every step. The more accurate of the two is
+        // the one under test.
+        let cubed = cos2.pow(&Num::from_i64(3)).unwrap();
+        assert_eq!(cubed.display(), cos2.mul(&cos2).mul(&cos2).display());
+        assert!(cubed.to_dec().is_negative(), "an odd power keeps the sign");
+        // A fractional exponent on a negative base is still the refusal it was.
+        assert_eq!(
+            cos2.pow(&Num::from_i64(1).div(&Num::from_i64(2)).unwrap()),
+            Err(EvalError::NegativeBaseFractionalExponent)
         );
     }
 
