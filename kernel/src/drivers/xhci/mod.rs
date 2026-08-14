@@ -1414,7 +1414,7 @@ impl XhciController {
     ///
     /// One step per call and no wait anywhere in it — see [`PortWork`]. The
     /// enumeration it eventually runs *is* blocking, and it is the same
-    /// `device::configure` the boot path runs; what this removes from the
+    /// `wait::boot::configure` the boot path runs; what this removes from the
     /// blocking part is the debounce and the port reset, which on the T14 are
     /// 100 ms and 55 ms against roughly 14 ms for everything else.
     fn service_ports(&mut self) -> Option<u64> {

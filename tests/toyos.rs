@@ -851,11 +851,10 @@ const FILL_FATAL: [u8; 3] = [0x60, 0x00, 0x00];
 const FILL_BOOT: [u8; 3] = [0x00, 0x00, 0x00];
 
 /// The T14 Gen 2's panel as the console grids it: 1080/16 rows of 1920/8
-/// columns. QEMU's stdvga GOP is *larger* — the bootloader picks the
-/// most-pixels mode and `MAX_ROWS`/`MAX_COLS` cap that at 96x256 — so a line
-/// can sit comfortably on the test's screen and fall off the laptop's. Every
-/// geometry claim `screen_diag_boot` makes is made against these two numbers
-/// and not against the screen it is reading.
+/// columns. `Profile::Metal` caps vgamem at 8 MiB, so the most-pixels mode
+/// the bootloader picks *is* this panel — the test's screen and the laptop's
+/// share one geometry. Every geometry claim `screen_diag_boot` makes is made
+/// against these two numbers and not against the screen it is reading.
 const T14_ROWS: usize = 1080 / 16;
 const T14_COLS: usize = 1920 / 8;
 
@@ -893,8 +892,7 @@ enum Why {
     /// failure nobody is assigned to is a disabled test, and a *decline* is
     /// not owed to anybody by construction.
     Declined(&'static str),
-    /// Held open by a write-up, which is where the reason lives. `docs.rs`
-    /// resolves the path.
+    /// Held open by a write-up, which is where the reason lives.
     Open(&'static str),
 }
 
@@ -12061,8 +12059,8 @@ fn check_registration() {
         // charge the fast tier the whole group's cost — which is the arithmetic
         // the ceiling exists to control. It is also what makes
         // `tiers::Why::RidesTheBootOf` an honest row rather than an excuse: the
-        // six cheap members of the metal-sim and i8042 boots are relegated
-        // *because* this is enforced.
+        // cheap members of the metal-sim boot are relegated *because* this is
+        // enforced.
         assert!(
             MACHINE_TESTS[first..=last].windows(2).all(|w| w[0].2 == w[1].2),
             "{group} shares one boot, so its members must share one tier"
