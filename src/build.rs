@@ -633,8 +633,9 @@ fn build_and_assemble(
 #[derive(Clone, Copy, PartialEq)]
 pub enum Boot {
     Normal,
-    /// `diag/system.toml`: nothing in the image can claim the framebuffer, so
-    /// the kernel's last boot checkpoint stays on screen. `tests/toyos.rs`'s
+    /// `diag/system.toml`: the config declares no `devices`, so nothing
+    /// started there claims the framebuffer and the kernel's last boot
+    /// checkpoint stays on screen. `tests/toyos.rs`'s
     /// `screen_diag_boot` boots this same config, so the tested image and the
     /// flashed image are the same image.
     Diag,

@@ -111,8 +111,8 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-    # `debian:sid` ships QEMU 11.0.3, the dev host's exact version and the one
-    # `.github/qemu-version` declares; `ubuntu-24.04` ships 8.2.2 and the two
+    # `debian:sid` ships the QEMU `.github/qemu-version` declares, the dev
+    # host's version too; `ubuntu-24.04` ships 8.2.2 and the two
     # disagree about test outcomes
     # (specs/assessments/ci-plan-assessment-2026-08.md §7.3). The firmware, boot
     # image and host CPU are unchanged from a bare runner — only the QEMU

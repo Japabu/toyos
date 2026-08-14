@@ -305,7 +305,7 @@ mistaken for a regression on a machine where debugging is nearly blind.
   a console the `===TEST_START===` protocol works, so the machine that gets
   flashed is the machine the input tests run on: all five i8042 tests and
   `metal_sim_input` boot this profile. `--metal-sim --mute` takes the 16550
-  away again; one test uses it (`screen_panic_muted`), and what it certifies is
+  away again; four tests boot it muted, and `screen_panic_muted` certifies
   the property that needs a mute machine to mean anything — a kernel panic
   reaching the screen with `uart_present()` false and `panic_flush` draining
   nowhere.
