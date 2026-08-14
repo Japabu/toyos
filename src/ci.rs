@@ -90,9 +90,9 @@ mod tests {
 
     /// Every `<job>:` block of a workflow, crudely and on purpose.
     ///
-    /// Deliberately not a YAML parser, for `docs.rs`'s reason: the shape is
-    /// fixed — two spaces, a name, a colon, end of line — and anything else is
-    /// a file to name rather than a shape to accommodate.
+    /// Deliberately not a YAML parser: the shape is fixed — two spaces, a
+    /// name, a colon, end of line — and anything else is a file to name
+    /// rather than a shape to accommodate.
     fn jobs(text: &str) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
         let mut in_jobs = false;

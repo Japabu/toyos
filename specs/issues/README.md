@@ -16,8 +16,7 @@ rg -c '' specs/issues/audio/              # how much audio owes
 
 ## Frontmatter
 
-Four fields, all required, no defaults. `src/docs.rs`'s `every_issue_is_well_formed`
-is the gate; it runs under `cargo test --lib` and takes seconds.
+Four fields, all required, no defaults.
 
 | field | values | means |
 |---|---|---|
@@ -33,7 +32,7 @@ is the gate; it runs under `cargo test --lib` and takes seconds.
 | `opened` | `YYYY-MM-DD` | the first commit whose `specs/known-issues.md` or `specs/issues/` carried this heading. Before 2026-08-08 that is derived from the single file this directory replaced, so a reworded heading dates from the rewording |
 | `task` | a number | optional; present only where the issue names one |
 
-**`status` and `kind` are not free of each other, and the gate enforces it.**
+**`status` and `kind` are not free of each other.**
 `kind` says what the entry is; `status` says what is owed. Two of the kinds
 answer that second question by themselves, so they may not contradict it:
 
@@ -64,19 +63,17 @@ question. Nobody has to decide it; somebody has to run it.
 `isolation` · `panic-path` · `kernel` · `audio` · `diagnostics` · `build` ·
 `design-debt` · `hardware` · `filesystem` · `boot-media`
 
-That list is closed, and the gate refuses a file outside it. An area is a
+That list is closed. An area is a
 directory because it makes every cross-reference a path that resolves. Moving
 an issue between areas is a `git mv`; the **slug** is its identity — unique
-across every area, which the gate also checks — so `rg <slug>` finds every
-pointer at it wherever it has been put.
+across every area — so `rg <slug>` finds every pointer at it wherever it has
+been put.
 
 ## Pointing at one
 
 **Name the file, not the directory.** `specs/issues/audio/hda-tone-phase-check.md`
 is a claim something can check; `specs/issues/audio/` is a claim that an area
-exists, which says nothing about whether the entry you meant is still there. The
-gate resolves every `specs/issues/<area>/<slug>.md` path written anywhere in the
-tree and names the ones that do not exist.
+exists, which says nothing about whether the entry you meant is still there.
 
 Never write "the entry above" or "the entry below". Position was what the
 numbered document had and what this directory exists to be rid of; a positional
