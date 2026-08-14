@@ -1426,19 +1426,24 @@ fn sys_process_wait(h: RawHandle, flags: u64) -> u64 {
         Ok(object) => object,
         Err(e) => return e.refuse(),
     };
-    if flags & WNOHANG != 0 {
-        return match object.exit_code() {
-            // Zero-extended: an exit code is an `i32`, and sign-extending -1
-            // would land on `SyscallError`'s encoding.
-            Some(code) => code as u32 as u64,
-            None => SyscallError::WouldBlock.to_u64(),
-        };
+    if flags & WNOHANG == 0 {
+        let queue = object.waiters();
+        crate::scheduler::wait_until(&queue, 0, || object.finished());
     }
-    let queue = object.waiters();
-    crate::scheduler::wait_until(&queue, 0, || object.finished());
-    object
-        .exit_code()
-        .expect("a finished process has an exit code") as u32 as u64
+    match object.exit_code() {
+        // Zero-extended: an exit code is an `i32`, and sign-extending -1 would
+        // land on `SyscallError`'s encoding.
+        Some(code) => code as u32 as u64,
+        // One answer for both arms, and the blocking one used to `expect` here.
+        // `publish_exit` fills the slot before it stores `finished`, and the
+        // wait above returns only when `finished` holds, so this is now
+        // unreachable — but it is reachable *from userland*, which is the whole
+        // reason it may not be an assertion: a wait that came back without its
+        // condition is a refusal the caller already handles (it is what
+        // `WNOHANG` answers), never a kernel that dies holding a userland
+        // thread's syscall.
+        None => SyscallError::WouldBlock.to_u64(),
+    }
 }
 
 /// A `Process` handle for a pid, presenting a `SysCap` that carries
