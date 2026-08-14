@@ -1,8 +1,6 @@
 # Worktrees
 
-One agent, one working tree, one branch. The shared tree was the only thing
-several agents ever had to share, and most of the workflow rules in CLAUDE.md
-exist to make sharing it survivable. This removes the reason for them.
+One agent, one working tree, one branch.
 
 ## 1. What is per-worktree and what is not
 
@@ -23,16 +21,16 @@ is per-worktree with no work. **The clean/build ENOENT race is gone by
 construction** — two worktrees cleaning their own target directories are not
 operating on the same files, and there is nothing left to serialise.
 
-## 2. The toolchain has an owner, and the owner is derived
+## 2. Toolchain ownership
 
 `rust/` is 50 GiB, 47 GiB of it `build/`, and `~/.rustup/toolchains/toyos` is
 one machine-global symlink into it. Nothing about that is per-worktree, so
 nothing here copies it.
 
-**Who owns it is asked of git, not recorded.** `git rev-parse --git-common-dir`
+Ownership is derived, never recorded: `git rev-parse --git-common-dir`
 answers with the primary checkout's `.git` from anywhere in the repository, so
-its parent *is* the primary checkout. A pointer file would be one more thing
-that can disagree with the tree; this cannot go stale because it is not stored.
+its parent *is* the primary checkout. The answer cannot go stale because it is
+not stored.
 
 `toolchain::ensure` therefore splits three ways. The primary runs the steps that
 write the shared tree. A linked worktree takes an early return that only
@@ -44,24 +42,23 @@ source to have built it from, is `Owner::Installed` — it compares the same
 witness and refuses `--rebuild-toolchain` and `--claim-sysroot` alike, because
 there is nothing there to build either from.
 
-`rust/` in a linked worktree stays the empty stub `git worktree add` leaves.
-Two things were tried and rejected:
+`rust/` in a linked worktree stays the empty stub `git worktree add` leaves;
+neither alternative works:
 
-- **Initialising the submodule.** Git gives a linked worktree its own submodule
-  git directory under `.git/worktrees/<name>/modules/` and shares no objects
-  with the one already on disk: a 913 MiB, 3,434,185-object clone from GitHub,
-  80 s and 1.4 GiB before anything is compiled — and that is before
-  `library/backtrace` and `src/llvm-project`.
-- **A symlink in its place.** Git refuses a symbolic link where a gitlink
-  belongs and fails the whole command, not just that path:
-  `error: expected submodule path 'rust' not to be a symbolic link` out of
-  `status`, `submodule`, and anything else that walks the index. The worktree
-  stops being usable as a worktree.
+- **Initialising the submodule** gives the linked worktree its own submodule
+  git directory under `.git/worktrees/<name>/modules/`, sharing no objects
+  with the one already on disk: a 913 MiB clone from GitHub and 1.4 GiB on
+  disk before anything is compiled, before `library/backtrace` and
+  `src/llvm-project`.
+- **A symlink in its place** is refused by git, which fails the whole command
+  rather than that path — `error: expected submodule path 'rust' not to be a
+  symbolic link` out of `status`, `submodule`, and anything else that walks
+  the index.
 
-The empty stub is the one arrangement git is content with — `git status` is
-clean and `git submodule status` reports it uninitialised, which it is.
+The empty stub is the one arrangement git accepts: `git status` is clean and
+`git submodule status` reports it uninitialised, which it is.
 
-## 3. The sysroot says what it was built from
+## 3. The sysroot witness
 
 std links `toyos-abi` and `toyos`; `libtoyos_c.a` is `userland/libc`. Those
 three **per-worktree** source trees are `toolchain::SYSROOT_SOURCES`, and they
@@ -89,15 +86,14 @@ two checkouts of one commit agree on neither of the latter, and because
   it.
 - **Mismatch, `--claim-sysroot`** — rebuild the shared sysroot from this
   worktree, under the global exclusive lock. Every other worktree then refuses
-  until it merges. That is not a side effect to be sorry about: they genuinely
-  cannot build correctly against it, and otherwise they would have done so
-  silently.
+  until it merges; without the refusal they would build incorrectly against it
+  in silence.
 - **No record at all** — the primary records what is on disk; a linked worktree
   refuses. Absence is ignorance, not disagreement, and only the primary has the
   standing to resolve it.
 
-An ABI change is therefore ordinary work in a worktree. It is the *landing* that
-is global, and it announces itself.
+An ABI change is therefore ordinary work in a worktree; only the landing is
+global.
 
 **A claim's act reaches every other worktree, not only the refusals around it.**
 It runs `rebuild_std` and `libc::build` under the global exclusive lock, which
@@ -105,12 +101,10 @@ replaces the sysroot rlibs; `build::external_fingerprint` reads their mtimes, so
 the next build in every other worktree cleans its crate targets. The refusals on
 either side of the act are gated; the act itself is not.
 
-### 3.1 A claim is an acquisition, not a rewrite
+### 3.1 Claim arbitration
 
-**A claim may not land inside another worktree's running gate.** The refusal §3
-describes is correct; what it needs beside it is somewhere to queue.
-
-So the claim goes through the lock machinery. `buildlock::claim_sysroot` takes
+**A claim may not land inside another worktree's running gate**, so the claim
+goes through the lock machinery. `buildlock::claim_sysroot` takes
 the **sysroot lock** exclusively; every suite run takes it shared for its whole
 length (`buildlock::run_against_sysroot`, once, at the top of `tests/toyos.rs`'s
 `main`). A claim therefore waits for every run in flight, and `acquire`'s intent
@@ -118,7 +112,7 @@ file — the same writer preference the build lock has — makes every run that
 starts while it waits queue behind it, so a tree that always has a suite in
 flight cannot starve it.
 
-Three things follow, and all three are constraints rather than preferences:
+Three constraints follow:
 
 - **The sysroot lock is always outermost.** Sysroot → global, never the reverse,
   at every acquirer of both. `build()` takes the claim before
@@ -131,8 +125,8 @@ Three things follow, and all three are constraints rather than preferences:
   holding it while its gate — a separate process — queued behind a claim would
   be exactly that cycle.
 
-Why not the `Scope::Global` lock a build already takes? Because it is the wrong
-*length*. It says "nothing replaces the sysroot while I build", and a suite is a
+The `Scope::Global` lock a build already takes has the wrong *length* for
+this. It says "nothing replaces the sysroot while I build", and a suite is a
 hundred builds over two minutes, every one of them reading the sysroot the first
 one agreed with. Holding it for the run instead would deadlock the run against
 itself the moment one of its own builds escalated to the exclusive mode of a
@@ -146,7 +140,7 @@ dies mid-run, a claim says before it starts whose sysroot it is taking, and a
 suite that starts during one waits with a message naming the holder instead of
 failing every build it attempts.
 
-Gates in `src/buildlock.rs`: `a_claim_waits_for_a_run_in_flight` — an exclusive
+Tests in `src/buildlock.rs`: `a_claim_waits_for_a_run_in_flight` — an exclusive
 acquisition is refused while a run holds it shared, and a second *run* is not;
 `a_run_queues_behind_a_waiting_claim` — the order is claim then run;
 `a_killed_run_does_not_wedge_the_claim` — a SIGKILLed run frees it, because it
@@ -154,12 +148,11 @@ is `flock` and not a pid file.
 
 ### 3.2 Who may claim: standing
 
-Arbitration decides *when* a claim happens. It does not stop the wrong checkout
-from making one, and a checkout that matches main has nothing to claim *with*: a
-claim from it rebuilds the sysroot **from main's sources**, which is what every
-other worktree already has, and refuses the one checkout that cannot merge its
-way out. That checkout then claims back. It is not a race to be arbitrated but a
-fight whose winner is whoever ran most recently.
+Arbitration decides *when* a claim happens, not whether the claiming checkout
+should make one. A checkout that matches main has nothing to claim *with*: a
+claim from it rebuilds the sysroot **from main's sources**, which every other
+worktree already has, and refuses the one checkout that cannot merge its way
+out — which then claims back, and nothing converges.
 
 **So a claim requires standing: this checkout's witnessed trees must actually
 differ from main's**, committed and uncommitted alike. `toolchain::standing`
@@ -176,21 +169,20 @@ that no diff against a commit could see. Three answers, all three stated:
   in the message**. What it is told instead is the fact that makes waiting
   correct: when the holder lands, main carries what the sysroot holds and the
   refusal ends by itself, with nobody acting.
-- **Unknown** — git could not answer. Refused, because a claim is destructive
-  and an unanswered question is not permission.
+- **Unknown** — git could not answer. Refused: a claim is destructive, and a
+  failure to answer is not grounds for one.
 
-**A merge in progress is not this branch's statement about itself.** An agent
-resolving `--pr`'s merge of main holds every file main changed as local work, so
-the working-tree question is skipped while `MERGE_HEAD` exists and only the
-committed one answers.
+While `MERGE_HEAD` exists the working-tree question is skipped — an agent
+resolving `--pr`'s merge of main holds every file main changed as local
+work — and only the committed diff answers.
 
 **The primary's ordinary build is the same act.** `std_sources_stale` is true
 for the toolchain's owner in exactly two situations: its own sources changed, or
 a worktree claimed the sysroot for something not on main yet. The second is a
 lease, and rebuilding over it takes the sysroot from the one checkout that
 cannot merge its way out. The primary refuses too, telling the two cases apart
-by who wrote the claimant record, and `--claim-sysroot` still takes it back —
-deliberately, and out loud.
+by who wrote the claimant record, and `--claim-sysroot` still takes it back,
+announced as every claim is.
 
 **What none of this removes is the sharing.** One sysroot serves N worktrees, so
 a checkout with a real ABI change still takes a turn during which the others
@@ -208,17 +200,15 @@ cannot build at all. Two things would remove it:
 - **Landing the ABI change first**, which is cheaper and which the standing rule
   points every refused checkout at.
 
-**The window is the claimant's to make small.** The ABI half of a change is
-usually a few lines that compile on their own, and landing it by itself makes
-the window one landing instead of one whole task. `toolchain::CLAIM_WINDOW` is
-that sentence, printed by the refusal a diverged checkout gets and again by the
-claim announcement, because the refusal is what an agent in this situation is
-actually reading.
+The claimant keeps the window small: the ABI half of a change is usually a few
+lines that compile on their own, and landing it by itself makes the window one
+landing instead of one whole task. `toolchain::CLAIM_WINDOW` prints this
+instruction in the refusal a diverged checkout gets and again in the claim
+announcement.
 
-**And the rule is enforced at the cause rather than at the victim.** The refusal
-in `toolchain.rs` is a good one arriving at the wrong process: it reaches an
-unrelated agent, after a full build, for somebody else's mistake. The same
-question is asked of the *landing* branch before anything is compiled — a branch
+The rule is also enforced at the landing, before anything is compiled — the
+`toolchain.rs` refusal reaches an unrelated agent, after a full build, for
+somebody else's mistake, so the landing branch is checked first: a branch
 whose commits touch the witnessed trees **and** carry commits that touch none of
 them is refused, naming both lists. `pr::abi_lands_alone` is the one
 implementation and it answers in two places: at `cargo run -- --pr` in a second,
@@ -236,7 +226,7 @@ interleaved it says so, because nothing in this workflow rebases. A branch's own
 update merges are not unrelated work — merges are excluded, or a branch whose
 only commit is the ABI change would be refused for having merged main once.
 
-Gates: `a_checkout_behind_main_has_no_standing_to_claim`,
+Tests: `a_checkout_behind_main_has_no_standing_to_claim`,
 `a_checkout_identical_to_main_has_no_standing_to_claim`,
 `an_abi_change_is_standing_committed_or_not`,
 `a_landing_s_uncommitted_merge_is_not_standing` and
@@ -245,16 +235,16 @@ Gates: `a_checkout_behind_main_has_no_standing_to_claim`,
 `the_inseparable_trailer_is_the_escape_and_it_is_in_the_history` and
 `an_abi_only_branch_and_an_ordinary_branch_both_pass` in `src/pr.rs`.
 
-### 3.3 A std edit is made in the primary's `rust/`, and it needs no claim
+### 3.3 Std edits
 
-**Where it has to live.** A linked worktree's `rust/` is the stub §2 leaves and
-`toolchain::rust_dir` sends every read to the primary's, so *the*
-`rust/library` on this host is one directory and editing the std fork edits it
-for every checkout at once. There is nowhere else to put the edit and no way to
-hold it privately.
+A std edit is made in the primary's `rust/`. A linked worktree's `rust/` is
+the stub §2 leaves and `toolchain::rust_dir` sends every read to the
+primary's, so *the* `rust/library` on this host is one directory and editing
+the std fork edits it for every checkout at once; there is no way to hold the
+edit privately.
 
-**What that does and does not cost.** It does not cost a claim.
-`rust/build/toyos-std-fork-witness` is a hash of `rust/library` kept apart from
+It costs no claim. `rust/build/toyos-std-fork-witness` is a hash of
+`rust/library` kept apart from
 the other three witnessed trees, and a worktree finding only *that* stale
 rebuilds std rather than being refused (`toolchain::std_fork_stale`) — because a
 rebuild out of the shared `rust/` produces the sysroot every checkout wants and
@@ -263,8 +253,8 @@ until it lands. What it does cost is that the next build in *every* worktree
 links against an edit that has not landed yet, so a std change is landed
 promptly for the same reason an ABI change is.
 
-**Type-checking one without touching the sysroot at all** is worth having while
-iterating, because the rebuild above is minutes and this is seconds.
+**Type-checking a std edit without touching the sysroot** — the rebuild above
+is minutes, this is seconds.
 `~/.rustup/toolchains/toyos/lib/rustlib/src/rust` is a symlink to the primary's
 `rust/`, so `-Zbuild-std` compiles the working tree rather than a copy of it,
 and it writes only into a target directory you name. `cargo` is not in the
@@ -283,7 +273,7 @@ compiler's and `library/` has its own. Pointing `<src>` at an APFS clone of
 that can be edited while the primary stays clean and no other worktree's build
 sees anything.
 
-Two things it does not tell you. Cargo does not re-fingerprint std on a source
+Two caveats. Cargo does not re-fingerprint std on a source
 change under `-Zbuild-std`, so delete `<scratch>/<target>/debug/.fingerprint/std-*`
 between runs or you will read a stale green. And it is a compile, not a boot:
 whether the guest behaves differently still needs the sysroot.
@@ -320,11 +310,11 @@ sysroot and then wants a build slot.
 Agents commit freely on their own branch. Landing is explicit, serialized, and
 never rewrites history. **It happens on GitHub.**
 
-`cargo run -- --land` is retired and answers rather than going missing. The
-reason is the gate rather than the mechanism — the dev host is arm64 emulating
-x86, `specs/assessments/ci-plan-assessment-2026-08.md` §7 is a class of defect
-it cannot execute at all, and a gate blind to a class is not a gate against it.
-The gate is twelve KVM shards on x86_64, and the merge went with it.
+`cargo run -- --land` is retired; the command answers with a pointer to this
+workflow. The gate is twelve KVM shards on x86_64 — the dev host is arm64
+emulating x86 and cannot execute a whole class of defect
+(`specs/assessments/ci-plan-assessment-2026-08.md` §7) — and the merge happens
+where the gate runs.
 
 In the worktree, at task end:
 
@@ -343,7 +333,7 @@ In the worktree, at task end:
 5. `cargo run -- --sync` afterwards, or at the top of the next task, to bring
    this host's `main` up to what was merged.
 
-**Step 1's merge is the load-bearing one and it is not a convenience.** The
+**Step 1's merge is load-bearing.** The
 required checks are *strict* — GitHub refuses the merge button until the branch
 contains `origin/main` — so the checks that run on the branch head are checks on
 the merged result. That is what catches a semantic conflict between two branches
@@ -408,22 +398,21 @@ where it is.
 branches already contain all of it, because "settle that" on its own sends an
 agent to read the reflog.
 
-**A queue has to be audible.** Every blocking acquisition in `src/buildlock.rs`
-repeats itself every 30 s with the holder re-read each time, so a wait that
-lasts does not look like a wedge. Gate: `a_lasting_wait_keeps_saying_so`.
+Every blocking acquisition in `src/buildlock.rs` repeats itself every 30 s
+with the holder re-read each time, so a wait that lasts does not look like a
+wedge. Test: `a_lasting_wait_keeps_saying_so`.
 
 ### Who merges: the agent, at task end
 
-The current model's one real virtue is that agents build on each other's
-landings immediately, and an orchestrator merge queue gives that up — branches
-diverge further the longer they wait, and the person merging has the least
-context about the change. The agent has the most, and `gh pr merge --auto` is
-the agent saying so and then leaving.
+The agent that made the change merges it: agents build on each other's
+landings immediately, and the agent has the most context about its own
+change. `gh pr merge --auto` arms the merge and the agent moves on.
 
 The owner's leverage is the pull request itself: changes to the files that
 govern other agents — CLAUDE.md, the specs others read — are reviewable before
-they land. **Zero approving reviews are required**, deliberately: one human and
-several agents means a review requirement is a deadlock on him being awake.
+they land. **Zero approving reviews are required**: one human and several
+agents means a review requirement is a deadlock on that one human being
+awake.
 
 **The primary checkout is not an agent's workspace.** It owns the toolchain,
 holds `main`, and `--sync` moves its tree.

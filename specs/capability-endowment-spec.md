@@ -8,8 +8,8 @@
    process's table. There is no service registry, no connect-by-name, and no
    pid that is authority.
 2. **A handle a process does not hold is a bug in that process.** `BadHandle`,
-   `Stale` and `WrongType` end the caller — exit 139 — rather than answering a
-   word it can ignore. The one exception is the connector argument to
+   `Stale` and `WrongType` end the caller — exit 139 — rather than returning
+   an error it could ignore. The one exception is the connector argument to
    `SYS_NAMESPACE_BUILD`: a `provides` name is a connector another process
    made, so a wrong type there answers a refusal instead of ending whoever
    received it.
@@ -67,12 +67,12 @@ syscall exit, `do_schedule` entry and the idle loop — never under a lock.
 table on the *killer's* CPU, so the same hook that fires on a clean exit fires
 on a kill. `Acceptor`, `Connector`, `Namespace` and `ConnectionEnd` all release
 this way, never through a guard living on a blocked thread's own stack — the
-shape that leaks when another CPU kills the thread that owns it. The one
-object that still has that shape: a thread blocked in `SYS_ACCEPT` is
+shape that leaks when another CPU kills the thread that owns it. One
+registration still has that shape: a thread blocked in `SYS_ACCEPT` is
 registered on the port's wait queue from its own stack, the same as every
 other blocking syscall's wait-queue registration in this kernel, and it leaks
-identically when killed. Nothing here is particular to ports, and nothing here
-closes it.
+identically when killed. The limitation is kernel-wide and this design does
+not close it.
 
 ## 3. Ports, namespaces, and SysCap
 
@@ -98,8 +98,7 @@ wants to name its client reads the client's own claim from the protocol's
 first frame, which is already the client's own claim about itself, or uses
 the connection's own `RawHandle` as a local identifier: a handle names one
 object for the life of the process holding it and designates nothing in any
-other process's table, which is the same property a machine-wide identity
-would give without an ABI to carry it.
+other process's table.
 
 A **namespace** holds `name → Arc<Connector>`, sorted by name, immutable after
 construction: there is no insert, remove or replace, only a new namespace
@@ -116,7 +115,7 @@ alive by counting.
 A `SysCap` carries no state of its own; its authority is entirely in the
 rights on the handle. Four of its rights gate a syscall directly:
 
-| Right | Gates | Held by |
+| Right | Syscall | Held by |
 |---|---|---|
 | `DEVICE` | `SYS_DEVICE_CLAIM` | `/bin/init`, and whatever it endows a `DUP` of |
 | `RT` | `SYS_RT_ENTER` | init, and a manifest-declared `RT`-only dup |
@@ -168,7 +167,7 @@ A device class is claimed by at most one program; two programs declaring the
 same `devices` entry is refused when the image is built, never arbitrated
 first-come at runtime.
 
-**The test estate's authority is a manifest fact.** The guest binaries under `tests/toyos-rust-tests/src/bin/` are not
+The guest binaries under `tests/toyos-rust-tests/src/bin/` are not
 `[programs]` entries, so no manifest row can name what any single one of them
 needs. `test-runner` is the one program whose `receives` is the union of what
 its binaries need in a given boot config; every binary it spawns inherits
@@ -218,7 +217,7 @@ takes a bare `Tid` rather than a handle, because a `Tid` never crosses a
 process boundary and there is nothing to smuggle through one.
 `SYS_SYSINFO`, `SYS_SCHED_INFO` and `SYS_SHUTDOWN` are gated by nothing; a
 `SysCap` right for `SYS_SHUTDOWN` would have to reach the test estate through
-`test-runner`, and nothing has asked for it yet.
+`test-runner`, and none is defined.
 
 `SYS_HANDLE_SEND` requires `TRANSFER` on every handle in its batch and
 carries each one's rights into the connection's other end unchanged, the same
@@ -372,9 +371,9 @@ Two connections each queued inside the other's outbox leak both until reboot.
 on, which closes the one-hop case; nothing stops a longer cycle through two
 separate sends.
 
-## 8. Gates
+## 8. Tests
 
-Every gate below either fails on the tree with its defect present or has a
+Every test below either fails on the tree with its defect present or has a
 negative arm that does.
 
 - **`every_receives_names_a_provider`** (`src/build.rs`, `cargo test --lib`) —
@@ -382,18 +381,16 @@ negative arm that does.
   some program's `serves` or `provides` in that same config. A client cannot
   be given a name the system it is built into does not have.
 - **`a_provides_name_is_never_also_a_serves_name`** — the two mean different
-  things (one port machine-wide, one per instance); declaring both is refused
-  rather than left to produce a dead connector nobody can trace.
+  things (one port machine-wide, one per instance); declaring both is
+  refused.
 - **`every_device_class_has_at_most_one_claimant`** — two programs declaring
-  the same `devices` entry is a config init cannot satisfy, refused before
-  the image exists rather than arbitrated by whichever process starts first.
+  the same `devices` entry is a config init cannot satisfy, refused when the
+  image is built.
 - **`no_diag_program_claims_the_screen`** — the diagnostic image's programs
-  declare no `devices` at all, which is what "nothing in this image can reach
-  the framebuffer" means now, and it is checkable rather than merely true of
-  which binaries happen to be present.
+  declare no `devices` at all, so nothing in that image can reach the
+  framebuffer.
 - **`every_started_program_is_declared`** — every `[boot] start` entry is a
-  `[programs]` key; a typo is a build failure, not a panic in a booted
-  kernel.
+  `[programs]` key; a typo fails the build.
 - **`every_declared_capability_is_one_the_abi_has`** — every `syscap` name in
   every config is one `toyos_manifest::syscap_rights` recognizes.
 - **`every_shipped_boot_config_is_covered`** — the gates above run over every
@@ -408,10 +405,10 @@ negative arm that does.
   is involved.
 - **`endowment_denied`** (guest binary) — a child endowed a namespace holding
   one name resolves that name and gets `NotFound` for a name it was not
-  given; a sibling endowed both resolves both, which is what proves the first
-  arm failed because the name was truly absent and not because the service
-  never came up. `SYS_DEVICE_CLAIM` and `SYS_RT_ENTER` on a `SysCap` the
-  caller was not endowed answer `PermissionDenied`.
+  given; a sibling endowed both resolves both, proving the first arm's
+  `NotFound` reflects an absent name and not a service that never came up.
+  `SYS_DEVICE_CLAIM` and `SYS_RT_ENTER` on a `SysCap` the caller was not
+  endowed answer `PermissionDenied`.
 - **`no_name_resolves_through_a_registry_any_more`** (`src/sourcegate.rs`,
   `cargo test --lib`) — the retired registry's identifiers (`SYS_CONNECT`,
   `SYS_LISTEN`, `SYS_PIPE_OPEN`, `SYS_PIPE_ID`, `SYS_SOCKET_CREATE`,
@@ -431,8 +428,7 @@ negative arm that does.
 - **`kill_while_blocked`** (guest binary) — a thread killed while blocked
   reading a pipe, an IPC connection, or waiting on an `Acceptor` still
   releases its handle through the table drain, so the peer observes the same
-  `Gone`/EOF a clean close would have produced. This is the gate that exists
-  only because `handle_count` is not the `Arc` count.
+  `Gone`/EOF a clean close would have produced.
 - **`device_claim_lifetime`** / **`process_lifecycle`** / **`handle_kill_policy`**
   (guest binaries) — a device claim moves rather than copies and its class
   re-mints after the holder dies; a process's exit code is published to its

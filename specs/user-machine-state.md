@@ -1,22 +1,14 @@
 # The user machine state
 
-**The invariant, which nobody had written down:**
+**The invariant:**
 
 > A transition out of Ring 3 that can reach another task must save and restore
 > **the whole** user machine state, and a task that has never been in Ring 3
 > must start from a **declared** state.
 
-This document is what that sentence means on x86-64 as this kernel configures
-the machine: the two defects the kernel shipped with before it held, and the
-design that makes the class unrepresentable rather than fixed twice.
-
-It is not about "the FPU". The FPU is where the two instances happen to live.
-The question is what a ring transition preserves, and the answer has to be
-*everything*, stated once, in one place, with no way to say "some of it".
-
 ---
 
-## 1. What the whole state is, on this machine
+## 1. The whole state, on this machine
 
 The state a Ring 3 thread can observe and a Ring 0 excursion can disturb:
 
@@ -34,8 +26,7 @@ The state a Ring 3 thread can observe and a Ring 0 excursion can disturb:
 gated `if osxsave`) is read-only diagnostics that never executes on this
 machine. So the machine runs with the reset value of `XCR0`, which permits
 x87 and SSE and nothing else. AVX `#UD`s. Therefore **`FXSAVE64`/`FXRSTOR64`
-is a *complete* save of everything this kernel permits to exist**, not a
-cheap approximation of one.
+is a *complete* save of everything this kernel permits to exist.**
 
 The kernel itself contributes nothing to that state: it is soft-float by
 compiler guarantee. `rustc +toyos --print cfg --target x86_64-unknown-none`
@@ -55,7 +46,7 @@ passes in both — proof the probe exercises the path rather than passing
 vacuously. `specs/assessments/ci-plan-assessment-2026-08.md` §9.3 has the run.
 
 **The victim instruction is `FLDCW`**, a *waiting* x87 instruction: it checks
-for a pending unmasked exception before it executes. It is not exotic —
+for a pending unmasked exception before it executes.
 `unwinding::unwinder::arch::x86_64::save_context` executes one `fnstcw`, and
 `restore_context`'s `fldcw`, reached from each of `__Unwind_RaiseException`,
 `__Unwind_ForcedUnwind`, `__Unwind_Resume_or_Rethrow` and `__Unwind_Resume`,
@@ -92,8 +83,8 @@ epilogue is not a shared save.
 
 `kernel/src/arch/entry.rs` exports `save_user_state!()` and
 `restore_user_state!()`. They are the **only text in the kernel naming an FP
-instruction**, and all five Ring 3-reachable shapes use them. "Saved some of it"
-stops being expressible, because there is nothing to say it with.
+instruction**, and all five Ring 3-reachable shapes use them. A partial save is
+not expressible, because no other kernel text can name an FP instruction.
 
 ### 4.2 A type owns the state
 
@@ -120,7 +111,7 @@ The size and alignment reach the assembly as `const { size_of::<UserFpState>() }
 and `const { align_of::<UserFpState>() }` operands, so a reservation cannot
 disagree with the type. §5 is why that matters.
 
-### 4.3 The IDT will not install anything else
+### 4.3 The IDT accepts two entry types and no third
 
 `Ring3Entry` and `Ring0Entry` are the two things `IdtEntry` accepts, and its
 raw-pointer constructor is private. Every `direct` row of `idt_vectors!` answers
@@ -130,52 +121,47 @@ with no third spelling and no default; `syscall::init` takes one too, because
 the NMI arrives between arbitrary instructions, including inside another entry's
 own save, and reschedules nothing; the halt IPI never returns.
 
-**The type does not prove the bracket is present.** Nothing short of reading the
-assembly does, and the doc says so rather than claiming more. What it makes
-unrepresentable is installing a handler *without answering the question*, which
-is exactly what `tlb_flush_entry` did for its whole life.
+**The type does not prove the bracket is present** — nothing short of reading
+the assembly does. What it makes unrepresentable is installing a handler
+without answering the Ring 3 question at all.
 
 ### 4.4 Not a `Drop` guard
 
-The failing path is naked assembly that returns through `iretq`/`sysretq`, and a
-task killed by another CPU never returns through it at all. CLAUDE.md's caveat
-with teeth applies exactly: an RAII guard would bind the paths that already
-work and miss the one that does not. The bracket is two macro invocations in the
-same naked block, which is the strongest thing available where there is no Rust
-scope to hang a destructor on.
+The failing path is naked assembly that returns through `iretq`/`sysretq`, and
+a task killed by another CPU never returns through it at all. This kernel does
+not unwind, so a `Drop` guard binds only paths where the value is actually
+dropped: an RAII guard here would bind the paths that already work and miss
+the one that does not. The bracket is two macro invocations in the same naked
+block, where there is no Rust scope to hang a destructor on.
 
 ---
 
-## 5. AVX-512 is a stated future requirement
+## 5. AVX-512 is a future requirement
 
-The owner has stated that the kernel must eventually support AVX-512.
+The kernel must eventually support AVX-512 (owner requirement).
 
 **`FXSAVE64` is the interim, and it is complete for the machine as configured
 today** (§1). Enabling any `XCR0` component beyond x87+SSE — AVX, AVX-512,
-anything — **requires switching to XSAVE in the same commit**, because the
-moment `XCR0` names a component, `FXSAVE64` stops being a complete save and
-starts being a silent partial one, which is defect 2 again with a wider blast
-radius.
+anything — **requires switching to XSAVE in the same commit**: the moment
+`XCR0` names a component, `FXSAVE64` becomes a silent partial save.
 
-That warning is worth nothing as prose, so it is not prose. The save area's size
-and alignment come from `UserFpState` through `const {}` asm operands, and the
-type's own definition carries the constraint. Growing the state means growing
-the type, and growing the type moves every reservation with it — a mismatch is a
-compile error, not a comment somebody did not read.
+The constraint is enforced in types rather than prose: the save area's size
+and alignment come from `UserFpState` through `const {}` asm operands, so
+growing the state means growing the type, and growing the type moves every
+reservation with it — a mismatch is a compile error.
 
-## 6. Decisions on the record
+## 6. Decisions
 
 ### 6.1 `FXSAVE64`/`FXRSTOR64`, unconditionally, no runtime branch
 
-Not the cheap option — the *complete* one for this machine, and the only one
-that exists on all three instruments. The dev host's guest has no XSAVE at all:
-QEMU 11.0.3's `qemu64` model, which is what gets selected whenever KVM is
-unusable, reports `fxsr: true, xsave: false, avx: false`. CI's KVM guest and the
-T14 both have it. Choosing XSAVE would mean `cargo test` exercises a *different
-kernel* from CI and metal on the one path this task exists to fix — the exact
-blind spot that hid the AMD `SYSRET` bug (`specs/issues/kernel/`).
+`FXSAVE64` is complete for this machine (§1) and is the only save that exists
+on all three instruments. The dev host's guest has no XSAVE at all: QEMU's
+`qemu64` model, selected whenever KVM is unusable, reports
+`fxsr: true, xsave: false, avx: false`; CI's KVM guest and the T14 both have
+it. Choosing XSAVE would mean `cargo test` exercises a *different kernel* from
+CI and metal on this exact path.
 
-Two details that are not incidental:
+Two details:
 
 - **REX.W forms.** Plain `FXSAVE` saves only the low 32 bits of `FIP`/`FDP`.
   `FXSAVE64` is the one that saves a 64-bit address.
@@ -188,14 +174,14 @@ Two details that are not incidental:
 
 ### 6.2 No runtime depth counter
 
-The type gate in §4.3 makes the mistake uncompilable. Two extra instructions on
-the syscall path forever, to re-check at run time something the compiler already
-refuses, is not a trade worth making.
+The type gate in §4.3 makes the mistake uncompilable; a runtime counter would
+re-check at run time what the compiler already refuses, at two extra
+instructions on the syscall path.
 
-### 6.3 Eager, and lazy ruled out
+### 6.3 Eager restore; lazy ruled out
 
-Lazy FP restore — leave `CR0.TS` set, restore on the first `#NM` — is the
-classic optimisation, and it is wrong here three times over:
+Lazy FP restore — leave `CR0.TS` set, restore on the first `#NM` — is ruled
+out three times over:
 
 1. It is **CVE-2018-3665** (LazyFP). Speculative execution reads the stale
    register file across the `#NM` boundary. Every major kernel removed lazy FPU
@@ -218,7 +204,7 @@ transition is in flight, and costs nothing while one is not.
 
 ---
 
-## 7. Every CPU agrees, and `log_state` is why anyone can say so
+## 7. Per-CPU verification
 
 `percpu::init` logs each CPU's FPU-relevant state (`arch/fpu.rs::log_state`):
 `XSAVE`, `OSXSAVE`, `XCR0` when `OSXSAVE` permits reading it, and the relevant
@@ -234,9 +220,9 @@ rules out; `CR0`/`CR4` print on that file's own log line beside this one.
 
 ---
 
-## 8. The kernel's soft-float promise becomes checkable
+## 8. The soft-float build assertion
 
-§1's soft-float guarantee is now load-bearing — it is the whole reason the FPU
+§1's soft-float guarantee is load-bearing — it is the whole reason the FPU
 may be left dirty between a save and its restore. So it is asserted where
 `assert_overflow_checked` is, in `src/build.rs`: the kernel target must still
 report no `sse` in its cfg. A future target-spec edit that turns hardware float
@@ -245,15 +231,13 @@ in `entry.rs` insufficient.
 
 ---
 
-## 9. Current state
+## 9. The shipped pieces
 
-The design in §4 is fully built: `UserFpState` and its self-check (§4.2),
-`common_entry` and `tlb_flush_entry` bracketed along with the other three
-Ring 3-reachable entries (closing defect 2, §3), the bracket body on
-`fxsave64`/`fxrstor64` (closing defect 1, §2), the loader's trampolines
-loading the declared state, `Ring3Entry`/`Ring0Entry` as the IDT's only
-accepted shapes (§4.3), the gate (§10), and the soft-float build assertion
-(§8). See git log for the incremental history.
+`UserFpState` and its self-check (§4.2); all five Ring 3-reachable entries
+bracketed (§3); the bracket body on `fxsave64`/`fxrstor64` (§2, §6.1); the
+loader's trampolines loading the declared state; `Ring3Entry`/`Ring0Entry` as
+the IDT's only accepted shapes (§4.3); the `fpu_isolation` test (§10); the
+soft-float build assertion (§8).
 
 ---
 
@@ -277,10 +261,9 @@ New permanent `fpu_isolation`, three halves, all positive assertions:
    kind — 20,000 syscalls, two demand page faults, a preemption spin — against
    an FP-heavy sibling, and asserts bit-identity.
 
-**`smp=1`, and that is the stronger machine rather than the weaker one.** Two of
-the arms are about a register file carrying from one process to the next, which
-needs the two to share a CPU; on two CPUs that is a coin flip, which is why CI's
-own observation of the defect was intermittent.
+**`smp=1` is the stronger configuration for this test.** Two of the arms are
+about a register file carrying from one process to the next, which needs the
+two to share a CPU; on two CPUs that is a coin flip.
 
 **An unbracketed transition only corrupts if it switches**, and arm 3 arranges
 that rather than hoping for it. Kernel code is soft-float, so a `#PF` that
@@ -320,10 +303,8 @@ Instruction count falls; µop count and latency very plausibly rise, because
 tree has taken of it.
 
 - **TCG is not evidence and will mislead.** QEMU implements `FXSAVE` as a
-  helper call. The precedent points the same way: one `fetch_add` per log
-  line cost **350 ms of boot** under TCG while being nearly free on hardware
-  (`specs/issues/hardware/`). A TCG delta is recorded anyway and **labelled**,
-  so nobody bisects a boot-time regression that is not one on real silicon.
+  helper call. A TCG delta is recorded anyway and **labelled**, so nobody
+  bisects a boot-time regression that is not one on real silicon.
 - **A microbenchmark**: a userland loop of N `SYS_CLOCK` calls timed with
   `rdtsc`, reporting cycles per syscall (`tests/toyos-rust-tests/src/bin/`
   `syscall_cost.rs`; read it with `cargo test -- syscall_cost --nocapture`). It
@@ -347,8 +328,8 @@ instructions the syscall arm measures.
 
 Every number here comes from a command that was run, on **TCG on the dev
 host** — `FXSAVE` is a QEMU helper call there, so this is a labelled
-distortion, not a claim about the T14 (CLAUDE.md's 1.06×–6.5×
-non-uniformity). **It also predates the AP control-register fix** (§7): both
+distortion, not a claim about the T14. **It also predates the AP
+control-register fix**: both
 arms below ran with three of four cores caching-disabled, so this is a
 measurement of a machine that no longer exists, and by how much is unmeasured
 (`specs/issues/kernel/ap-control-registers-inherit-init.md`).
@@ -367,6 +348,5 @@ between runs on this host than the whole effect.
 ## 13. Owed
 
 `arch/entry.rs` and `arch/fpu.rs` are x86-64 and live in `arch/` beside every
-other x86-64 file in this kernel. The `arch/x86_64/` split this tree owes is not
-made here; it is a rename of a dozen files and belongs to whoever makes it for
-all of them at once.
+other x86-64 file in this kernel. The `arch/x86_64/` split is a rename of a
+dozen files and belongs to one change that moves all of them.

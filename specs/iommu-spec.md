@@ -19,7 +19,7 @@ translation. `Iova::identity` is the one place that policy is stated (§5.7).
 
 ---
 
-## 1. What this is for, and what it is not for
+## 1. Purpose
 
 Three properties, in the order they matter:
 
@@ -32,9 +32,7 @@ Three properties, in the order they matter:
    request rather than as a translated memory access. DMA remapping does not cover
    that range at all. Without interrupt remapping, a driver process with a mapped
    BAR can inject an arbitrary vector on an arbitrary CPU, which is a kernel-code-
-   execution primitive. **A boundary that does not bind what its name implies is
-   worse than no boundary**; "userspace drivers, IOMMU-protected" with (2) missing
-   is exactly that sentence.
+   execution primitive.
 3. **A page released by a driver is not reachable by its device.** The classic IOMMU
    use-after-free: unmap without invalidating the IOTLB and the device keeps a
    translation for a page the PMM has already handed to somebody else. Same shape as
@@ -42,20 +40,18 @@ Three properties, in the order they matter:
    (`specs/issues/isolation/`), with a DMA engine instead of a process on the
    reading end.
 
-What this is **not** for: it is not a performance feature, not a virtualization
-feature, and not a way to make the kernel smaller. Enabling it costs a page-table
-walk per untranslated device access and buys nothing measurable. It is bought
-entirely by (1)–(3).
+It is not a performance or virtualization feature: enabling it costs a
+page-table walk per untranslated device access, and it is bought entirely by
+(1)–(3).
 
 ---
 
 ## 2. No usable IOMMU means ToyOS does not boot
 
-Not "userspace drivers are disabled" — the system refuses. The reasoning is the
-zero-legacy principle applied honestly: a fallback path that runs the same
-drivers with no protection is a second configuration nobody tests, and its
-existence would make every security claim in this file conditional on a boot
-flag.
+Not "userspace drivers are disabled" — the system refuses. A fallback path
+that runs the same drivers with no protection is a second configuration nobody
+tests, and its existence would make every security claim above conditional on
+a boot flag.
 
 The refusal is the last stage of `specs/plans/iommu-plan.md`, and until it lands
 every case below is reported as a line naming the register the kernel decided
@@ -72,8 +68,8 @@ function the walk returned must have a context entry before translation comes on
 ### 2.2 What is distinguishable, and what is not
 
 This matters because a user can fix one of these in firmware setup and not the
-other. The honest answer is that ACPI alone cannot separate the first two cases, and
-the message must say so rather than guess.
+other. ACPI alone cannot separate the first two cases, and the message says so
+rather than guessing.
 
 | Observation | Meaning | Distinguishable? | Message |
 |---|---|---|---|
@@ -102,7 +98,7 @@ The refusal is a **halt with the reason on screen**, not a panic: it takes the s
 no console the reason is on the panel. It is not a kernel bug and must not print a
 backtrace over its own explanation.
 
-### 2.3 What this excludes, stated plainly
+### 2.3 What this excludes
 
 - **Every AMD machine.** AMD-Vi is a different unit with a different table (`IVRS`).
   The seam in §3 admits an AMD-Vi backend; this spec does not write one, so an AMD
@@ -444,9 +440,8 @@ head.
 
 ### 5.6 The type that makes "release without invalidating" unrepresentable
 
-The bug is: `unmap` returns, the caller frees the pages, the device still has a
-cached translation. Making it a discipline rule fails the same way every discipline
-rule in this tree has failed. Making it a type:
+The bug is: `unmap` returns, the caller frees the pages, the device still has
+a cached translation. The rule is a type rather than a discipline:
 
 ```rust
 /// Pages whose PTEs are gone and whose translations may still be cached.
@@ -468,20 +463,19 @@ impl Unmapped {
 }
 ```
 
-Ladder position, stated exactly: **releasing with no invalidation at all is
-unrepresentable** (there is no other way to obtain the `Vec<PhysPage>`);
-**releasing against the wrong range is checked at runtime** and the check is a
-kernel-bug assert, because ranges are values and no type system here will relate
-them. Tests cover neither — they cover the mechanism working end to end (§7 of
+**Releasing with no invalidation at all is unrepresentable** — there is no
+other way to obtain the `Vec<PhysPage>`. **Releasing against the wrong range
+is checked at runtime**, and the check is a kernel-bug assert, because ranges
+are values and no type system here will relate them. Tests cover neither —
+they cover the mechanism working end to end (§7 of
 `specs/plans/userspace-drivers-spec.md`).
 
-**And now the caveat CLAUDE.md requires asking of every safety type: which paths does
-this bind, and is the failing one among them?** `Unmapped` binds *ordering inside one
-function*, and it is not a `Drop` guard — dropping it leaks pages, which is the safe
-direction, and `#[must_use]` catches the accident at compile time. The path that
-matters — a driver process killed by another CPU — never touches an `Unmapped` on the
-victim's stack, because reclaim does not run there. See §7.5 and
-`specs/plans/userspace-drivers-spec.md` §5.
+`Unmapped` binds *ordering inside one function*, and it is not a `Drop`
+guard — dropping it leaks pages, which is the safe direction, and
+`#[must_use]` catches the accident at compile time. The path that matters — a
+driver process killed by another CPU — never touches an `Unmapped` on the
+victim's stack, because reclaim does not run there (§7.5,
+`specs/plans/userspace-drivers-spec.md` §5).
 
 ### 5.7 One domain for kernel-owned devices, identity-mapped
 
@@ -498,8 +492,8 @@ is §5.2's rule applied to §5.7, and it costs one page directory per GiB of
 address space. `ECAP.PT` is read for the log line and for nothing else.
 
 The domain covers `[0, top)`, where `top` is one past the highest frame the PMM
-manages (`pmm::top`). One rule, and it is what makes "behaviour unchanged" a
-construction rather than a hope: every address a kernel driver can hand a device
+manages (`pmm::top`). The rule makes "behaviour unchanged" a construction
+rather than a hope: every address a kernel driver can hand a device
 comes out of the PMM, so that range is exactly what the device could already reach
 on a machine with no unit. `top` is taken from the memory manager and not from the
 firmware memory map, whose own buffer is ordinary free RAM by the time this runs.
@@ -508,21 +502,21 @@ Both leaf permissions are granted, and so are both at every level above the leaf
 the unit ANDs permissions down the walk, so narrowing an interior entry would
 narrow every mapping under it, which is not what any caller means.
 
-Honest about what it does not buy: a kernel driver bug still scribbles anywhere. That
-is unchanged from today and the kernel is the trust domain, so it is not a
-regression. Isolation begins with per-driver domains, where an IOVA is *allocated*
-out of a space above the top of RAM (§5.3) rather than inherited from a physical
-address — which is why `Iova` exists now with one constructor named `identity`: the
-policy has a single site, and the stage that stops identity-mapping deletes it and
-is handed every caller that assumed it.
+What it does not buy: a kernel driver bug still scribbles anywhere. The kernel
+is the trust domain, so that is not a regression. Isolation begins with
+per-driver domains, where an IOVA is *allocated* out of a space above the top
+of RAM (§5.3) rather than inherited from a physical address — which is why
+`Iova` has one constructor named `identity`: the policy has a single site, and
+the stage that stops identity-mapping deletes it and is handed every caller
+that assumed it.
 
 ---
 
 ## 6. Interrupt remapping
 
-### 6.1 Why it is not optional and not later
+### 6.1 Two escape routes, both closed only by remapping
 
-Two independent escape routes, both closed only by remapping:
+Interrupt remapping cannot be deferred behind DMA remapping:
 
 - **A device writes `0xFEE00000`.** VT-d decodes requests in that range as interrupt
   requests, *not* as memory accesses, so DMA remapping never sees them. A userland
@@ -539,7 +533,7 @@ compatibility-format message is blocked outright, and a remappable-format messag
 names an index into the kernel's interrupt remap table. With `IRTE.SVT` programmed to
 verify the source-id, a driver can fire only IRTEs that name **its own device**.
 
-Residual, accepted and stated: a driver can fire its own interrupts at will. That is
+Residual, accepted: a driver can fire its own interrupts at will. That is
 a self-DoS on a vector the kernel allocated for it. §6.4 bounds it.
 
 ### 6.2 The table
@@ -684,17 +678,16 @@ The scope is computed at enumeration from the DMAR device scopes, the bridge top
 scope has more than one member is refused with `ScopeShared`, naming the other
 member, and stays a kernel device.
 
-Honest about the evidence: **QEMU's q35 topology is flat and this rule is largely
-untestable there.** A `pcie-root-port` with two functions behind it can stage the
-shape; whether real ACS enforcement behaves as modelled is a hardware property and the
-T14 is the first machine that can answer it. Recorded as an open risk rather than as a
-tested property.
+**QEMU's q35 topology is flat and this rule is largely untestable there.** A
+`pcie-root-port` with two functions behind it can stage the shape; whether
+real ACS enforcement behaves as modelled is a hardware property and the T14 is
+the first machine that can answer it. Recorded as an open risk (§11) rather
+than as a tested property.
 
-The rule as written was aimed at peer-to-peer behind a switch, and a
-root-complex-integrated function is not that. Both the T14's audio and its
-networking targets are functions of a multi-function device, so restating it is a
-live decision this section owns; `specs/plans/hda-driver-plan.md` H0 is what reads
-the real scope off that machine.
+A root-complex-integrated function is not peer-to-peer behind a switch, and
+both the T14's audio and networking targets are functions of a multi-function
+device; whether the singleton rule refuses them is decided from the real
+scope, which `specs/plans/hda-driver-plan.md` H0 reads off that machine.
 
 ### 7.4 Reserved regions (`RMRR`)
 
@@ -742,7 +735,7 @@ unbounded, uninterruptible device operation in front of `pass()` is precisely th
 thread context that may block. The zero-handle hook does step 1 only, and enqueues
 nothing slow.
 
-This also answers the Drop question. Nothing here is a `Drop` guard on the victim's
+Nothing here is a `Drop` guard on the victim's
 stack; the kernel does not unwind and a killed thread's frames are discarded without
 running destructors. Teardown is driven by the process's death path because that path
 is code that runs, on a CPU that is alive.
@@ -815,8 +808,7 @@ above, and each is a property of the emulation rather than of any one boot:
   which is a different bit from `ECAP.C` (bit 0) and does not make the unit coherent.
 - **`ECAP.PT` moves between QEMU releases.** §5.7 writes an identity-mapped domain
   and never a passthrough context entry either way, so no decision here depends on
-  which value a host reports. A reason given for that decision that names the bit
-  is a reason that stops being true when the next release moves it.
+  which value a host reports.
 - **`ECAP.EIM` is clear** under `eim=auto`, while this kernel enables x2APIC. §4.2's
   refusal on `EIM` is written as "a machine using x2APIC ids above 255", and as
   worded it would refuse the harness's own machines; the rule has to be restated in
@@ -911,7 +903,7 @@ driver. The only panics are for kernel bugs and for hardware that will not answe
 10. **IORT parsing and any ARM code.** The seam admits an SMMU backend; this file
     writes none.
 11. **AMD-Vi.** Same.
-12. **A no-IOMMU fallback.** §2. This is the decision the rest of the file rests on.
+12. **A no-IOMMU fallback.** §2.
 13. **Per-device IOVA-space randomization.** IOVAs index a domain the owning process
     already exclusively holds; there is nothing to guess. (The same argument
     `specs/assessments/capability-handles-spec.md` §14.9 makes about handle values.)
@@ -954,6 +946,6 @@ driver. The only panics are for kernel bugs and for hardware that will not answe
   the unit's own register window included, rests on a mechanism the page tables name
   but do not state. Mapping a BAR into a *user* address space inherits the same
   dependency. `specs/issues/hardware/device-registers-trust-firmware.md` is the entry.
-- **Cost is unmeasurable in the harness.** The 2× bar in CLAUDE.md is answerable only
-  on hardware, and the honest expectation is that a translated DMA path is slower than
-  an untranslated one by an amount nobody here can currently quantify.
+- **Cost is unmeasurable in the harness.** The 2× production-cost bar is
+  answerable only on hardware, and the expectation is that a translated DMA
+  path is slower than an untranslated one by an unquantified amount.

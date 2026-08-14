@@ -1,10 +1,10 @@
-# ToyOS Scheduler Core — Technical Specification
+# The scheduler core
 
-Codename `toyos-sched`: the scheduling core the kernel and a host simulator both drive.
+`toyos-sched` is the scheduling core the kernel and a host simulator both drive.
 `kernel/src/scheduler.rs` is the kernel-facing API over it; `kernel/src/sched/` is the driver
 half.
 
-## 1. Goals and the prime directive
+## 1. Goals
 
 - **Catch bugs at compile time.** Every known bug class is triaged, in strict priority order, into:
   (1) unrepresentable in the type system, (2) runtime fail-fast assert, (3) exhaustively explored
@@ -17,18 +17,17 @@ half.
 - **Simulatable off-target.** The complete scheduling logic runs deterministically on the host
   under a seeded/fuzzed interleaving explorer. The kernel and the simulator drive the same crate.
 - **Scale to 128 cores.** No global locks or broadcast IPIs on any hot path.
-- **Policy-identical cutover.** The just-debugged stored-lag fairness semantics (commits
+- **Policy-identical cutover.** The stored-lag fairness semantics (commits
   `138a625d`, `c9205ce2`, `b71d0d07`) are preserved bit-identically through the machinery cutover
   so regressions are attributable. Policy upgrades are separate, sim-gated stages.
 - **Arch-portable.** x86-64 now, ARM64 later: all hardware access behind one trait; the core crate
   is arch-free.
 
-## 2. Bug-class ledger (evidence → mechanism)
+## 2. Bug-class ledger
 
-Every class is empirical — from the crash dossier and the wake-machinery audit. CT = compile-time
-impossible, RT = runtime fail-fast, SIM/LOOM = explored.
+CT = compile-time impossible, RT = runtime fail-fast, SIM/LOOM = explored.
 
-| # | Bug (observed) | Today's mechanism | Fate in this design |
+| # | Bug (observed) | Prior mechanism | Fate in this design |
 |---|---|---|---|
 | B1 | Task in two places at once → AddressSpace Arc double-drop → UAF triple fault (crash.md) | bitwise-moved `TaskCtx` across 5 containers; steal holds ctx unlocked in transit | **CT**: linear `Task` value, five consuming state types (§5) |
 | B2 | Lock guard leaked across `context_switch` (`into_raw`/`force_unlock`) | protocol by convention | **CT + RT**: no lock exists in the core; pass ends before switch (§6.2); preempt-count baseline assert (§6.4) |
@@ -246,8 +245,7 @@ transition — the fail-fast layer that would have preserved crash.md's evidence
 recursing. **There is no `TaskRef` type.** The non-owning handle is `Arc<TaskShared>` itself, and the
 waker funnel is a *free function*, `waitq::wake_direct(&Arc<TaskShared>, cause, ...)`
 (`waitq.rs:236-251`) — waking a dead task is a failed claim CAS → benign no-op, as described.
-The kernel's stand-in for the richer handle this spec imagined is `sched::payload::ThreadSched`.
-This spec names `TaskRef` in five places; none of them resolve to anything in the tree.
+The kernel's own task-payload handle is `sched::payload::ThreadSched`.
 
 ## 6. The per-CPU machine
 
@@ -593,15 +591,11 @@ the faulted context dies through an ordinary `Running → Dead` transition on it
 
 ### 7.7 StealRequest node recycling
 
-```rust
-// There is no `StealNode`. `steal_probe` is a bare `MailboxNode<Msg<X>>`
-// (cpu.rs:143-147): the generic in-flight claim flag every node kind already
-// has *is* the "a probe is already outstanding" answer, so a dedicated type
-// would have been a second mechanism for the same question. Behaviour is as
-// described below. One guard is undocumented: `post_steal_probe` skips a
-// victim whose published load is < 2 (cpu.rs:950) — a CPU with one task has
-// nothing to give without going idle itself.
-```
+There is no `StealNode`: `steal_probe` is a bare `MailboxNode<Msg<X>>`
+(`cpu.rs:143-147`), and the generic in-flight claim flag every node kind
+already has *is* the "a probe is already outstanding" answer.
+`post_steal_probe` skips a victim whose published load is < 2 (`cpu.rs:950`) —
+a CPU with one task has nothing to give without going idle itself.
 
 An idle pass posts a probe only if `!in_flight.swap(true, AcqRel)`; if a probe is still
 outstanding, it simply doesn't post another (harmless — the previous probe is still pending, and
@@ -641,7 +635,7 @@ impl<'q, M, L> WaitTicket<'q, M, L> {   // !Send, #[must_use]
     pub fn commit(self) -> Commit<'q, M, L>;   // phase 2 — see below
 }
 
-/// The three answers phase 2 can give. The spec previously named none of them.
+/// The three answers phase 2 can give.
 pub enum Commit<'q, M, L> {
     /// Word is `Blocked`; the pass may park. The `Registration` MUST be finished.
     Parked(CommittedTicket<M>, Registration<'q, M, L>),
@@ -813,11 +807,11 @@ pub struct BoostWindow { pub until: Nanos }
 IRQ timestamps are recorded **at IRQ time** in the ring entry and ride the wake into the CQE —
 the audio DLL gets hardware-completion time, not drain time (B10).
 
-## 9. Fairness: policy relocated, not changed
+## 9. Fairness
 
-### 9.1 `FairShare` — per-process vruntime survives verbatim
+### 9.1 `FairShare` — per-process vruntime
 
-The stored-lag semantics are preserved as pure math in `fair.rs`, so the simulator exercises the
+The stored-lag semantics are pure math in `fair.rs`, so the simulator exercises the
 exact production arithmetic:
 
 ```rust
@@ -858,19 +852,21 @@ and the others only run when it blocks. `queue.rs:18-24` carries this next to th
 Related: `pop_surplus` takes the *last* fair task (`keys().next_back()`), so a steal never
 hands away the next-to-run one.
 
-**What that rule is worth today is smaller than the paragraph above reads, and it is now
-measured rather than asserted.** The share's pot is charged for every nanosecond any of its
-threads runs, so a thread re-inserted after a dispatch already carries a key *strictly* above
-every sibling queued before it: the fair band serves a share's threads in insertion order
-whatever the tie-break is. Exact ties survive only where no charge separates two inserts — a
-`wake_all` of siblings, or the spawn burst — and one dispatch dissolves them. Ported literally,
-`(vruntime, TaskKey)` is invisible to invariant I13 on `sibling_storm`
-(`scenarios::fair_identity_tiebreak`, kept as a standing control for exactly that reason). The
-rule stands because the *pot* is what is doing the work, and a policy change that stops
-charging it once per dispatch — an ordered map of shares each holding a FIFO of its ready
-threads, say — hands the whole job back to this field. That is what I13 exists to guard: its
-gate `fair_identity_within_share` serves the leading share's lowest-keyed ready thread every
-time and starves the rest, and invariant I5 reports a perfectly even split throughout.
+The rule's effect is narrower than it reads, and it is measured. The share's
+pot is charged for every nanosecond any of its threads runs, so a thread
+re-inserted after a dispatch already carries a key *strictly* above every
+sibling queued before it: the fair band serves a share's threads in insertion
+order whatever the tie-break is. Exact ties survive only where no charge
+separates two inserts — a `wake_all` of siblings, or the spawn burst — and one
+dispatch dissolves them; `(vruntime, TaskKey)` ported literally is invisible
+to invariant I13 on `sibling_storm` (`scenarios::fair_identity_tiebreak`, kept
+as a standing control). The rule stands because the *pot* does the work: a
+policy change that stops charging it once per dispatch — an ordered map of
+shares each holding a FIFO of its ready threads, say — hands the whole job
+back to this field, which is what I13 guards. Its gate
+`fair_identity_within_share` serves the leading share's lowest-keyed ready
+thread every time and starves the rest, while invariant I5 reports a perfectly
+even split throughout.
 
 `dispatch` sets `quantum_end = now + QUANTUM_NS`;
 `finish()` arms `min(quantum_end, heap min)`. RT tasks round-robin within the band on the same
@@ -887,23 +883,19 @@ invariant I7 asserts conservation (Σ accounted == virtual elapsed per CPU).
 
 - **Wake placement**: `CpuSched::place` (`cpu.rs:437-450`) forwards in exactly one case — the
   woken task is RT **and** this CPU is already running RT — and only if `idle_sibling` finds a
-  peer. Every other wake enqueues locally, unconditionally. There is no "would it preempt / is
-  the CPU idle" test at placement time; that decision happens later, in `preempt_if_due`.
-
-  > Previously written as "run locally if it would preempt or the CPU is idle; else forward
-  > `Adopt` to an idle CPU from the sleep mask; else keep local". That reads as a load-balancing
-  > property the scheduler does not have: a woken *normal* task never moves, whatever the peers
-  > are doing.
+  peer. Every other wake enqueues locally, unconditionally: a woken *normal* task never moves,
+  whatever the peers are doing. There is no "would it preempt / is the CPU idle" test at
+  placement time; that decision happens later, in `preempt_if_due`.
 
   `idle_sibling` (`cpu.rs:424-431`) is a **linear scan of peer doorbells** — `(0..cpus.len())`
-  looking for one whose `doorbell().sleeping()` is set. There is no published sleep mask;
-  `grep sleep_mask` over `toyos-sched/` returns nothing. It is O(cpus) per RT wake, which is the
-  form that matters for the 128-core claim: the cost is paid on the RT wake path itself.
+  looking for one whose `doorbell().sleeping()` is set. There is no published sleep mask. The
+  scan is O(cpus) per RT wake, which is the form that matters for the 128-core claim: the cost
+  is paid on the RT wake path itself.
 - **Spawn**: spawner picks the least-loaded CPU from published `CpuHandle.load` (no `try_lock`
-  probing of remote queues, which today misreads contention as nonexistence) and posts `Adopt`.
+  probing of remote queues, which misreads contention as nonexistence) and posts `Adopt`.
 - **Pull**: an idle pass with an empty rq posts one `StealRequest` (§7.7) to the most-loaded CPU,
   then sleeps; the victim answers with `Adopt` at its next pass (its IRQ exit at latest — bounded
-  by the quantum). Two-hop latency is the honest price of no shared queues; the sleep handshake
+  by the quantum). Two-hop latency is the price of no shared queues; the sleep handshake
   wakes the thief the moment the task arrives. B4 cannot recur: a sleeping CPU with a nonempty
   rq violates I2, and every enqueue path to a sleeping CPU rings its doorbell.
 
@@ -947,8 +939,8 @@ naming a task at all. `idle_wait` splits for the same reason: its `SleepToken` i
 outside a `SchedPass`, so the token is the proof and `halt` is the effect, and a `Machine`
 implementor can perform the effect without being able to construct the proof.
 
-**`irq_guard` has no user in either world, and its RAII shape is wrong for the site this spec
-named for it.** The kernel's pre-halt recheck must *set* IF on both exits — the halt exit because
+**`irq_guard` has no user in either world, and its RAII shape is wrong for its intended
+site.** The kernel's pre-halt recheck must *set* IF on both exits — the halt exit because
 `sti;hlt` is one instruction pair (STI shadow), the stay-awake exit because panic recovery enters
 the idle loop with IF already 0 and restoring the caller's flags would strand that CPU. The core
 never calls it either. It stays on the trait as a declared surface; the first real caller decides
@@ -1030,7 +1022,7 @@ checkers.
 | I13 | Fairness, inside a share: threads of one share get equal service over I5's window, narrowed to intervals where every CPU carries the same number of each member's runnable threads | sim (+ negative gate `fair_identity_within_share`, control `fair_identity_tiebreak`) |
 | I14 | Retire promptness: a killed task is never migrated, and a retire reaches `Hw::release` within `QUANTUM + IPI_LATENCY + max KernelSection + 2×RUN_CHUNK`. The first half is what keeps the second reachable — §7.6 | sim (+ negative gate `old_migrate_kept_the_corpse`) |
 
-### 10.6 Loom scope (honest division of labor)
+### 10.6 Loom scope
 
 Loom owns the primitives the sim's step granularity assumes correct: mailbox push/drain (IRQ torn
 push; the forbidden preempted-producer strand), doorbell edge/IPI accounting, ticket CAS protocol
@@ -1065,7 +1057,7 @@ global `AtomicU64` advanced by `fetch_max` rather than per-CPU with epoch reconc
 | Producer preempted mid-mailbox-push | Cannot occur: push runs preempt-disabled (RT assert + loom model of the violation) | No stranded suffix (§7.2) |
 | IRQ tears a same-CPU push | Consumer sees end-of-queue; doorbell guarantees a follow-up pass | Message delayed ≤ one pass, never lost (loom_mailbox) |
 | Wake in flight while target enters hlt | SLEEPING set before final drain; producer sees SLEEPING ⇒ IPI; STI-shadow pending IPI ends hlt | No sleep-through (I2, loom_sleep) |
-| Normal wake to a busy CPU | KICK set, no IPI; drained at next safe point | ≤ one quantum, matching today; zero IPI cost (§7.3) |
+| Normal wake to a busy CPU | KICK set, no IPI; drained at next safe point | ≤ one quantum; zero IPI cost (§7.3) |
 | RT wake to a busy CPU | Unconditional targeted IPI → pass at IRQ exit | IPI + pass latency, bounded incl. KernelSection budget (I4) |
 | Task retired while in transit | Kill bit sticky; adopter converts to `DeadTask` on arrival; retire chase re-posts ≤ hops | Terminates; no scans, no timeout loops (§7.6) |
 | Two concurrent retires of one task | Second `RETIRE_QUEUED` CAS fails → panic | Fail fast: single-retirer is a kernel invariant |
@@ -1081,8 +1073,7 @@ global `AtomicU64` advanced by `fetch_max` rather than per-CPU with epoch reconc
 | Simulator finds a violation | Seed + full decision trace + shrunk replay auto-committed to corpus | Permanent regression; deterministic repro |
 
 No failure mode silently drops a wake, silently degrades, or leaves a task representable in two
-places. The worst accepted latency is one quantum (normal wake to a busy CPU) — identical to
-today's contract.
+places. The worst accepted latency is one quantum (normal wake to a busy CPU).
 
 ## 13. Explicitly rejected
 
@@ -1104,13 +1095,13 @@ today's contract.
    path that must stay behavior-identical to the first is a standing divergence risk, and its
    ownership-carrying `Deliver` case had no fallback at all. One path, no fallback needed.
 9. **Per-thread EEVDF / weight-division fairness at cutover** (Design 1): policy change bundled
-   into machinery replacement; discards the just-debugged stored-lag semantics. Deferred to a
+   into machinery replacement; discards the stored-lag semantics. Deferred to a
    sim-gated policy stage.
 10. **Dual-scheduler feature-flag coexistence**: two schedulers plus an `EventSource` compat
     registry buy bisectability the per-source conversions and the sub-staged cutover already
     provide with less standing surface — each conversion is individually revertable and each
-    sub-stage individually bootable. Zero-legacy principle: we do not carry a parallel old world
-    one stage longer than the conversion requires.
+    sub-stage individually bootable. Zero-legacy: a parallel old world is not carried one stage
+    longer than the conversion requires.
 11. **Enum state field on one task struct**: every invalid transition compiles. Five types give
     each transition a signature.
 12. **`Copy`/bitwise-movable task records**: address instability made raw pointers across
@@ -1118,7 +1109,7 @@ today's contract.
 13. **Host-thread-per-vCPU simulator**: nondeterministic, unreplayable, heavy at 128 vcpus.
     Step machine or nothing.
 14. **loom for the whole scheduler**: state-space explosion. Loom for primitives, sim for the
-    protocol — stated honestly.
+    protocol.
 15. **async/await coroutine kernel tasks**: a whole-kernel rewrite, out of scope.
 16. **Immediate wholesale rewrite without the simulator**: this subsystem's failures destroy
     their own evidence; the sim exists so the cutover lands against 10⁴ pre-failed schedules,

@@ -1,31 +1,28 @@
 # specs/
 
-Four places, one genre each.
+`specs/` itself holds living normative documents, written in the present
+tense and maintained to match the current system.
 
-`specs/` itself holds living normative documents: present tense, true now,
-changed when the world changes.
+`specs/plans/` holds staged intentions. A completed plan is deleted; any
+durable result moves into a spec.
 
-`specs/plans/` holds staged intentions. A plan dies on completion — deleted,
-its durable result stated in a spec, or nowhere.
-
-`specs/assessments/` holds dated evidence. Written once, frozen, never
+`specs/assessments/` holds dated evidence: written once, frozen, never
 maintained. A new assessment carries its date in its filename; legacy files
-keep the names they already have.
+keep their names.
 
 `specs/reference/` holds non-normative fact sheets: external formats,
 hardware inventories.
 
-`specs/issues/` is the defect tracker. Its own README governs.
+`specs/issues/` is the defect tracker, governed by its own README.
 
-Work narration has no committed home. It belongs in commit messages and
-pull-request bodies.
+Work narration is not committed to `specs/`; it belongs in commit messages
+and pull-request bodies.
 
 ## Checking a spec against the tree it describes
 
-A stale spec is worse than none: this project reads the spec before touching
-the subsystem it covers, so a false claim propagates straight into the next
-agent's work. Re-run this method whenever a spec needs re-verifying, not only
-in a dedicated sweep.
+A spec is read before its subsystem is touched, so a false claim propagates
+into the next change. Re-run this method whenever a spec needs re-verifying,
+not only in a dedicated sweep.
 
 **`git show HEAD:<path>` is the arbiter, never the working tree.** What is on
 disk may be someone's uncommitted, half-finished change in either direction —
@@ -35,10 +32,9 @@ looking fixed when it is not, or looking stale when it was just corrected.
   line number, a type or function name, a call-site count, "X has no
   callers", a threshold, "Stage N done" — goes to the code and gets read
   there.
-- **Re-derive; do not transcribe.** A finding handed over as prose and
-  applied without re-reading the code is worse than re-deriving it. Verify
-  against the code, not against a commit message that claims to have changed
-  it.
+- **Re-derive every finding.** Verify against the code, not against prose
+  handed over by another pass or a commit message that claims to have
+  changed it.
 - **Ask what would make a gate green other than the thing it tests.** Three
   shapes recur: a gate that cannot fail (nothing ever exercised the failure
   path); a bound whose cost nothing measures (a correct-looking check that
@@ -46,31 +42,30 @@ looking fixed when it is not, or looking stale when it was just corrected.
   (the change under test narrows the gate's own coverage rather than
   violating it — publish how much a windowed or filtered check actually
   covered, and gate on that number too, not only on pass/fail).
-- **Break it and run it.** When a spec, comment or plan claims test T guards
-  property P, break P and run T. If T still passes, the claim is false —
-  reading cannot substitute for this check.
-- **The inverse is a test that asserts a known limitation on purpose**, so
-  that fixing the limitation later turns the test red. Its failure message
-  names the expected transition, so whoever trips it reads it as the
-  limitation lifting, not a regression.
+- **When a spec, comment or plan claims test T guards property P, break P
+  and run T.** If T still passes, the claim is false — reading cannot
+  substitute for this check.
+- **A test may assert a known limitation on purpose**, so that fixing the
+  limitation later turns the test red. Its failure message names the
+  expected transition, so whoever trips it reads it as the limitation
+  lifting, not a regression.
 - **Ask what a bound refuses that it shouldn't**, not only whether it refuses
   what it should — a bound can look correct and still silently disable the
   fast path it exists to protect once it bites.
-- **A fix for a shape is not a fix for that shape recursively.** Re-verify a
-  generalized fix at every level the shape recurs, not only the level that
-  prompted it.
+- **Re-verify a generalized fix at every level the shape recurs**, not only
+  the level that prompted it.
 - **A comment's stated reason is a claim too**, separable from the rule it
   defends: the rule can be right while the reason given for it is false.
 - **Check the premise before building the fix** — confirm the defect is real
   and belongs to the subsystem a spec or issue names before changing
-  anything. A fix over an untouched defect is worse than no fix: it stops
-  the next reader from looking.
+  anything. A fix applied over an untouched defect stops the next reader
+  from looking.
 - **Resolve an ambiguous verb before resolving the claim.** "Revoke",
   "release", "close", "drop", "reset", "flush" each name more than one
   operation; name the actor, the object, and whether it is against the
   object's objection before matching the verb to code.
-- **Grep two ways.** A bare symbol search misses calls made through a guard
-  or trait object — also search `.method_name(`. And confirm the symbol
+- **Search both the bare symbol and `.method_name(`** — a bare symbol search
+  misses calls made through a guard or trait object. Confirm the symbol
   itself; a similar-looking identifier is not the same one.
 - **Parse a file's own data, not its prose.** A file carrying both numbers
   and narrative about them drifts between the two, and the narrative is what
@@ -90,4 +85,4 @@ gets fixed outright. **A dated record's body is never rewritten** — editing
 it falsifies an account of its own date; give a resolved finding a
 superseded header at the top, or a bracketed annotation in place, instead.
 A document whose filename itself misleads gets its warning at the top, not
-the bottom — a reader who scrolls first is already lost.
+the bottom.

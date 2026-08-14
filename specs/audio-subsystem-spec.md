@@ -1,4 +1,4 @@
-# ToyOS Audio Subsystem — Technical Specification
+# Audio subsystem
 
 ## 1. Goals
 
@@ -7,12 +7,12 @@
 - Per-client sample rate, channel count, and format — soundd resamples and converts during mixing
 - End-to-end latency under 5ms (target: 2.67ms at 128 frames / 48 kHz)
 - One data copy in the hot path (the mix operation, including any resampling)
-- f32 mix bus with TPDF dither on final i16 quantization — audiophile-grade signal path
+- f32 mix bus with TPDF dither on final i16 quantization
 - Deadlock-free by design. Missed deadlines produce silence, not stalls
 - Glitch-free stream transitions via gain ramping on connect and disconnect
 - Client API through cpal
 - Hardware-agnostic: kernel driver abstraction supports VirtIO sound, HDA, USB audio, and future hardware
-- **Hardware absence is a routing state, not an error.** soundd always runs and always accepts streams. A machine with no audio device gets a *null sink* (§5.11): the mix loop clocked by a software timer instead of a device, draining every stream at its real rate and discarding the samples. A client's `build_stream` succeeds and its write/backpressure timing is identical whether or not hardware is present.
+- soundd always runs and always accepts streams. A machine with no audio device gets a *null sink* (§5.11): the mix loop clocked by a software timer instead of a device, draining every stream at its real rate and discarding the samples. A client's `build_stream` succeeds and its write/backpressure timing is identical whether or not hardware is present.
 
 ## 2. Architecture
 
@@ -85,7 +85,7 @@ For example, a 44100 Hz client when the device runs at 48000 Hz with 128-frame p
 
 ## 4. Shared Memory Protocol
 
-Each connected client gets a shared memory region mapped into both the client's and soundd's address spaces. The protocol uses a small slot ring with atomic indices — no futex, no byte-level cursors, no blocking synchronization.
+Each connected client gets a shared memory region mapped into both the client's and soundd's address spaces. The protocol is a small slot ring with two atomic indices.
 
 ### 4.1 Layout
 
@@ -101,9 +101,9 @@ Offset      Size                        Field
 0x80        N × client_period_bytes     slot[0..N]: PCM audio data
 ```
 
-The header is **128 bytes**, and the padding is the point: the two indices are written by different processes at audio-period rate, so they sit on separate 64-byte cache lines. Do not pack them.
+The header is **128 bytes**: the two indices are written by different processes at audio-period rate, so each sits on its own 64-byte cache line. Do not pack them.
 
-**There is no `slot_count` field in the header.** It is not shared state — it is negotiated once and delivered in `MSG_STREAM_OPENED` (`StreamOpenResponse.slot_count: u16`). A client that reads a slot count out of the mapping is reading padding.
+The header carries no `slot_count`. The slot count is negotiated once and delivered in `MSG_STREAM_OPENED` (`StreamOpenResponse.slot_count: u16`).
 
 Slot size is per-client: `client_period_bytes = client_period_frames × client_frame_size`. This depends on the client's negotiated sample rate, channel count, and format. soundd computes the slot size and total shared memory allocation at stream open time.
 
@@ -111,7 +111,7 @@ Available for soundd to read: `write_idx - read_idx`. Available for client to fi
 
 Slot count is the device's DMA buffer count — `toyos_abi::virtio_sound::PERIODS = 8`, the same 8 the HDA backend uses — passed through as `num_buffers`. The client ring is therefore exactly as deep as the DMA pipeline, which is what §5.10 relies on: a client that kept up costs no silence at all during a drain. One slot is always the one soundd is reading, so a client can fill **7 ahead**.
 
-Total per client: `128 + N × client_period_bytes`. Allocation is `SharedMemory::allocate`, which goes through `alloc_shared` to the kernel's page allocator — and ToyOS maps 2 MiB pages only, so **every client costs one 2 MiB page** regardless of how little of it the ring uses. That is the unit to reason about for per-client cost, not the ring's nominal size.
+Total per client: `128 + N × client_period_bytes`. Allocation is `SharedMemory::allocate`, which goes through `alloc_shared` to the kernel's page allocator — and ToyOS maps 2 MiB pages only, so **every client costs one 2 MiB page** regardless of how little of it the ring uses.
 
 ### 4.2 Slot Ownership
 
@@ -254,7 +254,7 @@ If a client crashes, the read end closes and soundd's next write returns a broke
 
 ### 5.8 Idle Behavior
 
-soundd quiesces the device when idle. Mixing silence for an audience of zero is not an acceptable policy: it holds the host voice open, costs a wake per period forever, and on real hardware keeps the DMA engine and codec running. The mix thread is always in exactly one of three states:
+soundd quiesces the device when idle. Mixing silence with no clients is not an acceptable policy: it holds the host voice open, costs a wake per period, and on real hardware keeps the DMA engine and codec running. The mix thread is always in exactly one of three states:
 
 | State | Predicate | Submits | Wait | Wake sources |
 |---|---|---|---|---|
@@ -270,15 +270,15 @@ Transitions:
 - **SUSPENDED → STREAMING:** a client connects and the ordinary mix loop refills the whole pipeline — dithered silence until the client's ring has data — with the kernel starting the stopped stream inside the first submit. No pop is possible: every transition through stop and start passes through digital zero, and client audio still enters through the §5.5 connect ramp.
 - **Boot → SUSPENDED:** the initial state (§5.2). A machine with no audio client never starts the device voice at all.
 
-The idle predicate is "no client streams", not "all clients silent": a paused client (§6.4) resumes by writing shared memory, which produces no kernel event soundd could block on, so suspending under an open stream would leave soundd with no wake edge. A paused client keeps the device hot; that is correct.
+The idle predicate is "no client streams", not "all clients silent": a paused client (§6.4) resumes by writing shared memory, which produces no kernel event soundd could block on, so suspending under an open stream would leave soundd with no wake edge. A paused client therefore keeps the device hot.
 
-The grace between the drain completing and the STOP is zero, unconditionally, and that is policy — like `refill_floor_nanos` (§5.10) — not physics: virtio STOP does not RELEASE — SET_PARAMS and PREPARE stay valid and resume is one control verb inline with the first submit — so there is no codec pop or renegotiation for grace to amortize. A hardware backend that pops on stop is the one event that would justify a nonzero grace, implemented as a clock comparison against a drain timestamp at the idle wakes that still arrive while buffers play out — never an armed timer, which would put a periodic wake back into the idle path this state exists to empty.
+The grace between the drain completing and the STOP is zero, unconditionally. virtio STOP does not RELEASE — SET_PARAMS and PREPARE stay valid, and resume is one control verb inline with the first submit — so there is no codec pop or renegotiation for grace to amortize. A hardware backend that pops on stop would justify a nonzero grace, implemented as a clock comparison against a drain timestamp at the idle wakes that still arrive while buffers play out — never an armed timer, which would put a periodic wake back into the idle path.
 
 While SUSPENDED, soundd holds zero timers and takes zero wakes; its CPU cost is exactly zero until a client connects.
 
 ### 5.9 Pipeline Recovery
 
-If all DMA buffers drain due to a catastrophic scheduling stall, soundd detects a full free list and resets the DLL: the device restarts its period grid from whatever is submitted next, so the old estimate is not clock drift to be tracked but a dead reference to be discarded. The DLL re-initializes from the first new completion timestamp.
+If all DMA buffers drain due to a catastrophic scheduling stall, soundd detects a full free list and resets the DLL: the device restarts its period grid from whatever is submitted next, so the old estimate refers to a period grid that no longer exists. The DLL re-initializes from the first new completion timestamp.
 
 Recovery must be **proportional to the shortfall**. The drained buffers are refilled by the ordinary mix path, exactly like any other free buffer: client audio already sitting in the slot rings goes out immediately, and silence is submitted only for those periods no client can cover. Re-priming the whole pipeline with silence is not acceptable — it makes the cost of *any* stall, however brief, a full pipeline depth of audible dropout, and delays the client audio queued behind it by the same amount. Since the client rings are as deep as the DMA pipeline (§4.1), a stall that the clients kept up with costs no silence at all.
 
@@ -288,9 +288,7 @@ No path submits silence unconditionally: even the §5.8 resume prime runs the or
 
 The audio subsystem must produce glitch-free audio on a single-CPU system running concurrent workloads (e.g., a game with rendering, audio, and MIDI threads). This requires that client audio threads are scheduled deterministically within each mix cycle, not left to compete for CPU time at normal priority.
 
-**The problem:** in a naive signal-after-read model, the client thread runs at normal priority and may not be scheduled for tens of milliseconds when the CPU is contended. No amount of ring buffer depth fully compensates — deeper buffers add latency and only delay the problem.
-
-**The solution:** soundd signals clients before reading, then briefly waits. Two kernel mechanisms make this work:
+In a signal-after-read model the client thread runs at normal priority and may not be scheduled for tens of milliseconds when the CPU is contended; deeper ring buffers add latency and only delay the failure. soundd therefore signals clients before reading, then briefly waits. Two kernel mechanisms make this work:
 
 1. **Thread priority for soundd.** The mix thread runs at real-time priority (above all normal threads). The kernel scheduler must support at least two priority bands: real-time and normal. soundd's mix thread is the only userspace thread in the real-time band. This ensures soundd always preempts game logic, rendering, and other normal-priority work.
 
@@ -310,11 +308,11 @@ The audio subsystem must produce glitch-free audio on a single-CPU system runnin
 
 On a single CPU, steps 6-7 happen sequentially — each client fills its slots and blocks, yielding the CPU to the next boosted client or back to soundd. The total client fill time is bounded: N clients × callback_time. As long as this fits within one period, no underruns occur.
 
-**Priority inheritance is implemented.** `Pipe::rt_boost_pending` (`kernel/src/pipe.rs:153`) records that an RT thread wrote to a pipe; the next thread to consume data claims the boost (`:263-264`), which covers the case the wake-time boost in `wake_pipe_readers` misses. `set_rt_boost_pending` is at `:320`. There is no fallback mode without it: the ring is 8 slots because that is the device's DMA pipeline depth (§4.1), the same 8 in every configuration.
+`Pipe::rt_boost_pending` (`kernel/src/pipe.rs:153`) records that an RT thread wrote to a pipe; the next thread to consume data claims the boost (`:263-264`), which covers the case the wake-time boost in `wake_pipe_readers` misses. There is no fallback mode without priority inheritance: the ring is 8 slots because that is the device's DMA pipeline depth (§4.1), the same 8 in every configuration.
 
-**Deferral: what soundd does when a client is mid-refill.** The mix loop may hold a free buffer back for a client that has not finished filling, rather than mixing without it — this is what keeps a slow client from becoming a hole in the output, and it is the fix for the ring-depth dropout class.
+**Deferral.** The mix loop may hold a free buffer back for a client that has not finished filling, rather than mixing without it, which keeps a slow client from becoming a hole in the output.
 
-It is bounded, and the bound is policy rather than physics — the same standing as the kernel's `MAX_USER_STR`. soundd defers only while at least `refill_floor_nanos = 5 × period_nanos` of unplayed audio is still on the wire: of the pipeline's 8 periods it will spend at most 3 waiting for a client and always keeps 5 in reserve. `assert!(num_buffers > 5, "soundd: pipeline too shallow to defer safely")` (`userland/soundd/src/main.rs:891`) refuses to run the policy on a pipeline that cannot afford it.
+The bound is policy: soundd defers only while at least `refill_floor_nanos = 5 × period_nanos` of unplayed audio is still on the wire — of the pipeline's 8 periods it spends at most 3 waiting for a client and always keeps 5 in reserve. `assert!(num_buffers > 5, "soundd: pipeline too shallow to defer safely")` (`userland/soundd/src/main.rs:891`) refuses to run the policy on a pipeline that cannot afford it.
 
 The floor cannot be derived from worst-case wake lateness: the recorded worst exceeds two whole pipeline depths (`tests/audio-baseline.toml`), so no floor *inside* the pipeline covers it. Move the number only with a full re-baseline.
 
@@ -326,20 +324,20 @@ The floor cannot be derived from worst-case wake lateness: the recorded worst ex
 
 ### 5.11 No Audio Device: the Null Sink
 
-soundd claims the audio device at startup. When there is none (`AudioDev::open()` returns `NotFound`), it does **not** exit — exiting released the service name and left every client's `connect` failing `NotFound`, which crashed uncontrolled programs (cpal's `build_output_stream` surfaced it as `BackendSpecific`, and clients like `tone` panicked in `.expect`). Instead soundd presents a **null sink**.
+soundd claims the audio device at startup. When there is none (`AudioDev::open()` returns `NotFound`), it does **not** exit — an exit would release the service name and leave every client's `connect` failing `NotFound`. Instead soundd presents a **null sink**.
 
 The null sink is the mix loop clocked by a monotonic software timer instead of a device (`null_sink_thread`, `userland/soundd/src/main.rs`). It reuses every per-client mechanism — `mix_client`, the gain ramps, crash detection, the command ring, the stats windows — and drops only what a device provides:
 
 - **Virtual output.** It presents a fixed configuration — 44100 Hz stereo i16, 128 frames/period, an 8-deep ring — matching the one config cpal's ToyOS backend advertises, so a stream negotiates identically to a real device.
-- **Real-rate drain.** One period is consumed per `period_nanos` of wall clock, off `clock_nanos()`. This is the whole point: the client's ring drains — and its writes backpressure — at exactly the audio rate. Not instant discard (a client that writes then waits for space would spin) and not blocked-forever (the client would stall). A client that writes N seconds of audio takes ~N seconds, host-measured (`audio::null_sink_real_rate`).
+- **Real-rate drain.** One period is consumed per `period_nanos` of wall clock, off `clock_nanos()`, so the client's ring drains — and its writes backpressure — at exactly the audio rate: not instant discard (a client that writes then waits for space would spin) and not blocked-forever (the client would stall). A client that writes N seconds of audio takes ~N seconds, host-measured (`audio::null_sink_real_rate`).
 - **No DMA pipeline.** So no DLL (the timer is exact), no completion records, no dither, no submit. After mixing one period the samples are discarded. A wake that overslept more than the ring depth re-anchors the grid rather than chasing a jumped clock (a loaded CPU, a host suspend) — the burst would be silence anyway.
 - **No RT band.** The null sink protects no audible output, and could not take the band regardless: `SYS_SET_RT_PRIORITY` is gated on the audio claim there is no device to hold. Client scheduling on an idle machine needs no boost; under contention the discard just jitters, and a discard has nothing to glitch.
-- **Idle discipline (§5.8).** With no streams the null sink holds no timer and takes no wakes, blocking on the command pipe alone — an audience of zero costs exactly zero CPU.
-- **Not silent about being silenced.** It reports each discarded stream in the same stats windows a real sink emits (`soundd: wakes=… submitted=… clients=…`), which the audio-status tool (#106) reads.
+- **Idle discipline (§5.8).** With no streams the null sink holds no timer and takes no wakes, blocking on the command pipe alone.
+- **Stats.** It reports each discarded stream in the same stats windows a real sink emits (`soundd: wakes=… submitted=… clients=…`), which the audio-status diag tool reads.
 
-When real hardware is present the device path is unchanged; the null sink is the no-device route, not the device route. An HDA or USB-audio sink (#88) attaches to this same server as a real sink — the null sink is what it replaces when a device exists.
+When real hardware is present the device path is unchanged; the null sink serves only the no-device case. An HDA or USB-audio sink attaches to this same server as a real sink and replaces the null sink when a device exists.
 
-**The routing-state pattern is specific to a discardable output.** Audio is null-routable because a sink can be virtual: a client cannot tell whether its samples are heard, so discarding them is a valid route. A resource whose absence is observable to a peer is *not* — a network bind (netd, sshd/#104) has no null route, because there is no honest way to answer a remote peer with a socket that goes nowhere. Those daemons correctly exit when their device is absent; the lesson is the same (absence is not a panic), the resource is different (it cannot be faked).
+A null route exists only for a discardable output: a client cannot tell whether its samples are heard, so discarding them is a valid route. A resource whose absence is observable to a peer has no null route — netd and sshd exit when their device is absent, because a socket that goes nowhere cannot honestly answer a remote peer.
 
 ## 6. cpal
 

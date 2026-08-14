@@ -8,6 +8,6 @@
 
 **Reading a frozen guest without `cargo run`** — any harness test with `BootOptions { qmp: true }` leaves a socket under `$TMPDIR/toyos-tests-<pid>/lane-<n>/`. `human-monitor-command` with `info registers -a` gives every vCPU's `RIP`, `RFL` and `HLT` — how a halted-awaiting-interrupt machine is told from a wedged one. Take that capture before injecting anything: a keystroke revives a halted CPU, so Ctrl+Alt+D over the same socket both confirms the diagnosis and destroys the evidence for it.
 
-**Ctrl+Alt+D is the blocked-task dump, Ctrl+Alt+F1 the panic console's pager** — what to press on a machine that stopped without panicking, and what to ask the owner for. Both are detailed in `kernel/CLAUDE.md`.
+**Ctrl+Alt+D prints the blocked-task dump; Ctrl+Alt+F1 opens the panic console's pager.** Both apply to a machine that stopped without panicking; both are detailed in `kernel/CLAUDE.md`.
 
 **Audio** — `cargo run -- --smp N --dump-audio` captures device output to `/tmp/toyos-audio.wav` (parse to EOF — RIFF sizes stay 0 unless the guest shuts down cleanly). `cargo test -- audio` runs the glitch regressions. soundd prints wake/underrun/latency stats every ~2 s while clients exist; doom prints `[music]` telemetry every ~5 s.
