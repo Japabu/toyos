@@ -546,13 +546,16 @@ fn key_colour(button: &Button) -> Pixel {
         Action::Equals => KEY_EQUALS,
         Action::Clear | Action::Backspace => KEY_CLEAR,
         Action::SetBase(_) | Action::ToggleAngle => KEY_FN,
+        // A value looks like a value whether it is a digit or a constant, and a
+        // function looks like a function whether it is spelled or drawn.
+        Action::Insert("π") => KEY_DIGIT,
+        Action::Insert("√") => KEY_FN,
+        Action::Insert(text) if text.ends_with('(') => KEY_FN,
         Action::Insert(text) => {
-            let digit = text.len() == 1
+            let value = text.chars().count() == 1
                 && text.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '.');
-            if digit {
+            if value {
                 KEY_DIGIT
-            } else if text.ends_with('(') {
-                KEY_FN
             } else {
                 KEY_OP
             }
