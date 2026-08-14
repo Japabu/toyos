@@ -282,14 +282,18 @@ const IDLE_GUARD_SIZE: usize = 4096;
 ///
 /// **What is large on that path — type sizes, not a decomposition of the
 /// measurement.** These are what `size_of` says, not what `ist1_report`
-/// counted, and they come to 5,240 against the measured 7,488; the 2,248
+/// counted, and they come to 4,224 against the measured 7,488; the 3,264
 /// between them is frames, spills, alignment and everything the path does that
 /// is not one of these. Largest first, at `RECORD_BYTES` of 1024: `emit`'s
-/// `LogRecord` (1,024) beside `SerialWriter`'s line buffer (1,024) and the
-/// `Body` its `commit` stores (1,016); `snapshot_committed`'s one materialised
-/// record (1,024) and its eight `Descent`s (384); `paint`'s row table (768).
-/// The elision's tail buffer (452 — its head is streamed and buffers nothing)
-/// is on a branch no symbol in this tree reaches.
+/// `LogRecord` (1,024) beside `SerialWriter`'s line buffer (1,024);
+/// `snapshot_committed`'s one materialised record (1,024) and its eight
+/// `Descent`s (384); `paint`'s row table (768). The elision's tail buffer
+/// (452 — its head is streamed and buffers nothing) is on a branch no symbol in
+/// this tree reaches.
+///
+/// **`commit` no longer stages a 1,016-byte `Body` on this stack** — it stores
+/// the caller's record into the slot's atomic words directly — and the measured
+/// 7,488 did not move, which says that frame was never the deepest one.
 ///
 /// It was 4,512 before the record ring, so the ring cost 2,976 bytes of a
 /// stack with 8,896 still free.

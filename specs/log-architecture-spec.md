@@ -353,19 +353,50 @@ const _: () = assert!(size_of::<LogRecord>() == RECORD_BYTES);
 const _: () = assert!(align_of::<LogRecord>() == 64);
 ```
 
-**The kernel's slot is the same layout with the first word made atomic**, and
-nothing else differs:
+**The kernel's slot is the same layout as atomic machine words**, and nothing
+else differs:
 
 ```rust
 // kernel/src/log/shard.rs
 #[repr(C, align(64))]
 pub struct Slot {
-    seq: AtomicU64,        // the same eight bytes as LogRecord::seq
-    body: UnsafeCell<Body> // LogRecord minus its first word, 248 bytes
+    seq: AtomicU64,                // the same eight bytes as LogRecord::seq
+    body: [AtomicU64; BODY_WORDS], // 3 identity words then the message, LE
 }
 const _: () = assert!(size_of::<Slot>() == RECORD_BYTES);
 const _: () = assert!(offset_of!(LogRecord, at_ns) == size_of::<u64>());
 ```
+
+**Every word of the body is an `AtomicU64`, and that is a soundness requirement
+rather than a style.** It was an `UnsafeCell<Body>` until 2026-08-14 — the
+writer stored the whole struct through it while a reader took a `read_volatile`
+of the same bytes, and §2.4's sequence re-check discarded the torn *result*
+without ever legalising the *access*. A non-atomic write racing a read is
+undefined in Rust's model whatever x86 makes of it, and `volatile` is not a
+synchronisation primitive: it constrains the compiler and says nothing about
+the abstract machine. Per-word `Relaxed` stores and loads inside the unchanged
+sequence protocol have no race to discard, and they cost nothing — each is the
+same `mov` the struct copy was made of, and the fences that order them are the
+ones that were already there. It also deletes the `unsafe impl Sync for Shard`
+that stood in for the cell: every word being an atomic is what makes the claim
+true, so the compiler makes it.
+
+**The packing is written out by hand and a host test round-trips it.** Three
+identity words — `at_ns`; `pid | tid << 32`; `cpu | len << 16 | elided << 32 |
+level << 48 | flags << 56` — and then the message, little-endian, eight bytes to
+the word. A `transmute` of a `#[repr(C)]` struct would make the two sides'
+agreement a property of the compiler's layout choice rather than of the file,
+and a field shifted into the wrong half of a word is invisible to every model
+here: loom explores orderings, and a consistently mis-packed record is perfectly
+ordered. `kernel-loom/tests/log_body_words.rs` is the round trip, under the
+`--no-default-features` invocation because `MSG_WORDS` is 1 under loom.
+
+**A producer stores the words its message occupies and no more**, which is
+`3 + ceil(len/8)` of the 127 — nine words at the corpus's 68-byte mean message
+rather than a full 1,016-byte copy. The reader loads the same count, from a
+`len` it clamps first because that word may be mid-recycle; the worst a garbage
+value can do is make it read the whole message area, which is in bounds and is
+then thrown away by the re-check.
 
 **Two types and not one, because `AtomicU64` cannot cross the syscall boundary
 honestly.** `Record` in an earlier draft of this section was a single type with
@@ -636,8 +667,9 @@ pub fn emit(level: Level, args: core::fmt::Arguments);
    `shard.head`, behind `arch::percpu_fetch_add`, documented as
    *interrupt-atomic, not SMP-atomic; sound only for a counter one CPU writes*.
 3. **Write and commit before reopening the guard.** Fill the record's five
-   identity fields, store `WRITING`, perform the release fence, copy the
-   1016-byte body into `shard.slots[seq % SHARD_RECORDS]`, and finally
+   identity fields, store `WRITING`, perform the release fence, store the body
+   words into `shard.slots[seq % SHARD_RECORDS]` — three identity words and the
+   message's own `ceil(len/8)`, no more (§2.1) — and finally
    `slot.seq.store(seq, Release)`. Only then restore the caller's complete
    RFLAGS. Formatting remains outside; §2.3a says why reservation through final
    publication cannot. **The timestamp does not** — it is read inside the guard,
@@ -652,7 +684,8 @@ pub fn emit(level: Level, args: core::fmt::Arguments);
 
 **No lock and no locked RMW in `Drain::Thread`**, which is every mode after
 `scheduler::init`. The path loses today's `compare_exchange_weak` and keeps a
-flags bracket across reservation and one bounded 248-byte publication; it gains
+flags bracket across reservation and one bounded publication of at most 1,016
+bytes and in practice the message's own length; it gains
 one `SeqCst` fence and one relaxed load. The guard never polls, spins, schedules,
 or waits for a prior writer. L1 measures the widened bracket and the net for the
 ring; L3 measures the fence, which arrives with the wake (§9.6).
@@ -756,11 +789,15 @@ report must fit in half the stack, and it does: 14,976 of 16,384.
 It was **4,512** before the record ring, so the ring cost 2,976 bytes and left
 8,896 free. What is large on that path is type sizes rather than a
 decomposition of the measurement — `emit`'s `LogRecord` and `SerialWriter`'s
-line buffer at 1,024 each, `commit`'s `Body` at 1,016, `snapshot_committed`'s
+line buffer at 1,024 each, `snapshot_committed`'s
 one materialised record at 1,024 and its eight `Descent`s at 384, `paint`'s row
-table at 768 — and those come to 5,240 of the 7,488.
+table at 768 — and those come to 4,224 of the 7,488.
 `kernel/src/arch/percpu.rs`'s `IST1_STACK_SIZE` is where the number lives,
 beside the constant it is a budget against.
+
+**Making the body atomic words (§2.1) took `commit`'s 1,016-byte `Body` staging
+off this stack and the measurement did not move** — re-run 2026-08-14, still
+7,488 — which says that frame was never the deepest one.
 
 **This is the number a chunk that widens the fatal path re-measures**, and it is
 cheap: one `cargo test -- double_fault_stack`.
@@ -840,13 +877,14 @@ Four properties, each structural rather than checked:
   `a_recycled_slot_does_not_answer_for_the_record_it_replaced` are the models.
   This is the thing the model was built for and it earned itself immediately.
 
-  **The body copy is a volatile byte copy, and that is a requirement rather than
-  a style.** Reading 248 bytes that a writer may concurrently be storing into is a
-  data race in Rust's model whatever x86 does about it; the re-check makes the
-  *result* sound and does not make the *access* defined. `read_volatile` through
-  the `UnsafeCell` is the form, and the reason goes in the doc comment on the
-  copy. **Loom cannot model that access either**, and W2's entry in §2.5 says
-  what it models instead.
+  **The body is read word by word as atomics, and that is a requirement rather
+  than a style.** Reading bytes that a writer may concurrently be storing into
+  is a data race in Rust's model whatever x86 does about it; the re-check makes
+  the *result* sound and does not make the *access* defined. A `read_volatile`
+  through an `UnsafeCell` was the form until 2026-08-14 and it is not a fix —
+  volatile constrains the compiler and says nothing about the abstract machine.
+  `Relaxed` per-word loads against `Relaxed` per-word stores are what make the
+  access defined; §2.1 carries the argument and the packing.
 - **A live reservation cannot be abandoned or lapped.** The same IF/TF-off
   guard covers reservation through the final sequence store, and that region
   contains no lock, wait, spin, scheduler call, allocation, formatting, or
@@ -859,8 +897,8 @@ Four properties, each structural rather than checked:
 
   Therefore every reservation on a live machine reaches its release store and
   a quiet shard cannot retain a permanent hole in front of `klogd`. `commit`
-  has no lapping check: the former pre-body check missed preemption during its
-  248-byte copy, while a final check would merely diagnose corruption already
+  has no lapping check: the former pre-body check missed preemption during the
+  body stores, while a final check would merely diagnose corruption already
   performed. The non-preemptible publication is what prevents the transition;
   no producer ever waits for the interrupted one.
 
@@ -905,8 +943,8 @@ dependency this file may not grow: passing it means `arm_waiter` names no
 subject at all, and the model supplies its own.
 
 The caller does the post on a `true`, and never the ordering. The shimmed set for
-`shard.rs` is then `UnsafeCell`, `LogCommitGuard` and `percpu_fetch_add`, which
-is smaller than `sync.rs`'s. **The layout requirement is stated here and honoured at L1 even
+`shard.rs` is then `LogCommitGuard` and `percpu_fetch_add` — the cell left it
+with the `UnsafeCell` (§2.1) — which is smaller than `sync.rs`'s. **The layout requirement is stated here and honoured at L1 even
 though the two functions arrive at L3** (§2.6a): if `shard.rs` were allowed to
 grow a dependency on a subject, W3 could not be modelled at all, and that is
 exactly the mistake the paragraph above records.
@@ -914,7 +952,7 @@ exactly the mistake the paragraph above records.
 | obligation | shape | model | when |
 |---|---|---|---|
 | **W1** publication | body stores → `seq.store(Release)`; reader's `seq.load(Acquire) == s` implies the body is visible | `kernel-loom/tests/log_record.rs` | L1 |
-| **W2** recycle detection | the readable window is exactly the last `SHARD_RECORDS`, and a slot a writer has entered answers for neither generation. **Deterministic, not raced** — loom's `UnsafeCell` records every access as a write and reports the unsynchronised *pair*, so a seqlock read looks to it like a second writer; and a two-thread model over a whole ring is hundreds of thousands of interleavings, which did not finish in ten minutes here. What loom checks concurrently is W1; what makes W2 a state rather than a schedule is that the mark is published before the body | same | L1 |
+| **W2** recycle detection | the readable window is exactly the last `SHARD_RECORDS`, and a slot a writer has entered answers for neither generation. **Deterministic, not raced** — a two-thread model over a whole ring is hundreds of thousands of interleavings, which did not finish in ten minutes here. (Until 2026-08-14 there was a second reason: loom's `UnsafeCell` recorded every access as a write and reported the unsynchronised *pair*, so a seqlock read looked to it like a second writer. The body is atomic words now and loom models the accesses themselves.) What loom checks concurrently is W1; what makes W2 a state rather than a schedule is that the mark is published before the body | same | L1 |
 | **W2b** non-preemptible publication | one `LogCommitGuard` witnesses shard selection, reservation, `WRITING`, body copy and the final sequence store. A stale writer can neither migrate nor resume after a newer generation. CPU flags and strict same-CPU preemption are outside Loom; §9.2's guest actuator is the negative proof | `log_nested_emit` plus `log-unbracketed-reserve` | L4 |
 | **W3** the wake edge | `signal_after_commit`: `fence(SeqCst); LOG_WAITER.load(Relaxed)` after `seq.store(Release)`, against `arm_waiter`: `LOG_WAITER.store(true, Relaxed); fence(SeqCst); rescan for a committed record; park`. **Invariant: no committed record is left with a parked reader.** Store-buffer shaped, so TSO hides the missing fence and only loom sees it. Carries its own negative case — either fence removed behind a `cfg`, and the model must red — because a model that has never failed proves nothing | `kernel-loom/tests/log_wake.rs` | L3 |
 | **W4** the reservation | `head` is written by one CPU through inline asm and read by others as an `AtomicU64` | shimmed | L1 |
@@ -1184,7 +1222,7 @@ uncommitted record does not stop the merge: the other shards keep flowing and
 their records are emitted. So the merge is in `at_ns` order *among what it
 emits*, and a blocked shard's records arrive later than records with larger
 timestamps once it unblocks. That is the only ordering this design does not
-give. On a live machine it is bounded by one non-preemptible 248-byte
+give. On a live machine it is bounded by one non-preemptible body
 publication; on a fatal machine the interrupted `WRITING` slot can remain
 forever, but that machine uses `snapshot_committed` instead. The alternative —
 stalling every shard on the slowest — is what turns one wedged CPU into a silent
@@ -2513,7 +2551,7 @@ existing. Named rather than discovered at compl's C14.
   because the two differ:
   - `Drain::Thread` (everything after `scheduler::init`): loses one
     `compare_exchange_weak` per record, keeps one `pushfq`/`cli`/`popfq`-shaped
-    guard widened from shard selection through the bounded 248-byte publication
+    guard widened from shard selection through the bounded body publication
     (§2.3a), and gains **one `SeqCst` fence and one relaxed load** per record. No
     locked RMW on the producer's path at all. The five locked operations of the
     post (§2.6a) are paid at most once per `klogd` park, by one producer, inside

@@ -2,8 +2,8 @@
 //! record" untypeable.
 //!
 //! **This file is compiled a second time by `kernel-loom`**, so it may name
-//! only what that crate shims: the cell, the atomics, and
-//! `arch::percpu_fetch_add`. That is not a style rule — x86's TSO gives every
+//! only what that crate shims: the atomics and `arch::percpu_fetch_add`. That
+//! is not a style rule — x86's TSO gives every
 //! load acquire and every store release semantics, so a missing edge here is
 //! invisible to every guest test, and loom is the only instrument in this tree
 //! that can see one. **ARM64 is planned**, and on it the missing edge is not
@@ -13,12 +13,8 @@
 //! `specs/log-architecture-spec.md` §2.2, §2.4 and §2.5.
 
 #[cfg(not(feature = "loom"))]
-use core::cell::UnsafeCell;
-#[cfg(not(feature = "loom"))]
 use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 
-#[cfg(feature = "loom")]
-use crate::cell::UnsafeCell;
 #[cfg(feature = "loom")]
 use loom::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 
@@ -52,27 +48,62 @@ pub const SHARD_RECORDS: usize = 512;
 #[cfg(feature = "loom")]
 pub const SHARD_RECORDS: usize = 4;
 
-/// The body of a record — [`LogRecord`] minus the word the writer publishes
-/// with.
+/// The record's identity, packed into the three words that precede its message.
 ///
-/// It is a separate struct so that the one thing a reader may see torn is
-/// exactly the thing the sequence number answers for.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Body {
-    at_ns: u64,
-    pid: u32,
-    tid: u32,
-    cpu: u16,
-    len: u16,
-    elided: u16,
-    level: u8,
-    flags: u8,
-    msg: [u8; MAX_RECORD_MESSAGE],
-}
+/// Written out by hand rather than transmuted from a struct: the packing is
+/// what the two sides agree on, and a `transmute` would make that agreement a
+/// property of the compiler's layout choice instead of of this file.
+const HEADER_WORDS: usize = 3;
+
+/// Message words a slot holds.
+///
+/// **One under loom, for [`SHARD_RECORDS`]'s reason.** A model shard declares
+/// `SHARD_RECORDS * (1 + HEADER_WORDS + MSG_WORDS)` loom atomics and builds
+/// them all on a 32 KiB generator stack; at the kernel's 124 that is 508 per
+/// shard and the model cannot be constructed at all. Nothing the models check
+/// depends on the number — every record they write has `len` of 8, which is one
+/// word — and the clamp in [`Shard::commit`] is the same expression in both
+/// builds, so the model's bound is checked by the same line the kernel's is.
+#[cfg(not(feature = "loom"))]
+const MSG_WORDS: usize = MAX_RECORD_MESSAGE / 8;
+#[cfg(feature = "loom")]
+const MSG_WORDS: usize = 1;
+
+/// The whole body: everything in a [`LogRecord`] past the word the writer
+/// publishes with.
+const BODY_WORDS: usize = HEADER_WORDS + MSG_WORDS;
+
+/// The message bound this file enforces, which is the ABI's in the kernel build
+/// and the model's own under loom.
+const MSG_BYTES: usize = MSG_WORDS * 8;
 
 #[cfg(not(feature = "loom"))]
-const _: () = assert!(core::mem::size_of::<Body>() == RECORD_BYTES - core::mem::size_of::<u64>());
+const _: () = assert!(MSG_BYTES == MAX_RECORD_MESSAGE);
+#[cfg(not(feature = "loom"))]
+const _: () = assert!(BODY_WORDS * 8 == RECORD_BYTES - core::mem::size_of::<u64>());
+
+/// The three identity words, in the order a slot holds them.
+fn header(record: &LogRecord, len: u16) -> [u64; HEADER_WORDS] {
+    [
+        record.at_ns,
+        record.pid as u64 | (record.tid as u64) << 32,
+        record.cpu as u64
+            | (len as u64) << 16
+            | (record.elided as u64) << 32
+            | (record.level as u64) << 48
+            | (record.flags as u64) << 56,
+    ]
+}
+
+/// How many message words a record of this length occupies.
+///
+/// **The writer stores these and the reader loads these, and neither touches
+/// the rest.** A record's mean message over the measured corpus is 68 bytes, so
+/// the publication a producer pays for is nine words rather than 127 — the
+/// bound is the tail of the distribution and the cost is the record in hand.
+fn msg_words(len: u16) -> usize {
+    (len as usize).min(MSG_BYTES).div_ceil(8)
+}
 
 /// The first sequence number any shard issues.
 ///
@@ -99,15 +130,28 @@ pub const FIRST_SEQ: u64 = 1;
 /// inward: [`Shard::read`] answers `None` and no [`LogRecord`] ever holds it.
 const WRITING: u64 = u64::MAX;
 
-/// One record's storage. **The same layout as [`LogRecord`] with the first word
-/// made atomic**, and nothing else differs.
+/// One record's storage. **The same layout as [`LogRecord`], as atomic machine
+/// words**, and nothing else differs.
+///
+/// **Every word of it is an `AtomicU64`, and that is a soundness requirement
+/// rather than a style.** The body was an `UnsafeCell<Body>` until 2026-08-14:
+/// the writer stored the whole struct through it while a reader took a
+/// `read_volatile` of the same bytes, and the sequence re-check discarded the
+/// torn *result* without ever legalising the *access* — a non-atomic write
+/// racing a read is undefined in Rust's model whatever x86 makes of it, and
+/// `volatile` is not a synchronisation primitive. Per-word `Relaxed` stores and
+/// loads inside the unchanged sequence protocol have no race to discard: on x86
+/// each is the same `mov` the struct copy was made of, and the fences that
+/// order them are the ones that were already here.
 #[repr(C, align(64))]
 pub struct Slot {
     /// The state word: a sequence number, or [`WRITING`], or zero for a slot
     /// nothing has touched. The identity and the validity are the same word, so
     /// there is no separate valid flag that could disagree with it.
     seq: AtomicU64,
-    body: UnsafeCell<Body>,
+    /// Three identity words and then the message, little-endian, packed by
+    /// [`header`] and unpacked by [`Shard::read`].
+    body: [AtomicU64; BODY_WORDS],
 }
 
 /// **The layout assertions are the kernel's and are skipped under loom**, whose
@@ -145,40 +189,20 @@ impl Shard {
     pub const fn new() -> Self {
         const EMPTY: Slot = Slot {
             seq: AtomicU64::new(0),
-            body: UnsafeCell::new(Body {
-                at_ns: 0,
-                pid: 0,
-                tid: 0,
-                cpu: 0,
-                len: 0,
-                elided: 0,
-                level: 0,
-                flags: 0,
-                msg: [0; MAX_RECORD_MESSAGE],
-            }),
+            body: [const { AtomicU64::new(0) }; BODY_WORDS],
         };
         Self { head: AtomicU64::new(FIRST_SEQ), slots: [EMPTY; SHARD_RECORDS] }
     }
 
-    /// Loom's atomics have no `const` constructor, and its `UnsafeCell` records
-    /// a creation event, so the model builds shards at run time.
+    /// Loom's atomics have no `const` constructor, so the model builds shards at
+    /// run time.
     #[cfg(feature = "loom")]
     pub fn new() -> Self {
         Self {
             head: AtomicU64::new(FIRST_SEQ),
             slots: core::array::from_fn(|_| Slot {
                 seq: AtomicU64::new(0),
-                body: UnsafeCell::new(Body {
-                    at_ns: 0,
-                    pid: 0,
-                    tid: 0,
-                    cpu: 0,
-                    len: 0,
-                    elided: 0,
-                    level: 0,
-                    flags: 0,
-                    msg: [0; MAX_RECORD_MESSAGE],
-                }),
+                body: core::array::from_fn(|_| AtomicU64::new(0)),
             }),
         }
     }
@@ -273,21 +297,20 @@ impl Shard {
         slot.seq.store(WRITING, Ordering::Relaxed);
         fence(Ordering::Release);
 
-        // SAFETY: the live guard makes this sequence number and slot exclusively
-        // ours until we publish it. The slot now reads `WRITING`, so no reader
-        // will accept anything it finds here.
-        unsafe {
-            *slot.body.get() = Body {
-                at_ns: record.at_ns,
-                pid: record.pid,
-                tid: record.tid,
-                cpu: record.cpu,
-                len: record.len.min(MAX_RECORD_MESSAGE as u16),
-                elided: record.elided,
-                level: record.level,
-                flags: record.flags,
-                msg: record.msg,
-            };
+        // The live guard makes this sequence number and slot exclusively ours
+        // until we publish it, and the slot now reads `WRITING`, so no reader
+        // will accept anything it finds here. Each word is `Relaxed` because the
+        // fence above and the release store below are what order the whole body
+        // against the sequence number — a per-word ordering would say nothing
+        // extra and cost a barrier per word.
+        let len = record.len.min(MSG_BYTES as u16);
+        for (word, value) in slot.body.iter().zip(header(record, len)) {
+            word.store(value, Ordering::Relaxed);
+        }
+        for i in 0..msg_words(len) {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&record.msg[i * 8..i * 8 + 8]);
+            slot.body[HEADER_WORDS + i].store(u64::from_le_bytes(bytes), Ordering::Relaxed);
         }
 
         // The store that publishes, and it is the last one.
@@ -314,10 +337,9 @@ impl Shard {
             return None;
         }
 
-        // SAFETY: the slot is live for the whole of this read, nothing here
-        // forms a reference to the body, and `at_ns` is its first field — the
-        // `offset_of` assertion above is what says so.
-        let at_ns: u64 = unsafe { core::ptr::read_volatile(slot.body.get().cast::<u64>()) };
+        // `at_ns` is the body's first word, which is the whole reason a merge
+        // can hold a candidate without holding a record.
+        let at_ns = slot.body[0].load(Ordering::Relaxed);
 
         fence(Ordering::Acquire);
         if slot.seq.load(Ordering::Relaxed) != seq {
@@ -353,16 +375,35 @@ impl Shard {
             return None;
         }
 
-        // **A volatile byte copy, and that is a requirement rather than a
-        // style.** Reading 248 bytes a writer may concurrently be storing into
-        // is a data race in Rust's model whatever x86 does about it: the
-        // re-check below makes the *result* sound and does not make the
-        // *access* defined. Loom does not see this and neither does any guest
-        // test.
+        // **Word by word, and only as many words as the record claims.** A
+        // writer may be storing into these at this very moment — that is what
+        // the re-check below is for — and the loads are atomic so that the race
+        // is not one: the re-check discards a torn *result*, and only an atomic
+        // access makes the read itself defined.
         //
-        // SAFETY: the slot is live for the whole of this read, and nothing here
-        // forms a reference to the body.
-        let body: Body = unsafe { core::ptr::read_volatile(slot.body.get()) };
+        // `len` came out of a word that may be mid-recycle, so it is clamped
+        // before it decides anything. The worst a garbage value can do is make
+        // this read the whole message area, which is in bounds and is then
+        // thrown away.
+        let identity = slot.body[1].load(Ordering::Relaxed);
+        let shape = slot.body[2].load(Ordering::Relaxed);
+        let len = ((shape >> 16) as u16).min(MSG_BYTES as u16);
+        let mut record = LogRecord {
+            seq,
+            at_ns: slot.body[0].load(Ordering::Relaxed),
+            pid: identity as u32,
+            tid: (identity >> 32) as u32,
+            cpu: shape as u16,
+            len,
+            elided: (shape >> 32) as u16,
+            level: (shape >> 48) as u8,
+            flags: (shape >> 56) as u8,
+            msg: [0; MAX_RECORD_MESSAGE],
+        };
+        for i in 0..msg_words(len) {
+            let bytes = slot.body[HEADER_WORDS + i].load(Ordering::Relaxed).to_le_bytes();
+            record.msg[i * 8..i * 8 + 8].copy_from_slice(&bytes);
+        }
 
         // The re-check is total **because a writer marks the slot before it
         // touches the body**: any writer that started during the copy moved
@@ -373,26 +414,16 @@ impl Shard {
             return None;
         }
 
-        Some(LogRecord {
-            seq,
-            at_ns: body.at_ns,
-            pid: body.pid,
-            tid: body.tid,
-            cpu: body.cpu,
-            len: body.len,
-            elided: body.elided,
-            level: body.level,
-            flags: body.flags,
-            msg: body.msg,
-        })
+        Some(record)
     }
 }
 
-// SAFETY: `head` is written only by the owning CPU and read atomically by every
-// other; a body is written only by the CPU that reserved its sequence number,
-// and read only through `read`, whose exact-equality re-check rejects any body
-// a writer has begun to overwrite.
-unsafe impl Sync for Shard {}
+// A `Shard` is `Sync` because every word in it is an `AtomicU64`, and there is
+// deliberately no `unsafe impl` here saying so on the type's behalf. Until
+// 2026-08-14 there was one, and it stood in for the body's `UnsafeCell` — a
+// hand-written claim that a non-atomic write racing a `read_volatile` was
+// somebody's problem rather than undefined behaviour. The words are what make
+// the claim true, so the compiler makes it instead.
 
 /// Is a reader parked on this machine's records?
 ///

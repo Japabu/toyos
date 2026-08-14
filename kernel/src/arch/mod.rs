@@ -24,8 +24,10 @@ pub mod tlb;
 /// slot body.
 ///
 /// The bracket is deliberately narrower than formatting: it covers only the
-/// shard pointer and identity reads, the unlocked `xadd`, and the 248-byte body
-/// publication. It takes no lock and performs no locked read-modify-write.
+/// shard pointer and identity reads, the unlocked `xadd`, and the body
+/// publication — three identity words plus the message's own `ceil(len/8)`, at
+/// most 1,016 bytes and in practice nine words. It takes no lock and performs
+/// no locked read-modify-write.
 #[must_use = "dropping the log commit guard reopens interrupts and single-step traps"]
 pub(crate) struct LogCommitGuard {
     rflags: u64,
