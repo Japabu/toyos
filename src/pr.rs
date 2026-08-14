@@ -90,7 +90,7 @@ pub fn dispatch_retired_land() {
          the `gh` command that opens the pull request\n\
          [land]   cargo run -- --sync    fast-forward this machine's `main` to origin/main\n\
          [land]\n\
-         [land] specs/worktrees.md §5 is the protocol."
+         [land] CLAUDE.md's workflow section is the protocol."
     );
     std::process::exit(1);
 }
@@ -324,7 +324,7 @@ fn merge_base_into_branch(root: &Path, branch: &str) -> Result<String, String> {
                 "{branch}: merged main {base} before the pull request\n\n\
                  The required checks are strict, so GitHub refuses the merge button until this \
                  branch contains main — which also makes the checks that run on this head checks \
-                 on the merged result (specs/worktrees.md §5).\n"
+                 on the merged result.\n"
             );
             let file = root.join(format!("target/pr-merge-{}.txt", std::process::id()));
             fs::create_dir_all(root.join("target"))

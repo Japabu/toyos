@@ -212,8 +212,8 @@ pub fn artifact(root: &Path) -> Guard {
 
 /// The integration lock: one process at a time moves this host's `main`.
 ///
-/// It used to hold a whole landing — lock, merge, gate, fast-forward
-/// (`specs/worktrees.md` §5). GitHub does the merging now, so what is left on
+/// It used to hold a whole landing — lock, merge, gate, fast-forward.
+/// GitHub does the merging now, so what is left on
 /// this side is `--sync` fast-forwarding the primary checkout onto
 /// `origin/main`, and that is still a tree somebody may be building in.
 ///
