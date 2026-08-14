@@ -1,10 +1,153 @@
+use core::fmt::{self, Display, Write};
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use alloc::boxed::Box;
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
+use toyos_abi::log::MAX_RECORD_MESSAGE;
 
 use crate::process::PageAlloc;
+
+/// What is left of a record's message once a backtrace frame's own text has
+/// taken its share.
+///
+/// A frame is `    {addr:#x}  {symbol}+{offset:#x}`: four spaces, an address of
+/// at most eighteen characters, two spaces, a `+` and an offset of at most
+/// eighteen more. 64 is that with room to spare, and spare is the right
+/// direction to be wrong in — a symbol a byte over this loses a byte from its
+/// middle, where a *line* a byte over the record's bound loses its tail.
+const FRAME_OVERHEAD: usize = 64;
+const SYMBOL_BUDGET: usize = MAX_RECORD_MESSAGE - FRAME_OVERHEAD;
+
+/// How much of the budget the head keeps; [`SYMBOL_TAIL`] is the rest.
+///
+/// An even split, because a backtrace with only one end of a name in it names
+/// nothing either way: the head is the crate and the module path, the tail is
+/// the function, and `screen_late_panic` asserts on the tail for exactly that
+/// reason.
+const SYMBOL_HEAD: usize = SYMBOL_BUDGET / 2;
+const SYMBOL_TAIL: usize = SYMBOL_BUDGET - SYMBOL_HEAD;
+
+/// A demangled symbol, rendered head-and-tail when it is wider than a record
+/// can carry.
+///
+/// **No bound on the record fixes an unbounded symbol.** A demangled Rust name
+/// is bounded by nothing the kernel controls — `late_panic::Nest` is a generic
+/// nested in itself and nothing stops it being nested again — so
+/// [`MAX_RECORD_MESSAGE`] can only be raised until the *ordinary* line fits,
+/// which is what 992 is. What is left is to decide which bytes of an over-wide
+/// name survive, and the answer is both ends. Truncation keeps the head and
+/// drops the function, which is the half a backtrace is read for.
+///
+/// This is a producer's decision and not a reader's: the record then holds a
+/// whole message, so `elided` still means what the ABI says it means and every
+/// consumer renders one thing. The marker is ASCII because the panel's font is
+/// codepoints 0x20..=0x7E and the one reader this line has on the machine it
+/// matters on is looking at that panel.
+///
+/// `specs/issues/diagnostics/a-record-cannot-hold-a-demangled-frame.md` was the
+/// entry and carries the ruling.
+struct Elided<D>(D);
+
+impl<D: Display> Display for Elided<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut count = Count(0);
+        // Infallible: `Count` never fails, so this measures rather than renders.
+        let _ = write!(count, "{:#}", self.0);
+        if count.0 <= SYMBOL_BUDGET {
+            return write!(f, "{:#}", self.0);
+        }
+        let mut both = HeadTail { out: f, seen: 0, shown: 0, tail: [0; SYMBOL_TAIL], filled: 0 };
+        write!(both, "{:#}", self.0)?;
+        both.finish()
+    }
+}
+
+/// A `fmt::Write` that measures and writes nowhere.
+struct Count(usize);
+
+impl Write for Count {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.0 = self.0.saturating_add(s.len());
+        Ok(())
+    }
+}
+
+/// Passes a name's head straight through and keeps its tail in a fixed buffer,
+/// so what an over-wide name loses is its middle.
+struct HeadTail<'a, 'b> {
+    out: &'a mut fmt::Formatter<'b>,
+    /// Bytes the name has produced.
+    seen: usize,
+    /// Bytes of head already written out. Below [`SYMBOL_HEAD`] by up to three
+    /// when the bound falls inside a character.
+    shown: usize,
+    tail: [u8; SYMBOL_TAIL],
+    filled: usize,
+}
+
+impl HeadTail<'_, '_> {
+    /// Keep the last [`SYMBOL_TAIL`] bytes, contiguously.
+    ///
+    /// A ring would save the shifting and cost the seam: a character split
+    /// across the wrap has no `&str` to be part of. The shifts are a few
+    /// hundred bytes per chunk on a path that is already formatting.
+    fn keep_tail(&mut self, bytes: &[u8]) {
+        if let Some(last) = bytes.len().checked_sub(SYMBOL_TAIL) {
+            self.tail.copy_from_slice(&bytes[last..]);
+            self.filled = SYMBOL_TAIL;
+            return;
+        }
+        let drop = (self.filled + bytes.len()).saturating_sub(SYMBOL_TAIL);
+        if drop > 0 {
+            self.tail.copy_within(drop..self.filled, 0);
+            self.filled -= drop;
+        }
+        let end = self.filled + bytes.len();
+        if let Some(slot) = self.tail.get_mut(self.filled..end) {
+            slot.copy_from_slice(bytes);
+            self.filled = end;
+        }
+    }
+
+    fn finish(self) -> fmt::Result {
+        // The tail's first byte is wherever the shifting left it, which can be
+        // inside a character; at most three bytes of one can be.
+        let mut tail: &[u8] = self.tail.get(..self.filled).unwrap_or(&[]);
+        for _ in 0..3 {
+            if core::str::from_utf8(tail).is_ok() {
+                break;
+            }
+            tail = tail.get(1..).unwrap_or(&[]);
+        }
+        let text = core::str::from_utf8(tail).unwrap_or("");
+        let elided = self.seen.saturating_sub(self.shown).saturating_sub(text.len());
+        write!(self.out, "...[{elided} bytes elided]...{text}")
+    }
+}
+
+impl Write for HeadTail<'_, '_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let bytes = s.as_bytes();
+        if self.shown == self.seen && self.seen < SYMBOL_HEAD {
+            let room = SYMBOL_HEAD - self.seen;
+            if bytes.len() <= room {
+                self.out.write_str(s)?;
+                self.shown += bytes.len();
+            } else {
+                let mut fit = room;
+                while fit > 0 && !s.is_char_boundary(fit) {
+                    fit -= 1;
+                }
+                self.out.write_str(s.get(..fit).unwrap_or(""))?;
+                self.shown += fit;
+            }
+        }
+        self.seen += bytes.len();
+        self.keep_tail(bytes);
+        Ok(())
+    }
+}
 
 /// Zero-allocation symbol table. Points directly into ELF sections in memory.
 /// Resolution is a linear scan over raw Elf64_Sym entries — O(n) but lock-free,
@@ -254,7 +397,7 @@ fn log_kernel(addr: u64, lookup: impl FnOnce(&SymbolTable) -> Option<(&str, u64)
     }
     let table = unsafe { &*ptr };
     if let Some((raw, offset)) = lookup(table) {
-        log!("    {:#x}  {:#}+{:#x}", addr, rustc_demangle::demangle(raw), offset);
+        log!("    {:#x}  {}+{:#x}", addr, Elided(rustc_demangle::demangle(raw)), offset);
         Some(offset)
     } else {
         let kb = KERNEL_BASE.load(Ordering::Relaxed);
@@ -281,7 +424,7 @@ pub fn resolve_user_return(syms: &SymbolTable, return_addr: u64) -> bool {
 
 fn log_user(syms: &SymbolTable, addr: u64, resolved: Option<(&str, u64)>) -> bool {
     if let Some((name, offset)) = resolved {
-        log!("    {:#x}  {:#}+{:#x}", addr, rustc_demangle::demangle(name), offset);
+        log!("    {:#x}  {}+{:#x}", addr, Elided(rustc_demangle::demangle(name)), offset);
         true
     } else if syms.is_valid_user_addr(addr) {
         let base_offset = addr.saturating_sub(syms.prog_base());

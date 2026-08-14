@@ -30,6 +30,16 @@ loom = "0.7"
 # so it compiles into the model unchanged.
 toyos-abi = { path = "../toyos-abi" }
 
+# **The models are compiled with optimisation, and that is a stack decision.**
+# `generator`, which loom's coroutines are built on, gives each one 32 KiB —
+# and a `LogRecord` is a kilobyte, so a debug build's per-temporary copies of a
+# 4,416-byte `Shard` and the records that go through it overflow it before the
+# first assertion. Nothing loom checks depends on the optimisation level: its
+# atomics and cells are ordinary types whose instrumentation survives inlining,
+# and the schedule exploration is loom's own.
+[profile.test]
+opt-level = 2
+
 [lib]
 path = "src/lib.rs"
 # The models are the test targets; loom atomics outside a `loom::model` panic,
