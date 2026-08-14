@@ -1,5 +1,5 @@
 ---
-status: open
+status: assigned
 kind: defect
 opened: 2026-08-11
 ---
@@ -60,6 +60,14 @@ tail is gone for real.
    console.** That is what L1 does by accident of still having a byte ring, and
    it cannot survive L3 deleting it.
 
-**Owner's call, and it is due before L2.** The recommendation is 3 for the
-backtrace specifically plus 1 sized to the measured p999 if the memory is
-acceptable, because 2 is the property this whole design is built to avoid.
+**Ruled 2026-08-14** (owner delegated the call to the orchestrator with
+"best and most sustainable"): options 3 and 1 together, as recommended.
+A backtrace frame renders its symbol head-and-tail with the middle
+elided, at the producer — no fixed bound fixes an unbounded symbol, and
+both ends are what `check_wrap` asserts matter. `MAX_RECORD_MESSAGE`
+rises 224 → 896, the smallest slot multiple above the measured maximum
+(863), so every observed ordinary line fits whole; the ~2.5 MiB cost at
+eight CPUs is bought deliberately. The bump is ABI and lands alone
+ahead of L2; the elision is L2's. Option 2 stays rejected — a
+continuation flag puts "is this record whole?" back into every reader,
+the property the design exists to avoid.
