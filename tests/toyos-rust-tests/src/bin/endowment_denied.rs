@@ -2,7 +2,7 @@
 //! place to ask.
 //!
 //! **The test estate is the one place least authority is not enforced** — a test
-//! binary holds what `test-runner` holds, because the 90 guest binaries are not
+//! binary holds what `test-runner` holds, because the guest binaries are not
 //! `[programs]` keys and no manifest row can name what any of them needs
 //! (`specs/capability-endowment-spec.md` §4). This binary is where least
 //! authority *is* asserted, and it works because it builds its own namespaces

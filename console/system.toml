@@ -5,7 +5,7 @@
 # boot checkpoint stays on the glass — which is the only thing that works on a
 # machine that wedges before userland, and is the answer to exactly one
 # question. This image answers the rest by being asked them: `/bin/console`
-# claims the screen, seeds its scrollback from `/boot/toyos/kernel.log` so the
+# claims the screen, seeds its scrollback from the newest `/log` files so the
 # boot log is not lost with the checkpoint, and puts a prompt underneath.
 #
 # Deliberately three programs. Every extra one is something that can fail
