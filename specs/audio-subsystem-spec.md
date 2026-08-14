@@ -23,7 +23,29 @@
    carried by the scheduler's real-time band and pipe priority inheritance
    (scheduler spec).
 
-## 2. Timing
+## 2. Architecture and timing
+
+```
+┌──────────┐  ┌──────────┐  ┌──────────┐
+│ client A │  │ client B │  │ client C │   each with its own rate,
+└────┬─────┘  └────┬─────┘  └────┬─────┘   channels and format
+     │ shared ring + signal pipe (§3, §4) │
+     ▼             ▼             ▼
+┌──────────────────────────────────────────┐
+│                  soundd                  │  owns the device clock;
+│   converts · mixes · dithers · submits   │  signals, then reads (§4)
+└─────────────────────┬────────────────────┘
+                      │ kernel audio interface (§8)
+                      ▼
+┌──────────────────────────────────────────┐
+│                  kernel                  │  buffer memory, submit,
+│                                          │  timestamped completions
+└─────────────────────┬────────────────────┘
+                      ▼
+               ┌──────────────┐
+               │ audio device │   one native configuration
+               └──────────────┘
+```
 
 The device runs at one native configuration — sample rate, channels, format,
 period size, buffer count — negotiated once from its capabilities. The
@@ -73,6 +95,15 @@ neither side ever locks.
 keeps up can cover any stall the pipeline itself can absorb.
 
 ## 4. The cycle
+
+```
+time ──────────────────────────────────────────────────────────►
+
+soundd:  wake ── signal clients ── wait ── consume ── mix ── submit ── sleep
+                    │                ▲
+                    │                │ fills happen inside soundd's wait,
+client:             └── wake ── fill slots ── block      under the lent band
+```
 
 Once per period, in order:
 
