@@ -1008,11 +1008,21 @@ same section as the wrong-CPU reservation §2.3a exists to fix.
 /// uncommitted record. For klogd and for SYS_LOG_READ.
 pub fn drain_ordered(cursor: &mut Cursor, out: &mut impl RecordSink) -> usize;
 
-/// Every committed record in the window, merged by `at_ns`, skipping
-/// uncommitted slots. Takes no lock and never blocks. For the panic console and
-/// for Ctrl+Alt+D.
-pub fn snapshot_committed(from: Instant, to: Instant, out: &mut impl RecordSink) -> usize;
+/// Every committed record in the window, **newest first**, merged by `at_ns`,
+/// skipping uncommitted slots. Takes no lock and never blocks. For the panic
+/// console and for Ctrl+Alt+D.
+pub fn snapshot_committed(from: u64, to: u64, out: &mut impl RecordSink) -> usize;
 ```
+
+**Newest first, and it is not a preference.** Both callers have a fixed buffer
+and both show the *end* of what they hold, so a reader that filled from the
+oldest end would spend a panel on the boot and drop the panic. It is also what
+bounds the work by the buffer rather than by the ring: the sink answers "full"
+and the walk stops, where an oldest-first reader has to copy every live record
+out of every shard before it knows which ones it wanted. The bracket is two
+`nanos_since_boot` readings rather than an `Instant` type, because the kernel
+has no such type and inventing one for two call sites is a type built for a
+plan.
 
 **Why the second exists, and it is not a mode flag.** A nested writer — a #DF or
 a #MC logging while an ordinary record was mid-write on the same CPU — commits
@@ -1832,9 +1842,9 @@ and stays true.
 ### 6.5 Ctrl+Alt+D
 
 `log_ring::Mark` — a byte position in a single stream — has no meaning across
-shards. It becomes an `Instant`: `dump::request` takes `clock::nanos_since_boot()`
-before and after, and `panic_console::paint_report(from, to)` calls
-`snapshot_committed(from, to)`. That is **better** than today's bracket, not a
+shards. It becomes a pair of timestamps: `dump::request` takes
+`clock::nanos_since_boot()` before and after, and
+`panic_console::paint_report(from, to)` calls `snapshot_committed(from, to)`. That is **better** than today's bracket, not a
 concession: the dump's own records are stamped by the same clock, so the bracket
 is exact rather than being a byte range that a concurrent writer can widen.
 
@@ -1897,7 +1907,7 @@ deletion below is what makes it cheaper to keep.
 |---|---|---|
 | `panic_console` fatal report | `peek_tail` on a byte ring, tolerating tears | `snapshot_committed`, detecting them |
 | `boot_checkpoint` (6 phase repaints) | `peek_tail` with IRQs on, "a torn line on screen, nothing more" | `snapshot_committed`; a torn record is skipped, so the panel stops showing garbled lines |
-| Ctrl+Alt+D | two byte `Mark`s | two `Instant`s, §6.5 |
+| Ctrl+Alt+D | two byte `Mark`s | two `nanos_since_boot` readings, §6.5 |
 | `dump_nmi_probe` | unchanged | unchanged — **the NMI handler still must not log**, and the reason is the same shape: it would reenter its own CPU's shard. A grep gate asserts `arch/idt/nmi.rs` contains no `log!` |
 | `/bin/console` scrollback seeding | reads the newest `/log` files | unchanged; the files are logd's now and their names and format do not change. With `logread` it also gains this boot's records live, off the cursor (§5.1a) |
 | the harness's console capture | `is_kernel_line`, `Serial::interleaved` | both stay; `interleaved` becomes an assertion where it is safe to be one, §8.1 |
@@ -1927,15 +1937,20 @@ Gates that must be green throughout, per compl §17: `blocked_dump`,
 
 ### 8.1 Code, by name
 
-**`kernel/src/drivers/log_ring.rs` — the whole file, 549 lines.** With it:
+**`kernel/src/drivers/log_ring.rs` — the whole file.** With it:
 `LogRing`, `RingCell`, `RingGuard` and its `cli` bracket, `RING_LOCKED` and the
-per-record `compare_exchange_weak`, `WRITTEN`, `Mark`, `mark`, `OWED`,
+per-record `compare_exchange_weak`, `OWED`,
 `has_pending`, `SERIAL_SINK`, `set_serial_sink`, `FILE_SINK`, `FILE_OWED`,
 `FILE_DROPPED`, `file_has_pending`, `enable_file_sink`, `disable_file_sink`,
 `drain_to_file`, `take_file_drops`, `write_chunk`, `write_chunk_blocking`,
 `drain_to_serial`, `drain_chunk_to_serial`, `report_dropped`, `DROP_MARKER_MAX`,
-`take_drop_marker`, `DROPPED_BYTES`, `drain_unlocked`, `peek_tail`, `peek_range`,
+`take_drop_marker`, `DROPPED_BYTES`, `drain_unlocked`,
 `DRAIN_CHUNK`.
+
+**L2 already took the reading half**, because the panel stopped calling it
+there: `Mark`, `mark`, `peek_tail`, `peek_range` and the `WRITTEN` counter they
+existed for are gone, which also took one store out of `append` — the file was
+549 lines and is 465.
 
 **`kernel/src/log_file.rs` — the whole file, 565 lines.** With it: `Sink`,
 `SINK` and its `Lock`, `IN_FLUSH`, `flush_in_progress`, `install`, `destination`,
@@ -2345,8 +2360,8 @@ rebase, never amend.
 | **L0** | merge `origin/main` (**post-endowment, and that is the whole of it** — completions lands after this branch, §12). Re-derive every number in this spec against the merged tree; re-check §12.5's endowment rows against the merged *code* and not only its plan; compute the first clean syscall number. **Nothing about the completion core is confirmable here and L0 must not wait on it** — §2.6a needs nothing from it. **Done 2026-08-11 against `f1724a9`; §0.0 is the walk** | suite green; §0.0 accounts for every moved row; the baselines of §9.3 recorded here |
 | **L-ABI** | **its own branch off `main`, landed before L1** (§11). `toyos-abi/src/log.rs` — `LogRecord`, `Level`, `LogCursor` with its clamped `durable`, `MAX_LOG_SHARDS`, the two layout `const` assertions and the `Display` of §3.3; `SYS_LOG_READ = 114`; `Rights::LOG`; the `toyos` SDK wrapper. **No kernel dispatch**: there is no shard to read until L1, so the number falls to the dispatch's default and answers `InvalidArgument`, which is what an unassigned number answers | `cargo test` in `toyos-abi/`: the layout asserts, and the `Display` rendering a known record byte for byte |
 | **L1** | `kernel/src/log/`: `Slot` over L-ABI's `LogRecord` and `Level`, `Shard`, `emit` with §2.3a's bracket, `log!`/`alert!`/`boot_phase!`, the seven `alert!` conversions **carrying the level with their text unchanged** (below). Wired **behind** the existing byte ring — every `emit` also does today's `write_chunk`, so nothing observable changes. The AP shard in `alloc_percpu` (§2.2) | `kernel-loom/tests/log_record.rs` (W1, W2, W4); host-fast `log_zeroed_init`; the full suite indistinguishable from `main`'s; the boot A/B of §9.6. W2b's CPU-flags negative arrives with `log_nested_emit` at L4 |
-| **L2** | the two readers; `panic_console`, `boot_checkpoint` and `sched::dump` re-pointed at records and at `Level`; **the `!!!` sentinel deleted from the seven `alert!` texts and from the ~20 assertions that read it**; the `KernelArgs` `{:?}` site split into several records; `Mark` → `Instant` | `screen_panic_muted`, `screen_fatal_halt`, `screen_fatal_halt_composited`, `blocked_dump`, `screen_blocked_dump`, `dump_nmi_probe`, `screen_console_*` all green |
-| **L3** | `Drain::{Inline,Thread}`; **the kernel-thread machinery for one thread** (§4.3) — trampoline, kernel-address-space `ProcessObject`, `driver::spawn`, dump naming, the recoverable-panic predicate with `klogd`'s non-recoverable row; `klogd`'s body and §2.6a's wake (`signal_after_commit`/`arm_waiter`, the IRQ-off `PreemptGuard` witness, `wake_direct`, the park-lot park); `panic_flush`/`flush_final` on records; `log_file::poll` re-pointed at a `drain_ordered` cursor so the file sink survives; **`object/ops.rs:469`'s console arm re-pointed straight at `BackendGuard`** (§8.1) so the chunk builds. **Delete `log_ring.rs` whole**, `SerialWriter`, `drain_serial` and the idle loop's serial statement; **delete the `:523` pre-`hlt` condition** | `kernel-loom/tests/log_wake.rs` (W3, with its negative case); `pre_idle_wedge_speaks`; the `--slow-usb` A/B unmoved (nothing about the disk has changed yet); §9.6's `Drain::Inline` measurement and the fence's A/B |
+| **L2** | `snapshot_committed`; `panic_console`, `boot_checkpoint` and `sched::dump` re-pointed at records and at `Level`; **the `!!!` sentinel deleted from the seven `alert!` texts and from the ~20 assertions that read it**; the `KernelArgs` `{:?}` site split into several records; `Mark` → a pair of instants; the backtrace producer's head-and-tail elision, and `nmi_does_not_log`'s two clauses with it | `screen_panic_muted`, `screen_fatal_halt`, `screen_fatal_halt_composited`, `blocked_dump`, `screen_blocked_dump`, `dump_nmi_probe`, `screen_console_*` all green; `screen_late_panic`, whose stimulus is a symbol wider than any grid |
+| **L3** | `drain_ordered`, with the first caller that streams; `Drain::{Inline,Thread}`; **the kernel-thread machinery for one thread** (§4.3) — trampoline, kernel-address-space `ProcessObject`, `driver::spawn`, dump naming, the recoverable-panic predicate with `klogd`'s non-recoverable row; `klogd`'s body and §2.6a's wake (`signal_after_commit`/`arm_waiter`, the IRQ-off `PreemptGuard` witness, `wake_direct`, the park-lot park); `panic_flush`/`flush_final` on records; `log_file::poll` re-pointed at a `drain_ordered` cursor so the file sink survives; **`object/ops.rs:469`'s console arm re-pointed straight at `BackendGuard`** (§8.1) so the chunk builds. **Delete `log_ring.rs` whole**, `SerialWriter`, `drain_serial` and the idle loop's serial statement; **delete the `:523` pre-`hlt` condition** | `kernel-loom/tests/log_wake.rs` (W3, with its negative case); `pre_idle_wedge_speaks`; the `--slow-usb` A/B unmoved (nothing about the disk has changed yet); §9.6's `Drain::Inline` measurement and the fence's A/B |
 | **L4** | the kernel's half of L-ABI, which touches no sysroot source: the `SYS_LOG_READ` dispatch over `drain_ordered`, `Source::Log` and its watcher static (§3.2), `logread` in `toyos_manifest`'s `SYSCAP_RIGHTS` and on `test-runner`'s row in the six test configs that have one | `test-runner` reads its own kernel log and §9.1's conservation law holds across the syscall |
 | **L5** | one `ConsoleObject` per endowment over one backend, its line buffer, `Console` losing `DUP`; the ANSI strip moves; `MAX_CONSOLE_LINE` | `console_line_atomicity`; `console-unbuffered` reds both its clauses; `one_console_holder` |
 | **L6** | `/bin/logd`: the program, **its row in all eleven manifests** (§5.1a) including `diag/`'s and its restated comment, the protocol, rotation, retention, per-client backlog, the give-up policy on today's live 2 s transport bound (§5.4); **`SYS_FSYNC`'s device flush, outright — there is no C12 to hand it to (§12.4)**. **Delete `log_file.rs` whole**, `flush_log_file_if_affordable` and everything in §8.1's `driver.rs` list; `wait_for_log_file` re-pointed at `LOG_DURABLE_NS`, **including `apic.rs:146`'s comment and its kick loop, which name the idle loop's `log_file::poll`**; §6.3's shutdown | `kernel_log_file` re-pointed and green mid-run and after shutdown; `log_is_durable_after_fsync`; `screen_fatal_halt_composited`'s `/log` half green; `logd_gone`; `shutdown_last_line`; `idle_loop_is_the_declared_body`; `log-writes-the-file` and `log-trusts-durable` red |
@@ -2357,6 +2372,12 @@ rebase, never amend.
 
 **Dependencies.** L-ABI → L1. L1 → L2, L3, L4. L3 and L4 → L6. L5 → L7. L6 → L7.
 L8 after L7. L9 last. L10 independent of everything after L4.
+
+**One row moved at L2.** `drain_ordered` is **L3's, not L2's.** L2's callers
+are the panic surface and the boot checkpoint, and both want
+`snapshot_committed`; the streaming reader's first caller is `klogd`, which is
+L3's. Delivering it at L2 would be a function nothing calls, which is dead code
+by the tree's own rule and a build warning by its build.
 
 **Two rows moved at L1, and each is a thing this table had in the wrong chunk.**
 
