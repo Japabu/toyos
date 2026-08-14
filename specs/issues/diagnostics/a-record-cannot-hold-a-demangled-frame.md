@@ -65,9 +65,11 @@ tail is gone for real.
 A backtrace frame renders its symbol head-and-tail with the middle
 elided, at the producer — no fixed bound fixes an unbounded symbol, and
 both ends are what `check_wrap` asserts matter. `MAX_RECORD_MESSAGE`
-rises 224 → 896, the smallest slot multiple above the measured maximum
-(863), so every observed ordinary line fits whole; the ~2.5 MiB cost at
-eight CPUs is bought deliberately. The bump is ABI and lands alone
+rises 224 → 992, keeping `RECORD_BYTES` a power of two (256 → 1024,
+the shift-indexing invariant): the next power-of-two record that holds
+the measured maximum (863), so every observed ordinary line fits
+whole; the +3 MiB at eight CPUs is bought deliberately. The bump is
+ABI and lands alone
 ahead of L2; the elision is L2's. Option 2 stays rejected — a
 continuation flag puts "is this record whole?" back into every reader,
 the property the design exists to avoid.
