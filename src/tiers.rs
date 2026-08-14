@@ -84,8 +84,8 @@ pub enum Why {
     /// a member cannot be moved out of it — keeping a cheap rider in the fast
     /// tier would put the whole boot back in it.
     ///
-    /// This is the collateral the record has to name: six tests here cost 11.3 s
-    /// between them and go dark with their two slow carrier boots.
+    /// This is the collateral the record has to name: the riders here go dark
+    /// with the slow carrier boot they share.
     RidesTheBootOf(&'static str),
     /// **Nightly by classification, not by cost** — its verdict or duration is
     /// anchored to real time (`FAST_CEILING_MS`'s 2026-08-12 boundary): it plays

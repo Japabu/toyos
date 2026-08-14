@@ -8,10 +8,10 @@ A production-grade operating system built from scratch in Rust. Modern x86-64 ha
 
 | | |
 |---|---|
-| `kernel/CLAUDE.md` | memory, processes, scheduling, filesystem, storage, input, USB, PCI, faults, the panic console |
-| `userland/CLAUDE.md` | daemons, IPC, the compositor and display, surfaces, the POSIX layer |
-| `tests/CLAUDE.md` | the harness, machine shapes, gate A, expected failures |
-| `src/CLAUDE.md` | the build system, boot modes, the build and guest locks |
+| `kernel/CLAUDE.md` | which spec owns what, and the caveats that bite kernel work |
+| `userland/CLAUDE.md` | the server doctrine, and the caveats that bite userland work |
+| `tests/CLAUDE.md` | the caveats that bite the harness; the law is `specs/testing-strategy.md` |
+| `src/CLAUDE.md` | boot modes, the locks and slots, worktrees — the operational file |
 | `specs/testing-strategy.md` | the testing law: instruments, tiers, the PR gate, the nightly |
 | `specs/forks.md` | the ecosystem fork estate and the std library rules |
 | `specs/debugging.md` | LLDB, QMP, frozen guests, audio verification |

@@ -236,8 +236,8 @@ jobs:
             $SUITE_TIER_ARGS 2>&1 \
             | tee /tmp/suite.log
 
-      # `cargo test` runs several binaries and the last `test result:` line is
-      # the doc-tests'; the line grepped here is the suite's own, the one that
+      # `cargo test` runs several binaries and each prints a `test result:`
+      # line; the line grepped here is the suite's own, the one that
       # counts a total and names any declared `EXPECTED_FAILURES`. The
       # `ALONE:` verdicts say whether a re-run tells a reader anything, so they
       # go in the summary beside the count rather than requiring
