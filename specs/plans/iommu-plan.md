@@ -1,9 +1,8 @@
 # The IOMMU stages that are left
 
-`specs/iommu-spec.md` is the subsystem — what the unit is for, the portable
-seam, discovery, the DMA and interrupt-remapping rules, faults, scopes and
-reclaim. This file is the order the rest of it gets built in, and it dies when
-I5 lands.
+`specs/iommu-spec.md` is the law — requirements, the boot refusal,
+translation, interrupt remapping, handoff refusals, reclaim, faults. This
+file is the order the rest of it gets built in, and it dies when I5 lands.
 
 ## Where this stands
 
@@ -109,3 +108,24 @@ The stages run in their numbered order, and all three are independent of the
 capability-handles migration. I3 lands alone because of what it can break; I4
 is what the first userspace driver needs and I3 is what makes handing it one
 safe, so neither is skippable before I5.
+
+## Risks the stages carry
+
+- **The interrupt-remapping cutover can black-screen the machine**, and its
+  failure mode is "nothing works". Land it alone, against a suite where every
+  input, storage and audio test already depends on an interrupt.
+- **Whether the harness's virtio devices are behind the unit is unknown.**
+  QEMU bypasses the unit for a virtio device unless it is created with
+  `iommu_platform=on`, which requires the guest to negotiate
+  `VIRTIO_F_ACCESS_PLATFORM` — this kernel's virtio drivers do not. Under
+  identity mapping the two are indistinguishable, so both isolation gates run
+  on ordinary emulated PCI functions. The negotiation belongs to whichever
+  stage first needs a virtio device translated.
+- **Isolation scopes and reserved regions are modelled, not measured.** QEMU's
+  topology is flat and publishes no RMRR; the T14 gives the first real answer,
+  and it may refuse a device this project wants in userspace.
+- **Cost is unmeasurable in the harness.** The 2× bar is answerable only on
+  hardware, in a same-session A/B.
+- **QEMU cannot certify**: cache-snooping walks, real access-control
+  enforcement, `CAP.CM = 0` behavior, mid-DMA function reset on a real device.
+  Each lands on the metal checklist with the stage that makes it observable.
