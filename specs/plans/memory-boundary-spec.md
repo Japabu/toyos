@@ -335,7 +335,7 @@ one copy, the same one, with the reference on the kernel side where it is true.
   ring's wrap. The alternative was a staging buffer in `pipe::try_read`, which
   doubles the copy on the IPC path for no property, and the cost of avoiding it
   is that this stage touches `toyos-abi/src` and therefore claims the shared
-  sysroot (`specs/worktrees.md` §3.1). That is the whole reason M1b-2 is two
+  sysroot. That is the whole reason M1b-2 is two
   commits: everything else lands with no claim at all.
 - **Four typed sites became `copy_out`, and each deleted an `unsafe` cast.**
   `SchedInfo`, `ProcessStats`, `FramebufferInfo` and `sys_query_modules`'

@@ -115,8 +115,8 @@ system.toml        What to build and boot
 
 ## Planned work
 
-- `specs/scheduler-core-spec.md` — the ownership-typed scheduler core; five negative gates prove the harnesses have teeth, never weaken one to make a change pass.
-- `specs/iommu-spec.md` + `specs/plans/userspace-drivers-spec.md` — the IOMMU and the userspace drivers it makes safe.
+- `specs/scheduler-core-spec.md` — the ownership-typed scheduler core; nine negative gates prove the harnesses have teeth, never weaken one to make a change pass.
+- `specs/iommu-spec.md` + `specs/plans/iommu-plan.md` + `specs/plans/userspace-drivers-spec.md` — the IOMMU and the userspace drivers it makes safe.
 - `specs/plans/hda-driver-plan.md` — HDA on the T14; the line is who writes an address: soundd never holds a physical address.
 - `specs/plans/iouring-blocking-spec.md` + `specs/plans/blocking-io-plan.md` — io_uring as the only blocking mechanism; a CPU never waits for a device.
 - `specs/plans/metal-boot-plan.md` — the T14 metal track; carries the metal session checklist.

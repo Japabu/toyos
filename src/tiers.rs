@@ -140,8 +140,9 @@ pub const RELEGATED: &[Relegated] = &[
                  spin. A negative gate: without the second boot the first proves only \
                  that the machine works, which it did before the gate existed. What still \
                  runs per pull request: the compute-bound `fault_gates`/`std_unwind`/ \
-                 `std_unwind_so` trio (specs/user-machine-state.md §2, specs/ci-plan.md \
-                 §9.3), ~51 ms riding an existing shared boot, still catches a pending x87 \
+                 `std_unwind_so` trio (specs/user-machine-state.md §2, \
+                 specs/assessments/ci-plan-assessment-2026-08.md §9.3), ~51 ms riding an \
+                 existing shared boot, still catches a pending x87 \
                  control word killing the next process — the one shape that put this \
                  defect on CI in the first place — but proves nothing about a leaked \
                  register value, sustained preservation under scheduling churn, or \

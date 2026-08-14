@@ -184,9 +184,9 @@ const SECOND_LEVEL: &[&str] = &["read-permission", "write-permission", "paging-e
 /// A function whose context entry the kernel deliberately never wrote must
 /// fault on its first transaction, and the fault must name it.
 ///
-/// This is `specs/iommu-spec.md` §9's exit criterion for I2 and the isolation
-/// negative control at the same time, because at this stage they are the same
-/// question. Identity mapping means a translated machine and an untranslated
+/// This is `specs/plans/iommu-plan.md`'s exit criterion for I2 and the
+/// isolation negative control at the same time, because at this stage they are
+/// the same question. Identity mapping means a translated machine and an untranslated
 /// one produce the same result for every device that is *in* the tables, so
 /// the only way to tell the two apart is a device that is not: with the unit
 /// bypassing, or never enabled, or pointed at a context entry naming

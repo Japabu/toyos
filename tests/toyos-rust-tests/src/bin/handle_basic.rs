@@ -1,6 +1,6 @@
 //! What a handle is, before anything is done with one.
 //!
-//! `specs/capability-endowment-spec.md` §8.6 requires this gate and nothing in
+//! `specs/capability-endowment-spec.md` §8 requires this gate and nothing in
 //! the tree was it. Four properties of `HandleTable` that every other gate
 //! assumes and none of them exercises:
 //!

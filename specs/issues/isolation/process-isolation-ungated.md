@@ -30,9 +30,10 @@ the owner named.
 Two answers, and neither is this branch's to pick:
 
 - **A right that does not carry.** A `MAP`-without-`TRANSFER` handle is what
-  `specs/capability-endowment-spec.md` §6.3 already assumes soundd sends, and
-  the rights model cannot express it because sending needs `TRANSFER`. That is a
-  bound on delegation rather than a revocation, and it is the cheaper of the two.
+  soundd would need to send its per-client audio ring un-re-sendable, and
+  `specs/capability-endowment-spec.md` §5 rules it out: sending needs
+  `TRANSFER`, so the rights model cannot express it. That is a bound on
+  delegation rather than a revocation, and it is the cheaper of the two.
 - **Revocation proper**, which `specs/assessments/capability-handles-spec.md` §14.5 rejects
   by name: unmapping a running process's pages is the `gpu::set_resolution`
   hazard — freeing memory a consumer may hold pointers into. A capability system

@@ -341,7 +341,7 @@ const CLAIM_WINDOW: &str = "\
     The window is yours to make small: land the toyos-abi/toyos change on its own commit \
     first, before the work that depends on it. Every other worktree is refused for as long \
     as you hold the sysroot, and holding it for a whole task is what cost ~35 and ~50 \
-    minutes of eight agents' time on 2026-08-07 (specs/worktrees.md §3.2).";
+    minutes of eight agents' time on 2026-08-07.";
 
 fn standing(root: &Path) -> Standing {
     let mut ahead = vec!["diff", "--quiet", "main...HEAD", "--"];
@@ -1382,7 +1382,7 @@ mod tests {
     /// somebody else's landed ABI change read as `Diverged` and could claim —
     /// rebuilding the shared sysroot from sources *older* than main's and
     /// refusing the worktree whose change is already landed. That is the
-    /// 2026-08-04 fight `specs/worktrees.md` §3.2 exists to prevent, arrived at
+    /// 2026-08-04 fight the standing rule exists to prevent, arrived at
     /// from the other direction, and merging is this checkout's whole answer.
     #[test]
     fn a_checkout_behind_main_has_no_standing_to_claim() {

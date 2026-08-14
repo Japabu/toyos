@@ -1537,8 +1537,8 @@ const TONE_MIN_ACTIVE_SECS: f64 = 2.5;
 /// signal path is broken even if technically "active".
 const TONE_MIN_PEAK: i32 = 4000;
 
-/// Recorded per-(test, smp) baselines — the scheduler-core migration's gate A
-/// (specs/scheduler-core-spec.md §11). Two independent instruments per config:
+/// Recorded per-(test, smp) baselines — gate A's thorough tier
+/// (specs/testing-strategy.md §5). Two independent instruments per config:
 /// the wav underrun histogram (`gaps`, keyed by gap length in device periods)
 /// and ceilings on soundd's own counters. The wav is a rare-event detector;
 /// the counters fire on nearly every run and carry the statistical power. Both
@@ -2028,8 +2028,8 @@ fn rate_verdict(
 }
 
 /// Thorough tier — N iterations of all four configs, gating on *rates* and
-/// *distributions* rather than on single outcomes. This is what a
-/// scheduler-migration stage transition must pass (spec §11 gate A).
+/// *distributions* rather than on single outcomes. The nightly runs it
+/// (specs/testing-strategy.md §5).
 ///
 /// Certifies, at N=30 and the measured clean-tree distributions:
 ///   * wake lateness has not shifted by 25% (detected 99.9% of the time) or
@@ -5143,7 +5143,7 @@ const SNAKE_TURNS: usize = 8;
 ///
 /// **The wiring is all this measures, and the wiring is the part nothing else
 /// can.** `src/soundfont.rs`'s host tests say the committed bank covers every
-/// instrument `assets/DOOM1.WAD` selects, and `specs/doom-music-soundfont.md`
+/// instrument `assets/DOOM1.WAD` selects, and `specs/assessments/doom-music-soundfont.md`
 /// §4 says the subset renders bit-exact against the full bank through this same
 /// `mus2mid.c` and this same rustysynth. Neither can say the file got into an
 /// initrd, that doom opened it, or that what came out reached an audio device.
@@ -9176,7 +9176,8 @@ fn run_machine_test(
             // is. On a KVM runner it had not — the last two cycles' bindings were
             // still on their way out when the count was taken, and the test read
             // six of eight as a driver that missed them (run `31246245541`,
-            // `specs/ci-plan.md` §7.3). The assertion is the same one; what
+            // `specs/assessments/ci-plan-assessment-2026-08.md` §7.3). The
+            // assertion is the same one; what
             // changed is that a console behind the guest costs wall clock instead
             // of a verdict.
             let bindings = |text: &str| text.matches("merges as source").count();
@@ -11602,7 +11603,8 @@ fn durations_path() -> std::path::PathBuf {
 /// A machine with no measurement at all prices every test the same, and
 /// [`Shard::keep`]'s LPT then degenerates to round-robin — which is what put 191
 /// of 268 tests on one CI shard and cut it off at its job timeout while another
-/// finished in sixteen minutes (`specs/ci-plan.md` §7.2). Every runner is that
+/// finished in sixteen minutes (`specs/assessments/ci-plan-assessment-2026-08.md`
+/// §7.2). Every runner is that
 /// machine on every push, because a fresh clone has no `target/`.
 ///
 /// Measured on a runner rather than here, deliberately: it is read by the

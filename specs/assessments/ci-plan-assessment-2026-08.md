@@ -1,3 +1,7 @@
+# Continuous integration on GitHub: the assessment behind the plan
+
+> The runs, measurements and defect history CI's operating rules were decided from. Frozen at 2026-08-13: run IDs, durations and counts are as of the dates given in the text and are not maintained. The live rules are `specs/testing-strategy.md`.
+
 # Continuous integration on GitHub
 
 Everything here was measured on GitHub-hosted runners against `Japabu/toyos`

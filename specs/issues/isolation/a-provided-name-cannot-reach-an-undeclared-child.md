@@ -33,7 +33,7 @@ Until 2026-08-10 the SDK refused this case outright (`io::ErrorKind::NotFound`),
 which made every test binary typed at a shell fail to start: `screen_console_scroll`,
 `console_locale_detect`, `desktop_locale_detect` and `desktop_audio_client` all
 stalled on `test_rs_…: not found`. The fallback is unconditional now, which is
-what `specs/capability-endowment-spec.md` §4.5 clause 2 says it should be.
+what `specs/capability-endowment-spec.md` §6 clause 2 says it should be.
 
 ## What closing it would take
 

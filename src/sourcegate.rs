@@ -10,7 +10,7 @@
 //! The exceptions are per file and per line count, so an *added* `forget`
 //! beside a permitted one is a red rather than a silence.
 //!
-//! The second scan is `specs/capability-endowment-spec.md` §8.4: the global
+//! The second scan is `specs/capability-endowment-spec.md` §8: the global
 //! registry's names must be gone from the code, not merely unused. It reads
 //! **code only** — comments and string literals are stripped first — because
 //! the history of what a name used to mean is worth keeping and the
@@ -229,7 +229,7 @@ mod tests {
     }
 
     /// **There is no global registry.** `specs/capability-endowment-spec.md`
-    /// §8.4: a name a process could present and have resolved for it is the
+    /// §8: a name a process could present and have resolved for it is the
     /// thing this architecture deletes, so its identifiers may not be reachable
     /// from any code the guest compiles.
     #[test]

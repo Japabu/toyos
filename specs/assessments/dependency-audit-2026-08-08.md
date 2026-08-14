@@ -141,12 +141,11 @@ workflows do not.
 
 It is a probe workflow (`on: push: branches: ['ci/probe-toolchain']`), so it
 does not run on `main` — but it is committed, and a refused dependency sitting
-in the tree is how it comes back. `specs/ci-plan.md:242,404` discusses
-`fsck.vfat` as an option; the refusal is not recorded there.
+in the tree is how it comes back. `specs/assessments/ci-plan-assessment-2026-08.md`
+§6.1 discusses `fsck.vfat` as an option; the refusal is not recorded there.
 
-**Recommendation.** Delete the word from that workflow and record the refusal in
-`ci-plan.md` so the next reader of §6 does not re-propose it. The CI agent owns
-that file today — this is a note for them, not an edit made here.
+**Recommendation.** Delete the word from that workflow; the refusal is now
+recorded in `specs/issues/build/dosfstools-installed-by-a-workflow.md`.
 
 ## 3. Python is a hard dependency of every toolchain build
 

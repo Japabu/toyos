@@ -199,9 +199,9 @@ fn levels(width: AddressWidth) -> u8 {
 /// the root and how many leaves it took.
 ///
 /// One rule, and it is what makes I2 "behaviour unchanged by construction"
-/// (§9): every address a kernel driver can hand a device today is an address
-/// that device could already reach with no unit on the machine, and `[0, top)`
-/// is that set. It is not isolation and does not pretend to be — isolation
+/// (`specs/plans/iommu-plan.md`): every address a kernel driver can hand a
+/// device today is an address that device could already reach with no unit on
+/// the machine, and `[0, top)` is that set. It is not isolation and does not pretend to be — isolation
 /// arrives with I4's per-driver domains, where an IOVA is *allocated* out of a
 /// space that starts above the top of RAM (§5.3) rather than inherited from a
 /// physical address.
@@ -262,7 +262,7 @@ pub fn bind(tables: &mut Tables, root: Table, stream: StreamId, domain: Table, w
     };
     // Translation type 00: an untranslated request is translated through the
     // second-level table this entry names. The other two encodings are
-    // device-TLB (§11.1 rejects it) and passthrough (unavailable, above).
+    // device-TLB (§10.1 rejects it) and passthrough (unavailable, above).
     let lo = domain.phys | PRESENT;
     let hi = ((KERNEL_DOMAIN as u64) << 8) | (levels(width) as u64 - 2);
     context.write_pair(stream.devfn() as usize, lo, hi);

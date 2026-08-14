@@ -97,8 +97,9 @@ catches.
 
 ## A gate that goes quiet — the evidence
 
-Shape 3 of `specs/spec-staleness-sweep.md`'s taxonomy, which is where the rule
-lives. This is what it looked like in the one instance found so far, and it is
+Shape 3 of the taxonomy in `specs/README.md`'s spec-checking method, which is
+where the rule lives. This is what it looked like in the one instance found
+so far, and it is
 the only one of the three found **prospectively** — before the change that would
 have silenced it exists.
 

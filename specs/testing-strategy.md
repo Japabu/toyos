@@ -92,3 +92,15 @@ anything else.
 - The pull-request gate's wall clock is bounded by its slowest required job.
   Setup cost is attacked before coverage is: a setup cut needs a measurement,
   a coverage cut needs an invariant-level justification.
+
+## 9. CI mechanics
+
+- One declared QEMU version binds every guest instrument. A gate that finds a
+  different version is red; the dev host reports the difference and
+  continues.
+- A shard writes only its own measured durations. One merge step per run is
+  the sole writer of the committed duration profile, and it refuses a test
+  two shards both measured and a shard set with a gap.
+- Publishing the toolchain is idempotent: the release is keyed on the content
+  that compiles into it, a second publisher of the same content is not an
+  error, and a consumer waits for the artifact itself, never for the tag.

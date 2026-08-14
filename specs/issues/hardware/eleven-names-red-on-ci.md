@@ -18,7 +18,7 @@ unmeasured*, whose whole ask was this run. `probe-rate.yml`, run `31258202923`,
 tree `f8f73e1`: **five reps of the exact twelve-shard configuration `ci.yml`
 runs** — same image, same accelerator, same `--jobs 1` — sixty jobs, **all sixty
 finished**, 292 tests each, 1460 outcomes. **281 of the 292 names were green in
-all five.** `specs/ci-plan.md` §9.1 has the per-shard clocks.
+all five.** `specs/assessments/ci-plan-assessment-2026-08.md` §9.1 has the per-shard clocks.
 
 | test | red | shard | `Sched` | what it says |
 |---|---|---|---|---|
