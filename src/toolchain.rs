@@ -284,8 +284,51 @@ fn claimant(rust_dir: &Path) -> Option<(PathBuf, String)> {
     ))
 }
 
+/// Whether the checkout a claim names is still there to land it.
+///
+/// **A claim names its holder, and it is a claim only while that holder is
+/// real.** On 2026-08-14 the sysroot carried
+/// `1786423818 /Users/jan/Dev/jan/toyos-logabi wt/toyos-logabi`, written at
+/// 06:50 on 2026-08-11. The worktree had been removed, the branch survived
+/// neither locally nor on origin, and the change it held had landed on main
+/// three days earlier as `9d535d6`. Every main-matching checkout was told to
+/// wait for it to land — which had already happened and could never happen
+/// again — and `--rebuild-toolchain` in the primary was refused by the same
+/// record, so the one checkout allowed to rebuild was the one told not to. Both
+/// exits closed, on a promise nobody was left to keep.
+///
+/// **The directory, and not `git worktree list`.** Both answer for the path in
+/// the record, and only one of them can be wrong in the direction that costs
+/// something: reading a *live* holder as gone is how a worktree with an unlanded
+/// ABI change gets the sysroot taken from it, which is the 2026-08-04 fight. The
+/// listing risks exactly that three ways, two of them measured on this host on
+/// 2026-08-14. It prints git's own realpath — `/private/tmp/…/linked` for a
+/// worktree whose `pwd` is `/tmp/…/linked` — while a claim records
+/// `CARGO_MANIFEST_DIR`, the path cargo was invoked at, so one live holder
+/// spelled two ways reads as absent. It needs git to answer at all, and an
+/// unanswerable git question is not permission — the rule [`Standing::Unknown`]
+/// already exists for. And it lists a removed worktree anyway, as `prunable
+/// gitdir file points to non-existent location`: the missing *directory* is the
+/// ground truth that listing is derived from, so asking the listing is asking
+/// this question through a layer that can only lose.
+///
+/// The remaining error is the harmless one: a directory `git worktree remove`
+/// left behind reads as live, which costs today's refusal and nothing more.
+fn holder_gone(who: &Path) -> bool {
+    !who.exists()
+}
+
 fn holder(rust_dir: &Path) -> String {
-    claimant(rust_dir).map_or_else(|| "a checkout that left no record".to_string(), |(_, s)| s)
+    claimant(rust_dir).map_or_else(
+        || "a checkout that left no record".to_string(),
+        |(who, said)| {
+            if holder_gone(&who) {
+                format!("{said} — a checkout that is no longer on disk")
+            } else {
+                said
+            }
+        },
+    )
 }
 
 /// Whether this checkout has an ABI of its own at all.
@@ -379,6 +422,49 @@ fn merging(root: &Path) -> bool {
         .current_dir(root)
         .output()
         .is_ok_and(|out| out.status.success())
+}
+
+/// What a checkout whose sources disagree with the shared sysroot may do about
+/// it.
+///
+/// [`standing`] asks about this checkout and main. This asks about the sysroot
+/// as well, because the same disagreement is two different things depending on
+/// whether the checkout named on it is still there — and until 2026-08-14 only
+/// the first question was asked, so a claim outlived its holder by three days
+/// and refused everybody with a "wait for it to land" about a change that had
+/// landed.
+#[derive(PartialEq, Debug)]
+enum Resolution {
+    /// Wait. A checkout that is still there built the sysroot from a change
+    /// that is not on main yet, and this one has nothing of its own to build
+    /// with. The refusal ends when that change lands, and by nothing else.
+    Wait,
+    /// Rebuild it, and say why. The record names a checkout that is gone, so
+    /// the rebuild takes nothing from anybody, and this one's sources are
+    /// main's, so what it puts in the sysroot is what every other worktree
+    /// already has. Staleness, exactly as a moved [`std_fork_stale`] is.
+    Stale,
+    /// Claim it, deliberately and with `--claim-sysroot`. This checkout has an
+    /// ABI of its own, and putting it in the shared sysroot refuses every other
+    /// worktree whoever held it before.
+    Claim,
+    /// Refuse: git could not say whether this checkout differs from main, and a
+    /// claim is destructive.
+    Unclear,
+}
+
+fn resolution(root: &Path, rust_dir: &Path) -> Resolution {
+    match standing(root) {
+        Standing::Diverged => Resolution::Claim,
+        Standing::Unknown => Resolution::Unclear,
+        // **No record at all is not a dead claim.** [`record_claimant`] is
+        // advisory and may fail, so an absent record can be a live holder that
+        // could not write one; only a holder that is named *and* gone is dead.
+        Standing::MatchesMain if claimant(rust_dir).is_some_and(|(who, _)| holder_gone(&who)) => {
+            Resolution::Stale
+        }
+        Standing::MatchesMain => Resolution::Wait,
+    }
 }
 
 /// Fingerprint the sources that get compiled into the shared sysroot.
@@ -620,13 +706,24 @@ pub fn ensure(
     // is needed; a sysroot the primary itself built names the primary.
     if !claim_sysroot && std_sources_stale(root, &rust_dir) {
         if let Some((who, since)) = claimant(&rust_dir).filter(|(who, _)| who != root) {
-            panic!(
+            assert!(
+                holder_gone(&who),
                 "the shared sysroot is held by {}, for a change that is not on main yet, \
                  and rebuilding it here would take it from the one checkout that cannot \
                  merge its way out.\n\
                  It was claimed from {since}.\n\
                  Wait for it to land — this refusal ends by itself, because main will then \
                  carry what the sysroot holds. `--claim-sysroot` takes it back deliberately.",
+                who.display(),
+            );
+            // A lease nobody holds. The checkout that wrote it is gone, so there
+            // is nothing left to take it from and nothing that could ever end
+            // the refusal it used to be — see [`holder_gone`].
+            eprintln!(
+                "The shared sysroot was built from {}, which is not on disk any more; the \
+                 record it left ({since}) names nobody.\n\
+                 That makes the disagreement staleness rather than a claim, so this checkout \
+                 rebuilds the sysroot from its own sources and the record becomes its own.",
                 who.display(),
             );
         }
@@ -889,10 +986,10 @@ fn adopt_shared_sysroot(
     // holder claims back: six landing attempts, four witness rewrites in 38
     // minutes, one gate dead with 156 refusals.
     // `panic!` and not `assert_ne!`, because the message is the whole product of
-    // this branch and `left: MatchesMain / right: MatchesMain` under it is
-    // noise an agent has to read past.
-    match standing(root) {
-        Standing::MatchesMain => panic!(
+    // this branch and `left: Wait / right: Wait` under it is noise an agent has
+    // to read past.
+    match resolution(root, rust_dir) {
+        Resolution::Wait => panic!(
             "this worktree and the shared sysroot at {} disagree about {differs}, so a build \
              here would link its kernel against another checkout's struct layouts.\n\
              Your toyos-abi and toyos are byte-identical to main's, so there is nothing here \
@@ -904,7 +1001,7 @@ fn adopt_shared_sysroot(
             rust_dir.display(),
             holder(rust_dir),
         ),
-        Standing::Unknown => panic!(
+        Resolution::Unclear => panic!(
             "this worktree and the shared sysroot at {} disagree about {differs}, and git \
              cannot say whether this checkout differs from main — so whether it has any \
              standing to claim is unknown, and a claim is destructive.\n\
@@ -912,7 +1009,25 @@ fn adopt_shared_sysroot(
             rust_dir.display(),
             SYSROOT_SOURCES.join(" "),
         ),
-        Standing::Diverged => {}
+        // The refusal above would say "wait for it to land", and there is nobody
+        // left to land anything: the sysroot outlived the checkout that built
+        // it. So the disagreement is staleness, and this rebuilds rather than
+        // refusing — with main's sources, which is what every other worktree
+        // already has, taking nothing from anybody.
+        Resolution::Stale => {
+            eprintln!(
+                "This worktree and the shared sysroot at {} disagree about {differs}, and the \
+                 sysroot was built by {}.\n\
+                 A claim names its holder, and nothing here is waiting for that one any more: \
+                 your toyos-abi and toyos are main's, so rebuilding the sysroot from them is \
+                 staleness rather than a claim. The record becomes this worktree's, unclaimed.",
+                rust_dir.display(),
+                holder(rust_dir),
+            );
+            rebuild_shared_sysroot(root, rust_dir, &want, lock);
+            return;
+        }
+        Resolution::Claim => {}
     }
 
     assert!(
@@ -941,11 +1056,23 @@ fn adopt_shared_sysroot(
         holder(rust_dir),
     );
 
+    rebuild_shared_sysroot(root, rust_dir, &want, lock);
+}
+
+/// Put this worktree's sources in the shared sysroot, and record that they are
+/// what is in there.
+///
+/// The two ways a linked worktree reaches this are opposites in what they cost
+/// everybody else — a claim refuses every other worktree until it lands, a
+/// staleness rebuild refuses nobody — and identical in what they do, down to
+/// deciding again under the exclusive lock: whoever held it in between may have
+/// built exactly this.
+fn rebuild_shared_sysroot(root: &Path, rust_dir: &Path, want: &str, lock: &mut buildlock::Held) {
     lock.act_if(
         Scope::Global,
         "rebuild the shared sysroot from a linked worktree",
         || {
-            (fs::read_to_string(witness_path(rust_dir)).ok().as_deref() != Some(want.as_str())
+            (fs::read_to_string(witness_path(rust_dir)).ok().as_deref() != Some(want)
                 || std_fork_stale(rust_dir))
             .then_some(())
         },
@@ -954,7 +1081,7 @@ fn adopt_shared_sysroot(
             rebuild_std(root, rust_dir);
             crate::libc::build(root, rust_dir);
             record_std_fork(rust_dir);
-            fs::write(witness_path(rust_dir), &want)
+            fs::write(witness_path(rust_dir), want)
                 .unwrap_or_else(|e| panic!("write {}: {e}", witness_path(rust_dir).display()));
             record_claimant(root, rust_dir);
         },
@@ -1423,6 +1550,102 @@ mod tests {
             Standing::MatchesMain,
             "a landing gating its own merge of main was told it could claim"
         );
+    }
+
+    /// A `rust/` whose sysroot carries a claim by `who`, written the way
+    /// [`record_claimant`] writes one and as old as the ghost below was.
+    fn claimed_by(name: &str, who: &Path) -> PathBuf {
+        let rust_dir = std::env::temp_dir().join(format!("toyos-claim-{name}"));
+        let _ = fs::remove_dir_all(&rust_dir);
+        fs::create_dir_all(rust_dir.join("build")).unwrap();
+        let when = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("a clock later than 1970")
+            .as_secs()
+            .saturating_sub(4775 * 60);
+        fs::write(claimant_path(&rust_dir), format!("{when} {} wt/ghost\n", who.display()))
+            .unwrap();
+        rust_dir
+    }
+
+    /// A `rust/` whose sysroot was built by somebody who left no record.
+    fn unrecorded(name: &str) -> PathBuf {
+        let rust_dir = std::env::temp_dir().join(format!("toyos-claim-{name}"));
+        let _ = fs::remove_dir_all(&rust_dir);
+        fs::create_dir_all(rust_dir.join("build")).unwrap();
+        rust_dir
+    }
+
+    /// **The ghost claim of 2026-08-14, as a test.**
+    ///
+    /// The sysroot held `1786423818 /Users/jan/Dev/jan/toyos-logabi
+    /// wt/toyos-logabi`. That worktree had been removed, its branch was on
+    /// neither this machine nor origin, and what it held had landed on main
+    /// three days earlier as `9d535d6`. Before this, [`standing`] was the whole
+    /// answer and `MatchesMain` was always the refusal, so every main-matching
+    /// checkout got "**Wait for it to land and merge main.** This refusal then
+    /// ends by itself" about a change that had already landed — observed
+    /// verbatim from `toolchain.rs:895` in a fresh worktree that day, with
+    /// `--rebuild-toolchain` in the primary refused by the same record. Nothing
+    /// could end it: a livelock.
+    #[test]
+    fn a_claim_whose_holder_is_gone_is_staleness_and_not_a_claim() {
+        let root = scratch("ghost-claim");
+        git(&root, &["checkout", "-qb", "wt/whatever"]);
+        assert_eq!(standing(&root), Standing::MatchesMain);
+
+        let ghost = std::env::temp_dir().join("toyos-a-worktree-that-was-removed");
+        let _ = fs::remove_dir_all(&ghost);
+        assert!(holder_gone(&ghost));
+        assert_eq!(
+            resolution(&root, &claimed_by("ghost", &ghost)),
+            Resolution::Stale,
+            "a checkout that matches main was left waiting for a checkout that is gone"
+        );
+
+        // **No record at all is not a dead claim.** `record_claimant` is
+        // advisory and may fail, so an absent record can be a live holder that
+        // could not write one — which is why only a holder that is *named* and
+        // gone is dead.
+        assert_eq!(resolution(&root, &unrecorded("none")), Resolution::Wait);
+    }
+
+    /// The edge that must not move: a holder that is still on disk is still
+    /// holding it, and the checkout with nothing of its own still waits.
+    ///
+    /// Weakening this is the 2026-08-04 fight — a sysroot taken from the one
+    /// worktree that could not merge its way out, six landing attempts, four
+    /// witness rewrites in 38 minutes, one gate dead with 156 refusals.
+    #[test]
+    fn a_claim_whose_holder_is_there_is_still_a_claim() {
+        let root = scratch("live-claim");
+        git(&root, &["checkout", "-qb", "wt/whatever"]);
+        let live = scratch("live-holder");
+        assert!(!holder_gone(&live));
+        assert_eq!(
+            resolution(&root, &claimed_by("live", &live)),
+            Resolution::Wait,
+            "a live holder's claim was read as staleness"
+        );
+    }
+
+    /// A dead claim makes a disagreement staleness. It does not make a real ABI
+    /// change free: putting one in the shared sysroot refuses every other
+    /// worktree whoever held it before, so it stays a deliberate
+    /// `--claim-sysroot` — and git that cannot answer stays a refusal, because
+    /// a dead holder is not the question that one is unsure about.
+    #[test]
+    fn a_dead_claim_does_not_hand_the_sysroot_to_a_checkout_that_differs() {
+        let root = scratch("ghost-vs-abi");
+        git(&root, &["checkout", "-qb", "wt/abi"]);
+        fs::write(root.join("toyos-abi/src/lib.rs"), b"pub struct A(pub u64);\n").unwrap();
+
+        let ghost = std::env::temp_dir().join("toyos-a-worktree-that-was-removed");
+        let _ = fs::remove_dir_all(&ghost);
+        assert_eq!(resolution(&root, &claimed_by("ghost-abi", &ghost)), Resolution::Claim);
+
+        git(&root, &["branch", "-qD", "main"]);
+        assert_eq!(resolution(&root, &claimed_by("ghost-unknown", &ghost)), Resolution::Unclear);
     }
 
     /// An unanswered question is not permission: a claim is destructive.
