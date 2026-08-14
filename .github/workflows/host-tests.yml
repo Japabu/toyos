@@ -88,16 +88,21 @@ jobs:
             cargo test --manifest-path "$crate/Cargo.toml" 2>&1 | tee -a /tmp/host.log
           done
 
-      # `userland/.cargo/config.toml` cross-compiles by default, so its host
-      # tests have to name the host.
-      - name: sshd
+      # `userland/.cargo/config.toml` cross-compiles by default, so a userland
+      # crate's host tests have to name the host. `calc` is here for the reason
+      # the pure crates above are: its arithmetic is decided without a guest,
+      # so a CI that skipped it would skip the cheapest tests it has.
+      - name: userland host crates
         run: |
-          set -o pipefail
+          set -e -o pipefail
           host=$(rustc -vV | sed -n 's/^host: //p')
-          cargo test --manifest-path userland/sshd/Cargo.toml --target "$host" 2>&1 \
-            | tee -a /tmp/host.log
+          for crate in sshd calc; do
+            echo "=== userland/$crate" | tee -a /tmp/host.log
+            cargo test --manifest-path "userland/$crate/Cargo.toml" --target "$host" 2>&1 \
+              | tee -a /tmp/host.log
+          done
 
-      # Fifteen `cargo test` invocations in three steps, and a red is one line
+      # Sixteen `cargo test` invocations in three steps, and a red is one line
       # somewhere among them; the summary names which crate and the first
       # thing that failed in it.
       - name: failure summary
