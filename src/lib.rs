@@ -3,7 +3,6 @@ pub mod build;
 pub mod buildlock;
 pub mod ci;
 pub mod day;
-pub mod docs;
 pub mod durations;
 pub mod forkcheck;
 pub mod image;
