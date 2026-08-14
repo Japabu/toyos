@@ -1576,29 +1576,71 @@ mod tests {
         rust_dir
     }
 
+    /// **The geometry this machine was wedged in on 2026-08-14, built from
+    /// scratch:** the sysroot is *behind* main, not ahead of it.
+    ///
+    /// A holder claims the sysroot for an ABI change of its own and builds it
+    /// from that. The change lands. Main then moves on again over the same tree
+    /// — on this machine `4e690d0`, a doc-comment-only commit of 2026-08-13,
+    /// which [`witness`] hashes because it hashes bytes. Now the sysroot
+    /// matches neither the holder's branch nor main's tip, and every checkout
+    /// on the host disagrees with it while having nothing of its own to build
+    /// with.
+    ///
+    /// Returns a checkout that matches main, and the `rust/` whose sysroot
+    /// `holder` last built.
+    fn a_sysroot_behind_main(name: &str, holder: &Path) -> (PathBuf, PathBuf) {
+        let root = scratch(name);
+
+        git(&root, &["checkout", "-qb", "wt/ghost"]);
+        fs::write(root.join("toyos-abi/src/lib.rs"), b"pub struct A(pub u64);\n").unwrap();
+        git(&root, &["commit", "-qam", "the holder's ABI change, which it claimed the sysroot for"]);
+        let what_the_sysroot_holds = witness(&root);
+
+        git(&root, &["checkout", "-q", "main"]);
+        git(&root, &["merge", "-q", "--ff-only", "wt/ghost"]);
+        fs::write(
+            root.join("toyos-abi/src/lib.rs"),
+            b"/// A doc comment, and nothing else.\npub struct A(pub u64);\n",
+        )
+        .unwrap();
+        git(&root, &["commit", "-qam", "main, moving on past the sysroot"]);
+
+        git(&root, &["checkout", "-qb", "wt/whatever"]);
+        let rust_dir = claimed_by(name, holder);
+        fs::write(witness_path(&rust_dir), what_the_sysroot_holds).unwrap();
+
+        assert!(
+            std_sources_stale(&root, &rust_dir),
+            "the fixture is not the geometry it claims: this checkout agrees with the sysroot"
+        );
+        assert_eq!(standing(&root), Standing::MatchesMain, "the checkout is main's");
+        (root, rust_dir)
+    }
+
     /// **The ghost claim of 2026-08-14, as a test.**
     ///
     /// The sysroot held `1786423818 /Users/jan/Dev/jan/toyos-logabi
     /// wt/toyos-logabi`. That worktree had been removed, its branch was on
     /// neither this machine nor origin, and what it held had landed on main
-    /// three days earlier as `9d535d6`. Before this, [`standing`] was the whole
-    /// answer and `MatchesMain` was always the refusal, so every main-matching
-    /// checkout got "**Wait for it to land and merge main.** This refusal then
-    /// ends by itself" about a change that had already landed — observed
-    /// verbatim from `toolchain.rs:895` in a fresh worktree that day, with
-    /// `--rebuild-toolchain` in the primary refused by the same record. Nothing
-    /// could end it: a livelock.
+    /// three days earlier as `9d535d6` — the sysroot was behind main, by the
+    /// three `toyos-abi/src` files `4e690d0` had since touched. Before this,
+    /// [`standing`] was the whole answer and `MatchesMain` was always the
+    /// refusal, so every main-matching checkout got "**Wait for it to land and
+    /// merge main.** This refusal then ends by itself" about a change that had
+    /// already landed — observed verbatim from `toolchain.rs:895` in a fresh
+    /// worktree that day, and that arm `panic!`s before `--claim-sysroot` is so
+    /// much as examined, so no flag reached it. Nothing could end it: a
+    /// livelock.
     #[test]
     fn a_claim_whose_holder_is_gone_is_staleness_and_not_a_claim() {
-        let root = scratch("ghost-claim");
-        git(&root, &["checkout", "-qb", "wt/whatever"]);
-        assert_eq!(standing(&root), Standing::MatchesMain);
-
         let ghost = std::env::temp_dir().join("toyos-a-worktree-that-was-removed");
         let _ = fs::remove_dir_all(&ghost);
         assert!(holder_gone(&ghost));
+
+        let (root, rust_dir) = a_sysroot_behind_main("ghost-claim", &ghost);
         assert_eq!(
-            resolution(&root, &claimed_by("ghost", &ghost)),
+            resolution(&root, &rust_dir),
             Resolution::Stale,
             "a checkout that matches main was left waiting for a checkout that is gone"
         );
@@ -1611,19 +1653,20 @@ mod tests {
     }
 
     /// The edge that must not move: a holder that is still on disk is still
-    /// holding it, and the checkout with nothing of its own still waits.
+    /// holding it, in the same geometry, and the checkout with nothing of its
+    /// own still waits.
     ///
     /// Weakening this is the 2026-08-04 fight — a sysroot taken from the one
     /// worktree that could not merge its way out, six landing attempts, four
     /// witness rewrites in 38 minutes, one gate dead with 156 refusals.
     #[test]
     fn a_claim_whose_holder_is_there_is_still_a_claim() {
-        let root = scratch("live-claim");
-        git(&root, &["checkout", "-qb", "wt/whatever"]);
         let live = scratch("live-holder");
         assert!(!holder_gone(&live));
+
+        let (root, rust_dir) = a_sysroot_behind_main("live-claim", &live);
         assert_eq!(
-            resolution(&root, &claimed_by("live", &live)),
+            resolution(&root, &rust_dir),
             Resolution::Wait,
             "a live holder's claim was read as staleness"
         );
