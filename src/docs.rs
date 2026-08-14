@@ -4,6 +4,7 @@
 //! The frontmatter is the only query anybody has over two hundred files, and a
 //! field nothing checks is a field that is right until the day it is not.
 
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 
 /// Directories the walk does not enter, each named rather than matched on a
