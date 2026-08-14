@@ -495,6 +495,17 @@ straddling the head cut, a character straddling the start of the tail, a value
 arriving one character at a time — are checked on the host by `kernel-elide`,
 which compiles the kernel file itself rather than a transliteration of it.
 
+**`kernel-elide/` is a harness and not a crate of its own.** It is
+`kernel-span/`'s arrangement — `#[path = "../../kernel/src/log/elide.rs"]` and
+nothing else — and it sits beside `kernel/` rather than inside it because
+`kernel/.cargo/config.toml` cross-compiles everything below it to
+`x86_64-unknown-none` and cargo refuses to merge an inherited `build.target`
+away. It runs as `cargo test --manifest-path kernel-elide/Cargo.toml`, from
+`.github/workflows/host-tests.yml`'s host-crates list. **That is the property
+`elide.rs` has to keep to stay testable**: it names nothing outside itself, so
+the harness supplies nothing. A dependency added there is the file leaving the
+host, and the nine tests go with it.
+
 ### 2.2 The shard
 
 ```rust

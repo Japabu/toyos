@@ -73,11 +73,18 @@ jobs:
           set -o pipefail
           cargo test --lib 2>&1 | tee -a /tmp/host.log
 
-      # CLAUDE.md's list, whole. It used to be nine of the thirteen — the four
-      # that were missing (`toyos-elf`, `toyos-ld`, `toyos-pci`,
-      # `toyos-desktop`) are pure crates whose whole point is that a decision
-      # is testable without a guest, so a CI that skipped them skipped exactly
-      # the tests it was cheapest to run.
+      # Every crate in this repository with host tests. It used to be nine of
+      # the thirteen CLAUDE.md's layout names — the four that were missing
+      # (`toyos-elf`, `toyos-ld`, `toyos-pci`, `toyos-desktop`) are pure crates
+      # whose whole point is that a decision is testable without a guest, so a
+      # CI that skipped them skipped exactly the tests it was cheapest to run.
+      #
+      # **This list is longer than that layout table**, and deliberately: the
+      # two `kernel-*` harnesses compile a kernel source file for the host
+      # rather than being crates of their own (`kernel-span` for
+      # `mm/user_span.rs`, `kernel-elide` for `log/elide.rs`), and each says so
+      # in its own manifest. The list to keep current is this one — a harness
+      # that runs nowhere is the failure this file exists to prevent.
       - name: host crates
         run: |
           set -e -o pipefail
