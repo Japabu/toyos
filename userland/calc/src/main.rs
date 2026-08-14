@@ -873,6 +873,15 @@ mod tests {
                 assert!(baked, "{ch:?} (U+{:04X}) in {face:?} is not in the baked font", ch as u32);
             }
         }
+        // The message strip is one row tall and draws the first line it is
+        // given, so a refusal too long for the narrowest window would be a
+        // sentence cut in half. Every one of them fits.
+        let strip = Layout::new(MIN_W, MIN_H).message;
+        let cell = Fonts::load().smallest().width() as i32;
+        for face in faces.iter().filter(|f| f.contains(' ')) {
+            let width = face.chars().count() as i32 * cell;
+            assert!(width <= strip.w, "{face:?} is {width}px in a {}px message strip", strip.w);
+        }
         // And the set is not idle: every character in it is on a face, so a
         // codepoint that stops being drawn stops being baked.
         for &ch in DRAWABLE_NON_ASCII {
