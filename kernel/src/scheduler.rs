@@ -197,7 +197,11 @@ pub fn block_on(ticket: Ticket<'_>, deadline: u64) {
 /// first — `sys_process_wait` read an exit code that had not been published
 /// yet and killed the kernel from a plain `Child::wait()`. So the predicate is
 /// re-checked after every wake and the thread re-parks until it holds, which
-/// is what `sched::waitqs` already documents every blocking site as doing.
+/// is what `sched::waitqs` already documents every blocking site as doing and
+/// what spec §2's invariant 10 requires of one. A site that parks with
+/// `prepare_wait`/`block_on` directly owns that loop itself — `sys_nanosleep`
+/// is the one that does not
+/// (`specs/issues/kernel/nanosleep-ends-early-when-a-sibling-thread-exits.md`).
 ///
 /// Looping does not weaken spec §2's no-lost-wake invariant, because each trip
 /// is the whole two-phase handshake again: the re-registration happens *before*

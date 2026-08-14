@@ -37,6 +37,14 @@
    exhaust and no overflow.
 9. **Userland cannot stall the scheduler.** A wake storm costs the sender its
    own time only.
+10. **A wake is not proof of a condition.** Invariant 4's dual, and the
+    blocking site's half of it: a task is woken *by name* as well as by queue,
+    buckets are shared, and a deadline fires on the task's own CPU, so a park
+    that returned proves only that the task runs again. Every blocking site
+    re-checks its own condition after every wake and re-parks until it holds or
+    its deadline passes. The scheduler never decides what a wake meant, and a
+    site that reads the return as the answer is asserting a fact nothing
+    established.
 
 ## 3. Bands
 
