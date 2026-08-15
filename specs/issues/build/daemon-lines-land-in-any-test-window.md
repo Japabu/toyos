@@ -51,3 +51,25 @@ line and the child's are the same bytes on the same fd. Either the child gets
 a capture channel of its own (the in-guest runner piping and framing its
 stdout, which has to keep the line-by-line liveness `run_test_hooked` depends
 on) or console writes gain a writer tag. Both are design calls, not repairs.
+
+## `90_stdio_buffering`, 2026-08-15 — observed, and deliberately given no row
+
+Landing gate run 31890991692 red `90_stdio_buffering` on a daemon line in its
+window: the same race, a different member. It is recorded here and **not in
+`src/redlist.rs`, on purpose**.
+
+A redlist row is a claim about a *name*, and the name is not the subject. Any of
+the 110 C tests can be the one whose window a daemon's startup falls in — the
+paragraphs above have already caught `71_macro_empty_arg` and
+`90_stdio_buffering` doing it, and which one it is next time is decided by
+scheduling. Adding a row per observed victim would grow the index one name at a
+time while never bounding anything: the rate that matters is "how often does
+*some* member of the family absorb a daemon line", and there is no instrument
+that measures it today. `71_macro_empty_arg` keeps its row because it has a
+denominator — 4 of 14 suites in one session — and that row is the family's
+standing evidence.
+
+So this is a **hold**: the observation is kept, the enumeration is refused, and
+what would replace both is the design call at the end of this entry. An agent
+who reds on a third member of the family appends the observation here rather
+than opening a third front.

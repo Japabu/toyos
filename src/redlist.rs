@@ -894,7 +894,11 @@ pub const KNOWN_RED: &[Red] = &[
                so the xHCI prologue is outside the window entirely",
         evidence: "`cargo test -- sched_check_build` on this branch, two boots (parallel phase \
                    then ALONE re-run); green on KVM the same day — twelve of twelve guest shards, \
-                   run 31875856466, where it measured 5,879 ms",
+                   run 31875856466, where it measured 5,879 ms — **and a KVM shard has since \
+                   STALLed it**: run 31890991692, guest 8, STALL and then ALONE GREEN, so the \
+                   unqualified reading above is one session and not the accelerator's property. A \
+                   STALL is a duration and not a verdict, which is why it qualifies this sentence \
+                   rather than opening a row",
         source: "specs/issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
         measured: "2026-08-15",
     },

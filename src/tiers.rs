@@ -415,7 +415,13 @@ pub const RELEGATED: &[Relegated] = &[
         why: Why::Cost,
         guards: "A device that rejects the optional flush command remains usable, while a \
                  real write failure still propagates. Treating every command error alike \
-                 either loses compatible disks or hides failed writes.",
+                 either loses compatible disks or hides failed writes. **The cost this \
+                 relegation is about was cut about sevenfold at L6 of the log architecture** — \
+                 `/bin/logd` ends on an error instead of retrying inside a budget, which is what \
+                 turned 1,737 failing flushes over six seconds into the handful a single refusal \
+                 costs (`specs/log-architecture-spec.md` §5.4) — and `ci_ms` above is untouched \
+                 because it is a CI measurement and the new figure is a dev-host one. A nightly \
+                 KVM run is what may bring this name back to Fast.",
     },
     Relegated {
         test: "hda_tone",
