@@ -1734,30 +1734,111 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
     }
 }
 
+/// What a crash report learned when it asked for a user address's symbol.
+///
+/// **Not a bool.** A bool answered "no symbol was logged" for two facts that
+/// are not the same one — an address the tables genuinely do not cover, and an
+/// address nothing looked up because a lock was held — and the caller printed
+/// the same bare number for both. A fault report that says `0x10000004cbb`
+/// where the backtrace three lines below says `fault_gate_child::main+0x136`
+/// has told the reader something false about the binary
+/// (`specs/issues/panic-path/`, 2026-08-14).
+#[must_use = "an address with no symbol line still has to be printed"]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SymbolLookup {
+    /// Resolved: the line naming it has already been logged.
+    Named,
+    /// The symbol table was read and covers no such address. A bare address is
+    /// the whole truth about it.
+    Unnamed,
+    /// Nothing was read — the process table was held elsewhere.
+    TableBusy,
+    /// The entry was read; this process's own symbol table was held.
+    SymbolsBusy,
+    /// The process is no longer in the table, so there is nothing left to ask.
+    NoProcess,
+}
+
+impl SymbolLookup {
+    /// Log the bare address for a lookup that produced no symbol line, saying
+    /// *why* there is none. [`Named`](Self::Named) logs nothing: its line is
+    /// already out.
+    ///
+    /// Every caller goes through this rather than testing the variant, so a
+    /// concession can never again be printed as a verdict.
+    pub fn log_bare(self, addr: u64) {
+        match self {
+            Self::Named => {}
+            Self::Unnamed => log!("    {:#x}", addr),
+            Self::TableBusy => {
+                log!("    {:#x}  <symbol unread: the process table was held>", addr)
+            }
+            Self::SymbolsBusy => {
+                log!("    {:#x}  <symbol unread: the symbol table was held>", addr)
+            }
+            Self::NoProcess => {
+                log!("    {:#x}  <symbol unread: the process is gone from the table>", addr)
+            }
+        }
+    }
+}
+
 /// Resolve and log a user-mode address against the process's symbol table.
-/// Returns true if the address was resolved and logged.
-/// Uses try_lock so it's safe to call from panic handlers.
-pub fn resolve_user_symbol(pid: Pid, addr: u64) -> bool {
+/// Uses try_lock so it's safe to call from panic handlers; see
+/// [`with_user_symbols`] for what the answer means.
+pub fn resolve_user_symbol(pid: Pid, addr: u64) -> SymbolLookup {
     with_user_symbols(pid, |syms| crate::symbols::resolve_user(syms, addr))
 }
 
 /// [`resolve_user_symbol`] for a backtrace frame's return address — see
 /// [`crate::symbols::SymbolTable::resolve_return`].
-pub fn resolve_user_symbol_return(pid: Pid, return_addr: u64) -> bool {
+pub fn resolve_user_symbol_return(pid: Pid, return_addr: u64) -> SymbolLookup {
     with_user_symbols(pid, |syms| crate::symbols::resolve_user_return(syms, return_addr))
 }
 
-fn with_user_symbols(pid: Pid, f: impl FnOnce(&crate::symbols::SymbolTable) -> bool) -> bool {
+/// Run `f` against a process's symbol table, and say what happened.
+///
+/// **The contract, which is three-way and not two.** `f` decides between
+/// [`Named`](SymbolLookup::Named) and [`Unnamed`](SymbolLookup::Unnamed); the
+/// three remaining answers are this function's own, and each one says that the
+/// address was never looked up at all. The caller must print the address for
+/// any of the four — [`SymbolLookup::log_bare`] is that print — and a report
+/// that renders a concession as a bare number is the defect this shape exists
+/// to make unwritable.
+///
+/// **Why `try_lock` and not a wait, bounded or otherwise.** This runs from the
+/// fault and panic reports. The faulting thread may itself hold either lock —
+/// that is not a hypothesis, it is what `try_recover_from_panic` is written for
+/// — and a wait would then be a deadlock on the one path that must always
+/// produce output, with the exception's own handler as the deadlocked party. A
+/// bounded retry buys nothing there and costs the report its promptness on
+/// every real contention, so the answer is taken at once and the *reason* is
+/// carried out instead. `exceptions.rs`'s DESIGN RULE (panic-free, try_lock
+/// only) is the same rule from the caller's side.
+///
+/// A busy answer is now a real anomaly rather than routine weather:
+/// `scheduler::reap_poisoned` was the standing aggressor and no longer takes
+/// the table when there is nothing to reap. So `<symbol unread: …>` in a report
+/// names a lock holder worth finding, and the fault gates in `tests/toyos.rs`
+/// red on the reason rather than intermittently on a missing name.
+fn with_user_symbols(
+    pid: Pid,
+    f: impl FnOnce(&crate::symbols::SymbolTable) -> bool,
+) -> SymbolLookup {
     let syms_arc = {
-        let Some(guard) = PROCESS_TABLE.try_lock() else { return false };
-        let Some(table) = guard.as_ref() else { return false };
+        let Some(guard) = PROCESS_TABLE.try_lock() else { return SymbolLookup::TableBusy };
+        let Some(table) = guard.as_ref() else { return SymbolLookup::NoProcess };
         match table.get(pid) {
             Some(proc) => Arc::clone(&proc.symbols),
-            None => return false,
+            None => return SymbolLookup::NoProcess,
         }
     };
-    let Some(syms) = syms_arc.try_lock() else { return false };
-    f(&syms)
+    let Some(syms) = syms_arc.try_lock() else { return SymbolLookup::SymbolsBusy };
+    if f(&syms) {
+        SymbolLookup::Named
+    } else {
+        SymbolLookup::Unnamed
+    }
 }
 
 /// Kill the process an object names.
