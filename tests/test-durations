@@ -199,8 +199,10 @@ launcher_refusals 2130
 locale_detect 5179
 locale_detect_unrecognized 5300
 log_backing_read_error 5028
-log_conservation 18446744073709551615
-log_nested_emit 18446744073709551615
+log_conservation_smp1 18446744073709551615
+log_conservation_smp4 18446744073709551615
+log_conservation_smp8 18446744073709551615
+log_nested_emit 4584
 log_partition_identity 6421
 log_partition_layout 454
 log_volume_reread 11

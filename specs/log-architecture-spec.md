@@ -2823,10 +2823,16 @@ existing. Named rather than discovered at compl's C14.
 
 ### 9.5 New named tests
 
-- **`log_conservation`** — §9.1, at `--smp 1`, `4` and `8`. **It runs inside
-  `test-runner`**, which is the manifest program that holds `logread` in each
-  test config; a spawned test binary does not inherit a `SysCap` dup (§3.2).
-  **Built at L4**, `tests/common/logread.rs`, `Sched::Parallel`.
+- **`log_conservation_smp1`, `log_conservation_smp4`, `log_conservation_smp8`**
+  — §9.1, one registered name per width. **It runs inside `test-runner`**, which
+  is the manifest program that holds `logread` in each test config; a spawned
+  test binary does not inherit a `SysCap` dup (§3.2). **Built at L4**,
+  `tests/common/logread.rs`, `Sched::Parallel`. **Three names and not one**: as
+  a single name over three boots CI measured **17,112 ms**, over
+  `FAST_CEILING_MS`, and the gate the whole design turns on may not sit in the
+  nightly tier — while each boot alone is well under the line. The three widths
+  are different subjects anyway: at `--smp 1` the reader and the one producer
+  share a CPU, at `4` and `8` they do not.
 - **`log_nested_emit`** — §9.2, at `--smp 1`, and nesting is a property of one
   CPU: at one width the interrupted writer and its interrupting handler are
   provably the same CPU. **Built at L4**, and it is the gate both reservation

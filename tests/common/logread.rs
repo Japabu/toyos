@@ -43,50 +43,75 @@ impl Report {
     }
 }
 
-/// §9.1's conservation law, at the three widths.
+/// §9.1's conservation law, at one width.
 ///
-/// **One boot per width and not one boot re-run**: what the law is about is
-/// concurrent producers, so a machine with one CPU and a machine with eight are
-/// different subjects rather than the same subject measured twice. `--smp 1` is
-/// the case where the reader and the one producer share a CPU, `--smp 4` and
-/// `--smp 8` are where they do not.
-pub fn log_conservation(
+/// **Three registered names and not one, and the reason is the fast tier's
+/// line.** What the law is about is concurrent producers, so a machine with one
+/// CPU and a machine with eight are different subjects rather than one subject
+/// measured three times: `--smp 1` is where the reader and the one producer
+/// share a CPU, `--smp 4` and `--smp 8` are where they do not. One name over
+/// all three boots measured 17,112 ms in CI — over `FAST_CEILING_MS`, and the
+/// gate the whole design turns on may not sit in the nightly tier — while each
+/// boot on its own is comfortably under it.
+fn conservation(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+    smp: u32,
+) -> Result<(), String> {
+    let report = storm(test_config, c_bins, rust_bins, smp, &["log-storm"])?;
+    let shards = report.get("shards")?;
+    if shards != smp as u64 {
+        return Err(format!(
+            "--smp {smp} answered {shards} shard(s); the cursor's shard count is the machine's \
+             CPU count\n{}",
+            report.stdout
+        ));
+    }
+    // Non-vacuity, and it is the half a green law cannot supply: a reader that
+    // took every record after the storm had ended has proved nothing about
+    // concurrent producers.
+    let concurrent = report.get("concurrent")?;
+    let dropped = report.get("dropped")?;
+    let read = report.get("read")?;
+    if concurrent == 0 || read == 0 {
+        return Err(format!(
+            "--smp {smp} read {read} record(s), {concurrent} of them while the storm ran\n{}",
+            report.stdout
+        ));
+    }
+    eprintln!(
+        "  [log] smp={smp}: emitted={} read={read} dropped={dropped} concurrent={concurrent} \
+         lost={} wakes={}",
+        report.get("emitted")?,
+        report.get("lost")?,
+        report.get("wakes")?,
+    );
+    Ok(())
+}
+
+pub fn log_conservation_smp1(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    for smp in [1, 4, 8] {
-        let report = storm(test_config, c_bins, rust_bins, smp, &["log-storm"])?;
-        let shards = report.get("shards")?;
-        if shards != smp as u64 {
-            return Err(format!(
-                "--smp {smp} answered {shards} shard(s); the cursor's shard count is the \
-                 machine's CPU count\n{}",
-                report.stdout
-            ));
-        }
-        // Non-vacuity, and it is the half a green law cannot supply: a reader
-        // that took every record after the storm had ended has proved nothing
-        // about concurrent producers, and a storm nothing dropped has not
-        // reached the loss path the law is mostly about.
-        let concurrent = report.get("concurrent")?;
-        let dropped = report.get("dropped")?;
-        let read = report.get("read")?;
-        if concurrent == 0 || read == 0 {
-            return Err(format!(
-                "--smp {smp} read {read} record(s), {concurrent} of them while the storm ran\n{}",
-                report.stdout
-            ));
-        }
-        eprintln!(
-            "  [log] smp={smp}: emitted={} read={read} dropped={dropped} concurrent={concurrent} \
-             lost={} wakes={}",
-            report.get("emitted")?,
-            report.get("lost")?,
-            report.get("wakes")?,
-        );
-    }
-    Ok(())
+    conservation(test_config, c_bins, rust_bins, 1)
+}
+
+pub fn log_conservation_smp4(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    conservation(test_config, c_bins, rust_bins, 4)
+}
+
+pub fn log_conservation_smp8(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    conservation(test_config, c_bins, rust_bins, 8)
 }
 
 /// §9.2's gate: an interrupt that logs, inside another `emit`, on one CPU.
