@@ -6,8 +6,9 @@
 //! thirteen kinds (`File`, `Device`, `Acceptor`, `Connection`, `IoUring`,
 //! `Console`) were exercised by no census assertion at all, which is where
 //! three of this branch's defects lived. The kernel has always counted per
-//! kind; until now the only reader wrote them to the kernel log, where no guest
-//! test can see one.
+//! kind; the readers that answered a total or wrote the breakdown into the
+//! kernel log, where no guest test can see one, are retired, and this is what
+//! is left.
 //!
 //! Two readings and a comparison, never one reading against a constant: an
 //! object released by another process is dropped from the deferred queue on
@@ -16,7 +17,7 @@
 
 use core::fmt;
 
-use toyos_abi::syscall::debug_action::{CENSUS_KIND, CENSUS_TOTAL};
+use toyos_abi::syscall::debug_action::CENSUS_KIND;
 use toyos_abi::syscall::{self, OBJECT_KINDS};
 
 /// How many objects of every kind are alive right now.
@@ -76,9 +77,4 @@ impl fmt::Display for Census {
         }
         Ok(())
     }
-}
-
-/// The machine-wide live-object total, without the per-kind breakdown.
-pub fn total() -> u64 {
-    syscall::debug(CENSUS_TOTAL)
 }

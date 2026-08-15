@@ -4,7 +4,12 @@ use crate::RawHandle;
 
 pub const IORING_OP_NOP: u8 = 0;
 pub const IORING_OP_POLL_ADD: u8 = 1;
-pub const IORING_OP_POLL_REMOVE: u8 = 2;
+// Op code 2 unused (formerly IORING_OP_POLL_REMOVE). It had no submitter
+// anywhere either — and the selector that would have been its caller cancels
+// nothing: mio's ToyOS selector keeps its own registration list, re-arms every
+// registration on each `select`, and deregisters by dropping the entry. A poll
+// this kernel takes is one-shot, consumed by the completion it posts, so the
+// interest a remove would withdraw is gone before there is anything to name.
 pub const IORING_OP_ACCEPT: u8 = 3;
 // Op code 4 unused (formerly IORING_OP_CLOSE). It had no submitter anywhere —
 // not in the SDK, not in userland, not in mio — and it was the one handle path

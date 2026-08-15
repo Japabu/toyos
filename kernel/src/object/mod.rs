@@ -251,17 +251,17 @@ macro_rules! kobject {
 
             /// `(type name, live count)`, in declaration order.
             ///
+            /// Per kind and only per kind. The machine-wide sum this used to
+            /// offer beside it hid a leak of one kind behind ordinary churn in
+            /// another, and once every leak assertion in the estate was per
+            /// kind it had no reader left.
+            ///
             /// Read by `SYS_DEBUG` alone, which is `test-actuators`; the
             /// counters themselves are kept by every build.
             #[cfg(feature = "test-actuators")]
             pub fn live() -> impl Iterator<Item = (&'static str, u64)> {
                 use core::sync::atomic::Ordering;
                 [$((stringify!($variant), $variant.load(Ordering::Relaxed)),)+].into_iter()
-            }
-
-            #[cfg(feature = "test-actuators")]
-            pub fn total() -> u64 {
-                live().map(|(_, n)| n).sum()
             }
         }
     };

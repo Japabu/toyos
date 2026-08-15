@@ -117,7 +117,7 @@ A syscall that takes a handle requires a named right on it and answers
 | `SYS_PORT_CREATE` | mint an `Acceptor`/`Connector` pair |
 | `SYS_NAMESPACE_BUILD` / `SYS_NAMESPACE_OPEN` | build a namespace / resolve a name in one |
 | `SYS_HANDLE_SEND` / `SYS_HANDLE_RECV` | move a batch of handles over a connection |
-| `SYS_SHM_CREATE` / `SYS_SHM_MAP` / `SYS_SHM_UNMAP` | shared memory as a handle |
+| `SYS_SHM_CREATE` / `SYS_SHM_MAP` | shared memory as a handle; a region's mappings go with its last handle, so there is nothing to unmap by hand |
 | `SYS_PROCESS_WAIT` / `SYS_PROCESS_KILL` / `SYS_PROCESS_OPEN` | act on a process handle; mint one from a pid only with `MANAGE` |
 | `SYS_DEVICE_CLAIM` | mint a device claim (`DEVICE`) |
 | `SYS_RT_ENTER` | enter the real-time band (`RT`) |
