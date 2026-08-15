@@ -1062,6 +1062,27 @@ pub const KNOWN_RED: &[Red] = &[
         measured: "2026-08-07",
     },
     Red {
+        test: "fd_lifetime",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(4, 7),
+        standing: Standing::Stands,
+        what: "`a killed process kept 16777216 bytes of its io_urings`, `ALONE … GREEN` every \
+               time. `kill_releases_ring` asks `SYS_SYSINFO` for the **machine's** free memory \
+               either side of a kill, and it shares the `tests/testcases` boot with every other \
+               Rust guest binary — so the verdict is only sound while nothing else in that guest \
+               holds or releases a page across the window, which nothing arranges. `/bin/logd` \
+               joining every image is what made it loud: it holds an `io_uring`, a 64 KiB record \
+               buffer and a `File` whose page-cache pages come and go",
+        evidence: "a same-session A/B of two seven-suite arms, 12 wide, on one dev host: 0 of 7 at \
+                   a76ffd0 against 4 of 7 at 19ce5d0, whose diff is comment text, one \
+                   caller-less kernel function deleted and a test-runner gate nothing on this \
+                   boot invokes. Two earlier sevens on the same two trees gave 1 of 7 and 2 of 7, \
+                   so the rate this row carries is the widest of four readings and not the only \
+                   one",
+        source: "specs/issues/build/free-memory-verdicts-share-a-boot.md",
+        measured: "2026-08-15",
+    },
+    Red {
         test: "screen_console_scroll",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::Seen,
