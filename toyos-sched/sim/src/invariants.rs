@@ -413,9 +413,15 @@ fn note_rt_service(vm: &mut Vm<'_>) -> bool {
 /// never hides the standard: `Vm::fair_over_bound` records every crossing of the
 /// derived bound whatever the allowance permits, and the sweep prints it.
 fn check_fairness(vm: &mut Vm<'_>, rt_present: bool) {
-    // Cleared here and re-established only by a comparison that actually
-    // happened, so `Vm::thread_covered_ns` counts the reach I13 has and not the
-    // reach it would have if every window stayed open.
+    // Both cleared here and re-established only by a comparison that actually
+    // happened, so `Vm::thread_covered_ns` and `Vm::fair_covered_ns` count the
+    // reach each check has and not the reach it would have if every window
+    // stayed open. I5's is cleared on the same line as I13's because every one
+    // of the four conditions below can close it — an RT task, a CPU going idle,
+    // the member set changing, or a member falling under its even share — and a
+    // flag cleared anywhere but the top would miss whichever of them returns
+    // early.
+    vm.fair_window_open = false;
     vm.thread_window_open = false;
     let (runnable, per_cpu, live_threads) = runnable_now(vm);
     let saturated = (0..vm.scenario.cpus).all(|cpu| vm.cpus[cpu].running().is_some());
@@ -529,6 +535,11 @@ fn check_fairness(vm: &mut Vm<'_>, rt_present: bool) {
         served.iter().copied().max().unwrap_or(0),
     );
     let spread = high - low;
+    // The comparison is made from here on, so this is where the window counts as
+    // open. Set after the early returns rather than before them: `members` being
+    // unchanged is not enough — a window that restarted this step has a zero
+    // baseline and separates nothing yet.
+    vm.fair_window_open = true;
     if spread > vm.fair_spread {
         vm.fair_spread = spread;
         vm.fair_bound = bound;

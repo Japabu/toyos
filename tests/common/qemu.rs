@@ -65,12 +65,20 @@ pub fn boot_census() -> (u32, u32, Vec<String>) {
 /// `arch::entry`'s `naked_asm!` bracket, which is the path its own gate is
 /// about — and `specs/assessments/test-cost-audit.md` §5.9.7 is where that is argued.
 ///
-/// A fourth entry is a decision to pay a kernel build per suite run forever, so
-/// it is made in the shared declaration rather than by adding a
-/// `kernel_features` to a `BootOptions`. Interactive debug mode is separate: it
-/// builds [`toyos_build::build::DEBUG_KERNEL_BUILD`] and returns before the
-/// suite.
-pub const DECLARED_KERNEL_BUILDS: [&str; 3] =
+/// [`toyos_build::build::SCHED_CHECK_KERNEL`] is the fourth, and it is the one
+/// this list's own warning was written about: an entry here is a decision to pay
+/// a kernel build per suite run forever, made in the shared declaration rather
+/// than by adding a `kernel_features` to a `BootOptions`. It was made because
+/// the alternative had already been paid for and delivered nothing —
+/// `kernel/Cargo.toml` has forwarded `sched-check = ["toyos-sched/check"]` since
+/// the check build was written, and nothing in `src/` or `tests/` ever asked for
+/// it, so `cpu::MAX_PASS_NS`, invariant P and `invariants::check_cpu` were
+/// compiled by no CI run at all. `sched_check_build` is the test that asks.
+///
+/// A fifth entry is that decision again, and it gets this paragraph's argument
+/// made afresh. Interactive debug mode is separate: it builds
+/// [`toyos_build::build::DEBUG_KERNEL_BUILD`] and returns before the suite.
+pub const DECLARED_KERNEL_BUILDS: [&str; 4] =
     toyos_build::build::TEST_SUITE_KERNEL_BUILDS;
 
 /// How many guests the phase now running may have up at once.
