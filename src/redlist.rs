@@ -1389,7 +1389,13 @@ pub const KNOWN_RED: &[Red] = &[
         test: "screen_diag_boot",
         instrument: Instrument::Ci,
         finding: Finding::fires(2, 2),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the string is the whole defect and it is now declared once: \
+             `common::volumes::LOG_ON_CONSOLE_AND_FILE` is what the assertion reads, beside \
+             `NO_LOG_ALERT`, which its Fast-tier sibling `screen_log_absent` already read that \
+             way, and its doc names `report_log_destination` as the writer. \
+             `specs/testing-strategy.md` §1.3 is the rule the copy broke (2026-08-16)",
+        ),
         what: "`\"log: this boot is on the console and in\" is not on screen five seconds after the \
                boot finished`, and `red again` alone in both runs. The mode is not what is broken: \
                the screen printed beside the message carries \
@@ -1399,7 +1405,7 @@ pub const KNOWN_RED: &[Red] = &[
                dispatches these were",
         evidence: "runs 31900045901 (job 95049265216) and 31900050723 (job 95049280299), both \
                    `guest (12)`, read with `gh run view --job`",
-        source: "specs/issues/build/screen-diag-boot-asserts-a-kernel-line-that-changed.md",
+        source: "tests/common/volumes.rs",
         measured: "2026-08-15",
     },
     Red {
