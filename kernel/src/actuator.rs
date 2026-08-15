@@ -53,6 +53,16 @@ macro_rules! actuators {
 
             $(#[$doc])*
             #[cfg(not(feature = "boot-actuators"))]
+            // **The one allow this file needs, and it is the shipping arm.**
+            // Nineteen of these accessors have their only call site inside a
+            // module that is itself `#[cfg(feature = "boot-actuators")]` —
+            // `input_merge_test`, `usb_gate`, `heartbeat`, the xHCI break
+            // arms — so in a shipping kernel the constant is compiled and the
+            // caller is not. Deleting them is not the answer: the whole claim
+            // of this file is that the shipping kernel folds every actuator to
+            // a constant, and an accessor that exists only in the test kernel
+            // makes that claim per-actuator instead of whole.
+            #[allow(dead_code)]
             #[inline(always)]
             pub const fn $name() -> bool {
                 false

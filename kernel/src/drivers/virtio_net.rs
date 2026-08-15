@@ -48,13 +48,11 @@ struct VirtioNic {
     device: VirtioDevice,
     rxq: Virtqueue,
     txq: Virtqueue,
-    mac: [u8; 6],
     /// Physical addresses for device DMA descriptors.
     rx_phys: [u64; RX_BUF_COUNT],
     tx_phys: u64,
     /// Virtual pointers for kernel read/write.
     rx_ptrs: [*mut u8; RX_BUF_COUNT],
-    tx_ptr: *mut u8,
     // Maps virtqueue descriptor index -> rx_bufs index
     desc_to_buf: [u16; RX_QUEUE_SIZE as usize],
     /// Stash area: slot returned by poll_used, indexed by buf_idx, consumed by refill_rx_buf.
@@ -79,10 +77,6 @@ impl VirtioNic {
 }
 
 impl crate::net::Nic for VirtioNic {
-    fn mac(&self) -> [u8; 6] {
-        self.mac
-    }
-
     fn has_packet(&self) -> bool {
         self.rxq.has_used()
     }
@@ -203,7 +197,6 @@ pub fn init(devices: &[PciDevice]) {
         dma.ptr_at(OFF_RX_BUFS + i * 0x1000)
     });
     let tx_phys = dma.phys() + OFF_TX_BUF as u64;
-    let tx_ptr = dma.ptr_at(OFF_TX_BUF);
 
     let dma_base_phys = dma.phys() & !(crate::mm::PAGE_2M - 1);
     let dma_region = Region {
@@ -230,7 +223,7 @@ pub fn init(devices: &[PciDevice]) {
 
     const NONE_SLOT: Option<DescSlot> = None;
     let mut nic = VirtioNic {
-        device, rxq, txq, mac, rx_phys, tx_phys, rx_ptrs, tx_ptr,
+        device, rxq, txq, rx_phys, tx_phys, rx_ptrs,
         desc_to_buf: [0; RX_QUEUE_SIZE as usize],
         pending_rx_slots: [NONE_SLOT; RX_BUF_COUNT],
         tx_slot: Some(tx_slot),

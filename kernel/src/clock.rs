@@ -18,7 +18,6 @@
 //! return type, and every consumer decides what to do about it. Nothing here
 //! invents 1970.
 
-use core::fmt;
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::{Acquire, Relaxed, Release}};
 
 use crate::mm::paging::CachePolicy;
@@ -118,6 +117,35 @@ pub fn tsc_deadline(nanos: u64) -> u64 {
     cpu::rdtsc().saturating_add(ticks as u64)
 }
 
+/// Poll `ready` until it holds, or until `nanos` have passed. `false` is the
+/// deadline, and every caller turns it into a refusal that names the register
+/// it was waiting on.
+///
+/// **The one bounded wait a driver spins in, and it reads the TSC rather than
+/// the nanosecond clock.** This body was written three times — `drivers/hda.rs`,
+/// `drivers/hda_probe.rs` and `drivers/xhci/wait/mod.rs`, byte-identical apart
+/// from which constant each named — and all three read [`nanos_since_boot`] per
+/// iteration, whose 128-bit divide is an out-of-line `compiler_builtins` call.
+/// [`tsc_deadline`] and a 64-bit compare inline, which is why
+/// `src/redlist.rs`'s `dump_nmi_probe` red was retired on this form: a spin
+/// that calls out of itself is a spin an instruction-pointer sample attributes
+/// to `u128_div_rem` instead of to the loop. Consolidating the other way would
+/// re-open that red, so this direction is a constraint and not a taste.
+///
+/// Before [`init`] the TSC period is zero, [`tsc_deadline`] saturates and the
+/// wait is unbounded — the same behaviour the three copies had, and reachable
+/// only by a caller running before phase 2.
+pub fn settles(nanos: u64, ready: impl Fn() -> bool) -> bool {
+    let until = tsc_deadline(nanos);
+    while !ready() {
+        if cpu::rdtsc() >= until {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
+}
+
 /// Unix seconds, in the machine's own zone, at `nanos_since_boot() == 0`.
 static BOOT_LOCAL_SECS: AtomicU64 = AtomicU64::new(0);
 /// Seconds to add to the machine's own zone to get UTC — firmware's
@@ -181,102 +209,10 @@ pub fn utc_secs() -> Option<u64> {
     Some(local.saturating_add_signed(UTC_OFFSET_SECS.load(Relaxed)))
 }
 
-/// A wall-clock instant in the fields a human reads.
-///
-/// The kernel's one calendar. The RTC decodes its registers into this, the log
-/// file is named from it, and `SYS_CLOCK_REALTIME` answers out of it — so there
-/// is one conversion between seconds and dates in the kernel rather than one
-/// per caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Civil {
-    pub year: u64,
-    pub month: u64,
-    pub day: u64,
-    pub hour: u64,
-    pub min: u64,
-    pub sec: u64,
-}
-
-impl fmt::Display for Civil {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            self.year, self.month, self.day, self.hour, self.min, self.sec
-        )
-    }
-}
-
-impl Civil {
-    /// Whether these fields name a day that exists, at a time that exists.
-    ///
-    /// The Unix epoch is the floor because everything downstream counts
-    /// unsigned seconds from it. A leap second lands on 60 and is rejected: the
-    /// RTC does not report one, and a clock that does is not one this kernel
-    /// understands.
-    pub fn is_valid(&self) -> bool {
-        (1970..=9999).contains(&self.year)
-            && (1..=12).contains(&self.month)
-            && (1..=days_in_month(self.year, self.month)).contains(&self.day)
-            && self.hour < 24
-            && self.min < 60
-            && self.sec < 60
-    }
-
-    /// Seconds from the Unix epoch to this instant, reading it in the same zone
-    /// the epoch is in.
-    ///
-    /// Saturating on an invalid instant rather than refusing, because the one
-    /// caller that can produce one is [`Self::is_valid`]'s own check.
-    pub fn to_unix_secs(&self) -> u64 {
-        days_from_civil(self.year, self.month, self.day) * 86_400
-            + self.hour * 3_600
-            + self.min * 60
-            + self.sec
-    }
-
-    pub fn from_unix_secs(secs: u64) -> Civil {
-        let (year, month, day) = civil_from_days(secs / 86_400);
-        let rem = secs % 86_400;
-        Civil { year, month, day, hour: rem / 3_600, min: rem % 3_600 / 60, sec: rem % 60 }
-    }
-}
-
-fn is_leap(year: u64) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
-}
-
-fn days_in_month(year: u64, month: u64) -> u64 {
-    const LENGTHS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    match month {
-        2 if is_leap(year) => 29,
-        1..=12 => LENGTHS[month as usize - 1],
-        _ => 0,
-    }
-}
-
-/// Days from 1970-01-01 to this date. Hinnant's algorithm, restricted to the
-/// non-negative half — the epoch is [`Civil::is_valid`]'s floor.
-fn days_from_civil(year: u64, month: u64, day: u64) -> u64 {
-    let y = if month <= 2 { year.saturating_sub(1) } else { year };
-    let era = y / 400;
-    let yoe = y - era * 400;
-    let mp = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * mp + 2) / 5 + day.saturating_sub(1);
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era * 146_097 + doe).saturating_sub(719_468)
-}
-
-/// The inverse.
-fn civil_from_days(days: u64) -> (u64, u64, u64) {
-    let z = days + 719_468;
-    let era = z / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { y + 1 } else { y }, m, d)
-}
+// The calendar is `toyos-wallclock`'s, and the kernel is one of its callers
+// rather than a second copy of it. `Civil`, its validity rule and its two
+// conversions used to live here as well, byte-identical to that crate's — which
+// was added *beside* this file rather than replacing it, so the copy userland
+// could not reach was also the copy no test could run. `kernel/src/rtc.rs`
+// decodes into `toyos_wallclock::Civil` and `SYS_CLOCK_REALTIME` answers out of
+// it; the crate's nine host tests are what stand behind both.

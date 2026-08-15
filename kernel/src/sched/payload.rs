@@ -58,10 +58,6 @@ pub const fn static_queue(class: WaitClass) -> KWaitQueue {
     KWaitQueue::new(class, KernelLock::new(WaitList::new()))
 }
 
-pub fn heap_queue(class: WaitClass) -> Arc<KWaitQueue> {
-    Arc::new(static_queue(class))
-}
-
 /// The saved callee context, plus everything `Hw::switch` must load without
 /// dereferencing anything else.
 pub struct KernelCtx {

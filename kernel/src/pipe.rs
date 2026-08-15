@@ -23,8 +23,6 @@ use crate::DirectMap;
 pub struct PipeId(usize);
 
 impl PipeId {
-    pub fn raw(self) -> usize { self.0 }
-    pub fn from_raw(v: usize) -> Self { Self(v) }
 }
 
 impl core::ops::Add for PipeId {

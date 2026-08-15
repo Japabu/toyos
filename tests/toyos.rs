@@ -2550,7 +2550,9 @@ fn run_screen_test(
             }
             serial::Serial::named("boot console", console.as_str()).must_be_clean()?;
 
-            for want in ["Boot: complete", "i8042:", "log: this boot is on the console and in"] {
+            for want in
+                ["Boot: complete", "i8042:", common::volumes::LOG_ON_CONSOLE_AND_FILE]
+            {
                 if !text.contains(want) {
                     return Err(format!(
                         "{want:?} is not on screen five seconds after the boot \

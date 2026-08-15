@@ -716,11 +716,11 @@ fn power_up(pci: &PciDevice) {
 /// would report a codec that does not exist.
 fn reset_controller(regs: Mmio) -> bool {
     regs.write_u32(GCTL, 0);
-    if !settles(|| regs.read_u32(GCTL) & GCTL_CRST == 0) {
+    if !crate::clock::settles(SETTLE_NS, || regs.read_u32(GCTL) & GCTL_CRST == 0) {
         return false;
     }
     regs.write_u32(GCTL, GCTL_CRST);
-    if !settles(|| regs.read_u32(GCTL) & GCTL_CRST != 0) {
+    if !crate::clock::settles(SETTLE_NS, || regs.read_u32(GCTL) & GCTL_CRST != 0) {
         return false;
     }
     spin_ns(CODEC_DETECT_NS);
@@ -731,11 +731,11 @@ fn reset_controller(regs: Mmio) -> bool {
 /// registers before the kernel writes the ones it means.
 fn reset_stream(stream: Mmio) -> bool {
     stream.write_u8(SD_CTL, SD_CTL_SRST);
-    if !settles(|| stream.read_u8(SD_CTL) & SD_CTL_SRST != 0) {
+    if !crate::clock::settles(SETTLE_NS, || stream.read_u8(SD_CTL) & SD_CTL_SRST != 0) {
         return false;
     }
     stream.write_u8(SD_CTL, 0);
-    settles(|| stream.read_u8(SD_CTL) & SD_CTL_SRST == 0)
+    crate::clock::settles(SETTLE_NS, || stream.read_u8(SD_CTL) & SD_CTL_SRST == 0)
 }
 
 /// Arm the completion interrupt, or say why this machine has no HDA audio.
@@ -756,17 +756,6 @@ fn arm_interrupt(pci: &PciDevice) -> bool {
         pci.func
     );
     false
-}
-
-fn settles(ready: impl Fn() -> bool) -> bool {
-    let deadline = crate::clock::nanos_since_boot() + SETTLE_NS;
-    while !ready() {
-        if crate::clock::nanos_since_boot() >= deadline {
-            return false;
-        }
-        core::hint::spin_loop();
-    }
-    true
 }
 
 fn spin_ns(duration: u64) {

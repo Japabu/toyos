@@ -610,12 +610,12 @@ fn power_up(pci: &PciDevice) {
 /// would report a codec that does not exist.
 fn reset(regs: Mmio) -> bool {
     regs.write_u32(GCTL, 0);
-    if !settles(|| regs.read_u32(GCTL) & GCTL_CRST == 0) {
+    if !crate::clock::settles(SETTLE_NS, || regs.read_u32(GCTL) & GCTL_CRST == 0) {
         log!("hda: controller never entered reset (GCTL={:#010x}) — refused", regs.read_u32(GCTL));
         return false;
     }
     regs.write_u32(GCTL, GCTL_CRST);
-    if !settles(|| regs.read_u32(GCTL) & GCTL_CRST != 0) {
+    if !crate::clock::settles(SETTLE_NS, || regs.read_u32(GCTL) & GCTL_CRST != 0) {
         log!("hda: controller never left reset (GCTL={:#010x}) — refused", regs.read_u32(GCTL));
         return false;
     }
@@ -663,14 +663,14 @@ impl Answer {
 fn get(regs: Mmio, codec: Address, node: Node, verb: u16, payload: u8) -> Answer {
     let command = Verb::short(codec, node, verb, payload);
 
-    if !settles(|| regs.read_u16(IMMEDIATE_STATUS) & IMMEDIATE_BUSY == 0) {
+    if !crate::clock::settles(SETTLE_NS, || regs.read_u16(IMMEDIATE_STATUS) & IMMEDIATE_BUSY == 0) {
         return Answer::Silent;
     }
     regs.write_u16(IMMEDIATE_STATUS, IMMEDIATE_RESULT_VALID);
     regs.write_u32(IMMEDIATE_COMMAND, command.raw());
     regs.write_u16(IMMEDIATE_STATUS, IMMEDIATE_BUSY);
 
-    let done = settles(|| {
+    let done = crate::clock::settles(SETTLE_NS, || {
         let status = regs.read_u16(IMMEDIATE_STATUS);
         status & IMMEDIATE_BUSY == 0 && status & IMMEDIATE_RESULT_VALID != 0
     });
@@ -974,18 +974,6 @@ fn pin(regs: Mmio, codec: Address, node: Node) -> usize {
 }
 
 // --- bounded waiting ---
-
-/// Poll `ready` until it holds or [`SETTLE_NS`] passes.
-fn settles(ready: impl Fn() -> bool) -> bool {
-    let deadline = crate::clock::nanos_since_boot() + SETTLE_NS;
-    while !ready() {
-        if crate::clock::nanos_since_boot() >= deadline {
-            return false;
-        }
-        core::hint::spin_loop();
-    }
-    true
-}
 
 fn spin_until_ns(duration: u64) {
     let deadline = crate::clock::nanos_since_boot() + duration;

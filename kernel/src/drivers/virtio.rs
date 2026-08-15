@@ -556,10 +556,6 @@ impl VirtioDevice {
         self.config.notify_off_multiplier
     }
 
-    pub fn common_config(&self) -> Mmio {
-        self.config.common
-    }
-
     pub fn device_config(&self) -> Mmio {
         self.config.device
     }

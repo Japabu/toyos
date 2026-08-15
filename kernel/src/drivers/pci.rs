@@ -144,6 +144,7 @@ impl PciDevice {
     /// Separate from [`Self::enable_msix`] because a diagnostic asks what a
     /// function offers without arming anything, and the two must not be able
     /// to disagree about what the registers said.
+    #[cfg(feature = "boot-actuators")]
     pub fn msix(&self) -> Option<Result<msix::Msix, msix::Unusable>> {
         let cap = self.capabilities().find(|c| c.id() == msix::CAP_ID)?;
         Some(msix::Msix::decode(
@@ -153,6 +154,7 @@ impl PciDevice {
     }
 
     /// What this function's MSI capability says about itself, if it has one.
+    #[cfg(feature = "boot-actuators")]
     pub fn msi(&self) -> Option<msi::Msi> {
         let cap = self.capabilities().find(|c| c.id() == msi::CAP_ID)?;
         Some(msi::Msi::decode(cap.read_u16(msi::MESSAGE_CONTROL)))

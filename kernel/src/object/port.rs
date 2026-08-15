@@ -180,10 +180,6 @@ impl Connector {
         Ok(())
     }
 
-    pub fn waiters(&self) -> Arc<KWaitQueue> {
-        self.shared.waiters()
-    }
-
     pub fn port(&self) -> Arc<PortShared> {
         self.shared.clone()
     }

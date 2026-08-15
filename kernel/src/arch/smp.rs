@@ -16,7 +16,6 @@ const DATA_OFFSET: usize = 0xF00;
 
 static AP_STARTED: AtomicBool = AtomicBool::new(false);
 static SMP_READY: AtomicBool = AtomicBool::new(false);
-static NEXT_CPU_ID: AtomicU32 = AtomicU32::new(1); // BSP is 0
 static CPU_COUNT: AtomicU32 = AtomicU32::new(1); // BSP counts as 1
 
 /// cpu_id → LAPIC id, filled during AP bring-up. Needed for targeted IPIs

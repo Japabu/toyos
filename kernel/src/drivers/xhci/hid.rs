@@ -67,6 +67,10 @@ pub struct HidDevice {
     pub failures: u8,
     /// Completions this endpoint has produced, which nothing but the injection
     /// below counts.
+    // Counted in every build and compared in none but the test kernel's: the
+    // `xhci-hid-break-*` arms are what read it, and a counter that only exists
+    // when the actuator does would make the count itself a second code path.
+    #[cfg_attr(not(feature = "boot-actuators"), allow(dead_code))]
     pub completions: u32,
 }
 

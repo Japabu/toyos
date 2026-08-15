@@ -536,7 +536,7 @@ form at the wrap, which is the one place its two runs differ.
 
 - `Protection` — an enum with **no default**, the same explicitness
   `CachePolicy` has. Every mapping entry point (`map_range`, `remap`,
-  `map_alloc`, `alloc_and_map`, `vma_map`) takes one instead of
+  `alloc_and_map`, `vma_map`) takes one instead of
   `writable: bool`, so every call site states R / RW / RX / R-X and the compiler
   refuses a site that does not. This is the ladder's *compile-checked* rung and
   is what makes `vma_map`'s unconditional `true` unrepresentable rather than
@@ -912,8 +912,11 @@ Named so the gaps are decisions rather than oversights:
 
   - **`Protection`, with no default**, already threaded through every user
     mapping entry point. #166 adds the direct map's callers, and the compiler
-    names them rather than a grep: `map_2m`/`unmap_2m` (`paging.rs:709,725`)
-    and `map_mmio`/`unmap_mmio` are the whole set.
+    names them rather than a grep: `map_2m` and `map_mmio`/`unmap_mmio` are the
+    whole set. (`map_alloc` and `unmap_2m` were on this list until 2026-08-16,
+    when both were deleted for having no caller — the mechanism-consolidation
+    audit's A8. A `Protection` this stage threads through them would be a
+    parameter of a function nothing calls.)
   - **`EFER.NXE` already set on every CPU**, so bit 63 is expressible at all.
     Without it a mapping asking for NX faults as a reserved-bit violation, and
     that is the trap #166 would otherwise fall into first.

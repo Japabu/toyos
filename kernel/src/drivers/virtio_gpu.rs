@@ -16,7 +16,6 @@ use crate::sync::Lock;
 const VIRTIO_VENDOR: u16 = 0x1AF4;
 const VIRTIO_GPU_DEVICE: u16 = 0x1050; // 0x1040 + device_id 16
 
-const CMD_GET_DISPLAY_INFO: u32 = 0x0100;
 const CMD_RESOURCE_CREATE_2D: u32 = 0x0101;
 const CMD_RESOURCE_UNREF: u32 = 0x0102;
 const CMD_SET_SCANOUT: u32 = 0x0103;
@@ -28,7 +27,6 @@ const CMD_UPDATE_CURSOR: u32 = 0x0300;
 const CMD_MOVE_CURSOR: u32 = 0x0301;
 
 const RESP_OK_NODATA: u32 = 0x1100;
-const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 const RESP_OK_EDID: u32 = 0x1104;
 
 const VIRTIO_GPU_F_EDID: u64 = 1 << 1;
@@ -79,21 +77,6 @@ struct Rect {
     y: u32,
     width: u32,
     height: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct DisplayOne {
-    r: Rect,
-    enabled: u32,
-    flags: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct RespDisplayInfo {
-    hdr: CtrlHeader,
-    pmodes: [DisplayOne; 16],
 }
 
 #[repr(C)]
@@ -206,7 +189,6 @@ struct RespEdid {
 struct FbAlloc {
     regions: [Region; 2],
     phys_addrs: [u64; 2],
-    ptrs: [*mut u8; 2],
 }
 
 unsafe impl Send for GpuController {}
@@ -262,32 +244,6 @@ impl GpuController {
             core::slice::from_raw_parts(req as *const T as *const u8, core::mem::size_of::<T>())
         };
         self.command_raw(bytes, core::mem::size_of::<CtrlHeader>() as u32)
-    }
-
-    fn get_display_info(&mut self) -> RespDisplayInfo {
-        let hdr = CtrlHeader::new(CMD_GET_DISPLAY_INFO);
-        let bytes = unsafe {
-            core::slice::from_raw_parts(&hdr as *const _ as *const u8, core::mem::size_of::<CtrlHeader>())
-        };
-        let resp_size = core::mem::size_of::<RespDisplayInfo>() as u32;
-
-        unsafe {
-            copy_nonoverlapping(bytes.as_ptr(), self.req_ptr, bytes.len());
-        }
-
-        let slot = self.control_slot.take().expect("GPU: no control slot");
-        self.control_slot = Some(self.controlq.submit_and_wait(
-            slot,
-            &[
-                (self.req_phys, bytes.len() as u32, BufDir::Readable),
-                (self.resp_phys, resp_size, BufDir::Writable),
-            ],
-            self.device.notify_mmio(),
-            self.device.notify_off_multiplier(),
-            0,
-        ));
-
-        unsafe { read_volatile(self.resp_ptr as *const RespDisplayInfo) }
     }
 
     fn get_edid(&mut self, scanout: u32) -> RespEdid {
@@ -469,7 +425,6 @@ impl GpuController {
         let fb_pages = (fb_size + PAGE_2M as usize - 1) / PAGE_2M as usize;
         let fb_aligned = (fb_pages * PAGE_2M as usize) as u64;
         let mut phys_addrs = [0u64; 2];
-        let mut ptrs = [core::ptr::null_mut(); 2];
         let all_pages =
             [crate::mm::pmm::alloc_contiguous(fb_pages, crate::mm::pmm::Category::Framebuffer)?,
              crate::mm::pmm::alloc_contiguous(fb_pages, crate::mm::pmm::Category::Framebuffer)?];
@@ -484,10 +439,12 @@ impl GpuController {
         });
         for i in 0..2 {
             phys_addrs[i] = regions[i].phys.phys();
-            ptrs[i] = regions[i].phys.as_mut_ptr::<u8>();
-            log!("VirtIO GPU: buffer {} at {:?} phys={:#x} ({} bytes)", i, ptrs[i], phys_addrs[i], fb_size);
+            log!(
+                "VirtIO GPU: buffer {} at {:?} phys={:#x} ({} bytes)",
+                i, regions[i].phys.as_mut_ptr::<u8>(), phys_addrs[i], fb_size
+            );
         }
-        Some(FbAlloc { regions, phys_addrs, ptrs })
+        Some(FbAlloc { regions, phys_addrs })
     }
 
     fn build_gpu_info(&self) -> GpuInfo {
@@ -631,7 +588,6 @@ pub fn init(devices: &[PciDevice]) -> Option<(Box<dyn Gpu>, GpuInfo)> {
         fb: FbAlloc {
             regions: core::array::from_fn(|_| Region::empty()),
             phys_addrs: [0; 2],
-            ptrs: [core::ptr::null_mut(); 2],
         },
         cursor: Region::empty(),
     };

@@ -41,7 +41,6 @@ use toyos_abi::syscall::SyscallError;
 pub struct RingId(usize);
 
 impl RingId {
-    pub fn raw(self) -> usize { self.0 }
 }
 
 impl core::ops::Add for RingId {

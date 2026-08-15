@@ -61,7 +61,4 @@ impl Namespace {
         Some(&self.entries[i].1)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &Arc<Connector>)> {
-        self.entries.iter().map(|(name, c)| (&**name, c))
-    }
 }
