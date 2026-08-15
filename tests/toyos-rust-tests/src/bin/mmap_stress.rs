@@ -1,4 +1,4 @@
-use toyos_abi::syscall::{mmap, munmap, MmapProt, MmapFlags};
+use toyos_abi::syscall::{mmap, munmap, pipe, pipe_map, MmapProt, MmapFlags};
 use std::collections::HashSet;
 
 fn main() {
@@ -168,6 +168,24 @@ fn main() {
          below the freed {fixed:p}"
     );
     unsafe { munmap(reused, page_2m) }.expect("the reused region could not be freed");
+
+    // The last thing a FIXED request can run into: a range that is exactly one
+    // region and not one `mmap` made. A pipe's window is 2 MiB of the same
+    // arena, placed by the same search and owned by the pipe — the one case
+    // where "replace exactly one whole mapping" would otherwise let a process
+    // take something that is not its to take.
+    let pipe = pipe().expect("pipe");
+    let window = pipe_map(pipe.read).expect("pipe_map");
+    let published = unsafe { window.read() };
+    let got = unsafe {
+        mmap(window, page_2m, MmapProt::READ | MmapProt::WRITE,
+             MmapFlags::ANONYMOUS | MmapFlags::PRIVATE | MmapFlags::FIXED)
+    };
+    assert!(got.is_null(), "FIXED took the pipe window at {window:p}");
+    assert_eq!(
+        unsafe { window.read() }, published,
+        "a refused FIXED request unmapped the pipe window it was refused for"
+    );
 
     println!("all mmap stress tests passed (64 regions, no overlaps)");
 }
