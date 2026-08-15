@@ -60,14 +60,14 @@ The bar is not yet the tree. The standing failures are declared rather than remo
 
 `specs/testing-strategy.md` is the testing law. Operationally:
 
-- `cargo run` builds everything (toolchain, kernel, bootloader, userland, initrd) and launches QEMU; `--build-only` skips the launch. `cargo test` runs the QEMU harness.
+- `cargo run` builds everything (toolchain, kernel, bootloader, userland, initrd) and launches QEMU; `--build-only` skips the launch. `cargo test` runs the QEMU harness; `cargo test --workspace --exclude toyos-build` runs every host-crate suite.
 - **Agents verify through `cargo test`, never `cargo run`** — the run path opens a QEMU window on the owner's desktop by design; the harness runs headless.
 - **Both produce large output**: run them in the background and read the output file — `[N characters truncated]` means data was lost. ToyOS is fast: a full boot is under a second, incremental builds finish in seconds.
 
 ## Repository layout
 
 ```
-src/               Build system (the root cargo project, package name: toyos-build)
+src/               Build system (the root cargo project, package name: toyos-build; its Cargo.toml is also the host workspace, and a gate reds on a crate that joins neither members nor exclude)
 kernel/            Kernel
 kernel-loom/       Loom models of the kernel's lock-free concurrency, beside the kernel and not in it
 kernel-span/       Host harness for `kernel/src/mm/user_span.rs`, the same arrangement
@@ -107,7 +107,7 @@ system.toml        What to build and boot
 - **Never truncate command output.** No `| head`, `| tail`, `| grep` to reduce it; long output runs in the background and is read from the file.
 - **Always be empirical.** Read actual output; run the code; investigate root causes instead of guessing.
 - **Every written number comes from a command that was run.** An estimate or datasheet bound says so. Write commit messages with `git commit -F <file>`, never `-m` — a double-quoted `-m` substitutes backticks and the shell runs them.
-- **Commit freely on your branch; land through a pull request.** `main` moves only through a merged PR, and `cargo run -- --pr` is the whole local half. `gh pr create --draft` at the first push — CI runs on PRs and nothing else; `gh pr ready` plus a written `--title`/`--body-file` when finished (never `--fill`); `gh pr merge --auto --merge`; `cargo run -- --sync` after it lands. Never merge into `main` by hand. Your branch must contain `origin/main` or the merge button stays shut. The PR's title and body become the merge commit's: write them as main's record. An ABI change lands on its own PR first; `Abi-Inseparable: <why>` declares the split that genuinely cannot be made. Every merge leaves `main`'s tip compiling.
+- **Commit freely on your branch; land through a pull request.** `main` moves only through a merged PR, and `cargo run -- --pr` is the whole local half. `gh pr create --draft` at the first push — CI runs on PRs and nothing else; `gh pr ready` plus a written `--title`/`--body-file` when finished (never `--fill`); `gh pr merge --auto --merge`; `cargo run -- --sync` after it lands. Never merge into `main` by hand. Your branch must contain `origin/main` or the merge button stays shut. The PR's title and body become the merge commit's: write them as main's record. A modify/delete conflict is resolved by accounting for every hunk of the modified side, never by checking its headings survived. An ABI change lands on its own PR first; `Abi-Inseparable: <why>` declares the split that genuinely cannot be made. Every merge leaves `main`'s tip compiling.
 - **Never rewrite history, and never touch `main`.** No `--amend`, no `rebase`, no `--force` — on your own branch as much as anywhere: a pushed hash may already be cited. `main` is protected — PR required, no force-push, no deletion, no bypass.
 - **A red is known only if `cargo run -- --known-red <test>` says so** (`src/redlist.rs`). A PR red not about the author's diff is adjudicated there and fixed at its owner, never re-run away.
 - **Host load is not an excuse.** A load-coincident audio failure is investigated as a real defect, never re-run away as noise; evidence against that assumption goes to the owner, not into quiet workarounds.
