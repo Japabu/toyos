@@ -38,7 +38,7 @@ The stamps are all inside the keyboard bring-up window: **403 ms, 459 ms and
 | this branch before the byte ring went (`b8457df`) | 5 | 0 |
 | this branch after it (`ee8369c`+) | 5 | 2 |
 | the same with the *drain's* interrupts-off window bounded | 5 | 1 |
-| the same with **`write_console`'s** window bounded as well (2026-08-15) | 5 | **1** |
+| the same with **`write_console`'s** window bounded as well (2026-08-15) | 9 | **2** |
 | the tip of the same branch, that one window *not* bounded, same session | 5 | **1** |
 
 ## The blame, and it named one aggressor when there were two
@@ -57,9 +57,10 @@ bound and this one are the two halves of what `kernel/CLAUDE.md`'s
 `BackendGuard` caveat asks for.
 
 **Bounding it does not move the rate, and that is what settles the blame.** The
-last two rows are one interleaved A/B in one session — ten full suites, five
-with that window bounded and five without — and each five carries exactly one
-red. The isolated re-run the harness takes afterwards did not even agree with
+last two rows are one session — an interleaved A/B of five suites per arm,
+plus the four the landing gate then ran on the bounded arm — and the rate is
+where it was: 2 of 9 against 1 of 5, which for counts this size is no movement
+at all. The isolated re-run the harness takes afterwards did not even agree with
 itself across the two occurrences: `red again` on one, `ALONE: GREEN` on the
 other, which is what a race whose window is somebody else's looks like from
 here. So what is left is not an interrupts-off window this branch owns; it is
@@ -68,7 +69,7 @@ exposes and does not cause. Recorded rather than re-run away.
 
 `cargo run -- --known-red i8042_undecoded_bytes` said **NOT ON THE LIST** when
 this entry was opened; it now answers the row that cites it —
-`src/redlist.rs`, FIRES 2 of 10, dev host loaded, 2026-08-15.
+`src/redlist.rs`, FIRES 3 of 14, dev host loaded, 2026-08-15.
 
 ## Two halves, and they want different fixes
 

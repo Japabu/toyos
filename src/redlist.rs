@@ -1187,20 +1187,22 @@ pub const KNOWN_RED: &[Red] = &[
         measured: "2026-08-07",
     },
     // ---------------------------------------------------------------------
-    // `wt/toyos-logd`, dev host, 2026-08-15: **ten** full suites in one
-    // session, run as an interleaved A/B of L3's review finding F1 — five with
-    // `write_console`'s interrupts-off window bounded and five with the branch
-    // tip's single acquisition around a userland-chosen length. Both names
-    // below red once in each five. **That the rate does not move is the
-    // finding**: the branch's remaining suspicion for both was an
-    // interrupts-off window it owns, and bounding the last one leaves the rate
-    // where it was, so what is left belongs to the two write-ups cited here.
-    // Adjudicated rather than carried, per the root CLAUDE.md.
+    // `wt/toyos-logd`, dev host, 2026-08-15: **fourteen** full suites in one
+    // session — an interleaved A/B of L3's review finding F1, five suites with
+    // the branch tip's single `BackendGuard` acquisition around a
+    // userland-chosen length and nine with `write_console`'s window bounded
+    // (five of the A/B and the four the landing gate then ran). **That the
+    // rates do not move is the finding**: the branch's remaining suspicion for
+    // both names was an interrupts-off window it owns, and bounding the last
+    // one leaves each where it was — i8042 2 of 9 against 1 of 5, macro 3 of 9
+    // against 1 of 5, which for counts this size is the same rate. So what is
+    // left belongs to the two write-ups cited here. Adjudicated rather than
+    // carried, per the root CLAUDE.md.
     // ---------------------------------------------------------------------
     Red {
         test: "i8042_undecoded_bytes",
         instrument: Instrument::DevHostLoaded,
-        finding: Finding::fires(2, 10),
+        finding: Finding::fires(3, 14),
         standing: Standing::Stands,
         what: "`the line names no byte: [kernel 0.418 cpu1] i8042: 1 interrupts and 0 bytes, \
                nothing decoded — first seen at 418ms`. The test takes the *first* `nothing \
@@ -1209,24 +1211,26 @@ pub const KNOWN_RED: &[Red] = &[
                earlier one. **The isolated re-run answered differently on the two arms** — `red \
                again` on one occurrence and `ALONE: GREEN` on the other — which is itself evidence \
                that the timing and not the arm decides it",
-        evidence: "ten full `cargo test` suites in one session on `wt/toyos-logd`, five per arm of \
-                   the F1 A/B, one red in each five; `main` (4d8c2e9) 0 of 7 and this branch 0 of \
-                   5 before the byte ring went, both recorded in the source below",
+        evidence: "fourteen full `cargo test` suites in one session on `wt/toyos-logd`: 2 of the 9 \
+                   with the window bounded and 1 of the 5 without; `main` (4d8c2e9) 0 of 7 and \
+                   this branch 0 of 5 before the byte ring went, both recorded in the source below",
         source: "specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md",
         measured: "2026-08-15",
     },
     Red {
         test: "71_macro_empty_arg",
         instrument: Instrument::DevHostLoaded,
-        finding: Finding::fires(2, 10),
+        finding: Finding::fires(4, 14),
         standing: Standing::Stands,
         what: "`output mismatch`, expected `17` and the capture empty — the child's own line fell \
                outside the `===TEST_START===`/`===TEST_END===` window the C family compares whole. \
                Same shape and same test name the write-up records at `dbbdcbe`, which is before \
                this branch existed. **The log spec's §4.3 said bounding the console drain took \
-               this to zero in five; ten suites here say one in five on both arms**, so that was a \
-               lucky five rather than a fix, and §4.3 is corrected to say so",
-        evidence: "the same ten suites as the row above, one red in each five",
+               this to zero in five; fourteen suites here say roughly one in four whatever the \
+               console lock does**, so that was a lucky five rather than a fix, and §4.3 is \
+               corrected to say so",
+        evidence: "the same fourteen suites as the row above: 3 of the 9 with the window bounded \
+                   and 1 of the 5 without",
         source: "specs/issues/build/daemon-lines-land-in-any-test-window.md",
         measured: "2026-08-15",
     },
