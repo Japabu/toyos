@@ -1340,6 +1340,121 @@ pub const KNOWN_RED: &[Red] = &[
         source: "specs/issues/build/sshd-panics-when-netd-exits-before-it-binds.md",
         measured: "2026-08-15",
     },
+    // ---------------------------------------------------------------------
+    // `wt/toyos-ciwall`, dev host, 2026-08-15: the one-accumulator tree's full
+    // suite (landed as `81cfe22`), 256 passed and 4 failed, with a second
+    // worktree's suite holding guest slots beside it. Two of the four are the
+    // same QEMU-exited-0 signature under two names, which is neither test's
+    // subject — a shard's partitioning diff cannot reach a guest that never
+    // booted.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "screen_fatal_halt",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`[qemu] QEMU died before ===READY=== (status: Ok(ExitStatus(unix_wait_status(0))))` \
+               — QEMU exited *successfully* before the guest said anything, so the capture holds \
+               nothing to bisect and the test's name is the whole of the evidence. \
+               `ALONE: GREEN`, and green again in 3 s run by name",
+        evidence: "one full `cargo test` on `wt/toyos-ciwall`, in its 106.4 s parallel phase, with \
+                   `[host-slots]` naming `toyos-capwin`'s suite on the same host; the run's own \
+                   width line was `fastest boot 1380 ms against the reference 1320 ms`, 1.05x, so \
+                   this is not the slow-phase shape",
+        source: "specs/issues/build/qemu-exits-clean-before-ready.md",
+        measured: "2026-08-15",
+    },
+    Red {
+        test: "double_fault_stack",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "the identical line, in the same phase as the row above — and the two names have \
+               nothing in common but a boot. `ALONE: GREEN`, and green again in 2 s run by name",
+        evidence: "the same full `cargo test` on `wt/toyos-ciwall`; the same day the signature also \
+                   took `log_backing_read_error` on `wt/toyos-logd56` and, through the screendump \
+                   wait rather than the ready marker, `screen_console_shell` on `wt/toyos-capwin`",
+        source: "specs/issues/build/qemu-exits-clean-before-ready.md",
+        measured: "2026-08-15",
+    },
+    // ---------------------------------------------------------------------
+    // The nightly A/B of the one-accumulator fix: dispatches `31900045901`
+    // (`main` at e064a96) and `31900050723` (the same tree plus the fix),
+    // twelve KVM shards each, minutes apart on one runner pool. The trees
+    // differ only in `src/testargs.rs`, `tests/toyos.rs` and a deleted issue
+    // file, so nothing in either guest image moved — what the fix changes is
+    // which shard a test lands in.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "screen_diag_boot",
+        instrument: Instrument::Ci,
+        finding: Finding::fires(2, 2),
+        standing: Standing::Stands,
+        what: "`\"log: this boot is on the console and in\" is not on screen five seconds after the \
+               boot finished`, and `red again` alone in both runs. The mode is not what is broken: \
+               the screen printed beside the message carries \
+               `log: this boot is on the console and on /log`, the wording `ecede44` gave the line \
+               after `9ca7631` took the file off the kernel. A `Tier::Nightly` name, so no pull \
+               request runs it, and the nightly's alarm job fires on `schedule` and not on the \
+               dispatches these were",
+        evidence: "runs 31900045901 (job 95049265216) and 31900050723 (job 95049280299), both \
+                   `guest (12)`, read with `gh run view --job`",
+        source: "specs/issues/build/screen-diag-boot-asserts-a-kernel-line-that-changed.md",
+        measured: "2026-08-15",
+    },
+    Red {
+        test: "boot_partition_identity",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`\"panicked at\" during the boot` — `sshd: cannot bind 0.0.0.0:22: netd error`, the \
+               same panic the dev-host row above carries, on a KVM shard with one guest on the \
+               machine. So the \"only above load average 6\" qualifier belongs to that session and \
+               not to the race. `ALONE: GREEN, and it was alone both times — a rate and not a \
+               classification`",
+        evidence: "run 31900050723, job 95049280131 (`guest (3)`), `wt/toyos-ciwall`; green in the \
+                   sibling dispatch 31900045901 minutes earlier on the same names and the same \
+                   image",
+        source: "specs/issues/build/sshd-panics-when-netd-exits-before-it-binds.md",
+        measured: "2026-08-15",
+    },
+    Red {
+        test: "usb_boot_stick_pulled",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`\"PANIC:\" after the boot stick was pulled` — and the panic is the kernel's: \
+               `a task waits on at most one queue` (`toyos-sched/src/waitq.rs:124`) reached through \
+               `Ticket::register` from `kernel::io_uring::enter`, in logd's `Poller::submit`, \
+               4.7 s after the stick went and its writes started failing. Not the `sys_read` \
+               keyboard-flood path already written up under that assertion. The machine did not \
+               halt — the capture runs on to `pull-probe-91`. `ALONE: GREEN, and it was alone both \
+               times — a rate and not a classification`",
+        evidence: "run 31900050723, job 95049280131 (`guest (3)`), the serial phase; green in the \
+                   sibling dispatch 31900045901 on the byte-identical kernel",
+        source: "specs/issues/kernel/io-uring-enter-trips-the-one-queue-invariant.md",
+        measured: "2026-08-15",
+    },
+    // ---------------------------------------------------------------------
+    // This documentation branch's own pull-request run, adjudicated here
+    // rather than re-run: the diff is prose, one caveat and this table, and
+    // reaches nothing that boots.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "null_sink_client_exits",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`soundd reported 1 client removals, expected 2` — and the capture shows the second \
+               `soundd: client 0 removed (closed)` never arriving rather than arriving wrong: the \
+               guest printed `null sink drained two clients in series` and exited, which is where \
+               the window ends. Round 1's removal made it in because a whole second round followed \
+               it. `ALONE: GREEN, and it was alone both times — a rate and not a classification`",
+        evidence: "PR #85 run 31904338273, job 95059750268 (`guest (1)`), on a branch of \
+                   documentation and this table",
+        source: "specs/issues/audio/null-sink-client-exits-counts-a-removal-it-does-not-wait-for.md",
+        measured: "2026-08-15",
+    },
 ];
 
 // ---------------------------------------------------------------------------
