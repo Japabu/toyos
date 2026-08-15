@@ -593,16 +593,18 @@ pub fn remap() {
 /// Render the newest records into the console's static scratch.
 ///
 /// Called at the top of the panic handler, before `panic_flush` drains the
-/// byte ring. No pixels, no lock, no mutation of the shards -- one bounded
+/// records to the console. No pixels, no lock, no mutation of the shards -- one bounded
 /// newest-first walk on a path that is about to halt. Skipped entirely when no
 /// framebuffer is armed, which is every headless boot, so a panic storm on a
 /// server pays nothing.
 ///
 /// **Its original reason is gone, and it was kept anyway.** It existed because
-/// `panic_flush` drained the ring out from under the renderer, so a reader
-/// placed after the flush painted a blank screen. Since the ring retains what
-/// serial has collected (see `log_ring`), a drain erases nothing and
-/// [`live_tail`] after the flush returns the same text. Measured, not assumed:
+/// `panic_flush` drained the byte ring out from under the renderer, so a reader
+/// placed after the flush painted a blank screen. A drain has erased nothing
+/// since that ring learned to retain what serial had collected, and it erases
+/// nothing now for a better reason -- a record drain moves a cursor and leaves
+/// every shard where it was -- so [`live_tail`] after the flush returns the
+/// same text. Measured, not assumed:
 /// with the body of this function replaced by `return`, `screen_late_panic`
 /// still passes -- and `main.rs` used to claim that test was "the one test
 /// that fails if the capture stops happening". Nothing in the tree now

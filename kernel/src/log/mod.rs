@@ -59,24 +59,14 @@ pub fn shards() -> [Option<&'static Shard>; MAX_LOG_SHARDS] {
     out
 }
 
-/// One format pass, two sinks: the record's bounded message and — until L3
-/// deletes it — the byte ring.
+/// The formatter `emit` runs, writing the message into the record in place.
 ///
-/// **The byte ring gets every byte and the record gets the first
-/// [`MAX_RECORD_MESSAGE`].** They have to differ, and finding out why is what
-/// L1's "nothing observable changes" claim was for: `screen_late_panic`'s
-/// stimulus is `late_panic::Nest`, a symbol demangled deliberately wider than
-/// any console grid, and it is far past the record bound. Rendering the byte
-/// ring *from the truncated record* dropped its tail and reddened the gate that
-/// exists to prove the panel wraps rather than clips. Feeding both from one
-/// pass costs nothing extra — the formatter runs once either way — and keeps
-/// this chunk byte-identical on the wire.
-///
-/// **The record bound is still too small and that is not fixed here**;
-/// `specs/issues/diagnostics/a-record-cannot-hold-a-demangled-frame.md` is the
-/// entry, and it has to be answered before L2 makes records what the panel
-/// renders.
-struct Tee<'a> {
+/// **One pass and one sink.** It was a `Tee` until L3 — the record's bounded
+/// message *and* a rendered line into the byte ring — because L1 and L2 had to
+/// leave the wire byte-identical while the record ring grew up beside it. The
+/// byte ring is gone, and the line the console carries is rendered from the
+/// record by `log::console`, through the one formatter in `toyos-abi`.
+struct Message<'a> {
     /// The record's own message bytes, written in place. **Borrowed rather than
     /// owned**: a second buffer here and a copy out of it put two message-sized
     /// arrays on `emit`'s frame, and `emit` runs on the double-fault stack.
@@ -85,45 +75,10 @@ struct Tee<'a> {
     /// Bytes past the record's bound, saturating. **Counted rather than
     /// dropped** — the difference between a bound and a lie.
     elided: usize,
-    wire: crate::drivers::serial::SerialWriter,
 }
 
-impl<'a> Tee<'a> {
-    /// The legacy prefix, byte for byte what `log!` produced before this chunk.
-    ///
-    /// Its `cpu` and `tid` come from an unbracketed `gs:` read, exactly as the
-    /// old macro's did — a migration between here and the reservation would
-    /// mislabel this line and not the record. That is today's behaviour, it
-    /// goes away with the byte ring at L3, and the record's own identity is
-    /// read inside the bracket where it cannot be wrong.
-    fn open(at_ns: u64, msg: &'a mut [u8; MAX_RECORD_MESSAGE]) -> Self {
-        use core::fmt::Write;
-        let mut wire = crate::drivers::serial::SerialWriter::lock();
-        let secs = at_ns / 1_000_000_000;
-        let millis = at_ns % 1_000_000_000 / 1_000_000;
-        if PERCPU_READY.load(Ordering::Relaxed) {
-            let (cpu, tid) = crate::arch::percpu::log_identity();
-            if tid == u32::MAX {
-                let _ = write!(wire, "[kernel {secs}.{millis:03} cpu{cpu}] ");
-            } else {
-                let _ = write!(wire, "[kernel {secs}.{millis:03} cpu{cpu} tid={tid}] ");
-            }
-        } else {
-            let _ = write!(wire, "[kernel {secs}.{millis:03} boot] ");
-        }
-        Self { msg, len: 0, elided: 0, wire }
-    }
-
-    fn finish(mut self) {
-        use core::fmt::Write;
-        let _ = self.wire.write_str("\n");
-    }
-}
-
-impl core::fmt::Write for Tee<'_> {
+impl core::fmt::Write for Message<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        self.wire.write_bytes(s.as_bytes());
-
         let room = MAX_RECORD_MESSAGE - self.len;
         let bytes = s.as_bytes();
         if bytes.len() <= room {
@@ -213,22 +168,14 @@ fn on_a_thread(id: u32) -> u32 {
 pub fn emit(level: Level, args: core::fmt::Arguments) {
     let mut record = LogRecord { level: level as u8, ..LogRecord::EMPTY };
 
-    // The byte ring's line is finished before the bracket opens, which is what
-    // keeps the serial lock *out* of the interrupts-off window rather than
-    // putting one inside it. Both sinks are fed from the one format pass either
-    // way; L3 deletes this half.
-    //
-    // **Its timestamp is a second reading and is deliberately not the
-    // record's.** A prefix has to be written before the message it introduces,
-    // so this one is taken before the format pass — where the record's is taken
-    // inside the bracket, one instruction from the reservation it has to agree
-    // with. Today's prefix already reads its `cpu` and `tid` unbracketed for the
-    // same reason, and all three go with the byte ring at L3.
-    let mut tee = Tee::open(crate::clock::nanos_since_boot(), &mut record.msg);
-    let _ = core::fmt::Write::write_fmt(&mut tee, args);
-    record.len = tee.len as u16;
-    record.elided = tee.elided.min(u16::MAX as usize) as u16;
-    tee.finish();
+    // **Formatting is outside every critical section**, which is the one thing
+    // it was never inside the old serial writer's. Nothing here takes a lock,
+    // touches a device or reads `gs:`: it fills a stack record and counts what
+    // did not fit.
+    let mut message = Message { msg: &mut record.msg, len: 0, elided: 0 };
+    let _ = core::fmt::Write::write_fmt(&mut message, args);
+    record.len = message.len as u16;
+    record.elided = message.elided.min(u16::MAX as usize) as u16;
 
     let guard = crate::arch::LogCommitGuard::close();
     // **Stamped inside the bracket, and that is what makes a shard's records
@@ -260,16 +207,28 @@ pub fn emit(level: Level, args: core::fmt::Arguments) {
     unsafe { origin.shard.commit(seq, &record, &guard) };
     drop(guard);
 
-    // **After the publication bracket closes, and in a bracket of its own.**
-    // The producer's whole contribution to the wake is a `SeqCst` fence and a
-    // relaxed load; the five locked operations of the post are paid at most
-    // once per `klogd` park, by whichever producer wins the swap. `emit` may
-    // take no lock — it runs inside `sync.rs`, inside IRQ handlers, inside the
-    // scheduler and inside every syscall's locked region — which is why the
-    // post is `wake_direct` and not an ordinary queue wake.
-    // `specs/log-architecture-spec.md` §2.6a.
-    if shard::signal_after_commit(shard::log_waiter()) {
-        console::post_wake();
+    // **Who speaks this record, after the publication bracket has closed.**
+    // The two modes are phases and not fallbacks (§4.2), and the mode is the
+    // one word `console::mode` reads rather than a flag beside it.
+    match console::mode() {
+        // Nothing else can run yet, so the producer is the drainer. It costs
+        // one `BackendGuard` CAS and a synchronous backend write for the boot's
+        // ~185 records on one CPU, and it is what makes a boot that wedges
+        // before the idle loop say everything it logged.
+        console::Drain::Inline => console::drain_inline(),
+        // **In a bracket of its own.** The producer's whole contribution to the
+        // wake is a `SeqCst` fence and a relaxed load; the five locked
+        // operations of the post are paid at most once per `klogd` park, by
+        // whichever producer wins the swap. `emit` may take no lock — it runs
+        // inside `sync.rs`, inside IRQ handlers, inside the scheduler and
+        // inside every syscall's locked region — which is why the post is
+        // `wake_direct` and not an ordinary queue wake.
+        // `specs/log-architecture-spec.md` §2.6a.
+        console::Drain::Thread => {
+            if shard::signal_after_commit(shard::log_waiter()) {
+                console::post_wake();
+            }
+        }
     }
 }
 

@@ -530,6 +530,15 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     boot_phase!("storage ready", t_storage);
 
+    // **Four phases before the idle loop, which is where the log used to become
+    // sayable.** Under `Drain::Inline` every record above is already on the wire
+    // when this runs, so what the gate reads is the whole boot and then silence
+    // — where before this branch it was silence and nothing else.
+    #[cfg(feature = "boot-actuators")]
+    if actuator::pre_idle_wedge() {
+        pre_idle_wedge();
+    }
+
     // Phase 4: Peripherals
     let t_periph = clock::nanos_since_boot();
 
@@ -700,4 +709,21 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     smp::set_ready();
     crate::scheduler::enter_idle_loop();
+}
+
+/// Stop this machine where nothing can report it, and say so first.
+///
+/// **Interrupts off and then a spin, which is a wedge rather than a machine
+/// that is merely idle.** No timer tick, no scheduler pass, no idle loop: the
+/// two things that used to drain the byte ring are both unreachable from here,
+/// and so is `klogd`, which is not spawned for another four phases. Everything
+/// the boot has said is therefore already on the wire or it never will be —
+/// which is the whole of what `pre_idle_wedge_speaks` reads.
+#[cfg(feature = "boot-actuators")]
+fn pre_idle_wedge() -> ! {
+    log!("pre-idle-wedge: the boot stops here, and this line is the last thing this machine says");
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+    loop {
+        core::hint::spin_loop();
+    }
 }

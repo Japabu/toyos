@@ -373,6 +373,20 @@ actuators! {
     /// `specs/log-architecture-spec.md` §4.3.
     klogd_panic = "klogd-panic";
 
+    /// Stop the boot dead in phase 3, with interrupts off, before anything that
+    /// could ever have drained a log.
+    ///
+    /// **A machine that wedges cannot be staged from the host at all** — there
+    /// is no injection that stops a kernel between two statements, and a QEMU
+    /// pause stops the guest without leaving it in the state under test, which
+    /// is a CPU that will never reach a scheduler pass. What the gate reads is
+    /// the *console*: before `Drain::Inline` a boot that stopped here produced
+    /// nothing whatsoever, including everything it had logged
+    /// (`specs/issues/diagnostics/pre-idle-wedge-says-nothing.md`), because the
+    /// only two drains in the machine were the timer tick and the idle loop.
+    /// `specs/log-architecture-spec.md` §4.1.
+    pre_idle_wedge = "pre-idle-wedge";
+
     /// Fail every re-read of a page of a file on either FAT mount through
     /// `FatBacking`, with the mount and the filesystem underneath it working.
     /// Both partitions are on the disk the guest is running from, so no

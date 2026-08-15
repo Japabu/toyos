@@ -466,6 +466,8 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // The kernel thread and the row that says what its panic means. Two
     // boots, both headless: the second one halts on purpose.
     ("klogd_hosted", Sched::Parallel, Tier::Fast),
+    // One boot that stops dead in phase 3, read for what it managed to say.
+    ("pre_idle_wedge_speaks", Sched::Parallel, Tier::Fast),
     ("i8042_health", Sched::Parallel, Tier::Nightly),
     // And one from here to `i8042_mouse` (`I8042_TRACE`), which is why all
     // three carry the answer the last of them needs.
@@ -8094,6 +8096,67 @@ fn run_machine_test(
             dead.push(&qemu.drain_serial(CARRIED_ON));
             dead.must_not_say(qemu::DEFAULT_READY)?;
             eprintln!("  [klogd] a kernel thread's panic halted the machine rather than recovering");
+            Ok(())
+        }
+        "pre_idle_wedge_speaks" => {
+            // **The worst diagnostic hole in the tree, closed and gated.**
+            // Before this branch a boot that wedged before `enter_idle_loop`
+            // produced nothing at all on the console — not "less", *nothing*,
+            // including every line it had logged — because the only two things
+            // that drained the byte ring were the timer tick and the idle loop,
+            // and the machine reaches neither
+            // (`specs/issues/diagnostics/pre-idle-wedge-says-nothing.md`).
+            // `Drain::Inline` puts every record on the wire as it is committed,
+            // for the whole boot, so the end of the log is now where the
+            // machine stopped rather than where it last drained.
+            //
+            // The verdict is content and not a duration: what is asserted is
+            // which lines arrived, from the first phase to the wedge, and that
+            // the phase after it never did.
+            const WEDGE: &str = "pre-idle-wedge: the boot stops here";
+            let qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    // **`Metal`, because the console has to exist in phase 1
+                    // for the claim to mean anything.** The headless profile's
+                    // console is a virtio device the kernel does not bring up
+                    // until phase 6, so a machine wedged in phase 3 has nowhere
+                    // to put a byte on that shape and the records wait in their
+                    // shards for a backend that never arrives. metal-sim keeps
+                    // a 16550, which is up from the second statement of
+                    // `kernel_main` — and it is also the profile this whole
+                    // feature exists for, being the shape that gets flashed.
+                    profile: qemu::Profile::Metal,
+                    kernel_params: &["pre-idle-wedge"],
+                    ready_marker: WEDGE,
+                    ..Default::default()
+                },
+            );
+            let boot = serial::Serial::boot(&qemu);
+            // Every phase up to the wedge, oldest first — the first line the
+            // machine ever logs, both boot checkpoints before phase 3, and a
+            // phase-3 line from between them and the wedge.
+            for needle in [
+                "serial: 16550 loopback read",
+                "Boot: CPU ready",
+                "gpt: firmware booted us from partition",
+                "Boot: storage ready",
+                WEDGE,
+            ] {
+                boot.must_say(needle)?;
+            }
+            // And nothing from after it, which is what says the machine really
+            // is wedged rather than slow.
+            for needle in ["Boot: peripherals ready", "Boot: complete"] {
+                boot.must_not_say(needle)?;
+            }
+            eprintln!(
+                "  [wedge] {} kernel line(s) reached the console from a machine that never \
+                 reached a scheduler pass",
+                boot.kernel_lines(),
+            );
             Ok(())
         }
         "short_sleep_livelock" => {

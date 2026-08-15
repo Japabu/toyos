@@ -61,7 +61,7 @@ impl Serial {
         &self.text
     }
 
-    fn kernel_lines(&self) -> usize {
+    pub fn kernel_lines(&self) -> usize {
         self.text.lines().filter(|l| is_kernel_line(l)).count()
     }
 

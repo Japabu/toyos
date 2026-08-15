@@ -779,25 +779,27 @@ the negative control belongs to §9.2's guest actuator.
 
 ### 2.3b The fatal path's stack, measured
 
-**7,488 bytes of IST1's 16,384**, `ist1_report` off a real #DF on three
-consecutive `double_fault_stack` runs, identical each time, guard intact. It is
-taken after `render` and after `panic_flush` (`apic.rs`'s `halt_all_cpus` fixes
-that order and says why), so it covers the deepest the report goes — the record
-merge and the paint included. `double_fault_stack`'s own margin is that the
-report must fit in half the stack, and it does: 14,976 of 16,384.
+**6,688 bytes of IST1's 16,384**, `ist1_report` off a real #DF on a
+`double_fault_stack` run, guard intact. It is taken after `render` and after
+`panic_flush` (`apic.rs`'s `halt_all_cpus` fixes that order and says why), so it
+covers the deepest the report goes — the record merge and the paint included.
+`double_fault_stack`'s own margin is that the report must fit in half the stack,
+and it does: 13,376 of 16,384.
 
-It was **4,512** before the record ring, so the ring cost 2,976 bytes and left
-8,896 free. What is large on that path is type sizes rather than a
-decomposition of the measurement — `emit`'s `LogRecord` and `SerialWriter`'s
-line buffer at 1,024 each, `snapshot_committed`'s
-one materialised record at 1,024 and its eight `Descent`s at 384, `paint`'s row
-table at 768 — and those come to 4,224 of the 7,488.
-`kernel/src/arch/percpu.rs`'s `IST1_STACK_SIZE` is where the number lives,
-beside the constant it is a budget against.
+It was **4,512** before the record ring, so the ring's net cost is 2,176 bytes
+and 9,696 are free. What is large on that path is type sizes rather than a
+decomposition of the measurement — `log::console`'s rendered line at 1,152,
+`emit`'s `LogRecord` at 1,024, `snapshot_committed`'s one materialised record at
+1,024 and its eight `Descent`s at 384, `paint`'s row table at 768 — and those
+come to 4,352 of the 6,688. `kernel/src/arch/percpu.rs`'s `IST1_STACK_SIZE` is
+where the number lives, beside the constant it is a budget against.
 
-**Making the body atomic words (§2.1) took `commit`'s 1,016-byte `Body` staging
-off this stack and the measurement did not move** — re-run 2026-08-14, still
-7,488 — which says that frame was never the deepest one.
+**It was 7,488 with the byte ring, and both halves of that difference are
+deletions.** Making the body atomic words (§2.1) took `commit`'s 1,016-byte
+`Body` staging off this stack and the measurement did not move — re-run
+2026-08-14, still 7,488 — which says that frame was never the deepest one;
+deleting `SerialWriter`'s 1,024-byte line buffer and `drain_to_serial`'s
+512-byte chunk with the ring took it to 6,688, which says those were.
 
 **This is the number a chunk that widens the fatal path re-measures**, and it is
 cheap: one `cargo test -- double_fault_stack`.
@@ -1351,11 +1353,25 @@ longer the only thing between `logd` and booting with no authority.
 
 `LogRecord`'s rendering to a line lives in `toyos-abi` beside the type, so the
 kernel's serial sink, the panel, `logd` and any diagnostic tool produce
-byte-identical text from one implementation. Today `log!` bakes the prefix into
-the ring bytes and every consumer inherits whatever it produced; after this the
-prefix is synthesised, which is what lets `logd` render `[2033-03-07 09:14:26.123
+byte-identical text from one implementation. `log!` used to bake the prefix into
+the ring bytes and every consumer inherited whatever it produced; the prefix is
+synthesised now, which is what lets `logd` render `[2033-03-07 09:14:26.123
 cpu0 tid=3]` into `/log` while the panel renders `[0.123 cpu0 tid=3]` into 80
 columns, from the same record.
+
+**As built at L3 the kernel's tag is composed by replacing the formatter's first
+byte**, and that is worth a sentence because it looks like a hack and is a
+consequence of a rule. `Display` opens with the bracket the `kernel` tag has to
+sit *inside*, so `log/console.rs` writes `[kernel ` and strips the leading `[`
+from the formatter's first fragment. The tidy form is a `tagged(&str)` wrapper
+beside `Display` — one implementation either way — and `toyos-abi/src` is
+sysroot source, so it belongs to the next ABI landing rather than to this
+branch (§11).
+`specs/issues/diagnostics/a-console-tag-is-composed-by-replacing-a-bracket.md`
+carries it, and the same entry records the one byte of the console line that did
+change: an early record renders `[kernel 0.001 cpu0 boot]` where the byte ring
+wrote `[kernel 0.001 boot]`, because cpu0's shard *is* the boot shard and the
+ABI writes the origin before the flag.
 
 ### 3.4 Syscall numbering, and the three specs that collide over it
 
@@ -1494,12 +1510,35 @@ for the wake, so there is no second flag to disagree with the first.
 **`Drain::Inline` closes `pre-idle-wedge-says-nothing` completely** — not "says
 less", the entry's own wording — because every record reaches the wire as it is
 written, for the whole boot. Its cost is the boot log at backend speed during
-boot: nothing on the T14 (`has_console()` is false, so the backend discards and
-the mode is a branch), nothing measurable under QEMU, and on a machine with a
-real 115200-baud UART the boot log's ~40 KB at ~87 µs/byte would be seconds. **L3
-measures it on the `metal-sim` profile and, if it is not free, `Drain::Inline` is
-gated on `has_console()` and a real-UART boot pays it only when someone is
-watching.** The number decides; the design does not pre-empt it.
+boot: nothing on the T14 (`has_console()` is false, so the mode is a branch and
+the records wait in their shards), nothing measurable under QEMU, and on a
+machine with a real 115200-baud UART the boot log's ~40 KB at ~87 µs/byte would
+be seconds. **`Drain::Inline` is gated on `has_console()` as built** — not as a
+cost measure but because a record must not be marked spoken when nothing could
+carry it — and §1.4's A/B is what says the mode is free on this instrument.
+
+**Three things about the mode as built.**
+
+1. **It is `try_lock` and not `lock`.** `BackendGuard::lock` clears IF and then
+   spins, so it is not re-entrant on its own CPU, and in `Drain::Inline` the
+   caller is an arbitrary producer: a Ring 0 exception taken inside the backend
+   write whose handler logs would spin there forever with interrupts off, on the
+   one path that exists to report it. Declining costs nothing — the record stays
+   committed, the drain position is shared, and whoever holds the backend
+   re-scans every shard before releasing, so the holder drains the decliner's
+   record too.
+2. **One drain position, not one per context.** `Drain::Inline`, `klogd` and the
+   panic path all advance `read::Published`, which is why a record reaches the
+   wire once however the machine happened to be running when it was committed.
+3. **A backend arriving replays the boot into it.** `write_raw` writes to
+   exactly one backend, so a record written while the only one was a 16550 has
+   not been heard by the virtio-console that comes up in phase 6.
+   `serial::console_changed` rewinds the position and drains again when the
+   backend *changes*, which is what `log_ring::set_serial_sink`'s re-seed from
+   `retained` was — and exact where that was a 64 KiB window. On the harness's
+   own shape this is load-bearing: its UART goes to a file and its
+   virtio-console is what the suite reads, so without the replay every test that
+   asserts on an early boot line reds.
 
 ### 4.3 `klogd`
 
@@ -2175,6 +2214,9 @@ Gates that must be green throughout, per compl §17: `blocked_dump`,
 
 ### 8.1 Code, by name
 
+**Done at L3 unless a row says otherwise**, and the two rows that moved are
+named where they are.
+
 **`kernel/src/drivers/log_ring.rs` — the whole file.** With it:
 `LogRing`, `RingCell`, `RingGuard` and its `cli` bracket, `RING_LOCKED` and the
 per-record `compare_exchange_weak`, `OWED`,
@@ -2198,6 +2240,15 @@ stopped_at}`, `path`, `stamp`, `Class`, `classify`, `ours`, `sweep`,
 `MAX_LOG_FILES`, `MAX_LOG_BYTES` and `MAX_LOG_PARTS` move to logd with their
 values. The `log-rotate-fast` actuator goes — its `actuators!` row and
 `log_file::max_log_bytes` with it; the fast value becomes a logd argument.
+
+**`kernel/src/arch/idt/timer.rs`'s tick drain, which this ledger did not
+name.** The timer ISR held a `try_lock`ed `BackendGuard` for one 512-byte chunk
+before `do_preempt`, so that a machine under sustained user load — where no CPU
+reaches the idle loop — still emptied the ring. It goes with the ring: `klogd`
+is woken by the commit rather than by a tick, and a wake reaches a CPU whether
+or not one is idle. **Two drains on the highest-rate event in the kernel become
+none**, which is a reduction on the preemption path and is recorded here because
+§8.1 is the ledger a reviewer counts against.
 
 **`kernel/src/sched/driver.rs`:** `flush_log_file_if_affordable` (`:722`),
 `LOG_DEFERRAL_CEILING_NS` (`:701`), `LOG_DEFERRED_SINCE` (`:706`),
@@ -2238,6 +2289,14 @@ acquisition per `write`, ANSI-stripped, no buffering — and L5 puts the line bu
 in front of it. That is not a detour: it makes `console-unbuffered` (§9.4)
 literally L3's own state, so the negative control is a real prior build rather
 than an invented one.
+
+**And it is not optional in the way "or L3 does not build" suggests — it is what
+makes L3 *pass*.** Built with the arm left on the byte ring, a full suite reds
+three C tests that compare whole stdout (`30_hanoi`, `90_stdio_buffering`,
+`90_struct_init`, measured 2026-08-15): kernel records go to the backend at
+commit and userland bytes sat in a ring drained later, so the two streams
+interleave in a way neither did before. One lock over both is the fix, and it is
+this arm. `serial::write_console` is where the ANSI strip lives now.
 
 **`kernel/src/arch/apic.rs`:** `LOG_FILE_DRAIN_NANOS`'s derivation and `owed()`
 are rewritten against `LOG_DURABLE_NS` (§6.4); `wait_for_log_file` survives.
@@ -2506,10 +2565,18 @@ existing. Named rather than discovered at compl's C14.
   to zero**, not a probability, **and `Serial::interleaved().is_none()` on the
   same capture** (§8.1). Under `console-unbuffered` both are non-zero well inside
   the iteration budget.
-- **`pre_idle_wedge_speaks`** — a kernel feature that wedges deliberately in boot
-  phase 3; the host asserts the console carries every line up to the wedge.
-  Today it carries none, which is the entry this closes. Its verdict is content,
-  not a duration, so it is not a `STALLED:` class.
+- **`pre_idle_wedge_speaks`** — an actuator (`pre-idle-wedge`, not a feature:
+  §0.0) that wedges deliberately at the end of boot phase 3 with interrupts off;
+  the host asserts the console carries every line up to the wedge and nothing
+  after it. Before this branch it carried none, which is the entry this closes.
+  Its verdict is content, not a duration, so it is not a `STALLED:` class.
+  **On `Profile::Metal`, and that is the test's own claim rather than a
+  convenience**: the headless profile's console is a virtio device the kernel
+  does not bring up until phase 6, so on that shape a phase-3 wedge has nowhere
+  to put a byte and the records wait for a backend that never arrives. metal-sim
+  keeps a 16550 that is up from the second statement of `kernel_main`, and it is
+  the shape that gets flashed. **Measured 2026-08-15: 61 kernel lines reached
+  the console from a machine that never reached a scheduler pass.**
 - **`logd_gone`** — kill logd; the machine survives, `init: logd exited` reaches
   the console, kernel records keep arriving, a client that keeps printing does
   not die, and `Serial::interleaved().is_none()` on the capture.

@@ -533,37 +533,6 @@ fn execute(action: Action<KernelPayload>) {
                 || crate::preempt::need_resched()
                 || crate::irq_ring::any_pending_self()
                 || !with_cpu(|c| c.mailbox_is_empty())
-                // The log ring owes the host bytes, so this CPU must not sleep
-                // on them. `idle_loop` drains *before* the pass, and a line
-                // logged after that drain — by `drain_irqs`, by a driver it
-                // polls, by anything inside the pass — would otherwise wait for
-                // the next wake. The LAPIC timer is one-shot, so on a genuinely
-                // quiet machine there may not be one: the last thing the kernel
-                // said before going silent is then not evidence of anything.
-                //
-                // It closes the window rather than narrowing it, by the same
-                // argument §7.5 makes for the mailbox. A write that lands
-                // between this load and the `hlt` came from an interrupt on this
-                // CPU (which ends the halt through the STI shadow) or from
-                // another CPU that is still running — and that CPU runs this
-                // same check before it halts. The ring is one global buffer, so
-                // whoever drains drains everything: the last CPU to sleep
-                // flushes what all of them wrote.
-                //
-                // Declining rather than draining here is the point. A drain is
-                // serial I/O, and `uart_write_bytes` spins on THRE; doing that
-                // with interrupts off would put an unbounded wait exactly where
-                // the machine is trying to go quiet. Returning sends this CPU
-                // round the idle loop, which drains with interrupts on, one
-                // bounded chunk per backend acquisition.
-                //
-                // The condition self-clears, which is what stops it becoming
-                // the spin `i8042::service` documents for `any_pending_self`:
-                // `drain_serial` loops until the ring reports empty, so one
-                // trip round the idle loop always satisfies it. What would spin
-                // a CPU is something on the *pass* path logging unconditionally
-                // — which would also flood the ring, so it is already a bug.
-                || crate::drivers::log_ring::has_pending()
                 // A CPU with nothing left to run is the moment the i8042's
                 // "the pin has never asserted" verdict stops being premature:
                 // before it, silence only says the boot is still busy. A
@@ -723,18 +692,15 @@ extern "C" fn idle_loop() -> ! {
         }
         crate::scheduler::log_health();
         crate::scheduler::reap_poisoned();
-        // The third drain site. `pass` below covers it too; this one is here so
-        // a CPU that reaches the loop and then halts has run every hook first,
-        // rather than leaving one queued behind an interrupt that may be 102 s
-        // away.
+        // `pass` below covers this too; it is here so a CPU that reaches the
+        // loop and then halts has run every hook first, rather than leaving one
+        // queued behind an interrupt that may be 102 s away.
         crate::object::drain_zero_handles();
-        drain_serial();
         // Immediately before the sink's poll, so the line it appends is flushed
         // by the very next statement rather than waiting a trip round the loop.
         #[cfg(feature = "boot-actuators")]
         crate::heartbeat::poll();
-        // After the serial drain and before the pass, for the same reason that
-        // one is here: both are I/O off the critical path, and this is the one
+        // Before the pass: this is I/O off the critical path, and the one
         // context that provably holds none of the locks a filesystem needs.
         flush_log_file_if_affordable();
         pass(Dispose::None);
@@ -770,7 +736,7 @@ static LOG_DEFERRED_SINCE: AtomicU64 = AtomicU64::new(0);
 /// The one writer of the deferral clock, so that [`log_file_flush_due`] can
 /// answer the pre-halt check without consuming an expiry this has not acted on.
 fn flush_log_file_if_affordable() {
-    if !crate::drivers::log_ring::file_has_pending() {
+    if !crate::log_file::has_pending() {
         LOG_DEFERRED_SINCE.store(0, Ordering::Relaxed);
         return;
     }
@@ -791,7 +757,7 @@ fn flush_log_file_if_affordable() {
 
 /// Would the next trip round the idle loop write the log file? Read-only.
 fn log_file_flush_due() -> bool {
-    if !crate::drivers::log_ring::file_has_pending() {
+    if !crate::log_file::has_pending() {
         return false;
     }
     if !owes_wake() {
@@ -801,19 +767,6 @@ fn log_file_flush_due() -> bool {
         0 => false,
         since => {
             crate::clock::nanos_since_boot().saturating_sub(since) >= LOG_DEFERRAL_CEILING_NS
-        }
-    }
-}
-
-/// Flush buffered log output before sleeping. One chunk per backend
-/// acquisition: the guard holds interrupts off for its lifetime, so a
-/// full-ring drain under one guard would block them for up to 64 KiB of
-/// serial I/O.
-fn drain_serial() {
-    loop {
-        let mut backend = crate::drivers::serial::BackendGuard::lock();
-        if crate::drivers::log_ring::drain_chunk_to_serial(&mut backend) == 0 {
-            break;
         }
     }
 }

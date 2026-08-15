@@ -225,6 +225,7 @@ nvme_wide_sector 3474
 panic_recovery 18
 poller_capacity 22
 port_poll_churn 67
+pre_idle_wedge_speaks 18446744073709551615
 process_lifecycle 217
 process_stats 15
 query_modules_size 11

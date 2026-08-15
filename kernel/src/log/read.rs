@@ -153,6 +153,83 @@ impl Default for Cursor {
     }
 }
 
+/// A cursor kept where more than one context can pick it up.
+///
+/// **The console's drain is the one cursor in the machine that is shared**, and
+/// it has to be: `Drain::Inline` advances it from the producer's own stack,
+/// `klogd` advances it from a kernel thread, and the panic path advances it
+/// from a machine that is stopping. Three cursors over one stream would put
+/// every record on the wire three times.
+///
+/// **Words rather than a `Cursor` behind a cell**, because the panic path's
+/// bypass reads the position with no backend lock held — that is what the
+/// bypass *is* — and an array of `AtomicU64` has no torn read to reason about.
+/// `log_file` keeps its own position the same way for a plainer reason: its
+/// pending predicate is read from the pre-`hlt` check with interrupts off and
+/// may take no lock.
+pub struct Published {
+    next: [core::sync::atomic::AtomicU64; MAX_LOG_SHARDS],
+    lost: core::sync::atomic::AtomicU64,
+}
+
+impl Published {
+    pub const fn new() -> Self {
+        use core::sync::atomic::AtomicU64;
+        Self {
+            next: [const { AtomicU64::new(FIRST_SEQ) }; MAX_LOG_SHARDS],
+            lost: AtomicU64::new(0),
+        }
+    }
+
+    /// The position, as a cursor to walk with.
+    pub fn take(&self) -> Cursor {
+        use core::sync::atomic::Ordering;
+        Cursor {
+            next: core::array::from_fn(|i| self.next[i].load(Ordering::Relaxed)),
+            lost: self.lost.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Where the walk got to. Whatever exclusion the position has is the
+    /// caller's — the backend lock for the console, `SINK`'s for the file —
+    /// and these stores only make the result visible to a reader that has none.
+    pub fn put(&self, cursor: &Cursor) {
+        use core::sync::atomic::Ordering;
+        for (word, next) in self.next.iter().zip(cursor.next) {
+            word.store(next, Ordering::Relaxed);
+        }
+        self.lost.store(cursor.lost, Ordering::Relaxed);
+    }
+
+    pub fn lost(&self) -> u64 {
+        self.lost.load(core::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Forget everything this position has been told, so the next walk starts
+    /// at the oldest record every shard still holds.
+    ///
+    /// **The loss count goes back to zero with it, and that is the honest
+    /// reading rather than a convenience.** After a rewind the position means
+    /// "nothing has been said to *this* consumer", so what `lost` counts is
+    /// what the shards had already dropped before the replay could reach it —
+    /// which is a different, and correct, number for the consumer that is about
+    /// to hear the boot for the first time. Keeping the old total would count
+    /// the same overwritten record twice.
+    pub fn rewind(&self) {
+        use core::sync::atomic::Ordering;
+        for word in &self.next {
+            word.store(FIRST_SEQ, Ordering::Relaxed);
+        }
+        self.lost.store(0, Ordering::Relaxed);
+    }
+
+    /// Is there a committed record this position has not taken? Lock-free, for
+    /// the callers that ask with interrupts off.
+    pub fn any_pending(&self) -> bool {
+        any_committed(&self.take())
+    }
+}
+
 /// Every record this cursor has not seen, **oldest first**, merged across
 /// shards by `at_ns`. Returns how many reached `out`.
 ///

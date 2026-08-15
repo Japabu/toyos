@@ -1,5 +1,4 @@
-//! `klogd` — the kernel thread that drains committed records, and the wake that
-//! makes it runnable at the commit of the record it will drain.
+//! The kernel's console sink, the two drain modes, and `klogd`.
 //!
 //! One thread where every idle CPU used to drain, and that is a reduction this
 //! design accepts and names (`specs/log-architecture-spec.md` §4.3). Three
@@ -15,21 +14,28 @@
 //! from a counter, and `snapshot_committed` reads the shards directly — so the
 //! panic path is unaffected by `klogd` being gone. What is lost is the live
 //! console, which is exactly the thing nothing else can report.
+//!
+//! **[`Drain::Inline`] and [`Drain::Thread`] are phases and not fallbacks.**
+//! Exactly one is active, the transition is a single statement — [`start`] —
+//! and there is no second flag to disagree with the first about which one the
+//! machine is in: `Drain::Inline` *is* [`KLOGD`] being null.
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, Ordering};
 
 use alloc::sync::Arc;
 
+use toyos_abi::log::LogRecord;
 use toyos_sched::task::{WakeCause, WakeReason};
 use toyos_sched::waitq::wake_direct;
 
+use crate::drivers::serial::{self, BackendGuard};
 use crate::hw::HW;
 use crate::sched::driver::{cpus, irq_off};
 use crate::sched::kthread::{self, OnPanic};
 use crate::sched::payload::KShared;
 use crate::scheduler;
 
-use super::read::{drain_ordered, Cursor, RecordSink};
+use super::read::{drain_ordered, Published, RecordSink};
 use super::shard;
 
 /// The name `sched::dump`, `ps` and a crash report use.
@@ -52,6 +58,38 @@ const NAME: &str = "klogd";
 /// There is no second flag to disagree with this one about which mode the
 /// machine is in.
 static KLOGD: AtomicPtr<Arc<KShared>> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Who puts a committed record on the wire.
+///
+/// A fallback is a path taken when another one fails; these are phases. Exactly
+/// one is active, the transition is [`start`], it happens once, and it is
+/// logged.
+pub enum Drain {
+    /// The producer itself, on its own stack, immediately after committing.
+    /// Nothing else can run yet: there is no thread until `klogd`'s spawn, and
+    /// no CPU reaches a scheduler pass before the two statements after it.
+    Inline,
+    /// `klogd`, made runnable at the commit of the record it will drain, by the
+    /// producer's own `wake_direct` (§2.6a).
+    Thread,
+}
+
+/// Which phase this machine is in. One load, of the same word the wake post
+/// reads.
+pub fn mode() -> Drain {
+    if KLOGD.load(Ordering::Acquire).is_null() {
+        Drain::Inline
+    } else {
+        Drain::Thread
+    }
+}
+
+/// Where the console's drain has got to.
+///
+/// One position for every context that drains, which is what stops a record
+/// reaching the wire twice however the machine happens to be running when it is
+/// committed. `read::Published` carries the argument for the shape.
+static DRAINED: Published = Published::new();
 
 /// Start the thread. Called once, from `kernel_main`, immediately before the
 /// machine hands itself to the scheduler.
@@ -90,6 +128,211 @@ pub fn post_wake() {
     });
 }
 
+/// Put every committed record this machine has not yet spoken on the wire.
+///
+/// **Three callers — `emit` in `Drain::Inline`, `klogd`, and a console arriving
+/// — and one function rather than a mode of anything.** What differs between
+/// the phases is who calls it, never what it does.
+///
+/// **`try_lock` and not `lock`, and the reason is a deadlock rather than
+/// latency.** `BackendGuard::lock` clears IF and then spins, so it is not
+/// re-entrant on its own CPU — and in `Drain::Inline` the caller is an
+/// arbitrary producer. A Ring 0 exception taken inside the backend write whose
+/// handler logs would spin there forever with interrupts off, on the one path
+/// that exists to report it. Declining costs nothing: the record stays
+/// committed in its shard, the position is shared, and whoever holds the
+/// backend re-scans every shard before it releases — so the holder drains the
+/// decliner's record too, in `at_ns` order, and the next `emit` or `klogd` wake
+/// catches whatever was committed after that last scan.
+pub fn drain_inline() {
+    if !serial::has_console() {
+        return;
+    }
+    let Some(mut guard) = BackendGuard::try_lock() else { return };
+    drain_locked(&mut guard);
+}
+
+/// The same drain, for a caller that already holds the backend: the panic flush
+/// and the shutdown flush, which want it held across the whole report rather
+/// than re-taken per line.
+pub fn drain_locked(guard: &mut BackendGuard) {
+    let mut cursor = DRAINED.take();
+    let mut sink = Wire { out: guard, records: 0 };
+    drain_ordered(&mut cursor, &mut sink);
+    let records = sink.records;
+    DRAINED.put(&cursor);
+    RECORDS.fetch_add(records, Ordering::Relaxed);
+    LOST.store(DRAINED.lost(), Ordering::Relaxed);
+}
+
+/// Drain with no lock at all, straight to the 16550.
+///
+/// # Safety
+/// Panic path only, and only once a bounded wait for a clean `BackendGuard`
+/// handoff has failed (`serial::panic_flush`). What is unsynchronised is the
+/// *position*: a wedged holder may be between its walk and its publication, so
+/// a record can reach the wire twice. Twice is the right side of that trade on
+/// a machine that is halting — the alternative is a report that never arrives
+/// because the CPU holding the backend died holding it.
+pub unsafe fn drain_bypassed() {
+    let mut cursor = DRAINED.take();
+    let mut sink = Raw;
+    drain_ordered(&mut cursor, &mut sink);
+    DRAINED.put(&cursor);
+}
+
+/// Is there anything the console has not said? Lock-free.
+pub fn pending() -> bool {
+    serial::has_console() && DRAINED.any_pending()
+}
+
+/// Which backend the drain has already spoken to, as [`serial::Backend`]'s
+/// discriminant.
+static SPOKEN_TO: AtomicU8 = AtomicU8::new(serial::Backend::None as u8);
+
+/// A backend has appeared, or the machine has switched to a better one. Say the
+/// whole boot again, into the one that is current now.
+///
+/// **The rewind is what `log_ring::set_serial_sink`'s re-seed from `retained`
+/// was**, and it is exact where that was a 64 KiB window. A record written
+/// while the only backend was a 16550 went to the 16550; when virtio-console
+/// comes up in phase 6 the machine has a *different* channel that has heard
+/// none of it, and on the harness's shape that channel is the only one anybody
+/// reads. Rewinding to the oldest record each shard still holds and draining
+/// again is what puts the boot on it.
+///
+/// **Both channels then carry the early boot and neither carries it twice**,
+/// because `BackendGuard::write_raw` writes to exactly one backend and this
+/// only fires when that choice changes. A machine whose backend never changes —
+/// metal-sim, or a T14 with no console at all — replays nothing.
+pub fn backend_changed() {
+    let now = serial::backend() as u8;
+    if SPOKEN_TO.swap(now, Ordering::Relaxed) != now {
+        DRAINED.rewind();
+    }
+    drain_inline();
+    // `klogd` parks unarmed while there is no console (see `body`), so on the
+    // machine where this matters most it is asleep with nothing to wake it.
+    post_wake();
+}
+
+/// The longest line a record renders to: the tag, the ABI's bracket at its
+/// widest, the message, and the elision note.
+///
+/// It is a buffer and not a bound. A line that somehow ran past it spills to
+/// the backend and carries on under the one guard, so it is still whole on the
+/// wire — where a bound would have to choose between truncating and lying.
+const LINE_BYTES: usize = toyos_abi::log::MAX_RECORD_MESSAGE + 160;
+
+/// One rendered line on its way to the backend.
+///
+/// **Buffered, and that is a device fact rather than tidiness.**
+/// `virtio_console::write_bytes_locked` is one host round trip per call and a
+/// record's `Display` is eight or nine fragments, so writing them straight
+/// through would pay eight vmexits a line for the whole boot.
+struct Line<F: FnMut(&[u8])> {
+    emit: F,
+    buf: [u8; LINE_BYTES],
+    len: usize,
+    /// The ABI's line opens with the bracket the tag has to sit inside, and
+    /// this says that first fragment has been dealt with.
+    tagged: bool,
+}
+
+impl<F: FnMut(&[u8])> Line<F> {
+    fn new(emit: F) -> Self {
+        Self { emit, buf: [0; LINE_BYTES], len: 0, tagged: false }
+    }
+
+    fn flush(&mut self) {
+        if self.len > 0 {
+            (self.emit)(&self.buf[..self.len]);
+            self.len = 0;
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(LINE_BYTES) {
+            if self.len + chunk.len() > LINE_BYTES {
+                self.flush();
+            }
+            self.buf[self.len..self.len + chunk.len()].copy_from_slice(chunk);
+            self.len += chunk.len();
+        }
+    }
+
+    fn finish(mut self) {
+        self.push(b"\n");
+        self.flush();
+    }
+}
+
+impl<F: FnMut(&[u8])> core::fmt::Write for Line<F> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        if !self.tagged {
+            self.tagged = true;
+            // **The tag is composed with the ABI's line rather than derived
+            // from a second copy of its fields.** `LogRecord`'s `Display` opens
+            // with the bracket the tag belongs inside, so the tag replaces that
+            // one byte and everything that varies — the timestamp, the origin,
+            // the `boot` label, the tid, the elision note — is rendered once,
+            // in `toyos-abi`, for this sink and the panel and `logd` alike. A
+            // `LogRecord::tagged(&str)` beside `Display` would be tidier and is
+            // a *sysroot* change: §11 lands the ABI alone and it has already
+            // landed, so this branch composes instead of reopening it.
+            // `specs/issues/diagnostics/a-console-tag-is-composed-by-replacing-a-bracket.md`.
+            //
+            // If that leading bracket ever goes, the fragment passes through
+            // whole: a visible `[kernel [0.1 …` beats a line silently missing
+            // its first character.
+            let rest = s.strip_prefix('[').unwrap_or(s);
+            self.push(rest.as_bytes());
+            return Ok(());
+        }
+        self.push(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// Render one record as the console line — byte for byte what the byte ring
+/// carried, `[kernel ` and all.
+///
+/// **Public because `/log`'s sink renders the same line**, and a second
+/// implementation of it there would be a second thing to keep agreeing with the
+/// panel. It goes when `logd` does the rendering (L6), which is also when the
+/// wall-clock prefix stops being this one.
+pub fn write_line(record: &LogRecord, emit: impl FnMut(&[u8])) {
+    use core::fmt::Write;
+    let mut line = Line::new(emit);
+    line.push(b"[kernel ");
+    let _ = write!(line, "{record}");
+    line.finish();
+}
+
+/// Records through a backend the caller holds.
+struct Wire<'a> {
+    out: &'a mut BackendGuard,
+    records: u64,
+}
+
+impl RecordSink for Wire<'_> {
+    fn put(&mut self, record: &LogRecord) -> bool {
+        write_line(record, |bytes| self.out.write_raw(bytes));
+        self.records += 1;
+        true
+    }
+}
+
+/// Records straight to the 16550, for the bypass. No lock, bounded per byte.
+struct Raw;
+
+impl RecordSink for Raw {
+    fn put(&mut self, record: &LogRecord) -> bool {
+        write_line(record, serial::panic_raw);
+        true
+    }
+}
+
 extern "C" fn body(_arg: u64) -> ! {
     // Deliberately the first thing, before any drain: what this stages is a
     // panic *inside a kernel thread*, and the whole question is which branch
@@ -99,12 +342,11 @@ extern "C" fn body(_arg: u64) -> ! {
         panic!("klogd-panic: the console drainer died");
     }
 
-    let mut cursor = Cursor::new();
-    let mut sink = Drained::default();
     loop {
-        drain_ordered(&mut cursor, &mut sink);
-        DRAINED.store(sink.records, Ordering::Relaxed);
-        LOST.store(cursor.lost(), Ordering::Relaxed);
+        // One bounded chunk at a time, exactly as `drain_chunk_to_serial` was:
+        // the drain takes and drops the backend around one walk, and the walk
+        // writes whole lines.
+        drain_inline();
 
         // **Register, then arm, then park — in that order, and the order is the
         // lost wake's other half.** `prepare_wait` moves the word to
@@ -114,7 +356,17 @@ extern "C" fn body(_arg: u64) -> ! {
         // `klogd`, takes `Claim::Lost`, drops the wake, and `klogd` parks on a
         // committed record.
         let ticket = scheduler::prepare_wait(scheduler::park_lot());
-        if shard::arm_waiter(shard::log_waiter(), || super::read::any_committed(&cursor)) {
+        // **A machine with no console arms nothing, and that is what keeps this
+        // thread off a CPU it cannot use.** With no backend the drain above
+        // takes nothing and leaves the records where the panel can still find
+        // them, so an armed waiter would find a committed record on every
+        // rescan and never park — one kernel thread spinning for the whole life
+        // of a T14. Unarmed, no producer pays a post either, and the wake that
+        // matters is `serial::console_changed`'s: a console arriving is the one
+        // event that turns an accumulated boot into something to say.
+        if serial::has_console()
+            && shard::arm_waiter(shard::log_waiter(), || DRAINED.any_pending())
+        {
             ticket.cancel();
             continue;
         }
@@ -126,43 +378,24 @@ extern "C" fn body(_arg: u64) -> ! {
     }
 }
 
-/// Where `klogd`'s records go until the chunk that points it at the backend.
-///
-/// It counts rather than renders, which is what keeps this chunk's claim —
-/// nothing observable changes — true while the byte ring still owns the wire.
-/// A line printed from here would be a record committed from inside the drain
-/// that produced it, so the counts go into the three words below and
-/// `sched::dump` is what reads them.
-#[derive(Default)]
-struct Drained {
-    records: u64,
-}
-
-impl RecordSink for Drained {
-    fn put(&mut self, _record: &toyos_abi::log::LogRecord) -> bool {
-        self.records += 1;
-        true
-    }
-}
-
-/// What `klogd` has done, for a machine that has gone quiet and is being asked
-/// why.
+/// What the console drain has done, for a machine that has gone quiet and is
+/// being asked why.
 ///
 /// **Three numbers rather than a heartbeat**, and each answers a different
-/// question the console alone cannot: `drained` says the thread is running at
-/// all, `parks` says it is parking rather than spinning, and `lost` says
+/// question the console alone cannot: `records` says the drain is running at
+/// all, `parks` says `klogd` is parking rather than spinning, and `lost` says
 /// whether a producer outran it — which is the one number a reader of the
 /// console can never derive, because what it names is the lines that are not
-/// there. Written only by `klogd` and read only by `sched::dump`.
-static DRAINED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static LOST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static PARKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// there. Read only by `sched::dump`.
+static RECORDS: AtomicU64 = AtomicU64::new(0);
+static LOST: AtomicU64 = AtomicU64::new(0);
+static PARKS: AtomicU64 = AtomicU64::new(0);
 
 /// `(records drained, records lost, parks)`. Three relaxed loads: the dump may
 /// take no lock.
 pub fn stats() -> (u64, u64, u64) {
     (
-        DRAINED.load(Ordering::Relaxed),
+        RECORDS.load(Ordering::Relaxed),
         LOST.load(Ordering::Relaxed),
         PARKS.load(Ordering::Relaxed),
     )

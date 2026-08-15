@@ -118,14 +118,14 @@ const LOG_FILE_DRAIN_NANOS: u64 = 500_000_000;
 
 /// Does the log volume still owe this boot bytes?
 ///
-/// **Both halves, and the second is not belt-and-braces.** The ring's own
-/// predicate goes false at `drain_to_file`, which is before `flush_file` and
-/// `sync_mount` have put anything on the device — so waiting on it alone
+/// **Both halves, and the second is not belt-and-braces.** The sink's own
+/// predicate goes false as its cursor advances, which is before `flush_file`
+/// and `sync_mount` have put anything on the device — so waiting on it alone
 /// returns mid-write and the halt IPI then stops the CPU doing the writing.
 /// Measured: the wait was satisfied, no timeout line was printed, and the
 /// report was still absent from the file.
 fn owed() -> bool {
-    crate::drivers::log_ring::file_has_pending() || crate::log_file::flush_in_progress()
+    crate::log_file::has_pending() || crate::log_file::flush_in_progress()
 }
 
 /// Give the log sink a chance to put this report on the stick before the

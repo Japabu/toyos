@@ -256,7 +256,7 @@ const IDLE_GUARD_SIZE: usize = 4096;
 /// The double fault stack. Only #DF uses IST1, and what runs on it is the
 /// whole crash report plus `halt_all_cpus` — render, then `panic_flush`.
 ///
-/// It was 4096, and `drain_to_serial` put a 4096-byte buffer on it, so the
+/// It was 4096, and the byte ring's `drain_to_serial` put a 4096-byte buffer on it, so the
 /// report overflowed the stack it was being written from and corrupted the
 /// heap underneath while producing the evidence for the fault that had just
 /// happened.
@@ -274,29 +274,31 @@ const IDLE_GUARD_SIZE: usize = 4096;
 /// stack.
 ///
 /// **The record ring widened this path and the number is re-measured, not
-/// re-argued: 7,488 bytes**, `ist1_report` off a real #DF on three consecutive
-/// runs of `double_fault_stack`, guard intact. It is taken after `render` and
-/// after `panic_flush`, so it covers the deepest the report goes — the record
-/// merge and the paint included. The margin the gate asserts still holds:
-/// 7,488 doubled is 14,976 of 16,384.
+/// re-argued: 6,688 bytes**, `ist1_report` off a real #DF on a
+/// `double_fault_stack` run, guard intact. It is taken after `render` and after
+/// `panic_flush`, so it covers the deepest the report goes — the record merge
+/// and the paint included. The margin the gate asserts still holds: 6,688
+/// doubled is 13,376 of 16,384.
 ///
 /// **What is large on that path — type sizes, not a decomposition of the
 /// measurement.** These are what `size_of` says, not what `ist1_report`
-/// counted, and they come to 4,224 against the measured 7,488; the 3,264
+/// counted, and they come to 4,352 against the measured 6,688; the 2,336
 /// between them is frames, spills, alignment and everything the path does that
-/// is not one of these. Largest first, at `RECORD_BYTES` of 1024: `emit`'s
-/// `LogRecord` (1,024) beside `SerialWriter`'s line buffer (1,024);
+/// is not one of these. Largest first, at `RECORD_BYTES` of 1024:
+/// `log::console`'s rendered line (1,152); `emit`'s `LogRecord` (1,024) beside
 /// `snapshot_committed`'s one materialised record (1,024) and its eight
 /// `Descent`s (384); `paint`'s row table (768). The elision's tail buffer
 /// (452 — its head is streamed and buffers nothing) is on a branch no symbol in
 /// this tree reaches.
 ///
-/// **`commit` no longer stages a 1,016-byte `Body` on this stack** — it stores
-/// the caller's record into the slot's atomic words directly — and the measured
-/// 7,488 did not move, which says that frame was never the deepest one.
+/// **It was 7,488 with the byte ring, and both halves of that difference are
+/// deletions.** `commit` no longer stages a 1,016-byte `Body` here (the slot's
+/// words are written directly), which the measurement did not notice — so that
+/// frame was never the deepest one; and `SerialWriter`'s 1,024-byte line buffer
+/// and `drain_to_serial`'s 512-byte chunk went with the ring, which it did.
 ///
-/// It was 4,512 before the record ring, so the ring cost 2,976 bytes of a
-/// stack with 8,896 still free.
+/// It was 4,512 before the record ring, so the ring's net cost is 2,176 bytes
+/// of a stack with 9,696 still free.
 const IST1_STACK_SIZE: usize = 16384;
 
 /// Filled with [`STACK_FILL`] and never written by anything legitimate, so an
