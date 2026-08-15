@@ -1435,6 +1435,26 @@ pub const KNOWN_RED: &[Red] = &[
         source: "specs/issues/kernel/io-uring-enter-trips-the-one-queue-invariant.md",
         measured: "2026-08-15",
     },
+    // ---------------------------------------------------------------------
+    // This documentation branch's own pull-request run, adjudicated here
+    // rather than re-run: the diff is prose, one caveat and this table, and
+    // reaches nothing that boots.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "null_sink_client_exits",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`soundd reported 1 client removals, expected 2` — and the capture shows the second \
+               `soundd: client 0 removed (closed)` never arriving rather than arriving wrong: the \
+               guest printed `null sink drained two clients in series` and exited, which is where \
+               the window ends. Round 1's removal made it in because a whole second round followed \
+               it. `ALONE: GREEN, and it was alone both times — a rate and not a classification`",
+        evidence: "PR #85 run 31904338273, job 95059750268 (`guest (1)`), on a branch of \
+                   documentation and this table",
+        source: "specs/issues/audio/null-sink-client-exits-counts-a-removal-it-does-not-wait-for.md",
+        measured: "2026-08-15",
+    },
 ];
 
 // ---------------------------------------------------------------------------
