@@ -27,6 +27,31 @@ on five further runs of `cargo test --test toyos-build -- kernel_heartbeat`, six
 for six. It landed immediately after `xhci_flap`'s red in the same serial phase,
 with two other agents building on the host.
 
+**Four names in one day, on three worktrees, 2026-08-15.** The signature is not
+`kernel_heartbeat`'s and it is not one tree's:
+
+- `screen_fatal_halt` and `double_fault_stack`, both in the 106.4 s parallel
+  phase of one full `cargo test` on `wt/toyos-ciwall` (the one-accumulator
+  tree, landed as `81cfe22`), each `[qemu] QEMU died before ===READY===
+  (status: Ok(ExitStatus(unix_wait_status(0))))` from `tests/common/qemu.rs`,
+  in a run that was 256 passed and 4 failed. Both `ALONE: GREEN`, and both
+  green again when run by name minutes later — 3 s and 2 s.
+- `log_backing_read_error`, the identical message, on `wt/toyos-logd56`'s suite
+  the same afternoon. `ALONE: GREEN`.
+- `screen_console_shell`, the same *exit status* through a different wait —
+  `[qemu] QEMU died before the screendump (status: exit status: 0)` — on
+  `wt/toyos-capwin`'s suite. `ALONE: GREEN`.
+
+**Neither the guest nor the phase's width explains it.** The four names have
+nothing in common but a boot: two panic-screen tests, a fault test, a log-device
+test and a console test, on three different configs. The ciwall run's own load
+proxy says the host was not slow — `host: fastest boot 1380 ms against the
+reference 1320 ms — liveness ceilings paid at 1.05x width` — while its
+`[host-slots]` lines name a second worktree's suite holding guest slots beside
+it (`all 12 held by 2 holder(s): pid 103 (toyos-ciwall: sched_check_build),
+pid 3077 (toyos-capwin: c_capture_ignores_daemon_lines)`). So what is shared is
+another suite on the machine, not a margin any one guest was near.
+
 The defect is the diagnosis, not the boot. A QEMU that exits 0 before the ready
 marker should say why — whether it never got its arguments, could not open a
 device, or was reaped by something — and the harness should keep whatever it did

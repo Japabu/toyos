@@ -57,8 +57,12 @@ Required checks: `host`, `abi-split`, `gate-stage`, `guest-suite`, `build`.
   the merge refuses duplicates, gaps, and partial shard sets.
 - Exactly one job per run writes the shared build cache; it runs on every
   pull-request run.
-- The boot image is built once per run. A dependency is never rebuilt because
-  a timestamp moved.
+- A shard builds the boot image once and every one of its guests boots what
+  that build produced; a config the shared image does not cover costs that
+  shard one more build. Every shard builds it, and an artifact built once and
+  shipped to the others cannot reach one before its own build does
+  (`specs/issues/build/building-the-image-once-and-shipping-it-cannot-shorten-the-matrix.md`).
+  A dependency is never rebuilt because a timestamp moved.
 - `build` builds and publishes the toolchain every guest shard installs.
 
 A pull-request red that is not about the author's diff is adjudicated in
