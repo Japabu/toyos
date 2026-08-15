@@ -269,6 +269,23 @@ pub struct AddressSpace {
 unsafe impl Send for AddressSpace {}
 unsafe impl Sync for AddressSpace {}
 
+/// What a range already in `regions` runs into — [`AddressSpace::occupancy`].
+///
+/// A *placed* mapping names its own range instead of taking a free one from
+/// `find_gap`, so the question the allocator answers silently for everybody
+/// else has to be asked out loud for it. There is exactly one such caller, the
+/// FIXED arm of `sys_mmap`, and the address it asks about came from userland.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Occupancy {
+    /// Nothing is registered over any part of it.
+    Free,
+    /// One region covers it end for end, and that region is all it runs into.
+    Whole,
+    /// Anything else: part of a region, several regions, or a region that
+    /// merely starts where this one does.
+    Partial,
+}
+
 fn align_up_2m(v: u64) -> u64 {
     (v + PAGE_2M - 1) & !(PAGE_2M - 1)
 }
@@ -339,7 +356,11 @@ impl AddressSpace {
     }
 
     /// Unmap a contiguous range of 2MB pages.
-    pub fn unmap_range(&mut self, vaddr: UserAddr, size: u64) {
+    ///
+    /// Private: unmapping a range without unregistering it is what left a
+    /// placed `mmap` invisible to the placement search, so the only way out of
+    /// this module is [`free_and_unmap`](Self::free_and_unmap), which does both.
+    fn unmap_range(&mut self, vaddr: UserAddr, size: u64) {
         let mut offset = 0u64;
         while offset < size {
             self.unmap(UserAddr::new(vaddr.raw() + offset));
@@ -546,12 +567,6 @@ impl AddressSpace {
         Some(size)
     }
 
-    /// Free a region without unmapping (for demand-paged regions where pages
-    /// are tracked separately).
-    pub fn free_region(&mut self, addr: UserAddr) -> Option<u64> {
-        self.regions.remove(&addr).map(|r| r.size)
-    }
-
     /// Insert a region at a specific address (for ELF segments, stack, etc.)
     pub fn insert_region(&mut self, addr: UserAddr, region: Region) {
         assert!(
@@ -569,6 +584,27 @@ impl AddressSpace {
             Some((start, region))
         } else {
             None
+        }
+    }
+
+    /// What `[addr, addr + size)` runs into, as the one question a placed
+    /// mapping has to ask before it can be registered.
+    ///
+    /// `find_gap` answers it by construction for every allocated region, and
+    /// a range that is `Free` here is one `insert_region` can take. The end is
+    /// saturating so that no caller's arithmetic can wrap into a smaller range
+    /// than it asked about; every real call has already bounded its own end at
+    /// [`vma::ALLOC_CEILING`].
+    pub fn occupancy(&self, addr: UserAddr, size: u64) -> Occupancy {
+        let end = UserAddr::new(addr.raw().saturating_add(size));
+        let mut over = self.overlapping_regions(addr, end);
+        let Some((&start, region)) = over.next() else {
+            return Occupancy::Free;
+        };
+        if over.next().is_none() && start == addr && region.size == size {
+            Occupancy::Whole
+        } else {
+            Occupancy::Partial
         }
     }
 
