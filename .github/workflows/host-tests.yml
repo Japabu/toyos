@@ -42,17 +42,22 @@ jobs:
       # helps a branch's first run at all.
       - uses: actions/cache@v4
         with:
-          # One `target` for the whole host workspace. The sixteen per-crate
-          # entries that used to be listed here are the directories that
-          # stopped existing when those crates became members of it — a member
-          # builds into the workspace root's `target`, not its own.
+          # One `target` per workspace, which is all there is: a member builds
+          # into its workspace root's `target`, never its own. The sixteen
+          # per-crate entries that used to be here are directories that stopped
+          # existing when those crates joined the host workspace.
+          #
+          # `userland/sshd/target` was on this list and never existed at all —
+          # `sshd` and `calc` are both members of `userland/Cargo.toml`'s
+          # workspace, so their host builds land in `userland/target`, and the
+          # step below has been recompiling them from scratch every run. The
+          # gate in `src/hostws.rs` now reds on a path like that.
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            userland/sshd/target
-            userland/calc/target
+            userland/target
           key: host-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: host-${{ runner.os }}-
 

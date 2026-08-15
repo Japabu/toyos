@@ -177,6 +177,35 @@ fn tables_cargo_would_ignore(manifest: &str) -> Vec<&'static str> {
     ["profile", "patch"].into_iter().filter(|key| doc.get(key).is_some()).collect()
 }
 
+/// Every member of every workspace in this repository, as paths relative to the
+/// root.
+///
+/// The host workspace's own, plus those of the workspaces it excludes: a
+/// workspace excluded from this one is still a workspace, and its members still
+/// have no target directory of their own. `userland/` is the one that matters —
+/// `sshd` and `calc` are members of it, and `host-tests.yml` cached
+/// `userland/sshd/target`, a directory that has never existed.
+#[cfg(test)]
+fn every_workspace_member(root: &Path) -> BTreeSet<String> {
+    let mut all: BTreeSet<String> = members(root).into_iter().filter(|m| m != ".").collect();
+    for dir in excluded(root) {
+        let Ok(text) = std::fs::read_to_string(root.join(&dir).join("Cargo.toml")) else {
+            continue;
+        };
+        let Ok(doc) = text.parse::<toml::Value>() else { continue };
+        let nested = doc
+            .get("workspace")
+            .and_then(|w| w.get("members"))
+            .and_then(|m| m.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or_default();
+        for member in nested.iter().filter_map(|m| m.as_str()) {
+            all.insert(format!("{dir}/{}", member.trim_end_matches('/')));
+        }
+    }
+    all
+}
+
 /// Every `<member>/target` `text` names.
 ///
 /// A member has no target directory of its own, so naming one is a path that
@@ -447,8 +476,15 @@ mod tests {
     }
 
     /// **Nothing that executes may name `<member>/target`** — a member builds
-    /// into the workspace root's target directory, so such a path is one that
+    /// into its workspace root's target directory, so such a path is one that
     /// cannot exist.
+    ///
+    /// Every workspace in the tree, not just this one: the first thing this
+    /// found after `userland/doom/build.rs` was `host-tests.yml` caching
+    /// `userland/sshd/target`, which has never been a directory — `sshd` is a
+    /// member of `userland/`'s workspace and builds into `userland/target`. A
+    /// cache path that matches nothing fails silently and forever, which is why
+    /// it survived.
     ///
     /// The files scanned are the ones that *act* on a path: the workflows, this
     /// build system, and every `build.rs` in the tree. Prose is left alone —
@@ -458,7 +494,7 @@ mod tests {
     #[test]
     fn nothing_that_runs_names_a_target_directory_a_member_does_not_have() {
         let root = repo_root();
-        let members = members(&root);
+        let members = every_workspace_member(&root);
         let mut files: Vec<PathBuf> = Vec::new();
         for dir in [".github/workflows", "src"] {
             let Ok(entries) = std::fs::read_dir(root.join(dir)) else { continue };
@@ -504,10 +540,17 @@ mod tests {
             dead_member_target_paths(&members, "let cc = root.join(\"../../toyos-cc/target/x\");"),
             ["toyos-cc/target"],
         );
-        // `kernel/` and `userland/` are excluded and keep their own, so naming
-        // one of those is correct and must not be reported.
+        // `kernel/` and `userland/` are workspace *roots*, so naming one of
+        // their target directories is correct and must not be reported.
         assert!(dead_member_target_paths(&members, "kernel/target/x86_64-unknown-none").is_empty());
         assert!(dead_member_target_paths(&members, "userland/target").is_empty());
+        // A member of the userland workspace, which is the real find above.
+        let with_userland: BTreeSet<String> =
+            members.union(&["userland/sshd".to_string()].into()).cloned().collect();
+        assert_eq!(
+            dead_member_target_paths(&with_userland, "            userland/sshd/target\n"),
+            ["userland/sshd/target"],
+        );
         // And the root's own `target` is where members build *to*.
         assert!(dead_member_target_paths(&members, "root.join(\"target\")").is_empty());
     }
