@@ -361,6 +361,32 @@ actuators! {
     /// See `log_file::max_log_bytes`.
     log_rotate_fast = "log-rotate-fast";
 
+    /// Panic inside `klogd`, the kernel thread, on its first instruction.
+    ///
+    /// **Nothing outside the kernel can make a kernel thread panic**, and the
+    /// verdict is not the panic but which *branch* the panic handler takes: a
+    /// kernel task has a tid, so the recovery predicate's second clause holds,
+    /// and its first reads a `syscall_rip` that is never cleared. Without
+    /// `sched::kthread`'s row the outcome is decided by which CPU work stealing
+    /// last put a user thread on, so no host-side stimulus could exist even in
+    /// principle — there is no process to kill and no syscall to make.
+    /// `specs/log-architecture-spec.md` §4.3.
+    klogd_panic = "klogd-panic";
+
+    /// Stop the boot dead in phase 3, with interrupts off, before anything that
+    /// could ever have drained a log.
+    ///
+    /// **A machine that wedges cannot be staged from the host at all** — there
+    /// is no injection that stops a kernel between two statements, and a QEMU
+    /// pause stops the guest without leaving it in the state under test, which
+    /// is a CPU that will never reach a scheduler pass. What the gate reads is
+    /// the *console*: before `Drain::Inline` a boot that stopped here produced
+    /// nothing whatsoever, including everything it had logged
+    /// (`specs/issues/diagnostics/pre-idle-wedge-says-nothing.md`), because the
+    /// only two drains in the machine were the timer tick and the idle loop.
+    /// `specs/log-architecture-spec.md` §4.1.
+    pre_idle_wedge = "pre-idle-wedge";
+
     /// Fail every re-read of a page of a file on either FAT mount through
     /// `FatBacking`, with the mount and the filesystem underneath it working.
     /// Both partitions are on the disk the guest is running from, so no

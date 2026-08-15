@@ -45,22 +45,21 @@
 //!
 //! # When it writes
 //!
-//! Continuously, from the idle loop, beside `drain_serial`. The failure this
-//! exists for is a machine that *stops* — a wedge, a livelock, a hang with no
-//! panic and no console — and for that, "the tail is on disk" is the whole
-//! requirement. The alternative the owner asked about, a flush at boot-complete
-//! plus a periodic one, saves I/O and loses exactly the evidence the feature is
-//! for.
+//! Continuously, from the idle loop. The failure this exists for is a machine
+//! that *stops* — a wedge, a livelock, a hang with no panic and no console —
+//! and for that, "the tail is on disk" is the whole requirement. The
+//! alternative the owner asked about, a flush at boot-complete plus a periodic
+//! one, saves I/O and loses exactly the evidence the feature is for.
 //!
-//! It costs nothing when nothing is logged: [`log_ring::file_has_pending`] is
-//! one relaxed atomic load. And it is not on the logging hot path at all —
-//! `log!` still does nothing but append to the ring under a brief spinlock, as
-//! it did before, so nothing that logs while holding a kernel lock does I/O.
+//! It costs nothing when nothing is logged: [`has_pending`] is one relaxed load
+//! and, at most, a walk of eight shard heads. And it is not on the logging hot
+//! path at all — `log!` publishes a record into its own CPU's shard and nothing
+//! else, so nothing that logs while holding a kernel lock does I/O.
 //!
 //! Batching needs no tuning and has no period. A busy machine reaches the idle
 //! loop rarely, so each flush carries more; an idle one reaches it constantly
-//! and each flush carries a line or two. The same argument `drain_serial` makes
-//! for the console, with a device write in place of a UART byte.
+//! and each flush carries a line or two. The same argument the console's drain
+//! makes, with a device write in place of a UART byte.
 //!
 //! # The panic path does not write here, and cannot be made to
 //!
@@ -87,12 +86,14 @@
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::clock::{self, Civil};
-use crate::drivers::log_ring;
 use crate::file_cache::{self, FileId};
+use crate::log::read::{drain_ordered, Published, RecordSink};
 use crate::sync::Lock;
 use crate::vfs::{self, Vfs};
+use toyos_abi::log::LogRecord;
 use toyos_abi::syscall::SyscallError;
 
 /// Where the logs go.
@@ -160,14 +161,31 @@ fn max_log_bytes() -> u64 {
     }
 }
 
-/// Bytes moved per pass of the drain loop, and the size of the stack buffer it
-/// goes through.
+/// Whether this sink is collecting at all.
 ///
-/// 512 because this runs on the 16 KiB per-CPU idle stack, which is a heap
-/// allocation with no guard page — an overflow there corrupts the heap silently
-/// rather than faulting. Same number and same reason as
-/// [`log_ring::DRAIN_CHUNK`].
-const CHUNK: usize = 512;
+/// False until a `/log` exists and [`install`] runs, and false again the moment
+/// the sink gives up — which is what keeps [`has_pending`] from reporting
+/// records owed to a consumer that no longer exists, and the idle loop from
+/// declining to sleep on them forever. It was `log_ring::FILE_SINK` and it is
+/// the same flag the deleted byte ring had, for the same reason; what it gates
+/// is a cursor rather than a second set of byte indices into one buffer.
+static COLLECTING: AtomicBool = AtomicBool::new(false);
+
+/// Where this sink has got to in the record stream.
+///
+/// **Its own position, and that is the whole of what two consumers used to need
+/// two cursors into one byte ring for.** The console's is
+/// `log::console`'s; neither consumes the other's records, and a reader that
+/// stops costs the other nothing. Published words rather than a field in
+/// [`Sink`] because [`has_pending`] is read from the pre-`hlt` check with
+/// interrupts off and may take no lock.
+static POSITION: Published = Published::new();
+
+/// Does the log volume still owe this boot records? Lock-free, for the pre-halt
+/// check in `sched::driver::execute` and for `apic::owed`.
+pub fn has_pending() -> bool {
+    COLLECTING.load(Ordering::Relaxed) && POSITION.any_pending()
+}
 
 /// How long the VFS lock may stay held before the sink gives up on it.
 ///
@@ -205,23 +223,27 @@ struct Sink {
     size: u64,
     /// When the current run of polls that found the VFS lock held began.
     blocked_since: Option<u64>,
+    /// Records this sink has already said were overwritten before it got to
+    /// them. The cursor's own `lost` is cumulative, so the line reports the
+    /// difference — one line per hole rather than one per flush.
+    reported_lost: u64,
 }
 
 static SINK: Lock<Option<Sink>> = Lock::new(None);
 
-/// Whether a flush is between taking bytes out of the ring and getting them on
-/// the device.
+/// Whether a flush is between taking records out of the shards and getting them
+/// on the device.
 ///
-/// [`log_ring::file_has_pending`] answers "the ring still owes the sink", which
-/// goes false at `drain_to_file` — *before* `flush_file` and `sync_mount` have
-/// run. A dying machine waiting on that predicate alone therefore stops waiting
-/// in the middle of the write and halts the CPU doing it, which is exactly what
-/// `halt_all_cpus`'s drain wait did until this existed: the report left the ring
-/// and never reached the stick.
+/// [`has_pending`] answers "the shards still hold records this sink has not
+/// taken", which goes false as the cursor advances — *before* `flush_file` and
+/// `sync_mount` have run. A dying machine waiting on that predicate alone
+/// therefore stops waiting in the middle of the write and halts the CPU doing
+/// it, which is exactly what `halt_all_cpus`'s drain wait did until this
+/// existed: the report left the ring and never reached the stick.
 ///
-/// The pair has no gap. `FILE_OWED` only drops inside this flag's window, so
-/// "ring empty and no flush running" cannot be observed while bytes are still
-/// owed to the volume.
+/// The pair has no gap. The cursor only advances inside this flag's window, so
+/// "nothing pending and no flush running" cannot be observed while records are
+/// still owed to the volume.
 static IN_FLUSH: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Is a flush still between the ring and the device? For the fatal path, which
@@ -270,8 +292,20 @@ pub fn install() {
     };
     drop(vfs);
 
-    *SINK.lock() = Some(Sink { file_id, stem, part, size: 0, blocked_since: None });
-    log_ring::enable_file_sink();
+    *SINK.lock() = Some(Sink {
+        file_id,
+        stem,
+        part,
+        size: 0,
+        blocked_since: None,
+        reported_lost: POSITION.lost(),
+    });
+    // The cursor has never moved, so the file opens with this boot's log from
+    // its first record rather than from the moment `/boot` mounted — which is
+    // four phases in, and exactly the part a machine that dies early needs.
+    // That is what `enable_file_sink`'s seed from `retained` was for, without
+    // the 64 KiB window.
+    COLLECTING.store(true, Ordering::Relaxed);
     log!("log-file: this boot's kernel log is {path}");
 }
 
@@ -283,9 +317,9 @@ pub fn destination() -> Option<String> {
     Some(path(&sink.stem, sink.part))
 }
 
-/// Move whatever the ring owes into the file. Called from the idle loop.
+/// Move whatever the shards owe into the file. Called from the idle loop.
 pub fn poll() {
-    if !log_ring::file_has_pending() {
+    if !has_pending() {
         return;
     }
     // `try_lock` on both: the pass this CPU is about to run matters more than a
@@ -302,7 +336,7 @@ pub fn poll() {
         let stopped = sink.stopped_at();
         *guard = None;
         drop(guard);
-        log_ring::disable_file_sink();
+        COLLECTING.store(false, Ordering::Relaxed);
         log!(
             "log-file: the VFS lock has been held for {}s — {stopped}",
             MAX_BLOCKED_NANOS / 1_000_000_000
@@ -318,7 +352,7 @@ pub fn poll() {
         let stopped = sink.stopped_at();
         *guard = None;
         drop(guard);
-        log_ring::disable_file_sink();
+        COLLECTING.store(false, Ordering::Relaxed);
         log!("log-file: {step} was refused ({err}) — {stopped}");
     }
 }
@@ -351,24 +385,69 @@ pub fn flush_final() {
 /// it happened.
 type Refusal = (&'static str, SyscallError);
 
+/// One record, rendered as its line and appended.
+///
+/// **The renderer is the console's** (`log::console::write_line`), so `/log`
+/// and the wire carry the same bytes out of the same implementation — a second
+/// one here would be a second thing to keep agreeing with the panel. At L6 this
+/// and the file go together and `logd` renders a wall clock instead.
+struct Appender<'a> {
+    sink: &'a mut Sink,
+    moved: usize,
+    failed: Option<SyscallError>,
+}
+
+impl RecordSink for Appender<'_> {
+    fn put(&mut self, record: &LogRecord) -> bool {
+        let sink = &mut *self.sink;
+        let mut wrote = 0usize;
+        let mut failed = None;
+        crate::log::console::write_line(record, |bytes| {
+            // A line long enough to spill arrives in more than one piece, and
+            // once the device has refused one the rest are not attempted.
+            if failed.is_some() {
+                return;
+            }
+            match sink.append(bytes) {
+                Ok(()) => wrote += bytes.len(),
+                Err(e) => failed = Some(e),
+            }
+        });
+        self.moved += wrote;
+        self.failed = failed;
+        self.failed.is_none()
+    }
+}
+
 impl Sink {
     fn flush(&mut self, vfs: &mut Vfs) -> Result<(), Refusal> {
-        let lost = log_ring::take_file_drops();
-        if lost > 0 {
-            // Into the ring, so this line is itself in the batch below and the
-            // hole is described in the file it is a hole in.
-            log!("log-file: {lost} bytes were overwritten in the ring before they reached the file");
+        let lost = POSITION.lost();
+        if lost > self.reported_lost {
+            // Emitted rather than written, so this line is itself a record in
+            // the batch below and the hole is described in the file it is a
+            // hole in.
+            log!(
+                "log-file: {} record(s) were overwritten in a shard before they reached the file",
+                lost - self.reported_lost
+            );
+            self.reported_lost = lost;
         }
 
-        let mut buf = [0u8; CHUNK];
-        let mut moved = 0usize;
-        loop {
-            let n = log_ring::drain_to_file(&mut buf);
-            if n == 0 {
-                break;
-            }
-            self.append(&buf[..n]).map_err(|e| ("the append", e))?;
-            moved += n;
+        // **The cursor is taken and put back around the walk, and the walk is
+        // where the appending happens.** `RecordSink::put` answering `false`
+        // leaves `drain_ordered` with the cursor *before* the record it could
+        // not write, so a refused append loses nothing that a later flush could
+        // still have carried — and there is no later flush, because the caller
+        // disables the sink on the error this returns.
+        let mut cursor = POSITION.take();
+        let (moved, failed) = {
+            let mut out = Appender { sink: self, moved: 0, failed: None };
+            drain_ordered(&mut cursor, &mut out);
+            (out.moved, out.failed)
+        };
+        POSITION.put(&cursor);
+        if let Some(e) = failed {
+            return Err(("the append", e));
         }
         if moved == 0 {
             return Ok(());

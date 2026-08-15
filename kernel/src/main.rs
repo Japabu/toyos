@@ -172,7 +172,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
     // Early boot: percpu not ready, just halt (single CPU at this point)
     if !log::PERCPU_READY.load(core::sync::atomic::Ordering::Relaxed) {
-        log!("!!! EARLY PANIC !!!: {}", info);
+        alert!("EARLY PANIC: {}", info);
         // This branch halts directly and never reaches halt_all_cpus, so it
         // owns both halves itself — and inverts halt_all_cpus' order. It runs
         // before idt::init, the one window with no exception handlers at all,
@@ -206,7 +206,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let prev = percpu::swap_fault_state(percpu::CpuFaultState::Panic);
     if prev != percpu::CpuFaultState::Normal {
         // Nested: Panic→Panic, Fatal→Panic, PageFault→Panic. Escalate.
-        log!("!!! DOUBLE PANIC !!!");
+        alert!("DOUBLE PANIC");
         apic::halt_all_cpus();
     }
 
@@ -234,7 +234,18 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // If in syscall context: kill the process, rejoin scheduler. This panic
     // is fully handled — reset the reentry guard so a future, independent
     // panic on this CPU still reports.
-    if percpu::syscall_rip() != 0 && percpu::current_tid().is_some() {
+    //
+    // **A kernel thread answers from its own row and never from the two words
+    // below**, because for one of them the words do not merely give the wrong
+    // answer — they give a *nondeterministic* one. `syscall_rip` is never
+    // cleared (`specs/issues/panic-path/syscall-rip-never-cleared.md`), so a
+    // kernel task reads whatever user thread last ran on this CPU left behind:
+    // the same panic on the same build would recover or halt depending on which
+    // CPU work stealing had put the thread on. `sched::kthread` is where the
+    // answer is a property of the thread instead.
+    let recoverable = sched::kthread::panic_recovers_here()
+        .unwrap_or_else(|| percpu::syscall_rip() != 0 && percpu::current_tid().is_some());
+    if recoverable {
         depth.store(0, core::sync::atomic::Ordering::SeqCst);
         // The captured report dies with the panic it belongs to. Left set, it
         // outlives a panic the machine survived, and the next fatal path —
@@ -295,9 +306,10 @@ fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
 /// nothing to read afterwards. A `/log` that refused to mount already says so,
 /// once, in the middle of phase 5, in white, among sixty-seven other rows.
 ///
-/// `!!!` is the panic console's alert marker (`panic_console::has_alert`),
-/// which paints the row red. It is claimed here for the two states in which
-/// this boot leaves no readable account of itself anywhere.
+/// `alert!` is what says the row is red, and it is used here for the two states
+/// in which this boot leaves no readable account of itself anywhere. Nothing in
+/// the text says so any more: the panel reads `Level` off the record, so a
+/// refusal wears the colour without having to spell it.
 ///
 /// ASCII throughout, unlike the rest of the kernel's prose: the panel's font is
 /// codepoints 0x20..=0x7E and `draw_glyph` renders everything else as a dot, so
@@ -309,10 +321,10 @@ fn report_log_destination() {
             log!("log: no serial console - this boot is in {path} and on the screen")
         }
         (true, None) => {
-            log!("!!! log: no /log - this boot is on the console only, and nothing outlives the power !!!")
+            alert!("log: no /log - this boot is on the console only, and nothing outlives the power")
         }
         (false, None) => {
-            log!("!!! log: no serial console and no /log - this boot is on this screen and nowhere else !!!")
+            alert!("log: no serial console and no /log - this boot is on this screen and nowhere else")
         }
     }
 }
@@ -377,7 +389,42 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         }
     }
 
-    log!("{:?}", kernel_args);
+    // **Six records rather than one `{:?}`.** The derived debug of `KernelArgs`
+    // is the one call site in the tree whose message exceeds the record bound —
+    // everything above 200 characters in the measured corpus is this line, 18
+    // of 12,497 — and unlike a demangled symbol it is a producer the kernel can
+    // split. So it is split, grouped by the question each field answers, rather
+    // than truncated with a count of what was lost
+    // (`specs/log-architecture-spec.md` §2.1).
+    log!(
+        "boot: memory map {:#x}+{:#x}, kernel {:#x}+{:#x}, stack {:#x}+{:#x}",
+        kernel_args.memory_map_addr, kernel_args.memory_map_size,
+        kernel_args.kernel_memory_addr, kernel_args.kernel_memory_size,
+        kernel_args.kernel_stack_addr, kernel_args.kernel_stack_size
+    );
+    log!(
+        "boot: initrd {:#x}+{:#x}, kernel elf {:#x}+{:#x}, rsdp {:#x}, boot pml4 {:#x}",
+        kernel_args.initrd_addr, kernel_args.initrd_size,
+        kernel_args.kernel_elf_addr, kernel_args.kernel_elf_size,
+        kernel_args.rsdp_addr, kernel_args.boot_pml4_addr
+    );
+    log!(
+        "boot: gop {:#x}+{:#x} {}x{} stride {} format {}",
+        kernel_args.gop_framebuffer, kernel_args.gop_framebuffer_size,
+        kernel_args.gop_width, kernel_args.gop_height,
+        kernel_args.gop_stride, kernel_args.gop_pixel_format
+    );
+    log!(
+        "boot: boot partition present={} lba {} +{} blocks guid {:02x?}",
+        kernel_args.boot_partition_present, kernel_args.boot_partition_start_lba,
+        kernel_args.boot_partition_blocks, kernel_args.boot_partition_guid
+    );
+    log!("boot: log partition guid {:02x?}", kernel_args.log_partition_guid);
+    log!(
+        "boot: rtc utc offset {} minutes (known={}), cmdline {:#x}+{}",
+        kernel_args.rtc_utc_offset_minutes, kernel_args.rtc_utc_offset_known,
+        kernel_args.cmdline_addr, kernel_args.cmdline_len
+    );
 
     let initrd = core::slice::from_raw_parts(
         DirectMap::from_phys(kernel_args.initrd_addr).as_ptr::<u8>(),
@@ -482,6 +529,15 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     };
 
     boot_phase!("storage ready", t_storage);
+
+    // **Four phases before the idle loop, which is where the log used to become
+    // sayable.** Under `Drain::Inline` every record above is already on the wire
+    // when this runs, so what the gate reads is the whole boot and then silence
+    // — where before this branch it was silence and nothing else.
+    #[cfg(feature = "boot-actuators")]
+    if actuator::pre_idle_wedge() {
+        pre_idle_wedge();
+    }
 
     // Phase 4: Peripherals
     let t_periph = clock::nanos_since_boot();
@@ -643,6 +699,31 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
             late_panic::Nest<late_panic::Nest<()>>>>>>>>>>::on_screen_console_check();
     }
 
+    // The last thing before the machine hands itself to the scheduler, because
+    // that is the first moment anything can run: the APs spin on `SMP_READY`
+    // below and the BSP reaches no pass before `enter_idle_loop`. A `klogd`
+    // spawned earlier would sit in a run queue through phases 5, 6 and 7 —
+    // which is the window a machine with no console wedges in — while the boot
+    // believed it had a drainer. `specs/log-architecture-spec.md` §4.2.
+    log::console::start();
+
     smp::set_ready();
     crate::scheduler::enter_idle_loop();
+}
+
+/// Stop this machine where nothing can report it, and say so first.
+///
+/// **Interrupts off and then a spin, which is a wedge rather than a machine
+/// that is merely idle.** No timer tick, no scheduler pass, no idle loop: the
+/// two things that used to drain the byte ring are both unreachable from here,
+/// and so is `klogd`, which is not spawned for another four phases. Everything
+/// the boot has said is therefore already on the wire or it never will be —
+/// which is the whole of what `pre_idle_wedge_speaks` reads.
+#[cfg(feature = "boot-actuators")]
+fn pre_idle_wedge() -> ! {
+    log!("pre-idle-wedge: the boot stops here, and this line is the last thing this machine says");
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+    loop {
+        core::hint::spin_loop();
+    }
 }

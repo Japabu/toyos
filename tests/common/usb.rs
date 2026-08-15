@@ -197,7 +197,7 @@ fn boot_and_shutdown(
     qemu.flush_stdin();
     log.push_str(&qemu.drain_serial(Duration::from_secs(20)));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} during the USB gate boot\n{log}"));
         }
@@ -505,7 +505,7 @@ pub fn usb_disk_index_stable(
     qemu.flush_stdin();
     let log = format!("{boot}{}", qemu.drain_serial(Duration::from_secs(20)));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} after a disk arrived on the other controller\n{log}"));
         }
@@ -884,7 +884,7 @@ fn optional_flush_keeps_the_log(
     qemu.flush_stdin();
     let log = format!("{boot}{}", qemu.drain_serial(Duration::from_secs(20)));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} on a stick with no write cache\n{log}"));
         }
@@ -967,7 +967,7 @@ fn failed_flush_stops_once(
     qemu.flush_stdin();
     let log = format!("{boot}{}", qemu.drain_serial(Duration::from_secs(20)));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} on a stick that cannot flush\n{log}"));
         }
@@ -1245,16 +1245,34 @@ pub fn xhci_slow_connect(
         return Err(format!("the guest did not report a clean pass\n{log}"));
     }
     verify(&image, bytes, nonce)?;
-    if !log.contains("Boot: complete") {
+    // The guest's own boot stamp, printed rather than asserted on.
+    //
+    // **This is `specs/log-architecture-spec.md` §1.4's and §9.6's named
+    // instrument, and until 2026-08-15 it could not be read off the test that
+    // *is* it.** Both sections ask for an interleaved A/B of a producer-path
+    // cost against this boot's `Boot: complete`, and the stamp reached only the
+    // per-run UART file, which goes when the guest does. So the measurement had
+    // to instrument something — and the lesson
+    // `specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md` leaves is that
+    // the reading taken on an instrumented build is the one that misleads. One
+    // line of output, `i8042_absent`'s arrangement, and the obligation is
+    // re-runnable by anybody. It decides nothing: what is asserted is that the
+    // boot finished, which is the `else` below.
+    let Some(boot_ms) = log
+        .split("Boot: complete (")
+        .nth(1)
+        .and_then(|rest| rest.split("ms)").next())
+    else {
         return Err(format!("the boot did not finish\n{log}"));
-    }
+    };
+    let boot_ms = boot_ms.to_string();
     serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
     let _ = std::fs::remove_file(&image);
 
     eprintln!(
         "  [usb] controller started at {started:.3} s and the ports read empty to \
          {HELD_EMPTY_S} s; first port named at {first_seen:.3} s, both sticks bound, host bytes \
-         verified host-side"
+         verified host-side; Boot: complete at {boot_ms} ms"
     );
     Ok(())
 }
@@ -1885,7 +1903,7 @@ fn hid_break_boot(
         return Err(format!("{err}\n{}\n{}", result.serial, result.stdout));
     }
     let log = format!("{boot}{}", result.serial);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} with the break staged at {which}\n{log}"));
         }
@@ -2121,7 +2139,7 @@ pub fn xhci_hotplug(
         return Err(format!("{err}\n{}\n{}", result.serial, result.stdout));
     }
     let log = format!("{boot}{}", result.serial);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} while devices came and went\n{log}"));
         }
@@ -2310,7 +2328,7 @@ pub fn xhci_flap(
         return Err(format!("{err}\n{}\n{}", result.serial, result.stdout));
     }
     let log = &result.serial;
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} while the port was flapped\n{log}"));
         }
@@ -2564,7 +2582,7 @@ pub fn usb_refused_disk_first(
     qemu.flush_stdin();
     let log = format!("{boot}{}", qemu.drain_serial(Duration::from_secs(20)));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} during the USB gate boot\n{log}"));
         }
@@ -2807,7 +2825,7 @@ pub fn usb_boot_stick_pulled(
         ));
     }
 
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if console.contains(bad) {
             return Err(format!("{bad:?} after the boot stick was pulled\n{console}"));
         }

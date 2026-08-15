@@ -7,7 +7,7 @@
 //! table the kernel blitted -- there is nothing for the two to drift on.
 //!
 //! Which makes screen assertions ordinary string assertions:
-//! `screen.text().contains("!!! PANIC !!!")`. Same discipline as the audio
+//! `screen.text().contains("PANIC:")`. Same discipline as the audio
 //! gate: a decoded measurement, never a human looking at a picture.
 
 use std::collections::HashMap;
@@ -324,7 +324,7 @@ impl Font {
 pub fn self_test() {
     let font = Font::load();
     let lines = [
-        "!!! PANIC !!!: panicked at src/loader.rs:952:40",
+        "PANIC: panicked at src/loader.rs:952:40",
         "  0xffff80007d102adc kernel::loader::spawn_kernel+0x28e",
         "the quick brown fox JUMPS over 13 lazy dogs {}[]<>|~",
     ];

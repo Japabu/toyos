@@ -463,6 +463,13 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // `desktop_window_child` carries, not a reclassification.
     ("fpu_isolation", Sched::Parallel, Tier::Nightly),
     ("short_sleep_livelock", Sched::Parallel, Tier::Fast),
+    // The kernel thread and the row that says what its panic means. Two
+    // boots, both headless: the second one halts on purpose — and the pair
+    // measured 11.8 s on CI KVM, over the fast line, so the whole verdict is
+    // nightly until the split the relegation row names.
+    ("klogd_hosted", Sched::Parallel, Tier::Nightly),
+    // One boot that stops dead in phase 3, read for what it managed to say.
+    ("pre_idle_wedge_speaks", Sched::Parallel, Tier::Fast),
     ("i8042_health", Sched::Parallel, Tier::Nightly),
     // And one from here to `i8042_mouse` (`I8042_TRACE`), which is why all
     // three carry the answer the last of them needs.
@@ -838,6 +845,25 @@ const EXPECTED_FAILURES: &[ExpectedFailure] = &[ExpectedFailure {
     // so a green is one sample and may not red a healthy tree. The date is the
     // same month the entry above uses, for the same reason.
     stale: Stale::OnThisDate("2026-09-06"),
+}, ExpectedFailure {
+    test: "71_macro_empty_arg",
+    task: 84,
+    spec: "specs/issues/build/daemon-lines-land-in-any-test-window.md",
+    // This test's whole verdict is its captured stdout, so the open defect — a
+    // stray daemon line landing inside the capture window, or its mirror
+    // image, a capture that comes back empty — can only present as the capture
+    // disagreeing with the expectation. Fourteen suites on 2026-08-15 measured
+    // the rate at ~1 in 4 on the dev host, unchanged across an A/B whose diff
+    // never touched the window, and CI's own shard measured the same shape
+    // with the harness's ALONE retry answering GREEN both times ("a rate and
+    // not a classification"). The residual risk the struct doc names applies
+    // in full here: a real regression of the macro expansion would present
+    // identically, and the spec entry is what a human separates them with.
+    says: &["output mismatch", "exit code Some(0)"],
+    // Intermittent at a measured rate, so one green may not red the run. The
+    // one-month shelf, as above: long enough for #84's fix to land first,
+    // short enough that nobody inherits this silently.
+    stale: Stale::OnThisDate("2026-09-14"),
 }];
 
 /// The renderer's two text colours, as the screendump reports them.
@@ -1362,7 +1388,7 @@ fn check_panic_recovery(result: &TestResult) -> bool {
     }
 
     let checks: &[(&str, &str)] = &[
-        ("!!! PANIC !!!", "expected PANIC header"),
+        ("PANIC:", "expected PANIC header"),
         ("SYS_DEBUG", "expected SYS_DEBUG in panic message"),
         ("Syscall: num=92", "expected syscall context in panic report"),
         ("User backtrace:", "expected user backtrace in panic report"),
@@ -1463,7 +1489,7 @@ fn check_symbols_were_read(test: &str, serial: &str) -> bool {
 /// after the message, so it cannot supply the answer either.
 fn check_tripwire_attribution(serial: &str) -> Result<(), String> {
     const MSG: &str = "scheduler entered while a lock is held";
-    const HEADER: &str = "!!! PANIC !!!";
+    const HEADER: &str = "PANIC:";
     let msg_at = serial
         .find(MSG)
         .ok_or("expected the §6.4 lock-across-switch tripwire to fire")?;
@@ -2309,24 +2335,51 @@ fn report_is_photographable(dump: &screen::Ppm, what: &str) -> Result<(), String
     Ok(())
 }
 
-/// Assert the two colour decisions `text()` cannot see: the fill, and the
-/// alert highlight on a `!!!` line against white everywhere else.
-fn check_colors(dump: &screen::Ppm, fill: [u8; 3], alert_line: &str) -> Result<(), String> {
+/// Assert the colour decisions `text()` cannot see: the fill, every row an
+/// `alert!` produced, and one row it did not.
+///
+/// **Both rows are named by their text, and that is the whole assertion.**
+/// Nothing in the message says "alert" any more — the colour is the record's
+/// `Level` — so a version of this that picked the ordinary row as "the first
+/// one that is not red" asserted only that the palette has two colours in it,
+/// and passed on a panel where every row was red. The comparison row has to be
+/// chosen by something the paint cannot influence, so the caller names it.
+///
+/// `alert_lines` is a list because **a record is not a line**: `PanicInfo`'s
+/// `Display` writes `panicked at <site>:`, a newline, and then the panic's own
+/// text, so one `alert!` produces two rows and both of them are the record's.
+/// A renderer that counted records where the panel counts newlines painted the
+/// first red and the second white, and shifted every bit below it.
+fn check_colors(
+    dump: &screen::Ppm,
+    fill: [u8; 3],
+    alert_lines: &[&str],
+    plain_line: &str,
+) -> Result<(), String> {
     if dump.fill() != fill {
         return Err(format!("fill is {:?}, want {fill:?}", dump.fill()));
     }
     let rows = dump.rows();
-    let Some(cy) = dump.row_index(alert_line) else {
-        return Err(format!("{alert_line:?} not on screen"));
-    };
-    if dump.row_fg(cy) != Some(ALERT) {
-        return Err(format!(
-            "{alert_line:?} drawn in {:?}, want alert {ALERT:?}",
-            dump.row_fg(cy)
-        ));
+    for alert_line in alert_lines {
+        let Some(cy) = dump.row_index(alert_line) else {
+            return Err(format!("{alert_line:?} not on screen\n{}", dump.text()));
+        };
+        if dump.row_fg(cy) != Some(ALERT) {
+            return Err(format!(
+                "{alert_line:?} drawn in {:?}, want alert {ALERT:?} — every row of an \
+                 `alert!` record wears its level, including the ones its message wrapped \
+                 or newlined onto\n{}",
+                dump.row_fg(cy),
+                dump.text()
+            ));
+        }
     }
-    let Some(plain) = rows.iter().position(|r| !r.is_empty() && !r.contains("!!!")) else {
-        return Err("no ordinary row to compare the highlight against".to_string());
+    let Some(plain) = dump.row_index(plain_line) else {
+        return Err(format!(
+            "{plain_line:?} is not on screen, so there is no ordinary row to compare the \
+             highlight against\n{}",
+            dump.text()
+        ));
     };
     if dump.row_fg(plain) != Some(WHITE) {
         return Err(format!(
@@ -2442,10 +2495,11 @@ fn run_screen_test(
             // mounted, so nothing here may be wearing the alert marker — a
             // kernel that painted it unconditionally would satisfy that gate
             // and mean nothing.
-            if let Some(row) = dump.rows().iter().find(|r| r.contains("!!!")) {
+            if let Some(row) = (0..dump.rows().len()).find(|&i| dump.row_fg(i) == Some(ALERT)) {
                 return Err(format!(
-                    "an alert row on a boot where everything worked: {row:?}\n\
-                     decoded screen:\n{text}"
+                    "an alert row on a boot where everything worked: {:?}\n\
+                     decoded screen:\n{text}",
+                    dump.rows()[row]
                 ));
             }
 
@@ -2592,7 +2646,7 @@ fn run_screen_test(
             // Red, and the rest of the screen white. `text()` throws hue away
             // by construction, so this is the only place the difference between
             // "the line is there" and "the line stands out" exists.
-            check_colors(&dump, FILL_BOOT, common::volumes::NO_LOG_ALERT)?;
+            check_colors(&dump, FILL_BOOT, &[common::volumes::NO_LOG_ALERT], "Boot: complete")?;
             // And it is a boot checkpoint's paint rather than a panic's: the
             // fill above says so, and the machine is still running.
             if !text.contains("Boot: complete") {
@@ -3271,17 +3325,22 @@ fn run_screen_test(
             // Nothing announces the panic here — there is no console for a
             // marker to arrive on — so the screen is polled until it carries
             // the report. 30s covers firmware plus the initrd read off USB.
-            let dump = qemu.screendump_until("!!! PANIC !!!", Duration::from_secs(30));
+            let dump = qemu.screendump_until("PANIC:", Duration::from_secs(30));
             let text = dump.text();
             print_screen(name, &text);
-            for want in ["!!! PANIC !!!", "test-late-panic: on-screen console check"] {
+            for want in ["PANIC:", "test-late-panic: on-screen console check"] {
                 if !text.contains(want) {
                     return Err(format!(
                         "{want:?} not on screen of a guest with no serial port at all\ndecoded screen:\n{text}"
                     ));
                 }
             }
-            check_colors(&dump, FILL_FATAL, "!!! PANIC !!!")?;
+            check_colors(
+                &dump,
+                FILL_FATAL,
+                &["PANIC:", "test-late-panic: on-screen console check"],
+                "late_panic::Nest",
+            )?;
             Ok(())
         }
         "screen_early_panic" => {
@@ -3297,19 +3356,24 @@ fn run_screen_test(
                     profile: qemu::Profile::Gop,
                     qmp: true,
                     kernel_params: &["test-early-panic"],
-                    ready_marker: "!!! EARLY PANIC !!!",
+                    ready_marker: "EARLY PANIC:",
                     ..Default::default()
                 },
             );
             let dump = qemu.screendump();
             let text = dump.text();
             print_screen(name, &text);
-            for want in ["!!! EARLY PANIC !!!", "test-early-panic: on-screen console check"] {
+            for want in ["EARLY PANIC:", "test-early-panic: on-screen console check"] {
                 if !text.contains(want) {
                     return Err(format!("{want:?} not on screen\ndecoded screen:\n{text}"));
                 }
             }
-            check_colors(&dump, FILL_FATAL, "!!! EARLY PANIC !!!")?;
+            check_colors(
+                &dump,
+                FILL_FATAL,
+                &["EARLY PANIC:", "test-early-panic: on-screen console check"],
+                "PAT:",
+            )?;
             Ok(())
         }
         "screen_late_panic" => {
@@ -3325,7 +3389,7 @@ fn run_screen_test(
                     profile: qemu::Profile::Gop,
                     qmp: true,
                     kernel_params: &["test-late-panic"],
-                    ready_marker: "!!! PANIC !!!",
+                    ready_marker: "PANIC:",
                     ..Default::default()
                 },
             );
@@ -3335,15 +3399,20 @@ fn run_screen_test(
             // pager cycles it, so the window in which any given page is up is
             // `PAGE_HOLD_NS`, not forever: the timeout has to cover a whole
             // cycle rather than just the paint.
-            let dump = qemu.screendump_until("!!! PANIC !!!", Duration::from_secs(30));
+            let dump = qemu.screendump_until("PANIC:", Duration::from_secs(30));
             let text = dump.text();
             print_screen(name, &text);
-            for want in ["!!! PANIC !!!", "test-late-panic: on-screen console check"] {
+            for want in ["PANIC:", "test-late-panic: on-screen console check"] {
                 if !text.contains(want) {
                     return Err(format!("{want:?} not on screen\ndecoded screen:\n{text}"));
                 }
             }
-            check_colors(&dump, FILL_FATAL, "!!! PANIC !!!")?;
+            check_colors(
+                &dump,
+                FILL_FATAL,
+                &["PANIC:", "test-late-panic: on-screen console check"],
+                "late_panic::Nest",
+            )?;
             check_wrap(&dump)?;
             Ok(())
         }
@@ -3362,7 +3431,7 @@ fn run_screen_test(
                     profile: qemu::Profile::Gop,
                     qmp: true,
                     kernel_params: &["test-late-panic"],
-                    ready_marker: "!!! PANIC !!!",
+                    ready_marker: "PANIC:",
                     ..Default::default()
                 },
             );
@@ -3370,7 +3439,7 @@ fn run_screen_test(
             // The first kernel line of the boot, and the one a photograph of
             // the final screen has never been able to show.
             const HEAD: &str = "panic console: armed";
-            const TAIL: &str = "!!! PANIC !!!";
+            const TAIL: &str = "PANIC:";
 
             let mut pages: Vec<String> = Vec::new();
             let mut report: Option<String> = None;
@@ -3443,7 +3512,7 @@ fn run_screen_test(
                     profile: qemu::Profile::Metal,
                     qmp: true,
                     kernel_params: &["test-late-panic"],
-                    ready_marker: "!!! PANIC !!!",
+                    ready_marker: "PANIC:",
                     ..Default::default()
                 },
             );
@@ -3752,7 +3821,7 @@ fn run_screen_test(
                      death\ndecoded screen:\n{text}"
                 ));
             }
-            if !text.contains("!!! PANIC !!!") {
+            if !text.contains("PANIC:") {
                 return Err(format!(
                     "the marker is on the panel without the panic banner, so this painted \
                      something other than a fatal report\ndecoded screen:\n{text}"
@@ -3779,7 +3848,7 @@ fn run_screen_test(
                     on_device.len()
                 ));
             }
-            if !on_device.contains("!!! PANIC !!!") {
+            if !on_device.contains("PANIC:") {
                 return Err(format!(
                     "/log/{name} carries the marker without the panic banner, so what reached \
                      the stick is not the report"
@@ -8011,6 +8080,135 @@ fn run_machine_test(
             );
             Ok(())
         }
+        "klogd_hosted" => {
+            // The machine's first kernel thread, and the two things about it
+            // no other test in the suite can see.
+            //
+            // **That it is hosted at all.** `klogd` runs on the ordinary
+            // scheduler with no address space of its own — `driver::spawn`
+            // names the kernel's `cr3` — through a trampoline that never
+            // issues an `iretq`. It gets a process-table entry rather than a
+            // bare task, and that is what makes it nameable: without one a
+            // crash report would print a pid nothing in the machine resolves.
+            //
+            // **That its panic is not recoverable, deterministically.** The
+            // ordinary predicate is `syscall_rip() != 0 &&
+            // current_tid().is_some()`, and `syscall_rip` is never cleared —
+            // so a kernel task reads whatever user thread last ran on *that*
+            // CPU left behind, and recovers or halts by accident of work
+            // stealing. The row in `sched::kthread` is what replaces the
+            // accident with an answer. `specs/log-architecture-spec.md` §4.3.
+            let qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions::default(),
+            );
+            let boot = serial::Serial::boot(&qemu);
+            boot.must_be_clean()?;
+            let line = boot.must_say("kthread: klogd")?;
+            if !line.contains("halts the machine") {
+                return Err(format!("klogd is hosted but claims the wrong panic row: {line:?}"));
+            }
+            eprintln!("  [klogd] {}", line.trim());
+
+            drop(qemu);
+
+            // The marker is a line of the crash *report* rather than `PANIC:`
+            // itself, because `boot_log` stops at the marker and the name is
+            // printed after the header — a boot stopped at the header would
+            // have nothing left to assert the process table against.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    kernel_params: &["klogd-panic"],
+                    ready_marker: "Process: klogd",
+                    ..Default::default()
+                },
+            );
+            let mut dead = serial::Serial::boot(&qemu);
+            dead.must_say("PANIC:")?;
+            dead.must_say("klogd-panic: the console drainer died")?;
+            // The process table answered for a task with no address space.
+            dead.must_say("Process: klogd")?;
+
+            // The verdict. A *recovered* panic kills the thread and lets the
+            // machine carry on into userland, which announces itself; the
+            // fatal branch halts every CPU. The window is a liveness margin
+            // and not a threshold: `klogd` panics as the scheduler starts, and
+            // the arm this must never become reaches the marker a few hundred
+            // milliseconds later — so three seconds is a tenfold margin over
+            // the state it refuses, and it is the whole of this test's fixed
+            // cost against the Fast ceiling.
+            const CARRIED_ON: Duration = Duration::from_secs(3);
+            dead.push(&qemu.drain_serial(CARRIED_ON));
+            dead.must_not_say(qemu::DEFAULT_READY)?;
+            eprintln!("  [klogd] a kernel thread's panic halted the machine rather than recovering");
+            Ok(())
+        }
+        "pre_idle_wedge_speaks" => {
+            // **The worst diagnostic hole in the tree, closed and gated.**
+            // Before this branch a boot that wedged before `enter_idle_loop`
+            // produced nothing at all on the console — not "less", *nothing*,
+            // including every line it had logged — because the only two things
+            // that drained the byte ring were the timer tick and the idle loop,
+            // and the machine reaches neither
+            // (`specs/issues/diagnostics/pre-idle-wedge-says-nothing.md`).
+            // `Drain::Inline` puts every record on the wire as it is committed,
+            // for the whole boot, so the end of the log is now where the
+            // machine stopped rather than where it last drained.
+            //
+            // The verdict is content and not a duration: what is asserted is
+            // which lines arrived, from the first phase to the wedge, and that
+            // the phase after it never did.
+            const WEDGE: &str = "pre-idle-wedge: the boot stops here";
+            let qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    // **`Metal`, because the console has to exist in phase 1
+                    // for the claim to mean anything.** The headless profile's
+                    // console is a virtio device the kernel does not bring up
+                    // until phase 6, so a machine wedged in phase 3 has nowhere
+                    // to put a byte on that shape and the records wait in their
+                    // shards for a backend that never arrives. metal-sim keeps
+                    // a 16550, which is up from the second statement of
+                    // `kernel_main` — and it is also the profile this whole
+                    // feature exists for, being the shape that gets flashed.
+                    profile: qemu::Profile::Metal,
+                    kernel_params: &["pre-idle-wedge"],
+                    ready_marker: WEDGE,
+                    ..Default::default()
+                },
+            );
+            let boot = serial::Serial::boot(&qemu);
+            // Every phase up to the wedge, oldest first — the first line the
+            // machine ever logs, both boot checkpoints before phase 3, and a
+            // phase-3 line from between them and the wedge.
+            for needle in [
+                "serial: 16550 loopback read",
+                "Boot: CPU ready",
+                "gpt: firmware booted us from partition",
+                "Boot: storage ready",
+                WEDGE,
+            ] {
+                boot.must_say(needle)?;
+            }
+            // And nothing from after it, which is what says the machine really
+            // is wedged rather than slow.
+            for needle in ["Boot: peripherals ready", "Boot: complete"] {
+                boot.must_not_say(needle)?;
+            }
+            eprintln!(
+                "  [wedge] {} kernel line(s) reached the console from a machine that never \
+                 reached a scheduler pass",
+                boot.kernel_lines(),
+            );
+            Ok(())
+        }
         "short_sleep_livelock" => {
             // Task #156. A `nanosleep` whose deadline is already past when the
             // pass arms the one-shot armed the register's one-tick minimum, and
@@ -8095,7 +8293,7 @@ fn run_machine_test(
             // is the message, which names the ceiling rather than the page
             // source's own request.
             let serial = serial::Serial::named("test serial", result.serial.as_str());
-            serial.must_say("!!! PANIC !!!")?;
+            serial.must_say("PANIC:")?;
             let line = serial.must_say("exceeds MAX_HEAP_ALLOC")?;
             eprintln!("  [heap] {}", line.trim());
             Ok(())

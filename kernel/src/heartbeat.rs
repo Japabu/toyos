@@ -92,7 +92,8 @@
 //! [`poll`] is called from `sched::driver::idle_loop`, immediately before
 //! `log_file::poll`, so the line it appends is flushed by the very next
 //! statement through the path that already exists — and the pre-halt recheck's
-//! `file_has_pending` keeps this CPU awake until it is. No second flush
+//! `log_file_flush_due`, which reads `log_file::has_pending`, keeps this CPU
+//! awake until it is. No second flush
 //! mechanism, and nothing here waits on a lock: a heartbeat that could block
 //! would be a diagnostic that stops for the reason it exists to report. The one
 //! lock in reach is the I/O APIC topology, behind `i8042::report_line`'s

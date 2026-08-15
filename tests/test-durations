@@ -193,6 +193,7 @@ iommu_empty_domain 5584
 kernel_heartbeat 6794
 kernel_log_file 43056
 kill_while_blocked 14
+klogd_hosted 11805
 late_storage_connect 6229
 launcher_refusals 2130
 locale_detect 5179
@@ -224,6 +225,7 @@ nvme_wide_sector 3474
 panic_recovery 18
 poller_capacity 22
 port_poll_churn 67
+pre_idle_wedge_speaks 3662
 process_lifecycle 217
 process_stats 15
 query_modules_size 11

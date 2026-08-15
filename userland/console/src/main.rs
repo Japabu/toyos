@@ -57,9 +57,21 @@ const SEED_FILES: usize = 2;
 const KEY_PAGE_UP: u8 = 0x4B;
 const KEY_PAGE_DOWN: u8 = 0x4E;
 
-/// The kernel's log ring is 64 KiB (`kernel/src/drivers/log_ring.rs`), so no
-/// more than this was ever in it at one time. The line bound below is the one
-/// that normally applies; this one bounds a file with no newlines in it.
+/// The most of a seed file [`seed_tail`] will look at.
+///
+/// **A bound on this program's work, and no longer a statement about the
+/// kernel.** It read *"the kernel's log ring is 64 KiB
+/// (`kernel/src/drivers/log_ring.rs`), so no more than this was ever in it at
+/// one time"* — that file no longer exists
+/// (`specs/log-architecture-spec.md` §8.1), and what replaced it holds far
+/// more: a per-CPU ring of whole records, 512 KiB a shard and 4 MiB at the
+/// shipped eight CPUs, written to `/log` by a daemon that rotates on a byte
+/// count rather than by anything shaped like a ring.
+///
+/// So the number stands on its own reason instead. The scrollback bound below
+/// is what normally decides how far back a seed goes; this one is what stops a
+/// file with **no newlines in it** — a truncated write, something that is not a
+/// log at all — from being walked end to end before that bound can apply.
 const SEED_MAX_BYTES: usize = 64 * 1024;
 
 fn main() {

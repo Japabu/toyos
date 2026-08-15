@@ -553,10 +553,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernel-elide"
+version = "0.1.0"
+
+[[package]]
 name = "kernel-loom"
 version = "0.1.0"
 dependencies = [
  "loom",
+ "toyos-abi",
 ]
 
 [[package]]
