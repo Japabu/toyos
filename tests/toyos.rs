@@ -845,6 +845,25 @@ const EXPECTED_FAILURES: &[ExpectedFailure] = &[ExpectedFailure {
     // so a green is one sample and may not red a healthy tree. The date is the
     // same month the entry above uses, for the same reason.
     stale: Stale::OnThisDate("2026-09-06"),
+}, ExpectedFailure {
+    test: "71_macro_empty_arg",
+    task: 84,
+    spec: "specs/issues/build/daemon-lines-land-in-any-test-window.md",
+    // This test's whole verdict is its captured stdout, so the open defect — a
+    // stray daemon line landing inside the capture window, or its mirror
+    // image, a capture that comes back empty — can only present as the capture
+    // disagreeing with the expectation. Fourteen suites on 2026-08-15 measured
+    // the rate at ~1 in 4 on the dev host, unchanged across an A/B whose diff
+    // never touched the window, and CI's own shard measured the same shape
+    // with the harness's ALONE retry answering GREEN both times ("a rate and
+    // not a classification"). The residual risk the struct doc names applies
+    // in full here: a real regression of the macro expansion would present
+    // identically, and the spec entry is what a human separates them with.
+    says: &["output mismatch", "exit code Some(0)"],
+    // Intermittent at a measured rate, so one green may not red the run. The
+    // one-month shelf, as above: long enough for #84's fix to land first,
+    // short enough that nobody inherits this silently.
+    stale: Stale::OnThisDate("2026-09-14"),
 }];
 
 /// The renderer's two text colours, as the screendump reports them.
