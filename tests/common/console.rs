@@ -7,12 +7,13 @@
 //! per-holder line buffer in the kernel, and a buffer that works works every
 //! time.
 //!
-//! Two assertions and not one, because they catch different halves of the same
-//! coupling: the count catches one userland writer inside another's line, and
+//! Three assertions and not one, because they catch different halves of the
+//! same mechanism: the count catches one userland writer inside another's line;
 //! `Serial::interleaved` catches a *kernel* record inside a userland line,
-//! which is the half every recorded splice in
-//! `specs/issues/diagnostics/serial-console-has-no-line-atomicity.md` is made
-//! of.
+//! which is what both recorded splices were made of (§4.4 keeps their
+//! measurements — the issue file that held them is closed); and the run of
+//! unterminated bytes catches the buffer failing to flush what a process that
+//! exited mid-line had said, which is the one case a newline never reaches.
 
 use std::path::Path;
 use std::time::Duration;
@@ -34,6 +35,9 @@ struct Declared {
     writers: usize,
     lines: usize,
     width: usize,
+    /// Bytes the third writer said in two `write`s and never ended with a
+    /// newline, which only its own exit can put on the wire.
+    midline: usize,
 }
 
 pub fn console_line_atomicity(
@@ -119,6 +123,29 @@ pub fn console_line_atomicity(
             ));
         }
     }
+    // **The buffer's other half: a process that exits mid-line.** The third
+    // writer says `midline` bytes in two `write`s, ends them with nothing and
+    // exits; the only thing that can put them on the wire is
+    // `ConsoleObject::drop` flushing what the last handle left behind (§4.4).
+    // A tree without that flush loses them silently, which is a buffer that
+    // drops a dying process's last words — so the assertion is the run's
+    // *length*, and it is exact on both sides: shorter means bytes were lost,
+    // longer means something else was acquired inside them.
+    let longest = result
+        .stdout
+        .split(|c| c != 'C')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    if longest != declared.midline {
+        return Err(format!(
+            "a process exited having written {} unterminated bytes and the longest run of them on \
+             the console is {longest} — the last handle to a console going away is what turns a \
+             partial line into all there will ever be, and this capture says it went nowhere",
+            declared.midline
+        ));
+    }
+
     // The kernel-into-userland half, on the same capture. A kernel record can
     // only land inside a userland line if the line reached the backend in
     // pieces, so this reds on exactly the coupling the count above reds on and
@@ -131,8 +158,9 @@ pub fn console_line_atomicity(
         ));
     }
     eprintln!(
-        "  [console] {} writers x {} lines of {} bytes, 0 mixed",
-        declared.writers, declared.lines, declared.width
+        "  [console] {} writers x {} lines of {} bytes, 0 mixed; {} unterminated bytes flushed by \
+         an exit",
+        declared.writers, declared.lines, declared.width, declared.midline
     );
     Ok(())
 }
@@ -152,6 +180,7 @@ fn declared(stdout: &str) -> Result<Declared, String> {
         writers: field("writers=")?,
         lines: field("lines=")?,
         width: field("width=")?,
+        midline: field("midline=")?,
     })
 }
 

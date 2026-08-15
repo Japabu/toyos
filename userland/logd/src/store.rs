@@ -205,7 +205,19 @@ impl Volume {
         // volume. Two boots inside one second is a machine nobody has, but a
         // test that stages the wall clock has it every run, and a colliding
         // name would silently write over the older boot.
-        let part = (1..=MAX_LOG_PARTS).find(|p| !kept.contains(&path(&stem, *p)))?;
+        //
+        // **Exhaustion says so before it gives up.** A bare `?` here was the one
+        // path in this function that answered `None` without a line, so the
+        // machine's log would have gone to the console only with nothing on the
+        // console saying why — which is the failure this program exists to make
+        // impossible for everything else.
+        let Some(part) = (1..=MAX_LOG_PARTS).find(|p| !kept.contains(&path(&stem, *p))) else {
+            say(format!(
+                "logd: every one of the {MAX_LOG_PARTS} part numbers under {stem} is taken on \
+                 {DIR}; this boot's log has nowhere to go"
+            ));
+            return None;
+        };
         let full = path(&stem, part);
         let file = match create(&full) {
             Ok(file) => file,
