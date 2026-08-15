@@ -39,15 +39,6 @@ impl<T> Unmapped<T> {
         Self(ManuallyDrop::new(value))
     }
 
-    /// Shoot down, then hand the value back — for a caller that has its own use
-    /// for it and not merely a drop.
-    pub fn reclaim(self) -> T {
-        crate::arch::tlb::shootdown();
-        let mut this = ManuallyDrop::new(self);
-        // SAFETY: `this` suppresses the `Drop` below, so the value is taken
-        // exactly once and nothing reads it afterwards.
-        unsafe { ManuallyDrop::take(&mut this.0) }
-    }
 }
 
 impl<T> Drop for Unmapped<T> {

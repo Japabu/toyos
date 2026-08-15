@@ -13,18 +13,10 @@ pub trait IdKey: Copy + Eq + Hash + Ord + Add<Output = Self> {
     const ONE: Self;
 }
 
-impl IdKey for u32 {
-    const ZERO: Self = 0;
-    const ONE: Self = 1;
-}
-impl IdKey for u64 {
-    const ZERO: Self = 0;
-    const ONE: Self = 1;
-}
-impl IdKey for usize {
-    const ZERO: Self = 0;
-    const ONE: Self = 1;
-}
+// The four keys the tree has: two process-table ids and the two driver-side
+// ids below them. `u32`, `u64` and `usize` had impls of their own and no
+// `IdMap` was ever keyed by one — a bare integer is exactly the key this type
+// exists to stop a caller from inventing.
 impl IdKey for toyos_abi::Pid {
     const ZERO: Self = Self(0);
     const ONE: Self = Self(1);
@@ -60,19 +52,6 @@ impl<K: IdKey, V> IdMap<K, V> {
         id
     }
 
-    /// Insert at a specific ID (e.g. FDs 0/1/2). Advances counter past it.
-    pub fn insert_at(&mut self, id: K, value: V) {
-        self.map.insert(id, value);
-        let after = id + K::ONE;
-        if after > self.next {
-            self.next = after;
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
     pub fn get(&self, id: K) -> Option<&V> {
         self.map.get(&id)
     }
@@ -89,12 +68,4 @@ impl<K: IdKey, V> IdMap<K, V> {
         self.map.iter().map(|(&k, v)| (k, v))
     }
 
-    #[allow(dead_code)]
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (K, &mut V)> {
-        self.map.iter_mut().map(|(&k, v)| (k, v))
-    }
-
-    pub fn drain(&mut self) -> impl Iterator<Item = (K, V)> + '_ {
-        self.map.drain()
-    }
 }

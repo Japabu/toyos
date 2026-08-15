@@ -30,6 +30,7 @@
 /// takes them through exactly the same checks as a storm's — same text, same
 /// regeneration, same strictly-increasing indices — with no second parser on
 /// either side.
+#[cfg(feature = "boot-actuators")]
 pub const NEST_PRODUCER: u64 = u64::MAX;
 
 #[cfg(feature = "boot-actuators")]
@@ -124,6 +125,11 @@ mod armed {
 }
 
 /// Arm the injection on a kernel thread of its own, once.
+///
+/// Not compiled into a shipping kernel: its one caller is the `log-nested-emit`
+/// arm in `log::user`, which is `#[cfg]`'d away with the actuators. `mid_body`
+/// below is the opposite case and says why it is the opposite.
+#[cfg(feature = "boot-actuators")]
 pub fn start_once() {
     #[cfg(feature = "boot-actuators")]
     armed::start_once();
@@ -149,6 +155,10 @@ pub fn mid_body() {
 }
 
 /// The interrupt handler's body.
+///
+/// Its caller is the `log_nest` interrupt handler, which no shipping kernel
+/// installs.
+#[cfg(feature = "boot-actuators")]
 pub fn deliver() {
     #[cfg(feature = "boot-actuators")]
     armed::deliver();

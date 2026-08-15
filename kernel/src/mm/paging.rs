@@ -392,37 +392,6 @@ impl AddressSpace {
         pd.set_pde(pd_idx, phys | flags | PAGE_SIZE_BIT, va);
     }
 
-    /// Allocate a 2MB page from PMM and map it at `vaddr`.
-    /// Returns a DirectMap handle for kernel access to the page.
-    pub fn map_alloc(&mut self, vaddr: UserAddr, writable: bool) -> super::DirectMap {
-        let page = super::pmm::alloc_page(super::pmm::Category::PageTable)
-            .expect("map_alloc: out of physical memory");
-        let phys = page.phys();
-        let dm = page.direct_map();
-
-        let va = vaddr.raw();
-        assert!(
-            va & (PAGE_2M - 1) == 0,
-            "map_alloc: vaddr {va:#x} not 2MB-aligned"
-        );
-
-        let mut flags = PAGE_PRESENT | PAGE_USER;
-        if writable {
-            flags |= PAGE_WRITE;
-        }
-
-        let (pml4_idx, pdpt_idx, pd_idx) = indices(va);
-        let user_flags = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
-        let pd = self.ensure_table(pml4_idx, user_flags, pdpt_idx, user_flags);
-        assert!(
-            pd[pd_idx] & PAGE_PRESENT == 0,
-            "map_alloc: PDE already present at vaddr {va:#x}"
-        );
-        pd.set_pde(pd_idx, phys | flags | PAGE_SIZE_BIT, va);
-        self.pages.insert(phys, page);
-        dm
-    }
-
     /// Unmap one 2MB page and free its physical memory.
     pub fn unmap(&mut self, vaddr: UserAddr) {
         let va = vaddr.raw();
@@ -445,19 +414,6 @@ impl AddressSpace {
                 }
             }
         }
-    }
-
-    /// Check if a 2MB region is mapped.
-    pub fn is_mapped(&self, vaddr: UserAddr) -> bool {
-        let va = vaddr.raw() & !(PAGE_2M - 1);
-        let (pml4_idx, pdpt_idx, pd_idx) = indices(va);
-        let Some(pdpt) = self.root.child(pml4_idx) else {
-            return false;
-        };
-        let Some(pd) = pdpt.child(pdpt_idx) else {
-            return false;
-        };
-        pd[pd_idx] & PAGE_PRESENT != 0
     }
 
     /// Translate a user virtual address to a DirectMap handle.
@@ -621,11 +577,6 @@ impl AddressSpace {
             .filter(move |(&s, r)| s.raw() + r.size > start.raw())
     }
 
-    /// Clear all regions (for process teardown).
-    pub fn clear_regions(&mut self) {
-        self.regions.clear();
-    }
-
     /// Map a physical region into the direct map using 2MB pages.
     /// Returns an Mmio handle for bounds-checked register access.
     ///
@@ -745,16 +696,6 @@ impl AddressSpace {
             "map_2m: {phys:#x} is mapped {existing:#x} and cannot also be {entry:#x}"
         );
         pd.set_entry(pd_idx, entry);
-    }
-
-    fn unmap_2m(&mut self, phys: u64) {
-        let virt = super::DirectMap::from_phys(phys).as_ptr::<u8>() as u64;
-        let (pml4_idx, pdpt_idx, pd_idx) = indices(virt);
-        if let Some(pdpt) = self.root.child_mut(pml4_idx) {
-            if let Some(pd) = pdpt.child_mut(pdpt_idx) {
-                pd.set_entry(pd_idx, 0);
-            }
-        }
     }
 
     /// Everything an upper-level entry may carry besides the address of the

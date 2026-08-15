@@ -84,19 +84,6 @@ impl UserFpState {
         self.defined() == other.defined()
     }
 
-    /// Load this state onto the CPU.
-    ///
-    /// # Safety
-    /// `MXCSR` in the image must have no reserved bit set, or `FXRSTOR64` is
-    /// `#GP`. Both constructors satisfy that: [`Self::INITIAL`] is a literal
-    /// and [`Self::saved_from_cpu`] is what the CPU itself wrote.
-    pub unsafe fn restore(&self) {
-        core::arch::asm!(
-            "fxrstor64 [{}]",
-            in(reg) &raw const self.0,
-            options(nostack, readonly),
-        );
-    }
 }
 
 /// [`UserFpState::INITIAL`] in memory, so the loader's trampolines can put a

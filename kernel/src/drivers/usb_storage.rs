@@ -70,6 +70,9 @@ impl UsbBlockDevice {
     /// run of failures. It used to ask the geometry, which a device keeps after
     /// recovery has given up on it — so the one question this exists for was
     /// the one it got wrong, in the direction that keeps a caller retrying.
+    /// Whether the controller still has this disk bound. Read by
+    /// `usb-storage-gate`'s report and by nothing a shipping kernel compiles.
+    #[cfg(feature = "boot-actuators")]
     pub fn healthy(&self) -> bool {
         xhci::storage_online(self.index) == Some(true)
     }

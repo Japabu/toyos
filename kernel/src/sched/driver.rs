@@ -719,10 +719,6 @@ pub fn current_address_space() -> Option<PageTables> {
     .flatten()
 }
 
-pub fn current_handle() -> Option<Arc<TaskHandle>> {
-    try_with_cpu(|cpu| cpu.running().map(|t| t.ext().handle.clone())).flatten()
-}
-
 pub fn with_current_acct<R>(
     f: impl FnOnce(&toyos_sched::task::TaskAccounting) -> R,
 ) -> Option<R> {

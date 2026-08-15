@@ -247,11 +247,6 @@ pub unsafe fn drain_bypassed() {
     DRAINED.put(&cursor);
 }
 
-/// Is there anything the console has not said? Lock-free.
-pub fn pending() -> bool {
-    serial::has_console() && DRAINED.any_pending()
-}
-
 /// Which backend the drain has already spoken to, as [`serial::Backend`]'s
 /// discriminant.
 static SPOKEN_TO: AtomicU8 = AtomicU8::new(serial::Backend::None as u8);

@@ -57,14 +57,6 @@ pub fn new_queue(class: WaitClass) -> Arc<KWaitQueue> {
     Arc::new(static_queue(class))
 }
 
-/// Wake the first waiter of `queue`. The kick obligation the doorbell returns
-/// is discharged inside — a caller cannot forget it.
-pub fn wake_one(queue: &KWaitQueue) -> usize {
-    preempt_off(|p| {
-        queue.wake_one(WakeCause::new(WakeReason::Woken), cpus(), &HW, p)
-    })
-}
-
 pub fn wake_n(queue: &KWaitQueue, count: usize) -> usize {
     preempt_off(|p| {
         let mut woken = 0;

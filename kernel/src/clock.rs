@@ -117,6 +117,35 @@ pub fn tsc_deadline(nanos: u64) -> u64 {
     cpu::rdtsc().saturating_add(ticks as u64)
 }
 
+/// Poll `ready` until it holds, or until `nanos` have passed. `false` is the
+/// deadline, and every caller turns it into a refusal that names the register
+/// it was waiting on.
+///
+/// **The one bounded wait a driver spins in, and it reads the TSC rather than
+/// the nanosecond clock.** This body was written three times — `drivers/hda.rs`,
+/// `drivers/hda_probe.rs` and `drivers/xhci/wait/mod.rs`, byte-identical apart
+/// from which constant each named — and all three read [`nanos_since_boot`] per
+/// iteration, whose 128-bit divide is an out-of-line `compiler_builtins` call.
+/// [`tsc_deadline`] and a 64-bit compare inline, which is why
+/// `src/redlist.rs`'s `dump_nmi_probe` red was retired on this form: a spin
+/// that calls out of itself is a spin an instruction-pointer sample attributes
+/// to `u128_div_rem` instead of to the loop. Consolidating the other way would
+/// re-open that red, so this direction is a constraint and not a taste.
+///
+/// Before [`init`] the TSC period is zero, [`tsc_deadline`] saturates and the
+/// wait is unbounded — the same behaviour the three copies had, and reachable
+/// only by a caller running before phase 2.
+pub fn settles(nanos: u64, ready: impl Fn() -> bool) -> bool {
+    let until = tsc_deadline(nanos);
+    while !ready() {
+        if cpu::rdtsc() >= until {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
+}
+
 /// Unix seconds, in the machine's own zone, at `nanos_since_boot() == 0`.
 static BOOT_LOCAL_SECS: AtomicU64 = AtomicU64::new(0);
 /// Seconds to add to the machine's own zone to get UTC — firmware's

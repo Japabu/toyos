@@ -117,6 +117,7 @@ impl MscDevice {
     /// Published rather than inferred, because the geometry survives a failure:
     /// it is what the device reported before it broke, so `blocks > 0` answers
     /// "did this disk ever come up", not "is it still there".
+    #[cfg(feature = "boot-actuators")]
     pub fn online(&self) -> bool {
         !self.failed
     }

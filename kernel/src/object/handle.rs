@@ -152,10 +152,6 @@ impl HandleEntry {
         &self.object
     }
 
-    pub fn rights(&self) -> Rights {
-        self.rights
-    }
-
     /// A second handle to the same object, carrying no more than this one.
     pub fn duplicate(&self, rights: Rights) -> Result<Self, HandleError> {
         if !self.rights.contains(Rights::DUP) {
@@ -220,10 +216,6 @@ pub struct HandleTable {
 impl HandleTable {
     pub const fn new() -> Self {
         Self { slots: Vec::new(), free: Vec::new() }
-    }
-
-    pub fn len(&self) -> usize {
-        self.slots.iter().filter(|s| s.entry.is_some()).count()
     }
 
     /// Whether `n` more `install`s can all succeed.
@@ -341,20 +333,6 @@ impl HandleTable {
             return Err(HandleError::Rights { held: entry.rights, needed: need });
         }
         Ok(&entry.object)
-    }
-
-    /// The untyped owning one, for close, dup, transfer and stat. Clones the
-    /// object reference out; still no borrow escapes.
-    pub fn get_any(
-        &self,
-        h: RawHandle,
-        need: Rights,
-    ) -> Result<(KObjectRef, Rights), HandleError> {
-        let entry = self.entry_of(h)?;
-        if !entry.rights.contains(need) {
-            return Err(HandleError::Rights { held: entry.rights, needed: need });
-        }
-        Ok((entry.object.clone(), entry.rights))
     }
 
     pub fn duplicate(

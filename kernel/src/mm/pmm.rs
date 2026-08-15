@@ -25,12 +25,11 @@ pub enum Category {
     Tls          = 6,  // thread-local storage blocks
     Dma          = 7,  // DMA pools (drivers)
     Framebuffer  = 8,  // GPU framebuffers
-    PageTable    = 9,  // paging::map_alloc (demand page mapping)
-    Stack        = 10, // user stacks
-    InitTls      = 11, // initial TLS block at spawn
+    Stack        = 9,  // user stacks
+    InitTls      = 10, // initial TLS block at spawn
 }
 
-const NUM_CATEGORIES: usize = 12;
+const NUM_CATEGORIES: usize = 11;
 
 impl Category {
     fn name(self) -> &'static str {
@@ -44,7 +43,6 @@ impl Category {
             Category::Tls          => "tls",
             Category::Dma          => "dma",
             Category::Framebuffer  => "framebuffer",
-            Category::PageTable    => "page-table",
             Category::Stack        => "stack",
             Category::InitTls      => "init-tls",
         }
@@ -116,11 +114,6 @@ impl PhysPage {
     /// Assigned to KernelHeap category (used by dlmalloc lifetime management).
     pub(super) fn from_raw(phys: u64) -> Self {
         Self { phys, category: Category::KernelHeap as u8 }
-    }
-
-    /// Physical address (for page table entries, internal use only).
-    pub(super) fn phys(&self) -> u64 {
-        self.phys
     }
 
     /// Access this page through the kernel direct map.

@@ -9,7 +9,6 @@ pub use toyos_abi::net::NicInfo;
 /// Hardware-agnostic network interface. Implement this for any NIC driver
 /// (virtio-net, RTL8125, Intel i225, etc.) and register it with `net::register()`.
 pub trait Nic: Send {
-    fn mac(&self) -> [u8; 6];
     fn has_packet(&self) -> bool;
 
     /// Poll for a received frame without copying. Returns (buf_index, frame_len).

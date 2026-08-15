@@ -317,6 +317,7 @@ pub fn route(
 /// `try_lock` because the caller runs in the idle loop on a machine suspected of
 /// having stopped: a diagnostic that waits for a lock stops for the reason it
 /// exists to report.
+#[cfg(feature = "boot-actuators")]
 pub fn redirection(gsi: Gsi) -> Option<u64> {
     let topology = TOPOLOGY.try_lock()?;
     let (unit, n) = locate(&topology, gsi).ok()?;

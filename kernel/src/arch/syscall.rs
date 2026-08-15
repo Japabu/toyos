@@ -2503,6 +2503,12 @@ fn sys_dup2(old: RawHandle, slot: u64) -> u64 {
 /// carried out of a closure is easy to drop at the wrong statement, and
 /// `install_at`'s contract is about *where* the decrement happens rather than
 /// whether it happens.
+// **Never read, and being dropped is the whole of what it does** — the
+// decrement is `HandleEntry`'s own `Drop`, so a reader would be a second way
+// to spend the obligation. `expect` rather than `allow`: the day something
+// does read it, this line reds and whoever wrote the reader has to say why the
+// drop was not enough.
+#[expect(dead_code)]
 struct Displaced(Option<crate::object::HandleEntry>);
 
 fn sys_rename(old: &str, new: &str) -> u64 {

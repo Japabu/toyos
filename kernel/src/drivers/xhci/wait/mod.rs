@@ -100,13 +100,6 @@ enum Control {
 }
 
 impl Control {
-    /// Whether the device both finished the transfer and moved everything that
-    /// was asked of it. The two halves are one question for a descriptor read
-    /// and the caller has no use for them apart.
-    fn moved(self, wanted: u16) -> bool {
-        matches!(self, Self::Done { delivered } if delivered >= wanted)
-    }
-
     /// Whether the transfer completed, for the requests that carry no data
     /// stage and so have no byte count to check.
     fn done(self) -> bool {
@@ -160,15 +153,12 @@ struct Restart<'a> {
 /// this existed the five of them were bare `spin_loop`s, which on a machine
 /// with no serial port is the same picture as every other way a boot can stop:
 /// `Boot: peripherals ready` painted on the panel, forever.
+///
+/// The wait itself is [`crate::clock::settles`], which this file used to hold
+/// its own byte-identical copy of; what stays here is the bound this driver
+/// waits to, which is the only part that was ever the driver's own.
 fn settles(ready: impl Fn() -> bool) -> bool {
-    let deadline = deadline();
-    while !ready() {
-        if crate::clock::nanos_since_boot() >= deadline {
-            return false;
-        }
-        core::hint::spin_loop();
-    }
-    true
+    crate::clock::settles(USB_TIMEOUT_NS, ready)
 }
 
 

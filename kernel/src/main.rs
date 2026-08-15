@@ -1,6 +1,5 @@
 #![no_std]
 #![no_main]
-#![allow(dead_code)]
 extern crate alloc;
 
 /// Debugger spin gate. When `--debug` is active, the kernel spins here until
@@ -39,7 +38,6 @@ mod bcachefs_adapter;
 mod fat32_adapter;
 #[cfg(feature = "boot-actuators")]
 mod heartbeat;
-#[allow(dead_code)]
 mod vfs;
 mod elf;
 mod symbols;
