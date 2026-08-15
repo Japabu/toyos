@@ -1234,6 +1234,43 @@ pub const KNOWN_RED: &[Red] = &[
         source: "specs/issues/build/daemon-lines-land-in-any-test-window.md",
         measured: "2026-08-15",
     },
+    // ---------------------------------------------------------------------
+    // The same session's landing gate, and a second measurement of one of the
+    // names above rather than more of the first: ten full suites back to back
+    // with no gap, where the fourteen were spaced. It is a different
+    // instrument in everything but the label, and the rate says so.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "i8042_undecoded_bytes",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(6, 10),
+        standing: Standing::Stands,
+        what: "the same line, and **the rate tracks host load** — 6 of 10 with the suites run back \
+               to back and the load average never below 6.4, against the 3 of 14 above with the \
+               host allowed to settle between them, on one tree in one session. The harness's \
+               isolated re-run answered `ALONE: GREEN` on these, which is the class name for \
+               exactly that. A bring-up race whose window is the driver's own polling init is what \
+               a rate that moves with the host looks like; a defect in what this branch changed is \
+               not",
+        evidence: "ten consecutive full `cargo test` suites on `wt/toyos-logd`'s tip, loads \
+                   6.4-9.7, immediately after the fourteen above",
+        source: "specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md",
+        measured: "2026-08-15",
+    },
+    Red {
+        test: "boot_partition_identity",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 10),
+        standing: Standing::Stands,
+        what: "`\"panicked at\" during the boot` — and the panic is sshd's, not the kernel's: \
+               `sshd: cannot bind 0.0.0.0:22: netd error`, on a boot where netd had already said \
+               there is no NIC and exited 0. This test refuses any boot whose console carries a \
+               panic, so its own subject is untouched and the red names the workload. \
+               `ALONE: GREEN`",
+        evidence: "the same ten consecutive suites as the row above, loads 6.4-9.7",
+        source: "specs/issues/build/sshd-panics-when-netd-exits-before-it-binds.md",
+        measured: "2026-08-15",
+    },
 ];
 
 // ---------------------------------------------------------------------------

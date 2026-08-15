@@ -40,6 +40,16 @@ The stamps are all inside the keyboard bring-up window: **403 ms, 459 ms and
 | the same with the *drain's* interrupts-off window bounded | 5 | 1 |
 | the same with **`write_console`'s** window bounded as well (2026-08-15) | 9 | **2** |
 | the tip of the same branch, that one window *not* bounded, same session | 5 | **1** |
+| the landing gate: ten suites **back to back**, same tree, loads 6.4–9.7 | 10 | **6** |
+
+**The last row is the most useful thing here and it is a second measurement,
+not more of the first.** Same tree, same session, same command — run with no gap
+between suites so the host never settles, and the rate goes from about one in
+five to six in ten. `71_macro_empty_arg` in the same ten reds once, so it is
+this name that moves. A rate that tracks the host is what a bring-up race looks
+like, and the harness agreed: every occurrence in that batch came back
+`ALONE: GREEN`, which is its name for a test that fails only beside other
+guests. Both rows are on `src/redlist.rs`, deliberately as two rows.
 
 ## The blame, and it named one aggressor when there were two
 
