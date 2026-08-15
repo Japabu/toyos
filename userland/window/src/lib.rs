@@ -25,8 +25,10 @@ pub const MSG_SET_CURSOR: u32 = 5;
 pub const MSG_SET_RESOLUTION: u32 = 6;
 pub const MSG_GET_RESOLUTION: u32 = 7;
 
-// Cursor styles
-pub const CURSOR_DEFAULT: u8 = 0;
+/// Cursor styles. A style the compositor does not implement — 0 among them —
+/// is the default cursor rather than an index into anything
+/// (`compositor::session::cursor_from_wire`), so the default has no name here:
+/// it is every value these two are not.
 pub const CURSOR_CROSSHAIR: u8 = 1;
 pub const CURSOR_RESIZE: u8 = 2;
 
@@ -579,10 +581,6 @@ impl Window {
 
     pub fn set_cursor(&self, style: u8) {
         let _ = self.conn.send(MSG_SET_CURSOR, &(style as u32));
-    }
-
-    pub fn set_clipboard(&self, text: &str) {
-        let _ = self.conn.send_bytes(MSG_CLIPBOARD_SET, text.as_bytes());
     }
 
     /// Hand over the whole window.
