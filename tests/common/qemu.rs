@@ -1403,6 +1403,28 @@ pub struct TestResult {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub serial: String,
+    /// Every console line that arrived **before** this test announced itself.
+    ///
+    /// **It used to be dropped on the floor, and that is a hole in the capture
+    /// rather than a tidiness.** A boot's capture is `boot_log()` up to the
+    /// ready marker and then this function's `stdout`/`serial` from
+    /// `===TEST_START===` onwards; between those two points the reader thread
+    /// goes on delivering lines and nothing kept them. The window is not
+    /// hypothetical and it is not narrow — measured on `wall_clock_file`,
+    /// 2026-08-15: one run in three carried five real lines in it, including
+    /// `soundd: null sink idle` and the kernel's `spawn: /bin/test-runner`
+    /// record, so the ready marker fires before the runner is even loaded and
+    /// every daemon still finishing its startup writes into a hole.
+    ///
+    /// That is how a `logd:` line went missing from a `wall_clock_file` capture
+    /// while the *next* line logd writes was present: the two are either side of
+    /// a file creation on the log volume, which is milliseconds, and the window
+    /// closed between them.
+    ///
+    /// A caller that reads a daemon's startup out of a boot appends this to its
+    /// capture. It is separate from `serial` because `serial` means "while this
+    /// test ran" and audio gates count lines in it.
+    pub before: String,
     pub error: Option<String>,
     /// Whether the guest ever announced *this* test.
     ///
@@ -1961,6 +1983,9 @@ impl QemuInstance {
         let start = Instant::now();
         let mut stdout = String::new();
         let mut serial = String::new();
+        // Every line seen before this test announced itself. Kept, never
+        // dropped — `TestResult::before` is the argument.
+        let mut before = String::new();
         let mut in_test = false;
         // **Which of the two things the ceiling caught.** A test's `timeout` is
         // a liveness guard and never a verdict, and until now its expiry said
@@ -1998,6 +2023,7 @@ impl QemuInstance {
                     exit_code: None,
                     stdout,
                     serial,
+                    before,
                     error: Some(error),
                     started: in_test,
                 };
@@ -2048,6 +2074,7 @@ impl QemuInstance {
                             exit_code,
                             stdout,
                             serial,
+                            before,
                             error,
                             started: in_test,
                         };
@@ -2057,9 +2084,15 @@ impl QemuInstance {
                             exit_code: None,
                             stdout,
                             serial,
+                            before,
                             error: Some(format!("kernel panic: {line}")),
                             started: in_test,
                         };
+                    } else if !in_test {
+                        // **The window between two tests, kept rather than
+                        // dropped.** See [`TestResult::before`].
+                        before.push_str(&line);
+                        before.push('\n');
                     } else if in_test {
                         serial.push_str(&line);
                         serial.push('\n');
@@ -2082,6 +2115,7 @@ impl QemuInstance {
                         exit_code: None,
                         stdout,
                         serial,
+                        before,
                         error: Some("QEMU disconnected".to_string()),
                         started: in_test,
                     };
