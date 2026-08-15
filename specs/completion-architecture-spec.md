@@ -959,9 +959,10 @@ the token:
   scheduler, and a named kernel-bug panic if it ever stops being one.
   **That is work, not a description of the tree**: `kernel/src/main.rs` calls the
   plain spinning `vfs::lock()` everywhere on the boot path today (init, mounts,
-  `create_dir`), `vfs::try_lock()` exists (`kernel/src/vfs.rs:41`) with no boot
-  caller at all, and the string "boot: the VFS is uncontended" is nowhere in the
-  tree. The first draft wrote it as an existing fact; it is C8's deliverable, and
+  `create_dir`), and the string "boot: the VFS is uncontended" is nowhere in the
+  tree. `vfs::try_lock()` is not there either — it existed with no caller at all
+  and was deleted on 2026-08-16 as dead code, which is four lines C8 writes back
+  with its first caller rather than a mechanism C8 is missing. The first draft wrote it as an existing fact; it is C8's deliverable, and
   the boot/task split §21's C7+C8 row names is exactly this.
 - An ISR, `drain_irqs` and every `Drop` impl are in the same position, which is
   §13's argument stated as a type rather than as a rule.
