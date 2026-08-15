@@ -6,6 +6,14 @@
 use toyos_abi::log::{LogCursor, LogRecord};
 use toyos_abi::syscall::{self, SyscallError};
 
+/// The record and its shape, re-exported so a reader names them through the
+/// SDK. Userland does not depend on `toyos-abi` directly, and a program that
+/// had to would be one this module had forgotten to finish.
+pub use toyos_abi::log::{Level, MAX_LOG_SHARDS, MAX_RECORD_MESSAGE, RECORD_BYTES};
+/// `LogRecord` is what a read fills, so a caller has to be able to size a
+/// buffer of them.
+pub use toyos_abi::log::LogRecord as Record;
+
 use crate::syscap::SysCap;
 use crate::AsHandle;
 
