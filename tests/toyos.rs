@@ -1533,6 +1533,31 @@ fn check_audio_idle_suspend(result: &TestResult) -> bool {
     true
 }
 
+/// Two clients through the null sink, and what soundd said about each leaving.
+///
+/// The exit code already says both `/bin/tone` runs finished cleanly — that is
+/// the test's own assertion — so this window is exactly the case soundd used to
+/// misreport: `client N died` for a process that exited `code=0`, because the
+/// mix loop's signal pipe broke before the control thread read the peer. The
+/// race is scheduling and this test does not try to win it; what it asserts is
+/// that neither outcome of the race is worded as a death, and that both
+/// removals name a departure soundd actually established (§7).
+fn check_null_sink_client_exits(result: &TestResult) -> bool {
+    if !check_rust_result(result) {
+        return false;
+    }
+    let problems = audio::check_departures(&result.serial, 2);
+    if !problems.is_empty() {
+        eprintln!(
+            "FAIL rs::null_sink_client_exits: {}\nserial:\n{}",
+            problems.join("; "),
+            result.serial
+        );
+        return false;
+    }
+    true
+}
+
 /// The exit code says the child died; only the serial says *why*.
 ///
 /// A #DE with no gate escalates to #DF, and `double_fault_handler` halts every
@@ -1578,6 +1603,7 @@ fn check_for(name: &str) -> fn(&TestResult) -> bool {
         "panic_recovery" => check_panic_recovery,
         "disk_backtrace" => check_disk_backtrace,
         "audio_idle_suspend" => check_audio_idle_suspend,
+        "null_sink_client_exits" => check_null_sink_client_exits,
         "fault_gates" => check_fault_gates,
         _ => check_rust_result,
     }

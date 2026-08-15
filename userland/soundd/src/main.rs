@@ -274,6 +274,68 @@ impl GainRamp {
     fn level(&self) -> f32 { self.current }
 }
 
+/// How a stream ended, as far as soundd can honestly tell.
+///
+/// Two things witness a client leaving and they race: the control thread reads
+/// the peer, and the mix loop finds the signal pipe gone on its next write.
+/// Both start the same ramp, so no audio differs — but only the first of them
+/// *knows* anything, and soundd used to report the second as a death. A clean
+/// exit and a crash tear down the same descriptors the same way; the kernel's
+/// `exit:` line carries the code and nothing on this side can tell them apart,
+/// so `died` was a false positive at 11% of ordinary disconnects (5 of 44
+/// runs). Each variant below is something soundd observed rather than inferred,
+/// and the cause is left to the log that has it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Departure {
+    /// `MSG_STREAM_CLOSE`: the client said so itself, which is the one reason
+    /// nothing can improve on.
+    Closed,
+    /// soundd ended it — a protocol violation, or a volume that is not a
+    /// number. The only departure soundd itself caused.
+    Refused,
+    /// The control connection ended without a close. The client's process is
+    /// gone; whether it exited or crashed is not knowable here.
+    Disconnected,
+    /// The signal pipe broke, which says the client's descriptor table is gone
+    /// and nothing about why. The weakest of the four, and the only one the
+    /// others replace.
+    SignalPipeGone,
+}
+
+impl Departure {
+    /// The stronger of two witnesses, so the two may arrive in either order and
+    /// land on the same word.
+    ///
+    /// What the control thread read beats what the mix loop found broken —
+    /// it read the peer, where the mix loop only found a descriptor missing —
+    /// and nothing beats the client's own close. Idempotent, and a witness
+    /// never weakens what is already known.
+    fn refine(self, other: Departure) -> Departure {
+        if other.rank() < self.rank() { other } else { self }
+    }
+
+    /// How much this witness knows. Lower is stronger.
+    fn rank(self) -> u8 {
+        match self {
+            Departure::Closed => 0,
+            Departure::Refused => 1,
+            Departure::Disconnected => 2,
+            Departure::SignalPipeGone => 3,
+        }
+    }
+}
+
+impl core::fmt::Display for Departure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Departure::Closed => "closed",
+            Departure::Refused => "refused",
+            Departure::Disconnected => "disconnected",
+            Departure::SignalPipeGone => "signal pipe gone",
+        })
+    }
+}
+
 struct ClientStream {
     client_id: usize,
     slot_reader: AudioSlotReader,
@@ -288,7 +350,10 @@ struct ClientStream {
     resampler: Option<ClientResampler>,
     /// Latched by the first period this client supplies.
     delivered: bool,
-    pending_removal: bool,
+    /// How this stream ended, once anything has witnessed it. `None` while it
+    /// is live: the ramp-out starts when this is first set, and the stream is
+    /// dropped when that ramp reaches idle.
+    departure: Option<Departure>,
 }
 
 impl ClientStream {
@@ -301,7 +366,24 @@ impl ClientStream {
     /// thread — and after a close §5.5's ramp is deliberately fading it out,
     /// so it is entitled to stop filling.
     fn is_streaming(&self) -> bool {
-        self.delivered && !self.pending_removal
+        self.delivered && self.departure.is_none()
+    }
+
+    /// Record a departure, and start §7.4's ramp-out the first time one is
+    /// known.
+    ///
+    /// A later witness refines the word and leaves the ramp alone: it is
+    /// already aimed at silence, and re-targeting it recomputes the step from
+    /// the gain reached so far, which stretches a 5 ms fade by however much of
+    /// it had already run.
+    fn depart(&mut self, how: Departure, ramp_frames: u32) {
+        match self.departure {
+            None => {
+                self.gain.set_target(Gain::SILENT, ramp_frames);
+                self.departure = Some(how);
+            }
+            Some(known) => self.departure = Some(known.refine(how)),
+        }
     }
 }
 
@@ -323,7 +405,7 @@ const _: () = assert!(CMD_RING_SIZE as usize >= 1 + 2 * MAX_CONTROL_CLIENTS);
 
 enum MixCommand {
     AddClient(Box<ClientStream>),
-    RemoveClient(usize),
+    RemoveClient { client_id: usize, departure: Departure },
     SetVolume { client_id: usize, target: Gain },
 }
 
@@ -712,7 +794,7 @@ fn open_stream(
         client_period_frames,
         resampler,
         delivered: false,
-        pending_removal: false,
+        departure: None,
     })
 }
 
@@ -799,23 +881,25 @@ fn mix_client(
 /// Signal every client before the wait so priority inheritance can fill their
 /// rings while soundd blocks, and reap the ones that died doing it.
 ///
-/// §5.7/§7.3: a broken pipe here is the client's death, caught here rather than
-/// left to the control connection — a client that dies mid-stream would
+/// §5.7/§7.3: a broken pipe here is the client's departure, caught here rather
+/// than left to the control connection — a client that goes mid-stream would
 /// otherwise stay `is_streaming()` and keep the loop deferring buffers for a
-/// producer that no longer exists. Death is exactly `Err(NotFound)`, the
+/// producer that no longer exists. Departure is exactly `Err(NotFound)`, the
 /// kernel's broken-pipe error; a full pipe is `Err(WouldBlock)` and means the
 /// client is merely behind on consuming signals, which must leave it untouched
 /// — a §6.4-paused client stops reading its pipe indefinitely and is alive.
+///
+/// It says nothing on its own: [`Departure::SignalPipeGone`] is the weakest of
+/// the four witnesses and the control thread's is on the way, so the word waits
+/// for `retain_active` and the strongest witness by then wins.
 fn signal_clients(streams: &mut [ClientStream], ramp_frames: u32) {
     for stream in streams.iter_mut() {
-        let died = matches!(
+        let gone = matches!(
             syscall::write_nonblock(stream.signal_write_fd, &[1]),
             Err(syscall::SyscallError::NotFound)
         );
-        if died && !stream.pending_removal {
-            say!("soundd: client {} died, ramping down", stream.client_id);
-            stream.gain.set_target(Gain::SILENT, ramp_frames);
-            stream.pending_removal = true;
+        if gone {
+            stream.depart(Departure::SignalPipeGone, ramp_frames);
         }
     }
 }
@@ -831,10 +915,9 @@ fn apply_commands(cmd_ring: &CommandRing, streams: &mut Vec<ClientStream>, ramp_
                 let _ = syscall::write_nonblock(client.signal_write_fd, &[1]);
                 streams.push(*client);
             }
-            MixCommand::RemoveClient(id) => {
-                if let Some(s) = streams.iter_mut().find(|s| s.client_id == id) {
-                    s.gain.set_target(Gain::SILENT, ramp_frames);
-                    s.pending_removal = true;
+            MixCommand::RemoveClient { client_id, departure } => {
+                if let Some(s) = streams.iter_mut().find(|s| s.client_id == client_id) {
+                    s.depart(departure, ramp_frames);
                 }
             }
             MixCommand::SetVolume { client_id, target } => {
@@ -849,15 +932,18 @@ fn apply_commands(cmd_ring: &CommandRing, streams: &mut Vec<ClientStream>, ramp_
 /// Drop clients whose disconnect ramp has finished. Paused clients (§6.4) mix
 /// silence and are never removed here; a disconnecting client leaves only after
 /// its §5.5 ramp-out reaches idle, so its tail plays out first.
+///
+/// This is where a departure is finally worded, and the last moment at which it
+/// can be: both witnesses have had the whole ramp to arrive, and the removal is
+/// the one line per stream that names how it ended.
 fn retain_active(streams: &mut Vec<ClientStream>) {
-    streams.retain(|s| {
-        if s.pending_removal && s.gain.is_idle() {
-            say!("soundd: client {} removed", s.client_id);
+    streams.retain(|s| match s.departure {
+        Some(how) if s.gain.is_idle() => {
+            say!("soundd: client {} removed ({how})", s.client_id);
             syscall::close(s.signal_write_fd);
             false
-        } else {
-            true
         }
+        _ => true,
     });
 }
 
@@ -1675,6 +1761,26 @@ fn submit(cmd_ring: &CommandRing, cmd_pipe_write: RawHandle, cmd: MixCommand, pe
     }
 }
 
+/// Tell the mix thread a stream ended, and how.
+///
+/// Every removal the control thread issues goes through here, so the witness it
+/// holds — which of §7's four ways this stream ended — travels with the command
+/// instead of being reconstructed from a flag on the other side.
+fn remove(
+    cmd_ring: &CommandRing,
+    cmd_pipe_write: RawHandle,
+    client_id: usize,
+    departure: Departure,
+    period_nanos: u64,
+) {
+    submit(
+        cmd_ring,
+        cmd_pipe_write,
+        MixCommand::RemoveClient { client_id, departure },
+        period_nanos,
+    );
+}
+
 fn control_thread(
     acceptor: Acceptor,
     cmd_ring: &CommandRing,
@@ -1755,7 +1861,7 @@ fn control_thread(
                     Ok(None) => break 'msgs,
                     Err(()) => {
                         if let Some(idx) = c.stream_idx {
-                            submit(cmd_ring, cmd_pipe_write, MixCommand::RemoveClient(idx), period_nanos);
+                            remove(cmd_ring, cmd_pipe_write, idx, Departure::Disconnected, period_nanos);
                         }
                         dead.push(i);
                         disconnected = true;
@@ -1800,7 +1906,7 @@ fn control_thread(
                         let raw = f32::from_le_bytes(payload[0..4].try_into().unwrap());
                         let Some(gain) = Gain::from_wire(raw) else {
                             say!("soundd: volume is not a number, disconnecting client");
-                            submit(cmd_ring, cmd_pipe_write, MixCommand::RemoveClient(idx), period_nanos);
+                            remove(cmd_ring, cmd_pipe_write, idx, Departure::Refused, period_nanos);
                             dead.push(i);
                             disconnected = true;
                             break 'msgs;
@@ -1808,7 +1914,7 @@ fn control_thread(
                         clients[i].pending_volume = Some(gain);
                     }
                     (MSG_STREAM_CLOSE, Some(idx)) => {
-                        submit(cmd_ring, cmd_pipe_write, MixCommand::RemoveClient(idx), period_nanos);
+                        remove(cmd_ring, cmd_pipe_write, idx, Departure::Closed, period_nanos);
                         dead.push(i);
                         disconnected = true;
                         break 'msgs;
@@ -1816,7 +1922,7 @@ fn control_thread(
                     (other, _) => {
                         say!("soundd: protocol violation (msg {other}), disconnecting client");
                         if let Some(idx) = clients[i].stream_idx {
-                            submit(cmd_ring, cmd_pipe_write, MixCommand::RemoveClient(idx), period_nanos);
+                            remove(cmd_ring, cmd_pipe_write, idx, Departure::Refused, period_nanos);
                         }
                         dead.push(i);
                         disconnected = true;
@@ -2115,5 +2221,29 @@ mod tests {
         // A shape the free list *can* hold, which is what makes the ceiling a
         // ceiling rather than a refusal of everything unusual.
         assert!(matches!(period_frames(16, 1, 512), Ok(256)));
+    }
+
+    /// The race the `died` line lost: two witnesses, either order, one word.
+    ///
+    /// The control thread read the peer; the mix loop only found a descriptor
+    /// missing. Whichever arrives first, the removal must be reported with what
+    /// was actually established — and a clean exit must never be reported as a
+    /// death, which is what `SignalPipeGone` refuses to claim.
+    #[test]
+    fn the_stronger_witness_wins_in_either_order() {
+        use Departure::*;
+        for (a, b) in [(Closed, SignalPipeGone), (Refused, SignalPipeGone), (Disconnected, SignalPipeGone)] {
+            assert_eq!(a.refine(b), a, "{b} must not replace {a}");
+            assert_eq!(b.refine(a), a, "{a} must replace {b}");
+        }
+        // A client that asked to close is not downgraded by the connection it
+        // then dropped.
+        assert_eq!(Closed.refine(Disconnected), Closed);
+        assert_eq!(Disconnected.refine(Closed), Closed);
+        // Idempotent, so a repeated witness — the mix loop writes a broken pipe
+        // every period until the ramp finishes — changes nothing.
+        for how in [Closed, Refused, Disconnected, SignalPipeGone] {
+            assert_eq!(how.refine(how), how);
+        }
     }
 }

@@ -207,9 +207,20 @@ which soundd ramps out, then releases the ring and pipe.
 **Volume.** `MSG_STREAM_SET_VOLUME { gain }`, applied through the ramp with
 §4's validation.
 
-**Crash.** soundd detects a dead client on its next signal write. It ramps
-the stream out — draining any audio still in the ring — and removes it. No
-other stream is affected; soundd never blocks on a client.
+**Departure.** A stream ends in one of four ways, and soundd reports the one
+it established rather than the one it guessed: the client's own
+`MSG_STREAM_CLOSE`; a refusal soundd issued; the control connection ending
+without a close; or the signal pipe breaking under the next signal write. The
+last two are the same event seen by soundd's two threads and they race, so the
+word waits until the stream is dropped and the strongest witness by then wins
+— the control thread read the peer, the mix loop only found a descriptor gone.
+Whichever fires first ramps the stream out, draining any audio still in the
+ring, and removes it. No other stream is affected; soundd never blocks on a
+client.
+
+**A crash and a clean exit are not distinguishable here**, and soundd does not
+claim to tell them apart: they close the same descriptors the same way, and the
+exit code is the kernel's `exit:` line to report.
 
 ## 8. The kernel interface
 
@@ -233,7 +244,7 @@ priority inheritance, and the completion-before-re-block delivery above
 | failure | behavior |
 |---|---|
 | Client misses its deadline | Silence for that client's missed periods; automatic catch-up next cycle |
-| Client crashes | Ramp-out, removal; others unaffected |
+| Client leaves, however | Ramp-out, removal named by §7's strongest witness; others unaffected |
 | Completions arrive batched | Multiple slots consumed that cycle; the ring absorbs it |
 | Scheduling jitter | Absorbed by the prediction and the pipeline depth |
 | Every buffer drains | Prediction re-learned; refill proportional (§2); client audio resumes in the first refilled buffer |
