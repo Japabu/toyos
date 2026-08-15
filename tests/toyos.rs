@@ -903,6 +903,31 @@ const EXPECTED_FAILURES: &[ExpectedFailure] = &[ExpectedFailure {
     // one-month shelf, as above: long enough for #84's fix to land first,
     // short enough that nobody inherits this silently.
     stale: Stale::OnThisDate("2026-09-14"),
+}, ExpectedFailure {
+    test: "76_dollars_in_identifiers",
+    task: 84,
+    spec: "specs/issues/build/daemon-lines-land-in-any-test-window.md",
+    // Same defect, same shape as the entry above. The L5/L6 review held this
+    // family to one declaration on the argument that any of the 110 C tests
+    // can absorb the line and enumerating victims bounds nothing — and then
+    // the facts moved: logd is a new daemon writing startup lines in every
+    // boot, this test red twice across 22 suites on both arms of the L6 A/B,
+    // and it red the landing PR's own CI shard beside the entry below. The
+    // declarations carry the same clock as their sibling, which is the
+    // forcing function for #84's real fix rather than a quiet absorption.
+    says: &["output mismatch", "exit code Some(0)"],
+    stale: Stale::OnThisDate("2026-09-14"),
+}, ExpectedFailure {
+    test: "90_stdio_buffering",
+    task: 84,
+    spec: "specs/issues/build/daemon-lines-land-in-any-test-window.md",
+    // The entry the daemon-lines write-up names verbatim ("judge the C family
+    // from a full run"): its capture has been observed missing its own tail
+    // and carrying soundd's suspension line, and CI red it on two consecutive
+    // cycles of the L5/L6 landing PR. Same reconsidered hold, same clock, same
+    // residual risk as its two siblings.
+    says: &["output mismatch", "exit code Some(0)"],
+    stale: Stale::OnThisDate("2026-09-14"),
 }];
 
 /// The renderer's two text colours, as the screendump reports them.

@@ -73,3 +73,17 @@ So this is a **hold**: the observation is kept, the enumeration is refused, and
 what would replace both is the design call at the end of this entry. An agent
 who reds on a third member of the family appends the observation here rather
 than opening a third front.
+
+**2026-08-15, the third member, and the hold's declaration half reconsidered by
+the orchestrator.** `76_dollars_in_identifiers` red beside `90_stdio_buffering`
+in one shard of the L5/L6 landing PR's gate (run 31896047422), both
+`ALONE: GREEN` — the second consecutive CI cycle this family red that PR. Two
+facts moved: logd is a new daemon writing startup lines in every boot, so the
+base rate rose with the very branch being landed; and a landing gate that reds
+at the family's rate re-runs merges away, which is its own violation. The
+redlist half of the hold stands — no rows, the enumeration argument is right —
+but `EXPECTED_FAILURES` now declares the three observed members
+(`71_macro_empty_arg`, `76_dollars_in_identifiers`, `90_stdio_buffering`), all
+on task #84, all expiring 2026-09-14. Declarations also grow one victim at a
+time; the shared clock is the bound, and it forces the design call above
+instead of replacing it.
