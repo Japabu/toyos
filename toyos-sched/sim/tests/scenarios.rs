@@ -522,10 +522,30 @@ fn the_audio_pipeline_holds_on_one_cpu() {
 /// 10 000 seeds — so `worst_over_bound` must be zero here, and that is asserted:
 /// if the recorded allowance ever starts carrying these two, the suite says so
 /// rather than passing quietly on it.
+///
+/// **And the *reach* is asserted, not only the verdict** — I13's gate, which I5
+/// went without until this test grew one. A non-zero spread says a window opened
+/// *somewhere*; it does not say I5 was watching for any meaningful part of the
+/// run, and one window a nanosecond wide satisfies it. That gap matters more for
+/// I5 than for I13, because I5's window has four ways to close — an RT task
+/// present, any CPU idle, the member set changing, a member under its even share
+/// — against I13's one, and every one of them is a property the pick or the
+/// placement can narrow without a single verdict going red. The recorded figures
+/// are 99% and 81% of executed time (`measure fairness_storm:<cpus> 100`, on
+/// `a0729cf` with this change applied); a halving reds.
 #[test]
 fn the_fairness_storm_is_measured_and_holds() {
-    for cpus in [1, 2] {
+    for (cpus, reach) in [(1, 99), (2, 81)] {
         let result = sweep::seed_sweep(&scenarios::fairness_storm(cpus), FAIR_SEEDS, 3);
+        assert!(
+            result.fair_coverage_pct() * 2 >= reach,
+            "at {cpus} cpu(s) invariant I5 had a comparison open for {}% of the \
+             run against {reach}% recorded. Its *reach* has collapsed, which is \
+             not the same as its verdict being clean — read this as loudly as a \
+             violation and find what closed the windows: {}",
+            result.fair_coverage_pct(),
+            result.report(),
+        );
         assert!(result.passed(), "{}", result.report());
         assert!(
             result.worst_fair_spread > 0,
