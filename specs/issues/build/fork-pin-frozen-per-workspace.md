@@ -7,12 +7,18 @@ opened: 2026-08-07
 # A fork pin is a moving branch frozen per workspace, and nothing re-reads it
 
 `[patch]` names a *branch*; a lockfile records the rev that branch pointed at
-when that workspace was last resolved. Six workspaces in the tree resolve fork
-branches independently — the root, `toyos-cc/`, `userland/`,
-`tests/toyos-rust-tests/`, `tests/toyos-rust-tests/tls-cranelift/`, and the
-`rust/` submodule (which has two of its own). Push to a fork and every one of
-them keeps the old rev until somebody happens to run `cargo update` in it. There
-is no mechanism that notices, and no build that fails.
+when that workspace was last resolved. Five workspaces in the tree resolve fork
+branches independently — the root, `userland/`, `tests/toyos-rust-tests/`,
+`tests/toyos-rust-tests/tls-cranelift/`, and the `rust/` submodule (which has
+two of its own). Push to a fork and every one of them keeps the old rev until
+somebody happens to run `cargo update` in it. There is no mechanism that
+notices, and no build that fails.
+
+> Six when this was filed. `toyos-cc/` was the sixth and is now a member of the
+> host workspace rather than a root of its own, so it resolves in the root
+> `Cargo.lock` and `target-lexicon` is pinned in two lockfiles instead of
+> three. The defect is unchanged in kind — the remaining five still freeze
+> independently, and nothing re-reads any of them.
 
 Measured 2026-08-07, before the fix in this branch: six pins were behind their
 branch head, and two crates were pinned at *two different revs at once*.

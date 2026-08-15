@@ -42,28 +42,17 @@ jobs:
       # helps a branch's first run at all.
       - uses: actions/cache@v4
         with:
+          # One `target` for the whole host workspace. The sixteen per-crate
+          # entries that used to be listed here are the directories that
+          # stopped existing when those crates became members of it — a member
+          # builds into the workspace root's `target`, not its own.
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            toyos-sched/target
-            toyos-ps2/target
-            toyos-gpt/target
-            toyos-elf/target
-            toyos-cc/target
-            toyos-ld/target
-            toyos-hda/target
-            toyos-pci/target
-            toyos-xhci/target
-            toyos-desktop/target
-            toyos-keymap/target
-            kernel-loom/target
-            kernel-span/target
-            toyos-fat32/target
-            toyos-fat32-check/target
-            bcachefs/target
             userland/sshd/target
+            userland/calc/target
           key: host-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: host-${{ runner.os }}-
 
@@ -75,31 +64,44 @@ jobs:
           set -o pipefail
           cargo test --lib 2>&1 | tee -a /tmp/host.log
 
-      # CLAUDE.md's list, whole. It used to be nine of the thirteen — the four
-      # that were missing (`toyos-elf`, `toyos-ld`, `toyos-pci`,
-      # `toyos-desktop`) are pure crates whose whole point is that a decision
-      # is testable without a guest, so a CI that skipped them skipped exactly
-      # the tests it was cheapest to run.
+      # Every host-tested crate, and **this step no longer holds the list of
+      # them** — root `Cargo.toml`'s `[workspace] members` does, and
+      # `--workspace` reads it from there.
       #
-      # `toyos-keymap` and `bcachefs` were that same omission a second time,
-      # found on 2026-08-14: 37 tests over dead-key composition, layout tables,
-      # layout detection and translation, and 71 over bcachefs, all of them
-      # reaching no gate in any workflow.
+      # That is the repair, not a tidy-up. This used to be a shell loop naming
+      # sixteen crates, and the same set was also the set of standalone
+      # workspace roots, so it was a list in two places. The two drifted three
+      # times: nine of thirteen until 2026-08-08 (`toyos-elf`, `toyos-ld`,
+      # `toyos-pci` and `toyos-desktop` missing — pure crates whose whole point
+      # is that a decision is testable without a guest, so a CI that skipped
+      # them skipped exactly the tests it was cheapest to run); `toyos-keymap`
+      # and `bcachefs` until 2026-08-14, 108 tests reaching no gate; and
+      # `toyos-abi` and `toyos-manifest`, 23 tests, which were named in no
+      # workflow at all until the workspace landed.
+      #
+      # `--exclude toyos-build` because the root package's integration test is
+      # the QEMU harness — `ci.yml` runs that, sharded, on Linux with a guest.
+      # `cargo test --lib` above is the root package's half that belongs here,
+      # and one of the gates it runs (`src/hostws.rs`) reds on a `Cargo.toml`
+      # in the tree that joined neither `members` nor `exclude`. So a crate
+      # added and forgotten is a red in this job rather than a silent gap in
+      # it, which is the property the loop could never have.
       - name: host crates
         run: |
           set -e -o pipefail
-          for crate in toyos-sched toyos-ps2 toyos-gpt toyos-elf toyos-cc \
-                       toyos-ld toyos-hda toyos-pci toyos-xhci toyos-desktop \
-                       toyos-keymap kernel-loom kernel-span toyos-fat32 \
-                       toyos-fat32-check bcachefs; do
-            echo "=== $crate" | tee -a /tmp/host.log
-            cargo test --manifest-path "$crate/Cargo.toml" 2>&1 | tee -a /tmp/host.log
-          done
+          cargo test --workspace --exclude toyos-build 2>&1 | tee -a /tmp/host.log
 
       # `userland/.cargo/config.toml` cross-compiles by default, so a userland
       # crate's host tests have to name the host. `calc` is here for the reason
       # the pure crates above are: its arithmetic is decided without a guest,
       # so a CI that skipped it would skip the cheapest tests it has.
+      #
+      # These two stay a loop, and cannot stop being one: that same
+      # `.cargo/config.toml` is why `userland` is *excluded* from the host
+      # workspace, and cargo refuses to merge an inherited `build.target` away.
+      # They are named in `userland/Cargo.toml`'s own workspace, so the pair
+      # here is a list in two places — a smaller instance of the defect above,
+      # left standing deliberately rather than papered over.
       - name: userland host crates
         run: |
           set -e -o pipefail
@@ -110,9 +112,12 @@ jobs:
               | tee -a /tmp/host.log
           done
 
-      # Nineteen `cargo test` invocations in three steps, and a red is one line
-      # somewhere among them; the summary names which crate and the first
-      # thing that failed in it.
+      # Four `cargo test` invocations in three steps, down from nineteen: the
+      # root package's `--lib`, one `--workspace` over the other twenty-one
+      # members, and the two userland crates. A red is still one line somewhere
+      # among them, and `--workspace` prints a `Running ...` line naming the
+      # binary rather than the `=== <crate>` the loop used to echo, so the
+      # summary matches both.
       - name: failure summary
         if: failure()
         run: |
@@ -120,7 +125,7 @@ jobs:
             echo "### host tests"
             echo ""
             echo '```'
-            grep -E '^(=== |error(\[|:)|test .* FAILED|failures:$|    [a-z_:]+$|test result: FAILED)' \
+            grep -E '^(=== |error(\[|:)|test .* FAILED|failures:$|    [a-z_:]+$|test result: FAILED| +Running )' \
               /tmp/host.log | tail -40 || echo "(nothing matched; read the log)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"

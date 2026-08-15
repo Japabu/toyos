@@ -196,6 +196,12 @@ jobs:
       # permanently win the key with a tree several merges behind
       # (specs/testing-strategy.md §4). A cache written on `main` is the one
       # every branch can restore.
+      #
+      # `toyos-ld/target` and `toyos-cc/target` used to be on this list and are
+      # not directories any more: both crates are members of the host workspace
+      # (root `Cargo.toml`), so cargo writes the linker and the C compiler —
+      # host halves and guest halves alike — into `target`, which is already
+      # here. Naming a path that does not exist caches nothing and says nothing.
       - uses: actions/cache/restore@v4
         with:
           path: |
@@ -206,8 +212,6 @@ jobs:
             kernel/target
             bootloader/target
             userland/target
-            toyos-ld/target
-            toyos-cc/target
             tests/target
             tests/toyos-rust-tests/*/target
           key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
@@ -379,8 +383,6 @@ jobs:
             kernel/target
             bootloader/target
             userland/target
-            toyos-ld/target
-            toyos-cc/target
             tests/target
             tests/toyos-rust-tests/*/target
           key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
@@ -460,8 +462,6 @@ jobs:
             kernel/target
             bootloader/target
             userland/target
-            toyos-ld/target
-            toyos-cc/target
             tests/target
             tests/toyos-rust-tests/*/target
           key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
@@ -483,8 +483,6 @@ jobs:
             kernel/target
             bootloader/target
             userland/target
-            toyos-ld/target
-            toyos-cc/target
             tests/target
             tests/toyos-rust-tests/*/target
           key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}

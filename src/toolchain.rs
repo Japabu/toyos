@@ -1692,9 +1692,14 @@ linker = "{linker}"{codegen_backends}
 }
 
 /// Path to the host toyos-ld binary (stable location, never wiped by sysroot rebuilds).
+///
+/// The workspace root's `target/`, not `toyos-ld/target/`: `toyos-ld` is a
+/// member of the host workspace (root `Cargo.toml`), and a member has no target
+/// directory of its own — `src/hostws.rs::target_dir` is the same answer for
+/// the crates `src/build.rs` asks about generically.
 pub fn toyos_ld_binary(root: &Path) -> PathBuf {
     let host = host_triple();
-    root.join(format!("toyos-ld/target/{host}/release/toyos-ld"))
+    root.join(format!("target/{host}/release/toyos-ld"))
 }
 
 fn build_toyos_ld(root: &Path) {
@@ -1707,10 +1712,11 @@ fn build_toyos_ld(root: &Path) {
     assert!(status.success(), "toyos-ld build failed");
 }
 
-/// Path to the host toyos-cc binary.
+/// Path to the host toyos-cc binary. In the workspace root's `target/`, for
+/// [`toyos_ld_binary`]'s reason.
 pub fn toyos_cc_binary(root: &Path) -> PathBuf {
     let host = host_triple();
-    root.join(format!("toyos-cc/target/{host}/release/toyos-cc"))
+    root.join(format!("target/{host}/release/toyos-cc"))
 }
 
 fn build_toyos_cc(root: &Path) {
@@ -1746,8 +1752,7 @@ pub fn host_triple() -> String {
 
 /// PATH with toyos-ld's build directory prepended, so rustc finds it for linking.
 pub fn path_with_toyos_ld(root: &Path) -> String {
-    let host = host_triple();
-    let ld_dir = root.join(format!("toyos-ld/target/{host}/release"));
+    let ld_dir = toyos_ld_binary(root).parent().expect("the linker has a directory").to_path_buf();
     match std::env::var("PATH") {
         Ok(p) => format!("{}:{p}", ld_dir.display()),
         Err(_) => ld_dir.display().to_string(),
