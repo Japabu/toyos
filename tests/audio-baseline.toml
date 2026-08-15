@@ -94,6 +94,46 @@
 # log's residual flush cost on the idle path, not drift, and it is written up
 # in `specs/issues/boot-media/` rather than recorded here.
 #
+# Drift note, FIFTH instance, 2026-08-15, and the first one measured against
+# the sample below rather than against a superseded one — so the instrument
+# argument that closed the fourth instance does not apply to it. Two N=30 arms
+# back to back (904 s and 907 s), differing only in the four soundd commits of
+# `wt/toyos-soundfix`; BASE is `a0729cf`, the tree this sample was recorded on:
+#
+#                                  recorded   soundfix     BASE a0729cf
+#   audio_tone.smp1  wakes              882   870 z=3.47   870 z=3.14
+#   audio_tone.smp8  wakes              877   849 z=5.29   854 z=5.44
+#   audio_tone_load.smp1 wake_lat      5765   6051 pass    6151 z=3.54
+#
+# `wakes` reds downward in BOTH arms again, and the BASE arm reds one statistic
+# MORE than the branch under test. Harm null in both: underruns 0/0/0 in all
+# eight config-arms, dropouts 0/120 and 0/120, ceiling breaches 0/120 and
+# 0/120, drains all-zero except a single run in BASE's audio_tone_load.smp8.
+# That is five consecutive sessions of fewer-wakes-all-harm-clean, two of them
+# now with a same-session control.
+#
+# What is new here is a candidate mechanism, which is what this file's protocol
+# has been waiting for and what the fourth instance could not offer. The
+# conditions differ in the one figure that is exact rather than lagging:
+#
+#   recorded   qemu 3-3, toyos-build 1-1, 1-min load 1.2-2.1 (median 1.6)
+#   soundfix   qemu 1-1, toyos-build 1-2, 1-min load 1.0-8.6 (median 2.3)
+#   BASE       qemu 3-3, toyos-build 2-2, 1-min load 0.9-2.3 (median 1.6)
+#
+# `wakes` counts iterations of a loop woken by completions and by a predicted
+# timeout, and the pipeline retires in batches of 8 on this host in every run of
+# all three: fewer wakes for the same ~1110 periods submitted is the host
+# handing soundd more completions per wake. A guest sharing the host with two
+# other guests is descheduled more often, which is more wakes, not fewer — so
+# the *recorded* arm being the contended one is the direction that matches.
+# Not established: the BASE arm above ran at `qemu 3-3` like the recording and
+# still red, so competition alone does not close it either. Recorded as the
+# next thing to test, not as the answer.
+#
+# NO RE-RECORD IS TAKEN HERE. Not by this branch and not for this statistic:
+# the owner's ruling and this file both want a mechanism first, and a candidate
+# is not one.
+#
 # Why the counters are here at all: the wav is a rare-event detector. One 3s
 # tone samples ~1100 device periods once per run, so it only fires when a
 # dropout happens to land inside the tone — a 0-10% per-run event that cannot

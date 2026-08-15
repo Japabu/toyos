@@ -94,6 +94,20 @@ fn test(cap: &SysCap) {
         other => panic!("spawn with a device fd in its fd_map: expected PermissionDenied, got {other:?}"),
     }
 
+    // **A claim answers no write at all**, and every device class answers that
+    // in one exhaustive match arm. The audio fd used to dispatch command bytes
+    // — `0 => stop`, `1 => start`, `_ => {}` — and report the write's length
+    // whichever arm ran, so a caller could not tell an accepted command from an
+    // ignored one. That dispatch was deleted with `kernel/src/fd.rs` (`a022811`);
+    // this is what keeps a future one from arriving without a refusal, on the
+    // one claim every machine shape has.
+    match syscall::write(mouse, &[7]) {
+        Err(SyscallError::PermissionDenied) => {}
+        other => panic!(
+            "write of a command byte to a device claim: expected PermissionDenied, got {other:?}"
+        ),
+    }
+
     // Three refusals must not have released anything.
     assert_eq!(
         claim_in_child(cap),
@@ -137,7 +151,9 @@ fn test(cap: &SysCap) {
         .expect("a killed process must give its device claim back");
     drop(reclaimed);
 
-    println!("device claim: dup, dup2 and fd_map refused; close and kill both release it");
+    println!(
+        "device claim: dup, dup2, fd_map and a command byte refused; close and kill both release it"
+    );
 }
 
 /// `None` when the child got the claim, `Some(e)` when it was refused.
