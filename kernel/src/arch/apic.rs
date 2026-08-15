@@ -148,8 +148,8 @@ fn owed() -> bool {
 /// dying CPU spins on one relaxed atomic against a deadline and lets a healthy
 /// sibling do the write.
 ///
-/// It cannot deadlock and it cannot make a panic worse: `file_has_pending` is a
-/// load, the deadline is absolute, and every outcome ends in the same
+/// It cannot deadlock and it cannot make a panic worse: `log_file::has_pending`
+/// is a load, the deadline is absolute, and every outcome ends in the same
 /// `halt_all_cpus` tail that ran before. A machine where no CPU can flush —
 /// the VFS lock stranded, the sink disabled, no `/log` at all — pays the bound
 /// and halts exactly as it used to, with the panel as the only copy and a line
