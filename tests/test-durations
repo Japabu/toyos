@@ -230,6 +230,7 @@ process_lifecycle 217
 process_stats 15
 query_modules_size 11
 readdir_bound 6214
+sched_check_build 18446744073709551615
 sched_stress 1300
 screen_blocked_dump 4679
 screen_console_clear 8871
