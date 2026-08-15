@@ -190,7 +190,8 @@ actuators! {
     /// the backtrace that got there. The one number that says how much of the
     /// kernel is holding a spinlock while a device is being waited for, and one
     /// no static read of the call graph produces: it is 5 on an ordinary boot.
-    /// The instrument every stage of `specs/plans/blocking-io-plan.md` is judged on.
+    /// The instrument every stage of `specs/completion-architecture-spec.md` is
+    /// judged on.
     /// It measures and stages nothing — no driver behaviour changes with it on.
     io_depth_probe = "io-depth-probe";
 

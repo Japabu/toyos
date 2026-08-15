@@ -46,6 +46,6 @@ compiles and means "expired at boot") and F11 (`:987`, the
 are the design; F11's own closing line is "**Standing.** Not filed." Two
 corrections to it: its count of eight unbounded MMIO polls is **five** today,
 because the xHCI sites it named are the ones that closed; and `CAP.TO` appears
-nowhere in it. **Not** `specs/plans/iouring-blocking-spec.md` — that spec owns the
+nowhere in it. **Not** `specs/completion-architecture-spec.md` — that spec owns the
 *park* deadline (§9.1–9.2, `Instant`/`Duration`/`Deadline`, "no `0 = forever`"),
 never a driver register poll, and does not mention NVMe at all.

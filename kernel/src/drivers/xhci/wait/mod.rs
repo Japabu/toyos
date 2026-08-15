@@ -40,7 +40,7 @@ pub mod msc;
 /// does. It exists because the depth cannot be read off the call graph — the
 /// backtrace it prints beside it is what says which locks those are, and one of
 /// them is named nowhere in the chain of function names. Every stage of
-/// `specs/plans/blocking-io-plan.md` is judged on this number falling.
+/// `specs/completion-architecture-spec.md` is judged on this number falling.
 ///
 /// Deepest-so-far rather than every wait, because a line per transfer on a
 /// machine whose log lives on the transfer's own device is the self-sustaining

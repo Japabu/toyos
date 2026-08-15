@@ -445,7 +445,7 @@ pass does not help while one unit of work can block for 2 s. A dedicated
 context (a kernel thread) does not help either while the thing it would block
 on is the `XHCI` ticket lock, which disables preemption — the thread would have
 to drop the lock across every wait, and completions would have to be routed to
-it, which is the io_uring blocking primitive `specs/plans/iouring-blocking-spec.md`
+it, which is the completion primitive `specs/completion-architecture-spec.md`
 has not built yet, in a subsystem another agent owns. Submit-and-return needs
 none of that and is what the extraction produces anyway.
 
