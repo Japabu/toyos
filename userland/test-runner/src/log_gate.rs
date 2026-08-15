@@ -604,6 +604,7 @@ fn verdict(tail: &LogTail, run: &Run) -> Result<(), String> {
     let mut read_total = 0u64;
     let mut migrated = 0u64;
     let mut said_done = 0u64;
+    let mut unseen = 0u64;
     if let Some(threads) = run.storm {
         // **What every producer emitted, from a record where one survived and
         // from the ledger where none did.** `logstorm start` is written before
@@ -628,11 +629,22 @@ fn verdict(tail: &LogTail, run: &Run) -> Result<(), String> {
             }
         };
         for thread in 0..threads as u64 {
-            let producer = run.producers.get(&thread).ok_or_else(|| {
-                format!(
-                    "producer t={thread} was spawned and this reader took no record of it at all"
-                )
-            })?;
+            let Some(producer) = run.producers.get(&thread) else {
+                // **A producer this reader never saw at all is the ring's
+                // declared policy and not a failure**, and this used to be a
+                // hard error. Two producers placed on one CPU write one shard,
+                // and 1,024 records from the second lap all 1,024 of the first:
+                // measured 2 of 7 full suites on the dev host, 2026-08-15, with
+                // 2,582 records overwritten in a shard on the run that produced
+                // it. Refusing it would be refusing the behaviour under test.
+                //
+                // It is not free either — see the ledger check below, which is
+                // what stops "the reader saw nothing of it" from covering a
+                // producer that never ran.
+                unseen += 1;
+                emitted_total += declared;
+                continue;
+            };
             // **A cross-check where the record survived, never a requirement.**
             // A producer whose `done` was lapped is a producer the ring
             // dropped a record of, which is the behaviour under test.
@@ -661,6 +673,23 @@ fn verdict(tail: &LogTail, run: &Run) -> Result<(), String> {
             read_total += producer.read;
             if producer.shards > 1 {
                 migrated += 1;
+            }
+        }
+        // **A producer nobody saw has to be one the ring dropped, and the
+        // ledger is what says so.** `unseen` producers emitted `declared`
+        // records each and none of them was read, so at least that many
+        // sequence numbers must be among the ones the kernel counted lost. It
+        // is a necessary condition rather than an attribution — the cursor's
+        // `lost` is per shard and does not name producers — and it is what
+        // separates "the ring lapped its whole run", which is the behaviour
+        // under test, from "that thread never ran", which is a kernel that did
+        // not spawn what it said it did.
+        if unseen > 0 {
+            let owed = unseen * declared;
+            if reported < owed {
+                return Err(format!(
+                    "{unseen} producer(s) emitted {declared} record(s) each and this reader took                      none of them, while the kernel counted {reported} lost in all — a producer                      can only be invisible because its records were dropped, and the ledger does                      not account for the {owed} that would take"
+                ));
             }
         }
         if read_total == 0 {
@@ -734,7 +763,7 @@ fn verdict(tail: &LogTail, run: &Run) -> Result<(), String> {
         // (`tests/common/logread.rs`).
         println!(
             "log-gate: storm emitted={emitted_total} read={read_total} dropped={} \
-             concurrent={} migrated={migrated}/{} done={said_done} wakes={}",
+             concurrent={} migrated={migrated}/{} done={said_done} unseen={unseen} wakes={}",
             emitted_total - read_total,
             run.concurrent,
             run.producers.len(),

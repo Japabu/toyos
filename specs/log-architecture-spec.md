@@ -3004,6 +3004,22 @@ which is evidence about the ring rather than an assertion about it. That removes
 the class — *a workload whose liveness depends on a record the ring is allowed
 to drop* — rather than this instance of it.
 
+**And a producer this reader never sees at all is the ring's policy too.** The
+first rewrite kept "every producer must have been read at least once" as a hard
+clause, and that is the same mistake one level up: two producers on one CPU
+write one shard, and 1,024 records from the second lap all 1,024 of the first.
+Measured on the dev host, 2026-08-15 — the first seven suites after the
+termination fix were **2 of 7 red on exactly that**, with *"2,582 record(s) were
+overwritten in a shard"* on the run that produced it, and no ceiling anywhere
+(the reds took three seconds where the old ones took thirty-three). So an unseen
+producer is counted, reported as `unseen=`, and **checked against the ledger
+rather than waved through**: `unseen` producers emitted `declared` records each
+and none was read, so at least that many sequence numbers must be among the ones
+the kernel counted lost. That is a necessary condition and not an attribution —
+`cursor.lost` is per shard and names no producer — and it is what separates "the
+ring lapped its whole run", which is the behaviour under test, from "that thread
+never ran", which is a kernel that did not spawn what it said it did.
+
 **What the change costs, stated rather than left to be found.** The termination
 condition can, in principle, fire mid-storm: eight empty reads and 100 ms of
 guest quiet while a producer is stalled inside its publication bracket. That
