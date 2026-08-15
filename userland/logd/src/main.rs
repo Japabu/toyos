@@ -88,11 +88,26 @@ const BATCH: usize = 64;
 /// **A policy number, and it says so**: nothing about the device supplies one.
 /// The transport already bounds a single transfer — `USB_TIMEOUT_NS` is 2 s in
 /// `kernel/src/drivers/xhci`, which is what turns a stick that stopped
-/// answering into an `Err` here rather than an unbounded park — so this is an
-/// ordinary policy over *repeated* errors and over a device that answers but
-/// too slowly to keep up. Five seconds: long enough that a slow stick under a
-/// boot's worth of other I/O is not called dead, short enough that a person
-/// watching the console learns about it while they are still watching.
+/// answering into an `Err` here rather than an unbounded park. Five seconds:
+/// long enough that a slow stick under a boot's worth of other I/O is not
+/// called dead, short enough that a person watching the console learns about it
+/// while they are still watching.
+///
+/// **What it bounds is slowness and not errors, and that split is measured
+/// rather than chosen.** §5.4 called it "a policy over repeated errors and a
+/// slow-but-answering device", and the first half of that does not survive this
+/// tree: a failing write is *itself* logged by the driver
+/// (`usb-storage: cache flush failed on disk 0`), which commits a kernel record,
+/// which is a record this program then tries to write, which fails. Retrying
+/// inside a budget therefore does not sample a device that might recover — it
+/// runs a feedback loop, measured at **1,737 failing flushes over six seconds**
+/// under `usb-flush-fails` before this constant was given the narrower job.
+///
+/// So an **error** ends it at once, which is what `kernel/src/log_file.rs` did
+/// and for a reason that turns out to be this one rather than an idle loop's
+/// convenience. This bounds the other failure the volume has: a device that
+/// answers, and takes longer doing it than a log is worth. `usb_flush_optional`
+/// is the gate for the first and `--slow-usb` the instrument for the second.
 const LOG_WRITE_BUDGET: Duration = Duration::from_secs(5);
 
 /// How long a park on the log's readiness source waits before looking again.
@@ -140,16 +155,21 @@ fn main() {
     // The wall clock, read once. The kernel reads the RTC once too, so a second
     // reading later in the boot would answer out of the same anchor and tell
     // this program nothing new.
-    let (stem, boot_local) = boot_stamp();
+    let (stem, boot_local, zone) = boot_stamp();
 
     let mut volume = Volume::open(stem, rotate_at, |line| say!("{line}"));
     match &volume {
-        // §5.6's half: the kernel says whether it has a console, this program
-        // says whether it has a volume, and the two lines are the four-way
-        // table split between the two things that know.
-        Some(v) => say!("logd: this boot's kernel log is {}", v.path()),
+        // §5.6's half, **in one line**: the kernel says whether it has a
+        // console, this program says whether it has a volume and what the name
+        // it chose was decided by, and the two lines are the four-way table
+        // split between the two things that know. One and not two, because
+        // every line a daemon writes on a shared console is a line that can land
+        // inside a test's window (`specs/issues/build/daemon-lines-land-in-any-test-window.md`)
+        // and because §5.6 says "once".
+        Some(v) => say!("logd: this boot's kernel log is {} ({zone})", v.path()),
         None => say!(
-            "logd: no {DIR} on this machine - this boot's kernel log is on the console only"
+            "logd: no {DIR} on this machine - this boot's kernel log is on the console only \
+             ({zone})"
         ),
     }
 
@@ -165,7 +185,6 @@ fn main() {
     poller.poll_add(&cap, IORING_POLL_IN, LOG_TOKEN);
     poller.wait(0, 0, |_| {});
 
-    let mut trouble: Option<Instant> = None;
     let mut lost = 0u64;
     loop {
         let batch = match tail.read(&cap, &mut buf) {
@@ -201,23 +220,31 @@ fn main() {
         let Some(v) = volume.as_mut() else { continue };
 
         let newest = batch.last().map_or(0, |r| r.at_ns);
+        let began = Instant::now();
         let mut refused = None;
         for record in batch.iter() {
             let line = format!("{} {record}\n", stamp(boot_local, record.at_ns));
             if let Err(e) = v.write(line.as_bytes()) {
-                refused = Some(("the append", e));
+                refused = Some(("the append", e.to_string()));
                 break;
             }
         }
         if refused.is_none() {
             if let Err(e) = v.sync() {
-                refused = Some(("the sync", e));
+                refused = Some(("the sync", e.to_string()));
             }
+        }
+        // A volume that answered, and took longer than a log is worth doing it.
+        // Checked after the write rather than before, because there is nothing
+        // to cancel: `SYS_WRITE` and `SYS_FSYNC` do not come back until the
+        // transport's own bound has expired, so the only place to notice is
+        // here.
+        if refused.is_none() && began.elapsed() > LOG_WRITE_BUDGET {
+            refused = Some(("the write", format!("it took {:?}", began.elapsed())));
         }
 
         match refused {
             None => {
-                trouble = None;
                 // **After the sync and never before it.** This word is what a
                 // panicking kernel waits on, so publishing it for a record that
                 // is only in the page cache would lose the report in exactly
@@ -230,23 +257,15 @@ fn main() {
                     }
                 }
             }
-            Some((step, e)) => {
-                let since = *trouble.get_or_insert_with(Instant::now);
-                if since.elapsed() < LOG_WRITE_BUDGET {
-                    // Inside the budget the volume gets another batch. The
-                    // cursor has already moved past these records, so what a
-                    // retry would recover is not the batch — it is the *next*
-                    // one, on a device that may have been busy rather than
-                    // gone.
-                    continue;
-                }
-                // §5.4, in order: stop feeding the volume, say so once, and
-                // keep running. It does not exit and does not retry — "I stop
-                // waiting for this stick and say so" is the whole policy.
+            Some((step, why)) => {
+                // §5.4, in order: stop feeding the volume, say so once, and keep
+                // running. It does not exit, does not retry and does not queue
+                // for a device that is not answering — "I stop waiting for this
+                // stick and say so" is the whole policy, and the constant above
+                // is why a retry is not part of it.
                 say!(
-                    "logd: {DIR} has not answered in {}s ({step}: {e}) - this boot's log is on \
-                     the console only from {}",
-                    LOG_WRITE_BUDGET.as_secs(),
+                    "logd: {DIR} has not answered ({step}: {why}) - this boot's log is on the \
+                     console only from {}",
                     v.path()
                 );
                 volume = None;
@@ -261,34 +280,35 @@ fn main() {
 /// `unknown-NN` name — and the two ways to get there are named separately,
 /// because "this machine has no clock" and "this machine has a clock whose zone
 /// two readings cannot separate" are different facts about the machine.
-fn boot_stamp() -> (Option<String>, Option<u64>) {
+fn boot_stamp() -> (Option<String>, Option<u64>, String) {
     match wall::local_now() {
         Wall::Local { secs, offset_secs } => {
             let civil = Civil::from_unix_secs(secs);
-            say!(
-                "logd: the wall clock reads {civil}, {} minutes from UTC recovered from two \
-                 readings",
-                offset_secs / 60
-            );
             let uptime_secs = uptime_nanos() / 1_000_000_000;
-            (Some(format!("{}", civil.stem())), Some(secs.saturating_sub(uptime_secs)))
+            (
+                Some(format!("{}", civil.stem())),
+                Some(secs.saturating_sub(uptime_secs)),
+                format!("{civil} at UTC{:+} recovered from two readings", offset_secs / 3_600),
+            )
         }
-        Wall::Unknown => {
-            say!("logd: this machine will not say what time it is, so this boot's log is undated");
-            (None, None)
-        }
-        Wall::Ambiguous { east, west } => {
-            // Named rather than guessed. The two candidates are the same time
-            // of day on different days, so a file named from either is a day
-            // wrong half the time; `wall`'s module header is the argument.
-            say!(
-                "logd: the wall clock is UTC{:+} or UTC{:+} on these two readings and nothing \
-                 separates them, so this boot's log is undated",
+        Wall::Unknown => (
+            None,
+            None,
+            "undated: this machine will not say what time it is".into(),
+        ),
+        // Named rather than guessed. The two candidates are the same time of day
+        // on different days, so a file named from either is a day wrong half the
+        // time; `wall`'s module header is the argument.
+        Wall::Ambiguous { east, west } => (
+            None,
+            None,
+            format!(
+                "undated: the clock is UTC{:+} or UTC{:+} on these two readings and nothing \
+                 separates them",
                 east / 3_600,
                 west / 3_600
-            );
-            (None, None)
-        }
+            ),
+        ),
     }
 }
 

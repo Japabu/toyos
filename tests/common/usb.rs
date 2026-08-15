@@ -946,11 +946,10 @@ fn optional_flush_keeps_the_log(
 /// afford to tell a stick that is busy apart from one that is gone, and a
 /// device that answers slowly under load is not a device to abandon.
 ///
-/// That makes the stimulus part of this gate rather than incidental: the budget
-/// is only spent when there is something to write, so the probes below keep
-/// records arriving for longer than the budget. Without them a machine that
-/// went quiet after boot would never reach the give-up and this would pass on a
-/// logd that had none.
+/// The probes below are what make "and stops" a claim rather than an absence:
+/// each names a binary that is not there, so each commits a kernel record, so
+/// each is something logd would write if it had not given up. Twelve of them
+/// after the give-up and the failing-flush count still has to hold.
 fn failed_flush_stops_once(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
@@ -958,15 +957,19 @@ fn failed_flush_stops_once(
 ) -> Result<(), String> {
     const PARAMS: &[&str] = &["usb-flush-fails"];
     /// Probes after the boot, each of which spawns a name that is not there and
-    /// so commits a kernel record for logd to try to write. Twelve at 500 ms is
-    /// six seconds, past `LOG_WRITE_BUDGET`'s five.
+    /// so commits a kernel record logd would write if it were still writing.
     const PROBES: usize = 12;
     /// A per-failure line, and the thing that has to stay bounded. Before the
     /// fix it is emitted by every pass of the idle loop for the life of the
-    /// boot. After it, logd attempts one write per batch of records and gives up
-    /// for good once the budget is spent, so the count is bounded by the probes
-    /// and not by the boot's length — measured on the branch and recorded here.
-    const BOUND: usize = PROBES + 4;
+    /// boot. After it: one by the write that gives up, and one per mount by the
+    /// shutdown's `sync_all`, which is the last caller left.
+    ///
+    /// **This is the number that caught the retry**, and it is worth saying what
+    /// it caught. A logd that retried inside `LOG_WRITE_BUDGET` measured
+    /// **1,737** failing flushes here, because the driver logs each failure, the
+    /// failure is a kernel record, and the record is something logd then tries
+    /// to write. The loop is in the coupling and not in either half.
+    const BOUND: usize = 4;
 
     let mut qemu = QemuInstance::boot_with_options(
         test_config,
@@ -1003,11 +1006,11 @@ fn failed_flush_stops_once(
     // By step and not by code alone: logd names which of the two calls refused
     // it, and the one this test stages is the sync rather than the append ahead
     // of it.
-    let gave_up = log.matches("logd: /log has not answered in 5s (the sync").count();
+    let gave_up = log.matches("logd: /log has not answered (the sync").count();
     if gave_up != 1 {
         return Err(format!(
             "logd gave up {gave_up} times, wanted exactly one — a failed `SYS_FSYNC` has to \
-             reach it as an error, and once the budget is spent it must not start again\n{log}"
+             reach it as an error, and once it has given up it must not start again\n{log}"
         ));
     }
     let failures = log.matches("usb-storage: cache flush failed").count();
@@ -1018,9 +1021,8 @@ fn failed_flush_stops_once(
         ));
     }
     eprintln!(
-        "  [usb] a flush the device refuses: {failures} failing flushes over {PROBES} probes, \
-         logd disabled once at the {}s budget",
-        5
+        "  [usb] a flush the device refuses: {failures} failing flushes with {PROBES} probes \
+         after it, logd stopped once and never started again"
     );
     Ok(())
 }

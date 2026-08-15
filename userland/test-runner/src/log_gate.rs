@@ -56,6 +56,14 @@ const QUIET_READS: u32 = 8;
 /// kernel posts nothing, and eight of these is the whole tail of the run.
 const IDLE_NANOS: u64 = 2_000_000;
 
+/// How long the deterministic readiness round waits for its own record.
+///
+/// Generous, because what it bounds is a scheduler getting round to a child's
+/// exit on a machine that has just run a storm on every CPU — not the post,
+/// which is one function call after the drain. A gate that timed out here would
+/// be reporting the host's load and not the kernel's.
+const READINESS_WAIT_NANOS: u64 = 2_000_000_000;
+
 /// The poll's token. One handle is watched, so it identifies the round rather
 /// than the source.
 const LOG_TOKEN: u64 = 1;
@@ -162,17 +170,36 @@ fn gate(cap: &SysCap) -> Result<(), String> {
         completions: 0,
     };
 
-    // **Armed before the first read**, which is what makes a completion
-    // deterministic rather than lucky: the first read is what starts the storm,
-    // so the records that answer this poll are committed after it was
-    // registered. `min_complete` 0 with no timeout submits and returns.
+    // **Armed before the first read and kept armed**, which is what makes a
+    // completion deterministic rather than lucky: the first read is what starts
+    // the storm, so the records that answer this poll are committed after it was
+    // registered, and re-arming after every harvest means a post landing *during*
+    // the storm finds a pending poll rather than a gap.
+    //
+    // **It used to arm only on an empty read, and that made the assertion
+    // depend on the shape of the boot.** During a storm no read is empty, so the
+    // only poll in flight was the one from before the first read; whether it was
+    // ever completed came down to when `klogd` happened to get a turn. At
+    // `--smp 4` that measured `wakes=1`, and at `--smp 8` with `/bin/logd` also
+    // reading the cursor it measured **zero** — a red about scheduling rather
+    // than about the readiness source. `min_complete` 0 with no timeout submits
+    // and harvests without blocking, so this costs one syscall a round.
     let poller = Poller::new(1);
-    poller.poll_add(cap, IORING_POLL_IN, LOG_TOKEN);
-    poller.wait(0, 0, |_| run.completions += 1);
+    let mut armed = false;
 
     let mut quiet = 0u32;
     let started = Instant::now();
     loop {
+        if !armed {
+            poller.poll_add(cap, IORING_POLL_IN, LOG_TOKEN);
+            armed = true;
+        }
+        poller.wait(0, 0, |token| {
+            assert_eq!(token, LOG_TOKEN, "the log poll completed with another token");
+            run.completions += 1;
+            armed = false;
+        });
+
         let batch = tail
             .read(cap, &mut buf)
             .map_err(|e| format!("SYS_LOG_READ refused a {BATCH}-record buffer: {e:?}"))?;
@@ -214,13 +241,38 @@ fn gate(cap: &SysCap) -> Result<(), String> {
             // **Nothing new, so park on the readiness source rather than spin.**
             // `SYS_LOG_READ` never blocks by design; this is the other half of
             // that design, and the timeout is what bounds a machine that has
-            // nothing left to say.
-            poller.poll_add(cap, IORING_POLL_IN, LOG_TOKEN);
+            // nothing left to say. The poll is already armed by the top of the
+            // loop, so this parks on it rather than adding a second.
             poller.wait(1, IDLE_NANOS, |token| {
                 assert_eq!(token, LOG_TOKEN, "the log poll completed with another token");
                 run.completions += 1;
+                armed = false;
             });
         }
+    }
+
+    // **The readiness source, observed deterministically rather than raced.**
+    // Every completion above is a `klogd` post landing while this poll happened
+    // to be pending, and during a storm that is a race against eight producers:
+    // it measured `wakes=1` at `--smp 4` and **zero** at `--smp 8` once
+    // `/bin/logd` was reading the cursor too, which is a red about scheduling
+    // and not about `Source::Log`. So if the storm produced none, make one —
+    // the shape `log_poll_outlives_a_close` already proves on this tree: a child
+    // that runs and exits commits `process.rs`'s `exit:` line, which is one
+    // kernel record from userland with no actuator and no privilege behind it.
+    if run.completions == 0 {
+        let mut child = std::process::Command::new("/bin/echo")
+            .arg("log-gate")
+            .spawn()
+            .map_err(|e| format!("the record-making child would not start: {e}"))?;
+        let _ = child.wait();
+        if !armed {
+            poller.poll_add(cap, IORING_POLL_IN, LOG_TOKEN);
+        }
+        poller.wait(1, READINESS_WAIT_NANOS, |token| {
+            assert_eq!(token, LOG_TOKEN, "the log poll completed with another token");
+            run.completions += 1;
+        });
     }
 
     verdict(&tail, &run)
@@ -537,7 +589,9 @@ fn verdict(tail: &LogTail, run: &Run) -> Result<(), String> {
         // answer it were committed after it was registered.
         if run.completions == 0 {
             return Err(
-                "the log's readiness source completed no poll across the whole storm".into(),
+                "the log's readiness source completed no poll — not across the storm, and not on \
+                 the record a child's exit commits afterwards either"
+                    .into(),
             );
         }
     }

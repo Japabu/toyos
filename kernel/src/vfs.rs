@@ -543,10 +543,13 @@ impl Vfs {
         let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or(SyscallError::NotFound)?;
         if fs_path.is_empty() { return Err(SyscallError::InvalidArgument); }
 
-        // On the heap and not the stack. `log_file` reaches this from the idle
+        // On the heap and not the stack. `log_file` reached this from the idle
         // loop, whose per-CPU stack is 16 KiB of ordinary heap with no guard
-        // page — so a 4 KiB frame there is a quarter of the stack and an
-        // overflow corrupts whatever the allocator put underneath it, silently.
+        // page — so a 4 KiB frame there was a quarter of the stack and an
+        // overflow corrupted whatever the allocator put underneath it, silently.
+        // That caller is gone (log architecture L6) and this stays on the heap:
+        // every syscall stack in the machine is better off for it, and the next
+        // kernel-side caller would arrive with the hazard intact.
         // Measured at that call site: 11,505 bytes of the 16,384 in use at the
         // block layer, with the USB command path still below. `Vec` rather than
         // `Box::new([0u8; 4096])`, because the latter is only elided from the

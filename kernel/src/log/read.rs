@@ -187,9 +187,11 @@ impl Default for Cursor {
 /// **Words rather than a `Cursor` behind a cell**, because the panic path's
 /// bypass reads the position with no backend lock held — that is what the
 /// bypass *is* — and an array of `AtomicU64` has no torn read to reason about.
-/// `log_file` keeps its own position the same way for a plainer reason: its
-/// pending predicate is read from the pre-`hlt` check with interrupts off and
-/// may take no lock.
+/// `log_file` kept its own position the same way, for a plainer reason: its
+/// pending predicate was read from the pre-`hlt` check with interrupts off and
+/// could take no lock. That reader is gone at L6 and this one is not — the
+/// console's drain is the shared cursor and always was the one this type exists
+/// for.
 pub struct Published {
     next: [core::sync::atomic::AtomicU64; MAX_LOG_SHARDS],
     lost: core::sync::atomic::AtomicU64,

@@ -314,9 +314,13 @@ pub(super) fn deaf_window() {
     /// How long cpu0 waits for the victim to reach its idle loop and go deaf.
     ///
     /// **A kicked CPU does not arrive at the top of its loop promptly and there
-    /// is no bound to give**: the pass it is finishing runs
-    /// `flush_log_file_if_affordable` with preemption off, and on a machine
-    /// whose `/log` is a USB device that is a string of bulk transfers. CI run
+    /// is no bound to give.** The measurement below was taken when the pass it
+    /// was finishing ran `flush_log_file_if_affordable` with preemption off, on
+    /// a machine whose `/log` is a USB device — a string of bulk transfers.
+    /// **That statement is deleted at log architecture L6** and the conclusion
+    /// is not: `drain_irqs` still reaches USB enumeration from a pass, so a
+    /// kicked CPU still has no bound, and this is now the record of how large
+    /// "no bound" was measured to be rather than of its only cause. CI run
     /// `31284962381` measured 251 ms of it — cpu0 gave up at 11.417 s and the
     /// victim went deaf at 11.568 s, so nothing was staged, no dump ran, and a
     /// CPU sat deaf for 400 ms for nobody. So this is generous and, more to the

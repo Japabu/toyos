@@ -89,13 +89,15 @@
 //!
 //! # Where it runs
 //!
-//! [`poll`] is called from `sched::driver::idle_loop`, immediately before
-//! `log_file::poll`, so the line it appends is flushed by the very next
-//! statement through the path that already exists — and the pre-halt recheck's
-//! `log_file_flush_due`, which reads `log_file::has_pending`, keeps this CPU
-//! awake until it is. No second flush
-//! mechanism, and nothing here waits on a lock: a heartbeat that could block
-//! would be a diagnostic that stops for the reason it exists to report. The one
+//! [`poll`] is called from `sched::driver::idle_loop`. It used to sit
+//! immediately before `log_file::poll` so its line was flushed by the very next
+//! statement, with the pre-halt recheck keeping the CPU awake until it was.
+//! **Neither exists since log architecture L6**, and the placement needs
+//! neither: a heartbeat is an ordinary record now, so `emit` posts `klogd`'s
+//! wake at the commit and the halt is refused by the doorbell like any other
+//! runnable task's. No second flush mechanism, and nothing here waits on a
+//! lock: a heartbeat that could block would be a diagnostic that stops for the
+//! reason it exists to report. The one
 //! lock in reach is the I/O APIC topology, behind `i8042::report_line`'s
 //! `try_lock`, which prints `rte=busy` rather than waiting.
 //!
@@ -116,9 +118,9 @@
 //!
 //! # Cost
 //!
-//! Four lines a second, about 60 bytes each, each carrying a `sync_mount` of
-//! whatever `/log` sits on. Against `log_file`'s 1 MiB rotation that is a new
-//! part roughly every 70 minutes and sixteen of them kept, so a diagnostic
+//! Four lines a second, about 60 bytes each, each of which `/bin/logd` writes
+//! and `fsync`s — a device cache flush of whatever `/log` sits on. Against its
+//! 1 MiB rotation that is a new part roughly every 70 minutes and sixteen kept, so a diagnostic
 //! session of any length anyone will sit through fits. **That is a diagnostic
 //! budget and not a shipping one**, which is why the shipping kernel does not
 //! carry this module at all — and with `diag-tick` under it, the instrument is

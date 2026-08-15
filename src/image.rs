@@ -288,9 +288,9 @@ fn create_esp_volume(
 /// The partition the kernel's log lives on, empty until a machine boots.
 ///
 /// Exactly [`FAT32_MIN_BYTES`], because the floor is not ours to choose and the
-/// log cannot use much of it: two generations of `kernel.log` come to 8 MiB at
-/// `log_file::max_log_bytes`, under a quarter of what this volume has free, and
-/// there is no smaller FAT32 to cut it down to.
+/// log cannot use much of it: sixteen boots at `/bin/logd`'s `MAX_LOG_BYTES`
+/// come to 16 MiB, under half of what this volume has free, and there is no
+/// smaller FAT32 to cut it down to.
 fn create_log_volume() -> Vec<u8> {
     let mut volume = format_fat32(FAT32_MIN_BYTES, "TOYOS-LOG");
     populate(&mut volume, "TOYOS-LOG", &[]);
