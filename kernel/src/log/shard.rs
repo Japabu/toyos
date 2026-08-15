@@ -291,9 +291,12 @@ impl Shard {
         // The store comes *after* the body write, so throughout it the word
         // still reads the *previous* generation's number — and a reader that
         // loaded it, copied a half-overwritten body and re-checked saw the same
-        // value both times and accepted the tear. `kernel-loom`'s
-        // `a_reader_racing_a_recycle_gets_nothing_rather_than_a_mixture` found
-        // it on its first run; no guest test can, on any machine.
+        // value both times and accepted the tear. The loom recycle models
+        // found it on their first run; no guest test can, on any machine.
+        // `a_reader_racing_a_recycle_gets_nothing_rather_than_a_mixture`
+        // (2026-08-15) is the model that pins this mark directly — it reds if
+        // the mark, its release fence, or either reader's acquire fence is
+        // removed, and §2.5 records the four weakenings.
         //
         // The release fence is what puts this store ahead of the body writes
         // for the reader, rather than merely ahead of them in this function.

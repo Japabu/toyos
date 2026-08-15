@@ -13,10 +13,13 @@
 //! [`BackendGuard`] is CLI plus a global spinlock, so an interrupts-off window
 //! is one unit long. The slow I/O happens inside it, which is why **every unit
 //! is bounded and no holder may take its length from userland** — a rendered
-//! record is one 1 KiB `LogRecord`, the drain takes eight of them, the panic
-//! report is a fixed buffer, and a `write` of arbitrary length is cut into
-//! [`MAX_CONSOLE_LINE`] pieces by [`write_console`]. Nothing that holds a
-//! kernel lock formats here.
+//! record is one 1 KiB `LogRecord`, the live drain takes eight of them, the
+//! panic report is a fixed buffer, and a `write` of arbitrary length is cut
+//! into [`MAX_CONSOLE_LINE`] pieces by [`write_console`]. The one deliberate
+//! exception is the panic path's `drain_locked`, which takes the whole backlog
+//! under one hold — a machine that is dying pays latency to say why, and
+//! `log/console.rs` argues it at the site. Nothing that holds a kernel lock
+//! formats here.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use crate::arch::cpu::{inb, outb};

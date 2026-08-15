@@ -22,11 +22,18 @@ let listener = match tokio::net::TcpListener::bind("0.0.0.0:22").await {
 ```
 
 **Which arm it takes is a race with netd's lifetime, not a fact about the
-machine.** On a boot with no NIC, netd says so and exits 0. If sshd's bind
-reaches netd first it gets `NotConnected` and leaves with a line. If netd has
-already gone, the bind fails with a generic `netd error`, the guard does not
-match, and sshd panics — on a machine whose only fault is having no network
-card, which is the exact situation the clean arm was written for.
+machine — but the losing path is narrower than first written.** The SDK
+already folds the obvious gone-service shapes into the clean arm:
+`toyos/src/net.rs` maps `IpcError::Disconnected` and
+`EndowError::{NotEndowed,ServerGone}` to `NetError::NetdNotFound`, and the
+std fork maps that to `ErrorKind::NotConnected` — the guard's own kind, built
+after sshd "panicked across the boot of every NIC-less machine that lost the
+race" (`hangup`'s doc, landed in `78df7a3`). The observed panic therefore came
+through a path that is not any of those: `EndowError::Refused` with another
+code, a non-`Disconnected` `IpcError` mid-handshake, `pipe_pair()` failing, or
+netd answering an `ErrorResponse` other than `ERR_NOT_CONNECTED` while
+tearing down. Which one was not captured — the message cannot say, because
+the std fork flattens every kind to the same `"netd error"` string.
 
 Caught in a full suite, dev host, 2026-08-15, on `wt/toyos-logd`, once in ten
 consecutive runs and only with the host's load average above 6:
@@ -52,10 +59,12 @@ service is gone" and "the network service refused" arrive as the same error.
 
 Two honest shapes, and neither is this branch's to choose:
 
-- **netd's answer carries the reason.** A refusal from a live netd and a
-  connection to a netd that has exited are different failures and should not
-  both flatten to `netd error` at the SDK boundary — `toyos`'s net client is
-  where that distinction would live.
+- **The error's kind survives to the message.** The distinction largely
+  exists already — `toyos`'s net client separates gone-service from refusal —
+  and what flattens is the *string*: the std fork's
+  `io::Error::new(kind, "netd error")` prints the same words for every kind.
+  Making the message carry the kind (and netd's teardown answer carry a
+  gone-not-refused code) is what would have named the losing path above.
 - **sshd does not race a service it needs.** A program whose whole function
   needs netd could wait for it rather than binding into whatever state init's
   ordering left, which is the shape `[boot] start` ordering already implies but

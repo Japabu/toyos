@@ -290,10 +290,17 @@ pub fn drain_ordered(cursor: &mut Cursor, out: &mut impl RecordSink) -> usize {
             // monotonic — is now **strictly greater than `next[i]`**. The
             // `open` call below therefore clamps the position *up*, counting
             // the difference as loss, and the iteration that took this arm
-            // still ends with `next[i]` larger than it started. Every arm of
-            // this loop either emits, advances, or returns, so a shard cannot
-            // stall the drain by losing a race it is losing because it is being
-            // written to.
+            // still ends with `next[i]` larger than it started.
+            //
+            // On a machine weaker than TSO the argument needs its second half:
+            // nothing orders the writer's `head` xadd before the slot's state
+            // change from this reader's side, so `open` may re-run under a
+            // *stale* `head` and not clamp yet. Then `at_ns`'s exact-equality
+            // test answers `None` for the same slot and the shard simply drops
+            // out of this merge pass — no emit, no spin, and the next drain
+            // clamps. Either way every arm of this loop emits, advances, or
+            // returns, so a shard cannot stall the drain by losing a race it
+            // is losing because it is being written to.
             None => {}
         }
         cand[i] = cursor.open(i, shards[i]);

@@ -467,12 +467,14 @@ pub fn try_write(object: &KObjectRef, buf: &UserBytes) -> Option<u64> {
         KObjectRef::PipeWrite(w) => write_pipe(w.id(), buf),
         KObjectRef::Connection(c) => write_pipe(c.tx(), buf),
         KObjectRef::Console(_) => {
-            // Straight to the backend under one acquisition, where it used to
-            // be a lossless append to the byte ring that something else drained
-            // later. **L5 puts `ConsoleObject`'s line buffer in front of this**
-            // (§4.4); until then a `println!` still hands the kernel half a line
-            // at a time, which is what `console-unbuffered` stages — so this
-            // state is a real prior build rather than an invented one.
+            // Straight to the backend in bounded flushes — `write_console`
+            // stages into a `MAX_CONSOLE_LINE` buffer and takes the guard per
+            // flush — where it used to be a lossless append to the byte ring
+            // that something else drained later. **L5 puts `ConsoleObject`'s
+            // line buffer in front of this** (§4.4); until then a `println!`
+            // still hands the kernel half a line at a time, which is what
+            // L5's `console-unbuffered` actuator will stage — so this state is
+            // a real prior build rather than an invented one.
             serial::write_console(buf);
             Some(buf.len() as u64)
         }

@@ -1716,7 +1716,10 @@ re-parks.
   `specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`'s,
   a driver race this branch's timing moves rather than one it made. **Both are
   rows in `src/redlist.rs` now**, FIRES 3 of 14 and 4 of 14, rather than reds a reader
-  of this section has to re-derive.
+  of this section has to re-derive. The measurement that settles the blame is
+  the second `i8042_undecoded_bytes` row's: back-to-back at host loads 6.4–9.7
+  it FIRES 6 of 10, every occurrence `ALONE: GREEN` — the rate tracks host
+  load, not either bound.
 - **It is not `usbd` and not `iod`.** Those two stay exactly as compl §10 defines
   them, and neither exists until that branch lands.
 
@@ -2435,9 +2438,10 @@ the guard per flush.
 that boundary, where before it could not — so the atomicity claim is "whole up
 to `MAX_CONSOLE_LINE`", which is exactly the claim §4.4 already makes for the
 finished design: a line longer than the bound is emitted in pieces of it there
-too. Nothing that is whole after L5 is splittable now. `console_line_atomicity`
-(§9.5) writes 200-byte lines and is unaffected; the three C tests that compare
-whole stdout are line-oriented and far inside the bound. The re-acquisition is
+too. Nothing that is whole after L5 is splittable now. The
+`console_line_atomicity` gate §10 schedules for L5 writes 200-byte lines and
+will be unaffected; the gate that checks this **today** is the three C tests
+that compare whole stdout, which are line-oriented and far inside the bound. The re-acquisition is
 `ceil(n/1024)` uncontended `cli`/`compare_exchange_weak`/`popfq` triples instead
 of one, against a device write per kilobyte that is orders of magnitude dearer.
 The CSI stripper's state and the staging buffer both outlive every guard, so a
