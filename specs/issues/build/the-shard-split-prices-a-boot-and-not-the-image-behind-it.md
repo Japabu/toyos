@@ -39,6 +39,26 @@ Sum 2,366 s, an even split of 197.2 s, a widest shard of 347 s. Shard 7 is
 place what it cannot see: every shard shows `6 parallel task(s)` because the
 partition believes it is splitting six 3-to-7-second tests.
 
+**And it believes it succeeded.** Summing each shard's own tests at their
+committed prices, that run's twelve bins hold **30.2 s to 32.5 s** — a spread of
+2.3 s. The clock's spread over the same twelve is **194 s**. Nothing in the
+profile is wrong; the profile is simply not what a shard's wall clock is made
+of.
+
+**The A/B that shows the two objectives diverging.** Runs `31900045901` (`main`
+at `e064a96`) and `31900050723` (the same tree plus the one-accumulator fix),
+both twelve-shard `--nightly` dispatches, minutes apart on the same runner pool:
+
+| | widest priced bin | priced spread | widest phase total |
+|---|---|---|---|
+| before | 471.6 s | 328.7 s | 369.8 s |
+| after | **324.7 s** | **179.0 s** | **380.8 s** |
+
+The partition got 147.0 s better by the number it optimises and 11.0 s worse on
+the clock — inside that pair of runs' own noise, but not an improvement. Both
+runs place the identical 316 names with no duplicate, and both sum to 2,180.6 s
+priced, so this is one partition against another over the same work.
+
 **The bound a correct price would reach is not the even split either.** The
 image build is indivisible and attached to its task, so the widest shard is at
 best floor + 203.8 + its own test ≈ 316 s against today's 347 s — about 31 s,
