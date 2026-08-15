@@ -160,17 +160,25 @@ jobs:
       # the pure crates above are: its arithmetic is decided without a guest,
       # so a CI that skipped it would skip the cheapest tests it has.
       #
-      # These two stay a loop, and cannot stop being one: that same
+      # `soundd` for the same reason, and it arrived here already carrying two
+      # tests that ran nowhere: the mixer's bit-exact passthrough and its
+      # full-scale clamp compiled and passed on the host while no workflow ever
+      # invoked them. Everything decided without a device — the deferral floor,
+      # the device shapes it refuses, which witness of a client's departure
+      # wins — is decided here, where a weakening reds in seconds instead of
+      # waiting for a nightly audio boot.
+      #
+      # These stay a loop, and cannot stop being one: that same
       # `.cargo/config.toml` is why `userland` is *excluded* from the host
       # workspace, and cargo refuses to merge an inherited `build.target` away.
-      # They are named in `userland/Cargo.toml`'s own workspace, so the pair
+      # They are named in `userland/Cargo.toml`'s own workspace, so the list
       # here is a list in two places — a smaller instance of the defect above,
       # left standing deliberately rather than papered over.
       - name: userland host crates
         run: |
           set -e -o pipefail
           host=$(rustc -vV | sed -n 's/^host: //p')
-          for crate in sshd calc; do
+          for crate in sshd calc soundd; do
             echo "=== userland/$crate" | tee -a /tmp/host.log
             cargo test --manifest-path "userland/$crate/Cargo.toml" --target "$host" 2>&1 \
               | tee -a /tmp/host.log

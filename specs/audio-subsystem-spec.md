@@ -164,6 +164,12 @@ When no audio device exists, soundd serves streams from a null sink instead
 of exiting: exiting would leave every client's connect refused for the
 machine's lifetime.
 
+A device whose **shape** the mixer cannot render a period into gets the same
+answer for the same reason, and never a panic: a pipeline outside 2..16 periods
+or one that is not a power of two (§3's indices are free-running mod 2^32), a
+device that is neither mono nor stereo, or a period that is not a whole number
+of frames. soundd names which of those it found and presents the null sink.
+
 - It presents one fixed configuration — 44100 Hz stereo i16, 128-frame
   periods, an 8-slot ring — and negotiates streams identically to a device.
 - One period is consumed per period of wall clock, so a client's ring drains
@@ -233,6 +239,7 @@ priority inheritance, and the completion-before-re-block delivery above
 | Every buffer drains | Prediction re-learned; refill proportional (§2); client audio resumes in the first refilled buffer |
 | Last client leaves | Drain, then device stop (§5); zero wakes while idle |
 | No device at boot | Null sink (§6); clients play to completion |
+| A device shape the mixer cannot render | Named and refused; null sink (§6). Never a panic |
 | Device reports an error | Logged; the device is reopened; streams persist through the reopen |
 | Gain out of range or not finite | Clamped (§4) |
 

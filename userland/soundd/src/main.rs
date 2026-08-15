@@ -861,6 +861,104 @@ fn retain_active(streams: &mut Vec<ClientStream>) {
     });
 }
 
+/// Of a pipeline's periods, how many soundd keeps in reserve rather than
+/// spending on a client that is still filling (§4).
+///
+/// Policy, not physics, with the same standing as the kernel's `MAX_USER_STR`:
+/// of the shipped pipeline's 8 periods, soundd waits on a client for at most 3
+/// and always keeps 5 unplayed. It cannot be derived from worst-case wake
+/// lateness — the recorded worst exceeds two whole pipelines, so no floor
+/// inside the pipeline covers it. Move it only with a full re-baseline.
+const DEFERRAL_RESERVE: usize = 5;
+
+/// How much unplayed audio must still be on the wire before the mix loop may
+/// defer a buffer for a client that is mid-refill (§4), or `None` on a pipeline
+/// with nothing to spend.
+///
+/// **The `None` used to be a startup panic** — `assert!(num_buffers > 5)`, a
+/// device shape killing the daemon that serves every client on the machine, in
+/// the class of the NVMe and xHCI zero-device panics. §4 already says what to
+/// do instead and always did: *on a pipeline of five or fewer buffers the
+/// deferral policy is disabled and every free buffer is mixed immediately*. A
+/// reserve that is the whole pipeline is not a reserve, and mixing at once is
+/// what soundd does when it cannot afford to wait.
+fn deferral_floor_nanos(num_buffers: usize, period_nanos: u64) -> Option<u64> {
+    (num_buffers > DEFERRAL_RESERVE).then(|| DEFERRAL_RESERVE as u64 * period_nanos)
+}
+
+/// The deepest pipeline the mix loop can hold.
+///
+/// Its free list is a `u32` bitmask, so `1u32 << num_buffers` has to fit; with
+/// the power-of-two rule below, 16 is the deepest that does.
+const MAX_PIPELINE: usize = 16;
+
+/// A device shape soundd cannot render a period into.
+///
+/// Every arm is a constraint the mix loop's own arithmetic imposes, named where
+/// it is imposed. A shape that trips one is refused by name and the machine
+/// gets the null sink (§6): requirement 6 is that soundd always runs and always
+/// accepts streams, and it does not except itself from that when the surprise
+/// is a device rather than an absence. Silence a client can play into beats a
+/// dead daemon whose every connect is refused for the machine's lifetime.
+enum Shape {
+    /// A pipeline of one has no depth: `min_drain_nanos` is zero, so §5.9's
+    /// drain count could not tell a stall from ordinary operation.
+    Shallow(usize),
+    /// Deeper than [`MAX_PIPELINE`].
+    Deep(usize),
+    /// `slot_count` is the pipeline depth and the client ring's indices are
+    /// free-running mod 2^32 (§3), so the depth has to divide that evenly.
+    Uneven(usize),
+    /// The mixer converts mono and stereo, and nothing else.
+    Channels(u16),
+    /// A period that is not a whole number of frames — including a period of
+    /// no bytes at all, which would divide by zero on the way to the frame
+    /// count.
+    PartialFrame { period_bytes: usize, frame_bytes: usize },
+}
+
+impl core::fmt::Display for Shape {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Shape::Shallow(n) => write!(f, "a {n}-period pipeline has no depth to drain"),
+            Shape::Deep(n) => write!(f, "{n} periods is deeper than the {MAX_PIPELINE} a free list holds"),
+            Shape::Uneven(n) => write!(f, "{n} periods is not a power of two, and a client ring's indices wrap mod 2^32"),
+            Shape::Channels(c) => write!(f, "{c} channels is neither mono nor stereo"),
+            Shape::PartialFrame { period_bytes, frame_bytes } => {
+                write!(f, "a {period_bytes}-byte period is not a whole number of {frame_bytes}-byte frames")
+            }
+        }
+    }
+}
+
+/// The frames in one device period, or why soundd cannot serve this device.
+///
+/// The arithmetic that could fault lives inside the check, so no caller can
+/// perform it before asking.
+fn period_frames(
+    num_buffers: usize,
+    device_channels: u16,
+    device_period_bytes: usize,
+) -> Result<usize, Shape> {
+    if num_buffers < 2 {
+        return Err(Shape::Shallow(num_buffers));
+    }
+    if num_buffers > MAX_PIPELINE {
+        return Err(Shape::Deep(num_buffers));
+    }
+    if !num_buffers.is_power_of_two() {
+        return Err(Shape::Uneven(num_buffers));
+    }
+    if device_channels != 1 && device_channels != 2 {
+        return Err(Shape::Channels(device_channels));
+    }
+    let frame_bytes = device_channels as usize * 2;
+    if device_period_bytes == 0 || device_period_bytes % frame_bytes != 0 {
+        return Err(Shape::PartialFrame { period_bytes: device_period_bytes, frame_bytes });
+    }
+    Ok(device_period_bytes / frame_bytes)
+}
+
 fn mix_thread(
     backend: &mut dyn Backend,
     cmd_ring: &CommandRing,
@@ -881,15 +979,7 @@ fn mix_thread(
     // part-played, so more than `(num_buffers - 1)` periods of audio are still
     // unplayed at that instant. See the drain count site.
     let min_drain_nanos = (num_buffers as u64 - 1) * period_nanos;
-    // How much unplayed audio must still be on the wire before the mix loop may
-    // defer a buffer for a client that is mid-refill (§5.10). Policy, not
-    // physics, with the same standing as the kernel's `MAX_USER_STR`: of the
-    // pipeline's 8 periods, soundd spends at most 3 waiting for a client and
-    // always keeps 5 in reserve. It cannot be derived from worst-case wake
-    // lateness — the recorded worst exceeds two whole pipelines, so no floor
-    // inside the pipeline covers it. Move it only with a full re-baseline.
-    assert!(num_buffers > 5, "soundd: pipeline too shallow to defer safely");
-    let refill_floor_nanos = 5 * period_nanos;
+    let refill_floor_nanos = deferral_floor_nanos(num_buffers, period_nanos);
 
     let mut streams: Vec<ClientStream> = Vec::new();
     // Boot starts SUSPENDED (§5.8): every buffer free, nothing submitted, the
@@ -1212,8 +1302,12 @@ fn mix_thread(
             // engine wanted it either way.
             let now = syscall::clock_nanos();
             let mid_refill = pipeline == Pipeline::Queue
+                && refill_floor_nanos.is_some()
                 && streams.iter().any(|s| s.is_streaming() && s.slot_reader.peek().is_none());
-            if mid_refill && playout_until_ns.saturating_sub(now) >= refill_floor_nanos {
+            if mid_refill
+                && refill_floor_nanos
+                    .is_some_and(|floor| playout_until_ns.saturating_sub(now) >= floor)
+            {
                 deferred |= 1 << idx;
                 stats.deferred += 1;
                 continue;
@@ -1836,12 +1930,18 @@ fn run_with_device(
     device_channels: u16,
     device_period_bytes: usize,
 ) {
-    let device_period_frames = device_period_bytes / (device_channels as usize * 2);
-
-    assert!(device_channels == 1 || device_channels == 2,
-        "soundd: unsupported device channel count {device_channels}");
-    // Ring indices wrap mod 2^32, so slot_count must divide it evenly.
-    assert!(num_buffers.is_power_of_two(), "soundd: num_buffers must be a power of two");
+    // A shape this mixer cannot render is named and the machine gets the null
+    // sink, which is what §6 is for. It is checked before any arithmetic
+    // derives anything from it — a zero channel count divides by zero on the
+    // way to a frame count, which is a panic that names neither the device nor
+    // the reason.
+    let device_period_frames = match period_frames(num_buffers, device_channels, device_period_bytes) {
+        Ok(frames) => frames,
+        Err(why) => {
+            say!("soundd: this audio device's shape cannot carry audio: {why}");
+            return run_null_sink(acceptor);
+        }
+    };
 
     // Client ring depth matches the DMA pipeline depth: a wake gap can free
     // at most num_buffers periods, so a full client ring always covers it.
@@ -1962,5 +2062,58 @@ mod tests {
         // Dither may not push an in-range sample past a rail either.
         assert_eq!(quantize(-1.0, -1.0), i16::MIN);
         assert_eq!(quantize(1.0, 1.0), i16::MAX);
+    }
+
+    /// One period of the shipped 44100 Hz stereo device, in nanoseconds.
+    const PERIOD_NS: u64 = 2_902_494;
+
+    /// §4's shallow-pipeline clause: *on a pipeline of five or fewer buffers
+    /// the deferral policy is disabled and every free buffer is mixed
+    /// immediately*. It was an `assert!(num_buffers > 5)` — a startup panic —
+    /// for as long as the spec said this.
+    #[test]
+    fn a_pipeline_with_nothing_to_reserve_disables_deferral() {
+        for shallow in 1..=DEFERRAL_RESERVE {
+            assert_eq!(
+                deferral_floor_nanos(shallow, PERIOD_NS),
+                None,
+                "a {shallow}-period pipeline has no {DEFERRAL_RESERVE} periods to keep back, \
+                 so there is no floor to defer above"
+            );
+        }
+    }
+
+    /// The other side of the same rule, and the number gate A's baseline was
+    /// recorded against: eight periods, five held.
+    #[test]
+    fn the_shipped_pipeline_keeps_five_periods_in_reserve() {
+        assert_eq!(deferral_floor_nanos(8, PERIOD_NS), Some(5 * PERIOD_NS));
+        assert_eq!(deferral_floor_nanos(6, PERIOD_NS), Some(5 * PERIOD_NS));
+    }
+
+    /// Both shipped devices — virtio-sound and HDA — present the same shape,
+    /// and it is served rather than refused. A refusal here would put every
+    /// machine on the null sink.
+    #[test]
+    fn the_shipped_device_shape_is_served() {
+        assert!(matches!(period_frames(8, 2, 512), Ok(128)));
+    }
+
+    /// Every constraint the mix loop imposes is refused by name rather than by
+    /// a panic, and the arithmetic that would fault never runs: a zero channel
+    /// count used to divide by zero one line before the assert that was
+    /// supposed to catch it.
+    #[test]
+    fn a_shape_the_mixer_cannot_render_is_refused_and_nothing_divides_by_zero() {
+        assert!(matches!(period_frames(1, 2, 512), Err(Shape::Shallow(1))));
+        assert!(matches!(period_frames(32, 2, 512), Err(Shape::Deep(32))));
+        assert!(matches!(period_frames(6, 2, 512), Err(Shape::Uneven(6))));
+        assert!(matches!(period_frames(8, 0, 512), Err(Shape::Channels(0))));
+        assert!(matches!(period_frames(8, 6, 512), Err(Shape::Channels(6))));
+        assert!(matches!(period_frames(8, 2, 0), Err(Shape::PartialFrame { .. })));
+        assert!(matches!(period_frames(8, 2, 513), Err(Shape::PartialFrame { .. })));
+        // A shape the free list *can* hold, which is what makes the ceiling a
+        // ceiling rather than a refusal of everything unusual.
+        assert!(matches!(period_frames(16, 1, 512), Ok(256)));
     }
 }
