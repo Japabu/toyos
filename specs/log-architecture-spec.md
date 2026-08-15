@@ -1702,10 +1702,17 @@ is exactly what `println!` does — `LineWriter` issues `flush_buf()` and then
 `inner.write(rest)`, two syscalls per line. **The fix is in the kernel and it is
 per holder**: `ConsoleObject` (the endowment spec's fourteenth `KObjectRef`
 variant, §1.5) gains a line buffer. A write accumulates until `\n` and emits
-whole lines under the backend lock. `MAX_CONSOLE_LINE` is 1024 — today's
-`SW_BUF_SIZE` — and a longer line is emitted in `MAX_CONSOLE_LINE` chunks with
-the count of the split said out loud, because a bound whose overrun is silent is
-the defect this replaces.
+whole lines under the backend lock. `MAX_CONSOLE_LINE` is 1024 — what
+`SW_BUF_SIZE` was — and a longer line is emitted in `MAX_CONSOLE_LINE` chunks
+with the count of the split said out loud, because a bound whose overrun is
+silent is the defect this replaces.
+
+**The constant lands at L3 rather than at L5, and it lands as an interrupt
+latency before it lands as a line bound.** `serial::write_console` holds
+`BackendGuard` for one `MAX_CONSOLE_LINE` at a time (§8.1), because the guard
+masks interrupts and a userland `write` has no length. L5's buffer then sits in
+front of a path whose unit is already the same number, so the line it hands down
+is one acquisition and nothing about the bound has to change hands.
 
 **"Per holder" is load-bearing and the first draft of this paragraph said "per
 handle" and then put the buffer on the shared object.** A buffer on one shared
@@ -2335,10 +2342,38 @@ today, and L3 deletes both `SerialWriter` and the ring underneath it while L5 is
 what adds `ConsoleObject`'s line buffer. Between them userland console output has
 no path at all, which breaks §10's "every chunk builds, boots and passes
 `cargo test`". So **L3 re-points that arm straight at `BackendGuard`** — one
-acquisition per `write`, ANSI-stripped, no buffering — and L5 puts the line buffer
-in front of it. That is not a detour: it makes `console-unbuffered` (§9.4)
-literally L3's own state, so the negative control is a real prior build rather
-than an invented one.
+acquisition per `MAX_CONSOLE_LINE` of output, ANSI-stripped, no buffering — and
+L5 puts the line buffer in front of it. That is not a detour: it makes
+`console-unbuffered` (§9.4) literally L3's own state, so the negative control is
+a real prior build rather than an invented one.
+
+**"Per `MAX_CONSOLE_LINE`" and not "per `write`", and the difference is a
+defect this section carried until 2026-08-15.** The arm as first built took the
+guard once around the whole call — and `BackendGuard` is `cli` plus a global
+spinlock with the device write *inside* it, while `SYS_WRITE` puts no cap on
+its buffer (`arch/syscall.rs`'s `user_bytes` is unbounded) and a 16550 pays a
+100,000-iteration THRE spin per byte. So the length of an interrupts-off window
+in this kernel was a userland argument, taken under `with_fd_owner_data`'s
+per-process lock, on a path where the byte ring it replaced had held no backend
+lock at all. That is precisely the holder `kernel/CLAUDE.md`'s `BackendGuard`
+caveat refuses and this file's own module header forbids, and the drain three
+paragraphs of §4.3 above bounds itself to eight records for the same reason.
+`write_console` therefore stages output in a `MAX_CONSOLE_LINE` buffer and takes
+the guard per flush.
+
+**What that costs, stated rather than left to be discovered.** A write whose
+*stripped* output exceeds 1024 bytes can now interleave with another producer at
+that boundary, where before it could not — so the atomicity claim is "whole up
+to `MAX_CONSOLE_LINE`", which is exactly the claim §4.4 already makes for the
+finished design: a line longer than the bound is emitted in pieces of it there
+too. Nothing that is whole after L5 is splittable now. `console_line_atomicity`
+(§9.5) writes 200-byte lines and is unaffected; the three C tests that compare
+whole stdout are line-oriented and far inside the bound. The re-acquisition is
+`ceil(n/1024)` uncontended `cli`/`compare_exchange_weak`/`popfq` triples instead
+of one, against a device write per kilobyte that is orders of magnitude dearer.
+The CSI stripper's state and the staging buffer both outlive every guard, so a
+sequence split by a flush is stripped exactly as one that is not — the same
+property the user-side 256-byte chunking already needed.
 
 **And it is not optional in the way "or L3 does not build" suggests — it is what
 makes L3 *pass*.** Built with the arm left on the byte ring, a full suite reds

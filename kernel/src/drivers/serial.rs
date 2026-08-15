@@ -11,8 +11,12 @@
 //! atomic by anything downstream of them.
 //!
 //! [`BackendGuard`] is CLI plus a global spinlock, so an interrupts-off window
-//! is one unit long. The slow I/O happens inside it, which is why the unit is
-//! bounded and why nothing that holds a kernel lock formats here.
+//! is one unit long. The slow I/O happens inside it, which is why **every unit
+//! is bounded and no holder may take its length from userland** — a rendered
+//! record is one 1 KiB `LogRecord`, the drain takes eight of them, the panic
+//! report is a fixed buffer, and a `write` of arbitrary length is cut into
+//! [`MAX_CONSOLE_LINE`] pieces by [`write_console`]. Nothing that holds a
+//! kernel lock formats here.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use crate::arch::cpu::{inb, outb};
@@ -296,22 +300,46 @@ pub fn flush_final() {
 
 /// A userland `write` to a console object.
 ///
-/// **One backend acquisition for the whole call, ANSI stripped, no buffering.**
-/// It replaced `SerialWriter::console()` and the lossless byte-ring append
-/// underneath it, whose unit of interleaving was a `write` syscall — and
+/// **One backend acquisition per [`MAX_CONSOLE_LINE`] of output, ANSI stripped,
+/// no buffering.** It replaced `SerialWriter::console()` and the lossless
+/// byte-ring append underneath it, whose unit of interleaving was a `write`
+/// syscall — and
 /// `specs/issues/diagnostics/serial-console-has-no-line-atomicity.md` has four
-/// recorded splices to show for it. Holding the guard for the call is what
-/// makes this write whole against a kernel record and against another process;
-/// what it does *not* fix is `println!` handing the kernel half a line at a
-/// time, which is L5's line buffer on `ConsoleObject` and not this function's.
+/// recorded splices to show for it. Taking the guard here is what makes this
+/// write whole against a kernel record and against another process; what it
+/// does *not* fix is `println!` handing the kernel half a line at a time, which
+/// is L5's line buffer on `ConsoleObject` and not this function's.
+///
+/// **The guard is taken and released per chunk, and the bound is the reason
+/// this function may be called with a userland length at all.** `BackendGuard`
+/// is `cli` plus a global spinlock and the device write happens inside it, so a
+/// single acquisition around the whole call would mask interrupts for a window
+/// userland chooses: `SYS_WRITE` puts no cap on its buffer, and a UART pays a
+/// [`THRE_SPIN_LIMIT`]-bounded spin *per byte* of it. That is the shape
+/// `kernel/CLAUDE.md`'s `BackendGuard` caveat refuses, and it is what the byte
+/// ring this replaced never did — it appended under its own short lock and
+/// something else drained.
+///
+/// **[`MAX_CONSOLE_LINE`] rather than a number invented here.** §4.4 of
+/// `specs/log-architecture-spec.md` bounds a console *line* by it and emits a
+/// longer one in pieces of it, so the interleaving unit this chunking creates
+/// is the same one the finished design already has: anything that will be whole
+/// after L5 is whole now, and nothing that is atomic today stops being so.
+/// The tradeoff is re-acquisition against latency — a write of `n` bytes now
+/// pays `ceil(n/1024)` `cli`/`compare_exchange_weak`/`popfq` triples instead of
+/// one, which is a handful of uncontended atomics against an interrupts-off
+/// window that was otherwise unbounded. Latency wins; the acquisitions are
+/// paid once per kilobyte of output and a kilobyte of output is already a
+/// device write two orders of magnitude more expensive.
 ///
 /// The bytes live in user memory, so they arrive a chunk at a time with the
 /// filter's state carried across: a CSI sequence straddling a chunk boundary
 /// must come out the same as one that does not, and a fresh filter per chunk
-/// would emit its head.
+/// would emit its head. That is true of the *output* chunking too — [`Csi`] and
+/// [`Stripped`] both outlive every guard this function takes, so a sequence
+/// split by a flush is stripped exactly as one that is not.
 pub fn write_console(src: &crate::user_ptr::UserBytes) {
-    let mut guard = BackendGuard::lock();
-    let mut out = Stripped { out: &mut guard, buf: [0; STRIP_CHUNK], len: 0 };
+    let mut out = Stripped { buf: [0; MAX_CONSOLE_LINE], len: 0 };
     let mut csi = Csi::Text;
     let mut chunk = [0u8; STRIP_CHUNK];
     let mut off = 0;
@@ -325,23 +353,36 @@ pub fn write_console(src: &crate::user_ptr::UserBytes) {
     out.flush();
 }
 
-/// How much of a user write is staged on the stack between backend writes.
+/// How much of a user write is copied out of user memory at a time.
 ///
 /// The same 256 the old user-memory reader used, for the same reason: a user
 /// window cannot be a slice, so it is copied in pieces, and this is one piece.
+/// It is **not** the backend's unit — [`MAX_CONSOLE_LINE`] is — because the
+/// filter can consume a whole piece and emit nothing.
 const STRIP_CHUNK: usize = 256;
 
-/// Bytes on their way to a held backend, buffered so that a per-byte filter
-/// does not become a per-byte device write.
-struct Stripped<'a> {
-    out: &'a mut BackendGuard,
-    buf: [u8; STRIP_CHUNK],
+/// The most that reaches the backend under one [`BackendGuard`], and therefore
+/// the longest interrupts-off window a userland `write` can buy.
+///
+/// §4.4's console-line bound, 1024, which is what `SerialWriter::SW_BUF_SIZE`
+/// was. L5's line buffer emits in pieces of the same size, so a whole line is
+/// still one acquisition then and is one now.
+const MAX_CONSOLE_LINE: usize = 1024;
+
+/// Bytes on their way to the backend, buffered so that a per-byte filter does
+/// not become a per-byte device write — and so that the guard is taken once per
+/// buffer rather than once per call.
+///
+/// It holds no guard of its own: [`Stripped::flush`] takes one, writes, and
+/// drops it, so between two chunks of one write interrupts are on.
+struct Stripped {
+    buf: [u8; MAX_CONSOLE_LINE],
     len: usize,
 }
 
-impl Stripped<'_> {
+impl Stripped {
     fn push_byte(&mut self, b: u8) {
-        if self.len == STRIP_CHUNK {
+        if self.len == MAX_CONSOLE_LINE {
             self.flush();
         }
         self.buf[self.len] = b;
@@ -350,7 +391,7 @@ impl Stripped<'_> {
 
     fn flush(&mut self) {
         if self.len > 0 {
-            self.out.write_raw(&self.buf[..self.len]);
+            BackendGuard::lock().write_raw(&self.buf[..self.len]);
             self.len = 0;
         }
     }
@@ -359,8 +400,9 @@ impl Stripped<'_> {
 /// Strips ANSI CSI sequences, so the backend never carries bytes it would drop.
 ///
 /// A state machine rather than an index walk because the bytes arrive 256 at a
-/// time out of a user window, and only a machine that survives the gap between
-/// two chunks gives the same answer as one that saw the write whole.
+/// time out of a user window and leave 1024 at a time under a guard taken for
+/// each, and only a machine that survives the gap between two chunks — either
+/// gap — gives the same answer as one that saw the write whole.
 enum Csi {
     Text,
     /// An ESC held back: it is only the start of a sequence if `[` follows, and
