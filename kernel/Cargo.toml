@@ -118,6 +118,5 @@ toyos-sched = { path = "../toyos-sched" }
 toyos-wallclock = { path = "../toyos-wallclock" }
 toyos-xhci = { path = "../toyos-xhci" }
 rustc-demangle = "0.1"
-elf = { version = "0.8", default-features = false }
 hashbrown = { version = "0.16", default-features = false, features = ["default-hasher"] }
 dlmalloc = { version = "0.2", default-features = false }

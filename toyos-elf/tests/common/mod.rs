@@ -197,13 +197,20 @@ pub fn rela(r_offset: u64, r_sym: u32, r_type: u32, r_addend: i64) -> [u8; 24] {
     out
 }
 
-/// One `Elf64_Sym`, as bytes.
+/// One `Elf64_Sym`, as bytes, with `st_size` zero.
 pub fn sym(st_name: u32, st_info: u8, st_shndx: u16, st_value: u64) -> [u8; 24] {
+    sym_sized(st_name, st_info, st_shndx, st_value, 0)
+}
+
+/// The same, carrying a size — which is what decides whether an address past a
+/// symbol's last byte still resolves to it.
+pub fn sym_sized(st_name: u32, st_info: u8, st_shndx: u16, st_value: u64, st_size: u64) -> [u8; 24] {
     let mut out = [0u8; 24];
     out[0..4].copy_from_slice(&st_name.to_le_bytes());
     out[4] = st_info;
     out[6..8].copy_from_slice(&st_shndx.to_le_bytes());
     out[8..16].copy_from_slice(&st_value.to_le_bytes());
+    out[16..24].copy_from_slice(&st_size.to_le_bytes());
     out
 }
 
