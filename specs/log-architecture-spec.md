@@ -1925,7 +1925,7 @@ deciding, which is the same capability move the pair already was.
 `one_console_holder`'s console clause are therefore not built.** `/bin/logd` is
 spawned by init like every other program and gets its own object from the same
 mechanism every program's stdio uses; a labelled endowment, a `ProgramConfig`
-field and a `cargo test --lib` clause over eleven manifests would all exist to
+field and a `cargo test --lib` clause over twelve manifests would all exist to
 arrange something the spawn path already arranges. §5.1's row loses `console =
 true`, and §9.5's gate keeps its other two clauses under a name that says what
 it checks (`every_boot_config_runs_logd`).
@@ -2010,14 +2010,15 @@ init already narrows and endows a `SysCap` duplicate for exactly that
 `#[serde(default)] bool` on `ProgramConfig` (`src/build.rs:44`) and on
 `toyos_manifest::Program`, **and it is struck** — §4.4 is why.
 
-### 5.1a Eleven manifests, and the two that exist for the machine this is all for
+### 5.1a Twelve manifests, and the two that exist for the machine this is all for
 
 **"The kernel never writes a file" means every boot configuration that does not
 run `logd` loses `/log` entirely.** That is not a corner: `logd` must be in the
 `[boot] start` of every image whose partition table carries a `TOYOS-LOG`, and
-root `CLAUDE.md` says every image does. **The first draft counted six and the
-tree has eleven** — **CONFIRMED** 2026-08-11, every one of them declaring a
-`[boot] start`:
+root `CLAUDE.md` says every image does. **The first draft counted six, the tree
+had eleven when this was walked on 2026-08-11, and it has twelve as built** —
+L6 adds `tests/logrotatecase/` for the rotation arm (§10). Every one of them
+declares a `[boot] start`:
 
 | manifest | `[boot] start` today | after |
 |---|---|---|
@@ -2032,12 +2033,13 @@ tree has eleven** — **CONFIRMED** 2026-08-11, every one of them declaring a
 | `tests/doommusiccase/system.toml` | soundd, test-runner | the same |
 | `tests/desktopcase/system.toml` | compositor, terminal | `logd` first; **no `test-runner` row**, so no `logread` |
 | `tests/desktopaudiocase/system.toml` | compositor, soundd, terminal | the same |
+| `tests/logrotatecase/system.toml` | **added at L6** | `logd --rotate-fast` and `test-runner`, for `kernel_log_file`'s rotation arm |
 
-**Two of the eleven have no `test-runner`**, which is why §3.2's "the gate that
-reads the log runs inside `test-runner` itself" is a statement about six configs
-and not about every image: the three `log_conservation_smp*` names and the rest of §9.5's cursor
-gates cannot run on `desktopcase` or `desktopaudiocase`, and nothing asks them
-to.
+**Two of the twelve have no `test-runner`**, which is why §3.2's "the gate that
+reads the log runs inside `test-runner` itself" is a statement about the other
+ten and not about every image: the three `log_conservation_smp*` names and the
+rest of §9.5's cursor gates cannot run on `desktopcase` or `desktopaudiocase`,
+and nothing asks them to.
 
 **The diagnostic boot is the one that would have been missed and the one that
 matters most.** `--diag-boot` exists for a T14 with no serial port; today the
@@ -2365,7 +2367,7 @@ every client's next write on slot 1 or 2 is `Gone`.
 | program | slots 0/1/2 | who made them |
 |---|---|---|
 | `/bin/init` | the kernel's first `Console` | `spawn_init` (`loader/mod.rs:912`), unchanged |
-| `/bin/logd` | the kernel's second `Console` | `spawn_init` mints it, init moves it, per the manifest (§4.4) |
+| `/bin/logd` | its own `Console`, minted at spawn | `build_child_handles`, like every other `[boot] start` program — **the second `spawn_init` console is not built and §4.4 says why**: a console per holder makes a labelled endowment for this one program unnecessary |
 | every `[boot] start` program | a pipe pair to logd, labelled with its manifest name | init: create the pipes, `SYS_HANDLE_SEND` the read ends to logd with a `Register`, endow the write ends as the child's slots |
 | a launched program | the same, from the launcher | the launcher holds a `log` connector |
 | an sshd session shell | the session's own pipes, as today | sshd already creates them |
@@ -2431,8 +2433,13 @@ are on the console only`. That is the honest outcome rather than a cost: the
 lines are not going to reach the stick, and the console is told why.
 
 That closes the entry. **Measured 2026-08-15**: `kernel_log_file` reads the
-volume after `run shutdown` and finds `Shutting down.` in it, on both arms — 11,896
-bytes on the shipped bound, and in part 5 of 5 with logd rotating at 256 bytes.
+volume after `run shutdown` and finds `Shutting down.` in it, on both arms —
+11,896 bytes on the shipped bound, and on the rotation arm **in part 5 of 5 in
+the boot that was sampled**. Both of those numbers are a sample and neither is a
+claim: which part the line lands in is how many records the machine emits while
+`SYS_SHUTDOWN` is waiting, divided by a 256-byte bound. The gate searches *every*
+part of the boot for the line and prints where it found it, which is why the
+figure moves between runs without meaning anything moved.
 
 ### 6.4 Panic
 
@@ -2807,10 +2814,13 @@ and it is the wrong trade here for three reasons.**
   buys fifteen lines.
 
 **What changes is that it becomes an assertion where it safely can.**
-`console_line_atomicity` and `logd_gone` assert `interleaved().is_none()` on
-their own captures, so a tree with the old coupling reintroduced reds on the
-detector as well as on the count — and the `console-unbuffered` actuator, which
-produces exactly kernel-into-userland splices, reds both. It does **not** become
+`console_line_atomicity` asserts `interleaved().is_none()` on its own capture,
+so a tree with the old coupling reintroduced reds on the detector as well as on
+the count — and the `console-unbuffered` actuator, which produces exactly
+kernel-into-userland splices, reds both. **`logd_gone` was named here as the
+second such caller and it is not built** (§9.5): init does not wait on logd's
+`Process` handle yet and the clause about a client that keeps printing is L7's,
+so that name arrives with L7 and takes this assertion with it. It does **not** become
 a suite-wide assertion, and the reason is concrete: `/bin/console` seeds its
 scrollback from `/log` and prints lines that legitimately contain `[kernel `,
 so `screen_console_shell` would red on correct behaviour. Suite-wide it stays a
@@ -2824,16 +2834,24 @@ reason `kernel/Cargo.toml` names the log at all.
 
 ### 8.2 `specs/issues/` this closes
 
-Slugs only, deliberately: `src/docs.rs`'s `every_named_issue_file_resolves` walks
-every text file in the tree and reds on a `specs/issues/<area>/<slug>.md` path
-that does not resolve, so a full path written here would red `cargo test --lib`
-the moment the file is deleted. **L8 must also de-path the citations elsewhere** —
-several of the entries below are cited by full path from the root `CLAUDE.md`,
-from `kernel/CLAUDE.md`, from `specs/introspection-plan.md` and from
-`specs/completion-architecture-spec.md`, and every one of those is a
-`cargo test --lib` red at L8. The `specs/issues/README.md` protocol says the
-durable rule moves into the spec that owns the subject; doing that is the same
-edit that removes the citation.
+Slugs only, deliberately — and **the reason is no longer a gate, which this
+paragraph claimed and which is the L5 review's F2.** `src/docs.rs` walked every
+text file in the tree and its `every_named_issue_file_resolves` red on a
+`specs/issues/<area>/<slug>.md` path that did not resolve; it and every test
+over `specs/` prose were **deleted by owner ruling** (`8d0db10`,
+`src/CLAUDE.md`). So a full path written here is not caught by
+`cargo test --lib` the moment the file is deleted — it is caught by a reader, or
+not at all. Slugs stay, because a slug cannot rot; what changed is that the
+discipline is prose and review rather than a test, and a spec that cites a
+deleted gate as its safety net is a spec telling the next agent not to look.
+
+**L8 must also de-path the citations elsewhere**, for the same reason and with
+nothing behind it but that: several of the entries below are cited by full path
+from the root `CLAUDE.md`, from `kernel/CLAUDE.md`, from
+`specs/introspection-plan.md` and from `specs/completion-architecture-spec.md`.
+The `specs/issues/README.md` protocol says the durable rule moves into the spec
+that owns the subject; doing that is the same edit that removes the citation,
+and `rg <slug>` is what finds the ones that are left.
 
 | slug | area | closed by | what makes the claim true |
 |---|---|---|---|
@@ -3347,11 +3365,12 @@ existing. Named rather than discovered at compl's C14.
   C10. So the gate is written to be **amended by the other branch as each of the
   two goes**, which is what a declared-set gate is for: each amendment is a diff
   a reviewer reads.
-- **`every_boot_config_runs_logd`** — a `cargo test --lib` gate over **all eleven
-  manifests** (§5.1a), reading the *parsed* `ProgramConfig` and never the file
-  text (§3.2): each with a `[boot] start` lists `logd` in it, and `logread`
-  appears in the `syscap` of `logd` and `test-runner` and nowhere else. A twelfth
-  manifest added later fails it by default. **It was `one_console_holder` and it
+- **`every_boot_config_runs_logd`** — a `cargo test --lib` gate over **all twelve
+  manifests** (§5.1a — eleven plus `tests/logrotatecase/`, which L6 adds),
+  reading the *parsed* `ProgramConfig` and never the file text (§3.2): each with
+  a `[boot] start` lists `logd` in it, and `logread` appears in the `syscap` of
+  `logd` and `test-runner` and nowhere else. A thirteenth manifest added later
+  fails it by default. **It was `one_console_holder` and it
   has lost its console clause**, because §4.4 as built mints a console per holder
   at spawn and there is no `console = true` key for it to count.
 - **`nmi_does_not_log`** — a grep gate, two clauses:
@@ -3489,9 +3508,9 @@ rebase, never amend.
 | **L3** | `drain_ordered`, with the first caller that streams; `Drain::{Inline,Thread}`; **the kernel-thread machinery for one thread** (§4.3) — trampoline, kernel-address-space `ProcessObject`, `driver::spawn`, dump naming, the recoverable-panic predicate with `klogd`'s non-recoverable row; `klogd`'s body and §2.6a's wake (`signal_after_commit`/`arm_waiter`, the IRQ-off `PreemptGuard` witness, `wake_direct`, the park-lot park); `panic_flush`/`flush_final` on records; `log_file::poll` re-pointed at a `drain_ordered` cursor so the file sink survives; **`object/ops.rs:469`'s console arm re-pointed straight at `BackendGuard`** (§8.1) so the chunk builds. **Delete `log_ring.rs` whole**, `SerialWriter`, `drain_serial` and the idle loop's serial statement; **delete the `:523` pre-`hlt` condition** | `kernel-loom/tests/log_wake.rs` (W3, with its negative case); `pre_idle_wedge_speaks`; the `--slow-usb` A/B unmoved (nothing about the disk has changed yet); the fence's A/B. **All three run and recorded in §9.6, 2026-08-15**; the fourth this column used to name, §9.6's `Drain::Inline` measurement, is not L3's and not this tree's — §9.6 says where it went |
 | **L4** | **Done 2026-08-15.** The kernel's half of L-ABI, which touches no sysroot source: the `SYS_LOG_READ` dispatch over `drain_ordered` (`kernel/src/log/user.rs`), `Source::Log` and its watcher static (§3.2), `logread` in `toyos_manifest`'s `SYSCAP_RIGHTS` and on `test-runner`'s row in the six test configs that have one. **Two things the row did not name and L4 found it owed**: `Rights::LOG` and `Rights::WAIT` on the one full-rights `SysCap` the kernel makes for `/bin/init` — rights only shrink, so a bit absent at the root is a bit no manifest can name — and `logread` being *two* bits, because `SYS_LOG_READ` never blocks and a holder that may read but not park has to spin. §9.1's storm and §9.2's nesting injection with it | `test-runner` reads its own kernel log and §9.1's conservation law holds across the syscall — `log_conservation_smp1`, `log_conservation_smp4` and `log_conservation_smp8`, and `log_nested_emit` — the registered names, which are three and not one (§9.5). §9.5 records what `log_migration_storm` measured and why it was struck |
 | **L5** | **Done 2026-08-15.** One `ConsoleObject` per *holder* over one backend and its line buffer — `build_child_handles` mints a child's rather than duplicating its parent's handle, which is what makes "per holder" literal before L7's pipes exist (§4.4); the ANSI strip and its state move onto the buffer; `MAX_CONSOLE_LINE` unchanged; `ConsoleObject::drop` flushes a process that exited mid-line. **Three things this row asked for are not built and §4.4 says why**: `Console` keeps `DUP` (stdio inheritance *is* a duplicate, so dropping it at L5 refuses every spawn — it dies with L7's pipes), and the second `spawn_init` console and the `console = true` manifest key are unnecessary once a holder's console is minted at spawn | `console_line_atomicity`, 0 of 2000 mixed with `Serial::interleaved` silent and a mid-line exit's hundred unterminated bytes on the wire whole; `console-unbuffered` reds it 8 of 8 and removing `ConsoleObject::drop`'s flush reds it 2 of 2 |
-| **L6** | **Done 2026-08-15.** `/bin/logd` (`userland/logd/`, three files): the program, its row in **all twelve** manifests (§5.1a — eleven plus `tests/logrotatecase/`, which L6 adds), `diag/`'s restated comment, rotation, retention, the give-up policy; **`SYS_FSYNC`'s device flush, outright** (§12.4); the §6.4 clamp, which was F3 — documented in the ABI and in §3.2 and implemented nowhere. **`log_file.rs` deleted whole**, with `flush_log_file_if_affordable`, `log_file_flush_due`, `LOG_DEFERRAL_CEILING_NS`, `LOG_DEFERRED_SINCE`, `owes_wake` and the fourth pre-`hlt` condition; `wait_for_log_file` re-pointed at `LOG_DURABLE_NS`; §6.3's shutdown, which reads the same word. **Four things this row asked for are not built and each says why**: §5.2's protocol has no caller before L7 and `serves = ["log"]` goes with it (§5.1); `Sync` is struck outright (§5.2, §6.3); §5.3's per-client backlog is a bound on clients logd does not have yet; and the two negative controls are deferred to L9 with their instruments (§9.4). **One thing it did not ask for and L6 owed**: `toyos-wallclock/`, because naming a file for local time in userland is a recovery problem with a provably ambiguous band (§5.5) | `kernel_log_file` re-pointed and green mid-run and after shutdown — **measured 2026-08-15**, 11,442 bytes on the device 19 ms after the ready marker with `Boot: complete` in them, 11,896 after the shutdown carrying its own last line, and the rotation arm four continuations into five parts with that line in part 5 of 5; `every_boot_config_runs_logd`; `usb_flush_optional` at `BOUND = 4` failing flushes against **1,737** for a logd that retried (§5.4); `toyos-wallclock`'s eight host tests |
+| **L6** | **Done 2026-08-15.** `/bin/logd` (`userland/logd/`, three files): the program, its row in **all twelve** manifests (§5.1a — eleven plus `tests/logrotatecase/`, which L6 adds), `diag/`'s restated comment, rotation, retention, the give-up policy; **`SYS_FSYNC`'s device flush, outright** (§12.4); the §6.4 clamp, which was F3 — documented in the ABI and in §3.2 and implemented nowhere. **`log_file.rs` deleted whole**, with `flush_log_file_if_affordable`, `log_file_flush_due`, `LOG_DEFERRAL_CEILING_NS`, `LOG_DEFERRED_SINCE`, `owes_wake` and the fourth pre-`hlt` condition; `wait_for_log_file` re-pointed at `LOG_DURABLE_NS`; §6.3's shutdown, which reads the same word. **Four things this row asked for are not built and each says why**: §5.2's protocol has no caller before L7 and `serves = ["log"]` goes with it (§5.1); `Sync` is struck outright (§5.2, §6.3); §5.3's per-client backlog is a bound on clients logd does not have yet; and the two negative controls are deferred to L9 with their instruments (§9.4). **One thing it did not ask for and L6 owed**: `toyos-wallclock/`, because naming a file for local time in userland is a recovery problem with a provably ambiguous band (§5.5) | `kernel_log_file` re-pointed and green mid-run and after shutdown — **measured 2026-08-15**, 11,442 bytes on the device 19 ms after the ready marker with `Boot: complete` in them, 11,896 after the shutdown carrying its own last line, and the rotation arm continuing into further parts with that line in one of them — four continuations into five parts, and the line in part 5 of 5, **in the boot that was sampled**: the gate searches every part and prints which, so both figures move between runs without anything having moved; `every_boot_config_runs_logd`; `usb_flush_optional` at `BOUND = 4` failing flushes against **1,737** for a logd that retried (§5.4); `toyos-wallclock`'s nine host tests, the ninth being the whole-domain scan that says `Recovery`'s third variant was a state no input reaches |
 | **L7** | userland stdio → IPC: init creates and registers the pipes; the launcher and sshd do the same for what they spawn; the std PAL's `Gone` behaviour; every console assertion in the suite re-pointed. **Three rows L6 handed forward**: `serves = ["log"]` on logd's manifest row and the `log` acceptor with it (§5.1), §5.2's `Register` frame and its `MAX_STREAM_LABEL`/`MAX_STREAMS` bounds, and §5.3's per-client backlog — each arrives with the first thing that sends or fills it, which is these pipes | full suite; the 234 `println!`/141 `eprintln!` sites unchanged and their output still on the console; `every_boot_config_runs_logd` gains its `serves` clause |
-| **L8** | the deletion commit; the `specs/issues/` closures of §8.2 **and the citations that go stale with them**; `specs/introspection-plan.md` re-based (§3.4); the three `MAX_CPUS` declarations filed as an issue; all five `CLAUDE.md` files. **`specs/completion-architecture-spec.md` is not in this tree** (**CONFIRMED**: it exists only on `wt/toyos-compl`, not on `origin/main`), so L8 cannot de-path its citations and `every_named_issue_file_resolves` will not see them — but it cites three of these slugs by full path and that becomes *its* C0's red, which §12.7 records so it is not discovered by CI | `cargo test --lib` — `every_named_issue_file_resolves` is the gate, not "it compiles" |
+| **L8** | the deletion commit; the `specs/issues/` closures of §8.2 **and the citations that go stale with them**; `specs/introspection-plan.md` re-based (§3.4); the three `MAX_CPUS` declarations filed as an issue; all five `CLAUDE.md` files. **`specs/completion-architecture-spec.md` is not in this tree** (**CONFIRMED**: it exists only on `wt/toyos-compl`, not on `origin/main`), so L8 cannot de-path its citations — and nothing will see them, because `src/docs.rs` is deleted (§12.7): it cites three of these slugs by full path and those pointers simply go quiet at that branch's C0, which §12.7 records because no gate will | `cargo test --lib` still has to pass, and **nothing in it checks a citation**: `src/docs.rs` and every test over `specs/` prose were deleted by owner ruling (`8d0db10`), so what gates this chunk is `rg <slug>` and a reviewer reading the diff (§8.2, §12.7) |
 | **L9** | measurement: the interleaved four-arm A/B (compl §20.1's protocol, ~68 min of guest time, two worktrees); `io-depth-probe`; the positive log-content assertion; assertions written into `tests/audio-baseline.toml` and the numbers into this spec. **And the two negative controls L6 deferred here**, `log-writes-the-file` and `log-trusts-durable`, because the first reds `io-depth-probe` and §9.3's reading 1 — instruments this chunk is what builds — and the second needs a publisher of a bad `durable` as well as a kernel that believes one (§9.4). **Plus §6.4's `usb-slow-device` measurement of `LOG_FILE_DRAIN_NANOS`**, which is the same instrument and the same worktree pair | §9.3 |
 | **L10** | **conditional on the owner (§6.6, §13.1)** — pstore: the reserved region, the panic copy, the boot validate, the `SYS_LOG_READ` flag, logd's `prev-crash` file, `pstore_survives_reset` over QMP, and the `specs/issues/` entry recording that the metal arm is owed | its own; a red here is not a red on L1–L9 |
 
@@ -3814,21 +3833,28 @@ this spec's favour — L0 checked the code rather than the plan, which is what i
 was for:**
 
 - **endow §1.5 says of `ConsoleObject` "there is exactly one of them for the
-  machine".** The code does not: `ConsoleObject::new()` mints a fresh object per
-  call (`object/device.rs:202`) and there is one call site. So "one *backend*,
-  one object per endowment" needs no edit to anything — only a second call
-  site, which §4.4 puts in `spawn_init`.
+  machine".** The code did not even then: `ConsoleObject::new()` mints a fresh
+  object per call and there was one call site. **As built there are two, and
+  neither is the one this bullet predicted**: `loader::mod`'s `spawn_init` for
+  init's, and `loader::start::build_child_handles` for *every* inherited console
+  slot — one object per **holder**, minted at spawn, rather than one per
+  endowment with a second `spawn_init` call for logd. §4.4 carries the argument
+  and the reason the predicted shape could not deliver its own gate.
 - **endow §1.5 gives `Console` `READ|WRITE|DUP|TRANSFER|WAIT`.** As built it is
-  `BASE | READ | WRITE` (`object/ops.rs:50`), and `BASE` carries `DUP`. §4.4
-  drops `DUP`, so "exactly two" is structural rather than gated. L5's edit, one
-  arm.
+  `BASE | READ | WRITE` in `initial_rights`, and `BASE` carries `DUP`. **This
+  bullet said L5 drops `DUP` and L5 keeps it**: stdio inheritance *is* a
+  duplicate — `build_child_handles` calls `duplicate_entry` on every slot pair —
+  so a `Console` without `DUP` refuses every spawn in the machine. The right
+  dies with its last caller, which is L7's pipes. §4.4 is where that was argued
+  and this row is what it corrects.
 
 Neither touches a syscall number or a struct layout.
 
 **And two programs this spec endows are not in the manifest it would endow them
-from** — `console` and `test-runner` are in `console/system.toml` and the three
-`tests/*case/system.toml` respectively, never in `system.toml`. §5.1a is the
-six-manifest table that follows from it.
+from** — `console` is in `console/system.toml` and `test-runner` in the
+`tests/*case/system.toml` configs, never in `system.toml`. That is what sent
+§5.1a looking, and **the table it found is twelve manifests rather than the six
+this sentence expected**; eight of the twelve carry a `test-runner` row.
 
 ### 12.6 Every completion primitive this branch does without
 
@@ -3851,10 +3877,17 @@ a spec that quietly drops a wrong claim teaches the next reader nothing.
 | a caller-side write `Deadline` (its §12.3) | the live 2 s `USB_TIMEOUT_NS` (`xhci/mod.rs:319`, **CONFIRMED**) gives logd an `Io` to act on | whatever C7 picks, **it must leave logd an error rather than an unbounded park** (§5.4) |
 | the write-back queue (its C12) | `SYS_FSYNC` gains the mount sync at L6 (§12.4) | C12 changes what `SYS_FSYNC` *costs*, never what it *guarantees* |
 
-### 12.7 One thing this branch breaks on the other branch, named so CI does not find it
+### 12.7 One thing this branch breaks on the other branch, named so nobody has to find it
 
-`src/docs.rs`'s `every_named_issue_file_resolves` walks every text file in the
-tree and reds on a `specs/issues/<area>/<slug>.md` path that does not resolve.
+**This section was written against a gate that no longer exists, which is the L5
+review's F2**, and the heading said "so CI does not find it". `src/docs.rs`'s
+`every_named_issue_file_resolves` walked every text file in the tree and red on
+a `specs/issues/<area>/<slug>.md` path that did not resolve; it and every test
+over `specs/` prose were deleted by owner ruling (`8d0db10`, `src/CLAUDE.md`).
+**CI will not find this — nobody will, until a reader follows the pointer**,
+which makes writing it down here the whole of the mechanism rather than an
+early warning about a red.
+
 L8 deletes ten entries (§8.2) and de-paths every citation **in this tree**.
 `specs/completion-architecture-spec.md` is not in this tree, and its §19 records
 that it cites `client-cpu-takes-the-log-flush` by full path in its own §1.3, that
@@ -3865,12 +3898,13 @@ path from files that are not their own entry.
 Its §19 concludes that *"§1.3's full-path citation therefore stays live through
 this branch and goes stale at log L8, not at C13."* **Under the ruled order that
 is backwards**: L8 lands first, so the citation is already dead when that branch
-merges `origin/main` at its C0, and `cargo test --lib` reds on its own spec file
-the moment it does. It is a one-line edit and it is in nobody's chunk budget, so
-it is written here: **the completion branch's C0 de-paths every citation of a
-slug this branch closed, in the same commit as the merge.** The
-`specs/issues/README.md` protocol — move the durable rule into the spec that owns
-the subject — is the same edit.
+merges `origin/main` at its C0, and it will point at nothing, quietly, for as
+long as nobody reads it. It is a one-line edit and it is in nobody's chunk
+budget, so it is written here: **the completion branch's C0 de-paths every
+citation of a slug this branch closed, in the same commit as the merge**, and
+`rg <slug>` over that tree is how it finds them. The `specs/issues/README.md`
+protocol — move the durable rule into the spec that owns the subject — is the
+same edit.
 
 ---
 
@@ -4050,11 +4084,16 @@ Recorded because each is attractive and the next reader will re-derive it.
     take and which deadlocks the first time anything on that lock's path logs.
     The narrower thing §2.6a takes instead is `wake_direct`, which the scheduler
     has had all along.
-12. **A syscall that mints a `ConsoleObject`.** It is the obvious way to give
-    `logd` the second one, and it hands every process a name it can ask the
+12. **A syscall that mints a `ConsoleObject`.** It is the obvious way to give a
+    program one of its own, and it hands every process a name it can ask the
     machine's console for — connect-by-name, rebuilt at the one object the
-    panic path depends on. `spawn_init` minting both is the same capability
-    moved by endowment, which is what §4.4 takes.
+    panic path depends on. **What §4.4 takes instead is the spawn path**:
+    `build_child_handles` mints a child's console for each inherited slot, so a
+    program gets one exactly when its parent's slot map says it does. That is
+    the same capability moved by endowment and not a name anything can ask for.
+    (This row used to say "`spawn_init` minting both", which was the shape
+    before L5 measured that one object shared by init, the compositor, soundd,
+    netd and `test-runner` could not pass §9.5's own gate.)
 8. **Converting all 654 `log!` sites to a finer level set.** A level with no
    reader is a field built for a plan; §2.1's three variants each have callers
    today.
