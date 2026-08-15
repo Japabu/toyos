@@ -1584,6 +1584,27 @@ pub fn is_kernel_line(line: &str) -> bool {
     line.starts_with("[kernel ")
 }
 
+/// File the userland half of one captured console line under `stdout`.
+///
+/// The kernel drains its own records straight to the backend rather than
+/// through any process's line buffer, so a record can follow bytes a program
+/// left unterminated and the host's splitter joins the two. Splitting the
+/// record back off is what has always let a `printf` with no newline reach a
+/// capture at all — and it is why `71_macro_empty_arg` passes most runs and
+/// not all: when the next writer is *userland* rather than the kernel there is
+/// no `[kernel ` to cut at. That half is `common::console`'s, on the boot
+/// config's own list of who else may speak; this is only the kernel's.
+fn push_user_half(line: &str, stdout: &mut String) {
+    if is_kernel_line(line) {
+        return;
+    }
+    match line.find("[kernel ") {
+        Some(idx) => stdout.push_str(&line[..idx]),
+        None => stdout.push_str(line),
+    }
+    stdout.push('\n');
+}
+
 /// The in-guest runner's end-of-test marker. Matched anywhere in the line, not
 /// as a prefix: the virtio-console is shared and not line-atomic, so a daemon
 /// mid-`println!` pushes the marker into the middle of its line. Anchoring on
@@ -2050,13 +2071,30 @@ impl QemuInstance {
                         if parts[0] != want {
                             continue;
                         }
-                        // Everything before the marker is a line some other
-                        // console writer was in the middle of when the runner
+                        // Everything before the marker is what some console
+                        // writer had said without a newline when the runner
                         // printed; it is still real output and the audio gate
                         // reads soundd's stats out of it.
+                        //
+                        // **And it goes to `stdout` as well, because the writer
+                        // is usually the test's own child.** A program whose
+                        // output does not end in a newline — `printf("%d", …)`
+                        // and nothing after it — has its last bytes flushed by
+                        // `ConsoleObject::drop` with no terminator, so the
+                        // runner's `===TEST_END` lands on the same line the
+                        // host's splitter builds. Filing that head under
+                        // `serial` alone is how `71_macro_empty_arg` came back
+                        // with an *empty* capture against an expected `17`,
+                        // which is the mirror image
+                        // `specs/issues/build/daemon-lines-land-in-any-test-window.md`
+                        // records and the half no filter over whole lines
+                        // reaches. Nothing is dropped either way; this only
+                        // stops the capture from losing its own tail.
                         if at > 0 && in_test {
-                            serial.push_str(&line[..at]);
+                            let head = &line[..at];
+                            serial.push_str(head);
                             serial.push('\n');
+                            push_user_half(head, &mut stdout);
                         }
                         let (exit_code, error) = if parts.len() > 1 {
                             if let Some(code_str) = parts[1].strip_prefix("exit=") {
@@ -2096,16 +2134,7 @@ impl QemuInstance {
                     } else if in_test {
                         serial.push_str(&line);
                         serial.push('\n');
-                        if is_kernel_line(&line) {
-                            // pure kernel line
-                        } else if let Some(idx) = line.find("[kernel ") {
-                            // user output with kernel suffix on same line
-                            stdout.push_str(&line[..idx]);
-                            stdout.push('\n');
-                        } else {
-                            stdout.push_str(&line);
-                            stdout.push('\n');
-                        }
+                        push_user_half(&line, &mut stdout);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => continue,

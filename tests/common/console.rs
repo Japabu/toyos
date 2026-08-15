@@ -247,6 +247,41 @@ fn speaker_of<'a>(line: &str, speakers: &'a BTreeSet<String>) -> Option<&'a str>
     speakers.get(head).map(String::as_str)
 }
 
+/// Where a daemon's whole line begins inside a captured line — which is not
+/// always at its front.
+///
+/// **The half of this defect that no prefix rule reaches, and it is not a
+/// splice.** L5's guarantee is about what the kernel emits: every *flush* is
+/// one holder's bytes. It says nothing about where a **newline** is, and the
+/// host's line splitter is `BufReader::lines()`. A program that writes without
+/// a trailing newline — `71_macro_empty_arg` is `printf("%d", …)` and nothing
+/// else — leaves `17` on the wire unterminated, and the next writer's whole
+/// line is appended to it by the splitter, not by the kernel. Measured on this
+/// tree, 2026-08-15: `17init: started test-runner` in one captured line, with
+/// `17` expected. The same shape joins the two halves of a line longer than
+/// `MAX_CONSOLE_LINE`, which the kernel does emit in pieces:
+/// `90_stdio_buffering` prints a 10,000-byte line against that 1024-byte bound
+/// and is the only case in the corpus that does.
+///
+/// So a daemon's unit is `<speaker>: …` up to the newline that ended it, and it
+/// can start anywhere in a captured line. Found by walking the colons rather
+/// than every offset, because `90_stdio_buffering`'s ten thousand `x`s hold
+/// none and a per-offset search would read them ten thousand times.
+fn speaker_at(line: &str, speakers: &BTreeSet<String>) -> Option<usize> {
+    for (colon, _) in line.match_indices(':') {
+        for name in speakers {
+            let Some(start) = colon.checked_sub(name.len()) else { continue };
+            if line.is_char_boundary(start)
+                && &line[start..colon] == name.as_str()
+                && speaker_of(&line[start..], speakers).is_some()
+            {
+                return Some(start);
+            }
+        }
+    }
+    None
+}
+
 /// What the C family concluded from one capture, and what it took out first.
 pub struct Verdict<'a> {
     /// Whole lines attributed to another process and removed before the
@@ -276,7 +311,9 @@ pub struct Verdict<'a> {
 /// Which is also why the filter cannot make a broken case pass: a tinycc case's
 /// output is decided by its source, so the only way `soundd: …` appears in one
 /// is that the source prints it — and then the `.expect` declares it, and the
-/// refusal below fires by name rather than the line being silently eaten.
+/// refusal below fires by name rather than the line being silently eaten. 0 of
+/// the 153 expectations contain such a substring anywhere, measured, and
+/// [`c_capture_ignores_daemon_lines`] re-measures it every run.
 pub fn verdict<'a>(
     stdout: &'a str,
     expected: &str,
@@ -285,18 +322,30 @@ pub fn verdict<'a>(
     let mut mine = String::new();
     let mut filtered = Vec::new();
     for line in stdout.lines() {
-        if speaker_of(line, speakers).is_some() {
-            filtered.push(line);
-        } else {
-            mine.push_str(line);
-            mine.push('\n');
+        match speaker_at(line, speakers) {
+            // **The newline this captured line ended with was the daemon's, so
+            // it is removed with the rest of that unit and no line break takes
+            // its place.** That is what puts a program's unterminated `17` back
+            // beside its own next bytes instead of leaving `17init: started
+            // test-runner`, and what rejoins the two halves of a line the
+            // kernel emitted in `MAX_CONSOLE_LINE` pieces. `Some(0)` — a
+            // daemon's line arriving on its own, the ordinary case — falls out
+            // of the same arm with an empty head.
+            Some(at) => {
+                mine.push_str(&line[..at]);
+                filtered.push(&line[at..]);
+            }
+            None => {
+                mine.push_str(line);
+                mine.push('\n');
+            }
         }
     }
 
     // The one thing this may never do: remove a line the case exists to print.
     // Refused by name — a filter that made an exception for such a case would
     // be a filter nobody could reason about afterwards.
-    if let Some(declared) = expected.lines().find(|l| speaker_of(l, speakers).is_some()) {
+    if let Some(declared) = expected.lines().find(|l| speaker_at(l, speakers).is_some()) {
         return Verdict {
             filtered,
             mismatch: Some(format!(
@@ -399,17 +448,21 @@ pub fn c_capture_ignores_daemon_lines(
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("read {}: {e}", path.display()))?;
         for line in text.lines() {
-            if let Some(who) = speaker_of(line, speakers) {
+            // `speaker_at` and not `speaker_of`: the removal reaches a daemon
+            // unit anywhere in a captured line, so the corpus has to be clear of
+            // one anywhere and not only at the front.
+            if let Some(at) = speaker_at(line, speakers) {
                 declaring.push(format!(
-                    "{}: {line:?} reads as {who}'s",
-                    path.file_name().unwrap_or_default().to_string_lossy()
+                    "{}: {:?} reads as another process's",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    &line[at..],
                 ));
             }
         }
     }
     if !declaring.is_empty() {
         return Err(format!(
-            "{} expectation(s) declare a line this filter would remove from the capture, so \
+            "{} expectation(s) contain text this comparison would remove from the capture, so \
              the case could never match its own output:\n{}",
             declaring.len(),
             declaring.join("\n"),
@@ -438,7 +491,7 @@ pub fn c_capture_ignores_daemon_lines(
         .filter(|l| !super::qemu::is_kernel_line(l))
         // The runner's own protocol, which is not a console writer's sentence.
         .filter(|l| !l.contains(super::qemu::DEFAULT_READY))
-        .filter(|l| speaker_of(l, speakers).is_none())
+        .filter(|l| speaker_at(l, speakers).is_none())
         .collect();
     if !unattributed.is_empty() {
         return Err(format!(
@@ -516,11 +569,69 @@ pub fn c_capture_ignores_daemon_lines(
         ));
     }
 
+    // Five. The half a whole-line rule cannot reach, staged as the captures the
+    // wire actually produced rather than as a guess about them. Both of these
+    // are transcribed from a run of this suite on 2026-08-15, and both are
+    // *one* captured line: the host splits on newlines, and the newline the
+    // program never wrote is the reason its bytes and somebody else's share a
+    // line at all.
+    let joined: &[(&str, &str, &str)] = &[
+        // `71_macro_empty_arg` is `printf("%d", …)` and nothing after it, so
+        // its `17` reaches the wire with no terminator and init's next whole
+        // line is appended to it by the splitter.
+        ("17init: started test-runner\n", "17", "the program's unterminated tail"),
+        // The other joiner, and the only case in the corpus that reaches it:
+        // `90_stdio_buffering` prints a line ten times `MAX_CONSOLE_LINE`, so
+        // the kernel does emit it in pieces and a daemon's line lands between
+        // two of them. The two halves have to come back as one line.
+        ("aaasoundd: suspended\nbbb\n", "aaabbb", "a line the kernel emitted in pieces"),
+        // And the ordinary case still has to work the ordinary way.
+        ("one\nsoundd: suspended\ntwo\n", "one\ntwo", "a daemon's line between two of the program's"),
+    ];
+    for (capture, want, what) in joined {
+        let got = verdict(capture, want, speakers);
+        if let Some(mismatch) = &got.mismatch {
+            return Err(format!(
+                "{what}: the capture {capture:?} does not read back as {want:?}\n{mismatch}"
+            ));
+        }
+        if got.filtered.is_empty() {
+            return Err(format!(
+                "{what}: {capture:?} matched {want:?} while removing nothing, so the two were \
+                 equal already and this row proves nothing"
+            ));
+        }
+        // The control, per row: without the speakers there is nothing to
+        // remove and each of these must red.
+        if verdict(capture, want, &BTreeSet::new()).mismatch.is_none() {
+            return Err(format!(
+                "{what}: {capture:?} reads back as {want:?} with an empty speaker set too, so \
+                 this row is not testing the removal"
+            ));
+        }
+    }
+
+    // Six, end to end: the corpus case whose output has no trailing newline, on
+    // a real guest. It is `c_bins`' own binary and this boot carries it.
+    let unterminated = qemu.run_test("test_c_71_macro_empty_arg", CEILING);
+    if let Some(err) = &unterminated.error {
+        return Err(format!("running the unterminated case: {err}"));
+    }
+    let read_back = c_verdict(&unterminated.stdout, "17");
+    if let Some(mismatch) = &read_back.mismatch {
+        return Err(format!(
+            "a C program that wrote `17` and no newline did not read back as its own output — \
+             this is the capture losing its tail, whichever writer followed it:\n{mismatch}"
+        ));
+    }
+
     eprintln!(
         "  [console] {} speakers declared by tests/testcases/system.toml, {checked} \
          expectations clear of them, every userland line of the boot attributed; {IMPOSTOR:?} \
-         written inside a capture window and ignored, {MINE:?} kept; both controls red",
+         written inside a capture window and ignored, {MINE:?} kept, {} joined captures read \
+         back whole; every control red",
         speakers.len(),
+        joined.len(),
     );
     Ok(())
 }
