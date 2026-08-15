@@ -314,6 +314,46 @@ overlapping. **Both arms moved by ~4 ms between the two sessions with no code
 between them on the B side**, which is the whole reason this protocol is
 same-session and interleaved.
 
+### 1.4a L3's half, measured: the ring's deletion costs 4.4 ms of boot, and the 350 ms is not on this instrument
+
+**MEASURED 2026-08-15**, and it does not go the way this section's arithmetic
+implies, so the arithmetic is corrected here rather than left to be re-derived.
+
+Same protocol: interleaved A/B in one session, five reps per arm, alternating,
+the guest's own `Boot: complete (Nms)` as the instrument — read out of
+`i8042_absent`, which boots `Profile::Metal` twice per run and prints both
+stamps (`cargo test --test toyos-build -- --nightly i8042_absent`). The arms are
+this branch's two commits either side of the deletion, `b8457df` (byte ring
+alive) and `ee8369c` (byte ring gone), checked out whole so nothing but the
+kernel differs.
+
+| arm | with an i8042 | mean | without one | mean |
+|---|---|---|---|---|
+| byte ring alive (`b8457df`) | 257, 260, 259, 257, 260 | **258.6 ms** | 253, 256, 256, 257, 257 | **255.8 ms** |
+| records only (`ee8369c`) | 261, 262, 263, 264, 265 | **263.0 ms** | 259, 260, 260, 261, 261 | **260.2 ms** |
+
+**+4.4 ms, on both machine shapes, with the distributions not overlapping** (the
+ring's slowest boot is faster than the records' fastest, on both). It is a cost
+and it is named as one.
+
+**Why it is a cost and why that is not a contradiction.** `Boot: complete` is a
+measurement of the boot, and **the whole boot is `Drain::Inline`** — the phase
+in which this design explicitly *keeps* one locked RMW, `BackendGuard`'s CAS
+(§2.3). So the boot swaps `RingGuard`'s `compare_exchange_weak` for
+`BackendGuard`'s one for one, and adds what the ring existed to defer: a
+synchronous backend write per record. On metal-sim that is ~250 lines of
+per-byte `outb` to a 16550 that QEMU answers instantly, and 4.4 ms is what it
+costs. **The 350 ms this section is about is a producer-path RMW in steady
+state, which is `Drain::Thread`, and no boot-time instrument can see its
+removal.**
+
+**What it buys is the thing §4.1's second constraint asks for**, and that is
+measured too: a machine wedged in phase 3 puts 61 kernel lines on the console
+where it previously put none (§9.5's `pre_idle_wedge_speaks`). The trade was
+taken with the number in hand: 4.4 ms of boot against the tree's worst
+diagnostic hole. `Drain::Inline` is gated on `has_console()`, so a machine that
+cannot speak — the T14 as flashed — pays none of it.
+
 ---
 
 ## 2. The record and the ring
