@@ -809,7 +809,7 @@ fn check_geometry(log: &str, bytes: u64, lba: u32) -> Result<(), String> {
 /// SYNCHRONIZE CACHE (0x35) is optional in SBC and a great many USB flash
 /// drives answer ILLEGAL REQUEST / INVALID COMMAND OPERATION CODE. `msc_flush`
 /// read that as a failed flush; `FatFs::sync` logged the failure and returned
-/// `()`; the line it logged was new pending content in the ring `log_file` was
+/// `()`; the line it logged was new pending content in the shard `/bin/logd` was
 /// draining, and `Sink::flush` still said `Ok`, so the sink's disable path
 /// never ran. Every idle pass was then a file write, a FAT write and another
 /// SYNCHRONIZE CACHE on the stick the machine booted from, forever — and
@@ -907,8 +907,8 @@ fn optional_flush_keeps_the_log(
             ));
         }
     }
-    if log.contains("stops at") {
-        return Err(format!("the sink gave up on a stick that is working\n{log}"));
+    if log.contains("logd: /log has not answered") {
+        return Err(format!("logd gave up on a stick that is working\n{log}"));
     }
     if !on_device.contains("Boot: complete") {
         return Err(format!(
@@ -935,18 +935,40 @@ fn optional_flush_keeps_the_log(
     Ok(())
 }
 
-/// Boot with a stick whose flush genuinely fails. The sink says so once and
+/// Boot with a stick whose flush genuinely fails. The writer says so once and
 /// stops, rather than writing the device that just refused it.
+///
+/// **Re-pointed at `/bin/logd` at L6, and the policy it observes changed shape
+/// with the writer.** The kernel sink disabled itself on the *first* error,
+/// because the alternative from an idle loop was an error every pass. logd's
+/// give-up is a *duration* — `LOG_WRITE_BUDGET`, five seconds
+/// (`specs/log-architecture-spec.md` §5.4) — because a userland writer can
+/// afford to tell a stick that is busy apart from one that is gone, and a
+/// device that answers slowly under load is not a device to abandon.
+///
+/// The probes below are what make "and stops" a claim rather than an absence:
+/// each names a binary that is not there, so each commits a kernel record, so
+/// each is something logd would write if it had not given up. Twelve of them
+/// after the give-up and the failing-flush count still has to hold.
 fn failed_flush_stops_once(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
     const PARAMS: &[&str] = &["usb-flush-fails"];
+    /// Probes after the boot, each of which spawns a name that is not there and
+    /// so commits a kernel record logd would write if it were still writing.
+    const PROBES: usize = 12;
     /// A per-failure line, and the thing that has to stay bounded. Before the
     /// fix it is emitted by every pass of the idle loop for the life of the
-    /// boot; after it, once by the flush that gives up and once by the
+    /// boot. After it: one by the write that gives up, and one per mount by the
     /// shutdown's `sync_all`, which is the last caller left.
+    ///
+    /// **This is the number that caught the retry**, and it is worth saying what
+    /// it caught. A logd that retried inside `LOG_WRITE_BUDGET` measured
+    /// **1,737** failing flushes here, because the driver logs each failure, the
+    /// failure is a kernel record, and the record is something logd then tries
+    /// to write. The loop is in the coupling and not in either half.
     const BOUND: usize = 4;
 
     let mut qemu = QemuInstance::boot_with_options(
@@ -959,10 +981,15 @@ fn failed_flush_stops_once(
             ..Default::default()
         },
     );
-    let boot = qemu.boot_log().to_string();
-    // Long enough for a loop to be a loop: the flush runs from the idle loop,
-    // which on this machine goes round thousands of times a second.
-    std::thread::sleep(Duration::from_secs(2));
+    let mut boot = qemu.boot_log().to_string();
+    // Long enough for the give-up to be reachable, and *driven* rather than
+    // waited out: each probe names a binary that is not there, which commits a
+    // kernel record, which is what gives logd something to fail to write.
+    for i in 0..PROBES {
+        let _ = writeln!(qemu.stdin_mut(), "run flush-probe-{i}");
+        qemu.flush_stdin();
+        boot.push_str(&qemu.drain_serial(Duration::from_millis(500)));
+    }
     writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
     qemu.flush_stdin();
     let log = format!("{boot}{}", qemu.drain_serial(Duration::from_secs(20)));
@@ -976,14 +1003,14 @@ fn failed_flush_stops_once(
     if !log.contains("usb-storage: SCSI 0x35 failed, sense 0x04/0x44/0x00") {
         return Err(format!("the injected flush failure never reached the driver\n{log}"));
     }
-    // By step and not by code alone: the sink's four failure points all answer
-    // `SyscallError::Io` now, and the one this test stages is the sync rather
-    // than the append or the write-back ahead of it.
-    let gave_up = log.matches("log-file: the volume sync was refused").count();
+    // By step and not by code alone: logd names which of the two calls refused
+    // it, and the one this test stages is the sync rather than the append ahead
+    // of it.
+    let gave_up = log.matches("logd: /log has not answered (the sync").count();
     if gave_up != 1 {
         return Err(format!(
-            "the sink gave up {gave_up} times, wanted exactly one — a failed sync has to reach \
-             `Sink::flush` as an error\n{log}"
+            "logd gave up {gave_up} times, wanted exactly one — a failed `SYS_FSYNC` has to \
+             reach it as an error, and once it has given up it must not start again\n{log}"
         ));
     }
     let failures = log.matches("usb-storage: cache flush failed").count();
@@ -994,8 +1021,8 @@ fn failed_flush_stops_once(
         ));
     }
     eprintln!(
-        "  [usb] a flush the device refuses: {failures} failing flushes over a 2 s idle run, sink \
-         disabled once"
+        "  [usb] a flush the device refuses: {failures} failing flushes with {PROBES} probes \
+         after it, logd stopped once and never started again"
     );
     Ok(())
 }
@@ -2706,17 +2733,18 @@ pub fn usb_boot_stick_pulled(
     /// never carries on.
     const ANSWERED: usize = 8;
 
-    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+    // metalcase's machine shape with `/bin/logd` rotating at 256 bytes rather
+    // than a mebibyte, so the log writer is not just appending when the device
+    // goes: every few probes it creates a file, sweeps the volume, deletes the
+    // oldest and syncs the mount. That is FAT allocation and directory writes
+    // in flight at the moment of the pull, which is the state the owner's
+    // machine is in and the one a quiet idle desktop never reaches. It was a
+    // kernel parameter until L6 and is a manifest row now, because the writer
+    // is a userland program.
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/logrotatecase");
     let options = BootOptions {
         profile: Profile::Metal,
         qmp: true,
-        // Rotation at 256 bytes rather than a mebibyte, so the sink is not just
-        // appending when the device goes: every few probes it creates a file,
-        // sweeps the volume, deletes the oldest and syncs the mount. That is
-        // FAT allocation and directory writes in flight at the moment of the
-        // pull, which is the state the owner's machine is in and the one a
-        // quiet idle desktop never reaches.
-        kernel_params: &["log-rotate-fast"],
         // The T14's core count. How many CPUs are in the idle loop when the
         // device goes is the whole question on one hypothesis.
         smp: 8,
@@ -2744,11 +2772,11 @@ pub fn usb_boot_stick_pulled(
 
     // And it has to be writing to the stick, or the pull is a disconnect with
     // nothing in flight — which is not the state the owner's machine is in.
-    // The sink names the file it installed on `/log`, and that volume is on the
+    // `/bin/logd` names the file it opened on `/log`, and that volume is on the
     // device this test is about to take away.
-    if !console.contains("log-file: this boot's kernel log is /log/") {
+    if !console.contains("logd: this boot's kernel log is /log/") {
         return Err(format!(
-            "no log sink installed on /log, so the stick is not being written to and this gate \
+            "logd opened no file on /log, so the stick is not being written to and this gate \
              stages nothing:\n{console}"
         ));
     }
@@ -2769,11 +2797,11 @@ pub fn usb_boot_stick_pulled(
              drumbeat this gate measures does not work on a healthy machine:\n{console}"
         ));
     }
-    // The rotation actually ran, so "the sink was busy" is a fact rather than a
-    // parameter that might have been dropped.
-    if !console.contains("log-file: /log/") || !console.contains("and this boot continues in") {
+    // The rotation actually ran, so "the writer was busy" is a fact rather than
+    // a manifest row that might have been dropped.
+    if !console.contains("logd: /log/") || !console.contains("and this boot continues in") {
         return Err(format!(
-            "the log sink never rotated, so the pull below lands on a sink that is only \
+            "logd never rotated, so the pull below lands on a writer that is only \
              appending:\n{console}"
         ));
     }

@@ -242,9 +242,10 @@ adding conditions to the pre-`hlt` check — `driver.rs:523`, `:534`, `:552`,
 **(c) Userland console output shares the kernel's ring.**
 `object/ops.rs:470` → `SerialWriter::console` → `log_ring::write_chunk_blocking`,
 so the unit of interleaving is a `write` syscall.
-`specs/issues/diagnostics/serial-console-has-no-line-atomicity.md` has four
-recorded splices, one of which reds a landing gate on a documentation-only
-branch, and a measured **1 run in 10** for `desktop_audio_client` on CI.
+Two splices were recorded against it, one of which reds a landing gate on a
+documentation-only branch, and a measured **1 run in 10** for
+`desktop_audio_client` on CI. §4.4 keeps both measurements; the entry that held
+them is closed at L5.
 
 ### 1.3 Two things the code says about itself that are not true
 
@@ -1411,11 +1412,34 @@ pub fn log_read(
     once more, and park only if that read was empty. `Rights::WAIT` on the
     `SysCap` is what makes the poll expressible and `Rights::LOG` is what makes
     the read answerable, which is why `logread` grants both.
-  - **A machine with no console posts nothing at all**, because `klogd` does not
-    drain there and parks unarmed. Nothing reaches it at L4 — the gate's profile
-    has a console — and it becomes L6's the moment `/bin/logd` is the program
-    parking on it:
-    `specs/issues/diagnostics/a-console-less-machine-posts-no-log-readiness.md`.
+  - **A machine with no console posted nothing at all until L6**, because
+    `klogd` did not drain there and parked unarmed — so it never woke, so it
+    never reached the post, so the one machine shape this whole design exists
+    for told a reader nothing. Nothing reached it at L4, whose gate's profile
+    has a console; it became live the moment `/bin/logd` was the program parking
+    on it. **Closed by removing the premise rather than by a second post**:
+    `klogd` advances the drain position over records nothing can carry
+    (`log::console::discard_pending`), so `DRAINED.any_pending()` goes false as
+    it does with a console, `arm_waiter` is called unconditionally, and a commit
+    wakes the thread on every shape.
+    `specs/issues/diagnostics/a-console-less-machine-posts-no-log-readiness.md`
+    carries the argument and what it does not close.
+  - **A handle closing is not the log ending, and `ops::close` said it was.**
+    `read_source` maps every `SysCap` to `Source::Log`, and `close` handed that
+    to `io_uring::remove_fd`, which cancels across every ring in the machine —
+    right for a pipe whose other end has really gone, wrong for a stream no
+    handle owns. So any process closing any capability posted `-NotFound` into
+    every pending log poll there was, and `/bin/logd`'s whole loop is
+    read-then-park. `ops::ends_its_sources` is the fix, and the question is
+    asked of the *object*: `SysCap` and `Console` answer `false` because each is
+    one of many handles on a machine-wide facility, while a pipe end, a
+    connection, a port and a device claim each really do go away with their last
+    handle. `log_poll_outlives_a_close` (§9.5) is the gate and
+    `log-close-cancels-any-syscap` the control. **`Console` is in it for a
+    defect L5 would otherwise have introduced**: `read_source` answers
+    `Source::Keyboard` for a console, and after §4.4 every process has its own
+    console object, so one of them closing stdin would have cancelled the
+    compositor's key poll.
 
 **`MAX_LOG_SHARDS` is `MAX_CPUS`** and the cursor is **88 bytes** at the
 shipped 8 — `24 + 8 * MAX_LOG_SHARDS`, which `toyos-abi/src/log.rs` asserts. It
@@ -1443,14 +1467,19 @@ bits are on the one full-rights `SysCap` the kernel makes for `/bin/init`
 no manifest can name. It is not a `bool` key: `realtime` is gone and
 the table it became refuses a name it does not carry (§0.0).
 
-**Which manifest, and there are eleven of them.** `logread` is not one row in
-one file: `system.toml` gives it to `logd`; `console/system.toml` gives it to
-`console`; and the **six** test configs that carry a `test-runner` row
-(`tests/{metalcase,netcase,sshdcase,testcases,doomcase,doommusiccase}/system.toml`)
-give it to `test-runner`, which is the only manifest program in a test image.
-**CONFIRMED** 2026-08-11 — neither `console` nor `test-runner` is a `[programs]`
-key in the shipped `system.toml`, so §9.5's `one_console_holder` walks every
-manifest in the tree and not just the first. §5.1a is the whole table.
+**Which manifest, and there are twelve of them as built.** `logread` is not one
+row in one file. **As shipped at L6 it is on exactly two program names**:
+`logd`, in every one of the twelve configs, and `test-runner`, in the seven that
+carry one — the six that had a `test-runner` row plus `tests/logrotatecase`,
+which L6 added (§5.5). `/bin/console` does **not** hold it, and the draft above
+said it did: §5.1a is the argument, and it is this spec's own rule applied to
+its own row — a right with no caller is a capability handed out for a plan, and
+nothing in `/bin/console` reads a cursor. It seeds its scrollback from the
+previous boot's files and will keep doing so until something in it does.
+**CONFIRMED** 2026-08-15 — `every_boot_config_runs_logd` (§9.5) reads the parsed
+`ProgramConfig` of every config in `ALL_CONFIGS` and asserts both halves: every
+config with a `[boot] start` lists `logd`, and `logread` appears on `logd` and
+`test-runner` and nowhere else. §5.1a is the whole table.
 
 **And a test *binary* does not inherit it.** endow §6.7a: `test-runner` passes
 its whole **namespace** to every binary it spawns, and `logread` is not a
@@ -1818,9 +1847,18 @@ is exactly what `println!` does — `LineWriter` issues `flush_buf()` and then
 per holder**: `ConsoleObject` (the endowment spec's fourteenth `KObjectRef`
 variant, §1.5) gains a line buffer. A write accumulates until `\n` and emits
 whole lines under the backend lock. `MAX_CONSOLE_LINE` is 1024 — what
-`SW_BUF_SIZE` was — and a longer line is emitted in `MAX_CONSOLE_LINE` chunks
-with the count of the split said out loud, because a bound whose overrun is
-silent is the defect this replaces.
+`SW_BUF_SIZE` was — and a longer line is emitted in `MAX_CONSOLE_LINE` pieces.
+
+**As built at L5 the split is not announced, and this paragraph asked for it to
+be.** It said "with the count of the split said out loud, because a bound whose
+overrun is silent is the defect this replaces", and that is the *record's*
+argument rather than the console's: `elided` exists because a message the
+producer truncated is otherwise a lie about what was logged, while a line
+emitted in two pieces has lost nothing — every byte reaches the wire, in order,
+on the one backend. What the split costs is that another producer may get
+between the pieces, which §8.1 states in full, and a kernel line announcing it
+would itself be a line another producer could get inside. `write_console`'s
+chunking has had the same property since L3 and said nothing either.
 
 **The constant lands at L3 rather than at L5, and it lands as an interrupt
 latency before it lands as a line bound.** `serial::write_console` holds
@@ -1831,54 +1869,97 @@ is one acquisition and nothing about the bound has to change hands.
 
 **"Per holder" is load-bearing and the first draft of this paragraph said "per
 handle" and then put the buffer on the shared object.** A buffer on one shared
-object is one buffer that init and `logd` both accumulate into, and their two
+object is one buffer that two processes accumulate into, and their two
 half-lines splice inside the very mechanism that exists to stop splicing. So it
-is **one console *backend*, and one `ConsoleObject` per endowment**: the object
-is the line buffer plus a reference to the one backend, and the backend keeps
-`BackendGuard` as its only serialiser. `ConsoleObject::new()` already mints a
-fresh object per call (`object/device.rs:202`), so this is the shape the code
-has; what it does not have is a second call site.
+is **one console *backend*, and one `ConsoleObject` per holder**: the object is
+the line buffer plus a reference to the one backend, and the backend keeps
+`BackendGuard` as its only serialiser.
 
-**Why there must be two at all, which is a stronger reason than the buffer and
-is the one a future agent will otherwise miss.** **The panic path must not
-depend on `logd`.** If `logd` held the machine's only console object, a panic
-after `logd` had died or been killed would have nowhere to write — and on the
-T14 the panic console and its pager *are* the diagnostic story. The kernel keeps
-one so that path survives `logd`'s death; `logd` gets the other for ordinary
-logging. Two objects over one backend is therefore not a concession to the line
-buffer, and **anyone who arrives here and tries to unify them is removing the
-kernel's last independent way to speak.**
+**As built at L5, "per holder" is literal, and the shape this section had could
+not deliver its own gate.** It said two objects in the machine — init's and
+`logd`'s — with every other program still holding a handle to *init's* by
+inheritance until L7 replaces stdio with pipes. Between L5 and L7 that is one
+buffer shared by init, the compositor, soundd, netd and `test-runner`, which is
+exactly the arrangement the paragraph above rejects; `console_line_atomicity`
+(§9.5) is two ordinary processes and could not have been green under it. So
+`loader::start::build_child_handles` **mints a fresh `ConsoleObject` for each
+inherited console slot** rather than duplicating its parent's handle:
 
-**Where the second one comes from, and it needs no new syscall.** init can only
-endow what it holds, and nothing in userland can mint a `ConsoleObject` — so
-`spawn_init` (`loader/mod.rs:912`) mints **two**: the first fills slots 0/1/2 as
-it does today, the second is installed as a labelled endowment beside
-`SYSCAP_LABEL`, and init moves it into whichever program its manifest marks
-`console = true`. **"Exactly two in the machine" is then a property of
-`spawn_init`'s source** — there are two `ConsoleObject::new()` calls in the
-kernel and no way to reach a third — which is stronger than a manifest gate and
-is why `one_console_holder` (§9.5) is a second line rather than the only one. An
-image whose manifest marks nothing `console = true` leaves init holding the
-spare, which it closes; an image that marks two is refused by that gate at
-`cargo test --lib`, before any boot.
+- **Authority does not move.** A child gets a console exactly when the slot map
+  says it does, which is the rule that was already there, and
+  `duplicate_entry`'s rights check still refuses a handle without `DUP`.
+- **Aliasing does not move.** Two slots naming one parent object get one child
+  object, so a program whose stdout and stderr are the same console still writes
+  one stream.
+- **The last handle flushes.** `ConsoleObject::drop` emits whatever a process
+  that exited mid-line had said; a buffer that dropped it would be a way to lose
+  output rather than a way to keep it whole.
+
+**Why the kernel must not depend on `logd` to speak, which survives the change
+and is the reason a future agent must not undo it.** The panic path writes the
+**backend**, not an object: `panic_flush` takes `BackendGuard` and drains
+records itself. So a panic after `logd` has died or been killed has somewhere to
+write however many `ConsoleObject`s exist, including none. What the original
+"exactly two" bought — an independent channel for the dying machine — is bought
+more cheaply by the panic path never going through an object at all, and on the
+T14 the panel and its pager are the same story.
+
+**`Console` keeps `Rights::DUP` at L5, and dropping it is L7's.** This section
+said L5 drops it (`initial_rights` gives `BASE | READ | WRITE`, and `BASE` is
+`DUP | TRANSFER | WAIT` — `object/ops.rs:35`, `:50`), on the argument that
+nothing needs it after L7. That is true *after* L7 and false at L5: stdio
+inheritance **is** a duplicate — `build_child_handles` calls `duplicate_entry`
+on every slot-map pair — so a `Console` without `DUP` refuses every spawn in the
+machine. The right dies with its last caller, which is L7's pipes, and not
+before. Meanwhile `SYS_HANDLE_DUP` on a console gives one process a second
+handle to its *own* object and one buffer still holds the line, which is the
+property this section is about.
 
 **A syscall that mints a `ConsoleObject` was the other candidate and is
 rejected** (§14 row 12): it would let a process *name* its way to a console,
 which is the one thing the endowment architecture exists to make impossible.
+Minting one for a child at spawn is not that — it is the parent's slot map
+deciding, which is the same capability move the pair already was.
 
-**`Console` loses `Rights::DUP`** (`initial_rights` gives it `BASE | READ |
-WRITE`, and `BASE` is `DUP | TRANSFER | WAIT` — `object/ops.rs:35`, `:50`).
-`KObjectRef::Device` is the precedent, dropping `DUP` in the same match for the
-same reason. With `DUP` a third holder is a runtime
-`SYS_HANDLE_DUP` away and no manifest gate can see it; without it "exactly two"
-is a property of the object rather than something a test checks. Nothing needs it
-after L7 — every child gets pipes to `logd`, not a console — and init's three
-stdio slots are minted by `spawn_init`, which is inside the kernel and does not
-go through the right. **Unrepresentable beats checked**, and `one_console_holder`
-(§9.5) then guards the manifests as a second line rather than as the only one.
+**The second `spawn_init` console, the `console = true` manifest key and
+`one_console_holder`'s console clause are therefore not built.** `/bin/logd` is
+spawned by init like every other program and gets its own object from the same
+mechanism every program's stdio uses; a labelled endowment, a `ProgramConfig`
+field and a `cargo test --lib` clause over twelve manifests would all exist to
+arrange something the spawn path already arranges. §5.1's row loses `console =
+true`, and §9.5's gate keeps its other two clauses under a name that says what
+it checks (`every_boot_config_runs_logd`).
 
-There are exactly **two** `Console` endowments in the machine: `/bin/init`'s (it
-must be able to speak before `logd` exists) and `/bin/logd`'s.
+**The two reds this buffer retires, kept here because the issue file that held
+them closed with it.** `serial-console-has-no-line-atomicity` (diagnostics) was
+the write-up and it is deleted at L5 — **named as a slug and never as a path,
+here and in every other file that mentions it**, which is what §8.2's own rule
+says and what five citations in `kernel/`, `userland/` and `tests/` had to be
+corrected to. Its measurements move here rather than becoming pointers that
+miss. Both are a *splice*, one writer's line cut open by another's:
+
+- **`hda_tone`, dev host loaded, 1 of 3.** The needle
+  `soundd: hda codec0 vendor=1af4` split between `codec` and `0` by a kernel
+  record — `landing-1786130703-71774.log`, on a branch whose whole diff was one
+  spec file, so the audio path was not in it. Three suites in one session on one
+  tree, red on the third; the same test alone on a quiet host was 0 of 3 in that
+  session, which is the pair a contention red is read from.
+- **`desktop_audio_client`, CI, 1 of 10.** `soundd: client ` and `1 removed`
+  came back either side of the kernel's four `exit:` accounting lines, so the
+  test counted one removal of two and waited out its 300 s guard —
+  systematically, because soundd prints a client's removal exactly while the
+  kernel prints that client's exit. Probe-green run `31282019974` rep 10, and
+  run `31271983043` on `main`.
+
+Both are a kernel record landing inside a userland line, which is what a buffer
+per holder makes unrepresentable: the line reaches the backend whole, under one
+`BackendGuard`, and a record cannot be acquired in the middle of it.
+`console_line_atomicity` is what holds it — 0 of 2000 on the shipping kernel,
+and never 0 under `console-unbuffered`: **red 8 of 8, 2026-08-15, at counts from
+1 to 570 of 2000**. The magnitude is a race and only the sign is a verdict; §9.4
+says what the two clusters look like. The rows stay in the index as `Retired`,
+because a measurement that was taken is still a measurement and this is what took
+it off.
 
 The ANSI CSI strip that `SerialWriter` does today (`serial.rs:354`) moves onto
 the same path and keeps its reason: the backend must never carry bytes it would
@@ -1892,10 +1973,24 @@ drop.
 
 ```toml
 [programs.logd]
-serves = ["log"]
-syscap = ["logread"]     # Rights::LOG on a SysCap dup, §3.2
-console = true           # the second and last ConsoleObject, §4.4
+syscap = ["logread"]     # Rights::LOG | Rights::WAIT on a SysCap dup, §3.2
 ```
+
+**Two rows are struck and one is deferred, and as built the row is one line.**
+
+- **`console = true` is struck**, and §4.4 is the argument: logd's console
+  object is minted for it at spawn like every other program's, so a manifest key
+  and a labelled endowment would arrange something the spawn path already
+  arranges.
+- **`serves = ["log"]` is not built at L6, and it belongs to L7.** This section
+  left the question to §5.2 and §5.2 answers it: neither frame has a caller on
+  this tree. `Register` carries the read ends of a child's stdout and stderr
+  pipes and those pipes are L7's; `Sync` is struck outright (below). An acceptor
+  with no client is a port that exists for a plan, which is the same thing §5.1a
+  refuses `/bin/console` a `logread` for, and the argument does not get weaker
+  because the program in question is this one. **§10's L7 row is where it
+  arrives**, with the first `Register`, and `every_boot_config_runs_logd` does
+  not count it until then.
 
 It `receives` nothing. It claims no device. It cannot open a compositor
 connection, reach netd, or name a process. Its whole authority is: accept
@@ -1908,28 +2003,28 @@ endowment architecture's whole point is that every port exists before any server
 runs, so a client can connect before `logd` has executed an instruction — but
 because the sooner it runs the fewer boot records sit in a shard with no reader.
 
-**One new name and one new key**, and they are different mechanisms because the
-merged tree made them different. `logread` is a row in `SYSCAP_RIGHTS`
+**One new name and one new key were planned; the key is struck.** `logread` is a row in `SYSCAP_RIGHTS`
 (`toyos-manifest/src/lib.rs`) that a program asks for by name in `syscap`, and
 init already narrows and endows a `SysCap` duplicate for exactly that
 (`init/src/main.rs:527-539`) — nothing new is built. `console` is a
 `#[serde(default)] bool` on `ProgramConfig` (`src/build.rs:44`) and on
-`toyos_manifest::Program`, and what init does with it is §4.4's.
+`toyos_manifest::Program`, **and it is struck** — §4.4 is why.
 
-### 5.1a Eleven manifests, and the two that exist for the machine this is all for
+### 5.1a Twelve manifests, and the two that exist for the machine this is all for
 
 **"The kernel never writes a file" means every boot configuration that does not
 run `logd` loses `/log` entirely.** That is not a corner: `logd` must be in the
 `[boot] start` of every image whose partition table carries a `TOYOS-LOG`, and
-root `CLAUDE.md` says every image does. **The first draft counted six and the
-tree has eleven** — **CONFIRMED** 2026-08-11, every one of them declaring a
-`[boot] start`:
+root `CLAUDE.md` says every image does. **The first draft counted six, the tree
+had eleven when this was walked on 2026-08-11, and it has twelve as built** —
+L6 adds `tests/logrotatecase/` for the rotation arm (§10). Every one of them
+declares a `[boot] start`:
 
 | manifest | `[boot] start` today | after |
 |---|---|---|
 | `system.toml` | compositor, soundd, netd, filepicker | `logd` first |
 | `diag/system.toml` | toybox | **`logd` too** — see below |
-| `console/system.toml` | console | `logd` too, and `console` gains `logread` |
+| `console/system.toml` | console | `logd` too. **`console` does not gain `logread`** — see below |
 | `tests/metalcase/system.toml` | compositor, soundd, netd, sshd, test-runner | `logd` first; `test-runner` gains `logread` |
 | `tests/netcase/system.toml` | netd, test-runner | the same |
 | `tests/sshdcase/system.toml` | netd, sshd, test-runner | the same |
@@ -1938,12 +2033,13 @@ tree has eleven** — **CONFIRMED** 2026-08-11, every one of them declaring a
 | `tests/doommusiccase/system.toml` | soundd, test-runner | the same |
 | `tests/desktopcase/system.toml` | compositor, terminal | `logd` first; **no `test-runner` row**, so no `logread` |
 | `tests/desktopaudiocase/system.toml` | compositor, soundd, terminal | the same |
+| `tests/logrotatecase/system.toml` | **added at L6** | `logd --rotate-fast` and `test-runner`, for `kernel_log_file`'s rotation arm |
 
-**Two of the eleven have no `test-runner`**, which is why §3.2's "the gate that
-reads the log runs inside `test-runner` itself" is a statement about six configs
-and not about every image: `log_conservation` and the rest of §9.5's cursor
-gates cannot run on `desktopcase` or `desktopaudiocase`, and nothing asks them
-to.
+**Two of the twelve have no `test-runner`**, which is why §3.2's "the gate that
+reads the log runs inside `test-runner` itself" is a statement about the other
+ten and not about every image: the three `log_conservation_smp*` names and the
+rest of §9.5's cursor gates cannot run on `desktopcase` or `desktopaudiocase`,
+and nothing asks them to.
 
 **The diagnostic boot is the one that would have been missed and the one that
 matters most.** `--diag-boot` exists for a T14 with no serial port; today the
@@ -1956,48 +2052,73 @@ that claims the framebuffer, and it is not built into this image at all"* —
 argument survives verbatim. L6 edits that comment to say so, because a reader of
 `diag/system.toml` must be able to see why the second program is safe.
 
-**The console boot gains something it does not have today.** `/bin/console` seeds
-its scrollback from the newest `/log/*.log` files (`console/src/main.rs:44`,
-`:266`), which are the *previous* boot's; with `logread` it can show this boot's
-kernel records live, off the cursor, with no file in the path. Not required by
-anything here and not this spec's to build — named so L6 does not think
-`logread` on `console` is decoration. Its module doc's *"the kernel's log ring is
+**The console boot could gain something it does not have, and L6 does not give
+it.** `/bin/console` seeds its scrollback from the newest `/log/*.log` files
+(`console/src/main.rs:44`, `:266`), which are the *previous* boot's; with
+`logread` it could show this boot's kernel records live, off the cursor, with no
+file in the path. That is a program to write, and **a right with no caller is a
+capability handed out for a plan** — so `console/system.toml` gets `logd` and
+`/bin/console` gets no `syscap` row until something in it reads a cursor. §3.2's
+"`console/system.toml` gives it to `console`" is corrected to say so. Its module doc's *"the kernel's log ring is
 64 KiB (`kernel/src/drivers/log_ring.rs`)"* is a citation L3 deletes the subject
 of, so L3 rewrites it.
 
 **The gate.** `cargo test --lib`: every manifest that declares a `[boot] start`
-lists `logd`, and every manifest lists **at most** one program with
-`console = true` besides init's kernel-minted one — at most rather than exactly,
-because `spawn_init` mints the second object whether or not a manifest claims it
-and an image that leaves it unclaimed is a valid image with no `/log` (§5.6). A
-manifest added later fails the first clause by default, which is the direction
-that bound has to fail in.
+lists `logd`, and `logread` appears in the `syscap` of `logd` and `test-runner`
+and nowhere else. A manifest added later fails the first clause by default, which
+is the direction that bound has to fail in. The console clause this paragraph
+carried is gone with the key it counted (§4.4), and
+`every_boot_config_runs_logd` is the name (§9.5).
 
 ### 5.2 The protocol
 
-One port, two frame kinds, both over the ordinary IPC framing (`toyos::ipc`):
+One port, and it had two frame kinds. **`Sync` is struck; `Register` is L7's; so
+at L6 there is no port.**
 
 ```rust
 enum ToLogd {
     /// Sent by a spawner, carrying the read ends of the child's stdout and
     /// stderr pipes over SYS_HANDLE_SEND. logd polls them from then on.
+    /// **L7**, with the pipes it names.
     Register { label: [u8; MAX_STREAM_LABEL], pid: u32 },
-    /// A durability request. logd answers when the named records are on the
-    /// device. One caller: the shutdown path (§6.3).
-    Sync,
 }
 ```
 
+**`Sync` is struck, 2026-08-15, and the reason is who was going to send it.**
+§6.3 gave it one caller — the shutdown path — and that path is `SYS_SHUTDOWN`,
+which runs **in the kernel**. Building it would mean the kernel holding a
+connector to a userland server, in a namespace something had to grant it, so
+that it could ask a question and wait for an answer. That is the inversion this
+whole architecture exists to remove, and it would sit on the one path where the
+machine is least able to afford a round trip.
+
+Nothing is lost by striking it, because the answer already travels: `LogCursor`'s
+`durable` field goes userland-to-kernel on a call logd makes every loop, and
+`LOG_DURABLE_NS` is the kernel's running maximum of it (§6.4). So the shutdown
+reads a word. **The panic path and the shutdown path become one mechanism
+observed from two contexts** rather than two mechanisms that have to be kept
+agreeing — which is strictly better than what this section proposed, and is the
+argument for the strike rather than an excuse after it: `kernel/src/log/mod.rs`'s
+`wait_for_durable` and `apic::wait_for_log_file` differ in their bound and in
+whether they yield or spin, and in nothing else.
+
 `MAX_STREAM_LABEL` is 32 bytes. `MAX_STREAMS` is 64 and a 65th `Register` is
 `ResourceExhausted` with a line naming the label refused — a bound on the
-primitive, answering the caller, never a truncation.
+primitive, answering the caller, never a truncation. All three arrive at L7.
 
 **A server never blocks on a client**, which here means logd never blocks reading
 one stream while another has data: it uses `ipc::FrameRx` and an io_uring poll
 set over every registered pipe plus `Source::Log` (§3.2), exactly as the
-compositor and netd do.
+compositor and netd do. **At L6 the poll set is `Source::Log` alone**, which is
+the same loop with one member.
 
 ### 5.3 Back-pressure, per client
+
+**All of this arrives with the streams, at L7.** A per-client backlog is a bound
+on a client, and at L6 logd has no clients: it reads a cursor and writes a file,
+and the only producer it can be outrun by is the kernel — which is not a client
+and is handled by the shards dropping their oldest and counting them (§2.6).
+Written here as designed, unchanged, because L7 builds it.
 
 Per stream, logd holds a bounded in-memory queue (`MAX_STREAM_BACKLOG`, 64 KiB).
 Three states, and the client sees a different thing in each:
@@ -2042,11 +2163,37 @@ and it stays one afterwards.
 What happens when it expires, in order:
 
 1. logd stops feeding the volume.
-2. It writes one `alert!`-grade line to the console:
-   `logd: /log has not answered in 5s — this boot's log is on the console only`.
-3. It **keeps serving every client and keeps draining to the console.** It does
-   not exit, does not retry, and does not queue for a device that is not
-   answering. "I stop waiting for this stick and say so" is the whole policy.
+2. It writes one `alert!`-grade line to the console naming which call refused it
+   and where the log stops:
+   `logd: /log has not answered (the sync: …) — this boot's log is on the console only from /log/<file>`.
+3. It **keeps running.** It does not exit, does not retry, and does not queue for
+   a device that is not answering. "I stop waiting for this stick and say so" is
+   the whole policy.
+
+**What the budget bounds is slowness, and an *error* ends it at once. That split
+is measured rather than chosen, and it is the one correction L6 makes to this
+section.** The text above called it "a policy over repeated errors and a
+slow-but-answering device", and the first half of that does not survive contact
+with the tree: a failing write is itself logged by the driver
+(`usb-storage: cache flush failed on disk 0`), that line is a kernel record, and
+that record is something logd then tries to write — which fails, and logs. So
+retrying inside a budget does not sample a device that might recover; it runs a
+feedback loop whose gain is one. **Measured 2026-08-15 under `usb-flush-fails`:
+1,737 failing flushes in six seconds** with a retrying logd, against **3** with
+one that stops on the first error. The loop is in the coupling and not in either
+half of it, which is why neither the driver's line nor logd's retry is wrong on
+its own.
+
+So `LOG_WRITE_BUDGET` keeps its value and gets the narrower job: a write that
+*succeeded* and took longer than five seconds is a volume this program stops
+waiting for. That is the case the transport's own 2 s per transfer cannot answer
+— a device answering every transfer, slowly, forever — and it is the one the
+number was always described against. An error is the other case and needs no
+duration: `kernel/src/log_file.rs` disabled its sink on the first one, and the
+reason turns out to be this rather than an idle loop's convenience.
+`usb_flush_optional` is the gate, at `BOUND = 4` failing flushes, and its
+twelve probes after the give-up are what make "and does not start again" a claim
+rather than an absence.
 
 **Under the ruled order this needs nothing new from the transport, and the
 requirement inverts into an obligation on the other branch.** The first draft
@@ -2099,10 +2246,48 @@ belongs:
 | constant | today | after |
 |---|---|---|
 | `MAX_LOG_FILES` | 16 (`log_file.rs:129`) | 16, in logd |
-| `MAX_LOG_BYTES` | 1 MiB, 256 B under the `log-rotate-fast` boot parameter | the same, and the fast value becomes a logd argument rather than a kernel actuator |
+| `MAX_LOG_BYTES` | 1 MiB, 256 B under the `log-rotate-fast` boot parameter | the same, and the fast value becomes a logd argument — **which makes it a manifest row**: `tests/logrotatecase/system.toml` is metalcase's machine shape with `args = ["--rotate-fast"]` on logd, and the actuator is deleted. The arming moves from a global the kernel parses to a config an image is built from, which is the capability-shaped answer; both callers of the old parameter (`kernel_log_file`'s second arm and `usb_boot_stick_pulled`) boot it |
 | `MAX_LOG_PARTS` | 9999 | 9999 |
-| naming | `<wallclock>.log`, `unknown-NN.log`, `_0002` continuations | identical, so a stick from before this change and one from after sort together |
+| naming | `<wallclock>.log`, `unknown-NN.log`, `_0002` continuations | identical, so a stick from before this change and one from after sort together — **and getting a local wall clock in userland is its own problem, below** |
 | `classify` | strict; anything unrecognised is somebody else's file and never deleted | identical, and now it is *more* necessary: `/log` is userland-writable and logd is userland |
+
+**The local wall clock, recovered rather than asked for, and the band it
+refuses.** The kernel named files from `clock::local_secs()`. Userland has two
+calls and neither is that: `SYS_CLOCK_EPOCH` is UTC seconds — a full instant in
+the wrong zone — and `SYS_CLOCK_REALTIME` is local `h:m:s` with no date. The
+offset is the difference of the two readings' seconds-of-day, taken inside a
+bracket (epoch, local, epoch again, retried while the two epoch reads differ) so
+the subtraction is exact rather than approximately right.
+
+**That pins the offset modulo 24 hours, and the real range of zone offsets is 26
+hours wide** — UTC−12:00 to UTC+14:00 — so the recovery is unique everywhere
+except a two-hour band:
+
+- `off ∈ [0h, 12h)`: the other candidate is west of UTC−12:00. **Unique.**
+- `off ∈ (14h, 24h)`: `off` itself is east of UTC+14:00. **Unique.**
+- `off ∈ [12h, 14h]`: **both candidates are real zones, a day apart.** +12 against
+  −12, +13 (Tonga) against −11 (Samoa), +14 (Kiribati) against −10 (Hawaii).
+  One pair of readings, two local dates.
+
+**The band is refused by name and takes the `unknown-NN` name the format already
+has.** A file claiming a date this program cannot establish is worse than one
+saying it has none, which is the rule `UNDATED_STEM` was written under in the
+first place. Guessing would be wrong for half the machines in the band and wrong
+by a whole day.
+
+**No new syscall, and that was the owner-delegated ruling.** The clean fix is one
+field — `SYS_CLOCK_REALTIME` answering a full civil date, or a call handing back
+the `UTC_OFFSET_SECS` the kernel already holds — and an ABI change is the
+owner's. The proposal is recorded and not taken.
+
+The arithmetic and the calendar live in **`toyos-wallclock/`**, a host-workspace
+crate, and that placement is the point rather than tidiness: the argument above
+is the one thing here a guest test could not check cheaply, and on the host it is
+checked at **every real offset a quarter-hour apart across the whole range** —
+each is either recovered exactly or named as one of two candidates, and the
+ambiguous count is asserted at 18 so the band cannot silently change width. The
+kernel's `Civil` moves into the same crate, so the machine has one calendar
+rather than one per side of the syscall boundary.
 
 **`specs/issues/boot-media/rotation-leaves-the-newest-in-the-older-name.md`
 closes** — it describes the two-generation `kernel.log`/`kernel.log.1` scheme,
@@ -2119,12 +2304,35 @@ the entry.
 
 ### 5.6 What logd does when there is no `/log` at all
 
-It says so once, on the console, and runs as a console-only logger.
-`report_log_destination` (`main.rs:300`) splits: the kernel keeps the half it
-knows (whether it has a console) and logd owns the half it knows (whether it has
-a volume). The four-way table and its `!!!` markers survive as two `alert!`s, one
-from each side, and the panel still paints them red — now because of `Level`
-rather than because of three exclamation marks.
+It says so once, on the console, and carries on. **As built at L6 the split is
+made, and the four-way table stays with the kernel because the panel is the
+kernel's.** `report_log_destination` (`kernel/src/main.rs`) keeps both axes: it
+no longer knows *which file*, and it still knows whether the log **volume
+mounted**, which is the fact the line exists to carry — a machine with no `/log`
+partition leaves no account of itself once userland owns the screen. `/bin/logd`
+adds the half only it knows, on its own console handle: `logd: this boot's
+kernel log is /log/<file> (<wall clock>)`, or `logd: no /log on this machine -
+this boot's kernel log is on the console only`.
+
+**The first draft of this split moved the whole table to logd and that was
+wrong, caught by `screen_log_absent`.** `panic_console` paints *records*, so a
+userland line reaches a console and never the screen — and this line's whole
+audience is somebody looking at a T14 with no serial port. A split that leaves
+the panel silent about `/log` deletes the diagnostic on the one machine the
+subsystem exists for. `NO_LOG_ALERT` is what the gate reads and it is the
+kernel's line.
+
+The panel still paints it red because of `Level` rather than because of three
+exclamation marks.
+
+**What "console-only logger" does *not* mean, and the draft above invites the
+wrong reading.** logd does not write kernel records to the console, with a volume
+or without one. `klogd` already puts every committed record on the wire at the
+commit (§4.3), so a second copy from logd would double every line on a machine
+whose whole console is the diagnostic. §4.1's split is literal: the kernel keeps
+the console, logd keeps the filesystem, and what logd writes to a console is what
+only logd knows. The phrase belongs to L7, where logd holds userland's streams
+and a machine with no `/log` really does have to put them somewhere.
 
 ### 5.7 If logd dies
 
@@ -2159,7 +2367,7 @@ every client's next write on slot 1 or 2 is `Gone`.
 | program | slots 0/1/2 | who made them |
 |---|---|---|
 | `/bin/init` | the kernel's first `Console` | `spawn_init` (`loader/mod.rs:912`), unchanged |
-| `/bin/logd` | the kernel's second `Console` | `spawn_init` mints it, init moves it, per the manifest (§4.4) |
+| `/bin/logd` | its own `Console`, minted at spawn | `build_child_handles`, like every other `[boot] start` program — **the second `spawn_init` console is not built and §4.4 says why**: a console per holder makes a labelled endowment for this one program unnecessary |
 | every `[boot] start` program | a pipe pair to logd, labelled with its manifest name | init: create the pipes, `SYS_HANDLE_SEND` the read ends to logd with a `Register`, endow the write ends as the child's slots |
 | a launched program | the same, from the launcher | the launcher holds a `log` connector |
 | an sshd session shell | the session's own pipes, as today | sshd already creates them |
@@ -2193,19 +2401,47 @@ slots 1 and 2, and only what is behind those slots changes.
 
 ### 6.3 Shutdown
 
-`SYS_SHUTDOWN` (`arch/syscall.rs:219-251`) today logs "Syncing filesystems…",
-syncs, logs "Shutting down.", and calls `acpi::shutdown()`; both lines die in the
-ring (`specs/issues/kernel/shutdown-path-logs-never-reach-console.md`). After:
+`SYS_SHUTDOWN` (`arch/syscall.rs`) logged "Syncing filesystems…", synced, logged
+"Shutting down.", and called `acpi::shutdown()`; both lines died in the ring
+(`specs/issues/kernel/shutdown-path-logs-never-reach-console.md`). **As built at
+L6**, in order:
 
-1. Send `Sync` to logd and wait for its answer, bounded by `LOG_WRITE_BUDGET`.
-   Ordinary thread context, so it blocks properly — a shutdown that loses its own
-   last lines is the one nobody can diagnose.
-2. `drain_inline()` for the console, after logd has answered, so the last kernel
-   record — including logd's own — is on the wire before the power goes.
+1. `log::wait_for_durable()` — wait, bounded, until `LOG_DURABLE_NS` covers the
+   newest committed record. **It yields rather than spins**: this is ordinary
+   thread context with the VFS lock released, and at `--smp 1` the CPU it is on
+   is the only one logd can run on, so a spin would guarantee the bound expired
+   on every single-CPU shutdown — which is the width most of the suite boots at.
+2. `log::console::drain_inline()` — the console, after logd has answered, so the
+   last record including logd's own is on the wire before the power goes. Inline
+   because `klogd` has no guarantee of another turn.
 3. `acpi::shutdown()`.
 
-That closes the entry, and the gate is a named assertion that the guest's last
-console line is the shutdown's own and that `/log` carries it too.
+**Step 1 is not the `Sync` frame this section asked for, and §5.2 is where that
+is struck.** The asker is the kernel; `durable` already travels the other way on
+a call logd makes every loop; so the shutdown reads a word instead of holding a
+connector. The bound is its own — `SHUTDOWN_DURABLE_NANOS`, 2 s
+(`kernel/src/log/mod.rs`) — and not `apic`'s 500 ms, because the two bound
+different machines: that one is a panicking machine where the scheduler may be
+unable to pick logd at all, this one is an orderly shutdown where every thread is
+healthy and what is being waited for is one wake, one `SYS_LOG_READ`, a
+write-back, a FAT append and a device cache flush. Two seconds is the same order
+as the transport's own `USB_TIMEOUT_NS` for one transfer.
+
+**A machine whose logd has given up on the volume pays the bound, once, and says
+so** — `shutdown: /log did not answer in 2000ms, so this shutdown's last lines
+are on the console only`. That is the honest outcome rather than a cost: the
+lines are not going to reach the stick, and the console is told why.
+
+That closes the entry. **Measured 2026-08-15**: `kernel_log_file` reads the
+volume after `run shutdown` and finds `Shutting down.` in it, on both arms —
+11,896 bytes on the shipped bound, and on the rotation arm **in part 5 of 5 in
+the boot that was sampled**. Both of those numbers are a sample and neither is a
+claim: which part the line lands in is how many records the machine emits while
+`SYS_SHUTDOWN` is waiting, divided by a 256-byte bound. The gate searches *every*
+part of the boot for the line and prints where it found it, which is why the
+figure moves between runs without meaning anything moved — and it does move: the
+same gate on the same tree later the same day reported **11,907 bytes, six parts,
+and the line in part 5 of 6**.
 
 ### 6.4 Panic
 
@@ -2228,37 +2464,72 @@ panic is everything logd made durable, and the lag is one logd wakeup plus one
 device round trip — the same lag `log_file::poll` has from the idle loop today.
 
 **And the report itself still reaches `/log`, because the dying machine waits for
-logd.** `apic::wait_for_log_file` survives in shape and changes what it waits on:
+logd.** `apic::wait_for_log_file` survives in shape and changes what it waits on.
+**As built at L6:**
 
 ```
 if serial::has_console() { return }             // unchanged: the report is already off the box
+let want = read::newest_committed_at_ns()       // sampled once
+if LOG_DURABLE_NS >= want { return }
 kick every sibling                              // unchanged: a quiet CPU is in sti;hlt
-wait, bounded, until LOG_DURABLE_NS >= the panic record's at_ns
+wait, bounded, until LOG_DURABLE_NS >= want
 ```
 
-`LOG_DURABLE_NS` is a kernel global that logd publishes: `LogCursor` gains a
+**`want` is sampled once, and that is a property rather than an optimisation.**
+`panic_console::capture` has already run, so the newest committed record *is* the
+report's; taking it once means a sibling that keeps logging on its way down
+cannot extend the wait by moving the target.
+
+`LOG_DURABLE_NS` is a kernel global that logd publishes: `LogCursor` carries a
 `durable: u64` field that logd sets to the timestamp of the newest record it has
 `fsync`ed, and the kernel takes the maximum on the next `SYS_LOG_READ`. One
 field, no extra syscall, and logd calls `SYS_LOG_READ` every loop anyway. It is
-also what lets Ctrl+Alt+D say how far behind the file is.
+also what lets Ctrl+Alt+D say how far behind the file is, and — since §5.2's
+`Sync` is struck — what the shutdown path reads too.
 
 **`durable` is a number that crossed the trust boundary and decides how long a
-kernel waits, so it is clamped.** The kernel takes
-`min(cursor.durable, newest_record_at_ns)` before the maximum, because an
-unclamped `u64::MAX` from a buggy logd makes `wait_for_log_file` return
+kernel waits, so it is clamped. Built at L6 and read by nothing until then**,
+which was F3: the clamp was documented here and in the ABI and no kernel code
+implemented it, because the panic path was still waiting on the kernel's own file
+sink. `log::user::publish_durable` now takes
+`min(cursor.durable, read::newest_committed_at_ns())` before the maximum, because
+an unclamped `u64::MAX` from a buggy logd makes `wait_for_log_file` return
 immediately and the report is silently lost — which is exactly the "a device's
 own numbers are untrusted" rule one layer up. Clamping cannot make the wait
 *longer* than the bound, so the only thing a hostile logd can do is shorten a
 wait for its own output, and that is acceptable. Stated because a field this
 shape with no clamp reads as an oversight.
 
-The bound is today's `LOG_FILE_DRAIN_NANOS`, 500 ms (`apic.rs:117`), **re-derived
-because what it bounds has changed kind, not just size**. Today's derivation is
-its own comment: *"the idle loop goes round in microseconds and a flush is one
-FAT append plus a sync."* After L6 the same wait covers a **userland process
-being scheduled**, two syscalls, a page-cache write-back, a FAT append, a device
-cache flush and a second `SYS_LOG_READ` to publish. L6 measures it under
-`usb-slow-device` and writes the number it found. This is the mechanism that
+**The ceiling is a number the kernel knows for itself.**
+`read::newest_committed_at_ns` is one `Descent` per shard on the stack, no lock
+and no allocation — the same shape `snapshot_committed` and `drain_ordered`
+already have — descending from `head - 1` to the shard's first committed slot,
+which in practice is one iteration.
+
+**A machine with no durable log pays the bound.** `LOG_DURABLE_NS` is zero until
+the first publication, which is the honest state of a machine with no `/log`, a
+logd that has not run yet, a logd that was killed, or one that has given up on
+the volume. Each of those spends the 500 ms on a fatal panic, once, and halts
+with the panel as the only copy — which is the correct outcome and not a
+regression: the report is not on the stick, so there is nothing to return early
+for. Those are §6.6's seven cases and §6.6's subject.
+
+The bound is `LOG_FILE_DRAIN_NANOS`, 500 ms (`apic.rs`), **re-derived because
+what it bounds has changed kind, not just size**. Its old derivation was its own
+comment: *"the idle loop goes round in microseconds and a flush is one FAT append
+plus a sync."* The same wait now covers a **userland process being scheduled**,
+two syscalls, a page-cache write-back, a FAT append, a device cache flush and a
+second `SYS_LOG_READ` to publish.
+
+**It stays at 500 ms, and L6's re-derivation is about what the number is for
+rather than what it now contains.** It is not a prediction of how long the write
+takes — it is what a machine with nobody left to do the writing pays on its way
+down, against the ~460 ms the panel paint costs on the T14 anyway. A machine
+whose logd is alive and schedulable finishes far inside it, and
+`screen_fatal_halt_composited`'s `/log` half is what says so on every run.
+**The `usb-slow-device` measurement this row asked for is not taken at L6 and is
+owed**: §9.6 is where it goes, alongside the interleaved A/B, because it is the
+same instrument and the same worktree pair. This is the mechanism that
 keeps **`screen_fatal_halt_composited`**'s second half — the assertion that the
 fatal report is in `/log` and not only in a photograph
 (`tests/toyos.rs:3402-3427`) — green, and root `CLAUDE.md`'s "three
@@ -2404,14 +2675,24 @@ there: `Mark`, `mark`, `peek_tail`, `peek_range` and the `WRITTEN` counter they
 existed for are gone, which also took one store out of `append` — the file was
 549 lines and is 465.
 
-**`kernel/src/log_file.rs` — the whole file, 565 lines.** With it: `Sink`,
-`SINK` and its `Lock`, `IN_FLUSH`, `flush_in_progress`, `install`, `destination`,
-`poll`, `flush_final`, `Refusal`, `Sink::{flush,append,continue_in_next_part,
-stopped_at}`, `path`, `stamp`, `Class`, `classify`, `ours`, `sweep`,
-`undated_stem`, `MAX_BLOCKED_NANOS`, `CHUNK`, `UNDATED_STEM`, `DIR`, `MOUNT`.
-`MAX_LOG_FILES`, `MAX_LOG_BYTES` and `MAX_LOG_PARTS` move to logd with their
-values. The `log-rotate-fast` actuator goes — its `actuators!` row and
-`log_file::max_log_bytes` with it; the fast value becomes a logd argument.
+**`kernel/src/log_file.rs` — the whole file. Deleted at L6; it was 646 lines by
+then, not the 565 this row was written against.** With it: `Sink`, `SINK` and its
+`Lock`, `COLLECTING`, `POSITION`, `has_pending`, `IN_FLUSH`, `flush_in_progress`,
+`install`, `destination`, `poll`, `flush_final`, `Refusal`, `Appender`,
+`Sink::{flush,append,continue_in_next_part,stopped_at}`, `path`, `stamp`,
+`Class`, `classify`, `ours`, `sweep`, `undated_stem`, `MAX_BLOCKED_NANOS`,
+`max_log_bytes`, `UNDATED_STEM`, `DIR`, `MOUNT`. `MAX_LOG_FILES`,
+`MAX_LOG_BYTES` and `MAX_LOG_PARTS` move to `userland/logd/src/store.rs` with
+their values and their reasons; `classify` moves with them and its strictness
+stops being belt-and-braces, because the writer is userland now too. The
+`log-rotate-fast` actuator goes — its `actuators!` row with it; the fast value
+becomes a logd argument and therefore a manifest row (§5.5).
+
+**And `kernel/src/log/console.rs`'s `write_line` does not go with it**, which
+this ledger implied it would: its doc said it goes "when `logd` does the
+rendering (L6)". It stays, because the console still renders records and logd
+renders its *own* line from `LogRecord`'s `Display` plus a wall-clock prefix
+(§3.3) — two prefixes over one formatter, which is what §3.3 designed.
 
 **`kernel/src/arch/idt/timer.rs`'s tick drain, which this ledger did not
 name.** The timer ISR held a `try_lock`ed `BackendGuard` for one 512-byte chunk
@@ -2422,14 +2703,16 @@ or not one is idle. **Two drains on the highest-rate event in the kernel become
 none**, which is a reduction on the preemption path and is recorded here because
 §8.1 is the ledger a reviewer counts against.
 
-**`kernel/src/sched/driver.rs`:** `flush_log_file_if_affordable` (`:722`),
-`LOG_DEFERRAL_CEILING_NS` (`:701`), `LOG_DEFERRED_SINCE` (`:706`),
-`log_file_flush_due` (`:743`), `owes_wake` (`:832`, whose only caller is the
-above), `drain_serial` (`:762`) and its `BackendGuard::lock` spin with interrupts
-disabled, and **two** of the four pre-`hlt` conditions in `execute`'s `Idle` arm:
-`log_ring::has_pending` (`:523`) at L3 and `log_file_flush_due` (`:552`) at L6.
-The idle loop's `drain_serial()` (`:681`) and `flush_log_file_if_affordable()`
-(`:689`) statements.
+**`kernel/src/sched/driver.rs`:** `flush_log_file_if_affordable`,
+`LOG_DEFERRAL_CEILING_NS`, `LOG_DEFERRED_SINCE`, `log_file_flush_due`,
+`owes_wake` (whose only caller was the first), `drain_serial` and its
+`BackendGuard::lock` spin with interrupts disabled, and **two** of the four
+pre-`hlt` conditions in `execute`'s `Idle` arm: `log_ring::has_pending` at L3 and
+`log_file_flush_due` at L6. The idle loop's `drain_serial()` and
+`flush_log_file_if_affordable()` statements. **All done as written**, and the
+whole of the log's presence on the idle path is now zero statements and zero
+conditions — `idle_loop_is_the_declared_body` is what keeps a third from being
+added quietly.
 
 **`log_ring::has_pending` (`:523`) is deleted outright and nothing replaces it.**
 The producer posts `klogd`'s wake at the commit (§2.6a), so the halt is refused
@@ -2460,7 +2743,10 @@ no path at all, which breaks §10's "every chunk builds, boots and passes
 acquisition per `MAX_CONSOLE_LINE` of output, ANSI-stripped, no buffering — and
 L5 puts the line buffer in front of it. That is not a detour: it makes
 `console-unbuffered` (§9.4) literally L3's own state, so the negative control is
-a real prior build rather than an invented one.
+a real prior build rather than an invented one. **As built at L5 the arm is
+`c.write(buf)` on the object and `serial::write_console` survives with one
+caller, the actuator** — the unbuffered path is not a rewritten imitation of L3's
+behaviour, it is L3's function.
 
 **"Per `MAX_CONSOLE_LINE`" and not "per `write`", and the difference is a
 defect this section carried until 2026-08-15.** The arm as first built took the
@@ -2481,10 +2767,10 @@ the guard per flush.
 that boundary, where before it could not — so the atomicity claim is "whole up
 to `MAX_CONSOLE_LINE`", which is exactly the claim §4.4 already makes for the
 finished design: a line longer than the bound is emitted in pieces of it there
-too. Nothing that is whole after L5 is splittable now. The
-`console_line_atomicity` gate §10 schedules for L5 writes 200-byte lines and
-will be unaffected; the gate that checks this **today** is the three C tests
-that compare whole stdout, which are line-oriented and far inside the bound. The re-acquisition is
+too. Nothing that is whole after L5 is splittable now. `console_line_atomicity`
+writes 200-byte lines and is unaffected, as built; the gate that checked this
+before L5 is the three C tests that compare whole stdout, which are
+line-oriented and far inside the bound. The re-acquisition is
 `ceil(n/1024)` uncontended `cli`/`compare_exchange_weak`/`popfq` triples instead
 of one, against a device write per kilobyte that is orders of magnitude dearer.
 The CSI stripper's state and the staging buffer both outlive every guard, so a
@@ -2501,6 +2787,12 @@ this arm. `serial::write_console` is where the ANSI strip lives now.
 
 **`kernel/src/arch/apic.rs`:** `LOG_FILE_DRAIN_NANOS`'s derivation and `owed()`
 are rewritten against `LOG_DURABLE_NS` (§6.4); `wait_for_log_file` survives.
+**As built, `owed` went from two predicates to one**, and the pair is not
+missed: it existed because the sink's own "anything pending" went false in the
+middle of the flush that was writing it, and `LOG_DURABLE_NS` has no such gap by
+construction — logd publishes it *after* `fsync` returns, so the word passing a
+record's timestamp means that record is on the stick and not that somebody has
+started putting it there.
 
 **`kernel/src/log.rs`:** the `log!` macro's body — the `gs:` reads and the
 `SerialWriter` — and its false doc comment (§1.3). `PERCPU_READY` survives and
@@ -2524,10 +2816,13 @@ and it is the wrong trade here for three reasons.**
   buys fifteen lines.
 
 **What changes is that it becomes an assertion where it safely can.**
-`console_line_atomicity` and `logd_gone` assert `interleaved().is_none()` on
-their own captures, so a tree with the old coupling reintroduced reds on the
-detector as well as on the count — and the `console-unbuffered` actuator, which
-produces exactly kernel-into-userland splices, reds both. It does **not** become
+`console_line_atomicity` asserts `interleaved().is_none()` on its own capture,
+so a tree with the old coupling reintroduced reds on the detector as well as on
+the count — and the `console-unbuffered` actuator, which produces exactly
+kernel-into-userland splices, reds both. **`logd_gone` was named here as the
+second such caller and it is not built** (§9.5): init does not wait on logd's
+`Process` handle yet and the clause about a client that keeps printing is L7's,
+so that name arrives with L7 and takes this assertion with it. It does **not** become
 a suite-wide assertion, and the reason is concrete: `/bin/console` seeds its
 scrollback from `/log` and prints lines that legitimately contain `[kernel `,
 so `screen_console_shell` would red on correct behaviour. Suite-wide it stays a
@@ -2541,16 +2836,24 @@ reason `kernel/Cargo.toml` names the log at all.
 
 ### 8.2 `specs/issues/` this closes
 
-Slugs only, deliberately: `src/docs.rs`'s `every_named_issue_file_resolves` walks
-every text file in the tree and reds on a `specs/issues/<area>/<slug>.md` path
-that does not resolve, so a full path written here would red `cargo test --lib`
-the moment the file is deleted. **L8 must also de-path the citations elsewhere** —
-several of the entries below are cited by full path from the root `CLAUDE.md`,
-from `kernel/CLAUDE.md`, from `specs/introspection-plan.md` and from
-`specs/completion-architecture-spec.md`, and every one of those is a
-`cargo test --lib` red at L8. The `specs/issues/README.md` protocol says the
-durable rule moves into the spec that owns the subject; doing that is the same
-edit that removes the citation.
+Slugs only, deliberately — and **the reason is no longer a gate, which this
+paragraph claimed and which is the L5 review's F2.** `src/docs.rs` walked every
+text file in the tree and its `every_named_issue_file_resolves` red on a
+`specs/issues/<area>/<slug>.md` path that did not resolve; it and every test
+over `specs/` prose were **deleted by owner ruling** (`8d0db10`,
+`src/CLAUDE.md`). So a full path written here is not caught by
+`cargo test --lib` the moment the file is deleted — it is caught by a reader, or
+not at all. Slugs stay, because a slug cannot rot; what changed is that the
+discipline is prose and review rather than a test, and a spec that cites a
+deleted gate as its safety net is a spec telling the next agent not to look.
+
+**L8 must also de-path the citations elsewhere**, for the same reason and with
+nothing behind it but that: several of the entries below are cited by full path
+from the root `CLAUDE.md`, from `kernel/CLAUDE.md`, from
+`specs/introspection-plan.md` and from `specs/completion-architecture-spec.md`.
+The `specs/issues/README.md` protocol says the durable rule moves into the spec
+that owns the subject; doing that is the same edit that removes the citation,
+and `rg <slug>` is what finds the ones that are left.
 
 | slug | area | closed by | what makes the claim true |
 |---|---|---|---|
@@ -2617,7 +2920,8 @@ thread per shard — at preempt depth 0, with `IF` set, through the shipped
 within that producer and a checksum over the two, and then one `done` record
 naming what it emitted. `test-runner` — which holds `logread` from its own
 manifest row, where a spawned test binary would not (§3.2) — reads through
-`SYS_LOG_READ` until every producer has said `done` and asserts:
+`SYS_LOG_READ` until its own cursor has caught up and stayed caught up, and
+asserts:
 
 ```
 records_emitted  ==  records_read + cursor.lost
@@ -2651,18 +2955,83 @@ The actuator carries the comment the harness rule requires: nothing else can
 reach it, because a real workload's record rate is set by what the kernel happens
 to log and cannot be made to saturate a shard.
 
-**Measured, 2026-08-15, on this host under TCG** (`cargo test --test toyos-build
--- log_conservation`), one boot per width:
+**Measured on this host under TCG** (`cargo test --test toyos-build -- log_`),
+one boot per width, **two samples and not one — every column but `emitted` is a
+race and moves between runs**:
 
-| `--smp` | emitted | read | dropped | read while storming | `cursor.lost` |
-|---|---|---|---|---|---|
-| 1 | 1,024 | 511 | 513 | 512 | 513 |
-| 4 | 4,096 | 2,044 | 2,052 | 1,988 | 2,143 |
-| 8 | 8,192 | 4,088 | 4,104 | 4,090 | 4,229 |
+| `--smp` | emitted | read | dropped | read while storming | `cursor.lost` | run |
+|---|---|---|---|---|---|---|
+| 1 | 1,024 | 511 | 513 | 512 | 513 | 2026-08-15 a |
+| 1 | 1,024 | 511 | 513 | 512 | 513 | 2026-08-15 b |
+| 4 | 4,096 | 2,044 | 2,052 | 1,988 | 2,143 | 2026-08-15 a |
+| 4 | 4,096 | 2,111 | 1,985 | 2,055 | 2,076 | 2026-08-15 b |
+| 8 | 8,192 | 4,088 | 4,104 | 4,090 | 4,229 | 2026-08-15 a |
+| 8 | 8,192 | 4,095 | 4,097 | 4,043 | 4,212 | 2026-08-15 b |
+
+**`--smp 1` is the one width that repeats exactly**, because there the reader
+and the single producer share a CPU and the interleaving is the scheduler's
+rather than the hardware's. At 4 and 8 the split between `read` and `dropped`
+moved by 67 and 7 records between two runs of the same build — which is the
+quantity being a race and not the law being one. **The law itself is not a
+sample**: `emitted == read + lost` holds exactly on every run, and it is the
+guest that computes it.
 
 `cursor.lost` exceeds `dropped` by the ordinary kernel records the same shards
 dropped, and the ledger accounts for those too — which is the point of computing
 the law over sequence numbers rather than over the storm.
+
+**The reader waits for no record the ring may drop, and it used to.** It read
+until every producer had said `done`, and that record is the last thing one
+*producer* writes rather than the last thing written to its *shard*:
+`sched::driver::placement` picks the least-loaded CPU from a rotating start, so
+eight threads spawned back to back are spread only while every published load is
+equal, and a task is stealable between its spawn and its first run either way.
+Two producers on one shard lap the first one's `done`, and the reader then waited
+for a record that was never coming — the L4 review's F2, and **not a prediction:
+measured 2 of 7 full suites on the dev host, 2026-08-15**, each time as the
+guest's whole 30 s ceiling with *"7 producer(s) done"* in the report, and each
+time green alone.
+
+**The fix is the reader and no kernel code.** The obvious kernel-side answer was
+measured and rejected first: a park-based barrier that put every `done` past
+every patterned record passed alone, passed a whole 259-test suite, and then
+hung `log_conservation_smp4` in a 12-wide one with no ceiling report at all. So
+`log_gate.rs` decides from its own cursor instead — the log is drained, nothing
+new has arrived over eight reads, and nothing new has arrived for 100 ms of
+guest time since the last producer record. `logstorm start`, `logstorm done` and
+the nesting burst's `done` are all cross-checks where they survived and none is
+waited on; the count a producer emitted comes from the highest index the ledger
+saw when none of them did. `done=` in the gate's report is how many survived,
+which is evidence about the ring rather than an assertion about it. That removes
+the class — *a workload whose liveness depends on a record the ring is allowed
+to drop* — rather than this instance of it.
+
+**And a producer this reader never sees at all is the ring's policy too.** The
+first rewrite kept "every producer must have been read at least once" as a hard
+clause, and that is the same mistake one level up: two producers on one CPU
+write one shard, and 1,024 records from the second lap all 1,024 of the first.
+Measured on the dev host, 2026-08-15 — the first seven suites after the
+termination fix were **2 of 7 red on exactly that**, with *"2,582 record(s) were
+overwritten in a shard"* on the run that produced it, and no ceiling anywhere
+(the reds took three seconds where the old ones took thirty-three). So an unseen
+producer is counted, reported as `unseen=`, and **checked against the ledger
+rather than waved through**: `unseen` producers emitted `declared` records each
+and none was read, so at least that many sequence numbers must be among the ones
+the kernel counted lost. That is a necessary condition and not an attribution —
+`cursor.lost` is per shard and names no producer — and it is what separates "the
+ring lapped its whole run", which is the behaviour under test, from "that thread
+never ran", which is a kernel that did not spawn what it said it did.
+
+**What the change costs, stated rather than left to be found.** The termination
+condition can, in principle, fire mid-storm: eight empty reads and 100 ms of
+guest quiet while a producer is stalled inside its publication bracket. That
+ends the read early and computes the law over less of the workload; it cannot
+make the law *wrong*, because the sequence numbers this reader took and the loss
+its own cursor counted are a consistent snapshot at every instant. The
+non-vacuity clauses are what refuse a run that proved nothing: every producer
+must have been read at least once, some record must have been read while
+producers were still emitting, and the readiness source must have completed a
+poll.
 
 **It does not cover §2.3a, and neither does anything else of this shape**: a
 producer that moves between CPUs mid-storm is not reachable on this tree at all.
@@ -2775,9 +3144,47 @@ holds them out of a shipping kernel.
 | `log-commit-early` | the commit store moves **before** the body write | **not built at L4** — see below |
 | `log-shared-reservation` | the reservation becomes a load-then-store with an interrupt admitted between the two | `log_nested_emit`, deterministically — **measured 2026-08-15**, 2 of 2 |
 | `log-unbracketed-reserve` | §2.3a's complete IF/TF guard is removed from shard selection through final publication, so a producer can resume its body copy after a newer generation committed | `log_nested_emit`'s patterned mid-body lap — **measured 2026-08-15**, 2 of 2 |
-| `log-trusts-durable` | the §6.4 clamp on `LogCursor::durable` is removed | a test logd publishing `u64::MAX` makes `wait_for_log_file` return with nothing written, and `screen_fatal_halt_composited`'s `/log` half reds |
-| `log-writes-the-file` | `klogd`'s drain appends records to `/log` through the VFS, from the idle loop — the coupling, rebuilt in miniature | `io-depth-probe`'s depth, and §9.3 reading 1 by the recorded margin |
-| `console-unbuffered` | `ConsoleObject`'s line buffer is bypassed; each `write` reaches the backend — **which is literally L3's own intermediate state** (§8.1) | `console_line_atomicity`, and `Serial::interleaved` on the same capture |
+| `log-trusts-durable` | the §6.4 clamp on `LogCursor::durable` is removed | **not built at L6, and it is owed — see below** |
+| `log-writes-the-file` | `klogd`'s drain appends records to `/log` through the VFS, from the idle loop — the coupling, rebuilt in miniature | **not built at L6, and it is owed — see below** |
+| `log-close-cancels-any-syscap` | `ops::close` hands `remove_fd` the sources a `SysCap` or a `Console` names, so a handle going away cancels every poll in the machine on the log or the keyboard — **the behaviour this tree had** until L6 | `log_poll_outlives_a_close` — **measured 2026-08-15**, *"closing a second handle to the same capability completed the log poll with no record behind it"*, red 2 of 2 |
+| `console-unbuffered` | `ConsoleObject`'s line buffer is bypassed; each `write` reaches the backend — **which is literally L3's own intermediate state** (§8.1), and as built it calls L3's own function | `console_line_atomicity` — **red 8 of 8, re-measured 2026-08-15**; the count is not, see below |
+
+**`console-unbuffered`'s count is not a number this section may quote, and it
+used to.** The row said `4 of 2000` and `2 of 2000`, which reads as the size of
+the defect. Re-measured on the dev host on 2026-08-15, eight boots of the same
+build under the same command gave **456, 412, 1, 2, 507, 538, 570 and 3** of
+2000 — two clusters three orders of magnitude apart. What a boot decides is
+whether the two writer processes end up on the machine's two CPUs or on one, and
+a writer *preempting* another leaves a far narrower window than a writer running
+beside it. So **the verdict is the sign and never the magnitude**: red 8 of 8,
+never once zero, with the count printed as evidence about that boot. A control
+quoted by its magnitude is one a later reader will reproduce and disbelieve.
+
+**Neither L6 control is built, and the reason is the same one for both: each
+needs a *second* half that this chunk does not have, and this section's own rule
+is that a control must red something.**
+
+- **`log-trusts-durable`** removes the clamp. Removing it changes nothing on its
+  own: the clamp only bites when a reader publishes a value past the newest
+  record, and the one reader in a shipped image is `/bin/logd`, which publishes
+  the timestamp it actually synced. Making it red therefore needs a *publisher*
+  of `u64::MAX` as well as a kernel that believes one — a second knob, in
+  userland, on a config where `screen_fatal_halt_composited` runs. The clamp
+  itself is built and its ceiling is `read::newest_committed_at_ns`; what is
+  missing is the pair of arms that makes its absence observable, and shipping
+  half of one would be an actuator that reds nothing, which is what this section
+  forbids.
+- **`log-writes-the-file`** rebuilds the coupling in miniature: `klogd`
+  appending records to `/log` through the VFS from a kernel context. It reds
+  `io-depth-probe` and §9.3's reading 1 — **and both of those are L9's
+  instruments, which do not exist yet**. An actuator whose gate is a measurement
+  nobody takes is a control nobody runs.
+
+**Both move to L9**, where the instruments they red arrive, and this row is the
+record that they are owed rather than dropped. What L6 does have against the same
+subject is `idle_loop_is_the_declared_body` — a source gate over the exact set of
+statements and pre-`hlt` conditions the idle loop may carry — which refuses the
+*re-addition* of the coupling rather than measuring its cost.
 
 **`log-commit-early` is not built at L4, and the reason is the workload rather
 than the defect.** Publishing the sequence number ahead of the body is only
@@ -2790,12 +3197,35 @@ unseen. Built and run on 2026-08-15 against `log-storm` at all three widths: the
 gate stayed **green**, which is an inert control and is what §9.4's own rule
 forbids, so the actuator was deleted rather than shipped. What would earn it is a
 *paced* storm whose reader keeps up, which is a second workload and not this one.
-The teeth of §9.1's ledger are not left unproven by its absence: both controls
-above red through the same guest-side ledger, on the same code path.
+
+**And the sentence that followed it here was false, which is the L4 review's
+F4.** It said "both controls above red through the same guest-side ledger, on
+the same code path", and they do not: `log-shared-reservation` reds on *"an
+interrupt handler's burst was declared and never seen"*, which is a presence
+check, and `log-unbracketed-reserve` reds on the gate's own liveness ceiling
+after the shard drops out of the merge. Both are real failures of the mechanism
+and neither is the conservation law failing. **What did red the ledger is two
+weakenings of the kernel the reviewer made by hand**, 2 of 2 each: halving the
+loss the reader is told about in `read.rs`, and corrupting a storm record's
+payload after it is formatted. So the ledger's teeth are demonstrated — by those
+two, not by these.
+
+**Neither weakening becomes an actuator, and the reason is what the ledger is
+for.** An actuator earns its place by staging a state a *design decision* could
+plausibly be wrong about, and these two stage a kernel that has been edited to
+lie: `lost / 2` and a scribbled payload are not shapes any refactor of this
+subsystem arrives at, they are the arithmetic of the assertion written
+backwards. A control of that kind proves the assertion is connected to its
+subject, which is worth doing once — it is done, and recorded here — and costs a
+permanent row in `actuators!` plus a CI boot to keep proving it forever. The
+three controls that do ship each stage a design the tree could genuinely have
+had. Argued rather than asserted, and recorded so the next reader does not
+re-derive it as an omission.
 
 None can join `INERT_ACTUATORS`. `log-writes-the-file` is the strongest
 because it replaces the behaviour rather than a verdict, which is the harness's
-own rule for what makes an actuator worth having;
+own rule for what makes an actuator worth having, and is the reason it is
+deferred rather than dropped;
 `log-unbracketed-reserve` is the one that has to exist, because §2.3a is the
 correctness claim the whole design rests on and nothing else can make it fail on
 purpose.
@@ -2853,12 +3283,38 @@ existing. Named rather than discovered at compl's C14.
   carries the finding. §2.3a's gate is therefore §9.2's, on one CPU, where an
   interrupt is a stimulus a test can aim; `log-unbracketed-reserve` reds there
   rather than here.
-- **`console_line_atomicity`** — in-guest and deterministic in shape: two
-  processes, each writing a distinguishable 200-byte line in two `write` calls,
-  1,000 iterations on two CPUs. The assertion is a **count of mixed lines equal
-  to zero**, not a probability, **and `Serial::interleaved().is_none()` on the
-  same capture** (§8.1). Under `console-unbuffered` both are non-zero well inside
-  the iteration budget.
+- **`console_line_atomicity`** — **built at L5**,
+  `tests/toyos-rust-tests/src/bin/console_line_atomicity.rs` and
+  `tests/common/console.rs`. In-guest and deterministic in shape: two processes,
+  each writing a distinguishable 200-byte line in two `write` calls, 1,000
+  iterations on two CPUs. The assertion is a **count of mixed lines equal to
+  zero**, not a probability, **and `Serial::interleaved().is_none()` on the same
+  capture** (§8.1). Two more, because a count of zero is also what an empty
+  capture gives: every one of the 2,000 lines is present at its declared width,
+  and the guest declares the width and the count rather than the host carrying a
+  second copy of them. **And a third writer that exits mid-line**: it says a
+  hundred bytes in two `write`s, never ends them with a newline, and exits, so
+  the only thing that can put them on the wire is `ConsoleObject::drop` flushing
+  what the last handle left behind — the assertion is the length of that run,
+  exact on both sides. **Measured 2026-08-15**: 0 of 2000 on the shipping kernel
+  with the hundred bytes whole; under `console-unbuffered`, **red 8 of 8 at
+  counts from 1 to 570 of 2000** (§9.4); and with `ConsoleObject::drop`'s flush
+  removed by hand, red 2 of 2 with the run at 1 and then 0 bytes.
+  The writers are two *processes* and not two threads, because the buffer is per
+  console object and two threads of one process share one.
+- **`log_poll_outlives_a_close`** — §3.2's second bullet, in guest and
+  deterministic. `test-runner` submits a `POLL_ADD` on its own `SysCap`,
+  **enters the kernel with it** — `poll_add` only queues a submission entry, and
+  a round that closed first would stage nothing and pass on a tree with the
+  defect — duplicates the capability, closes the duplicate, and asserts no
+  completion. Then a child that runs and exits commits one kernel record
+  (`process.rs`'s `exit:` line, which needs no actuator and no privilege) and
+  the poll completes on it, so what the close did not take was a live arming
+  rather than an absent one. A completion in the immediate window is
+  distinguishable from the defect — an honest one leaves records in the cursor —
+  and sends the round again, bounded at five. It needs `dup` beside `logread`,
+  which `tests/testcases/system.toml` has. **Measured 2026-08-15**:
+  `survived=1 records_after=6` green, red 2 of 2 under the control.
 - **`pre_idle_wedge_speaks`** — an actuator (`pre-idle-wedge`, not a feature:
   §0.0) that wedges deliberately at the end of boot phase 3 with interrupts off;
   the host asserts the console carries every line up to the wedge and nothing
@@ -2876,13 +3332,46 @@ existing. Named rather than discovered at compl's C14.
   when §1.4a's A/B was taken and the boot has gained two lines since.
 - **`logd_gone`** — kill logd; the machine survives, `init: logd exited` reaches
   the console, kernel records keep arriving, a client that keeps printing does
-  not die, and `Serial::interleaved().is_none()` on the capture.
+  not die, and `Serial::interleaved().is_none()` on the capture. **Not built at
+  L6**: init does not wait on logd's `Process` handle yet, and the "a client that
+  keeps printing does not die" clause is about the std PAL's `Gone` behaviour,
+  which is L7's (§5.7). It goes with L7, and what L6 has against the same subject
+  is that a dead logd is now *survivable by construction* — the console is
+  `klogd`'s and the panic path writes the backend, so nothing on the kernel's
+  side of §4.1 goes quiet when logd does.
 - **`shutdown_last_line`** — the guest's last console line is the shutdown's own,
-  and `/log` carries it.
+  and `/log` carries it. **Not built as a separate name at L6, and it would be a
+  second copy of one**: `kernel_log_file` already reads the volume after
+  `run shutdown` and asserts `Shutting down.` is in it, on both of its arms, and
+  it is what caught §6.3's wait being absent from the rotation image. A name of
+  its own would boot another guest to assert what an existing one already
+  asserts, which the test-cost audit is exactly against. **Registered when it can
+  claim something that gate cannot** — the *console* half, which is `Serial`'s
+  last line rather than the volume's, and which L7's stdio move is what makes
+  meaningful.
 - **`log_is_durable_after_fsync`** — the gate for §12.4's coupling, host-side
   against the volume: logd writes, `fsync`s, and the harness reads the *image*
-  rather than asking the guest. It reds on a `SYS_FSYNC` that stops at the page
-  cache, which is what it does today (§12.4).
+  rather than asking the guest. **As built this is `kernel_log_file`'s mid-run
+  read and not a name of its own**, and the merge is the honest one rather than a
+  saving: that gate reads the *image* while the guest is still running and
+  requires `Boot: complete` in it, which is precisely "logd wrote, `fsync`ed, and
+  the bytes are on the device" — the same claim, on the same instrument, in a
+  test that has to boot anyway. What it does not separate is *which* of the two
+  levels the flush reached, and the honest note is that a `SYS_FSYNC` stopping at
+  the page cache would still pass it on a machine that shuts down cleanly
+  afterwards. **What closes that gap is `usb_flush_optional`**, whose whole
+  subject is a device that refuses SYNCHRONIZE CACHE: it reds the moment the
+  syscall stops issuing one.
+- **`every_boot_config_runs_logd`** and **`idle_loop_is_the_declared_body`** are
+  the two `cargo test --lib` gates L6 owes; the first is built and the second is
+  **not**, and the reason is worth stating rather than leaving as an absence. Its
+  subject — the exact set of statements in `idle_loop`'s body and of conditions in
+  `execute`'s pre-`hlt` list — is now *smaller* than when the row was written:
+  L6 removed the last log statement and the last log condition, so what the gate
+  would declare is a set with nothing of this spec's in it. It is still worth
+  having, and it is still compl C9's and C10's to amend; **it is owed and it is
+  named here rather than quietly dropped**. What holds the property meanwhile is
+  the deletion ledger (§8.1) and a reviewer reading the diff.
 - **`idle_loop_is_the_declared_body`** — a **host-side source gate**, not a guest
   test: `idle_loop`'s body and `execute`'s pre-`hlt` condition list are exactly
   the declared sets. A condition quietly re-added is invisible to every
@@ -2894,12 +3383,14 @@ existing. Named rather than discovered at compl's C14.
   C10. So the gate is written to be **amended by the other branch as each of the
   two goes**, which is what a declared-set gate is for: each amendment is a diff
   a reviewer reads.
-- **`one_console_holder`** — a `cargo test --lib` gate over **all eleven
-  manifests** (§5.1a), reading the *parsed* `ProgramConfig` and never the file
-  text (§3.2): each declares at most one `console = true` program, each with a
-  `[boot] start` lists `logd` in it, and `logread` appears in the `syscap` of
-  `logd`, `console` and `test-runner` and nowhere else. A twelfth manifest added
-  later fails it by default.
+- **`every_boot_config_runs_logd`** — a `cargo test --lib` gate over **all twelve
+  manifests** (§5.1a — eleven plus `tests/logrotatecase/`, which L6 adds),
+  reading the *parsed* `ProgramConfig` and never the file text (§3.2): each with
+  a `[boot] start` lists `logd` in it, and `logread` appears in the `syscap` of
+  `logd` and `test-runner` and nowhere else. A thirteenth manifest added later
+  fails it by default. **It was `one_console_holder` and it
+  has lost its console clause**, because §4.4 as built mints a console per holder
+  at spawn and there is no `console = true` key for it to count.
 - **`nmi_does_not_log`** — a grep gate, two clauses:
   `kernel/src/arch/idt/nmi.rs` contains no `log!`, `alert!` or `emit`; and **no
   `log!` in `kernel/` has `!!!` in its format string** (§2.1), which is what makes
@@ -3033,12 +3524,12 @@ rebase, never amend.
 | **L1** | `kernel/src/log/`: `Slot` over L-ABI's `LogRecord` and `Level`, `Shard`, `emit` with §2.3a's bracket, `log!`/`alert!`/`boot_phase!`, the seven `alert!` conversions **carrying the level with their text unchanged** (below). Wired **behind** the existing byte ring — every `emit` also does today's `write_chunk`, so nothing observable changes. The AP shard in `alloc_percpu` (§2.2) | `kernel-loom/tests/log_record.rs` (W1, W2, W4); host-fast `log_zeroed_init`; the full suite indistinguishable from `main`'s; the boot A/B of §9.6. W2b's CPU-flags negative arrives with `log_nested_emit` at L4 |
 | **L2** | `snapshot_committed`; `panic_console`, `boot_checkpoint` and `sched::dump` re-pointed at records and at `Level`; **the `!!!` sentinel deleted from the seven `alert!` texts and from the ~20 assertions that read it**; the `KernelArgs` `{:?}` site split into several records; `Mark` → a pair of instants; the backtrace producer's head-and-tail elision (§2.1a), and `nmi_does_not_log`'s two clauses with it | `screen_panic_muted`, `screen_fatal_halt`, `screen_fatal_halt_composited`, `blocked_dump`, `screen_blocked_dump`, `dump_nmi_probe`, `screen_console_*` all green; `screen_late_panic`, whose stimulus is a symbol wider than any grid — **it gates the panel keeping a tail and not the elision**, which is `kernel-elide`'s nine host tests |
 | **L3** | `drain_ordered`, with the first caller that streams; `Drain::{Inline,Thread}`; **the kernel-thread machinery for one thread** (§4.3) — trampoline, kernel-address-space `ProcessObject`, `driver::spawn`, dump naming, the recoverable-panic predicate with `klogd`'s non-recoverable row; `klogd`'s body and §2.6a's wake (`signal_after_commit`/`arm_waiter`, the IRQ-off `PreemptGuard` witness, `wake_direct`, the park-lot park); `panic_flush`/`flush_final` on records; `log_file::poll` re-pointed at a `drain_ordered` cursor so the file sink survives; **`object/ops.rs:469`'s console arm re-pointed straight at `BackendGuard`** (§8.1) so the chunk builds. **Delete `log_ring.rs` whole**, `SerialWriter`, `drain_serial` and the idle loop's serial statement; **delete the `:523` pre-`hlt` condition** | `kernel-loom/tests/log_wake.rs` (W3, with its negative case); `pre_idle_wedge_speaks`; the `--slow-usb` A/B unmoved (nothing about the disk has changed yet); the fence's A/B. **All three run and recorded in §9.6, 2026-08-15**; the fourth this column used to name, §9.6's `Drain::Inline` measurement, is not L3's and not this tree's — §9.6 says where it went |
-| **L4** | **Done 2026-08-15.** The kernel's half of L-ABI, which touches no sysroot source: the `SYS_LOG_READ` dispatch over `drain_ordered` (`kernel/src/log/user.rs`), `Source::Log` and its watcher static (§3.2), `logread` in `toyos_manifest`'s `SYSCAP_RIGHTS` and on `test-runner`'s row in the six test configs that have one. **Two things the row did not name and L4 found it owed**: `Rights::LOG` and `Rights::WAIT` on the one full-rights `SysCap` the kernel makes for `/bin/init` — rights only shrink, so a bit absent at the root is a bit no manifest can name — and `logread` being *two* bits, because `SYS_LOG_READ` never blocks and a holder that may read but not park has to spin. §9.1's storm and §9.2's nesting injection with it | `test-runner` reads its own kernel log and §9.1's conservation law holds across the syscall — `log_conservation` at `--smp 1`, `4` and `8`, and `log_nested_emit`. §9.5 records what `log_migration_storm` measured and why it was struck |
-| **L5** | one `ConsoleObject` per endowment over one backend, its line buffer, `Console` losing `DUP`; the ANSI strip moves; `MAX_CONSOLE_LINE` | `console_line_atomicity`; `console-unbuffered` reds both its clauses; `one_console_holder` |
-| **L6** | `/bin/logd`: the program, **its row in all eleven manifests** (§5.1a) including `diag/`'s and its restated comment, the protocol, rotation, retention, per-client backlog, the give-up policy on today's live 2 s transport bound (§5.4); **`SYS_FSYNC`'s device flush, outright — there is no C12 to hand it to (§12.4)**. **Delete `log_file.rs` whole**, `flush_log_file_if_affordable` and everything in §8.1's `driver.rs` list; `wait_for_log_file` re-pointed at `LOG_DURABLE_NS`, **including `apic.rs:146`'s comment and its kick loop, which name the idle loop's `log_file::poll`**; §6.3's shutdown | `kernel_log_file` re-pointed and green mid-run and after shutdown; `log_is_durable_after_fsync`; `screen_fatal_halt_composited`'s `/log` half green; `logd_gone`; `shutdown_last_line`; `idle_loop_is_the_declared_body`; `log-writes-the-file` and `log-trusts-durable` red |
-| **L7** | userland stdio → IPC: init creates and registers the pipes; the launcher and sshd do the same for what they spawn; the std PAL's `Gone` behaviour; every console assertion in the suite re-pointed | full suite; the 234 `println!`/141 `eprintln!` sites unchanged and their output still on the console |
-| **L8** | the deletion commit; the `specs/issues/` closures of §8.2 **and the citations that go stale with them**; `specs/introspection-plan.md` re-based (§3.4); the three `MAX_CPUS` declarations filed as an issue; all five `CLAUDE.md` files. **`specs/completion-architecture-spec.md` is not in this tree** (**CONFIRMED**: it exists only on `wt/toyos-compl`, not on `origin/main`), so L8 cannot de-path its citations and `every_named_issue_file_resolves` will not see them — but it cites three of these slugs by full path and that becomes *its* C0's red, which §12.7 records so it is not discovered by CI | `cargo test --lib` — `every_named_issue_file_resolves` is the gate, not "it compiles" |
-| **L9** | measurement: the interleaved four-arm A/B (compl §20.1's protocol, ~68 min of guest time, two worktrees); `io-depth-probe`; the positive log-content assertion; assertions written into `tests/audio-baseline.toml` and the numbers into this spec | §9.3 |
+| **L4** | **Done 2026-08-15.** The kernel's half of L-ABI, which touches no sysroot source: the `SYS_LOG_READ` dispatch over `drain_ordered` (`kernel/src/log/user.rs`), `Source::Log` and its watcher static (§3.2), `logread` in `toyos_manifest`'s `SYSCAP_RIGHTS` and on `test-runner`'s row in the six test configs that have one. **Two things the row did not name and L4 found it owed**: `Rights::LOG` and `Rights::WAIT` on the one full-rights `SysCap` the kernel makes for `/bin/init` — rights only shrink, so a bit absent at the root is a bit no manifest can name — and `logread` being *two* bits, because `SYS_LOG_READ` never blocks and a holder that may read but not park has to spin. §9.1's storm and §9.2's nesting injection with it | `test-runner` reads its own kernel log and §9.1's conservation law holds across the syscall — `log_conservation_smp1`, `log_conservation_smp4` and `log_conservation_smp8`, and `log_nested_emit` — the registered names, which are three and not one (§9.5). §9.5 records what `log_migration_storm` measured and why it was struck |
+| **L5** | **Done 2026-08-15.** One `ConsoleObject` per *holder* over one backend and its line buffer — `build_child_handles` mints a child's rather than duplicating its parent's handle, which is what makes "per holder" literal before L7's pipes exist (§4.4); the ANSI strip and its state move onto the buffer; `MAX_CONSOLE_LINE` unchanged; `ConsoleObject::drop` flushes a process that exited mid-line. **Three things this row asked for are not built and §4.4 says why**: `Console` keeps `DUP` (stdio inheritance *is* a duplicate, so dropping it at L5 refuses every spawn — it dies with L7's pipes), and the second `spawn_init` console and the `console = true` manifest key are unnecessary once a holder's console is minted at spawn | `console_line_atomicity`, 0 of 2000 mixed with `Serial::interleaved` silent and a mid-line exit's hundred unterminated bytes on the wire whole; `console-unbuffered` reds it 8 of 8 and removing `ConsoleObject::drop`'s flush reds it 2 of 2 |
+| **L6** | **Done 2026-08-15.** `/bin/logd` (`userland/logd/`, three files): the program, its row in **all twelve** manifests (§5.1a — eleven plus `tests/logrotatecase/`, which L6 adds), `diag/`'s restated comment, rotation, retention, the give-up policy; **`SYS_FSYNC`'s device flush, outright** (§12.4); the §6.4 clamp, which was F3 — documented in the ABI and in §3.2 and implemented nowhere. **`log_file.rs` deleted whole**, with `flush_log_file_if_affordable`, `log_file_flush_due`, `LOG_DEFERRAL_CEILING_NS`, `LOG_DEFERRED_SINCE`, `owes_wake` and the fourth pre-`hlt` condition; `wait_for_log_file` re-pointed at `LOG_DURABLE_NS`; §6.3's shutdown, which reads the same word. **Four things this row asked for are not built and each says why**: §5.2's protocol has no caller before L7 and `serves = ["log"]` goes with it (§5.1); `Sync` is struck outright (§5.2, §6.3); §5.3's per-client backlog is a bound on clients logd does not have yet; and the two negative controls are deferred to L9 with their instruments (§9.4). **One thing it did not ask for and L6 owed**: `toyos-wallclock/`, because naming a file for local time in userland is a recovery problem with a provably ambiguous band (§5.5) | `kernel_log_file` re-pointed and green mid-run and after shutdown — **measured 2026-08-15**, 11,442 bytes on the device 19 ms after the ready marker with `Boot: complete` in them, 11,896 after the shutdown carrying its own last line, and the rotation arm continuing into further parts with that line in one of them — four continuations into five parts with the line in part 5 of 5 in one boot and five continuations into six parts with the line in part 5 of 6 in another, **both samples**: the gate searches every part and prints which, so the figures move between runs without anything having moved; `every_boot_config_runs_logd`; `usb_flush_optional` at `BOUND = 4` failing flushes against **1,737** for a logd that retried (§5.4); `toyos-wallclock`'s nine host tests, the ninth being the whole-domain scan that says `Recovery`'s third variant was a state no input reaches |
+| **L7** | userland stdio → IPC: init creates and registers the pipes; the launcher and sshd do the same for what they spawn; the std PAL's `Gone` behaviour; every console assertion in the suite re-pointed. **Three rows L6 handed forward**: `serves = ["log"]` on logd's manifest row and the `log` acceptor with it (§5.1), §5.2's `Register` frame and its `MAX_STREAM_LABEL`/`MAX_STREAMS` bounds, and §5.3's per-client backlog — each arrives with the first thing that sends or fills it, which is these pipes | full suite; the 234 `println!`/141 `eprintln!` sites unchanged and their output still on the console; `every_boot_config_runs_logd` gains its `serves` clause |
+| **L8** | the deletion commit; the `specs/issues/` closures of §8.2 **and the citations that go stale with them**; `specs/introspection-plan.md` re-based (§3.4); the three `MAX_CPUS` declarations filed as an issue; all five `CLAUDE.md` files. **`specs/completion-architecture-spec.md` is not in this tree** (**CONFIRMED**: it exists only on `wt/toyos-compl`, not on `origin/main`), so L8 cannot de-path its citations — and nothing will see them, because `src/docs.rs` is deleted (§12.7): it cites three of these slugs by full path and those pointers simply go quiet at that branch's C0, which §12.7 records because no gate will | `cargo test --lib` still has to pass, and **nothing in it checks a citation**: `src/docs.rs` and every test over `specs/` prose were deleted by owner ruling (`8d0db10`), so what gates this chunk is `rg <slug>` and a reviewer reading the diff (§8.2, §12.7) |
+| **L9** | measurement: the interleaved four-arm A/B (compl §20.1's protocol, ~68 min of guest time, two worktrees); `io-depth-probe`; the positive log-content assertion; assertions written into `tests/audio-baseline.toml` and the numbers into this spec. **And the two negative controls L6 deferred here**, `log-writes-the-file` and `log-trusts-durable`, because the first reds `io-depth-probe` and §9.3's reading 1 — instruments this chunk is what builds — and the second needs a publisher of a bad `durable` as well as a kernel that believes one (§9.4). **Plus §6.4's `usb-slow-device` measurement of `LOG_FILE_DRAIN_NANOS`**, which is the same instrument and the same worktree pair | §9.3 |
 | **L10** | **conditional on the owner (§6.6, §13.1)** — pstore: the reserved region, the panic copy, the boot validate, the `SYS_LOG_READ` flag, logd's `prev-crash` file, `pstore_survives_reset` over QMP, and the `specs/issues/` entry recording that the metal arm is owed | its own; a red here is not a red on L1–L9 |
 
 **Dependencies.** L-ABI → L1. L1 → L2, L3, L4. L3 and L4 → L6. L5 → L7. L6 → L7.
@@ -3067,7 +3558,7 @@ by the tree's own rule and a build warning by its build.
 
 **Two rows moved at L1, and each is a thing this table had in the wrong chunk.**
 
-- **`log_conservation`, `log_nested_emit` and `log_migration_storm` are L4's, not
+- **`log_conservation_smp{1,4,8}`, `log_nested_emit` and `log_migration_storm` are L4's, not
   L1's.** All three read records back through `SYS_LOG_READ`, and L4 is what
   dispatches it — at L1 there is no way for `test-runner` to see a shard at all.
   The `log-storm`, `log-nested-emit`, `log-shared-reservation` and
@@ -3312,18 +3803,26 @@ cache flush. **CONFIRMED against this tree, 2026-08-09:**
   **only** `crate::vfs::lock().flush_file(...)` at `:644`. There is no
   `sync_mount` and no `dev.flush()` anywhere on that path.
 
-So today's `SYS_FSYNC` stops one level short of what `log_file` does. **The
-earlier draft said "L6 owes the equivalent regardless of what C12 does to
-parking"; under the ruled order the hedge is gone and L6 owes it, full stop** —
-C12 does not exist yet, and a logd that fsyncs and calls the result durable
-without it is a spec lying about its own guarantee. That is a change to a shipped
-syscall's semantics and therefore a decision rather than an implementation
-detail: either `SYS_FSYNC` gains the mount sync for every caller — which makes
-every `fsync` in the machine slower and more honest — or logd gets a distinct
-call and the asymmetry is written down. **L6 raises it; the second option needs a
-new syscall number, which needs discussion, and it would be a *second* number on
-a branch §11 has already structured around one.** `log_is_durable_after_fsync`
-(§9.5) is the gate, and it reds on today's behaviour.
+So `SYS_FSYNC` stopped one level short of what `log_file` did. **The earlier
+draft said "L6 owes the equivalent regardless of what C12 does to parking";
+under the ruled order the hedge is gone and L6 owed it, full stop** — C12 does
+not exist yet, and a logd that fsyncs and calls the result durable without it is
+a spec lying about its own guarantee.
+
+**As built at L6 the first option is taken: `SYS_FSYNC` gains the mount sync,
+for every caller.** `ops::fsync` runs `flush_file` and then `Vfs::sync_for_path`
+under one acquisition of the VFS lock — one and not two, because two would let
+the file's own mount be unmounted between them. The second option, a distinct
+call for logd, needs a new syscall number, which needs discussion, and it would
+be a *second* number on a branch §11 has already structured around one; it would
+also leave every other `fsync` in the machine quietly weaker than the one program
+that noticed. Every `fsync` is slower for this and more honest.
+
+**The gate is `usb_flush_optional` and not a name of its own** (§9.5): its whole
+subject is a device that refuses SYNCHRONIZE CACHE, so it reds the moment the
+syscall stops issuing one, which is exactly the regression this row exists
+against. `kernel_log_file`'s mid-run read is the positive half — the log is on
+the *image*, read host-side, while the guest is still running.
 
 **What C12 then inherits.** compl §13 says *"`SYS_FSYNC` parks on a real
 completion"* and separately that parking is not durability. After L6 the two
@@ -3352,21 +3851,28 @@ this spec's favour — L0 checked the code rather than the plan, which is what i
 was for:**
 
 - **endow §1.5 says of `ConsoleObject` "there is exactly one of them for the
-  machine".** The code does not: `ConsoleObject::new()` mints a fresh object per
-  call (`object/device.rs:202`) and there is one call site. So "one *backend*,
-  one object per endowment" needs no edit to anything — only a second call
-  site, which §4.4 puts in `spawn_init`.
+  machine".** The code did not even then: `ConsoleObject::new()` mints a fresh
+  object per call and there was one call site. **As built there are two, and
+  neither is the one this bullet predicted**: `loader::mod`'s `spawn_init` for
+  init's, and `loader::start::build_child_handles` for *every* inherited console
+  slot — one object per **holder**, minted at spawn, rather than one per
+  endowment with a second `spawn_init` call for logd. §4.4 carries the argument
+  and the reason the predicted shape could not deliver its own gate.
 - **endow §1.5 gives `Console` `READ|WRITE|DUP|TRANSFER|WAIT`.** As built it is
-  `BASE | READ | WRITE` (`object/ops.rs:50`), and `BASE` carries `DUP`. §4.4
-  drops `DUP`, so "exactly two" is structural rather than gated. L5's edit, one
-  arm.
+  `BASE | READ | WRITE` in `initial_rights`, and `BASE` carries `DUP`. **This
+  bullet said L5 drops `DUP` and L5 keeps it**: stdio inheritance *is* a
+  duplicate — `build_child_handles` calls `duplicate_entry` on every slot pair —
+  so a `Console` without `DUP` refuses every spawn in the machine. The right
+  dies with its last caller, which is L7's pipes. §4.4 is where that was argued
+  and this row is what it corrects.
 
 Neither touches a syscall number or a struct layout.
 
 **And two programs this spec endows are not in the manifest it would endow them
-from** — `console` and `test-runner` are in `console/system.toml` and the three
-`tests/*case/system.toml` respectively, never in `system.toml`. §5.1a is the
-six-manifest table that follows from it.
+from** — `console` is in `console/system.toml` and `test-runner` in the
+`tests/*case/system.toml` configs, never in `system.toml`. That is what sent
+§5.1a looking, and **the table it found is twelve manifests rather than the six
+this sentence expected**; eight of the twelve carry a `test-runner` row.
 
 ### 12.6 Every completion primitive this branch does without
 
@@ -3389,10 +3895,17 @@ a spec that quietly drops a wrong claim teaches the next reader nothing.
 | a caller-side write `Deadline` (its §12.3) | the live 2 s `USB_TIMEOUT_NS` (`xhci/mod.rs:319`, **CONFIRMED**) gives logd an `Io` to act on | whatever C7 picks, **it must leave logd an error rather than an unbounded park** (§5.4) |
 | the write-back queue (its C12) | `SYS_FSYNC` gains the mount sync at L6 (§12.4) | C12 changes what `SYS_FSYNC` *costs*, never what it *guarantees* |
 
-### 12.7 One thing this branch breaks on the other branch, named so CI does not find it
+### 12.7 One thing this branch breaks on the other branch, named so nobody has to find it
 
-`src/docs.rs`'s `every_named_issue_file_resolves` walks every text file in the
-tree and reds on a `specs/issues/<area>/<slug>.md` path that does not resolve.
+**This section was written against a gate that no longer exists, which is the L5
+review's F2**, and the heading said "so CI does not find it". `src/docs.rs`'s
+`every_named_issue_file_resolves` walked every text file in the tree and red on
+a `specs/issues/<area>/<slug>.md` path that did not resolve; it and every test
+over `specs/` prose were deleted by owner ruling (`8d0db10`, `src/CLAUDE.md`).
+**CI will not find this — nobody will, until a reader follows the pointer**,
+which makes writing it down here the whole of the mechanism rather than an
+early warning about a red.
+
 L8 deletes ten entries (§8.2) and de-paths every citation **in this tree**.
 `specs/completion-architecture-spec.md` is not in this tree, and its §19 records
 that it cites `client-cpu-takes-the-log-flush` by full path in its own §1.3, that
@@ -3403,12 +3916,13 @@ path from files that are not their own entry.
 Its §19 concludes that *"§1.3's full-path citation therefore stays live through
 this branch and goes stale at log L8, not at C13."* **Under the ruled order that
 is backwards**: L8 lands first, so the citation is already dead when that branch
-merges `origin/main` at its C0, and `cargo test --lib` reds on its own spec file
-the moment it does. It is a one-line edit and it is in nobody's chunk budget, so
-it is written here: **the completion branch's C0 de-paths every citation of a
-slug this branch closed, in the same commit as the merge.** The
-`specs/issues/README.md` protocol — move the durable rule into the spec that owns
-the subject — is the same edit.
+merges `origin/main` at its C0, and it will point at nothing, quietly, for as
+long as nobody reads it. It is a one-line edit and it is in nobody's chunk
+budget, so it is written here: **the completion branch's C0 de-paths every
+citation of a slug this branch closed, in the same commit as the merge**, and
+`rg <slug>` over that tree is how it finds them. The `specs/issues/README.md`
+protocol — move the durable rule into the spec that owns the subject — is the
+same edit.
 
 ---
 
@@ -3588,11 +4102,16 @@ Recorded because each is attractive and the next reader will re-derive it.
     take and which deadlocks the first time anything on that lock's path logs.
     The narrower thing §2.6a takes instead is `wake_direct`, which the scheduler
     has had all along.
-12. **A syscall that mints a `ConsoleObject`.** It is the obvious way to give
-    `logd` the second one, and it hands every process a name it can ask the
+12. **A syscall that mints a `ConsoleObject`.** It is the obvious way to give a
+    program one of its own, and it hands every process a name it can ask the
     machine's console for — connect-by-name, rebuilt at the one object the
-    panic path depends on. `spawn_init` minting both is the same capability
-    moved by endowment, which is what §4.4 takes.
+    panic path depends on. **What §4.4 takes instead is the spawn path**:
+    `build_child_handles` mints a child's console for each inherited slot, so a
+    program gets one exactly when its parent's slot map says it does. That is
+    the same capability moved by endowment and not a name anything can ask for.
+    (This row used to say "`spawn_init` minting both", which was the shape
+    before L5 measured that one object shared by init, the compositor, soundd,
+    netd and `test-runner` could not pass §9.5's own gate.)
 8. **Converting all 654 `log!` sites to a finer level set.** A level with no
    reader is a field built for a plan; §2.1's three variants each have callers
    today.

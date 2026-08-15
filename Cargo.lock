@@ -1132,6 +1132,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "toyos-wallclock"
+version = "0.1.0"
+
+[[package]]
 name = "toyos-xhci"
 version = "0.1.0"
 

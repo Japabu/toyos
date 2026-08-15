@@ -214,10 +214,13 @@ const _: () = assert!(core::mem::offset_of!(PerCpu, log_shard) == 264);
 ///
 /// It was 16 KiB, and that number was never a decision about the work this
 /// stack carries. The idle loop runs a scheduler pass, `drain_irqs` — which
-/// reaches USB enumeration — `log_file::poll`, a filesystem write down to a
-/// block device whose measured high water was **11,505 bytes of the 16,384**
-/// with the USB command path still below the probe, and
-/// `object::drain_zero_handles`, which releases arbitrary kernel objects.
+/// reaches USB enumeration — and `object::drain_zero_handles`, which releases
+/// arbitrary kernel objects. **It also ran `log_file::poll` until log
+/// architecture L6**: a filesystem write down to a block device, whose measured
+/// high water was **11,505 bytes of the 16,384** with the USB command path still
+/// below the probe. That caller is gone; the number stays because it is what
+/// established the depth this stack can be driven to, and `drain_irqs` still
+/// reaches a device from here.
 ///
 /// That last one is why this is the same number a task's kernel stack is.
 /// `kobject!` classifies each object `deferred` or `immediate`, and an

@@ -187,9 +187,11 @@ impl Default for Cursor {
 /// **Words rather than a `Cursor` behind a cell**, because the panic path's
 /// bypass reads the position with no backend lock held — that is what the
 /// bypass *is* — and an array of `AtomicU64` has no torn read to reason about.
-/// `log_file` keeps its own position the same way for a plainer reason: its
-/// pending predicate is read from the pre-`hlt` check with interrupts off and
-/// may take no lock.
+/// `log_file` kept its own position the same way, for a plainer reason: its
+/// pending predicate was read from the pre-`hlt` check with interrupts off and
+/// could take no lock. That reader is gone at L6 and this one is not — the
+/// console's drain is the shared cursor and always was the one this type exists
+/// for.
 pub struct Published {
     next: [core::sync::atomic::AtomicU64; MAX_LOG_SHARDS],
     lost: core::sync::atomic::AtomicU64,
@@ -328,6 +330,37 @@ pub fn drain_ordered(cursor: &mut Cursor, out: &mut impl RecordSink) -> usize {
         }
         cand[i] = cursor.open(i, shards[i]);
     }
+}
+
+/// The `at_ns` of the newest committed record in the machine, or zero when no
+/// shard holds one.
+///
+/// **The clamp's ceiling** (§6.4). `LogCursor::durable` is a number a userland
+/// process wrote and a dying kernel waits on, so it is bounded by something the
+/// kernel knows for itself: nothing can have been made durable that is newer
+/// than the newest record there is. An unclamped `u64::MAX` from a buggy
+/// `/bin/logd` would otherwise satisfy `wait_for_log_file` at once and lose the
+/// report in silence.
+///
+/// One [`Descent`] per shard on the stack, no lock, no allocation — the same
+/// shape as its two siblings. The descent is bounded by the shard's own window
+/// and in practice stops on its first candidate: a sequence number below `head`
+/// is committed unless its writer is inside the publication bracket right now.
+pub fn newest_committed_at_ns() -> u64 {
+    let mut newest = 0;
+    for shard in super::shards().iter().flatten() {
+        let mut descent = IDLE;
+        descent.shard = Some(shard);
+        // `head` counts reservations, so the newest number that can carry a
+        // record is one below it.
+        descent.next = shard.head().saturating_sub(1);
+        descent.floor = shard.oldest_readable();
+        descent.advance(0, u64::MAX);
+        if let Some((_, at_ns)) = descent.cand {
+            newest = newest.max(at_ns);
+        }
+    }
+    newest
 }
 
 /// Is there a committed record this cursor has not taken?

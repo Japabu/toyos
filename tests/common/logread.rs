@@ -43,6 +43,21 @@ impl Report {
     }
 }
 
+/// A name two of the guest's lines both defined.
+///
+/// **Not a merge, because the two lines are different subjects.** The guest
+/// prints its ledger over several `log-gate:` lines and this file reads them
+/// into one map, so a name appearing twice means the number a test asserts on
+/// came from whichever line was printed last — silently, and with the other
+/// line still on screen looking like the evidence. The nest and storm lines
+/// already share `read=` and `dropped=`, and every gate here reads exactly one
+/// of the two.
+struct Contaminated {
+    key: String,
+    first: u64,
+    second: u64,
+}
+
 /// §9.1's conservation law, at one width.
 ///
 /// **Three registered names and not one, and the reason is the fast tier's
@@ -151,6 +166,62 @@ pub fn log_nested_emit(
     Ok(())
 }
 
+/// §3.2: a pending poll on the machine's log is not something a handle closing
+/// can cancel.
+///
+/// **The L4 review's F1, gated.** `object::ops::close` handed every source the
+/// closing object named to `io_uring::remove_fd`, which cancels across every
+/// ring in the machine — right for a pipe whose other end has really gone, and
+/// wrong for a stream that outlives every handle. Every `SysCap` maps to
+/// `Source::Log`, so any process closing any capability posted `-NotFound` into
+/// every pending log poll there was. It was latent while nothing parked on one
+/// and live from the moment `/bin/logd`'s whole loop is read-then-park.
+///
+/// The verdict is the guest's and it has two halves: closing a second handle to
+/// the same capability completes nothing, and a record afterwards still
+/// completes the poll — so what the close did not take was a live arming and not
+/// an absent one. The immediate half is retried against a record committing in
+/// the same microseconds, which is distinguishable because an honest completion
+/// leaves the cursor owing records.
+pub fn log_poll_outlives_a_close(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    close_probe(test_config, c_bins, rust_bins, &[])
+}
+
+fn close_probe(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+    params: &'static [&'static str],
+) -> Result<(), String> {
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions { kernel_params: params, ..Default::default() },
+    );
+    let result = qemu.run_test("log-close", CEILING);
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\nstdout:\n{}", result.stdout));
+    }
+    if result.exit_code != Some(0) || !result.stdout.contains("log-close: OK") {
+        return Err(format!(
+            "the close probe exited {:?}\n{}",
+            result.exit_code, result.stdout
+        ));
+    }
+    let survived = result
+        .stdout
+        .lines()
+        .find(|l| l.contains("log-close: survived="))
+        .ok_or_else(|| format!("the guest never said what it saw\n{}", result.stdout))?;
+    eprintln!("  [log] {}", survived.trim());
+    Ok(())
+}
+
 /// Boot one machine with the storm armed and read the gate's verdict off it.
 fn storm(
     test_config: &Path,
@@ -191,13 +262,37 @@ fn storm(
             result.stdout
         ));
     }
-    Ok(Report { fields: fields(&result.stdout), stdout: result.stdout })
+    let fields = fields(&result.stdout).map_err(|c| {
+        format!(
+            "--smp {smp} {params:?}: two of the guest's `log-gate:` lines define `{}` ({} and \
+             {}), so every number read out of this report is whichever line came last\n{}",
+            c.key, c.first, c.second, result.stdout
+        )
+    })?;
+    Ok(Report { fields, stdout: result.stdout })
 }
 
 /// Every `key=<number>` the guest printed, and the two counts it prints as
 /// prose. One parse, so a test asserts on a name rather than on a column.
-fn fields(stdout: &str) -> BTreeMap<String, u64> {
-    let mut out = BTreeMap::new();
+///
+/// **A name defined twice is refused rather than merged.** The guest's report is
+/// several lines about different subjects, and flattening them means a repeated
+/// name silently resolves to the last line printed — with the other line still
+/// in the failure message, looking like the evidence. Refusing is what makes the
+/// flattening safe: it holds exactly while the names really are unique.
+fn fields(stdout: &str) -> Result<BTreeMap<String, u64>, Contaminated> {
+    fn put(
+        out: &mut BTreeMap<String, u64>,
+        key: &str,
+        value: u64,
+    ) -> Result<(), Contaminated> {
+        match out.insert(key.to_string(), value) {
+            None => Ok(()),
+            Some(first) => Err(Contaminated { key: key.to_string(), first, second: value }),
+        }
+    }
+
+    let mut out: BTreeMap<String, u64> = BTreeMap::new();
     for line in stdout.lines() {
         let Some(rest) = line.split_once("log-gate: ").map(|(_, r)| r) else { continue };
         for word in rest.split_whitespace() {
@@ -209,10 +304,10 @@ fn fields(stdout: &str) -> BTreeMap<String, u64> {
                 None => (value, None),
             };
             if let Ok(n) = value.trim_end_matches(&[',', ';'][..]).parse::<u64>() {
-                out.insert(key.to_string(), n);
+                put(&mut out, key, n)?;
             }
             if let Some(n) = producers {
-                out.insert("producers".to_string(), n);
+                put(&mut out, "producers", n)?;
             }
         }
         // "N record(s) over M read(s) from S shard(s)" — the shape of the line
@@ -221,14 +316,14 @@ fn fields(stdout: &str) -> BTreeMap<String, u64> {
         for pair in words.windows(2) {
             let Ok(n) = pair[0].parse::<u64>() else { continue };
             match pair[1] {
-                "record(s)" => out.insert("records".to_string(), n),
-                "read(s)" => out.insert("reads".to_string(), n),
-                "shard(s);" | "shard(s)" => out.insert("shards".to_string(), n),
-                _ => None,
-            };
+                "record(s)" => put(&mut out, "records", n)?,
+                "read(s)" => put(&mut out, "reads", n)?,
+                "shard(s);" | "shard(s)" => put(&mut out, "shards", n)?,
+                _ => {}
+            }
         }
     }
-    out
+    Ok(out)
 }
 
 /// The last of a capture, for a failure message. A storm puts thousands of

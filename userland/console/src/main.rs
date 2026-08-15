@@ -39,8 +39,8 @@ use window::Screen;
 
 const FONT: &str = "/share/fonts/JetBrainsMono-Regular-8x16.font";
 
-/// Where `log_file` puts one file per boot, each named for the wall clock at
-/// the moment that boot's sink installed.
+/// Where `/bin/logd` puts one file per boot, each named for the wall clock at
+/// the moment that boot's logd opened it.
 const KERNEL_LOG_DIR: &str = "/log";
 
 /// How many of those files seed the screen, oldest first.
@@ -265,7 +265,7 @@ fn main() {
 
 /// The newest [`SEED_FILES`] kernel logs on `/log`, oldest first.
 ///
-/// By name, which is by time: `log_file` names each boot's file for the wall
+/// By name, which is by time: `/bin/logd` names each boot's file for the wall
 /// clock in a form that sorts chronologically, and a boot's continuation parts
 /// sort directly after the file they continue.
 ///
@@ -288,11 +288,15 @@ fn newest_kernel_logs() -> Vec<std::path::PathBuf> {
 
 /// Push this boot's kernel log into the scrollback; returns the bytes written.
 ///
-/// Reading a file rather than the ring itself is not a workaround: `log_file`
-/// seeds the sink from the ring's *retained* window, so the file opens at this
-/// boot's first line and carries everything up to the last idle pass. What it
-/// cannot carry is anything logged after this program read it — for that the
-/// owner has a shell and `cat` on the file this names, which is the whole point.
+/// Reading a file rather than a cursor is a **choice this program has not made
+/// yet**, not a workaround. `/bin/logd` starts from a fresh `LogTail`, which is
+/// the oldest record every shard still holds, so the file opens at this boot's
+/// first line and carries everything logd has written. What it cannot carry is
+/// anything logged after this program read it — for that the owner has a shell
+/// and `cat` on the file this names. Reading the cursor directly would show this
+/// boot live and with no file in the path, and it needs `logread` on this
+/// program's manifest row; `specs/log-architecture-spec.md` §5.1a declines to
+/// grant that until something here asks for it.
 fn seed_kernel_log(console: &mut Console) -> usize {
     let mut log = Vec::new();
     for path in newest_kernel_logs() {

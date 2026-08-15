@@ -309,10 +309,22 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             log!("Syncing filesystems...");
             crate::vfs::lock().sync_all();
             log!("Shutting down.");
-            // After that line and before power goes: on a machine with no
-            // serial port these last two lines exist nowhere but the ring, and
-            // `acpi::shutdown` does not come back.
-            crate::log_file::flush_final();
+            // **§6.3, in order, and the order is the whole of it.** At the
+            // moment they are written these last two lines exist nowhere but
+            // the shards, and `acpi::shutdown` does not come back — so a
+            // shutdown that loses its own last lines is the one nobody can
+            // diagnose, and on a machine with no serial port they exist nowhere
+            // else at all.
+            //
+            // 1. Wait, bounded, for `/bin/logd` to make them durable. **This is
+            //    ordinary thread context**, so it yields rather than spins: at
+            //    `--smp 1` logd and this caller are the same CPU and a spin here
+            //    would guarantee the bound expired every time.
+            crate::log::wait_for_durable();
+            // 2. The console, after logd has answered, so the last record —
+            //    including logd's own — is on the wire before the power goes.
+            //    Inline, because `klogd` has no guarantee of another turn.
+            crate::log::console::drain_inline();
             acpi::shutdown();
         }
         SYS_CHDIR => {

@@ -1,0 +1,74 @@
+# The rotation boot: `tests/metalcase`'s machine shape with `/bin/logd` writing
+# 256-byte files instead of mebibyte ones.
+#
+# **A config and not a boot parameter, and that is what L6 changed about it.**
+# `log-rotate-fast` was a kernel actuator armed from the command line, because
+# the rotation bound lived in `kernel/src/log_file.rs`. It lives in `/bin/logd`
+# now (`specs/log-architecture-spec.md` §5.5: "the fast value becomes a logd
+# argument rather than a kernel actuator"), and the way a program gets an
+# argument in this system is its manifest row — so the arming moves from a
+# cmdline the kernel parses into a config the image is built from, which is a
+# capability-shaped answer rather than a global one.
+#
+# What it buys is unchanged, and two tests want it: filling a mebibyte by
+# logging would take a boot far longer than a test should wait, and the code
+# the small bound drives is the shipped code. `kernel_log_file`'s second arm
+# reads the continuations and the retention sweep off the volume;
+# `usb_boot_stick_pulled` wants the FAT allocation and directory writes that a
+# rotation puts *in flight* at the moment the stick is pulled, which a machine
+# that is only ever appending never reaches.
+#
+# It is metalcase's program set and not a smaller one on purpose: both callers
+# are about what the T14's shape does, and a config that dropped the daemons
+# would be measuring a different machine.
+
+assets = ["assets"]
+
+[boot]
+start = ["logd", "compositor", "soundd", "netd", "sshd", "test-runner"]
+
+# **Every image that carries a `TOYOS-LOG` partition runs this**, and every
+# image does. The kernel stopped writing files at L6 of
+# `specs/log-architecture-spec.md`, so a boot config without `logd` is a boot
+# whose `/log` is empty — `every_boot_config_runs_logd` is what refuses one.
+# It claims no device and serves no port yet (§5.1, §5.2): its whole authority
+# is `logread`, which is `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
+[programs.logd]
+args = ["--rotate-fast"]
+syscap = ["logread"]
+
+[programs.compositor]
+serves = ["compositor"]
+receives = ["soundd", "launcher"]
+devices = ["framebuffer", "keyboard", "mouse"]
+
+[programs.soundd]
+serves = ["soundd"]
+devices = ["hda-audio", "virtio-sound"]
+syscap = ["rt"]
+
+[programs.netd]
+serves = ["netd"]
+devices = ["nic"]
+
+[programs.sshd]
+receives = ["netd", "launcher"]
+
+# The union its guest binaries need on this machine shape.
+# `logread` is the log gate's own: a spawned test binary does not inherit a
+# `SysCap` dup, so the gate that reads the kernel's records runs inside
+# `test-runner` itself (`specs/log-architecture-spec.md` §3.2, §9.5).
+[programs.test-runner]
+receives = ["compositor", "soundd", "netd"]
+syscap = ["logread"]
+
+# `run shutdown` is what closes `kernel_log_file`'s second arm, and it spawns
+# `/bin/shutdown`. metalcase carries no toybox and therefore no such name, so
+# this config adds the one applet the gate uses — a boot that could not shut
+# down would run the rotation path and then fail on a tail that was never
+# written, which is what it did the first time this config existed.
+[programs.toybox]
+receives = ["soundd"]
+
+[symlinks]
+"bin/shutdown" = "/bin/toybox"

@@ -34,7 +34,9 @@ A subdirectory `CLAUDE.md` loads when a file in that subtree is `Read`, and not 
 
 **Kernel** — minimal; new additions are discussed and justified. Resource management, scheduling, process lifecycle, filesystem, device arbitration. 2 MB pages, demand paging, PIE binaries, full SMP.
 
-**Userspace daemons** — compositor, netd, soundd, sshd. Each claims a device from the kernel and serves clients over IPC; crash one and the kernel is fine.
+**Userspace daemons** — compositor, netd, soundd, sshd, logd. Each claims a device or capability from the kernel and serves its function; crash one and the kernel is fine.
+
+**The log is a userland file.** `/bin/logd` reads records on a cursor and owns `/log`; the kernel keeps the record ring, the console and the panel, and writes no file. `SYS_FSYNC` reaches the device's cache flush because logd's durability claim rests on it.
 
 **Syscall ABI** — `toyos-abi/`: struct layouts, syscall numbers, typed wrappers; completely unstable, read the code. Never add or change a syscall without discussion; a deleted syscall's number is retired, never reused. `toyos/` builds on it with typed handles, IPC framing, ports, namespaces and `surface` — userland uses `toyos`, the kernel uses `toyos-abi` only.
 
@@ -77,6 +79,7 @@ userland/          All userland programs
 toyos-abi/         Kernel ABI (types, constants, syscall numbers, syscall wrappers)
 toyos/             Userland SDK (typed handles, IPC, ports, namespaces, surface, shm, net)
 toyos-manifest/    The one definition of `/etc/system.manifest`
+toyos-wallclock/   The calendar, and the zone offset userland has to recover — pure
 toyos-keymap/      Layouts, dead-key composition, key translation, layout detection
 toyos-fat32/       FAT32 driver, read + write; no format path by design
 toyos-fat32-check/ FAT32 checker from Microsoft's fatgen103 — the outside judge

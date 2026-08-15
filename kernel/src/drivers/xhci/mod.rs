@@ -365,8 +365,8 @@ fn port_answers() -> bool {
 /// and the only state in which the cost of waiting for one is visible. Same
 /// reason `usb-transport-break` and `xhci-slow-connect` exist.
 ///
-/// Two milliseconds: a Bulk-Only round trip is three transfers, and one
-/// `log_file` flush is a page write, a FAT entry, a directory entry and a
+/// Two milliseconds: a Bulk-Only round trip is three transfers, and one of
+/// `/bin/logd`'s flushes is a page write, a FAT entry, a directory entry and a
 /// SYNCHRONIZE CACHE — so about ten round trips, which puts a flush at the ~50
 /// ms the T14 measured. It is deliberately *not* one stick's number: what the
 /// gate asserts is that the machine stays responsive while a device is slow,

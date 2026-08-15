@@ -59,7 +59,14 @@ const RTC_BASE_DATE: &str = "2033-03-07-";
 /// century wrong is out by a hundred years rather than by seconds.
 const MAX_BOOT_DRIFT_SECS: i64 = 300;
 
-/// How many logs `log_file::MAX_LOG_FILES` keeps. Mirrored rather than shared,
+/// What [`boot_and_read`] makes the guest print into the window between the
+/// ready marker and the first test it runs.
+///
+/// Distinctive enough that nothing else on a console could be it, and short
+/// enough to be one `write`.
+const WINDOW_MARKER: &str = "between-tests-window-is-captured";
+
+/// How many logs `/bin/logd`'s `MAX_LOG_FILES` keeps. Mirrored rather than shared,
 /// so moving the kernel's bound without looking at this fails here rather than
 /// quietly weakening the gate.
 pub const MAX_LOG_FILES: usize = 16;
@@ -103,7 +110,7 @@ fn clock_lines(log: &str) -> String {
     let lines: Vec<&str> = log
         .lines()
         .filter(|l| {
-            l.contains("clock:") || l.contains("log-file:") || l.contains("RTC") || l.contains("rtc")
+            l.contains("clock:") || l.contains("logd:") || l.contains("RTC") || l.contains("rtc")
         })
         .collect();
     if lines.is_empty() {
@@ -152,10 +159,34 @@ fn boot_and_read(
     );
     let mut log = qemu.boot_log().to_string();
     serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
+    // **A line printed into the window between the ready marker and the first
+    // test, staged so that losing it is a red rather than a flake.**
+    //
+    // `logd` writes its retention line, creates this boot's file — a device
+    // write, milliseconds — and then writes its identity line; the window used
+    // to close between the two and the first line was dropped by the harness
+    // with nothing saying so. `run echo` is the smallest thing that lands in
+    // that window on purpose: the guest's runner reads commands in order, so
+    // this whole exchange strictly precedes the probe's `===TEST_START===` and
+    // every line of it arrives while the next `run_test` is waiting for its own
+    // marker. `TestResult::before` is what keeps it.
+    writeln!(qemu.stdin_mut(), "run echo {WINDOW_MARKER}")
+        .map_err(|e| format!("stage the between-tests window: {e}"))?;
+    qemu.flush_stdin();
     // What the two clock syscalls answer, which nothing on the volume can show:
     // the file name is local time and `SYS_CLOCK_EPOCH` serves UTC.
     let probe = qemu.run_test("test_rs_wall_clock_now", Duration::from_secs(30));
+    log.push_str(&probe.before);
     log.push_str(&probe.stdout);
+    if !log.contains(WINDOW_MARKER) {
+        return Err(format!(
+            "the guest printed {WINDOW_MARKER} between the ready marker and the probe's start and \
+             this capture does not carry it — the window between two tests is being dropped, which \
+             is how a daemon's startup line goes missing from a boot nothing else is wrong \
+             with\nbefore:\n{}\nstdout:\n{}",
+            probe.before, probe.stdout
+        ));
+    }
     writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
     qemu.flush_stdin();
     log.push_str(&qemu.drain_serial(Duration::from_secs(20)));

@@ -1647,7 +1647,61 @@ mod tests {
         }
     }
 
-    /// The eleven `system.toml` files this repository builds an image from.
+    /// **Every config with a `[boot] start` runs `/bin/logd`, and `logread` is
+    /// held by exactly the programs that read a cursor.**
+    ///
+    /// `specs/log-architecture-spec.md` §5.1a and §9.5. The kernel stopped
+    /// writing `/log` at L6, so a boot config that does not start `logd` is an
+    /// image whose log partition stays empty for the whole of that boot — and on
+    /// the machine this subsystem exists for, a T14 with no serial port, that is
+    /// the boot with no record of itself anywhere. A thirteenth config added
+    /// later fails the first clause **by default**, which is the direction this
+    /// bound has to fail in.
+    ///
+    /// The second clause is the capability half: `logread` is
+    /// `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate, which is authority
+    /// over every record every CPU wrote, and a right with no caller is a
+    /// capability handed out for a plan. Two programs read a cursor —
+    /// `/bin/logd`, which writes the file, and `test-runner`, which runs the
+    /// conservation gates inside itself — so those two carry it and nothing
+    /// else may. `/bin/console` is the near miss the spec argues about: it
+    /// *could* show this boot's records live off a cursor instead of seeding
+    /// from the previous boot's files, and it does not hold the right until
+    /// something in it reads one.
+    ///
+    /// It reads the **parsed** `ProgramConfig` and never the file text (§3.2):
+    /// a grep over the TOML would pass on a row that is commented out and on a
+    /// key `serde` never saw.
+    #[test]
+    fn every_boot_config_runs_logd() {
+        const READERS: &[&str] = &["logd", "test-runner"];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for config in ALL_CONFIGS {
+            let parsed = parse_config(&root.join(config));
+            assert!(
+                parsed.boot.start.iter().any(|p| p == "logd"),
+                "{config} declares `[boot] start = {:?}` and no `logd` in it, so this image's \
+                 /log is empty for the whole boot",
+                parsed.boot.start,
+            );
+            assert!(
+                parsed.programs.contains_key("logd"),
+                "{config} starts `logd` and has no `[programs.logd]` row to say what it holds",
+            );
+            for (name, program) in &parsed.programs {
+                let holds = program.syscap.iter().any(|s| s == "logread");
+                assert_eq!(
+                    holds,
+                    READERS.contains(&name.as_str()),
+                    "{config}: `{name}` {} `logread`, and the programs that read a cursor are \
+                     exactly {READERS:?}",
+                    if holds { "holds" } else { "does not hold" },
+                );
+            }
+        }
+    }
+
+    /// The twelve `system.toml` files this repository builds an image from.
     /// `every_shipped_boot_config_is_covered` asserts this equals what a walk of
     /// the tree finds, so a config added without a gate row reds rather than
     /// slipping through uncovered.
@@ -1659,6 +1713,7 @@ mod tests {
         "tests/desktopaudiocase/system.toml",
         "tests/doomcase/system.toml",
         "tests/doommusiccase/system.toml",
+        "tests/logrotatecase/system.toml",
         "tests/metalcase/system.toml",
         "tests/netcase/system.toml",
         "tests/sshdcase/system.toml",

@@ -14,6 +14,21 @@
 //! byte for byte from the two numbers it declares. A torn record fails the
 //! text, a lost record that is not counted fails the ledger, and a duplicated
 //! one fails it the other way.
+//!
+//! **Nothing this reader waits for is a record the ring may drop.** It used to
+//! read until every producer had said `logstorm done`, and that record is the
+//! last thing one producer writes rather than the last thing written to its
+//! shard: two producers placed on one CPU means the second's records lap the
+//! first's `done`, and the loop then waited for something that was never
+//! coming — twice in seven suites on the dev host, each time the whole 30 s
+//! ceiling in the fast tier. So the termination condition is the *cursor*: the
+//! log has been drained and nothing new has arrived for [`QUIET_READS`] reads
+//! and [`STORM_SETTLE`] of guest time. A `done` is a cross-check where it
+//! survived and is never waited on, and the same holds of `logstorm start` and
+//! of the nesting burst's own `done`. **The rule this shape exists to keep is
+//! general**: a workload whose liveness depends on a record the ring is allowed
+//! to drop is the same mistake wherever it appears.
+//! `specs/log-architecture-spec.md` §9.1 carries the measurement.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -40,6 +55,12 @@ const BATCH: usize = 64;
 /// its first uncommitted record, so a writer that never publishes takes that
 /// shard out of the merge for good. A green run is under a second of guest
 /// time at every width this gate is booted at.
+///
+/// **It is the guest's own ceiling and it is the smaller of the two**: the host
+/// gives the whole boot 60 s (`tests/common/logread.rs`), so what a hung gate
+/// reports is this one's message and this one's elapsed time. Nothing in the
+/// loop below waits on a record any more, so reaching it now means the kernel
+/// stopped answering rather than that a record went missing.
 const CEILING: Duration = Duration::from_secs(30);
 
 /// Empty reads in a row before the log is called quiet.
@@ -48,13 +69,43 @@ const CEILING: Duration = Duration::from_secs(30);
 /// single empty read can land while a producer is inside its publication
 /// bracket: `drain_ordered` stops that shard and says nothing about it, so a
 /// ledger closed on the first empty read can be short by what was in flight.
+///
+/// **It is the whole termination condition now**, so what it costs when it is
+/// wrong is worth stating: a quiet run that lands mid-storm ends the read early
+/// and the verdict is computed over less of the workload. It cannot make the
+/// verdict *wrong* — the conservation law is over the sequence numbers this
+/// reader took and the loss the kernel counted for the same cursor, and both
+/// are a consistent snapshot at any point — and the non-vacuity clauses in
+/// [`verdict`] are what refuse a run that raced nothing. [`STORM_SETTLE`] is
+/// what makes an early end implausible rather than merely unlikely.
 const QUIET_READS: u32 = 8;
+
+/// How long after the last producer record the log must stay quiet before a
+/// storm counts as finished.
+///
+/// Eight empty reads are sixteen milliseconds of parks, and a producer stalled
+/// inside its publication bracket for that long — a vCPU that the host has not
+/// scheduled, which is the twelve-wide suite's ordinary state — takes its shard
+/// out of the merge and can leave every other shard drained. A hundred
+/// milliseconds of *guest* time on top costs one tenth of a second on three
+/// boots and buys an order of magnitude on that window. It is armed only once a
+/// producer's record has been seen, so an ordinary boot's gate ends on the
+/// quiet reads alone.
+const STORM_SETTLE: Duration = Duration::from_millis(100);
 
 /// How long a park on the log's readiness source waits before giving up on it.
 ///
 /// It is the gate's pacing as much as its wait: with nothing left to say the
 /// kernel posts nothing, and eight of these is the whole tail of the run.
 const IDLE_NANOS: u64 = 2_000_000;
+
+/// How long the deterministic readiness round waits for its own record.
+///
+/// Generous, because what it bounds is a scheduler getting round to a child's
+/// exit on a machine that has just run a storm on every CPU — not the post,
+/// which is one function call after the drain. A gate that timed out here would
+/// be reporting the host's load and not the kernel's.
+const READINESS_WAIT_NANOS: u64 = 2_000_000_000;
 
 /// The poll's token. One handle is watched, so it identifies the round rather
 /// than the source.
@@ -132,16 +183,32 @@ struct Run {
     /// `log::storm::start_once` spawns, and the cursor is what says how many
     /// shards there are.
     storm: Option<u32>,
-    /// What every producer's `done` declared. They must agree.
+    /// What `logstorm start` or a producer's `done` declared, where one of
+    /// those records survived. They must agree. **A cross-check and never a
+    /// requirement**: both kinds are records like any other and the ring is
+    /// allowed to drop either, so [`verdict`] derives the count from the
+    /// highest index any producer reached when neither arrives.
     declared: Option<u64>,
-    /// The nesting gate's declared burst, once its `done` has been read.
+    /// The nesting gate's declared burst, once its `done` has been read. Read
+    /// the same way, for the same reason.
     nest: Option<u64>,
     records: u64,
     reads: u64,
-    /// Records read while the storm was still running. **Zero would mean this
-    /// reader raced nothing**, which is the one way a green conservation law
-    /// says nothing at all.
+    /// Producer records — a storm's or the nesting burst's — this reader took.
+    producer_records: u64,
+    /// Producer records read **strictly before the last batch that carried
+    /// one**, which is exactly "records this reader took while the producers
+    /// were still emitting": a later batch carrying a producer record proves
+    /// the workload had not finished when this one was read. **Zero would mean
+    /// this reader raced nothing**, which is the one way a green conservation
+    /// law says nothing at all.
+    ///
+    /// It needs no `done` and no clock, only the order of the batches.
     concurrent: u64,
+    /// When the last batch carrying a producer record was read. `None` until
+    /// one is, which is what leaves an ordinary boot's gate on the quiet reads
+    /// alone.
+    last_producer_at: Option<Instant>,
     /// Times the log's readiness source completed a poll. The `Source::Log`
     /// half of L4, asserted rather than assumed.
     completions: u64,
@@ -158,55 +225,87 @@ fn gate(cap: &SysCap) -> Result<(), String> {
         nest: None,
         records: 0,
         reads: 0,
+        producer_records: 0,
         concurrent: 0,
+        last_producer_at: None,
         completions: 0,
     };
 
-    // **Armed before the first read**, which is what makes a completion
-    // deterministic rather than lucky: the first read is what starts the storm,
-    // so the records that answer this poll are committed after it was
-    // registered. `min_complete` 0 with no timeout submits and returns.
+    // **Armed before the first read and kept armed**, which is what makes a
+    // completion deterministic rather than lucky: the first read is what starts
+    // the storm, so the records that answer this poll are committed after it was
+    // registered, and re-arming after every harvest means a post landing *during*
+    // the storm finds a pending poll rather than a gap.
+    //
+    // **It used to arm only on an empty read, and that made the assertion
+    // depend on the shape of the boot.** During a storm no read is empty, so the
+    // only poll in flight was the one from before the first read; whether it was
+    // ever completed came down to when `klogd` happened to get a turn. At
+    // `--smp 4` that measured `wakes=1`, and at `--smp 8` with `/bin/logd` also
+    // reading the cursor it measured **zero** — a red about scheduling rather
+    // than about the readiness source. `min_complete` 0 with no timeout submits
+    // and harvests without blocking, so this costs one syscall a round.
     let poller = Poller::new(1);
-    poller.poll_add(cap, IORING_POLL_IN, LOG_TOKEN);
-    poller.wait(0, 0, |_| run.completions += 1);
+    let mut armed = false;
 
     let mut quiet = 0u32;
     let started = Instant::now();
     loop {
+        if !armed {
+            poller.poll_add(cap, IORING_POLL_IN, LOG_TOKEN);
+            armed = true;
+        }
+        poller.wait(0, 0, |token| {
+            assert_eq!(token, LOG_TOKEN, "the log poll completed with another token");
+            run.completions += 1;
+            armed = false;
+        });
+
         let batch = tail
             .read(cap, &mut buf)
             .map_err(|e| format!("SYS_LOG_READ refused a {BATCH}-record buffer: {e:?}"))?;
         run.reads += 1;
-        // **Whether the storm was still running when this batch was taken.**
-        // Read before the batch is accounted, so a batch that carries a
-        // producer's `done` still counts as concurrent — it was read while that
-        // producer was working. Zero of these is a reader that raced nothing.
-        let still_storming = !all_done(&run.producers, run.storm);
         if batch.is_empty() {
             quiet += 1;
         } else {
             quiet = 0;
             run.records += batch.len() as u64;
-            if still_storming {
-                run.concurrent += batch.len() as u64;
-            }
         }
 
+        // **The concurrency evidence, from the order of the batches alone.**
+        // Taken across the whole batch rather than per record: if this batch
+        // carried a producer record, then everything this reader had taken from
+        // a producer *before* it was taken while that producer was still
+        // emitting. The last such batch is what fixes the number, so it is
+        // assigned and not accumulated.
+        let producer_records_before = run.producer_records;
         let shards = tail.shards();
         for record in batch {
             account(record, &mut run, shards)?;
         }
+        if run.producer_records > producer_records_before {
+            run.concurrent = producer_records_before;
+            run.last_producer_at = Some(Instant::now());
+        }
 
-        if all_done(&run.producers, run.storm) && nest_done(&run) && quiet >= QUIET_READS {
+        // **The cursor decides, not a record.** Caught up, quiet for
+        // `QUIET_READS` reads, and — once a producer has been seen — quiet for
+        // `STORM_SETTLE` of guest time as well.
+        let settled = run
+            .last_producer_at
+            .is_none_or(|at| at.elapsed() >= STORM_SETTLE);
+        if quiet >= QUIET_READS && settled {
             break;
         }
         if started.elapsed() > CEILING {
             return Err(format!(
-                "gave up after {:?}: {} records over {} reads, storm {:?}, {} producer(s) done",
+                "gave up after {:?}: {} records over {} reads, storm {:?}, {} producer record(s), \
+                 {} producer(s) done",
                 started.elapsed(),
                 run.records,
                 run.reads,
                 run.storm,
+                run.producer_records,
                 run.producers.values().filter(|p| p.emitted.is_some()).count(),
             ));
         }
@@ -214,34 +313,41 @@ fn gate(cap: &SysCap) -> Result<(), String> {
             // **Nothing new, so park on the readiness source rather than spin.**
             // `SYS_LOG_READ` never blocks by design; this is the other half of
             // that design, and the timeout is what bounds a machine that has
-            // nothing left to say.
-            poller.poll_add(cap, IORING_POLL_IN, LOG_TOKEN);
+            // nothing left to say. The poll is already armed by the top of the
+            // loop, so this parks on it rather than adding a second.
             poller.wait(1, IDLE_NANOS, |token| {
                 assert_eq!(token, LOG_TOKEN, "the log poll completed with another token");
                 run.completions += 1;
+                armed = false;
             });
         }
     }
 
-    verdict(&tail, &run)
-}
-
-/// Has the nesting burst finished? Vacuously true when none was injected, and
-/// **`false` from the moment one of its records is seen**: the burst's own
-/// `done` is emitted after it and is therefore the newest thing in that shard,
-/// so a reader that never sees it is a reader that stopped too early.
-fn nest_done(run: &Run) -> bool {
-    if run.nest.is_some() {
-        return true;
+    // **The readiness source, observed deterministically rather than raced.**
+    // Every completion above is a `klogd` post landing while this poll happened
+    // to be pending, and during a storm that is a race against eight producers:
+    // it measured `wakes=1` at `--smp 4` and **zero** at `--smp 8` once
+    // `/bin/logd` was reading the cursor too, which is a red about scheduling
+    // and not about `Source::Log`. So if the storm produced none, make one —
+    // the shape `log_poll_outlives_a_close` already proves on this tree: a child
+    // that runs and exits commits `process.rs`'s `exit:` line, which is one
+    // kernel record from userland with no actuator and no privilege behind it.
+    if run.completions == 0 {
+        let mut child = std::process::Command::new("/bin/echo")
+            .arg("log-gate")
+            .spawn()
+            .map_err(|e| format!("the record-making child would not start: {e}"))?;
+        let _ = child.wait();
+        if !armed {
+            poller.poll_add(cap, IORING_POLL_IN, LOG_TOKEN);
+        }
+        poller.wait(1, READINESS_WAIT_NANOS, |token| {
+            assert_eq!(token, LOG_TOKEN, "the log poll completed with another token");
+            run.completions += 1;
+        });
     }
-    !run.producers.contains_key(&NEST_PRODUCER)
-}
 
-/// Has every producer said `done`? Vacuously true before a storm record has
-/// been seen, which is what lets this gate also run on an ordinary boot.
-fn all_done(producers: &BTreeMap<u64, Producer>, storm: Option<u32>) -> bool {
-    let Some(threads) = storm else { return true };
-    (0..threads as u64).all(|t| producers.get(&t).is_some_and(|p| p.emitted.is_some()))
+    verdict(&tail, &run)
 }
 
 /// Put one record through both ledgers.
@@ -287,6 +393,15 @@ fn account(record: &Record, run: &mut Run, shards: u32) -> Result<(), String> {
         ));
     }
 
+    // **What the batch-boundary concurrency evidence counts.** Every record
+    // either of this machine's two workloads wrote, `start` and `done` records
+    // included: the question it answers is "had the producers finished when
+    // this batch was read", and a `done` is a producer still working as much as
+    // a patterned record is.
+    if message.starts_with("logstorm ") || message.starts_with("lognest ") {
+        run.producer_records += 1;
+    }
+
     if let Some(rest) = message.strip_prefix("lognest done ") {
         let emitted = rest
             .split_whitespace()
@@ -323,7 +438,8 @@ fn account(record: &Record, run: &mut Run, shards: u32) -> Result<(), String> {
             None => run.declared = Some(emitted),
             Some(declared) if declared != emitted => {
                 return Err(format!(
-                    "producer t={thread} emitted {emitted} records where another declared                      {declared}"
+                    "producer t={thread} emitted {emitted} records where another \
+                     declared {declared}"
                 ))
             }
             Some(_) => {}
@@ -487,39 +603,93 @@ fn verdict(tail: &LogTail, run: &Run) -> Result<(), String> {
     let mut emitted_total = 0u64;
     let mut read_total = 0u64;
     let mut migrated = 0u64;
+    let mut said_done = 0u64;
+    let mut unseen = 0u64;
     if let Some(threads) = run.storm {
-        let declared = run
-            .declared
-            .ok_or_else(|| "storm records were read and no producer ever said `done`".to_string())?;
-        for thread in 0..threads as u64 {
-            let producer = run
-                .producers
-                .get(&thread)
-                .ok_or_else(|| format!("producer t={thread} was declared and said nothing"))?;
-            let emitted = producer
-                .emitted
-                .ok_or_else(|| format!("producer t={thread} never said `done`"))?;
-            if emitted != declared {
-                return Err(format!(
-                    "producer t={thread} emitted {emitted} records against a declared {declared}"
-                ));
+        // **What every producer emitted, from a record where one survived and
+        // from the ledger where none did.** `logstorm start` is written before
+        // the first producer runs and each `done` after that producer's last
+        // record; the storm laps every shard twice, so the ring is allowed to
+        // drop any of them and this gate may not wait for one. The floor is the
+        // highest index any producer reached — a producer emits `0..count`, so
+        // the highest index seen plus one is a count no producer exceeded, and
+        // the producer that finished last on a shard has its final records at
+        // the newest end of it.
+        let derived = run
+            .producers
+            .iter()
+            .filter(|(&t, _)| t != NEST_PRODUCER)
+            .filter_map(|(_, p)| p.next)
+            .max();
+        let declared = match (run.declared, derived) {
+            (Some(declared), _) => declared,
+            (None, Some(derived)) => derived,
+            (None, None) => {
+                return Err("storm records were read and none of them named an index".into())
             }
-            if producer.read > emitted {
+        };
+        for thread in 0..threads as u64 {
+            let Some(producer) = run.producers.get(&thread) else {
+                // **A producer this reader never saw at all is the ring's
+                // declared policy and not a failure**, and this used to be a
+                // hard error. Two producers placed on one CPU write one shard,
+                // and 1,024 records from the second lap all 1,024 of the first:
+                // measured 2 of 7 full suites on the dev host, 2026-08-15, with
+                // 2,582 records overwritten in a shard on the run that produced
+                // it. Refusing it would be refusing the behaviour under test.
+                //
+                // It is not free either — see the ledger check below, which is
+                // what stops "the reader saw nothing of it" from covering a
+                // producer that never ran.
+                unseen += 1;
+                emitted_total += declared;
+                continue;
+            };
+            // **A cross-check where the record survived, never a requirement.**
+            // A producer whose `done` was lapped is a producer the ring
+            // dropped a record of, which is the behaviour under test.
+            if let Some(emitted) = producer.emitted {
+                said_done += 1;
+                if emitted != declared {
+                    return Err(format!(
+                        "producer t={thread} emitted {emitted} records against a declared \
+                         {declared}"
+                    ));
+                }
+            }
+            if producer.read > declared {
                 return Err(format!(
-                    "producer t={thread} emitted {emitted} records and this reader took {}",
+                    "producer t={thread} emitted {declared} records and this reader took {}",
                     producer.read
                 ));
             }
-            if producer.next.is_some_and(|next| next > emitted) {
+            if producer.next.is_some_and(|next| next > declared) {
                 return Err(format!(
-                    "producer t={thread} answered index {} of a declared {emitted}",
+                    "producer t={thread} answered index {} of a declared {declared}",
                     producer.next.unwrap_or(0) - 1
                 ));
             }
-            emitted_total += emitted;
+            emitted_total += declared;
             read_total += producer.read;
             if producer.shards > 1 {
                 migrated += 1;
+            }
+        }
+        // **A producer nobody saw has to be one the ring dropped, and the
+        // ledger is what says so.** `unseen` producers emitted `declared`
+        // records each and none of them was read, so at least that many
+        // sequence numbers must be among the ones the kernel counted lost. It
+        // is a necessary condition rather than an attribution — the cursor's
+        // `lost` is per shard and does not name producers — and it is what
+        // separates "the ring lapped its whole run", which is the behaviour
+        // under test, from "that thread never ran", which is a kernel that did
+        // not spawn what it said it did.
+        if unseen > 0 {
+            let owed = unseen * declared;
+            if reported < owed {
+                return Err(format!(
+                    "{unseen} producer(s) emitted {declared} record(s) each and this reader took                      none of them, while the kernel counted {reported} lost in all — a producer                      can only be invisible because its records were dropped, and the ledger does                      not account for the {owed} that would take"
+                ));
             }
         }
         if read_total == 0 {
@@ -536,16 +706,26 @@ fn verdict(tail: &LogTail, run: &Run) -> Result<(), String> {
         // answer it were committed after it was registered.
         if run.completions == 0 {
             return Err(
-                "the log's readiness source completed no poll across the whole storm".into(),
+                "the log's readiness source completed no poll — not across the storm, and not on \
+                 the record a child's exit commits afterwards either"
+                    .into(),
             );
         }
     }
 
-    if let Some(declared) = run.nest {
-        let burst = run
-            .producers
-            .get(&NEST_PRODUCER)
-            .ok_or_else(|| "an interrupt handler's burst was declared and never seen".to_string())?;
+    if let Some(burst) = run.producers.get(&NEST_PRODUCER) {
+        // The burst's own `done` is read the same way a storm's is: a
+        // cross-check where it survived, and the ledger's own floor where it
+        // did not. The burst laps its shard by construction (§9.2), so a reader
+        // that required that record would be requiring one the design says may
+        // go.
+        let declared = match (run.nest, burst.next) {
+            (Some(declared), _) => declared,
+            (None, Some(next)) => next,
+            (None, None) => {
+                return Err("the nesting burst was seen and named no index".into())
+            }
+        };
         if burst.read == 0 {
             return Err("the nesting burst was injected and none of it was read".into());
         }
@@ -556,7 +736,11 @@ fn verdict(tail: &LogTail, run: &Run) -> Result<(), String> {
             ));
         }
         println!(
-            "log-gate: nest declared={declared} read={} dropped={} shards={}",
+            // `nest_shards` and not `shards`: the line below reports the
+            // machine's shard count under that name, and two lines defining one
+            // name is a host-side reader that silently takes whichever came
+            // last (`tests/common/logread.rs`).
+            "log-gate: nest declared={declared} read={} dropped={} nest_shards={}",
             burst.read,
             declared - burst.read,
             burst.shards,
@@ -571,9 +755,15 @@ fn verdict(tail: &LogTail, run: &Run) -> Result<(), String> {
         seen.len()
     );
     if run.storm.is_some() {
+        // `done=` is the count of producers whose own `done` record survived
+        // the ring, and it is evidence rather than an assertion — the gate no
+        // longer waits for one and the number is what says how often the ring
+        // ate one. Bare, not `k/n`: the host's reader takes the denominator of
+        // an `a/b` field as the producer count and two of those would collide
+        // (`tests/common/logread.rs`).
         println!(
             "log-gate: storm emitted={emitted_total} read={read_total} dropped={} \
-             concurrent={} migrated={migrated}/{} wakes={}",
+             concurrent={} migrated={migrated}/{} done={said_done} unseen={unseen} wakes={}",
             emitted_total - read_total,
             run.concurrent,
             run.producers.len(),

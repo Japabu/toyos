@@ -318,11 +318,14 @@ impl UserBytesMut<'_> {
 
 /// Bytes the kernel copies *from*, wherever they live.
 ///
-/// Exists for one caller: `file_cache::write_page` is reached both by a syscall
-/// carrying a [`UserBytes`] window and by `log_file`, whose bytes are the
-/// kernel's own. A slice cannot express the first and a `UserBytes` cannot
-/// express the second, so the page cache names the capability it needs instead
-/// of one of the two representations.
+/// It existed for two callers: `file_cache::write_page` was reached both by a
+/// syscall carrying a [`UserBytes`] window and by `log_file`, whose bytes were
+/// the kernel's own. **`log_file` is gone at L6 of
+/// `specs/log-architecture-spec.md`** and `/bin/logd` reaches the page cache
+/// through `SYS_WRITE` like any other program, so the second caller is a
+/// kernel-owned buffer no more. The abstraction stays because the page cache
+/// naming the capability it needs is still the right shape and the kernel still
+/// has non-syscall writers; if it ever has none, this goes with them.
 pub trait ByteSource {
     fn len(&self) -> usize;
     fn read_at(&self, off: usize, dst: &mut [u8]);

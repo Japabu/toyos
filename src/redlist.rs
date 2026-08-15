@@ -699,8 +699,11 @@ pub const KNOWN_RED: &[Red] = &[
         finding: Finding::fires(1, 10),
         standing: Standing::Retired(
             "soundd builds each line and issues one `write_all` (its local `say!`) now: 0 of 10 in \
-             run 31283095698. The other 176 `eprintln!` sites in `userland/` do not, so the shape \
-             is open for every other daemon",
+             run 31283095698. The other 176 `eprintln!` sites in `userland/` still do not — and \
+             the shape that left open is closed at the kernel by L5 of the log architecture: a \
+             `ConsoleObject` per holder buffers its line and emits it whole under one \
+             `BackendGuard`, so a kernel record cannot land inside one. `console_line_atomicity` \
+             is the gate, 0 of 2000, and 8 of 8 red under `console-unbuffered`",
         ),
         what: "`STALLED` waiting for both clients to leave the mixer: `soundd: client ` and \
                `1 removed` came back either side of the kernel's four `exit:` accounting lines, so \
@@ -708,7 +711,7 @@ pub const KNOWN_RED: &[Red] = &[
                rather than chance — soundd prints a client's removal exactly while the kernel \
                prints that client's exit",
         evidence: "probe-green run 31282019974 rep 10, and run 31271983043 on `main`",
-        source: "specs/issues/diagnostics/serial-console-has-no-line-atomicity.md",
+        source: "specs/log-architecture-spec.md §4.4",
         measured: "2026-08-09",
     },
     // ---------------------------------------------------------------------
@@ -891,7 +894,11 @@ pub const KNOWN_RED: &[Red] = &[
                so the xHCI prologue is outside the window entirely",
         evidence: "`cargo test -- sched_check_build` on this branch, two boots (parallel phase \
                    then ALONE re-run); green on KVM the same day — twelve of twelve guest shards, \
-                   run 31875856466, where it measured 5,879 ms",
+                   run 31875856466, where it measured 5,879 ms — **and a KVM shard has since \
+                   STALLed it**: run 31890991692, guest 8, STALL and then ALONE GREEN, so the \
+                   unqualified reading above is one session and not the accelerator's property. A \
+                   STALL is a duration and not a verdict, which is why it qualifies this sentence \
+                   rather than opening a row",
         source: "specs/issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
         measured: "2026-08-15",
     },
@@ -924,23 +931,33 @@ pub const KNOWN_RED: &[Red] = &[
         test: "hda_tone",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(1, 3),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the splice is unrepresentable since L5 of the log architecture: a `ConsoleObject` per \
+             holder buffers its line and emits it whole under one `BackendGuard`, so the kernel \
+             record that cut this needle open has nowhere to be acquired. `console_line_atomicity` \
+             is the gate, 0 of 2000 with 8 of 8 red under `console-unbuffered` \
+             (2026-08-15, at counts from 1 to 570 of 2000 — the magnitude is a race and only \
+             the sign is a verdict)",
+        ),
         what: "the needle `soundd: hda codec0 vendor=1af4` split in half by another writer, between \
                `codec` and `0`. Three full suites on one tree in one session, red on the third — so \
                it is not the audio path and not load in any way a re-run answers; it is which two \
                writers happen to collide",
         evidence: "landing-1786130703-71774.log, a documentation-only branch",
-        source: "specs/issues/diagnostics/serial-console-has-no-line-atomicity.md",
+        source: "specs/log-architecture-spec.md §4.4",
         measured: "2026-08-07",
     },
     Red {
         test: "hda_tone",
         instrument: Instrument::DevHostAlone,
         finding: Finding::quiet(3),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the loaded arm it was the control for is retired above; a quiet reading whose red \
+             half has gone is not evidence of anything on its own",
+        ),
         what: "green 3 of 3 alone on a quiet host, against the splice red in the same session",
         evidence: "the same session as the splice above",
-        source: "specs/issues/diagnostics/serial-console-has-no-line-atomicity.md",
+        source: "specs/log-architecture-spec.md §4.4",
         measured: "2026-08-07",
     },
     Red {
@@ -1043,6 +1060,27 @@ pub const KNOWN_RED: &[Red] = &[
         evidence: "one full suite under load, and a second landing gate in the eight-landing regime",
         source: "specs/issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-07",
+    },
+    Red {
+        test: "fd_lifetime",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(4, 7),
+        standing: Standing::Stands,
+        what: "`a killed process kept 16777216 bytes of its io_urings`, `ALONE … GREEN` every \
+               time. `kill_releases_ring` asks `SYS_SYSINFO` for the **machine's** free memory \
+               either side of a kill, and it shares the `tests/testcases` boot with every other \
+               Rust guest binary — so the verdict is only sound while nothing else in that guest \
+               holds or releases a page across the window, which nothing arranges. `/bin/logd` \
+               joining every image is what made it loud: it holds an `io_uring`, a 64 KiB record \
+               buffer and a `File` whose page-cache pages come and go",
+        evidence: "a same-session A/B of two seven-suite arms, 12 wide, on one dev host: 0 of 7 at \
+                   a76ffd0 against 4 of 7 at 19ce5d0, whose diff is comment text, one \
+                   caller-less kernel function deleted and a test-runner gate nothing on this \
+                   boot invokes. Two earlier sevens on the same two trees gave 1 of 7 and 2 of 7, \
+                   so the rate this row carries is the widest of four readings and not the only \
+                   one",
+        source: "specs/issues/build/free-memory-verdicts-share-a-boot.md",
+        measured: "2026-08-15",
     },
     Red {
         test: "screen_console_scroll",

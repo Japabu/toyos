@@ -543,10 +543,13 @@ impl Vfs {
         let (fs, fs_path) = self.resolve_fs(&mount, &file).ok_or(SyscallError::NotFound)?;
         if fs_path.is_empty() { return Err(SyscallError::InvalidArgument); }
 
-        // On the heap and not the stack. `log_file` reaches this from the idle
+        // On the heap and not the stack. `log_file` reached this from the idle
         // loop, whose per-CPU stack is 16 KiB of ordinary heap with no guard
-        // page — so a 4 KiB frame there is a quarter of the stack and an
-        // overflow corrupts whatever the allocator put underneath it, silently.
+        // page — so a 4 KiB frame there was a quarter of the stack and an
+        // overflow corrupted whatever the allocator put underneath it, silently.
+        // That caller is gone (log architecture L6) and this stays on the heap:
+        // every syscall stack in the machine is better off for it, and the next
+        // kernel-side caller would arrive with the hazard intact.
         // Measured at that call site: 11,505 bytes of the 16,384 in use at the
         // block layer, with the USB command path still below. `Vec` rather than
         // `Box::new([0u8; 4096])`, because the latter is only elided from the
@@ -697,6 +700,48 @@ impl Vfs {
     /// stick.
     pub fn sync_mount(&mut self, name: &str) -> Result<(), SyscallError> {
         self.mounts.get_mut(name).ok_or(SyscallError::NotFound)?.fs.sync()
+    }
+
+    /// Is there a filesystem mounted under this name?
+    ///
+    /// The one thing the kernel still knows about `/log` after L6 of
+    /// `specs/log-architecture-spec.md`: it mounts the volume and hands it to
+    /// userland, and `/bin/logd` is what knows whether a file was opened on it.
+    /// `report_log_destination` is the caller and the panel is why it exists —
+    /// logd's own line reaches a console and never the screen.
+    pub fn has_mount(&self, name: &str) -> bool {
+        self.mounts.contains_key(name)
+    }
+
+    /// Sync whichever filesystem `path` lives on, the root included.
+    ///
+    /// **What `SYS_FSYNC` means since L6.** `flush_file` puts the data, the FAT
+    /// and the directory entry on the device; it does not reach the device's own
+    /// write cache, and [`Vfs::sync_mount`] is what does — `Fat32::sync` writes
+    /// FSInfo and then calls `dev.flush()`, which is SCSI SYNCHRONIZE CACHE on a
+    /// stick. Until L6 the only caller of that second step was `log_file.rs`,
+    /// from the idle loop, and `fd::fsync` stopped one level short of it.
+    /// `/bin/logd` now publishes `LOG_DURABLE_NS` off the result of an ordinary
+    /// `fsync`, and a panicking kernel waits on that word — so a syscall that
+    /// stopped at the page cache would make the word a claim about nothing
+    /// (§12.4).
+    ///
+    /// It is the whole mount and not the one file because that is the only
+    /// granularity a block device offers: a cache flush is per device. Every
+    /// `fsync` in the machine is slower for it, and more honest.
+    pub fn sync_for_path(&mut self, path: &str) -> Result<(), SyscallError> {
+        let (mount, _) = self.resolve_path("/", path);
+        if self.mounts.contains_key(&mount) {
+            return self.sync_mount(&mount);
+        }
+        // Not a named mount, so the file is on the root filesystem. A machine
+        // with no root at all has nothing to flush, and that is not an error
+        // here: the write this is being asked to make durable cannot have
+        // happened.
+        match &mut self.root {
+            Some(root) => root.sync(),
+            None => Ok(()),
+        }
     }
 
     /// Every mount, on the way down. Failures are logged here and not returned:

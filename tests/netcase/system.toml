@@ -11,7 +11,16 @@
 # ===TEST_START=== protocol.
 
 [boot]
-start = ["netd", "test-runner"]
+start = ["logd", "netd", "test-runner"]
+
+# **Every image that carries a `TOYOS-LOG` partition runs this**, and every
+# image does. The kernel stopped writing files at L6 of
+# `specs/log-architecture-spec.md`, so a boot config without `logd` is a boot
+# whose `/log` is empty — `every_boot_config_runs_logd` is what refuses one.
+# It claims no device and serves no port yet (§5.1, §5.2): its whole authority
+# is `logread`, which is `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
+[programs.logd]
+syscap = ["logread"]
 
 [programs.netd]
 serves = ["netd"]

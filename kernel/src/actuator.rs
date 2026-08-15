@@ -354,13 +354,6 @@ actuators! {
     /// quiet machine has.
     heartbeat = "heartbeat";
 
-    /// Rotate `/log/kernel.log` at 256 bytes instead of 4 MiB. Filling megabytes
-    /// by logging would take a boot far longer than a test should wait, and the
-    /// rotation code this drives is the shipped code — only the bound moves,
-    /// exactly as `test-small-caches` moves the cache ceilings.
-    /// See `log_file::max_log_bytes`.
-    log_rotate_fast = "log-rotate-fast";
-
     /// Every CPU emitting patterned log records at once, from kernel threads the
     /// boot's first `SYS_LOG_READ` spawns.
     ///
@@ -417,6 +410,33 @@ actuators! {
     /// See `arch::percpu_fetch_add`.
     log_shared_reservation = "log-shared-reservation";
 
+    /// Let a `SysCap` or a `Console` close cancel every poll in the machine on
+    /// the source it names — the log's readiness and the keyboard's.
+    ///
+    /// **A real prior behaviour and the defect `/bin/logd` would have lived
+    /// under.** `ops::close` cancelled by source across every ring, which is
+    /// right for a pipe and wrong for a stream that outlives every handle: any
+    /// process closing any capability posted `-NotFound` into logd's parked
+    /// poll. It cannot be staged from the host — which process closes which
+    /// handle is decided inside the guest, and the two processes involved need
+    /// not know about each other at all, which is the whole shape of the bug.
+    /// `specs/log-architecture-spec.md` §3.2.
+    log_close_cancels_any_syscap = "log-close-cancels-any-syscap";
+
+    /// Bypass `ConsoleObject`'s line buffer: every userland `write` reaches the
+    /// backend as it arrives.
+    ///
+    /// **A real prior build rather than an invented defect** — it is exactly
+    /// what this tree shipped between L3 and L5, and before that the byte ring
+    /// made the unit of interleaving a `write` syscall in a lossier way still.
+    /// The host cannot stage it: `println!` is `LineWriter`, whose two syscalls
+    /// per line are decided inside the guest's own `std`, and no host-side
+    /// stimulus can make the kernel forget a buffer it holds. What it produces
+    /// is a line one process began and another finished —
+    /// `console_line_atomicity` counts them and `Serial::interleaved` names the
+    /// kernel-into-userland half. `specs/log-architecture-spec.md` §4.4, §9.4.
+    console_unbuffered = "console-unbuffered";
+
     /// Panic inside `klogd`, the kernel thread, on its first instruction.
     ///
     /// **Nothing outside the kernel can make a kernel thread panic**, and the
@@ -449,8 +469,12 @@ actuators! {
     /// QEMU-side way of failing its reads leaves the machine booted and the
     /// volumes mounted — `readonly=on` is writes only and `rerror` takes the
     /// whole drive. The read is still issued and only its verdict is replaced.
-    /// What it drives is the partial write `log_file` makes into an evicted
-    /// page. See `fat32_adapter.rs`'s `fat_backing_reads`.
+    /// What it drives is the partial write an appender makes into an evicted
+    /// page — `log_file`'s until L6 and `/bin/logd`'s since, which is the same
+    /// path through the page cache and a *more* reachable one, because a
+    /// userland writer's tail page is ordinary evictable cache
+    /// (`specs/log-architecture-spec.md` §8.2). See `fat32_adapter.rs`'s
+    /// `fat_backing_reads`.
     fat_backing_read_fails = "fat-backing-read-fails";
 
     /// Fail every *filesystem* read of the boot volume once it is mounted, with

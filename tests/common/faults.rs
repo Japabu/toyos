@@ -92,9 +92,11 @@ pub fn double_fault_stack(
 /// That stack is 16 KiB of ordinary heap, so an overflow off its bottom did
 /// not fault — it rewrote whatever the allocator had put underneath, and the
 /// damage surfaced somewhere else entirely (a `BTreeMap` node with an
-/// out-of-range index, a write to `0x4`). The idle loop runs `log_file::poll`,
-/// a filesystem write reaching a block device, whose measured high water was
-/// 11,505 bytes of the 16,384 with the USB command path still below the probe.
+/// out-of-range index, a write to `0x4`). The idle loop ran `log_file::poll`
+/// when that was measured — a filesystem write reaching a block device, whose
+/// high water was 11,505 bytes of the 16,384 with the USB command path still
+/// below the probe. That caller is gone at log architecture L6 and `drain_irqs`
+/// still reaches a device from the same stack.
 ///
 /// Absence is invisible to every log line and every screendump, so the only
 /// way to ask whether the page is really gone is to touch it — which nothing

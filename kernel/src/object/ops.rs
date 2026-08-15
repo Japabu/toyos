@@ -195,11 +195,76 @@ pub fn close(
             }
         }
     }
-    let sources = [read_source(&object), write_source(&object)];
+    let sources = if ends_its_sources(&object) {
+        [read_source(&object), write_source(&object)]
+    } else {
+        [None, None]
+    };
     if sources.iter().any(|s| s.is_some()) {
         crate::io_uring::remove_fd(&sources);
     }
     Ok(())
+}
+
+/// Does releasing one handle to `object` end the sources it names?
+///
+/// **`io_uring::remove_fd` cancels by source across every ring in the machine**,
+/// which is what a pipe needs — a client closing its end must complete the
+/// server's poll on the other, and an fd number means nothing outside the
+/// process that owns it. It is also why the question has to be asked: a source
+/// that does *not* end when a handle does gets every poll on it cancelled by
+/// whoever happened to close a handle naming it, in every other process.
+///
+/// **Two rows answer `false` and both are named by a handle any number of
+/// processes hold.** `SysCap` maps to [`Source::Log`], and the machine's log is
+/// not something a capability going away ends: closing one is one process
+/// putting down its authority to read a stream that outlives every handle. That
+/// was live and latent — `ops::close` on *any* `SysCap` cancelled *every*
+/// pending log poll in the machine with `-NotFound`, which `/bin/logd`'s
+/// read-then-park loop turns from latent into a daemon that stops reading the
+/// moment anything anywhere closes a capability. `Console` maps to
+/// [`Source::Keyboard`] for the same reason and has the same shape: every
+/// process that has a console has its own object over the one keyboard (§4.4),
+/// so one of them closing stdin would cancel the compositor's key poll.
+///
+/// Every other row answers `true` because its source really is the object's:
+/// a pipe end, a connection, a port and a device claim each go away with their
+/// last handle, and a claim admits exactly one handle by construction, so
+/// "every ring watching it" is the one holder's.
+///
+/// **That argument is about the object and the condition it needs is about the
+/// source, which is not the same thing — and one `true` row does not meet it.**
+/// What makes cancelling safe is that no *other kind* of object names the same
+/// [`Source`]. A `Device(Keyboard)` claim names [`Source::Keyboard`], and so
+/// does every `Console` (see `read_source`), so the claim's holder closing its
+/// handle cancels every pending poll on stdin in the machine — which is what
+/// libc's terminal read arms — with `-NotFound`. That is a live
+/// cross-cancellation on this tree and not a hypothetical; what keeps it quiet
+/// is that the compositor takes the keyboard claim at boot and holds it until
+/// the machine stops, so nothing closes one first. It is stated here as the
+/// residual of this function rather than as a property it has, and it is filed
+/// rather than fixed on this branch — the fix is on the keyboard side, where a
+/// source would have to name its object the way a pipe's already does.
+fn ends_its_sources(object: &KObjectRef) -> bool {
+    match object {
+        KObjectRef::PipeRead(_)
+        | KObjectRef::PipeWrite(_)
+        | KObjectRef::Connection(_)
+        | KObjectRef::Acceptor(_)
+        | KObjectRef::Device(_) => true,
+        KObjectRef::Console(_) | KObjectRef::SysCap(_) => {
+            // The negative control: the behaviour above, restored, so
+            // `log_poll_outlives_a_close` reds on the tree that had it.
+            crate::actuator::log_close_cancels_any_syscap()
+        }
+        // No source at all, so the answer decides nothing.
+        KObjectRef::File(_)
+        | KObjectRef::IoUring(_)
+        | KObjectRef::Connector(_)
+        | KObjectRef::Namespace(_)
+        | KObjectRef::SharedMem(_)
+        | KObjectRef::Process(_) => false,
+    }
 }
 
 /// Release every handle a process holds. Called by exit *and by kill*, so the
@@ -476,16 +541,18 @@ pub fn try_write(object: &KObjectRef, buf: &UserBytes) -> Option<u64> {
         }),
         KObjectRef::PipeWrite(w) => write_pipe(w.id(), buf),
         KObjectRef::Connection(c) => write_pipe(c.tx(), buf),
-        KObjectRef::Console(_) => {
-            // Straight to the backend in bounded flushes — `write_console`
-            // stages into a `MAX_CONSOLE_LINE` buffer and takes the guard per
-            // flush — where it used to be a lossless append to the byte ring
-            // that something else drained later. **L5 puts `ConsoleObject`'s
-            // line buffer in front of this** (§4.4); until then a `println!`
-            // still hands the kernel half a line at a time, which is what
-            // L5's `console-unbuffered` actuator will stage — so this state is
-            // a real prior build rather than an invented one.
-            serial::write_console(buf);
+        KObjectRef::Console(c) => {
+            // Into this holder's line buffer, which emits whole lines under one
+            // `BackendGuard` (§4.4). It used to be a lossless append to the byte
+            // ring that something else drained later, then a direct bounded
+            // write to the backend; both made the unit of interleaving a `write`
+            // syscall, and `println!` issues two of those per line. The
+            // `console-unbuffered` actuator restores the second of those states.
+            //
+            // **The whole write is always accepted.** The buffer is the kernel's
+            // and a short count would make a caller re-send bytes it already
+            // handed over.
+            c.write(buf);
             Some(buf.len() as u64)
         }
         KObjectRef::PipeRead(_) | KObjectRef::Device(_) | KObjectRef::Acceptor(_)
@@ -565,6 +632,25 @@ pub fn fstat(object: &KObjectRef) -> Stat {
     }
 }
 
+/// `SYS_FSYNC`: the file's bytes on the device, **and the device told to commit
+/// them**.
+///
+/// **The second step is L6's, and it is a change to a shipped syscall's
+/// semantics rather than an implementation detail** (§12.4). This used to be
+/// `flush_file` alone, which puts the data, the FAT and the directory entry on
+/// the volume and stops there — the stick's own write cache still holds them,
+/// so a power cut after a successful `fsync` could lose what it returned `Ok`
+/// for. The only caller in the machine that did the second step was
+/// `log_file.rs`, in the kernel, from the idle loop.
+///
+/// It is not optional now: `/bin/logd` publishes `LOG_DURABLE_NS` off this
+/// call's result, and a panicking kernel stops waiting for its own report when
+/// that word passes the report's timestamp. An `fsync` that stopped at the page
+/// cache would make the whole durability contract a claim about nothing. The
+/// alternative considered and rejected was a second syscall for logd alone,
+/// which needs a number, needs discussion, and would make every *other*
+/// `fsync` in the machine quietly weaker than the one program that noticed.
+/// `log_is_durable_after_fsync` is the gate, and it reds on the old behaviour.
 pub fn fsync(object: &KObjectRef) -> u64 {
     let KObjectRef::File(file) = object else {
         return SyscallError::PermissionDenied.to_u64();
@@ -578,9 +664,19 @@ pub fn fsync(object: &KObjectRef) -> u64 {
     // Outside `FileObject`'s own lock: the VFS lock is taken here and in
     // `OpenFileState::drop`, and holding both in one order here and the other
     // there is the deadlock this ordering exists to avoid.
-    if let Err(e) = crate::vfs::lock().flush_file(&path, file_id, mtime) {
+    let mut vfs = crate::vfs::lock();
+    if let Err(e) = vfs.flush_file(&path, file_id, mtime) {
         return e.to_u64();
     }
+    // Under the same acquisition as the write-back above, deliberately: two
+    // acquisitions would let another writer's data reach the volume between
+    // them and be committed by this caller's flush, which is harmless, and
+    // would let this caller's own file be *unmounted* between them, which is
+    // not.
+    if let Err(e) = vfs.sync_for_path(&path) {
+        return e.to_u64();
+    }
+    drop(vfs);
     file.with(|state| state.modified = false);
     0
 }

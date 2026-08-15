@@ -37,7 +37,6 @@ mod tmpfs;
 mod file_backing;
 mod bcachefs_adapter;
 mod fat32_adapter;
-mod log_file;
 #[cfg(feature = "boot-actuators")]
 mod heartbeat;
 #[allow(dead_code)]
@@ -299,31 +298,43 @@ fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
 /// Say where this boot's log can be read, on the last surface that still shows
 /// it.
 ///
-/// The final boot checkpoint paints the tail of the ring, so a line logged
+/// The final boot checkpoint paints the tail of the records, so a line logged
 /// immediately before it is on the panel until userland claims the screen. On
 /// the machine this exists for that panel is the only thing a person can be
 /// told anything on — and what they most need to be told is that there will be
-/// nothing to read afterwards. A `/log` that refused to mount already says so,
-/// once, in the middle of phase 5, in white, among sixty-seven other rows.
+/// nothing to read afterwards.
 ///
-/// `alert!` is what says the row is red, and it is used here for the two states
-/// in which this boot leaves no readable account of itself anywhere. Nothing in
-/// the text says so any more: the panel reads `Level` off the record, so a
-/// refusal wears the colour without having to spell it.
+/// **The four-way table survives L6 and its second axis changed, which is not
+/// the same as losing it** (§5.6). It was `(console, the file logd opened)`, and
+/// the kernel does not open a file any more — it does not name one and cannot
+/// say whether logd got anywhere. What it *does* still know is whether the log
+/// **volume mounted**, which is the fact this line exists to carry: a machine
+/// with no `/log` partition leaves no account of itself once userland owns the
+/// screen, and that is the sentence the owner needs on the panel.
+///
+/// **It has to be the kernel's, because the panel is the kernel's.**
+/// `panic_console` paints records, so a userland line reaches a console and
+/// never the screen — and this line's whole audience is somebody looking at a
+/// T14 with no serial port. `/bin/logd` says the half only it knows, on its own
+/// console handle: which file, or that it could not open one.
+///
+/// `alert!` is what says the row is red, and it is used for the two states in
+/// which this boot leaves no readable account of itself anywhere. Nothing in
+/// the text says so: the panel reads `Level` off the record, so a refusal wears
+/// the colour without having to spell it.
 ///
 /// ASCII throughout, unlike the rest of the kernel's prose: the panel's font is
 /// codepoints 0x20..=0x7E and `draw_glyph` renders everything else as a dot, so
 /// an em dash reaches the one reader this line has as three of them.
 fn report_log_destination() {
-    match (drivers::serial::has_console(), log_file::destination()) {
-        (true, Some(path)) => log!("log: this boot is on the console and in {path}"),
-        (false, Some(path)) => {
-            log!("log: no serial console - this boot is in {path} and on the screen")
-        }
-        (true, None) => {
+    let has_log = vfs::lock().has_mount(fat32_adapter::Role::Log.mount());
+    match (drivers::serial::has_console(), has_log) {
+        (true, true) => log!("log: this boot is on the console and on /log"),
+        (false, true) => log!("log: no serial console - this boot is on /log and on the screen"),
+        (true, false) => {
             alert!("log: no /log - this boot is on the console only, and nothing outlives the power")
         }
-        (false, None) => {
+        (false, false) => {
             alert!("log: no serial console and no /log - this boot is on this screen and nowhere else")
         }
     }
@@ -615,14 +626,10 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     match fat32_adapter::mount(Role::Log) {
         Some(fs) => {
             vfs::lock().mount(Role::Log.mount(), Box::new(fs), UserAccess::ReadWrite);
-            // Immediately after the mount and before anything else can fail:
-            // what a machine with no serial port most needs in the file is the
-            // boot that did not finish.
-            log_file::install();
         }
         // A refusal `gpt:` has already named the missing GUID for, and never a
         // fallback onto `/boot`: a stick with no log partition keeps its log in
-        // the ring, where the screen and the console can still reach it.
+        // the shards, where the screen and the console can still reach it.
         None => log!("log-volume: not mounted; this boot's kernel log stays in memory"),
     }
 

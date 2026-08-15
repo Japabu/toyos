@@ -28,8 +28,10 @@ use std::sync::Arc;
 /// collision is systematic and not unlucky: this daemon prints a client's
 /// removal exactly when the kernel is printing that client's exit.
 ///
-/// `specs/issues/diagnostics/serial-console-has-no-line-atomicity.md` is the class
-/// and where it should be fixed for everyone.
+/// **Fixed for everyone at the kernel since L5**: a `ConsoleObject` per holder
+/// buffers a line and emits it whole under one `BackendGuard`
+/// (`specs/log-architecture-spec.md` §4.4), so this macro is about the *count*
+/// of syscalls now rather than about atomicity.
 macro_rules! say {
     ($($arg:tt)*) => {{
         use std::io::Write as _;

@@ -9,7 +9,9 @@
 //!
 //! **Kernel threads at preempt depth 0 with `IF` set, one per shard**, so the
 //! records really are written by every CPU at once and through the shipped
-//! `emit`, the shipped reservation and the shipped publication.
+//! `emit`, the shipped reservation and the shipped publication. *One per
+//! shard* is how many are spawned and not where they land — nothing in this
+//! kernel pins a task to a CPU, and [`body`] says what that costs the gate.
 //!
 //! **What this workload cannot reach, measured rather than assumed**: a
 //! producer that moves between CPUs *mid-storm*. A Ring 0 loop that takes no
@@ -118,10 +120,25 @@ extern "C" fn body(thread: u64) -> ! {
     for index in 0..STORM_RECORDS {
         emit_patterned(thread, index);
     }
-    // **The last record this shard's producer writes, so nothing overwrites
-    // it.** One producer per shard is what makes that true: a second producer
-    // on the same shard would lap this generation and a reader waiting for a
-    // `done` that was dropped would wait for ever.
+    // **The last record this producer writes, and the reader may never see
+    // it.**
+    //
+    // `sched::driver::placement` picks the least-loaded CPU from a rotating
+    // start, so the threads spawned back to back above land on distinct CPUs
+    // only while every published load is equal; one CPU with a ready task at
+    // that moment sends two of them to the same place, and a task is stealable
+    // between its spawn and its first run either way. Two producers on one
+    // shard means the first one's `done` is lapped by the second's records —
+    // **observed twice in seven suites on the dev host, 2026-08-15**, each time
+    // as the reader's whole 30 s ceiling.
+    //
+    // **So this is evidence and nothing waits on it.** A barrier that put every
+    // `done` past every patterned record was tried and hung a 12-wide suite;
+    // the reader was rewritten instead to decide from its own cursor, which
+    // removes the class rather than this instance
+    // (`userland/test-runner/src/log_gate.rs`, `specs/log-architecture-spec.md`
+    // §9.1). The record still declares what this producer emitted and the
+    // reader cross-checks it wherever it survives.
     crate::log!("logstorm done t={thread} emitted={STORM_RECORDS}");
 
     // **It parks rather than exiting**, because `sched::kthread`'s rows are
