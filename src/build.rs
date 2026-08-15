@@ -788,8 +788,15 @@ fn declared_kernel_features(root: &Path) -> Vec<String> {
 pub const TEST_KERNEL: &[&str] = &["boot-actuators", "test-actuators"];
 
 /// Kernel builds the ordinary test suite is allowed to make.
-pub const TEST_SUITE_KERNEL_BUILDS: [&str; 3] =
-    ["", "boot-actuators,test-actuators", "fpu-save-nothing"];
+pub const TEST_SUITE_KERNEL_BUILDS: [&str; 4] =
+    ["", "boot-actuators,test-actuators", "fpu-save-nothing", "sched-check"];
+
+/// The scheduler core's own asserts, compiled in: `toyos-sched/check`.
+///
+/// One name, read from here by the one test that boots it, for
+/// [`TEST_KERNEL`]'s reason — a second spelling is a second kernel and nothing
+/// would say so.
+pub const SCHED_CHECK_KERNEL: &[&str] = &["sched-check"];
 
 /// The kernel build used only by the harness's interactive debugger.
 pub const DEBUG_KERNEL_BUILD: &str = "debug-wait";
@@ -867,6 +874,60 @@ fn assert_actuators_match_features(root: &Path, features: &str, kernel: &[u8]) {
         if want { "is missing" } else { "names" },
         wrong.len(),
         names.len(),
+    );
+}
+
+/// The scheduler core's `feature = "check"` asserts, by their own panic text,
+/// and the two kernels that must disagree about carrying them.
+///
+/// Every one of these is a `#[cfg(feature = "check")]` site in `toyos-sched`:
+/// invariant P is `cpu::check_pass_duration`'s budget, and the other two are
+/// `invariants::check_cpu` — invariant T's armed-timer bound and the
+/// container-versus-state-word agreement. Their format strings are the only
+/// part of the check build with a literal the linker keeps, which is what makes
+/// the artifact answerable at all.
+const SCHED_CHECK_ASSERTS: [&str; 3] = [
+    "invariant P: a scheduler pass took",
+    "invariant T: cpu",
+    "disagrees with its state word",
+];
+
+/// Refuse to write an image whose scheduler asserts do not match the feature
+/// set that decides whether they exist.
+///
+/// [`assert_actuators_match_features`]'s shape and its reason: the property is
+/// about the artifact, so the artifact is what is asked, and a convention
+/// nothing enforces is not a bar. **Both directions, because one of them is a
+/// spelling of `true`** — a shipping kernel must carry none of these, and the
+/// `sched-check` kernel must carry all of them, which is what says the search
+/// works at all.
+///
+/// This is the half of the check-build gate that a booted guest cannot supply.
+/// A guest proves the asserts did not *fire*; a kernel with the feature quietly
+/// dropped proves that too, and rather more easily. Measured on the two binaries
+/// this build produces: 0 of 3 in the shipping kernel, 3 of 3 in the
+/// `sched-check` one.
+fn assert_sched_check_matches_features(features: &str, kernel: &[u8]) {
+    let want = match features {
+        "" => false,
+        f if f == SCHED_CHECK_KERNEL.join(",") => true,
+        _ => return,
+    };
+    let named = |needle: &&str| {
+        let needle = needle.as_bytes();
+        kernel.windows(needle.len()).any(|w| w == needle)
+    };
+    let wrong: Vec<&&str> = SCHED_CHECK_ASSERTS.iter().filter(|a| named(a) != want).collect();
+    assert!(
+        wrong.is_empty(),
+        "the {} kernel {} {} of the {} scheduler check asserts: {wrong:?}.\n\
+         `sched-check` forwards to `toyos-sched/check`, so a build that carries the feature \
+         and not the asserts is a check build in name only — which is what a green \
+         `sched_check_build` would then be certifying.",
+        if want { "sched-check" } else { "shipping" },
+        if want { "is missing" } else { "names" },
+        wrong.len(),
+        SCHED_CHECK_ASSERTS.len(),
     );
 }
 
@@ -967,6 +1028,7 @@ pub fn build(
     let kernel_bytes = fs::read(&kernel_art).expect("Failed to read staged kernel");
     assert_overflow_checked("kernel", &kernel_bytes);
     assert_actuators_match_features(root, &kernel_features, &kernel_bytes);
+    assert_sched_check_matches_features(&kernel_features, &kernel_bytes);
     assert_kernel_is_softfloat(&path_env);
     let bl_bytes = fs::read(&bl_art).expect("Failed to read staged bootloader");
     let disk_bytes = image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes, &cmdline);
@@ -1187,6 +1249,7 @@ pub fn build_test_image(
                 let bytes = fs::read(&staged).expect("Failed to read staged kernel");
                 assert_overflow_checked("kernel", &bytes);
                 assert_actuators_match_features(root, &features, &bytes);
+                assert_sched_check_matches_features(&features, &bytes);
                 assert_kernel_is_softfloat(&path_env);
                 bytes
             }

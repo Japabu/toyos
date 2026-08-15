@@ -59,6 +59,10 @@ pub struct Outcome {
     /// Worst spread past the *derived* bound, even where the recorded sample
     /// allowed the run to pass. Zero means the run met the standard.
     pub fair_over_bound: u64,
+    /// Virtual nanoseconds I5 had a comparison open for. Its *reach*, which is a
+    /// separate question from its verdict and one that four different conditions
+    /// can silently shrink; see [`crate::vm::Vm::fair_covered_ns`].
+    pub fair_covered_ns: u64,
     /// Invariant I13's measurement, in the same three roles: the widest service
     /// spread between threads of one share, the bound in force when it was
     /// seen, and any crossing of the derived bound the allowance let pass.
@@ -203,6 +207,7 @@ fn outcome_of(scenario: &'static str, vm: &Vm<'_>, choices: &ChoiceStream) -> Ou
         fair_spread: vm.fair_spread,
         fair_bound: vm.fair_bound,
         fair_over_bound: vm.fair_over_bound,
+        fair_covered_ns: vm.fair_covered_ns,
         thread_spread: vm.thread_spread,
         thread_bound: vm.thread_bound,
         thread_over_bound: vm.thread_over_bound,

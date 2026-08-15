@@ -462,6 +462,13 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // packing (run 31705986758) is a Cost row, the same shape
     // `desktop_window_child` carries, not a reclassification.
     ("fpu_isolation", Sched::Parallel, Tier::Nightly),
+    // The fourth declared kernel build, booted so that the scheduler core's
+    // `feature = "check"` asserts are compiled and executed by a CI run at all.
+    // Parallel: every verdict is an exit code, a stdout line or a clean serial,
+    // and the one number in it — invariant P's 200 µs — is a bound the *guest*
+    // measures against its own TSC inside a single scheduler pass, which no
+    // amount of host load lengthens. A pass is preempt-off by construction.
+    ("sched_check_build", Sched::Parallel, Tier::Fast),
     ("short_sleep_livelock", Sched::Parallel, Tier::Fast),
     // The kernel thread and the row that says what its panic means. Two
     // boots, both headless: the second one halts on purpose — and the pair
@@ -8078,6 +8085,78 @@ fn run_machine_test(
                 "  [fpu] fpu-save-nothing: exit {:?}, which is the gate having teeth",
                 negative.exit_code
             );
+            Ok(())
+        }
+        "sched_check_build" => {
+            // The scheduler core's own asserts, run on a real machine — spec
+            // §10.2's on-target counterpart to everything the simulator does.
+            //
+            // `kernel/Cargo.toml` has forwarded `sched-check =
+            // ["toyos-sched/check"]` since the check build was written, and
+            // until this test nothing in `src/` or `tests/` ever asked for it.
+            // So `cpu::MAX_PASS_NS`, invariant P and `invariants::check_cpu`
+            // were compiled by no CI run at all: a quantum never armed, a task
+            // whose container disagreed with its state word, and a pass that
+            // blew its 200 µs budget were each caught by nothing on hardware,
+            // however green the simulator was.
+            //
+            // **What the simulator cannot say.** Two of the three asserts are
+            // about state, and the sim checks those globally and better. The
+            // third is about *cost*, and the sim's clock does not advance inside
+            // a step — `scenarios::overlong_pass` exercises it against a
+            // modelled pass cost, which proves the assert compiles and fires,
+            // not that a real pass on real silicon fits in 200 µs. Only a booted
+            // kernel reads a TSC.
+            //
+            // **The workload is `sched_stress`** because the asserts are dense
+            // on exactly what it does: it spawns burners that drive vruntime,
+            // blocks and wakes across io_uring and ports, and forces a
+            // Runnable→NonRunnable→Runnable cycle. Every one of those is a pass,
+            // and every pass on every CPU runs both checks. `smp: 2` is the
+            // default and it is deliberate — one CPU cannot migrate, and
+            // invariant T's arming is per CPU.
+            //
+            // **That the asserts are compiled in at all is not asked here.** A
+            // guest proves they did not fire, and a kernel with the feature
+            // quietly dropped proves that more easily; the artifact is asked
+            // instead, at build time, by `assert_sched_check_matches_features` —
+            // 0 of 3 assert texts in the shipping kernel, 3 of 3 in this one.
+            // This half is the other one: on a machine that really carries them,
+            // honest work does not trip them.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    kernel_features: toyos_build::build::SCHED_CHECK_KERNEL,
+                    ..BootOptions::default()
+                },
+            );
+            // The boot is already thousands of passes on both CPUs, and an
+            // assert that fires there takes the machine down before userland.
+            serial::Serial::boot(&qemu).must_be_clean()?;
+
+            let result = qemu.run_test("test_rs_sched_stress", Duration::from_secs(120));
+            if let Some(err) = &result.error {
+                return Err(format!(
+                    "the check-build guest stopped answering, which is what a scheduler \
+                     assert firing looks like from here: {err}\nserial:\n{}",
+                    result.serial,
+                ));
+            }
+            if !check_rust_result(&result) {
+                return Err(format!(
+                    "sched_stress failed on the check build:\n{}",
+                    result.stdout
+                ));
+            }
+            // An assert fires as a kernel panic on whichever CPU took the pass,
+            // and the guest process can still exit 0 while another CPU is dying
+            // — so the serial is read as well as the exit code.
+            serial::Serial::named("test serial", result.serial.as_str()).must_be_clean()?;
+            for line in result.stdout.lines() {
+                eprintln!("  [sched-check] {}", line.trim());
+            }
             Ok(())
         }
         "klogd_hosted" => {
