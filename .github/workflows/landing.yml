@@ -76,13 +76,18 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: branch protection
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu -o pipefail
-          # No `Authorization`: `rules/branches` is readable by anyone who can
-          # read the repository, so this asks nothing of the workflow token and
-          # cannot start failing because a permission narrowed.
+          # Authenticated with the token this job already holds: `rules/branches`
+          # needs only `metadata: read`, which every workflow token carries even
+          # with no `permissions:` block, so this still asks nothing beyond the
+          # default grant and cannot start failing because a permission
+          # narrowed. What authenticating buys is the rate limit moving from the
+          # runner's shared IP to this run's own quota.
           api="https://api.github.com/repos/${GITHUB_REPOSITORY}/rules/branches/main"
-          curl -sSL --fail "$api" -o /tmp/rules.json
+          curl -sSL --fail -H "Authorization: Bearer $GH_TOKEN" "$api" -o /tmp/rules.json
           jq . /tmp/rules.json
 
           # Five (specs/testing-strategy.md §4); `tcg` is not one of them —
