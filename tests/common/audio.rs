@@ -633,6 +633,71 @@ pub fn check_suspend_structure(serial: &str) -> Vec<String> {
     problems
 }
 
+/// Every way a client left, as soundd reported it: one entry per
+/// `soundd: client {id} removed ({how})` in `serial`.
+///
+/// Anchored on ` removed` with the `soundd: client ` prefix discipline
+/// [`last_client_removed`] documents, and the reason is read from the same line
+/// — a removal that names none yields the empty string, which is what
+/// [`check_departures`] reds on.
+pub fn departures(serial: &str) -> Vec<String> {
+    serial
+        .lines()
+        .filter(|l| l.contains("soundd: client ") && l.contains(" removed"))
+        .map(|l| {
+            let after = l.split(" removed").nth(1).unwrap_or("").trim();
+            after
+                .strip_prefix('(')
+                .and_then(|r| r.split(')').next())
+                .unwrap_or("")
+                .to_string()
+        })
+        .collect()
+}
+
+/// **soundd may not report a departure it did not establish.**
+///
+/// A crash and a clean exit close the same descriptors in the same order, so
+/// the mix loop's broken signal pipe witnesses neither — it used to say `died`
+/// anyway, and did so on 5 of 44 runs whose client exited `code=0`
+/// (`specs/issues/audio/`, closed). Two things are asserted here, and the
+/// second is the one with teeth: every removal names how the stream ended, in
+/// the vocabulary §7 fixes, and no line claims a death.
+///
+/// `expect` is how many removals the window must carry: a capture where no
+/// client ever left would otherwise satisfy every check above it vacuously.
+pub fn check_departures(serial: &str, expect: usize) -> Vec<String> {
+    const KNOWN: [&str; 4] = ["closed", "refused", "disconnected", "signal pipe gone"];
+    let mut problems = Vec::new();
+
+    let seen = departures(serial);
+    if seen.len() != expect {
+        problems.push(format!(
+            "soundd reported {} client removals, expected {expect}",
+            seen.len()
+        ));
+    }
+    for how in &seen {
+        if !KNOWN.contains(&how.as_str()) {
+            problems.push(format!(
+                "a client was removed with no departure soundd established ({how:?}); \
+                 §7's four are {KNOWN:?}"
+            ));
+        }
+    }
+    // The word itself, whatever line carries it: soundd cannot see a death and
+    // must not print one.
+    for line in serial.lines().filter(|l| l.contains("soundd: ")) {
+        if line.contains(" died") || line.contains(" crashed") {
+            problems.push(format!(
+                "soundd claimed a client death it cannot distinguish from a clean exit: \
+                 {line:?}"
+            ));
+        }
+    }
+    problems
+}
+
 /// Offset of the last `soundd: client {id} removed`, the anchor the two
 /// after-the-last-client assertions above are relative to.
 ///

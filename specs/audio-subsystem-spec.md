@@ -164,6 +164,12 @@ When no audio device exists, soundd serves streams from a null sink instead
 of exiting: exiting would leave every client's connect refused for the
 machine's lifetime.
 
+A device whose **shape** the mixer cannot render a period into gets the same
+answer for the same reason, and never a panic: a pipeline outside 2..16 periods
+or one that is not a power of two (§3's indices are free-running mod 2^32), a
+device that is neither mono nor stereo, or a period that is not a whole number
+of frames. soundd names which of those it found and presents the null sink.
+
 - It presents one fixed configuration — 44100 Hz stereo i16, 128-frame
   periods, an 8-slot ring — and negotiates streams identically to a device.
 - One period is consumed per period of wall clock, so a client's ring drains
@@ -201,9 +207,20 @@ which soundd ramps out, then releases the ring and pipe.
 **Volume.** `MSG_STREAM_SET_VOLUME { gain }`, applied through the ramp with
 §4's validation.
 
-**Crash.** soundd detects a dead client on its next signal write. It ramps
-the stream out — draining any audio still in the ring — and removes it. No
-other stream is affected; soundd never blocks on a client.
+**Departure.** A stream ends in one of four ways, and soundd reports the one
+it established rather than the one it guessed: the client's own
+`MSG_STREAM_CLOSE`; a refusal soundd issued; the control connection ending
+without a close; or the signal pipe breaking under the next signal write. The
+last two are the same event seen by soundd's two threads and they race, so the
+word waits until the stream is dropped and the strongest witness by then wins
+— the control thread read the peer, the mix loop only found a descriptor gone.
+Whichever fires first ramps the stream out, draining any audio still in the
+ring, and removes it. No other stream is affected; soundd never blocks on a
+client.
+
+**A crash and a clean exit are not distinguishable here**, and soundd does not
+claim to tell them apart: they close the same descriptors the same way, and the
+exit code is the kernel's `exit:` line to report.
 
 ## 8. The kernel interface
 
@@ -227,12 +244,13 @@ priority inheritance, and the completion-before-re-block delivery above
 | failure | behavior |
 |---|---|
 | Client misses its deadline | Silence for that client's missed periods; automatic catch-up next cycle |
-| Client crashes | Ramp-out, removal; others unaffected |
+| Client leaves, however | Ramp-out, removal named by §7's strongest witness; others unaffected |
 | Completions arrive batched | Multiple slots consumed that cycle; the ring absorbs it |
 | Scheduling jitter | Absorbed by the prediction and the pipeline depth |
 | Every buffer drains | Prediction re-learned; refill proportional (§2); client audio resumes in the first refilled buffer |
 | Last client leaves | Drain, then device stop (§5); zero wakes while idle |
 | No device at boot | Null sink (§6); clients play to completion |
+| A device shape the mixer cannot render | Named and refused; null sink (§6). Never a panic |
 | Device reports an error | Logged; the device is reopened; streams persist through the reopen |
 | Gain out of range or not finite | Clamped (§4) |
 
