@@ -2894,7 +2894,8 @@ thread per shard — at preempt depth 0, with `IF` set, through the shipped
 within that producer and a checksum over the two, and then one `done` record
 naming what it emitted. `test-runner` — which holds `logread` from its own
 manifest row, where a spawned test binary would not (§3.2) — reads through
-`SYS_LOG_READ` until every producer has said `done` and asserts:
+`SYS_LOG_READ` until its own cursor has caught up and stayed caught up, and
+asserts:
 
 ```
 records_emitted  ==  records_read + cursor.lost
@@ -2953,20 +2954,42 @@ guest that computes it.
 dropped, and the ledger accounts for those too — which is the point of computing
 the law over sequence numbers rather than over the storm.
 
-**The workload's liveness rests on placement, and this section said it did not
-have to.** `storm.rs` claimed one producer per shard, which nothing guarantees —
+**The reader waits for no record the ring may drop, and it used to.** It read
+until every producer had said `done`, and that record is the last thing one
+*producer* writes rather than the last thing written to its *shard*:
 `sched::driver::placement` picks the least-loaded CPU from a rotating start, so
 eight threads spawned back to back are spread only while every published load is
 equal, and a task is stealable between its spawn and its first run either way.
-Two producers on one shard lap the first one's `done` record and the reader
-waits for a record that is never coming, which is this gate's 60 s ceiling in
-the fast tier. That is the L4 review's F2 and **it is open rather than closed**:
-`specs/issues/kernel/the-log-storm-gate-needs-a-record-a-shard-may-drop.md`
-carries the analysis, the measurement that rejected the obvious fix — a
-park-based barrier passed alone and passed a whole suite and then hung
-`log_conservation_smp4` in a 12-wide one — and the shape that would answer it,
-which is a reader that needs no `done` at all. What is closed is the claim: the
-comment now derives what it can and names what it cannot.
+Two producers on one shard lap the first one's `done`, and the reader then waited
+for a record that was never coming — the L4 review's F2, and **not a prediction:
+measured 2 of 7 full suites on the dev host, 2026-08-15**, each time as the
+guest's whole 30 s ceiling with *"7 producer(s) done"* in the report, and each
+time green alone.
+
+**The fix is the reader and no kernel code.** The obvious kernel-side answer was
+measured and rejected first: a park-based barrier that put every `done` past
+every patterned record passed alone, passed a whole 259-test suite, and then
+hung `log_conservation_smp4` in a 12-wide one with no ceiling report at all. So
+`log_gate.rs` decides from its own cursor instead — the log is drained, nothing
+new has arrived over eight reads, and nothing new has arrived for 100 ms of
+guest time since the last producer record. `logstorm start`, `logstorm done` and
+the nesting burst's `done` are all cross-checks where they survived and none is
+waited on; the count a producer emitted comes from the highest index the ledger
+saw when none of them did. `done=` in the gate's report is how many survived,
+which is evidence about the ring rather than an assertion about it. That removes
+the class — *a workload whose liveness depends on a record the ring is allowed
+to drop* — rather than this instance of it.
+
+**What the change costs, stated rather than left to be found.** The termination
+condition can, in principle, fire mid-storm: eight empty reads and 100 ms of
+guest quiet while a producer is stalled inside its publication bracket. That
+ends the read early and computes the law over less of the workload; it cannot
+make the law *wrong*, because the sequence numbers this reader took and the loss
+its own cursor counted are a consistent snapshot at every instant. The
+non-vacuity clauses are what refuse a run that proved nothing: every producer
+must have been read at least once, some record must have been read while
+producers were still emitting, and the readiness source must have completed a
+poll.
 
 **It does not cover §2.3a, and neither does anything else of this shape**: a
 producer that moves between CPUs mid-storm is not reachable on this tree at all.
