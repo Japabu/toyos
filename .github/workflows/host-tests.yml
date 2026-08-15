@@ -37,9 +37,13 @@ jobs:
           rustc -vV
           cargo -V
 
-      # Cold, this job is 594 s and all of it is compilation. A cache written
-      # on `main` is readable from every branch, which is the only reason this
-      # helps a branch's first run at all.
+      # Cold, this job is 398 s and all of it is compilation — 594 s before the
+      # host workspace, measured the same way, on the run that introduced it
+      # (the eighteen deleted member lockfiles moved `hashFiles`, so that run
+      # restored nothing and is a clean cold reading). The three steps below
+      # were 133 s, 184 s and 48 s of it. A cache written on `main` is readable
+      # from every branch, which is the only reason this helps a branch's first
+      # run at all.
       - uses: actions/cache@v4
         with:
           # One `target` per workspace, which is all there is: a member builds
