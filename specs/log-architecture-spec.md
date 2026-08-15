@@ -1341,13 +1341,30 @@ pub struct LogCursor {
     /// In/out: cumulative records this cursor never saw because they were
     /// overwritten. The kernel adds; the caller never has to remember to ask.
     pub lost: u64,
+    /// In: the timestamp of the newest record the caller has made durable, or
+    /// zero. The kernel takes the maximum, **after clamping it to the newest
+    /// record it actually holds**: this is a number that crossed the trust
+    /// boundary and decides how long a dying kernel waits for its own report,
+    /// and an unclamped `u64::MAX` from a buggy `logd` would lose it silently.
+    /// Clamping cannot lengthen the wait, so the worst a hostile writer does is
+    /// shorten one for its own output.
+    pub durable: u64,
     /// In/out: the next sequence wanted from each shard.
     pub next: [u64; MAX_LOG_SHARDS],
 }
 
-/// Returns records written into `out`, which is `n * RECORD_BYTES` bytes of
-/// `LogRecord`, merged by `at_ns`.
-pub fn log_read(cursor: &mut LogCursor, out: &mut [u8]) -> Result<usize, SyscallError>;
+/// Returns records written into `out`, merged by `at_ns`. `out` is whole
+/// `LogRecord`s at a fixed stride — `n * RECORD_BYTES` bytes — so the caller
+/// indexes by shift and the kernel does no length arithmetic.
+///
+/// The `SysCap` is the authority this call rides, below; a wrapper that took
+/// only a cursor and a buffer would be an ambient read of the whole machine's
+/// log.
+pub fn log_read(
+    syscap: RawHandle,
+    cursor: &mut LogCursor,
+    out: &mut [LogRecord],
+) -> Result<usize, SyscallError>;
 ```
 
 - **The kernel keeps no per-reader state at all.** No object, no handle

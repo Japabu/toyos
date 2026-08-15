@@ -278,6 +278,29 @@ pub struct Vm<'q> {
     /// recorded allowance let the run pass. This is the gap between the standard
     /// and the shipped scheduler, surfaced by the instrument on every run.
     pub fair_over_bound: u64,
+    /// How many virtual nanoseconds invariant I5 actually had a comparison open
+    /// for, and whether it has one open right now — [`Self::thread_covered_ns`]
+    /// for the per-*process* check.
+    ///
+    /// **I5 is exposed to the same silent switch-off as I13, through more
+    /// conditions.** Its window needs a saturated machine, an empty RT band, an
+    /// unchanged member set, and at least two members that are not limited by
+    /// their own thread count. Every one of those is a property the pick, the
+    /// placement or the balance can change, so a change that stops satisfying
+    /// one makes I5 measure less rather than fail — and I5 is the check the
+    /// per-process fairness verdict on every other scenario rests on.
+    ///
+    /// Its liveness gate asserted only that *some* window opened, which one
+    /// window a nanosecond wide satisfies. The reach is the quantity that
+    /// distinguishes those, so it is published here and gated in
+    /// `the_fairness_storm_is_measured_and_holds` — a collapse read as loudly as
+    /// a violation.
+    ///
+    /// The flag is consulted by `advance`, which runs before the step's checks,
+    /// so the accounting lags the window by one step — I13's rounding error, for
+    /// I13's reason.
+    pub fair_covered_ns: u64,
+    pub fair_window_open: bool,
     /// How many virtual nanoseconds invariant I13 actually had a comparison
     /// open for, and whether it has one open right now.
     ///
@@ -406,6 +429,8 @@ impl<'q> Vm<'q> {
             fair_spread: 0,
             fair_bound: 0,
             fair_over_bound: 0,
+            fair_covered_ns: 0,
+            fair_window_open: false,
             thread_covered_ns: 0,
             thread_window_open: false,
             thread_spread: 0,
@@ -726,6 +751,9 @@ impl<'q> Vm<'q> {
             if rt.inherited.is_some() {
                 entry.1 += delta;
             }
+        }
+        if self.fair_window_open {
+            self.fair_covered_ns += delta;
         }
         if self.thread_window_open {
             self.thread_covered_ns += delta;

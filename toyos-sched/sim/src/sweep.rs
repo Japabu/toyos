@@ -24,6 +24,13 @@ pub struct SweepResult {
     /// the standard-versus-shipped gap, not a test failure — the run passed on
     /// the recorded allowance.
     pub worst_over_bound: u64,
+    /// I5's *reach* over the whole sweep: virtual nanoseconds it had a
+    /// comparison open for, against the nanoseconds the sweep executed. Its
+    /// window has four ways to close — an RT task present, a CPU idle, the
+    /// member set changing, a member under its even share — and any of them can
+    /// be narrowed by a change to the pick or the placement without a single
+    /// verdict going red, so this is the number to A/B across one.
+    pub fair_covered_ns: u64,
     /// Invariant I13's three, in the same three roles: the worst service spread
     /// between threads of one share, the bound in force when it happened, and
     /// any crossing of the derived per-thread bound the allowance let pass.
@@ -40,6 +47,31 @@ pub struct SweepResult {
 }
 
 impl SweepResult {
+    /// An empty sweep over `scenario`.
+    ///
+    /// One constructor for the same reason [`Self::observe`] is one fold: both
+    /// entry points below build this, and a hand-written initialiser in each is
+    /// a field a new measurement can be added to one of and forgotten in the
+    /// other — where the symptom is a reach or a worst-case silently reading
+    /// zero for half the criterion.
+    fn new(scenario: &Scenario) -> Self {
+        Self {
+            scenario: scenario.name,
+            runs: 0,
+            steps: 0,
+            failures: Vec::new(),
+            worst_fair_spread: 0,
+            worst_fair_bound: 0,
+            worst_over_bound: 0,
+            fair_covered_ns: 0,
+            worst_thread_spread: 0,
+            worst_thread_bound: 0,
+            worst_thread_over_bound: 0,
+            thread_covered_ns: 0,
+            elapsed_ns: 0,
+        }
+    }
+
     pub fn passed(&self) -> bool {
         self.failures.is_empty()
     }
@@ -52,6 +84,7 @@ impl SweepResult {
             self.worst_fair_bound = outcome.fair_bound;
         }
         self.worst_over_bound = self.worst_over_bound.max(outcome.fair_over_bound);
+        self.fair_covered_ns += outcome.fair_covered_ns;
         if outcome.thread_spread > self.worst_thread_spread {
             self.worst_thread_spread = outcome.thread_spread;
             self.worst_thread_bound = outcome.thread_bound;
@@ -59,6 +92,15 @@ impl SweepResult {
         self.worst_thread_over_bound = self.worst_thread_over_bound.max(outcome.thread_over_bound);
         self.thread_covered_ns += outcome.thread_covered_ns;
         self.elapsed_ns += outcome.elapsed;
+    }
+
+    /// What fraction of the sweep's executed time I5 had a comparison open for,
+    /// in percent. The reach, as one number to compare across a change.
+    pub fn fair_coverage_pct(&self) -> u64 {
+        if self.elapsed_ns == 0 {
+            return 0;
+        }
+        self.fair_covered_ns * 100 / self.elapsed_ns
     }
 
     /// What fraction of the sweep's executed time I13 had a comparison open
@@ -73,7 +115,7 @@ impl SweepResult {
     pub fn report(&self) -> String {
         if self.passed() {
             format!(
-                "{}: {} runs, {} steps, clean (I5 worst spread {}/{} ns{}, \
+                "{}: {} runs, {} steps, clean (I5 worst spread {}/{} ns{}, I5 reach {}%, \
                  I13 worst spread {}/{} ns{}, I13 reach {}%)",
                 self.scenario,
                 self.runs,
@@ -81,6 +123,7 @@ impl SweepResult {
                 self.worst_fair_spread,
                 self.worst_fair_bound,
                 past_the_bound(self.worst_over_bound),
+                self.fair_coverage_pct(),
                 self.worst_thread_spread,
                 self.worst_thread_bound,
                 past_the_bound(self.worst_thread_over_bound),
@@ -116,20 +159,7 @@ fn past_the_bound(over: u64) -> String {
 /// `seeds` seeded runs, alternating the uniform driver with PCT so both
 /// exploration strategies contribute to the same budget.
 pub fn seed_sweep(scenario: &Scenario, seeds: u64, keep_failures: usize) -> SweepResult {
-    let mut result = SweepResult {
-        scenario: scenario.name,
-        runs: 0,
-        steps: 0,
-        failures: Vec::new(),
-        worst_fair_spread: 0,
-        worst_fair_bound: 0,
-        worst_over_bound: 0,
-        worst_thread_spread: 0,
-        worst_thread_bound: 0,
-        worst_thread_over_bound: 0,
-        thread_covered_ns: 0,
-        elapsed_ns: 0,
-    };
+    let mut result = SweepResult::new(scenario);
     for seed in 0..seeds {
         let mut choices = if seed % 2 == 0 {
             ChoiceStream::from_seed(seed)
@@ -174,20 +204,7 @@ pub fn abort_gate(scenario: &Scenario, seeds: u64) -> Option<(u64, String)> {
 /// same entry point takes libFuzzer's bytes unchanged, which is the point of
 /// the `Bytes` driver.
 pub fn fuzz_sweep(scenario: &Scenario, budget: u64, keep_failures: usize) -> SweepResult {
-    let mut result = SweepResult {
-        scenario: scenario.name,
-        runs: 0,
-        steps: 0,
-        failures: Vec::new(),
-        worst_fair_spread: 0,
-        worst_fair_bound: 0,
-        worst_over_bound: 0,
-        worst_thread_spread: 0,
-        worst_thread_bound: 0,
-        worst_thread_over_bound: 0,
-        thread_covered_ns: 0,
-        elapsed_ns: 0,
-    };
+    let mut result = SweepResult::new(scenario);
     let mut generator = 0x9E3779B97F4A7C15u64;
     while result.steps < budget {
         generator = generator

@@ -878,6 +878,24 @@ pub const KNOWN_RED: &[Red] = &[
     // machine CI has no way to construct.
     // ---------------------------------------------------------------------
     Red {
+        test: "sched_check_build",
+        instrument: Instrument::DevHostAlone,
+        finding: Finding::fires(2, 2),
+        standing: Standing::Stands,
+        what: "`invariant P: a scheduler pass took 1684167 ns, budget 200000 ns`, panicking in \
+               `driver::idle_loop` before userland — then 1749243 ns on cpu1 in the isolated \
+               re-run. The dev host emulates x86-64 instruction by instruction while the guest \
+               TSC advances with host wall clock, so a pass that fits 200 µs natively cannot fit \
+               it here. Ruled out rather than assumed: removing `check_cpu` from inside the \
+               measured window left 1705987 ns, and `pass` samples its clock after `drain_irqs`, \
+               so the xHCI prologue is outside the window entirely",
+        evidence: "`cargo test -- sched_check_build` on this branch, two boots (parallel phase \
+                   then ALONE re-run); green on KVM the same day — twelve of twelve guest shards, \
+                   run 31875856466, where it measured 5,879 ms",
+        source: "specs/issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
+        measured: "2026-08-15",
+    },
+    Red {
         test: "screen_pager_keys",
         instrument: Instrument::DevHostAlone,
         finding: Finding::fires(3, 3),
