@@ -1781,9 +1781,15 @@ re-parks.
   bounded — and neither rate moves. `i8042_undecoded_bytes` 2 of 9 against 1 of
   5; `71_macro_empty_arg` 3 of 9 against 1 of 5.** So the eight-record bound stands on its
   argument rather than on those rates; `71_macro_empty_arg` at "zero in five"
-  was a lucky five, and its mechanism is
-  `specs/issues/build/daemon-lines-land-in-any-test-window.md`'s, which records
-  the same test failing the same way before this branch existed;
+  was a lucky five, and **its mechanism turned out to be nothing on the console
+  path at all** — fixed 2026-08-15 in `tests/common/console.rs`, where the whole
+  of it is written down. Two causes, and neither is a lock: a daemon's whole
+  line landing in the window, and — the one that decided the residual rate —
+  this case being `printf("%d", …)` with no newline, so its `17` reaches the
+  wire unterminated and the *host's* line splitter appends whoever wrote next.
+  That is why bounding the drain looked like it helped: while the next writer
+  was the kernel, the capture already cut at `[kernel `. No suite here could
+  have told the two apart, which is the caution this paragraph is really about;
   `i8042_undecoded_bytes` is
   `specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`'s,
   a driver race this branch's timing moves rather than one it made. **Both are

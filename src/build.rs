@@ -815,9 +815,9 @@ pub fn harness_kernel_build_is_declared(features: &str, debug_wait: bool) -> boo
 ///
 /// **Derived, never listed.** The point of reading it out of the config is that
 /// a daemon added to `[boot] start` tomorrow is in this set the moment it
-/// exists — a hardcoded list would let the next `netd` silently rejoin
-/// `specs/issues/build/daemon-lines-land-in-any-test-window.md`. `/bin/init`
-/// itself is added by hand because it is the one speaker that is not a
+/// exists — a hardcoded list would let the next `netd`'s lines start deciding C
+/// tests again, which is what task #84 was (`tests/common/console.rs`).
+/// `/bin/init` itself is added by hand because it is the one speaker that is not a
 /// `[programs]` key: it is the parent that starts every one of them, and it
 /// speaks before any of them exists (`init: netd: no nic on this machine` is on
 /// the console before netd is loaded).

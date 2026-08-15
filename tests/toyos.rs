@@ -890,50 +890,6 @@ const EXPECTED_FAILURES: &[ExpectedFailure] = &[ExpectedFailure {
     // so a green is one sample and may not red a healthy tree. The date is the
     // same month the entry above uses, for the same reason.
     stale: Stale::OnThisDate("2026-09-06"),
-}, ExpectedFailure {
-    test: "71_macro_empty_arg",
-    task: 84,
-    spec: "specs/issues/build/daemon-lines-land-in-any-test-window.md",
-    // This test's whole verdict is its captured stdout, so the open defect — a
-    // stray daemon line landing inside the capture window, or its mirror
-    // image, a capture that comes back empty — can only present as the capture
-    // disagreeing with the expectation. Fourteen suites on 2026-08-15 measured
-    // the rate at ~1 in 4 on the dev host, unchanged across an A/B whose diff
-    // never touched the window, and CI's own shard measured the same shape
-    // with the harness's ALONE retry answering GREEN both times ("a rate and
-    // not a classification"). The residual risk the struct doc names applies
-    // in full here: a real regression of the macro expansion would present
-    // identically, and the spec entry is what a human separates them with.
-    says: &["output mismatch", "exit code Some(0)"],
-    // Intermittent at a measured rate, so one green may not red the run. The
-    // one-month shelf, as above: long enough for #84's fix to land first,
-    // short enough that nobody inherits this silently.
-    stale: Stale::OnThisDate("2026-09-14"),
-}, ExpectedFailure {
-    test: "76_dollars_in_identifiers",
-    task: 84,
-    spec: "specs/issues/build/daemon-lines-land-in-any-test-window.md",
-    // Same defect, same shape as the entry above. The L5/L6 review held this
-    // family to one declaration on the argument that any of the 110 C tests
-    // can absorb the line and enumerating victims bounds nothing — and then
-    // the facts moved: logd is a new daemon writing startup lines in every
-    // boot, this test red twice across 22 suites on both arms of the L6 A/B,
-    // and it red the landing PR's own CI shard beside the entry below. The
-    // declarations carry the same clock as their sibling, which is the
-    // forcing function for #84's real fix rather than a quiet absorption.
-    says: &["output mismatch", "exit code Some(0)"],
-    stale: Stale::OnThisDate("2026-09-14"),
-}, ExpectedFailure {
-    test: "90_stdio_buffering",
-    task: 84,
-    spec: "specs/issues/build/daemon-lines-land-in-any-test-window.md",
-    // The entry the daemon-lines write-up names verbatim ("judge the C family
-    // from a full run"): its capture has been observed missing its own tail
-    // and carrying soundd's suspension line, and CI red it on two consecutive
-    // cycles of the L5/L6 landing PR. Same reconsidered hold, same clock, same
-    // residual risk as its two siblings.
-    says: &["output mismatch", "exit code Some(0)"],
-    stale: Stale::OnThisDate("2026-09-14"),
 }];
 
 /// The renderer's two text colours, as the screendump reports them.
@@ -1402,9 +1358,9 @@ fn check_c_result(result: &TestResult) -> bool {
                 // as one program's output, on a console every process shares.**
                 // `common::console::verdict` takes the lines that are some
                 // other process's out of it first, and hands them back so they
-                // can be printed rather than vanish —
-                // `specs/issues/build/daemon-lines-land-in-any-test-window.md`
-                // and `c_capture_ignores_daemon_lines` are what that rests on.
+                // can be printed rather than vanish. Its own doc has the two
+                // ways that happens and `c_capture_ignores_daemon_lines` is the
+                // gate under it.
                 let verdict = common::console::c_verdict(&result.stdout, &expected);
                 if !verdict.filtered.is_empty() {
                     eprintln!(

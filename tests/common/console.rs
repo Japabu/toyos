@@ -7,19 +7,23 @@
 //!    whole. `specs/log-architecture-spec.md` §4.4 and §9.5.
 //! 2. [`verdict`] — therefore a line's *first bytes are its writer's own*, so
 //!    the C family can tell a daemon's line from the program under test's by
-//!    reading the front of it, and stop failing on output that is not its own
-//!    (`specs/issues/build/daemon-lines-land-in-any-test-window.md`).
+//!    reading it, and stop failing on output that is not its own.
 //!
-//! The order is the argument. Before L5 a daemon's `println!` and a test's
-//! could reach the backend in pieces and arrive spliced into one line, and no
-//! filter over lines could separate them — which is why that write-up says
-//! there is no cheap honest fix and leaves the choice between a capture channel
-//! per child and a writer tag on every console write. L5 built neither and made
-//! the third answer sound: a console *is* a per-holder line buffer now, so a
-//! line begins with its writer's first bytes or `console_line_atomicity` is
-//! red. [`c_capture_ignores_daemon_lines`] is the gate that says the harness
-//! actually depends on that, and its negative control says the dependence has
-//! teeth.
+//! The order is the argument, and it is the whole of what closed task #84.
+//! Before L5 a daemon's `println!` and a test's could reach the backend in
+//! pieces and arrive spliced into one line, and no rule over lines could
+//! separate them — so the standing write-up said there was no cheap honest fix
+//! and left a choice between giving each child a capture channel and tagging
+//! every console write with its writer. L5 built neither and made a third
+//! answer sound: a console *is* a per-holder line buffer now, so a line begins
+//! with its writer's first bytes or `console_line_atomicity` is red.
+//!
+//! **L5's guarantee is about flushes, not about newlines, and that is the
+//! second half.** A program that writes without a trailing newline has its
+//! bytes joined to the next writer's line by the *host's* splitter — see
+//! [`speaker_at`], which is where that is written down. Both halves are
+//! [`c_capture_ignores_daemon_lines`]'s, and every one of its verdicts carries
+//! the control that says it has teeth.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -284,10 +288,11 @@ fn speaker_at(line: &str, speakers: &BTreeSet<String>) -> Option<usize> {
 
 /// What the C family concluded from one capture, and what it took out first.
 pub struct Verdict<'a> {
-    /// Whole lines attributed to another process and removed before the
-    /// comparison.
+    /// Each whole line another process wrote, removed before the comparison —
+    /// as it stood on the wire, which is from where it started to the newline
+    /// that ended it, and not necessarily a whole captured line.
     ///
-    /// **Kept and printed either way, never dropped.** The filter is a claim
+    /// **Kept and printed either way, never dropped.** The removal is a claim
     /// about who wrote a line, and a claim that nobody can see is a capture
     /// quietly getting shorter; on a red these are usually the whole
     /// explanation.

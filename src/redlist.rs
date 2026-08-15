@@ -1277,17 +1277,30 @@ pub const KNOWN_RED: &[Red] = &[
         test: "71_macro_empty_arg",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(4, 14),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the capture path stopped attributing other processes' bytes to this program, \
+             2026-08-15. Two causes, both measured rather than argued: a daemon's whole line \
+             landing in the window, which `common::console::verdict` removes on the boot \
+             config's own list of who may speak; and the one no rule over whole lines reaches \
+             — this case is `printf(\"%d\", …)` with no newline, so its `17` reaches the wire \
+             unterminated and the host's splitter appends whoever wrote next, giving \
+             `17init: started test-runner` in one line, or `17===TEST_END …` and an empty \
+             capture. After the fix: 10 targeted runs and 5 full suites, 0 reds, against 1 of \
+             10 with only the first cause answered. `c_capture_ignores_daemon_lines` is the \
+             gate and carries both captures verbatim",
+        ),
         what: "`output mismatch`, expected `17` and the capture empty — the child's own line fell \
                outside the `===TEST_START===`/`===TEST_END===` window the C family compares whole. \
                Same shape and same test name the write-up records at `dbbdcbe`, which is before \
                this branch existed. **The log spec's §4.3 said bounding the console drain took \
                this to zero in five; fourteen suites here say roughly one in four whatever the \
                console lock does**, so that was a lucky five rather than a fix, and §4.3 is \
-               corrected to say so",
+               corrected to say so. The console lock was never in it: what decided the rate was \
+               whether the writer after this program was the kernel, whose `[kernel ` prefix the \
+               capture already cut at",
         evidence: "the same fourteen suites as the row above: 3 of the 9 with the window bounded \
                    and 1 of the 5 without",
-        source: "specs/issues/build/daemon-lines-land-in-any-test-window.md",
+        source: "tests/common/console.rs",
         measured: "2026-08-15",
     },
     // ---------------------------------------------------------------------

@@ -2084,12 +2084,11 @@ impl QemuInstance {
                         // runner's `===TEST_END` lands on the same line the
                         // host's splitter builds. Filing that head under
                         // `serial` alone is how `71_macro_empty_arg` came back
-                        // with an *empty* capture against an expected `17`,
-                        // which is the mirror image
-                        // `specs/issues/build/daemon-lines-land-in-any-test-window.md`
-                        // records and the half no filter over whole lines
-                        // reaches. Nothing is dropped either way; this only
-                        // stops the capture from losing its own tail.
+                        // with an *empty* capture against an expected `17` —
+                        // the half no filter over whole lines reaches, and
+                        // `common::console` has the rest of it. Nothing is
+                        // dropped either way; this only stops the capture from
+                        // losing its own tail.
                         if at > 0 && in_test {
                             let head = &line[..at];
                             serial.push_str(head);
