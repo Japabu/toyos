@@ -164,8 +164,10 @@ fn main() {
         // it chose was decided by, and the two lines are the four-way table
         // split between the two things that know. One and not two, because
         // every line a daemon writes on a shared console is a line that can land
-        // inside a test's window (`specs/issues/build/daemon-lines-land-in-any-test-window.md`)
-        // and because §5.6 says "once".
+        // inside a test's window — the C family removes it by this program's
+        // own name now (`tests/common/console.rs`), which is a reason to write
+        // few rather than a licence to write any number — and because §5.6 says
+        // "once".
         Some(v) => say!("logd: this boot's kernel log is {} ({zone})", v.path()),
         None => say!(
             "logd: no {DIR} on this machine - this boot's kernel log is on the console only \
