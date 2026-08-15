@@ -4,6 +4,7 @@ The law lives in the specs: `specs/user-machine-state.md` (every Ring 3 transiti
 
 ## Caveats that bite every agent
 
+- **Nothing on the idle path touches a filesystem** — `log_file.rs` was the last one and it is gone; a log condition on the pre-`hlt` list is the scaffolding that mechanism replaced. The deletion ledger and review hold this; no gate does.
 - **Anything added to the idle loop is an audio change** — housekeeping runs before `pass()`, so a woken CPU is late by what it costs. On a machine with nothing to run the idle loop does not run at all, so a diagnostic placed there reports nothing exactly when it is needed.
 - **The idle loop may not take a global lock unconditionally** — the crash report reads the process table through a `try_lock` it must never block on, so housekeeping there is a standing aggressor against the one reader that cannot wait. `sched/reap_gate.rs` is the pattern: a relaxed-load gate in front of the lock.
 - **`BackendGuard` masks interrupts for its whole life, so anything written under it is an interrupt latency** — the console drain is bounded to eight records and a userland `write` to one 1024-byte flush for that reason, and a new holder must bound itself too.
