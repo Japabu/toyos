@@ -306,9 +306,9 @@ pub fn flush_final() {
 /// **One backend acquisition per [`MAX_CONSOLE_LINE`] of output, ANSI stripped,
 /// no buffering.** It replaced `SerialWriter::console()` and the lossless
 /// byte-ring append underneath it, whose unit of interleaving was a `write`
-/// syscall — and
-/// `specs/issues/diagnostics/serial-console-has-no-line-atomicity.md` has four
-/// recorded splices to show for it. Taking the guard here is what makes this
+/// syscall — and two recorded splices to show for it, whose measurements
+/// `specs/log-architecture-spec.md` §4.4 keeps now that the entry that held
+/// them is closed. Taking the guard here is what makes this
 /// write whole against a kernel record and against another process; what it
 /// does *not* fix is `println!` handing the kernel half a line at a time.
 ///

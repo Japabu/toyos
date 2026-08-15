@@ -703,7 +703,7 @@ pub const KNOWN_RED: &[Red] = &[
              the shape that left open is closed at the kernel by L5 of the log architecture: a \
              `ConsoleObject` per holder buffers its line and emits it whole under one \
              `BackendGuard`, so a kernel record cannot land inside one. `console_line_atomicity` \
-             is the gate, 0 of 2000",
+             is the gate, 0 of 2000, and 8 of 8 red under `console-unbuffered`",
         ),
         what: "`STALLED` waiting for both clients to leave the mixer: `soundd: client ` and \
                `1 removed` came back either side of the kernel's four `exit:` accounting lines, so \
@@ -931,7 +931,9 @@ pub const KNOWN_RED: &[Red] = &[
             "the splice is unrepresentable since L5 of the log architecture: a `ConsoleObject` per \
              holder buffers its line and emits it whole under one `BackendGuard`, so the kernel \
              record that cut this needle open has nowhere to be acquired. `console_line_atomicity` \
-             is the gate, 0 of 2000 with 2 of 2 red under `console-unbuffered`",
+             is the gate, 0 of 2000 with 8 of 8 red under `console-unbuffered` \
+             (2026-08-15, at counts from 1 to 570 of 2000 — the magnitude is a race and only \
+             the sign is a verdict)",
         ),
         what: "the needle `soundd: hda codec0 vendor=1af4` split in half by another writer, between \
                `codec` and `0`. Three full suites on one tree in one session, red on the third — so \
