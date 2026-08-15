@@ -7,7 +7,8 @@ use core::mem;
 
 use alloc::vec;
 use alloc::alloc::Layout;
-use elf::{abi, endian::AnyEndian, ElfBytes};
+use toyos_elf::section::{SectionTable, SHT_RELA};
+use toyos_elf::{RelaTable, RelocKind};
 use uefi::{
     prelude::*,
     CStr16,
@@ -241,37 +242,62 @@ fn rtc_utc_offset(system_table: &SystemTable<Boot>) -> Option<i32> {
 /// Kernel virtual base: all physical memory is mapped here in the kernel's address space.
 const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
-fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
-    let elf = ElfBytes::<AnyEndian>::minimal_parse(&kernel_elf_bytes)
-        .expect("Failed to parse kernel elf");
+/// `SHT_REL`, the relocation form whose addend lives in the destination word.
+///
+/// Named here rather than taken from `toyos-elf`, which names only the section
+/// types it consumes and consumes no `SHT_REL`: nothing in this tree emits one,
+/// and an image that carried them would otherwise start with every one of them
+/// silently unapplied.
+const SHT_REL: u32 = 9;
 
-    let segments = elf.segments().expect("Failed to get segments");
-    let section_headers = elf.section_headers().expect("Failed to get sections");
+/// `[offset, offset + len)` of the file, or `None` when that is not wholly
+/// inside it.
+///
+/// Every `offset` and `len` passed here came out of the image's own headers, so
+/// both are numbers the file chose: the addition is checked and the bytes are
+/// taken with `get` rather than indexed. Each caller refuses on `None` — a
+/// table this cannot cover is never read short.
+fn file_range(bytes: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
+    let start = usize::try_from(offset).ok()?;
+    let end = usize::try_from(offset.checked_add(len)?).ok()?;
+    bytes.get(start..end)
+}
+
+fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
+    // `toyos-elf` is the tree's one ELF decoder: the crate the kernel reads
+    // every program image with reads the kernel's own image here. Refused by
+    // name before anything is allocated — ELF32, big-endian, a version that is
+    // not `EV_CURRENT`, an `e_type` that is not `ET_DYN`, a machine that is not
+    // x86-64, no program headers or a table outside the file, more than
+    // `toyos_elf::MAX_LOAD_SEGMENTS` `PT_LOAD`s or none at all, a `PT_LOAD`
+    // with `p_filesz > p_memsz` or a `p_vaddr + p_memsz` or `p_offset +
+    // p_filesz` that overflows, and an `e_entry` no segment covers.
+    //
+    // `p_filesz <= p_memsz` matters for the same reason it does in the kernel's
+    // loader: the pair is a (copy length, destination size) pair here too, as
+    // the image is sized from every `p_memsz` and each segment is then copied
+    // in at `p_filesz`.
+    let layout = toyos_elf::Layout::parse(kernel_elf_bytes)
+        .unwrap_or_else(|e| panic!("kernel.elf: {e}"));
+
+    // Section headers are optional to `toyos-elf`, which loads programs whose
+    // sections carry only symbol names. Here they carry the relocations that
+    // make the image runnable, so a file with no readable table is refused
+    // rather than started unrelocated.
+    let sections = layout
+        .section_headers
+        .and_then(|table| file_range(kernel_elf_bytes, table.file_offset, table.byte_len() as u64))
+        .map(SectionTable::new)
+        .expect("kernel.elf: no section header table inside the file");
 
     let stack_size: usize = 8 * 1024 * 1024; // 8MB
 
-    // The kernel's own `elf::parse_layout` enforces `p_filesz <= p_memsz`
-    // because the pair is a (copy length, destination size) pair to it. It is
-    // the same pair here, and nothing had checked it: the image is sized from
-    // every `p_memsz` and each segment is then copied in at `p_filesz`.
-    let mut mem_size: u64 = 0;
-    segments.iter().for_each(|segment| {
-        if segment.p_type == abi::PT_LOAD {
-            assert!(
-                segment.p_filesz <= segment.p_memsz,
-                "kernel.elf: PT_LOAD p_filesz {} > p_memsz {}",
-                segment.p_filesz, segment.p_memsz
-            );
-            let end = segment
-                .p_vaddr
-                .checked_add(segment.p_memsz)
-                .expect("kernel.elf: PT_LOAD p_vaddr + p_memsz overflows");
-            mem_size = mem_size.max(end);
-        }
-    });
-
     println!("Kernel stack size: {}", stack_size);
-    let mem_size = mem_size
+    // `vaddr_max` is the largest `p_vaddr + p_memsz` over the `PT_LOAD`
+    // segments, and the image is laid out at its own vaddrs — so it is what the
+    // kernel's memory has to cover before the stack is added to it.
+    let mem_size = layout
+        .vaddr_max
         .checked_add(stack_size as u64)
         .and_then(|n| usize::try_from(n).ok())
         .expect("kernel.elf: image plus stack does not fit an allocation");
@@ -281,77 +307,62 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
     let mut process_mem = alloc_kernel_memory(mem_size);
     println!("Kernel memory located at: {:?}", process_mem.as_ptr());
 
-    segments.iter().for_each(|segment| {
-        if segment.p_type == abi::PT_LOAD {
-            println!("Loading segment: {:?}", segment);
-            let fstart = segment.p_offset as usize;
-            let fend = segment
-                .p_offset
-                .checked_add(segment.p_filesz)
-                .and_then(|n| usize::try_from(n).ok())
-                .filter(|end| *end <= kernel_elf_bytes.len())
-                .expect("kernel.elf: PT_LOAD file extent is past the end of the file");
-            let vstart = segment.p_vaddr as usize;
-            // In bounds by construction: `mem_size` is at least
-            // `p_vaddr + p_memsz` for this segment and `p_filesz <= p_memsz`.
-            let vend = vstart + segment.p_filesz as usize;
-            process_mem[vstart..vend].copy_from_slice(&kernel_elf_bytes[fstart..fend]);
-        }
-    });
-
-    if section_headers
-        .iter()
-        .find(|section| section.sh_type == abi::SHT_REL)
-        .is_some()
-    {
-        panic!("SHT_REL not supported");
+    for segment in layout.segments() {
+        println!("Loading segment: {:?}", segment);
+        let src = file_range(kernel_elf_bytes, segment.file_offset, segment.filesz)
+            .expect("kernel.elf: PT_LOAD file extent is past the end of the file");
+        let vstart = segment.vaddr as usize;
+        // In bounds by construction: `mem_size` is at least
+        // `p_vaddr + p_memsz` for this segment and `p_filesz <= p_memsz`.
+        process_mem[vstart..vstart + src.len()].copy_from_slice(src);
     }
 
+    assert!(
+        !sections.iter().any(|section| section.kind == SHT_REL),
+        "kernel.elf: SHT_REL is not supported"
+    );
+
     let mut reloc_count = 0u64;
-    section_headers
-        .iter()
-        .filter(|section_header| section_header.sh_type == abi::SHT_RELA)
-        .for_each(|section_header| {
-            elf.section_data_as_relas(&section_header)
-                .expect("Failed to parse SHT_RELA")
-                .for_each(|rela| {
-                    match rela.r_type {
-                        abi::R_X86_64_RELATIVE => {
-                            // Both fields index the image and both come out of
-                            // the file: `r_offset` is the destination of an
-                            // 8-byte store and `r_addend` is the address
-                            // stored. Unchecked, the store is an arbitrary
-                            // write anywhere in the machine, made before
-                            // ExitBootServices with firmware still live.
-                            let offset = rela.r_offset;
-                            let addend = rela.r_addend;
-                            assert!(
-                                offset.checked_add(8).is_some_and(|end| end <= mem_size as u64),
-                                "kernel.elf: relocation stores 8 bytes at {offset:#x}, outside the {mem_size:#x}-byte image"
-                            );
-                            assert!(
-                                (0..=mem_size as i64).contains(&addend),
-                                "kernel.elf: relocation addend {addend:#x} is outside the {mem_size:#x}-byte image"
-                            );
-                            let value = PHYS_OFFSET + unsafe { process_mem.as_ptr().add(addend as usize) } as u64;
-                            unsafe {
-                                process_mem
-                                    .as_mut_ptr()
-                                    .add(offset as usize)
-                                    .cast::<u64>()
-                                    .write(value);
-                            }
-                            reloc_count += 1;
-                        }
-                        _ => panic!("Unsupported relocation type"),
+    for section in sections.iter().filter(|section| section.kind == SHT_RELA) {
+        let table = file_range(kernel_elf_bytes, section.offset, section.size)
+            .expect("kernel.elf: SHT_RELA section is past the end of the file");
+        for rela in RelaTable::new(table).iter() {
+            match rela.kind {
+                RelocKind::Relative => {
+                    // Both fields index the image and both come out of the
+                    // file: `r_offset` is the destination of an 8-byte store
+                    // and `r_addend` is the address stored. Unchecked, the
+                    // store is an arbitrary write anywhere in the machine, made
+                    // before ExitBootServices with firmware still live.
+                    let offset = rela.offset;
+                    let addend = rela.addend;
+                    assert!(
+                        offset.checked_add(8).is_some_and(|end| end <= mem_size as u64),
+                        "kernel.elf: relocation stores 8 bytes at {offset:#x}, outside the {mem_size:#x}-byte image"
+                    );
+                    assert!(
+                        (0..=mem_size as i64).contains(&addend),
+                        "kernel.elf: relocation addend {addend:#x} is outside the {mem_size:#x}-byte image"
+                    );
+                    let value = PHYS_OFFSET + unsafe { process_mem.as_ptr().add(addend as usize) } as u64;
+                    unsafe {
+                        process_mem
+                            .as_mut_ptr()
+                            .add(offset as usize)
+                            .cast::<u64>()
+                            .write(value);
                     }
-                });
-        });
+                    reloc_count += 1;
+                }
+                kind => panic!("kernel.elf: unsupported relocation type {kind:?}"),
+            }
+        }
+    }
     println!("Applied {} relocations", reloc_count);
 
     LoadedKernel {
         memory: process_mem,
-        entry_offset: elf.ehdr.e_entry as usize,
+        entry_offset: layout.entry as usize,
         stack_offset: mem_size - stack_size,
         stack_size,
     }
