@@ -115,6 +115,7 @@ toyos-hda = { path = "../toyos-hda" }
 toyos-pci = { path = "../toyos-pci" }
 toyos-ps2 = { path = "../toyos-ps2" }
 toyos-sched = { path = "../toyos-sched" }
+toyos-wallclock = { path = "../toyos-wallclock" }
 toyos-xhci = { path = "../toyos-xhci" }
 rustc-demangle = "0.1"
 elf = { version = "0.8", default-features = false }

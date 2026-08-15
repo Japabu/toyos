@@ -61,6 +61,7 @@ dependencies = [
  "toyos-pci",
  "toyos-ps2",
  "toyos-sched",
+ "toyos-wallclock",
  "toyos-xhci",
 ]
 
@@ -87,6 +88,9 @@ version = "0.1.0"
 [[package]]
 name = "toyos-fat32"
 version = "0.1.0"
+dependencies = [
+ "toyos-wallclock",
+]
 
 [[package]]
 name = "toyos-gpt"
@@ -106,6 +110,10 @@ version = "0.1.0"
 
 [[package]]
 name = "toyos-sched"
+version = "0.1.0"
+
+[[package]]
+name = "toyos-wallclock"
 version = "0.1.0"
 
 [[package]]

@@ -453,7 +453,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_CLOCK_REALTIME => crate::clock::local_secs().map_or(
             SyscallError::NotSupported.to_u64(),
             |secs| {
-                let now = crate::clock::Civil::from_unix_secs(secs);
+                let now = toyos_wallclock::Civil::from_unix_secs(secs);
                 (now.hour << 16) | (now.min << 8) | now.sec
             },
         ),

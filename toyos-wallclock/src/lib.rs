@@ -83,8 +83,16 @@ impl Civil {
     /// Seconds from the Unix epoch to this instant, reading it in the same zone
     /// the epoch is in.
     ///
-    /// Saturating on an invalid instant rather than refusing, because the one
-    /// caller that can produce one is [`Self::is_valid`]'s own check.
+    /// **Total, on every field combination, including ones no calendar has.**
+    /// [`days_from_civil`] saturates rather than checking, so a month of 0 or
+    /// 13..=15 and a day of 0 — which is what a hostile or never-initialised
+    /// FAT directory entry decodes to — read as the day before the first of the
+    /// following month instead of refusing. That is the property `toyos-fat32`
+    /// needs: a timestamp is not load-bearing enough to fail a volume read
+    /// over, and its `every_bit_pattern_decodes` asserts it over all 65,536
+    /// date encodings. [`Self::is_valid`] is the *other* caller's answer — the
+    /// RTC's — and refusing there is what keeps an impossible instant out of
+    /// the wall clock.
     pub fn to_unix_secs(&self) -> u64 {
         days_from_civil(self.year, self.month, self.day) * DAY
             + self.hour * 3_600
