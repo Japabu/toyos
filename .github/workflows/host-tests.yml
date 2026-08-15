@@ -127,14 +127,30 @@ jobs:
       # only obligation in the tree whose *negative* no guest test can express —
       # on x86 a build with either fence gone behaves identically, which is the
       # whole reason it is a model. `specs/log-architecture-spec.md` §2.5.
+      #
+      # **A non-zero exit is not the check, and until 2026-08-15 it was the
+      # whole of it.** Anything that stops `cargo test` before a model runs — a
+      # syntax error in `shard.rs`, a `wake-fence-off` block that no longer
+      # compiles, a manifest path that moved — exits non-zero and read here as
+      # proof that the model has teeth. That is the one failure mode a negative
+      # control must not have: the less it ran, the greener it looked. So the
+      # step demands the model's own verdict line by name, and a build that
+      # produced no verdict fails whichever way it exited.
       - name: kernel-loom wake fences have teeth
         run: |
           set -o pipefail
           echo "=== kernel-loom --features wake-fence-off --test log_wake (must red)" \
             | tee -a /tmp/host.log
           if cargo test --manifest-path kernel-loom/Cargo.toml \
-               --features wake-fence-off --test log_wake 2>&1 | tee -a /tmp/host.log; then
+               --features wake-fence-off --test log_wake 2>&1 \
+               | tee /tmp/wake-fence-off.log | tee -a /tmp/host.log; then
             echo "log_wake passed with both fences removed: the model has no teeth" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+          if ! grep -q 'a_commit_and_an_arm_cannot_both_miss \.\.\. FAILED' \
+               /tmp/wake-fence-off.log; then
+            echo "the fence-off build failed without a_commit_and_an_arm_cannot_both_miss reaching a verdict: this step proved nothing, and whatever stopped the model from running is what to fix" \
               | tee -a /tmp/host.log
             exit 1
           fi
