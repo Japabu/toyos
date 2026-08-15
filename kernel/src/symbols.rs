@@ -3,8 +3,62 @@ use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use alloc::boxed::Box;
 use elf::ElfBytes;
 use elf::endian::AnyEndian;
+use toyos_abi::log::MAX_RECORD_MESSAGE;
 
+use crate::log::elide::{self, Elided};
 use crate::process::PageAlloc;
+
+/// A backtrace frame's own text: `    ` + `{addr:#x}` + `  ` + `+` +
+/// `{offset:#x}`, with both numbers at their widest — `0x` and sixteen hex
+/// digits is every `u64` there is.
+const FRAME_TEXT: usize = 4 + 18 + 2 + 1 + 18;
+
+/// What is left of a record's message for the symbol, once the frame's own text
+/// has taken its share. The slack is deliberate and it is in the safe
+/// direction: a symbol a byte over this loses a byte from its middle, where a
+/// *line* a byte over the record's bound loses its tail.
+const FRAME_OVERHEAD: usize = 48;
+const _: () = assert!(FRAME_OVERHEAD >= FRAME_TEXT);
+const SYMBOL_BUDGET: usize = MAX_RECORD_MESSAGE - FRAME_OVERHEAD;
+
+/// How much of the budget the head keeps; [`SYMBOL_TAIL`] is the rest.
+///
+/// **The marker comes out of the budget first**, because it is part of what
+/// gets rendered: an earlier split spent the whole budget on head and tail and
+/// then wrote `...[N bytes elided]...` between them, which put the line back
+/// over the record's bound and cost it the tail this exists to keep.
+///
+/// An even split of what is left, because a backtrace with only one end of a
+/// name in it names nothing either way: the head is the crate and the module
+/// path, the tail is the function, and `screen_late_panic` asserts on the tail
+/// for that reason.
+const SYMBOL_KEPT: usize = SYMBOL_BUDGET - elide::MARKER_MAX;
+const SYMBOL_HEAD: usize = SYMBOL_KEPT / 2;
+const SYMBOL_TAIL: usize = SYMBOL_KEPT - SYMBOL_HEAD;
+
+/// The whole of the claim, in one place a compiler checks: a frame line fits a
+/// record whatever the symbol was.
+const _: () =
+    assert!(elide::widest(SYMBOL_HEAD, SYMBOL_TAIL) + FRAME_TEXT <= MAX_RECORD_MESSAGE);
+
+/// And the three numbers the prose around here states, pinned so it cannot
+/// drift from them again — which it did the first time `FRAME_OVERHEAD` moved.
+const _: () = assert!(SYMBOL_BUDGET == 944 && SYMBOL_HEAD == 451 && SYMBOL_TAIL == 452);
+
+/// A demangled symbol, rendered head-and-tail when it is wider than a record
+/// can carry. `kernel/src/log/elide.rs` is the mechanism and the argument.
+///
+/// **Nothing in the guest suite reaches this at the shipped bound, and saying
+/// so is the point of this comment.** `screen_late_panic`'s
+/// `late_panic::Nest` demangles to 288 bytes against a budget of 944, so
+/// that gate proves the panel keeps a symbol's tail and proves nothing about
+/// the elision — the tree's own widest symbol is under a third of what
+/// triggers it.
+/// `kernel-elide` is where the seams are checked, on the host, against
+/// characters that straddle both of them.
+fn symbol_text<D>(name: D) -> Elided<D, SYMBOL_HEAD, SYMBOL_TAIL> {
+    Elided(name)
+}
 
 /// Zero-allocation symbol table. Points directly into ELF sections in memory.
 /// Resolution is a linear scan over raw Elf64_Sym entries — O(n) but lock-free,
@@ -254,7 +308,7 @@ fn log_kernel(addr: u64, lookup: impl FnOnce(&SymbolTable) -> Option<(&str, u64)
     }
     let table = unsafe { &*ptr };
     if let Some((raw, offset)) = lookup(table) {
-        log!("    {:#x}  {:#}+{:#x}", addr, rustc_demangle::demangle(raw), offset);
+        log!("    {:#x}  {}+{:#x}", addr, symbol_text(rustc_demangle::demangle(raw)), offset);
         Some(offset)
     } else {
         let kb = KERNEL_BASE.load(Ordering::Relaxed);
@@ -281,7 +335,7 @@ pub fn resolve_user_return(syms: &SymbolTable, return_addr: u64) -> bool {
 
 fn log_user(syms: &SymbolTable, addr: u64, resolved: Option<(&str, u64)>) -> bool {
     if let Some((name, offset)) = resolved {
-        log!("    {:#x}  {:#}+{:#x}", addr, rustc_demangle::demangle(name), offset);
+        log!("    {:#x}  {}+{:#x}", addr, symbol_text(rustc_demangle::demangle(name)), offset);
         true
     } else if syms.is_valid_user_addr(addr) {
         let base_offset = addr.saturating_sub(syms.prog_base());

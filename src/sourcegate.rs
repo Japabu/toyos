@@ -186,9 +186,127 @@ fn named_in_code(needle: &str) -> Vec<String> {
     found
 }
 
+/// Every line of `kernel/src` under a relative path, with its number.
+fn kernel_lines() -> Vec<(String, usize, String)> {
+    let root = repo_root();
+    let mut files = Vec::new();
+    rust_files(&root, &root.join("kernel/src"), &mut files);
+    let mut out = Vec::new();
+    for path in files {
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        for (n, line) in text.lines().enumerate() {
+            out.push((rel(&root, &path), n + 1, line.to_string()));
+        }
+    }
+    out
+}
+
+/// The three log macros and the function they all expand to.
+const LOG_PRODUCERS: &[&str] = &["log!(", "alert!(", "boot_phase!(", "log::emit("];
+
+/// The two places in `kernel/` a `!!!` may still appear, and how many times.
+///
+/// **Named by file and count rather than tested against the same line as a
+/// `log!`.** A macro invocation is not a line — `rustfmt` puts a long one's
+/// format string on its own — so "this line has `!!!` and a `log!` on it" is
+/// defeated by a line break, and defeated silently. Every `!!!` in the tree is
+/// listed here instead, so a new one is a red wherever it is written and
+/// whatever it is written next to.
+///
+/// Both of these write raw bytes straight to the UART. They never enter the
+/// ring, so `panic_console`'s deleted scan could not see them either and
+/// `Level` was never their business
+/// (`specs/log-architecture-spec.md` §2.1).
+/// Counted in occurrences of `!!!` and not in lines, because each of these
+/// writes one at each end of its message.
+const SENTINEL_ALLOWED: &[(&str, usize)] = &[
+    // `\n!!! PANIC REENTRY: CPU halted !!!\n`, written with the IDT possibly
+    // gone.
+    ("kernel/src/main.rs", 2),
+    // `\n!!! DB TRAP !!!\n`, from the #DB handler before it clears DR7.
+    ("kernel/src/arch/idt/exceptions.rs", 2),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Two clauses, one rule each, and neither is checkable any other way.**
+    ///
+    /// The first: the NMI handler must not log. It would reenter its own CPU's
+    /// log shard — the reservation is sound only because the CPU that owns the
+    /// shard has `IF` and `TF` masked through publication, and an NMI is the one
+    /// interrupt that ignores `IF`. `dump_nmi_probe` is what makes the handler
+    /// *useful*; this is what keeps it silent.
+    ///
+    /// The second: no log producer in `kernel/` carries `!!!` in its format
+    /// string. `panic_console::has_alert` used to scan every display row for
+    /// three exclamation marks, and its own comment enumerated the messages that
+    /// happened to match; the panel reads `Level` off the record now, so a `!!!`
+    /// put back into a message would be a marker marking nothing — a second,
+    /// silent alert channel beside the typed one. The two `!!!` still in
+    /// `kernel/` write raw bytes straight to the UART, never enter the ring, and
+    /// were never `has_alert`'s business either
+    /// (`specs/log-architecture-spec.md` §2.1).
+    #[test]
+    fn nmi_does_not_log() {
+        let lines = kernel_lines();
+        assert!(
+            lines.iter().any(|(file, _, _)| file == "kernel/src/arch/idt/nmi.rs"),
+            "the NMI handler moved: this gate is scanning a file that is not there"
+        );
+
+        let silent: Vec<_> = lines
+            .iter()
+            .filter(|(file, _, line)| {
+                file == "kernel/src/arch/idt/nmi.rs"
+                    && LOG_PRODUCERS.iter().any(|p| code_only(line).contains(p))
+            })
+            .map(|(file, n, line)| format!("{file}:{n}: {}", line.trim()))
+            .collect();
+        assert!(
+            silent.is_empty(),
+            "the NMI handler logs, and it reenters its own CPU's shard to do it:\n{}",
+            silent.join("\n")
+        );
+
+        let mut found: Vec<(String, usize)> = Vec::new();
+        for (file, _, line) in &lines {
+            let n = line.matches("!!!").count();
+            if n == 0 {
+                continue;
+            }
+            match found.last_mut() {
+                Some((last, count)) if last == file => *count += n,
+                _ => found.push((file.clone(), n)),
+            }
+        }
+        let mut complaints = Vec::new();
+        for (file, count) in &found {
+            match SENTINEL_ALLOWED.iter().find(|(allowed, _)| allowed == file) {
+                Some((_, want)) if want == count => {}
+                Some((_, want)) => complaints.push(format!(
+                    "{file} has {count} `!!!` where this gate exempts {want} raw-UART ones"
+                )),
+                None => complaints.push(format!("{file} has {count} `!!!`")),
+            }
+        }
+        for (file, want) in SENTINEL_ALLOWED {
+            if !found.iter().any(|(f, _)| f == file) {
+                complaints.push(format!(
+                    "{file} no longer has the {want} raw-UART `!!!` this gate exempts, so the \
+                     exemption is stale"
+                ));
+            }
+        }
+        assert!(
+            complaints.is_empty(),
+            "the `!!!` sentinel is deleted: the panel paints a red row from `Level::Alert` and \
+             reads nothing out of the text, so a marker put back into a message marks \
+             nothing.\n{}",
+            complaints.join("\n")
+        );
+    }
 
     #[test]
     fn nothing_in_the_kernel_counts_a_reference_by_hand() {

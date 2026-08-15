@@ -49,8 +49,51 @@ pub mod preempt {
 /// interrupts. Empty here: the models do not drive that spin at all (see the
 /// scope note above), and the protocol it would call has its own models.
 pub mod arch {
+    /// The kernel implementation masks IF and TF across reservation and
+    /// publication. Loom has no per-CPU flags; the model's sole-writer
+    /// precondition is the corresponding witness here.
+    pub struct LogCommitGuard;
+
+    impl LogCommitGuard {
+        pub fn close() -> Self {
+            Self
+        }
+    }
+
     pub mod tlb {
         pub fn poll() {}
+    }
+
+    /// **A strictly stronger model than the instruction, and the direction is
+    /// the whole argument.**
+    ///
+    /// The kernel's `percpu_fetch_add` is one `xadd` with no `lock` prefix
+    /// inside a `cli` bracket. The only behaviour it has that a real
+    /// `fetch_add` does not is non-atomicity against *another CPU's* write to
+    /// the same word — and the bracket is what makes "no other CPU writes
+    /// `head`" true rather than hopeful. So every interleaving the real code
+    /// can produce, loom explores here; the shim cannot hide a race.
+    ///
+    /// Stated with its precondition, because without the bracket this shim is
+    /// the thing hiding the bug rather than the thing modelling around it.
+    ///
+    /// # Safety
+    /// Same contract as the kernel's: a word only one CPU writes.
+    #[cfg(feature = "loom")]
+    pub unsafe fn percpu_fetch_add(
+        counter: &loom::sync::atomic::AtomicU64,
+        _guard: &LogCommitGuard,
+    ) -> u64 {
+        counter.fetch_add(1, loom::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Host-fast form used to exercise the real zero-allocation constructor.
+    #[cfg(not(feature = "loom"))]
+    pub unsafe fn percpu_fetch_add(
+        counter: &core::sync::atomic::AtomicU64,
+        _guard: &LogCommitGuard,
+    ) -> u64 {
+        counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -67,6 +110,18 @@ pub mod sync;
 
 #[path = "../../kernel/src/shootdown.rs"]
 pub mod shootdown;
+
+#[path = "../../kernel/src/log/shard.rs"]
+pub mod log_shard;
+
+/// `registry.rs` names its shard as `super::shard`, which in the kernel is
+/// `crate::log::shard`. Here `super` is the crate root, so this is what makes
+/// the one path resolve in both builds — and it holds whether or not the `loom`
+/// feature is on, which the crate's other invocation depends on.
+pub use log_shard as shard;
+
+#[path = "../../kernel/src/log/registry.rs"]
+pub mod log_registry;
 
 #[path = "../../kernel/src/sched/reap_gate.rs"]
 pub mod reap_gate;

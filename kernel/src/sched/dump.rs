@@ -183,7 +183,12 @@ pub fn request() {
 
     let cpus = online_cpus();
     let me = percpu::cpu_id() as usize;
-    let from = crate::drivers::log_ring::mark();
+    // The bracket is two instants rather than two byte positions in one stream,
+    // because there is no one stream any more: a byte position has no meaning
+    // across shards. It is also exact where a byte range was not — the dump's
+    // own records are stamped by this same clock, so nothing a sibling CPU logs
+    // meanwhile can widen it.
+    let from = crate::clock::nanos_since_boot();
     log!("=== blocked-task dump: {cpus} cpu(s), and this report takes the screen ===");
 
     for cpu in 0..cpus {
@@ -227,7 +232,7 @@ pub fn request() {
 
     let census = census();
     summary(cpus, silent, census);
-    crate::drivers::panic_console::paint_report(from, crate::drivers::log_ring::mark());
+    crate::drivers::panic_console::paint_report(from, crate::clock::nanos_since_boot());
     IN_PROGRESS.store(false, Ordering::Release);
 }
 
@@ -595,6 +600,12 @@ fn summary(cpus: usize, silent: u32, c: Census) {
              open, so nothing here can say what no cpu holds",
         );
     }
+    // The one thread the report cannot ask about by walking a queue, because
+    // what it is doing is the reason this report is readable at all. `lost` is
+    // the number a reader of the console can never derive: it names the lines
+    // that are not there.
+    let (drained, lost, parks) = crate::log::console::stats();
+    log!("== klogd: {drained} record(s) drained, {lost} lost, {parks} park(s)");
     let unprinted = tally::UNPRINTED.load(Ordering::Relaxed);
     if unprinted > 0 {
         log!("== {unprinted} ordinary parked task(s) not listed; every anomaly is");

@@ -53,7 +53,7 @@ uses for processes: the *thread* owns a wait queue, every joiner registers on
 it, and the exit wakes it. `wake_task(main_tid)` would then have nothing left to
 do — it is only there because the main thread was assumed to be the joiner.
 
-Found while fixing `scheduler::wait_until`'s missing re-check
-(`a-wait-that-returns-without-its-condition-panics-the-kernel`), which is the
-same family read from the other end: that one is a wait ended by a wake meant
+Found while fixing `scheduler::wait_until`'s missing re-check (#62, whose entry
+is deleted now that it has landed), which is the same family read from the
+other end: that one is a wait ended by a wake meant
 for something else, this one is a wait that is owed a wake nobody sends.

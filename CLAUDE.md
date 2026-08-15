@@ -69,8 +69,9 @@ The bar is not yet the tree. The standing failures are declared rather than remo
 ```
 src/               Build system (the root cargo project, package name: toyos-build; its Cargo.toml is also the host workspace, and a gate reds on a crate that joins neither members nor exclude)
 kernel/            Kernel
-kernel-loom/       Loom models of `kernel/src/sync.rs`, beside the kernel and not in it
+kernel-loom/       Loom models of the kernel's lock-free concurrency, beside the kernel and not in it
 kernel-span/       Host harness for `kernel/src/mm/user_span.rs`, the same arrangement
+kernel-elide/      Host harness for `kernel/src/log/elide.rs`, the same arrangement
 bootloader/        UEFI bootloader
 userland/          All userland programs
 toyos-abi/         Kernel ABI (types, constants, syscall numbers, syscall wrappers)

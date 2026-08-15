@@ -6,6 +6,7 @@
 //!   trampoline. Decides nothing.
 //! * [`waitqs`] — where the kernel's wait queues live.
 //! * [`dump`] — Ctrl+Alt+D, the machine-wide blocked-task report.
+//! * [`kthread`] — a task with no address space, and what its panic means.
 //! * [`reap_gate`] — the flag that keeps the idle loop off the process table
 //!   when there is nothing to reap.
 //!
@@ -14,6 +15,7 @@
 
 pub mod driver;
 pub mod dump;
+pub mod kthread;
 pub mod payload;
 pub mod reap_gate;
 pub mod waitqs;

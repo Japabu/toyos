@@ -2830,7 +2830,7 @@ fn wait_for_ready(
                     && !no_timeout
                     && (line.contains("SEGFAULT")
                         || line.contains("KERNEL PANIC")
-                        || line.contains("!!! PANIC !!!")) =>
+                        || line.contains("PANIC:")) =>
             {
                 let mut crash_msg = line.clone();
                 let drain_deadline = Instant::now() + Duration::from_secs(2);

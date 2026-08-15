@@ -59,7 +59,7 @@ pub fn foreign_disk_untouched(
     // The boot log, not a post-ready drain: every line this test cares about
     // is printed in the storage phase, long before the ready marker.
     let log = qemu.boot_log().to_string();
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?}: refusing a disk must not be fatal\n{log}"));
         }
@@ -91,7 +91,7 @@ pub fn foreign_disk_untouched(
     writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
     qemu.flush_stdin();
     let tail = qemu.drain_serial(Duration::from_secs(20));
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if tail.contains(bad) {
             return Err(format!("{bad:?} during shutdown\n{tail}"));
         }

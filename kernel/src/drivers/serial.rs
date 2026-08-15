@@ -1,20 +1,25 @@
-//! Kernel serial console.
+//! The 16550 and the virtio-console, and the one lock that serialises them.
 //!
-//! Two responsibilities, kept apart so that `log!()` never blocks while
-//! holding kernel locks:
+//! **There is one thing here now where there were two.** `SerialWriter` was a
+//! per-invocation stack buffer that every `log!` formatted into and committed
+//! to a 64 KiB byte ring, which something else drained later; the ring is gone
+//! (`specs/log-architecture-spec.md` §8.1) and what reaches this file is whole
+//! units — a rendered record from `log::console`, a userland `write`, a panic
+//! report — each of which takes [`BackendGuard`] once and holds it for its own
+//! whole unit. That is where line atomicity comes from, and it is the only
+//! place it could come from: two producers of half-lines cannot be made
+//! atomic by anything downstream of them.
 //!
-//! 1. **`SerialWriter`** — the formatter `log!()` writes into. Buffers
-//!    bytes on the stack and atomically commits to `log_ring` on Drop.
-//!    No spinlock, no CLI: each `log!()` invocation owns its own
-//!    independent buffer, so multiple CPUs (and IRQ-vs-thread on the
-//!    same CPU) can format concurrently with no interaction.
-//!
-//! 2. **`BackendGuard`** — exclusive access to the underlying serial
-//!    backend (virtio-console or 16550 UART). CLI + global spinlock,
-//!    held only by drain (`log_ring::drain_to_serial`), input polling,
-//!    and panic flush. The slow I/O happens here, off the critical path.
-//!
-//! See [`log_ring`](super::log_ring) for the buffering rationale.
+//! [`BackendGuard`] is CLI plus a global spinlock, so an interrupts-off window
+//! is one unit long. The slow I/O happens inside it, which is why **every unit
+//! is bounded and no holder may take its length from userland** — a rendered
+//! record is one 1 KiB `LogRecord`, the live drain takes eight of them, the
+//! panic report is a fixed buffer, and a `write` of arbitrary length is cut
+//! into [`MAX_CONSOLE_LINE`] pieces by [`write_console`]. The one deliberate
+//! exception is the panic path's `drain_locked`, which takes the whole backlog
+//! under one hold — a machine that is dying pays latency to say why, and
+//! `log/console.rs` argues it at the site. Nothing that holds a kernel lock
+//! formats here.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use crate::arch::cpu::{inb, outb};
@@ -58,27 +63,56 @@ pub fn init() {
     console_changed();
 }
 
-/// Tell the ring whether serial has anywhere to put a byte.
+/// A backend has arrived, or the machine has switched to a better one.
 ///
-/// Called from the two places [`has_console`] can change its answer — this
-/// module's probe, and virtio-console coming up in phase 6 — so the ring's flag
-/// is derived from the backend rather than tracked beside it.
+/// Called from the two places [`backend`] can change its answer — this module's
+/// probe, and virtio-console coming up in phase 6. What it does is
+/// `log::console`'s and the argument lives there: everything said so far went
+/// to whichever backend existed then, and the new one has heard none of it.
 pub fn console_changed() {
-    super::log_ring::set_serial_sink(has_console());
+    crate::log::console::backend_changed();
 }
 
 pub fn uart_present() -> bool {
     UART_PRESENT.load(Ordering::Relaxed)
 }
 
-/// Whether the log ring has anywhere to go. False is the T14's shape: the ring
-/// still fills and still holds its tail, but nothing drains it off the machine,
-/// so the framebuffer is the only surface a diagnostic can reach.
+/// Whether anything can carry a byte off this machine. False is the T14's
+/// shape: the shards still fill and still hold their tails, but nothing drains
+/// them off the machine, so the framebuffer is the only surface a diagnostic
+/// can reach.
 ///
 /// The predicate a caller wants before falling back to the screen, and the same
 /// one [`panic_flush`] refuses on.
 pub fn has_console() -> bool {
-    uart_present() || super::virtio_console::is_ready()
+    !matches!(backend(), Backend::None)
+}
+
+/// Where a write goes right now.
+///
+/// **One answer, and [`BackendGuard::write_raw`] is written in terms of it**, so
+/// the drain's "which backend has already heard this" question cannot disagree
+/// with where the bytes actually went. The order is the preference: a
+/// virtio-console is the host's own channel and a 16550 is what is left when
+/// there is none.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Backend {
+    /// Nothing can carry a byte off this machine. The T14's shape: records
+    /// stay in their shards, where the panel can still read them.
+    None = 0,
+    Uart = 1,
+    Virtio = 2,
+}
+
+pub fn backend() -> Backend {
+    if super::virtio_console::is_ready() {
+        Backend::Virtio
+    } else if uart_present() {
+        Backend::Uart
+    } else {
+        Backend::None
+    }
 }
 
 // Backend access — slow path, used by drain / input / panic.
@@ -123,13 +157,14 @@ impl BackendGuard {
         }
     }
 
-    /// Write raw bytes directly to the backend, no escape stripping
-    /// (already done before they hit the ring). Used by drain.
+    /// Write raw bytes straight to the backend, no escape stripping — the
+    /// record drain's lines carry none, and a userland write is stripped by
+    /// [`write_console`] before it gets here.
     pub fn write_raw(&mut self, bytes: &[u8]) {
-        if super::virtio_console::is_ready() {
-            super::virtio_console::write_bytes_locked(bytes);
-        } else {
-            uart_write_bytes(bytes);
+        match backend() {
+            Backend::Virtio => super::virtio_console::write_bytes_locked(bytes),
+            Backend::Uart => uart_write_bytes(bytes),
+            Backend::None => {}
         }
     }
 
@@ -215,20 +250,20 @@ const PANIC_LOCK_SPIN_LIMIT: u64 = 100_000_000;
 /// cannot wedge.
 ///
 /// # Safety
-/// Panic context only — on the bypass path the ring is read unsynchronized
-/// (see `log_ring::drain_unlocked`).
+/// Panic context only — on the bypass path the drain's position is read with no
+/// lock held (see `log::console::drain_bypassed`).
 pub unsafe fn panic_flush() {
-    // No backend at all means every path below pops the ring into a writer
-    // that discards it — `drain_to_serial` consumes first and finds out
-    // second. The report is then gone from the one place still holding it,
-    // the on-screen console included. This has to be checked before the
-    // locked path, not after: that path is the common one.
+    // No backend at all means every path below hands the report to a writer
+    // that discards it, and the record drain would move its position over it.
+    // The report is then gone from the one place still holding it, the
+    // on-screen console included. This has to be checked before the locked
+    // path, not after: that path is the common one.
     if !has_console() {
         return;
     }
     for _ in 0..PANIC_LOCK_SPIN_LIMIT {
         if let Some(mut g) = BackendGuard::try_lock() {
-            super::log_ring::drain_to_serial(&mut g);
+            crate::log::console::drain_locked(&mut g);
             return;
         }
         core::hint::spin_loop();
@@ -238,17 +273,10 @@ pub unsafe fn panic_flush() {
         return;
     }
     super::virtio_console::disable();
-    let mut buf = [0u8; super::log_ring::DRAIN_CHUNK];
-    loop {
-        let n = unsafe { super::log_ring::drain_unlocked(&mut buf) };
-        if n == 0 { break; }
-        uart_write_bytes(&buf[..n]);
-    }
-    let mut marker = [0u8; super::log_ring::DROP_MARKER_MAX];
-    let n = super::log_ring::take_drop_marker(&mut marker);
-    if n > 0 {
-        uart_write_bytes(&marker[..n]);
-    }
+    // SAFETY: this is the bypass the function's own clause describes — a
+    // bounded wait for a clean handoff has already failed, so the holder is
+    // wedged and will not publish.
+    unsafe { crate::log::console::drain_bypassed() };
 }
 
 /// Drain the ring before the machine stops.
@@ -266,98 +294,118 @@ pub unsafe fn panic_flush() {
 pub fn flush_final() {
     for _ in 0..PANIC_LOCK_SPIN_LIMIT {
         if let Some(mut g) = BackendGuard::try_lock() {
-            super::log_ring::drain_to_serial(&mut g);
+            crate::log::console::drain_locked(&mut g);
             return;
         }
         core::hint::spin_loop();
     }
 }
 
-// Formatter — fast path, used by every log!() invocation.
-
-const SW_BUF_SIZE: usize = 1024;
-
-/// Stack-buffered formatter for `log!()`. Accumulates bytes locally and
-/// commits the whole buffer to `log_ring` on Drop. Strips ANSI CSI escape
-/// sequences inline so the ring never holds bytes that would be dropped at
-/// the backend.
+/// A userland `write` to a console object.
 ///
-/// Despite the name `lock()`, no lock is acquired — each invocation has
-/// its own independent buffer. The name is preserved for the `log!` macro.
-pub struct SerialWriter {
-    buf: [u8; SW_BUF_SIZE],
-    len: usize,
-    lossless: bool,
+/// **One backend acquisition per [`MAX_CONSOLE_LINE`] of output, ANSI stripped,
+/// no buffering.** It replaced `SerialWriter::console()` and the lossless
+/// byte-ring append underneath it, whose unit of interleaving was a `write`
+/// syscall — and
+/// `specs/issues/diagnostics/serial-console-has-no-line-atomicity.md` has four
+/// recorded splices to show for it. Taking the guard here is what makes this
+/// write whole against a kernel record and against another process; what it
+/// does *not* fix is `println!` handing the kernel half a line at a time, which
+/// is L5's line buffer on `ConsoleObject` and not this function's.
+///
+/// **The guard is taken and released per chunk, and the bound is the reason
+/// this function may be called with a userland length at all.** `BackendGuard`
+/// is `cli` plus a global spinlock and the device write happens inside it, so a
+/// single acquisition around the whole call would mask interrupts for a window
+/// userland chooses: `SYS_WRITE` puts no cap on its buffer, and a UART pays a
+/// [`THRE_SPIN_LIMIT`]-bounded spin *per byte* of it. That is the shape
+/// `kernel/CLAUDE.md`'s `BackendGuard` caveat refuses, and it is what the byte
+/// ring this replaced never did — it appended under its own short lock and
+/// something else drained.
+///
+/// **[`MAX_CONSOLE_LINE`] rather than a number invented here.** §4.4 of
+/// `specs/log-architecture-spec.md` bounds a console *line* by it and emits a
+/// longer one in pieces of it, so the interleaving unit this chunking creates
+/// is the same one the finished design already has: anything that will be whole
+/// after L5 is whole now, and nothing that is atomic today stops being so.
+/// The tradeoff is re-acquisition against latency — a write of `n` bytes now
+/// pays `ceil(n/1024)` `cli`/`compare_exchange_weak`/`popfq` triples instead of
+/// one, which is a handful of uncontended atomics against an interrupts-off
+/// window that was otherwise unbounded. Latency wins; the acquisitions are
+/// paid once per kilobyte of output and a kilobyte of output is already a
+/// device write two orders of magnitude more expensive.
+///
+/// The bytes live in user memory, so they arrive a chunk at a time with the
+/// filter's state carried across: a CSI sequence straddling a chunk boundary
+/// must come out the same as one that does not, and a fresh filter per chunk
+/// would emit its head. That is true of the *output* chunking too — [`Csi`] and
+/// [`Stripped`] both outlive every guard this function takes, so a sequence
+/// split by a flush is stripped exactly as one that is not.
+pub fn write_console(src: &crate::user_ptr::UserBytes) {
+    let mut out = Stripped { buf: [0; MAX_CONSOLE_LINE], len: 0 };
+    let mut csi = Csi::Text;
+    let mut chunk = [0u8; STRIP_CHUNK];
+    let mut off = 0;
+    while off < src.len() {
+        let n = chunk.len().min(src.len() - off);
+        src.read_at(off, &mut chunk[..n]);
+        csi.feed(&mut out, &chunk[..n]);
+        off += n;
+    }
+    csi.finish(&mut out);
+    out.flush();
 }
 
-impl SerialWriter {
-    pub fn lock() -> Self {
-        Self { buf: [0; SW_BUF_SIZE], len: 0, lossless: false }
-    }
+/// How much of a user write is copied out of user memory at a time.
+///
+/// The same 256 the old user-memory reader used, for the same reason: a user
+/// window cannot be a slice, so it is copied in pieces, and this is one piece.
+/// It is **not** the backend's unit — [`MAX_CONSOLE_LINE`] is — because the
+/// filter can consume a whole piece and emit nothing.
+const STRIP_CHUNK: usize = 256;
 
-    /// Console-output variant: spills throttle on a full ring instead of
-    /// dropping, so userland `write()` is lossless — the test harness protocol
-    /// depends on it. Syscall context only; `log!()` must keep the lossy
-    /// writer, since it runs under arbitrary kernel locks and must never do
-    /// I/O.
-    pub fn console() -> Self {
-        Self { buf: [0; SW_BUF_SIZE], len: 0, lossless: true }
-    }
+/// The most that reaches the backend under one [`BackendGuard`], and therefore
+/// the longest interrupts-off window a userland `write` can buy.
+///
+/// §4.4's console-line bound, 1024, which is what `SerialWriter::SW_BUF_SIZE`
+/// was. L5's line buffer emits in pieces of the same size, so a whole line is
+/// still one acquisition then and is one now.
+const MAX_CONSOLE_LINE: usize = 1024;
 
-    /// Spill the buffer to the ring and reset. Called when the buffer
-    /// fills before Drop — log lines longer than `SW_BUF_SIZE` lose
-    /// atomicity across the spill, which is acceptable for huge logs.
-    fn spill(&mut self) {
-        if self.len > 0 {
-            if self.lossless {
-                super::log_ring::write_chunk_blocking(&self.buf[..self.len]);
-            } else {
-                super::log_ring::write_chunk(&self.buf[..self.len]);
-            }
-            self.len = 0;
-        }
-    }
+/// Bytes on their way to the backend, buffered so that a per-byte filter does
+/// not become a per-byte device write — and so that the guard is taken once per
+/// buffer rather than once per call.
+///
+/// It holds no guard of its own: [`Stripped::flush`] takes one, writes, and
+/// drops it, so between two chunks of one write interrupts are on.
+struct Stripped {
+    buf: [u8; MAX_CONSOLE_LINE],
+    len: usize,
+}
 
+impl Stripped {
     fn push_byte(&mut self, b: u8) {
-        if self.len == SW_BUF_SIZE {
-            self.spill();
+        if self.len == MAX_CONSOLE_LINE {
+            self.flush();
         }
         self.buf[self.len] = b;
         self.len += 1;
     }
 
-    pub fn write_bytes(&mut self, bytes: &[u8]) {
-        let mut csi = Csi::Text;
-        csi.feed(self, bytes);
-        csi.finish(self);
-    }
-
-    /// The same, for bytes that live in user memory and so cannot be a slice.
-    ///
-    /// Read in chunks, with the filter's state carried across them: a CSI
-    /// sequence straddling a chunk boundary must come out the same as one that
-    /// does not, and a fresh filter per chunk would emit its head.
-    pub fn write_user(&mut self, src: &crate::user_ptr::UserBytes) {
-        let mut chunk = [0u8; 256];
-        let mut csi = Csi::Text;
-        let mut off = 0;
-        while off < src.len() {
-            let n = chunk.len().min(src.len() - off);
-            src.read_at(off, &mut chunk[..n]);
-            csi.feed(self, &chunk[..n]);
-            off += n;
+    fn flush(&mut self) {
+        if self.len > 0 {
+            BackendGuard::lock().write_raw(&self.buf[..self.len]);
+            self.len = 0;
         }
-        csi.finish(self);
     }
 }
 
-/// Strips ANSI CSI sequences, so the ring never holds bytes the backend would
-/// drop.
+/// Strips ANSI CSI sequences, so the backend never carries bytes it would drop.
 ///
-/// A state machine rather than an index walk because the bytes arrive in two
-/// shapes — a kernel slice from `log!`, and 256 bytes at a time out of a user
-/// window — and only a machine that survives the gap between two chunks gives
-/// both the same answer.
+/// A state machine rather than an index walk because the bytes arrive 256 at a
+/// time out of a user window and leave 1024 at a time under a guard taken for
+/// each, and only a machine that survives the gap between two chunks — either
+/// gap — gives the same answer as one that saw the write whole.
 enum Csi {
     Text,
     /// An ESC held back: it is only the start of a sequence if `[` follows, and
@@ -367,7 +415,7 @@ enum Csi {
 }
 
 impl Csi {
-    fn feed(&mut self, out: &mut SerialWriter, bytes: &[u8]) {
+    fn feed(&mut self, out: &mut Stripped, bytes: &[u8]) {
         for &b in bytes {
             match self {
                 Self::Text if b == 0x1B => *self = Self::Esc,
@@ -387,23 +435,10 @@ impl Csi {
     /// A sequence the input ended in the middle of. The lone ESC is the caller's
     /// byte and is emitted; a started CSI body is not, and its terminator was
     /// never going to arrive.
-    fn finish(self, out: &mut SerialWriter) {
+    fn finish(self, out: &mut Stripped) {
         if matches!(self, Self::Esc) {
             out.push_byte(0x1B);
         }
-    }
-}
-
-impl Drop for SerialWriter {
-    fn drop(&mut self) {
-        self.spill();
-    }
-}
-
-impl core::fmt::Write for SerialWriter {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        self.write_bytes(s.as_bytes());
-        Ok(())
     }
 }
 

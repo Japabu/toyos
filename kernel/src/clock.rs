@@ -72,9 +72,32 @@ pub fn calibrated() -> bool {
     TSC_PERIOD_FS.load(Relaxed) != 0
 }
 
-/// Returns nanoseconds since boot. Lock-free, no MMIO.
+/// Returns nanoseconds since boot. Lock-free, no MMIO, **and it cannot panic**.
+///
+/// [`TSC_BOOT`] is one global, stored by the BSP during [`init`]. A CPU whose
+/// TSC reads below it therefore subtracts to a negative number — and with
+/// overflow-checks on, which every guest build has, that is a panic. It was a
+/// latent one until `log::emit` began reading the clock inside its publication
+/// bracket: there it would fire with `IF` clear and a reservation taken and not
+/// yet committed, and the panic handler's own `log!` would reenter the same
+/// shard. **No panic site may be inside that bracket.**
+///
+/// Saturating, and the direction is the argument rather than the taste. A
+/// trailing CPU's records stamp zero, so they read as the oldest thing the
+/// machine has: `read.rs`'s merge sorts them last and its descent stops at
+/// them, which loses that CPU's lines from a bracketed report and costs nothing
+/// else. Wrapping would stamp them 584 years in the future, where they would
+/// sort ahead of every real record for the life of the boot and take the top of
+/// every panel with them. Losing a CPU's lines is recoverable; being lied to
+/// about which line is newest is not.
+///
+/// It stays an assumption that this does not happen: §2.1 of
+/// `specs/log-architecture-spec.md` rests cross-CPU ordering on an invariant,
+/// firmware-synchronised TSC, and
+/// `specs/issues/kernel/ap-tsc-trail-is-assumed-and-never-checked.md` is the
+/// entry for the fact that nothing measures it.
 pub fn nanos_since_boot() -> u64 {
-    let delta = cpu::rdtsc() - TSC_BOOT.load(Relaxed);
+    let delta = cpu::rdtsc().saturating_sub(TSC_BOOT.load(Relaxed));
     let period_fs = TSC_PERIOD_FS.load(Relaxed);
     ((delta as u128 * period_fs as u128) / 1_000_000) as u64
 }

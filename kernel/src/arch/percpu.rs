@@ -107,6 +107,13 @@ pub struct PerCpu {
     /// timers are armed independently on every CPU; a shared value would let
     /// any CPU's arm/stop clobber every other CPU's re-arm fallback.
     pub last_armed_ticks: AtomicU32,       // offset 260
+    /// This CPU's [`log::Shard`], reached by [`reserve_log_slot`].
+    ///
+    /// **Never null on a live CPU**: [`alloc_percpu`] fills it for cpu0 and for
+    /// every AP, and the BSP allocates an AP's whole `PerCpu` before that AP
+    /// executes an instruction. That is why `emit` needs no check — an absent
+    /// shard is not a state this field can be in.
+    log_shard: u64,                        // offset 264
 }
 
 // GDT layout:
@@ -200,6 +207,7 @@ const _: () = assert!(core::mem::offset_of!(PerCpu, ring0_timer_fires) == 248);
 const _: () = assert!(core::mem::offset_of!(PerCpu, last_seen_ring0_fires) == 252);
 const _: () = assert!(core::mem::offset_of!(PerCpu, fault_state) == 256);
 const _: () = assert!(core::mem::offset_of!(PerCpu, last_armed_ticks) == 260);
+const _: () = assert!(core::mem::offset_of!(PerCpu, log_shard) == 264);
 
 /// **One stack size, so "which stack am I on" is not a question kernel code
 /// has to answer.**
@@ -248,7 +256,7 @@ const IDLE_GUARD_SIZE: usize = 4096;
 /// The double fault stack. Only #DF uses IST1, and what runs on it is the
 /// whole crash report plus `halt_all_cpus` — render, then `panic_flush`.
 ///
-/// It was 4096, and `drain_to_serial` put a 4096-byte buffer on it, so the
+/// It was 4096, and the byte ring's `drain_to_serial` put a 4096-byte buffer on it, so the
 /// report overflowed the stack it was being written from and corrupted the
 /// heap underneath while producing the evidence for the fault that had just
 /// happened.
@@ -264,6 +272,33 @@ const IDLE_GUARD_SIZE: usize = 4096;
 /// double, which is the margin `double_fault_stack` asserts. It costs 20 KiB
 /// per CPU with the guard, against the 16 KiB each already pays for an idle
 /// stack.
+///
+/// **The record ring widened this path and the number is re-measured, not
+/// re-argued: 6,688 bytes**, `ist1_report` off a real #DF on a
+/// `double_fault_stack` run, guard intact. It is taken after `render` and after
+/// `panic_flush`, so it covers the deepest the report goes — the record merge
+/// and the paint included. The margin the gate asserts still holds: 6,688
+/// doubled is 13,376 of 16,384.
+///
+/// **What is large on that path — type sizes, not a decomposition of the
+/// measurement.** These are what `size_of` says, not what `ist1_report`
+/// counted, and they come to 4,352 against the measured 6,688; the 2,336
+/// between them is frames, spills, alignment and everything the path does that
+/// is not one of these. Largest first, at `RECORD_BYTES` of 1024:
+/// `log::console`'s rendered line (1,152); `emit`'s `LogRecord` (1,024) beside
+/// `snapshot_committed`'s one materialised record (1,024) and its eight
+/// `Descent`s (384); `paint`'s row table (768). The elision's tail buffer
+/// (452 — its head is streamed and buffers nothing) is on a branch no symbol in
+/// this tree reaches.
+///
+/// **It was 7,488 with the byte ring, and both halves of that difference are
+/// deletions.** `commit` no longer stages a 1,016-byte `Body` here (the slot's
+/// words are written directly), which the measurement did not notice — so that
+/// frame was never the deepest one; and `SerialWriter`'s 1,024-byte line buffer
+/// and `drain_to_serial`'s 512-byte chunk went with the ring, which it did.
+///
+/// It was 4,512 before the record ring, so the ring's net cost is 2,176 bytes
+/// of a stack with 9,696 still free.
 const IST1_STACK_SIZE: usize = 16384;
 
 /// Filled with [`STACK_FILL`] and never written by anything legitimate, so an
@@ -294,7 +329,97 @@ fn alloc_percpu(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
     percpu.tss = Tss::new();
     percpu.gdt = GDT_ENTRIES;
     percpu.init_tss_descriptor();
+    percpu.log_shard = alloc_log_shard(cpu_id);
     ptr
+}
+
+/// This CPU's log shard: cpu0's is the boot shard, and every other is a fresh
+/// zeroed one.
+///
+/// **Here rather than in [`init_ap`], which is where an earlier draft of the
+/// spec put it.** `init_ap` calls `control_regs::init` and `fpu::log_state`,
+/// both of which log — so an AP whose shard were allocated there would log into
+/// a shard that did not exist yet, and the only candidate is cpu0's, which
+/// another CPU is writing. The whole `PerCpu` is BSP-allocated before the AP
+/// runs an instruction, so allocating here closes that window rather than
+/// narrowing it.
+///
+/// The slots stay zeroed, while [`log::Shard::initialize_zeroed`] writes the
+/// nonzero first reservation number into `head`. cpu0 gets the same state from
+/// [`log::Shard::new`] in `.bss`.
+fn alloc_log_shard(cpu_id: u32) -> u64 {
+    if cpu_id == 0 {
+        return &raw const log::BOOT_SHARD as u64;
+    }
+    let layout = Layout::from_size_align(size_of::<log::Shard>(), 64).unwrap();
+    let ptr = unsafe { alloc_zeroed(layout) } as *mut log::Shard;
+    assert!(!ptr.is_null(), "percpu: log shard alloc failed for cpu{cpu_id}");
+    // SAFETY: this is a fresh zeroed, 64-byte-aligned allocation which is not
+    // published into `PerCpu` until this function returns.
+    unsafe { log::Shard::initialize_zeroed(ptr) };
+    // A writer finds its shard through `gs:` and a reader cannot, so the shard
+    // is published to `log::shards` here — before the CPU it belongs to has
+    // executed an instruction, which is the same window `PerCpu` itself is
+    // built in.
+    //
+    // SAFETY: the allocation above is live for the life of the machine and is
+    // initialised.
+    unsafe { log::publish_ap_shard(cpu_id, ptr) };
+    ptr as u64
+}
+
+/// This CPU's number and its current thread, for the legacy byte ring's prefix.
+///
+/// Unbracketed, which is what the `log!` macro did before the record ring and
+/// is why it is only good enough for a line that is about to be rendered as
+/// text. The record's own identity is read inside [`reserve_log_slot`]'s
+/// bracket. Both this and the caller go with the byte ring at L3.
+pub fn log_identity() -> (u32, u32) {
+    let cpu: u32;
+    let tid: u32;
+    unsafe {
+        core::arch::asm!(
+            "mov {cpu:e}, gs:[8]",
+            "mov {tid:e}, gs:[136]",
+            cpu = out(reg) cpu,
+            tid = out(reg) tid,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    (cpu, tid)
+}
+
+/// This CPU's shard, its identity, and one sequence number out of that shard.
+///
+/// The `xadd` has **no `lock` prefix**. It is atomic against an interrupt on its
+/// own CPU because instructions retire whole, and it is not atomic against
+/// another CPU — which is sound only while this CPU owns the shard. The live
+/// [`crate::arch::LogCommitGuard`] proves that neither migration nor a
+/// single-step #DB can happen from this pointer read through publication.
+pub fn reserve_log_slot(
+    guard: &crate::arch::LogCommitGuard,
+) -> (*const log::Shard, u64, u32, u32, u32) {
+    let shard: u64;
+    let seq: u64;
+    let cpu: u32;
+    let tid: u32;
+    let pid: u32;
+    unsafe {
+        core::arch::asm!(
+            "mov {shard}, gs:[{shard_off}]",
+            "mov {cpu:e}, gs:[8]",
+            "mov {tid:e}, gs:[136]",
+            "mov {pid:e}, gs:[140]",
+            shard = out(reg) shard,
+            cpu = out(reg) cpu,
+            tid = out(reg) tid,
+            pid = out(reg) pid,
+            shard_off = const core::mem::offset_of!(PerCpu, log_shard),
+            options(preserves_flags),
+        );
+        seq = (&*(shard as *const log::Shard)).reserve(guard);
+    }
+    (shard as *const log::Shard, seq, cpu, tid, pid)
 }
 
 /// One idle stack and the guard page under it.
@@ -628,4 +753,3 @@ pub fn swap_fault_state(new: CpuFaultState) -> CpuFaultState {
 pub fn set_fault_state(new: CpuFaultState) {
     unsafe { (*percpu_ptr()).fault_state = new as u8; }
 }
-

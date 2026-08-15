@@ -16,6 +16,7 @@
 [workspace]
 members = [
     "bcachefs",
+    "kernel-elide",
     "kernel-loom",
     "kernel-span",
     "toyos-abi",
@@ -121,6 +122,16 @@ opt-level = 3
 # `cargo build -p toyos-fat32 -v`), and rustc derives `overflow-checks` from
 # that. The pure crates' hostile-input tests keep both knobs that *found* the
 # two crafted-ELF kernel panics in `specs/issues/`.
+#
+# **One member depends on this line for correctness rather than for speed, and
+# its own manifest says so at length — this is the other half of that
+# citation.** `kernel-loom`'s models run on the 32 KiB coroutine stacks
+# `generator` gives loom's threads, with a 4,416-byte `Shard` and kilobyte
+# `LogRecord`s passing through them; at `opt-level = 0` the per-temporary copies
+# overflow one before the first assertion. Lowering the number here does not
+# make those models slower, it stops them running. A member's own `[profile]`
+# table cannot rescue it: cargo ignores one in a member, and `src/hostws.rs`
+# reds on it.
 [profile.dev]
 opt-level = 2
 

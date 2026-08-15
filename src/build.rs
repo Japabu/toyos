@@ -1534,6 +1534,11 @@ mod tests {
                 "loom",
                 "sched-check",
                 "test-actuators",
+                // Costs no kernel build at all, for `loom`'s reason: declared
+                // so `cfg` checking knows the name, and turned on only by
+                // `kernel-loom` — to remove §2.6a's two `SeqCst` fences and
+                // prove `log_wake` reds without them.
+                "wake-fence-off",
             ],
             "the kernel declares a feature `specs/assessments/test-cost-audit.md` §5.9.7 does not account for"
         );

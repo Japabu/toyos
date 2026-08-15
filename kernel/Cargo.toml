@@ -12,6 +12,13 @@ license = "MIT OR Apache-2.0"
 # A kernel build cannot enable it — the kernel does not depend on loom — and it
 # is declared only so `cfg` checking knows the name.
 loom = []
+# Declared, never enabled here, and never enabled by any *kernel* build:
+# `kernel-loom` turns it on to remove §2.6a's two `SeqCst` fences, and
+# `kernel-loom/tests/log_wake.rs` must red when it does. A model that has never
+# failed proves nothing, and no guest test can stand in for it — on x86 a build
+# with either fence removed behaves identically, which is the whole reason the
+# obligation is a model. `specs/log-architecture-spec.md` §2.5's W3.
+wake-fence-off = []
 # **Every actuator, and which one is armed comes from the boot parameter.**
 # `kernel/src/actuator.rs` declares all 47 with the claim each rests on; this
 # name is the whole of what a build decides about them. A kernel without it has
