@@ -21,7 +21,7 @@ assets = ["assets"]
 # while the compositor had no way to ask for a program's *declared* authority —
 # the launcher gives it one, and starting a service from `[boot] start` is not
 # the thing that needed fixing.
-start = ["compositor", "soundd", "netd", "filepicker"]
+start = ["logd", "compositor", "soundd", "netd", "filepicker"]
 
 [programs]
 input-test = {}
@@ -29,6 +29,15 @@ proctest = {}
 toyos-ld = { path = "toyos-ld" }
 toyos-cc = { path = "toyos-cc" }
 # cargo = { path = "userland/cargo", no-default-features = true }
+
+# **Every image that carries a `TOYOS-LOG` partition runs this**, and every
+# image does. The kernel stopped writing files at L6 of
+# `specs/log-architecture-spec.md`, so a boot config without `logd` is a boot
+# whose `/log` is empty — `every_boot_config_runs_logd` is what refuses one.
+# It claims no device and serves no port yet (§5.1, §5.2): its whole authority
+# is `logread`, which is `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
+[programs.logd]
+syscap = ["logread"]
 
 [programs.compositor]
 serves = ["compositor"]

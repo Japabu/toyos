@@ -437,7 +437,8 @@ pub fn esp_filesystem(
 fn volume_lines(log: &str) -> String {
     let lines: Vec<&str> = log
         .lines()
-        .filter(|l| l.contains("-volume:") || l.contains("log-file:") || l.contains("gpt:")
+        .filter(|l| l.contains("-volume:") || l.contains("logd:") || l.contains("gpt:")
+            || l.contains("shutdown") || l.contains("Shutting down") || l.contains("Syncing")
             || l.contains("usb-storage:"))
         .collect();
     if lines.is_empty() {
@@ -447,32 +448,39 @@ fn volume_lines(log: &str) -> String {
 }
 
 /// The kernel's own log, written to the log partition of the stick it booted
-/// from.
+/// from — **by `/bin/logd` since L6, and this gate is what says the hand-over
+/// kept its promise**.
 ///
 /// The claim under test is *continuity*: not that a log file exists at the end,
 /// but that the tail of what the kernel said is on the device while the machine
 /// is still running — because the failure it is for is a machine that stops
 /// without panicking, on a laptop with no serial port, where nothing else is
-/// left. So the file is read **mid-run**, before any shutdown, and only the
-/// idle-loop sink can have put anything there.
+/// left. So the file is read **mid-run**, before any shutdown.
 ///
-/// Three things could make this green without the sink working, and each has an
+/// **What it is evidence for changed with the writer.** It used to prove the
+/// idle loop's sink; it now proves a userland process holding `logread` reads a
+/// cursor, renders, writes, `fsync`s and keeps up — which is the whole of
+/// `specs/log-architecture-spec.md` §5 observed from outside the machine.
+/// §9.3's positive log-content assertion is this, and without it the headline
+/// number of that section is unfalsifiable: the cheapest way to make an
+/// idle-loop I/O measurement look good is for the log to stop being written.
+///
+/// Three things could make this green without logd working, and each has an
 /// assertion aimed at it:
 ///
 /// - **A file left over from something else.** The log must carry this image's
 ///   own unique ESP GUID, which `create_boot_image` draws fresh per build and
 ///   no earlier run can have.
-/// - **A single flush at install time.** `log_file::install` runs in the
-///   subsystem phase and seeds the file with the ring's retained tail, so a
-///   sink that then did nothing would still produce a file. `Boot: complete` is
-///   logged two phases later, so requiring it requires a flush after install.
+/// - **A single write when the file was opened.** logd creates its file early,
+///   so a logd that then did nothing would still produce one. `Boot: complete`
+///   is logged after that, so requiring it requires a write after the open.
 /// - **The shutdown path standing in for the continuous one.** The mid-run read
 ///   happens before `run shutdown` and must already have `Boot: complete`; the
 ///   post-shutdown read must additionally have the shutdown's own last line,
-///   which only `flush_final` can deliver.
+///   which only §6.3's bounded wait on `LOG_DURABLE_NS` can deliver.
 ///
-/// A second boot, with `log-rotate-fast`, drives the bound: rotation is what
-/// stops the file filling the owner's stick, and at the shipped four megabytes
+/// A second boot, from `tests/logrotatecase`, drives the bound: rotation is
+/// what stops the file filling the owner's stick, and at the shipped mebibyte
 /// no test would ever reach it.
 pub fn kernel_log_file(
     test_config: &Path,
@@ -513,19 +521,19 @@ pub fn kernel_log_file(
     );
     let boot = qemu.boot_log().to_string();
     serial::Serial::named("boot console", boot.as_str()).must_be_clean()?;
-    if !boot.contains("log-file: this boot's kernel log is") {
-        return Err(format!("the sink never installed:\n{}", volume_lines(&boot)));
+    if !boot.contains("logd: this boot's kernel log is") {
+        return Err(format!("logd never opened a file:\n{}", volume_lines(&boot)));
     }
 
     // Mid-run, with the guest still up and nothing shut down. Whatever is here
-    // was put there by the idle loop.
+    // was put there by `/bin/logd` while the machine was running.
     //
     // Polled rather than read once, because the claim is "promptly", not
-    // "instantly": the ready marker is printed by a userland process and the
-    // flush happens on the next idle pass, so a single read races a window the
-    // design does not promise to close. Ten seconds is three orders of
-    // magnitude above what a working sink needs — the measurement below says
-    // what it actually took — so a broken one still reds.
+    // "instantly": the ready marker is printed by a userland process and logd
+    // is another one, so a single read races a window the design does not
+    // promise to close. Ten seconds is three orders of magnitude above what a
+    // working logd needs — the measurement below says what it actually took —
+    // so a broken one still reds.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let began = std::time::Instant::now();
     let mut running;
@@ -550,8 +558,8 @@ pub fn kernel_log_file(
     }
     if !running_text.contains("Boot: complete") {
         return Err(format!(
-            "the log on the device stops before `Boot: complete` at {} bytes — the sink wrote \
-             once at install and never again",
+            "the log on the device stops before `Boot: complete` at {} bytes — logd wrote \
+             once when it opened the file and never again",
             running.len()
         ));
     }
@@ -619,9 +627,9 @@ pub fn kernel_log_file(
 
 /// The newest of the kernel's log files on the volume, with its name.
 ///
-/// `log_file` names one file per boot for the wall clock and continues a long
-/// boot in `_0002` and up, both of which sort after everything older — so the
-/// last name is this boot's most recent file. Read off the device, like
+/// `logd` names one file per boot for the wall clock and continues a long boot
+/// in `_0002` and up, both of which sort after everything older — so the last
+/// name is this boot's most recent file. Read off the device, like
 /// everything else here.
 pub fn newest_log(image_path: &Path, start: usize, len: usize) -> Result<(String, Vec<u8>), String> {
     let image = std::fs::read(image_path).map_err(|e| format!("read the image: {e}"))?;
@@ -644,28 +652,34 @@ fn log_names(volume: &[u8]) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// The bound. `log-rotate-fast` moves it from a megabyte to 256 bytes, which
-/// one boot's own log crosses many times over, so both the continuation path
-/// and the retention path run on the shipped code.
+/// The bound, from `tests/logrotatecase`: `/bin/logd` rotating at 256 bytes
+/// rather than a mebibyte, which one boot's own log crosses many times over, so
+/// both the continuation path and the retention path run on the shipped code.
+///
+/// **A config and no longer a kernel parameter.** The bound moved into a
+/// userland program at L6, and the way a userland program is given a number is
+/// its manifest row — so the arming is an image this repository builds rather
+/// than a word on the kernel's command line. The other caller of that config is
+/// `usb_boot_stick_pulled`, which wants the same rotation in flight for a
+/// different reason.
 fn rotation(
-    test_config: &Path,
+    _test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const PARAMS: &[&str] = &["log-rotate-fast"];
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/logrotatecase");
     let image_path = test_dir().join("kernel-log-rotate.img");
-    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, PARAMS);
+    let image = qemu::build_boot_image(&config, c_bins, rust_bins, &[]);
     std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
     let (start, len) = log_extent(&image, &image_path)?;
 
     let mut qemu = QemuInstance::boot_with_options(
-        test_config,
+        &config,
         c_bins,
         rust_bins,
         BootOptions {
             profile: qemu::Profile::Metal,
             boot_image: Some(image_path.clone()),
-            kernel_params: PARAMS,
             ..Default::default()
         },
     );
@@ -716,30 +730,52 @@ fn rotation(
             ));
         }
     }
-    // The last line is in whichever part the final flush landed in: a
-    // continuation can be the last thing that happens, which leaves the newest
-    // part empty and the tail in the one before it. What must not happen is the
-    // tail being in neither.
-    let names: Vec<&str> = logs.iter().rev().take(2).map(|e| e.name.as_str()).collect();
-    let tail_in = read_files(&image[start..start + len], &names)?
+    // **The claim is that the shutdown's own last line reached the volume**, so
+    // the search is every part of this boot and not a guess at which one it
+    // landed in. The image is built fresh for this arm, so every `.log` here is
+    // this boot's.
+    //
+    // It used to look at the two newest and that was an assumption about the
+    // *writer*: the kernel sink drained everything it was owed in one flush and
+    // then looked at the size, so the tail was in the last part or in the one
+    // before it. `/bin/logd` writes a batch, syncs it, publishes `durable` and
+    // then looks at the size, and at a 256-byte bound a batch is a part — so
+    // records the machine emits while `SYS_SHUTDOWN` is waiting push the line
+    // several parts back. That is the bound doing what it is set to do, and an
+    // assertion that reads it as a failure is an assertion about the old code.
+    let names: Vec<&str> = logs.iter().map(|e| e.name.as_str()).collect();
+    let tail_at = read_files(&image[start..start + len], &names)?
         .into_iter()
-        .flatten()
-        .any(|bytes| String::from_utf8_lossy(&bytes).contains("Shutting down."));
-    if !tail_in {
+        .enumerate()
+        .find(|(_, bytes)| {
+            bytes.as_ref().is_some_and(|b| String::from_utf8_lossy(b).contains("Shutting down."))
+        })
+        .map(|(i, _)| i);
+    let Some(tail_at) = tail_at else {
+        let newest = read_files(&image[start..start + len], &names[names.len() - 1..])?
+            .pop()
+            .flatten()
+            .unwrap_or_default();
+        let newest = String::from_utf8_lossy(&newest).into_owned();
         return Err(format!(
-            "the shutdown's last line is in neither of the two newest parts ({}) of {} on the \
-             volume",
+            "the shutdown's last line is in none of the {} parts on the volume ({}), so §6.3's \
+             bounded wait on LOG_DURABLE_NS did not deliver it.\nthe newest part ends:\n{}\nwhat \
+             the guest said:\n{}",
+            logs.len(),
             names.join(", "),
-            logs.len()
+            newest.lines().rev().take(4).collect::<Vec<_>>().join("\n"),
+            volume_lines(&log)
         ));
-    }
+    };
     let _ = std::fs::remove_file(&image_path);
     eprintln!(
         "  [log] continued {continuations} times at the 256-byte bound, leaving {} parts at the \
-         {}-file bound, newest {}",
+         {}-file bound, newest {}; the shutdown's last line is in part {} of {}",
         logs.len(),
         super::wallclock::MAX_LOG_FILES,
-        logs.last().map_or("none", |e| e.name.as_str())
+        logs.last().map_or("none", |e| e.name.as_str()),
+        tail_at + 1,
+        logs.len()
     );
     Ok(())
 }
@@ -816,7 +852,7 @@ pub fn late_storage_connect(
     for want in [
         "boot-volume: partition mounted",
         "log-volume: partition mounted",
-        "log-file: this boot's kernel log is",
+        "logd: this boot's kernel log is",
     ] {
         if !boot.contains(want) {
             return Err(format!(
@@ -1415,7 +1451,7 @@ pub const NO_LOG_ALERT: &str = "log: no /log";
 ///   completes, because a missing diagnostic is not worth a machine;
 /// - and it is not a **fallback**: the log partition is read back on the host
 ///   afterwards and must still be empty. Falling back to the ESP would also
-///   leave it empty, so `log-file:` must not have installed either.
+///   leave it empty, so `logd` must not have opened a file either.
 pub fn log_partition_identity(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
@@ -1470,10 +1506,16 @@ pub fn log_partition_identity(
     if !log.contains("log-volume: not mounted") {
         return Err(format!("the kernel mounted a log volume it was never given:\n{}", volume_lines(&log)));
     }
-    if log.contains("log-file: this boot's kernel log is") {
+    if log.contains("logd: this boot's kernel log is") {
         return Err(format!(
-            "the sink installed with no log partition — a fallback is exactly what this must not \
+            "logd opened a file with no log partition — a fallback is exactly what this must not \
              do:\n{}",
+            volume_lines(&log)
+        ));
+    }
+    if !log.contains("logd: no /log on this machine") {
+        return Err(format!(
+            "logd said nothing about a machine with no /log, so §5.6's other half is missing:\n{}",
             volume_lines(&log)
         ));
     }

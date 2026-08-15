@@ -52,6 +52,51 @@ pub unsafe fn publish_ap_shard(cpu: u32, shard: *mut Shard) {
     unsafe { registry::publish(registry::kernel_slots(), cpu, shard) };
 }
 
+/// How long `SYS_SHUTDOWN` gives `/bin/logd` to make the last records durable.
+///
+/// **Not `apic`'s `LOG_FILE_DRAIN_NANOS`, and the difference is what each one
+/// bounds.** That one is a *panicking* machine, where the scheduler may be
+/// unable to pick logd at all and erring long costs the panel on a machine that
+/// is already lost. This is an orderly shutdown: every thread is healthy, the
+/// caller yields rather than spins, and what it waits for is one wake, one
+/// `SYS_LOG_READ`, a page-cache write-back, a FAT append and a device cache
+/// flush on the log volume — tens of milliseconds on an ordinary stick and
+/// hundreds under `--slow-usb`. Two seconds is the same order as the
+/// transport's own `USB_TIMEOUT_NS` for one transfer, which is what puts a floor
+/// under how slow "answering, slowly" is allowed to look.
+const SHUTDOWN_DURABLE_NANOS: u64 = 2_000_000_000;
+
+/// Wait, bounded, for `/bin/logd` to put everything committed so far on the
+/// device.
+///
+/// One caller, `SYS_SHUTDOWN` (§6.3), and it is why §5.2's `Sync` frame is
+/// struck: the asker is the kernel, and a kernel opening an IPC connection to a
+/// userland server to ask it a question is the inversion this architecture
+/// exists to remove. `LogCursor::durable` already travels the other way on a
+/// call logd makes every loop, so the answer is a word rather than a protocol —
+/// and the panic path's wait and this one become one mechanism seen from two
+/// contexts, instead of two mechanisms that have to be kept agreeing.
+///
+/// **It yields and does not spin.** This runs on an ordinary thread with the
+/// VFS lock already released, and at `--smp 1` the CPU it is on is the only one
+/// logd can run on: a spin would make the bound expire on every single-CPU
+/// shutdown, which is the width most of the suite boots at.
+pub fn wait_for_durable() {
+    let want = read::newest_committed_at_ns();
+    let deadline = crate::clock::nanos_since_boot().saturating_add(SHUTDOWN_DURABLE_NANOS);
+    while user::durable_ns() < want {
+        if crate::clock::nanos_since_boot() >= deadline {
+            crate::log!(
+                "shutdown: /log did not answer in {}ms, so this shutdown's last lines are on the \
+                 console only",
+                SHUTDOWN_DURABLE_NANOS / 1_000_000
+            );
+            return;
+        }
+        crate::scheduler::yield_now();
+    }
+}
+
 /// Every shard a reader can reach, cpu0 first. `None` is a CPU this machine
 /// does not have.
 pub fn shards() -> [Option<&'static Shard>; MAX_LOG_SHARDS] {

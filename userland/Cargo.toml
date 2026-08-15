@@ -12,6 +12,7 @@ members = [
     "font",
     "init",
     "input-test",
+    "logd",
     "netd",
     "paint",
     "proctest",

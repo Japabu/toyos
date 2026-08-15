@@ -699,6 +699,37 @@ impl Vfs {
         self.mounts.get_mut(name).ok_or(SyscallError::NotFound)?.fs.sync()
     }
 
+    /// Sync whichever filesystem `path` lives on, the root included.
+    ///
+    /// **What `SYS_FSYNC` means since L6.** `flush_file` puts the data, the FAT
+    /// and the directory entry on the device; it does not reach the device's own
+    /// write cache, and [`Vfs::sync_mount`] is what does — `Fat32::sync` writes
+    /// FSInfo and then calls `dev.flush()`, which is SCSI SYNCHRONIZE CACHE on a
+    /// stick. Until L6 the only caller of that second step was `log_file.rs`,
+    /// from the idle loop, and `fd::fsync` stopped one level short of it.
+    /// `/bin/logd` now publishes `LOG_DURABLE_NS` off the result of an ordinary
+    /// `fsync`, and a panicking kernel waits on that word — so a syscall that
+    /// stopped at the page cache would make the word a claim about nothing
+    /// (§12.4).
+    ///
+    /// It is the whole mount and not the one file because that is the only
+    /// granularity a block device offers: a cache flush is per device. Every
+    /// `fsync` in the machine is slower for it, and more honest.
+    pub fn sync_for_path(&mut self, path: &str) -> Result<(), SyscallError> {
+        let (mount, _) = self.resolve_path("/", path);
+        if self.mounts.contains_key(&mount) {
+            return self.sync_mount(&mount);
+        }
+        // Not a named mount, so the file is on the root filesystem. A machine
+        // with no root at all has nothing to flush, and that is not an error
+        // here: the write this is being asked to make durable cannot have
+        // happened.
+        match &mut self.root {
+            Some(root) => root.sync(),
+            None => Ok(()),
+        }
+    }
+
     /// Every mount, on the way down. Failures are logged here and not returned:
     /// the caller is `SYS_SHUTDOWN`, which has nowhere to put a `Result` and
     /// nothing left to try, and one mount refusing must not stop the rest from

@@ -152,10 +152,62 @@ pub fn read(
     // reading.
     cursor.shards = shards;
     // `durable` is the caller's word to the kernel and travels the other way.
-    // Nothing reads it yet: `LOG_DURABLE_NS` and the clamp that guards it are
-    // the panic path's (§6.4), and the panic path still waits on the kernel's
-    // own file sink until `/bin/logd` replaces it. It is left exactly as the
-    // caller wrote it rather than zeroed, so a reader that publishes into a
-    // cursor it keeps does not have to re-publish every call.
+    // It is left exactly as the caller wrote it rather than zeroed, so a reader
+    // that publishes into a cursor it keeps does not have to re-publish every
+    // call.
+    publish_durable(cursor.durable);
     Ok(written)
+}
+
+/// How far `/bin/logd` says the machine's log is on the device, as the `at_ns`
+/// of the newest record it has `fsync`ed.
+///
+/// **The one number userland tells the kernel about the log**, and the only
+/// thing that reads it is a machine that is stopping: `apic::wait_for_log_file`
+/// on the panic path and `SYS_SHUTDOWN` on the way to the power-off, each
+/// waiting, bounded, for its own last records to reach the stick. Monotone
+/// because it is a maximum: a reader that goes away, is killed, or publishes a
+/// cursor it has kept since before its last write can never move it backwards
+/// and make the kernel wait for something that has already landed.
+///
+/// Zero until the first publication, which reads as "nothing is durable" and is
+/// the honest state of a machine with no `/log`, a `logd` that has not run yet
+/// or one that has given up on the volume. Each of those pays the bound on a
+/// fatal panic, once, and that is the correct outcome rather than a cost: the
+/// report is not on the stick, so there is nothing to return early for.
+static DURABLE_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Take the caller's claim, clamped, and keep the maximum.
+///
+/// **`durable` crossed the trust boundary and decides how long a dying kernel
+/// waits, so it is clamped** (§6.4). The ceiling is the newest record the
+/// machine actually holds: an unclamped `u64::MAX` from a buggy `logd` makes
+/// the wait return immediately and the report is silently lost, which is
+/// exactly the "a device's own numbers are untrusted" rule one layer up.
+///
+/// Clamping cannot make a wait *longer* than its own bound, so the only thing a
+/// hostile `logd` can do with this is shorten a wait for its own output, which
+/// is acceptable and is stated so nobody reads the clamp as more than it is.
+fn publish_durable(claimed: u64) {
+    if claimed == 0 {
+        return;
+    }
+    let clamped = claimed.min(super::read::newest_committed_at_ns());
+    DURABLE_NS.fetch_max(clamped, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The newest record `/bin/logd` has put on the device. One relaxed load, for
+/// the two callers that ask it from a machine on its way down.
+pub fn durable_ns() -> u64 {
+    DURABLE_NS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Is there a committed record newer than anything `/bin/logd` has made
+/// durable?
+///
+/// The predicate both waits are written against, in one place because they are
+/// one question asked by two callers: the panic path before the halt IPI, and
+/// `SYS_SHUTDOWN` before the power goes.
+pub fn owed() -> bool {
+    super::read::newest_committed_at_ns() > durable_ns()
 }

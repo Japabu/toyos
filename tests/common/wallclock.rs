@@ -59,7 +59,7 @@ const RTC_BASE_DATE: &str = "2033-03-07-";
 /// century wrong is out by a hundred years rather than by seconds.
 const MAX_BOOT_DRIFT_SECS: i64 = 300;
 
-/// How many logs `log_file::MAX_LOG_FILES` keeps. Mirrored rather than shared,
+/// How many logs `/bin/logd`'s `MAX_LOG_FILES` keeps. Mirrored rather than shared,
 /// so moving the kernel's bound without looking at this fails here rather than
 /// quietly weakening the gate.
 pub const MAX_LOG_FILES: usize = 16;
@@ -103,7 +103,7 @@ fn clock_lines(log: &str) -> String {
     let lines: Vec<&str> = log
         .lines()
         .filter(|l| {
-            l.contains("clock:") || l.contains("log-file:") || l.contains("RTC") || l.contains("rtc")
+            l.contains("clock:") || l.contains("logd:") || l.contains("RTC") || l.contains("rtc")
         })
         .collect();
     if lines.is_empty() {

@@ -2696,9 +2696,9 @@ fn run_screen_test(
                      about a missing /log:\n{console}"
                 ));
             }
-            if console.contains("log-file: this boot's kernel log is") {
+            if console.contains("logd: this boot's kernel log is") {
                 return Err(format!(
-                    "the sink installed anyway — a fallback is what this must not do:\n{console}"
+                    "logd opened a file anyway — a fallback is what this must not do:\n{console}"
                 ));
             }
 

@@ -544,24 +544,18 @@ fn execute(action: Action<KernelPayload>) {
                 // ring above: the next pass emits the line and moves the state
                 // on, so this costs one trip round the loop and never a spin.
                 || crate::drivers::i8042::verdict_due()
-                // And the same argument for the *file* sink, which has its own
-                // cursor into the same ring: a machine with no serial port is
-                // the one this matters on, and there the log ring drains into
-                // nothing while `/boot/toyos/kernel.log` is the only surviving
-                // copy. Self-clearing like the two above — `log_file::poll`
-                // runs at the top of the loop and writes everything it is
-                // owed, and the paths on which it cannot (a VFS lock a dead
-                // thread still holds) turn the sink off after a bounded number
-                // of tries, which clears this too.
+                // **No log condition survives L6, and its absence is the
+                // point.** Two used to be here. `log_ring::has_pending` went at
+                // L3, when the commit started posting `klogd`'s wake and the
+                // halt became refusable by the doorbell like any other runnable
+                // task's; `log_file_flush_due` goes here, with the kernel file
+                // sink it asked about. What writes `/log` now is a userland
+                // process made runnable through the mailbox, so a CPU with a
+                // log to write is a CPU with something in its run queue and the
+                // three conditions above already refuse the halt for it.
+                // `idle_loop_is_the_declared_body` is what keeps a fourth from
+                // being quietly re-added.
                 //
-                // Asked as "would the next trip write it", not "is anything
-                // owed", or the condition stops self-clearing: a CPU that
-                // declines the flush and then stays awake *because* the log is
-                // unwritten spins for as long as the bytes sit there. Declining
-                // costs it the halt and nothing else — it holds a deadline, so
-                // its own timer brings it back, and the deferral ceiling makes
-                // the flush its own if nobody else has taken it.
-                || log_file_flush_due()
                 // A root-hub port whose connect state the driver has not
                 // finished acting on. The connect edge that started it was the
                 // last interrupt that controller has to give — a device sitting
@@ -696,78 +690,14 @@ extern "C" fn idle_loop() -> ! {
         // loop and then halts has run every hook first, rather than leaving one
         // queued behind an interrupt that may be 102 s away.
         crate::object::drain_zero_handles();
-        // Immediately before the sink's poll, so the line it appends is flushed
-        // by the very next statement rather than waiting a trip round the loop.
+        // A heartbeat is a record like any other now, so it reaches the wire on
+        // the commit rather than waiting for a sink that used to run in the
+        // statement below it. What that statement was — the log file's flush —
+        // is gone with the file (§8.1), and the idle loop no longer touches a
+        // filesystem, a volume or a controller at all.
         #[cfg(feature = "boot-actuators")]
         crate::heartbeat::poll();
-        // Before the pass: this is I/O off the critical path, and the one
-        // context that provably holds none of the locks a filesystem needs.
-        flush_log_file_if_affordable();
         pass(Dispose::None);
-    }
-}
-
-/// The longest the log file may go unwritten because every CPU that reached
-/// the idle loop owed a wake.
-///
-/// A ceiling and not a target. On a machine with a spare CPU it never expires;
-/// it exists so that "prefer a CPU that owes nothing" cannot become "never" —
-/// on one core there is no other CPU, and on any number of them a busy machine
-/// could owe a deadline everywhere at once.
-const LOG_DEFERRAL_CEILING_NS: u64 = 1_000_000_000;
-
-/// When the first CPU declined to write the log, or 0 if none has since the
-/// last flush. Global rather than per-CPU: the question is how long the *file*
-/// has been owed bytes, and any CPU may answer it.
-static LOG_DEFERRED_SINCE: AtomicU64 = AtomicU64::new(0);
-
-/// Write the log file, unless this CPU is the wrong one to spend the time on.
-///
-/// A flush is a device transfer — on the machine this matters on, a USB one,
-/// whose whole duration `xhci::wait_transfer` spends with preemption disabled.
-/// It cannot be abandoned once begun, so the only place to decline is before.
-///
-/// A CPU that owes a wake is the wrong one to spend it: a task parks on the CPU
-/// with nothing else to run, so the CPU an audio daemon is waiting on is
-/// exactly the CPU that reaches this loop first. Whoever owes nothing takes the
-/// bytes instead — and if nobody has for [`LOG_DEFERRAL_CEILING_NS`], this CPU
-/// takes them anyway.
-///
-/// The one writer of the deferral clock, so that [`log_file_flush_due`] can
-/// answer the pre-halt check without consuming an expiry this has not acted on.
-fn flush_log_file_if_affordable() {
-    if !crate::log_file::has_pending() {
-        LOG_DEFERRED_SINCE.store(0, Ordering::Relaxed);
-        return;
-    }
-    if owes_wake() {
-        let now = crate::clock::nanos_since_boot().max(1);
-        match LOG_DEFERRED_SINCE.load(Ordering::Relaxed) {
-            0 => {
-                LOG_DEFERRED_SINCE.store(now, Ordering::Relaxed);
-                return;
-            }
-            since if now.saturating_sub(since) < LOG_DEFERRAL_CEILING_NS => return,
-            _ => {}
-        }
-    }
-    LOG_DEFERRED_SINCE.store(0, Ordering::Relaxed);
-    crate::log_file::poll();
-}
-
-/// Would the next trip round the idle loop write the log file? Read-only.
-fn log_file_flush_due() -> bool {
-    if !crate::log_file::has_pending() {
-        return false;
-    }
-    if !owes_wake() {
-        return true;
-    }
-    match LOG_DEFERRED_SINCE.load(Ordering::Relaxed) {
-        0 => false,
-        since => {
-            crate::clock::nanos_since_boot().saturating_sub(since) >= LOG_DEFERRAL_CEILING_NS
-        }
     }
 }
 
@@ -817,23 +747,6 @@ pub fn ready_len() -> usize {
 
 pub fn parked_len() -> usize {
     try_with_cpu(|cpu| cpu.parked().count()).unwrap_or(0)
-}
-
-/// Is any task parked here? The idle loop's admission test for unbounded I/O.
-///
-/// A deadline is not the question, though it was: a timed waiter is only the
-/// subset of owed wakes whose *time* this CPU happens to know, and the audio
-/// path's producer is not in it — a client filling soundd's ring parks on a
-/// pipe with no deadline at all, and is woken by an RT daemon that expects it
-/// back inside one 2.9 ms period. Deferring only for deadlines steers the flush
-/// off the daemon's CPU and onto its client's, where it costs the same audio.
-///
-/// A CPU cannot answer for a sibling, and does not need to: the question is
-/// only ever asked about the CPU that is about to spend the time. `true` when
-/// the answer is unavailable — declining costs a trip round the loop, and
-/// proceeding costs whatever the device takes.
-pub fn owes_wake() -> bool {
-    try_with_cpu(|cpu| cpu.parked().next().is_some()).unwrap_or(true)
 }
 
 /// The thread this CPU has loaded, if any.

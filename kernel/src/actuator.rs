@@ -354,13 +354,6 @@ actuators! {
     /// quiet machine has.
     heartbeat = "heartbeat";
 
-    /// Rotate `/log/kernel.log` at 256 bytes instead of 4 MiB. Filling megabytes
-    /// by logging would take a boot far longer than a test should wait, and the
-    /// rotation code this drives is the shipped code — only the bound moves,
-    /// exactly as `test-small-caches` moves the cache ceilings.
-    /// See `log_file::max_log_bytes`.
-    log_rotate_fast = "log-rotate-fast";
-
     /// Every CPU emitting patterned log records at once, from kernel threads the
     /// boot's first `SYS_LOG_READ` spawns.
     ///

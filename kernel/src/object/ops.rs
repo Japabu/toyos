@@ -618,6 +618,25 @@ pub fn fstat(object: &KObjectRef) -> Stat {
     }
 }
 
+/// `SYS_FSYNC`: the file's bytes on the device, **and the device told to commit
+/// them**.
+///
+/// **The second step is L6's, and it is a change to a shipped syscall's
+/// semantics rather than an implementation detail** (§12.4). This used to be
+/// `flush_file` alone, which puts the data, the FAT and the directory entry on
+/// the volume and stops there — the stick's own write cache still holds them,
+/// so a power cut after a successful `fsync` could lose what it returned `Ok`
+/// for. The only caller in the machine that did the second step was
+/// `log_file.rs`, in the kernel, from the idle loop.
+///
+/// It is not optional now: `/bin/logd` publishes `LOG_DURABLE_NS` off this
+/// call's result, and a panicking kernel stops waiting for its own report when
+/// that word passes the report's timestamp. An `fsync` that stopped at the page
+/// cache would make the whole durability contract a claim about nothing. The
+/// alternative considered and rejected was a second syscall for logd alone,
+/// which needs a number, needs discussion, and would make every *other*
+/// `fsync` in the machine quietly weaker than the one program that noticed.
+/// `log_is_durable_after_fsync` is the gate, and it reds on the old behaviour.
 pub fn fsync(object: &KObjectRef) -> u64 {
     let KObjectRef::File(file) = object else {
         return SyscallError::PermissionDenied.to_u64();
@@ -631,9 +650,19 @@ pub fn fsync(object: &KObjectRef) -> u64 {
     // Outside `FileObject`'s own lock: the VFS lock is taken here and in
     // `OpenFileState::drop`, and holding both in one order here and the other
     // there is the deadlock this ordering exists to avoid.
-    if let Err(e) = crate::vfs::lock().flush_file(&path, file_id, mtime) {
+    let mut vfs = crate::vfs::lock();
+    if let Err(e) = vfs.flush_file(&path, file_id, mtime) {
         return e.to_u64();
     }
+    // Under the same acquisition as the write-back above, deliberately: two
+    // acquisitions would let another writer's data reach the volume between
+    // them and be committed by this caller's flush, which is harmless, and
+    // would let this caller's own file be *unmounted* between them, which is
+    // not.
+    if let Err(e) = vfs.sync_for_path(&path) {
+        return e.to_u64();
+    }
+    drop(vfs);
     file.with(|state| state.modified = false);
     0
 }

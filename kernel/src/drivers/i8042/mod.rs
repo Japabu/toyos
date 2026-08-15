@@ -281,7 +281,7 @@ static REPORTED_IRQS: AtomicU32 = AtomicU32::new(0);
 /// The array is the longer one in every build and the *bound* is what moves, so
 /// a boot with nothing armed reports exactly the eight the shipping kernel
 /// does. Only the bound moves: the list, the run-blaming and the line are the
-/// shipped ones, exactly as `log-rotate-fast` moves a size and nothing else.
+/// shipped ones, exactly as `test-small-caches` moves a ceiling and nothing else.
 const UNEXPLAINED_CAP: usize = 24;
 
 fn unexplained_len() -> usize {
