@@ -22,6 +22,28 @@ capture, because the one window opened is the one soundd's startup falls in.
 Judge the C family from a full run, and read a filtered red for *which* line
 differs before believing it.
 
+## Measured again on `wt/toyos-logd`, 2026-08-15 — and from the other side
+
+`71_macro_empty_arg`, **2 of 10 full suites in one session**: one red in each
+five of an interleaved A/B of a kernel change to the console write path
+(`specs/log-architecture-spec.md` §8.1's `MAX_CONSOLE_LINE` bound on how long
+`write_console` holds the backend). The rate is the same with the change and
+without it, so nothing about how long that lock is held moves this.
+`src/redlist.rs` carries the row.
+
+**The failure was the mirror image of the one above, and that is worth writing
+down.** The capture came out *empty* against an expected `17`, rather than
+carrying an extra daemon line: the child's own output fell outside
+`===TEST_START===`/`===TEST_END===` instead of somebody else's falling inside.
+Same window, same race, opposite side. So the shape to look for is "the capture
+is not this program's" in *either* direction — a diagnosis that only looks for
+added lines will read an empty capture as something else entirely, which is
+what happened here before the two were connected.
+
+`specs/log-architecture-spec.md` §4.3 recorded this name at "zero in five" after
+that branch bounded its console drain; ten suites say one in five with the drain
+bounded either way, so that was a lucky five, and §4.3 now says so.
+
 No cheap honest fix. The kernel tags its own lines `[kernel `, which is why
 those are already filtered; userland writes carry no attribution, so a daemon's
 line and the child's are the same bytes on the same fd. Either the child gets

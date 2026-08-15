@@ -1697,9 +1697,25 @@ re-parks.
   three times because a daemon's own `write` waited behind the same guard and
   landed after a marker it was written before. Neither reds on the byte-ring
   commit. Bounding the window took the second to zero in five and the first to
-  one (`specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`
-  is what is left of it, and it is a driver race this branch's timing moves
-  rather than one it made).
+  one.
+
+  **That reading blamed one holder and there were two, and the follow-up
+  retires half of it.** The other was `write_console`, which took the same guard
+  once for a userland-chosen length (§8.1, bounded 2026-08-15 as L3's review
+  finding F1) — so every suite in the paragraph above ran with an unbounded
+  interrupts-off window still live on the console path, and no rate measured
+  then can be attributed to the drain's bound alone. With both bounded: **ten
+  full suites in one session, five per arm of that fix's own A/B, and each name
+  red once in each five on both arms.** So the eight-record bound stands on its
+  argument rather than on those rates; `71_macro_empty_arg` at "zero in five"
+  was a lucky five, and its mechanism is
+  `specs/issues/build/daemon-lines-land-in-any-test-window.md`'s, which records
+  the same test failing the same way before this branch existed;
+  `i8042_undecoded_bytes` is
+  `specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`'s,
+  a driver race this branch's timing moves rather than one it made. **Both are
+  rows in `src/redlist.rs` now**, FIRES 2 of 10 each, rather than reds a reader
+  of this section has to re-derive.
 - **It is not `usbd` and not `iod`.** Those two stay exactly as compl §10 defines
   them, and neither exists until that branch lands.
 

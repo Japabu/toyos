@@ -37,13 +37,38 @@ The stamps are all inside the keyboard bring-up window: **403 ms, 459 ms and
 | `origin/main` (`4d8c2e9`) | 7 | 0 |
 | this branch before the byte ring went (`b8457df`) | 5 | 0 |
 | this branch after it (`ee8369c`+) | 5 | 2 |
-| the same with the drain's interrupts-off window bounded | 5 | 1 |
+| the same with the *drain's* interrupts-off window bounded | 5 | 1 |
+| the same with **`write_console`'s** window bounded as well (2026-08-15) | 5 | **1** |
+| the tip of the same branch, that one window *not* bounded, same session | 5 | **1** |
 
-So it is a race the log branch's timing moves rather than one it introduces:
-what that branch changed here is when the machine goes idle and how long a
-console drain masks interrupts, and bounding the second of those took it from
-two in five to one in five. `cargo run -- --known-red i8042_undecoded_bytes`
-says **NOT ON THE LIST**.
+## The blame, and it named one aggressor when there were two
+
+**The first four rows above were read as "the drain masks interrupts and
+bounding it halves the rate", and that account was incomplete.** L3's review
+found a second holder of the same lock with a worse shape: `write_console` took
+`BackendGuard` — `cli` plus a global spinlock, with the device write inside it —
+once for a **userland-chosen** length, because `SYS_WRITE`'s buffer has no cap
+and the byte ring this branch deleted had never held that lock at all. So a
+guest doing ordinary console output could mask interrupts for as long as it
+liked, on the same machine whose i8042 was being brought up, and that window was
+live for every measurement in the table's third and fourth rows.
+`specs/log-architecture-spec.md` §8.1 carries the fix; the drain's eight-record
+bound and this one are the two halves of what `kernel/CLAUDE.md`'s
+`BackendGuard` caveat asks for.
+
+**Bounding it does not move the rate, and that is what settles the blame.** The
+last two rows are one interleaved A/B in one session — ten full suites, five
+with that window bounded and five without — and each five carries exactly one
+red. The isolated re-run the harness takes afterwards did not even agree with
+itself across the two occurrences: `red again` on one, `ALONE: GREEN` on the
+other, which is what a race whose window is somebody else's looks like from
+here. So what is left is not an interrupts-off window this branch owns; it is
+the driver race the two halves below describe, which the branch's timing
+exposes and does not cause. Recorded rather than re-run away.
+
+`cargo run -- --known-red i8042_undecoded_bytes` said **NOT ON THE LIST** when
+this entry was opened; it now answers the row that cites it —
+`src/redlist.rs`, FIRES 2 of 10, dev host loaded, 2026-08-15.
 
 ## Two halves, and they want different fixes
 
