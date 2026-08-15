@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -286,6 +287,10 @@ fn claimant(rust_dir: &Path) -> Option<(PathBuf, String)> {
 
 /// Whether the checkout a claim names is still there to land it.
 ///
+/// Half of [`staleness`]: a holder that is gone cannot land what it holds, and a
+/// holder that has *already* landed it cannot either. This is the first
+/// question because it is a `stat`.
+///
 /// **A claim names its holder, and it is a claim only while that holder is
 /// real.** On 2026-08-14 the sysroot carried
 /// `1786423818 /Users/jan/Dev/jan/toyos-logabi wt/toyos-logabi`, written at
@@ -439,11 +444,11 @@ enum Resolution {
     /// that is not on main yet, and this one has nothing of its own to build
     /// with. The refusal ends when that change lands, and by nothing else.
     Wait,
-    /// Rebuild it, and say why. The record names a checkout that is gone, so
-    /// the rebuild takes nothing from anybody, and this one's sources are
-    /// main's, so what it puts in the sysroot is what every other worktree
+    /// Rebuild it, and say why. Nobody is left to land what the sysroot holds,
+    /// so the rebuild takes nothing from anybody, and this checkout's sources
+    /// are main's, so what it puts in the sysroot is what every other worktree
     /// already has. Staleness, exactly as a moved [`std_fork_stale`] is.
-    Stale,
+    Stale(Staleness),
     /// Claim it, deliberately and with `--claim-sysroot`. This checkout has an
     /// ABI of its own, and putting it in the shared sysroot refuses every other
     /// worktree whoever held it before.
@@ -453,17 +458,54 @@ enum Resolution {
     Unclear,
 }
 
+/// The two ways a claim stops being one, which are the two ways there is nobody
+/// left to land what the sysroot holds.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Staleness {
+    /// The checkout named on the record is not on disk any more.
+    HolderGone,
+    /// What the record holds is content main's history already carries, so its
+    /// holder — on disk or not, and this checkout or not — has nothing left to
+    /// land.
+    Landed,
+}
+
+impl Staleness {
+    /// Said in the sentence that announces the rebuild, because "this is
+    /// staleness" is a verdict and an agent reading it needs the fact under it.
+    fn why(self) -> &'static str {
+        match self {
+            Self::HolderGone => "the checkout that wrote it is not on disk any more",
+            Self::Landed => "what it recorded is content main's history already carries",
+        }
+    }
+}
+
+/// Why a sysroot this checkout disagrees with is stale rather than claimed, or
+/// `None` while somebody can still land what it holds.
+///
+/// **The holder first, then the content**, and only because the first is a
+/// `stat` and the second walks main's history: they are one question asked two
+/// ways, and either answer alone ends the claim.
+fn staleness(root: &Path, rust_dir: &Path) -> Option<Staleness> {
+    // **No record at all is not a dead claim.** [`record_claimant`] is advisory
+    // and may fail, so an absent record can be a live holder that could not
+    // write one; only a holder that is named *and* gone is dead. The content
+    // question below answers for the unnamed holder too, and answers it about
+    // the sysroot rather than about who wrote it.
+    if claimant(rust_dir).is_some_and(|(who, _)| holder_gone(&who)) {
+        return Some(Staleness::HolderGone);
+    }
+    sysroot_content_landed(root, rust_dir).then_some(Staleness::Landed)
+}
+
 fn resolution(root: &Path, rust_dir: &Path) -> Resolution {
     match standing(root) {
         Standing::Diverged => Resolution::Claim,
         Standing::Unknown => Resolution::Unclear,
-        // **No record at all is not a dead claim.** [`record_claimant`] is
-        // advisory and may fail, so an absent record can be a live holder that
-        // could not write one; only a holder that is named *and* gone is dead.
-        Standing::MatchesMain if claimant(rust_dir).is_some_and(|(who, _)| holder_gone(&who)) => {
-            Resolution::Stale
+        Standing::MatchesMain => {
+            staleness(root, rust_dir).map_or(Resolution::Wait, Resolution::Stale)
         }
-        Standing::MatchesMain => Resolution::Wait,
     }
 }
 
@@ -485,12 +527,176 @@ fn witness(root: &Path) -> String {
             let data = fs::read(&path)
                 .unwrap_or_else(|e| panic!("witness {}: {e}", path.display()));
             let rel = path.strip_prefix(root).unwrap_or(&path);
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            data.hash(&mut hasher);
-            lines.push(format!("{}:{:016x}", rel.display(), hasher.finish()));
+            lines.push(format!("{}:{}", rel.display(), content_hash(&data)));
         }
     }
     lines.join("\n")
+}
+
+/// The half of a witness line that is the content, shared with [`witness_at`] so
+/// a line read out of git and a line read off the disk are the same function of
+/// the same bytes.
+fn content_hash(data: &[u8]) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// `main` as this checkout can name it without asking the network.
+///
+/// **`origin/main` first, and it is the local remote-tracking ref**: nothing
+/// here fetches, so this is what the last `--sync`, `--pr` or `git fetch` left,
+/// and an agent whose machine is offline gets an answer rather than a hang. Then
+/// local `main`, which is what a repository with no remote has — every fixture
+/// in this module, and a fresh `git init`. `None` is a repository with neither,
+/// where [`Standing::Unknown`]'s rule applies: an unanswered question is not
+/// permission.
+fn main_ref(root: &Path) -> Option<&'static str> {
+    ["origin/main", "main"].into_iter().find(|r| {
+        Command::new("git")
+            .args(["rev-parse", "--verify", "--quiet", r])
+            .current_dir(root)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    })
+}
+
+fn git_stdout(root: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git").args(args).current_dir(root).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+fn git_blob(root: &Path, sha: &str) -> Option<Vec<u8>> {
+    let out =
+        Command::new("git").args(["cat-file", "blob", sha]).current_dir(root).output().ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// Whether a path `git ls-tree` listed under `tree` is one [`collect_sources`]
+/// would have picked up off the disk.
+///
+/// The same three extensions and the same two directory exclusions, because the
+/// two lists are compared as strings and a file in one and not the other is a
+/// disagreement that is not there.
+fn witnessed_source(path: &Path, tree: &str) -> bool {
+    let Ok(rel) = path.strip_prefix(tree) else {
+        return false;
+    };
+    let mut dirs: Vec<_> = rel.components().collect();
+    dirs.pop();
+    if dirs.iter().any(|c| {
+        let name = c.as_os_str().to_string_lossy();
+        name.starts_with('.') || name == "target"
+    }) {
+        return false;
+    }
+    path.extension().is_some_and(|e| e == "rs" || e == "toml" || e == "h")
+}
+
+/// The witness [`witness`] would have written for the state of
+/// [`SYSROOT_SOURCES`] at `commit`.
+///
+/// Line for line the same function: the same trees in the same order, the same
+/// extension filter, the same sort over `PathBuf`s (which orders by component
+/// and not by byte, so `a/b.rs` precedes `ab.rs`), and the same
+/// [`content_hash`]. It is compared against a string [`witness`] wrote, so any
+/// difference in any of those is a false answer.
+///
+/// Blob hashes are memoised across commits: main's history on 2026-08-14 is 148
+/// commits over 42 files but only 214 distinct blobs, so each is read once. The
+/// listing is one `ls-tree` for all three trees rather than one each, which is
+/// the difference between 444 processes and 148 — measured over this
+/// repository, 6.9 s against 3.9 s for a search that finds nothing, and 0.5 s
+/// for one that finds main's tip.
+///
+/// A path git has to quote — one holding a tab, a quote or a non-ASCII byte —
+/// would come back C-escaped and match nothing. None of these trees has ever
+/// held one, and the failure direction is the safe one: an unmatched witness is
+/// a refusal that stands, not a sysroot handed away.
+fn witness_at(root: &Path, commit: &str, blobs: &mut HashMap<String, String>) -> Option<String> {
+    let mut args: Vec<&str> = vec!["ls-tree", "-r", commit, "--"];
+    args.extend(SYSROOT_SOURCES);
+    let listing = git_stdout(root, &args)?;
+    let mut listed: Vec<(PathBuf, &str)> = Vec::new();
+    for line in listing.lines() {
+        let (meta, path) = line.split_once('\t')?;
+        listed.push((PathBuf::from(path), meta.split_whitespace().nth(2)?));
+    }
+
+    let mut lines = Vec::new();
+    for tree in SYSROOT_SOURCES {
+        let mut files: Vec<&(PathBuf, &str)> =
+            listed.iter().filter(|(path, _)| witnessed_source(path, tree)).collect();
+        files.sort();
+        for (path, sha) in files {
+            let hash = match blobs.get(*sha) {
+                Some(hash) => hash.clone(),
+                None => {
+                    let hash = content_hash(&git_blob(root, sha)?);
+                    blobs.insert((*sha).to_string(), hash.clone());
+                    hash
+                }
+            };
+            lines.push(format!("{}:{hash}", path.display()));
+        }
+    }
+    Some(lines.join("\n"))
+}
+
+/// Whether what the sysroot records is content `main`'s history already carries.
+///
+/// **The question the refusal actually needs, and the one nothing asked until
+/// 2026-08-14.** [`standing`] asks whether *this checkout* differs from main; a
+/// claim is a claim only while the *sysroot* does. A worktree that claimed the
+/// sysroot for an ABI change, landed it, and stayed on disk left every other
+/// checkout waiting for a landing that had already happened — and joined them
+/// itself the moment it merged main, because it then matched main too and had no
+/// standing to claim its own record back. Its holder directory was there, so
+/// [`holder_gone`] said nothing. The sysroot was *behind* main, not ahead of it,
+/// and nothing could end the refusal: `--claim-sysroot` in the primary checkout,
+/// admitted by the flag alone, was the whole exit and no refusal named it.
+///
+/// So the sysroot's own witness is searched for in main's history, and finding
+/// it makes the disagreement staleness exactly as a moved [`std_fork_stale`] is
+/// — what it protects has landed, so rebuilding takes nothing from anybody. Not
+/// finding it is the real claim, which keeps refusing: the sysroot then holds
+/// something main has never had, and only its holder can land that.
+///
+/// **Main's history and not main's tip.** An equality against the tip answers
+/// this geometry wrongly, because the tip has moved on past what the sysroot
+/// holds — on this machine by `4e690d0`, a doc-comment-only commit, which
+/// [`witness`] hashes because it hashes bytes.
+///
+/// **`--full-history`**, so a state that reached main through a merge whose
+/// path simplification prunes it is still found: 148 commits against 68 on
+/// 2026-08-14, and both directions of the error are on the safe side of a
+/// refusal — a state that is missed leaves the refusal standing.
+///
+/// Reached only where a checkout already disagrees with the sysroot, which is
+/// the refusal path and not any ordinary build. Measured over this repository
+/// on 2026-08-14: 0.5 s to find main's tip, 3.9 s to walk all 148 commits and
+/// find nothing — the second being the case that then panics anyway, against a
+/// wedge that costs a whole host until somebody is told about `--claim-sysroot`
+/// by hand.
+fn sysroot_content_landed(root: &Path, rust_dir: &Path) -> bool {
+    let Ok(recorded) = fs::read_to_string(witness_path(rust_dir)) else {
+        return false;
+    };
+    let Some(main) = main_ref(root) else {
+        return false;
+    };
+    let mut args: Vec<&str> = vec!["rev-list", "--full-history", main, "--"];
+    args.extend(SYSROOT_SOURCES);
+    let Some(history) = git_stdout(root, &args) else {
+        return false;
+    };
+    let mut blobs = HashMap::new();
+    history
+        .lines()
+        .any(|commit| witness_at(root, commit, &mut blobs).as_deref() == Some(recorded.as_str()))
 }
 
 /// The std fork the sysroot's `library` was compiled from.
@@ -609,12 +815,132 @@ fn differing_trees(recorded: Option<&str>, current: &str) -> String {
     names.join(", ")
 }
 
+fn rustup_home() -> Option<PathBuf> {
+    std::env::var_os("RUSTUP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".rustup")))
+}
+
 /// Where the machine-global `toyos` rustup toolchain currently points.
 fn rustup_link() -> Option<PathBuf> {
-    let home = std::env::var_os("RUSTUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".rustup")))?;
-    fs::read_link(home.join("toolchains/toyos")).ok()
+    fs::read_link(rustup_home()?.join("toolchains/toyos")).ok()
+}
+
+/// The binaries rustup proxies out of a linked toolchain's `bin/`.
+///
+/// A name that is not there is a name rustup answers for by falling back to
+/// another toolchain and narrating it, two `info:` lines per invocation — about
+/// 8-10 invocations in a build and 249 in a full `cargo test`.
+const TOOLCHAIN_BINARIES: [&str; 2] = ["rustc", "cargo"];
+
+/// Which of [`TOOLCHAIN_BINARIES`] a toolchain's `bin/` would make rustup
+/// narrate a fallback for.
+///
+/// `exists` and not `read_dir`, because it follows the link: a `cargo` symlink
+/// left by another machine — an artifact publisher's, say — dangles here, and a
+/// dangling proxy is a narrated fallback exactly as an absent one is.
+fn narrated_binaries(bin: &Path) -> Vec<&'static str> {
+    TOOLCHAIN_BINARIES.into_iter().filter(|name| !bin.join(name).exists()).collect()
+}
+
+/// The `cargo` this machine can lend the `toyos` toolchain.
+///
+/// **A nightly one if rustup has it, and the host's otherwise — which is what
+/// rustup itself falls back to, measured on both machines that matter.** The
+/// dev host has a `nightly-<host>` installed and rustup's narration names it
+/// (`falling back to ".../nightly-aarch64-apple-darwin/bin/cargo"`, cargo
+/// 1.96.0-nightly); every CI runner installs `--profile minimal
+/// --default-toolchain stable` and nothing else, so rustup falls back to
+/// stable's. Provisioning in that order changes the cargo behind no ToyOS build
+/// anywhere: it removes the narration and nothing else.
+///
+/// The order is not decoration. `-Z` is refused outside the nightly channel, so
+/// stable's cargo (1.97.1) and bootstrap's stage0 cargo (1.98.0-beta.2) both
+/// refuse the `-Zbuild-std` std type-check `src/CLAUDE.md` documents — measured,
+/// both — while the nightly rustup already falls back to accepts it. Picking
+/// "the host cargo" flatly would have taken that away from the dev host and
+/// called it a cleanup.
+///
+/// The host's is resolved through `rustc --print sysroot` for the same reason
+/// [`link_host_target`] does: it is whatever stable toolchain this machine has,
+/// and it is not a path any artifact can know.
+fn host_cargo() -> &'static Path {
+    static CARGO: OnceLock<PathBuf> = OnceLock::new();
+    CARGO.get_or_init(|| {
+        if let Some(home) = rustup_home() {
+            let nightly = home.join(format!("toolchains/nightly-{}/bin/cargo", host_triple()));
+            if nightly.exists() {
+                return nightly;
+            }
+        }
+        let output = Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .output()
+            .expect("Failed to run rustc");
+        let sysroot = String::from_utf8(output.stdout).expect("rustc prints a path");
+        let cargo = Path::new(sysroot.trim()).join("bin/cargo");
+        assert!(
+            cargo.exists(),
+            "there is no cargo at {}, so the toyos toolchain cannot be given one and every \
+             cargo invocation under it will narrate a fallback.",
+            cargo.display(),
+        );
+        cargo
+    })
+}
+
+/// Whether the toolchain's `cargo` is not the one this machine would lend it.
+///
+/// The question is what the link *points at*, not whether a file is there: a
+/// `bin/cargo` that arrived inside the published artifact names a path only the
+/// publisher had, and a build that took it for provisioned would keep narrating
+/// — or worse, run another platform's binary.
+fn cargo_link_stale(stage2: &Path) -> bool {
+    fs::read_link(stage2.join("bin/cargo")).ok().as_deref() != Some(host_cargo())
+}
+
+/// Put a `cargo` beside the toolchain's `rustc`.
+///
+/// **The one step that provisions it, and every path that can produce a
+/// toolchain directory goes through it**: the primary's bootstrap and its
+/// staleness rebuild (both upstream of [`ensure`]'s call), a linked worktree
+/// adopting the shared one, and a runner that unpacked the published artifact.
+/// The fix this replaces was made once, by hand, in a step the rebuild path does
+/// not run — so the 2026-08-14 sysroot rebuild recreated `bin/` without it and
+/// nothing noticed, and CI, which links its toolchain fresh from the artifact
+/// every run, never had it at all.
+///
+/// **A symlink, and what survives the artifact round-trip is this step rather
+/// than the link.** `toolchain.yml` excludes it from the tarball for the reason
+/// it excludes `lib/rustlib/<host>`: it names a path only the publishing runner
+/// has, and a copy would put a 32 MB host binary into a 401 MiB artifact to
+/// stand in for a file the consumer can make in a microsecond. `Owner::Installed`
+/// makes it, exactly as it makes the host target.
+fn provision_toolchain_cargo(stage2: &Path) {
+    let at = stage2.join("bin/cargo");
+    let _ = fs::remove_file(&at);
+    std::os::unix::fs::symlink(host_cargo(), &at).unwrap_or_else(|e| {
+        panic!("Failed to symlink {} -> {}: {e}", at.display(), host_cargo().display())
+    });
+}
+
+/// Refuse a toolchain layout that would make rustup narrate.
+///
+/// Unconditional and after the step that provisions, because the defect being
+/// gated is a provisioning step that silently stopped running: a check that only
+/// runs when the step runs asserts nothing about the build that skipped it.
+fn assert_toolchain_is_honest(stage2: &Path) {
+    let bin = stage2.join("bin");
+    let narrated = narrated_binaries(&bin);
+    assert!(
+        narrated.is_empty(),
+        "the toyos toolchain at {} is missing {}, so rustup answers for {} by falling back to \
+         another toolchain and narrating it on every invocation.\n\
+         provision_toolchain_cargo is the step that puts them there, and it did not.",
+        bin.display(),
+        narrated.join(" and "),
+        if narrated.len() == 1 { "it" } else { "them" },
+    );
 }
 
 /// Ensure the toolchain is up to date.
@@ -706,8 +1032,9 @@ pub fn ensure(
     // is needed; a sysroot the primary itself built names the primary.
     if !claim_sysroot && std_sources_stale(root, &rust_dir) {
         if let Some((who, since)) = claimant(&rust_dir).filter(|(who, _)| who != root) {
+            let stale = staleness(root, &rust_dir);
             assert!(
-                holder_gone(&who),
+                stale.is_some(),
                 "the shared sysroot is held by {}, for a change that is not on main yet, \
                  and rebuilding it here would take it from the one checkout that cannot \
                  merge its way out.\n\
@@ -716,15 +1043,16 @@ pub fn ensure(
                  carry what the sysroot holds. `--claim-sysroot` takes it back deliberately.",
                 who.display(),
             );
-            // A lease nobody holds. The checkout that wrote it is gone, so there
-            // is nothing left to take it from and nothing that could ever end
-            // the refusal it used to be — see [`holder_gone`].
+            // A lease nobody holds: either the checkout that wrote it is gone,
+            // or what it wrote has landed and it has nothing left to land. Both
+            // leave nothing to take it from and nothing that could ever end the
+            // refusal it used to be — see [`staleness`].
             eprintln!(
-                "The shared sysroot was built from {}, which is not on disk any more; the \
-                 record it left ({since}) names nobody.\n\
+                "The shared sysroot was built from {} ({since}), and {}.\n\
                  That makes the disagreement staleness rather than a claim, so this checkout \
                  rebuilds the sysroot from its own sources and the record becomes its own.",
                 who.display(),
+                stale.expect("asserted above").why(),
             );
         }
     }
@@ -796,6 +1124,16 @@ pub fn ensure(
         |()| run("rustup", &["toolchain", "link", "toyos", stage2.to_str().unwrap()]),
     );
 
+    // After both bootstrap steps above, because either of them recreates `bin/`
+    // and a fix that lives upstream of a rebuild is a fix that rots.
+    lock.act_if(
+        Scope::Global,
+        "give the toyos toolchain its own cargo",
+        || cargo_link_stale(&stage2).then_some(()),
+        |()| provision_toolchain_cargo(&stage2),
+    );
+    assert_toolchain_is_honest(&stage2);
+
     // Before any cargo build uses the toolchain, otherwise cargo may
     // fingerprint an incomplete sysroot on first run.
     lock.act_if(
@@ -864,11 +1202,18 @@ fn check_installed_toolchain(root: &Path, rust_dir: &Path, force_rebuild: bool, 
         stage2.display(),
     );
 
-    // Recreated rather than shipped: it points into whatever stable toolchain
-    // this machine has, which is not a path any artifact can know.
+    // Recreated rather than shipped: both of these point into whatever stable
+    // toolchain this machine has, which is not a path any artifact can know.
+    // This is CI's whole share of the cargo provisioning — it links its
+    // toolchain fresh from the published artifact on every run, so nothing
+    // upstream of the download can have put one there.
     if host_target_missing(rust_dir) {
         link_host_target(rust_dir);
     }
+    if cargo_link_stale(&stage2) {
+        provision_toolchain_cargo(&stage2);
+    }
+    assert_toolchain_is_honest(&stage2);
 
     let want = witness(root);
     let recorded = fs::read_to_string(witness_path(rust_dir)).ok();
@@ -947,6 +1292,20 @@ fn adopt_shared_sysroot(
         primary.display()
     );
 
+    // **The toolchain's `bin/` is not the sysroot, so a worktree may heal it.**
+    // Everything else about the shared tree is arbitrated because putting this
+    // checkout's version there takes something from another one; a `cargo`
+    // beside `rustc` holds no ABI and refuses nobody, and every checkout on the
+    // machine resolves the same one. A worktree that waited for the primary to
+    // rebuild would narrate a fallback on every cargo invocation until it did.
+    lock.act_if(
+        Scope::Global,
+        "give the toyos toolchain its own cargo",
+        || cargo_link_stale(&stage2).then_some(()),
+        |()| provision_toolchain_cargo(&stage2),
+    );
+    assert_toolchain_is_honest(&stage2);
+
     let want = witness(root);
     let recorded = fs::read_to_string(witness_path(rust_dir)).ok();
     if recorded.as_deref() == Some(want.as_str()) {
@@ -1010,19 +1369,22 @@ fn adopt_shared_sysroot(
             SYSROOT_SOURCES.join(" "),
         ),
         // The refusal above would say "wait for it to land", and there is nobody
-        // left to land anything: the sysroot outlived the checkout that built
-        // it. So the disagreement is staleness, and this rebuilds rather than
-        // refusing — with main's sources, which is what every other worktree
-        // already has, taking nothing from anybody.
-        Resolution::Stale => {
+        // left to land anything: either the sysroot outlived the checkout that
+        // built it, or what that checkout built it from is already on main. So
+        // the disagreement is staleness, and this rebuilds rather than refusing
+        // — with main's sources, which is what every other worktree already has,
+        // taking nothing from anybody.
+        Resolution::Stale(why) => {
             eprintln!(
                 "This worktree and the shared sysroot at {} disagree about {differs}, and the \
                  sysroot was built by {}.\n\
-                 A claim names its holder, and nothing here is waiting for that one any more: \
-                 your toyos-abi and toyos are main's, so rebuilding the sysroot from them is \
-                 staleness rather than a claim. The record becomes this worktree's, unclaimed.",
+                 A claim is a claim only while somebody can still land what it holds, and \
+                 nobody can: {}. Your toyos-abi and toyos are main's, so rebuilding the \
+                 sysroot from them is staleness rather than a claim. The record becomes this \
+                 worktree's, unclaimed.",
                 rust_dir.display(),
                 holder(rust_dir),
+                why.why(),
             );
             rebuild_shared_sysroot(root, rust_dir, &want, lock);
             return;
@@ -1552,6 +1914,51 @@ mod tests {
         );
     }
 
+    /// **The mirror has to be exact, and one file per tree does not test it.**
+    ///
+    /// [`witness_at`] rebuilds out of git a string [`witness`] wrote off the
+    /// disk, and every way the two could differ answers "main has never had
+    /// this" for everything — which is the wedge this closes, reopened
+    /// silently and looking exactly like a sysroot nobody may rebuild. So the
+    /// shape is here: nested directories, the three extensions and a file
+    /// outside them, a committed `target/` and a dotted directory that both
+    /// sides drop, and the `PathBuf` sort that puts `a/b.rs` before `ab.rs`
+    /// where a byte sort of the same paths would not.
+    #[test]
+    fn the_witness_read_out_of_git_is_the_one_read_off_the_disk() {
+        let root = scratch("mirror");
+        let tree = root.join("toyos-abi/src");
+        for dir in ["a", "target", ".hidden"] {
+            fs::create_dir_all(tree.join(dir)).unwrap();
+        }
+        fs::write(tree.join("a/b.rs"), b"pub struct B;\n").unwrap();
+        fs::write(tree.join("ab.rs"), b"pub struct Ab;\n").unwrap();
+        fs::write(tree.join("Cargo.toml"), b"[package]\nname = \"a\"\n").unwrap();
+        fs::write(tree.join("abi.h"), b"struct A;\n").unwrap();
+        fs::write(tree.join("notes.md"), b"not a witnessed extension\n").unwrap();
+        fs::write(tree.join("target/cached.rs"), b"a build directory\n").unwrap();
+        fs::write(tree.join(".hidden/x.rs"), b"a dotted directory\n").unwrap();
+        git(&root, &["add", "-Af"]);
+        git(&root, &["commit", "-qm", "trees with shape"]);
+
+        let disk = witness(&root);
+        assert_eq!(
+            witness_at(&root, "HEAD", &mut HashMap::new()).as_deref(),
+            Some(disk.as_str()),
+        );
+
+        // And not vacuously: the shape above has to be what was compared.
+        assert!(disk.contains("toyos-abi/src/a/b.rs:"), "{disk}");
+        assert!(disk.contains("toyos-abi/src/abi.h:"), "{disk}");
+        assert!(disk.contains("toyos-abi/src/Cargo.toml:"), "{disk}");
+        assert!(!disk.contains("notes.md"), "{disk}");
+        assert!(!disk.contains("target/"), "{disk}");
+        assert!(!disk.contains(".hidden"), "{disk}");
+        let (before, after) = (disk.find("/a/b.rs:"), disk.find("/ab.rs:"));
+        assert!(before < after, "the PathBuf sort orders a/b.rs first: {disk}");
+    }
+
+
     /// A `rust/` whose sysroot carries a claim by `who`, written the way
     /// [`record_claimant`] writes one and as old as the ghost below was.
     fn claimed_by(name: &str, who: &Path) -> PathBuf {
@@ -1618,6 +2025,37 @@ mod tests {
         (root, rust_dir)
     }
 
+    /// **The geometry a real claim is, built from scratch:** the sysroot is
+    /// *ahead* of main, holding an ABI change its holder has not landed.
+    ///
+    /// The mirror of [`a_sysroot_behind_main`] and the thing that must keep
+    /// refusing. Main never carries what the sysroot holds, so no amount of
+    /// waiting or merging gives the reading checkout that content — only the
+    /// holder landing does, which is exactly what the refusal asks for.
+    ///
+    /// Returns a checkout that matches main, and the `rust/` whose sysroot
+    /// `holder` built from an unlanded change.
+    fn a_sysroot_ahead_of_main(name: &str, holder: &Path) -> (PathBuf, PathBuf) {
+        let root = scratch(name);
+
+        git(&root, &["checkout", "-qb", "wt/ghost"]);
+        fs::write(root.join("toyos-abi/src/lib.rs"), b"pub struct A(pub u64);\n").unwrap();
+        git(&root, &["commit", "-qam", "the holder's ABI change, not landed"]);
+        let what_the_sysroot_holds = witness(&root);
+
+        git(&root, &["checkout", "-q", "main"]);
+        git(&root, &["checkout", "-qb", "wt/whatever"]);
+        let rust_dir = claimed_by(name, holder);
+        fs::write(witness_path(&rust_dir), what_the_sysroot_holds).unwrap();
+
+        assert!(
+            std_sources_stale(&root, &rust_dir),
+            "the fixture is not the geometry it claims: this checkout agrees with the sysroot"
+        );
+        assert_eq!(standing(&root), Standing::MatchesMain, "the checkout is main's");
+        (root, rust_dir)
+    }
+
     /// **The ghost claim of 2026-08-14, as a test.**
     ///
     /// The sysroot held `1786423818 /Users/jan/Dev/jan/toyos-logabi
@@ -1641,7 +2079,7 @@ mod tests {
         let (root, rust_dir) = a_sysroot_behind_main("ghost-claim", &ghost);
         assert_eq!(
             resolution(&root, &rust_dir),
-            Resolution::Stale,
+            Resolution::Stale(Staleness::HolderGone),
             "a checkout that matches main was left waiting for a checkout that is gone"
         );
 
@@ -1652,23 +2090,89 @@ mod tests {
         assert_eq!(resolution(&root, &unrecorded("none")), Resolution::Wait);
     }
 
-    /// The edge that must not move: a holder that is still on disk is still
-    /// holding it, in the same geometry, and the checkout with nothing of its
-    /// own still waits.
+    /// The edge that must not move: a holder that is still on disk **and still
+    /// has something to land** is still holding it, and the checkout with
+    /// nothing of its own still waits.
     ///
     /// Weakening this is the 2026-08-04 fight — a sysroot taken from the one
     /// worktree that could not merge its way out, six landing attempts, four
     /// witness rewrites in 38 minutes, one gate dead with 156 refusals.
+    ///
+    /// **Its fixture moved on 2026-08-14 and its meaning did not.** It used to
+    /// be posed over [`a_sysroot_behind_main`], where the live holder had
+    /// nothing left to land and the wait was the wedge below. A live holder is
+    /// only protected by what it is protecting, so the gate is posed over the
+    /// geometry where there is something: a sysroot *ahead* of main.
     #[test]
     fn a_claim_whose_holder_is_there_is_still_a_claim() {
         let live = scratch("live-holder");
         assert!(!holder_gone(&live));
 
-        let (root, rust_dir) = a_sysroot_behind_main("live-claim", &live);
+        let (root, rust_dir) = a_sysroot_ahead_of_main("live-claim", &live);
         assert_eq!(
             resolution(&root, &rust_dir),
             Resolution::Wait,
             "a live holder's claim was read as staleness"
+        );
+    }
+
+    /// **The wedge of 2026-08-14 that the ghost fix scoped out, as a test.**
+    ///
+    /// Same geometry as the ghost claim, and the holder is still on disk. It
+    /// claimed the sysroot for an ABI change, landed it, and stayed — so
+    /// [`holder_gone`] says nothing and every other checkout on the host was
+    /// told *"the sysroot belongs to X, for a change that is not on main yet.
+    /// Wait for it to land and merge main."* X had nothing left to land, and
+    /// that arm `panic!`s before `--claim-sysroot` is so much as examined. The
+    /// only exit was `--claim-sysroot` in the primary checkout, which no refusal
+    /// names and every wedged agent had to be told by hand.
+    ///
+    /// What answers it is the sysroot's own content: it is *behind* main, so
+    /// what it holds has landed and rebuilding takes nothing from the holder.
+    #[test]
+    fn a_live_holder_behind_main_is_staleness_and_not_a_claim() {
+        let live = scratch("live-behind-holder");
+        assert!(!holder_gone(&live));
+
+        let (root, rust_dir) = a_sysroot_behind_main("live-behind", &live);
+        assert_eq!(
+            resolution(&root, &rust_dir),
+            Resolution::Stale(Staleness::Landed),
+            "a live holder with nothing left to land still refused every other checkout"
+        );
+    }
+
+    /// **The self-wait shape: the claimant is the checkout reading the record.**
+    ///
+    /// `record_claimant` is written by every sysroot build and not only by a
+    /// `--claim-sysroot` one, so a worktree with no ABI of its own becomes the
+    /// holder simply by building. Main then moves under it, it merges — and it
+    /// is refused by its own record, told to wait for itself. Observed on
+    /// 2026-08-14 with `wt/toyos-logd`, which had built at 14:48 with
+    /// `toyos-abi` equal to main's before `#57` landed `MAX_RECORD_MESSAGE`.
+    ///
+    /// It needs no rule about who the claimant is: what it recorded was main's
+    /// content, so the content question answers it along with everybody else's.
+    #[test]
+    fn a_claimant_waiting_for_its_own_record_is_staleness() {
+        let (root, rust_dir) = a_sysroot_behind_main("self-wait", Path::new("/unused"));
+        // The record names this very checkout, written by the ordinary build
+        // that put main's sources of the day into the sysroot.
+        let when = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("a clock later than 1970")
+            .as_secs();
+        fs::write(
+            claimant_path(&rust_dir),
+            format!("{when} {} wt/self\n", root.display()),
+        )
+        .unwrap();
+        assert!(!holder_gone(&root), "the claimant is this checkout, and it is on disk");
+
+        assert_eq!(
+            resolution(&root, &rust_dir),
+            Resolution::Stale(Staleness::Landed),
+            "a checkout was told to wait for a landing only it could do, and it had done it"
         );
     }
 
@@ -1689,6 +2193,38 @@ mod tests {
 
         git(&root, &["branch", "-qD", "main"]);
         assert_eq!(resolution(&root, &claimed_by("ghost-unknown", &ghost)), Resolution::Unclear);
+    }
+
+    /// **The layout that makes rustup narrate, as a decision.**
+    ///
+    /// The toolchain was given a cargo once, by hand, in a step the rebuild path
+    /// does not run; the 2026-08-14 sysroot rebuild recreated `bin/` without it
+    /// and nothing noticed, because nothing asked. This is the asking —
+    /// [`assert_toolchain_is_honest`] is this function over the real `bin/`.
+    #[test]
+    fn a_toolchain_bin_without_cargo_is_one_rustup_narrates() {
+        let stage2 = std::env::temp_dir().join("toyos-toolchain-layout");
+        let _ = fs::remove_dir_all(&stage2);
+        let bin = stage2.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        assert_eq!(narrated_binaries(&bin), ["rustc", "cargo"]);
+
+        fs::write(bin.join("rustc"), b"").unwrap();
+        assert_eq!(narrated_binaries(&bin), ["cargo"], "the layout every build had until now");
+        assert!(cargo_link_stale(&stage2));
+
+        // A link that rode in on the published artifact, naming a path only the
+        // publishing runner had. It is *there*, and it is a narrated fallback
+        // all the same — which is why the question is what it points at.
+        let foreign = Path::new("/a-runner-that-is-not-this-one/bin/cargo");
+        std::os::unix::fs::symlink(foreign, bin.join("cargo")).unwrap();
+        assert_eq!(narrated_binaries(&bin), ["cargo"], "a dangling proxy is not a cargo");
+        assert!(cargo_link_stale(&stage2), "another machine's cargo is not this one's");
+
+        provision_toolchain_cargo(&stage2);
+        assert!(narrated_binaries(&bin).is_empty());
+        assert!(!cargo_link_stale(&stage2));
+        assert_toolchain_is_honest(&stage2);
     }
 
     /// An unanswered question is not permission: a claim is destructive.

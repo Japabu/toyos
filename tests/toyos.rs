@@ -1388,7 +1388,7 @@ fn check_panic_recovery(result: &TestResult) -> bool {
         eprintln!("FAIL rs::panic_recovery: {msg}\nserial:\n{}", result.serial);
         ok = false;
     }
-    ok
+    ok & check_symbols_were_read("panic_recovery", &result.serial)
 }
 
 /// The kernel names the frames of a process it loaded off a **disk**.
@@ -1424,7 +1424,36 @@ fn check_disk_backtrace(result: &TestResult) -> bool {
             ok = false;
         }
     }
-    ok
+    ok & check_symbols_were_read("disk_backtrace", &result.serial)
+}
+
+/// No line of a crash report conceded its symbol to a lock somebody else held.
+///
+/// **The reason every check above is allowed to be a `contains`.** A symbol
+/// lookup on the fault path is a `try_lock` — it has to be, the faulting thread
+/// may hold either lock itself — so "no name here" used to mean either "this
+/// address has no name" or "nobody looked", and a gate asserting on a name red
+/// intermittently on the second. It was not hypothetical: `fault_gates` red 2
+/// of 5 full runs and `disk_backtrace` 1 of 5 on `wt/toyos-logd`, with the
+/// backtrace three lines below the unresolved `rip:` naming the very symbol the
+/// line above had lost.
+///
+/// `process::with_user_symbols` now says which, so this reds on the reason
+/// instead — and the reason is worth a red, because `reap_poisoned` no longer
+/// takes the process table on every idle trip, so a busy answer names a holder
+/// worth finding rather than the housekeeping that used to be there.
+fn check_symbols_were_read(test: &str, serial: &str) -> bool {
+    const CONCEDED: &str = "<symbol unread:";
+    let lines: Vec<&str> = serial.lines().filter(|l| l.contains(CONCEDED)).collect();
+    if lines.is_empty() {
+        return true;
+    }
+    eprintln!(
+        "FAIL rs::{test}: the crash report could not read a symbol it was asked for, so a bare \
+         address in it is a lost race and not a verdict:\n{}\nserial:\n{serial}",
+        lines.join("\n"),
+    );
+    false
 }
 
 /// The §6.4 tripwire must fire, and its `panicked at` must name the syscall
@@ -1519,7 +1548,7 @@ fn check_fault_gates(result: &TestResult) -> bool {
         );
         ok = false;
     }
-    ok
+    ok & check_symbols_were_read("fault_gates", &result.serial)
 }
 
 /// Select check function by test name convention.

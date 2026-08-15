@@ -111,9 +111,12 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # `lib/rustlib/<host>` is a symlink into whatever stable toolchain built
-      # it, which is not a path any artifact can carry. `Owner::Installed`
-      # recreates it.
+      # `lib/rustlib/<host>` and `<host>/stage2/bin/cargo` are symlinks into
+      # whatever toolchain this runner has, which is not a path any artifact can
+      # carry. `Owner::Installed` recreates both —
+      # `toolchain::provision_toolchain_cargo` is the one step that makes the
+      # second, and a link shipped from here would dangle on the consumer and
+      # narrate a fallback while looking provisioned.
       - name: publish
         if: steps.have.outputs.build == 'yes'
         env:
@@ -123,6 +126,7 @@ jobs:
           t0=$(date +%s)
           tar -C rust/build \
               --exclude="x86_64-unknown-toyos/stage2/lib/rustlib/$host" \
+              --exclude="$host/stage2/bin/cargo" \
               -c "$host/stage2" x86_64-unknown-toyos/stage2 toyos-sysroot-witness \
             | zstd -T0 -3 -o /tmp/toyos-toolchain.tar.zst
           echo "PACKAGE-SECONDS: $(( $(date +%s) - t0 ))"

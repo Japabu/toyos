@@ -70,6 +70,7 @@ The bar is not yet the tree. The standing failures are declared rather than remo
 src/               Build system (the root cargo project, package name: toyos-build)
 kernel/            Kernel
 kernel-loom/       Loom models of `kernel/src/sync.rs`, beside the kernel and not in it
+kernel-span/       Host harness for `kernel/src/mm/user_span.rs`, the same arrangement
 bootloader/        UEFI bootloader
 userland/          All userland programs
 toyos-abi/         Kernel ABI (types, constants, syscall numbers, syscall wrappers)
@@ -111,7 +112,7 @@ system.toml        What to build and boot
 - **Host load is not an excuse.** A load-coincident audio failure is investigated as a real defect, never re-run away as noise; evidence against that assumption goes to the owner, not into quiet workarounds.
 - **Subagents wait in the foreground.** Background-task notifications do not reliably re-wake subagents: run long commands in the foreground with an explicit `timeout`, and for longer work background once and block with a few long foreground waits — never hundreds of polls. Always poll before sleeping.
 - **Subagents get an explicit model, never the session default.** The orchestrator scopes, dispatches and verifies; it does not hand-work. Judgment-bearing coding gets Opus or stronger; mechanical execution from an exact brief gets Sonnet; non-coding mechanical work gets Haiku; trivial edits need no agent.
-- **Durable facts go in this file, a subsystem `CLAUDE.md`, or `specs/` — never in private agent memory.** Detail belongs in `specs/`, subsystem detail in the subsystem's file, resolved narrative in `git log`. After each task, audit the file that owns what you changed.
+- **Durable facts go in the spec that owns the subject or the module header at the site — never in private agent memory, and almost never in a `CLAUDE.md`.** A `CLAUDE.md` is pointers and caveats; **an agent never edits one.** A rule that truly has no better home and whose violation is invisible or unrecoverable is *proposed as one sentence in the final report*, and the orchestrator places it or declines. The story of a change goes in its commit message; after each task, audit the spec or module header that owns what you changed.
 
 ## Planned work
 

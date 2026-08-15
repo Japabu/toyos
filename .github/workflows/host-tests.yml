@@ -57,10 +57,12 @@ jobs:
             toyos-pci/target
             toyos-xhci/target
             toyos-desktop/target
+            toyos-keymap/target
             kernel-loom/target
             kernel-span/target
             toyos-fat32/target
             toyos-fat32-check/target
+            bcachefs/target
             userland/sshd/target
           key: host-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: host-${{ runner.os }}-
@@ -78,6 +80,10 @@ jobs:
       # (`toyos-elf`, `toyos-ld`, `toyos-pci`, `toyos-desktop`) are pure crates
       # whose whole point is that a decision is testable without a guest, so a
       # CI that skipped them skipped exactly the tests it was cheapest to run.
+      # `toyos-keymap` and `bcachefs` were that same omission a second time,
+      # found on 2026-08-14: 37 tests over dead-key composition, layout tables,
+      # layout detection and translation, and 71 over bcachefs, all of them
+      # reaching no gate in any workflow.
       #
       # **This list is longer than that layout table**, and deliberately: the
       # two `kernel-*` harnesses compile a kernel source file for the host
@@ -90,8 +96,8 @@ jobs:
           set -e -o pipefail
           for crate in toyos-sched toyos-ps2 toyos-gpt toyos-elf toyos-cc \
                        toyos-ld toyos-hda toyos-pci toyos-xhci toyos-desktop \
-                       kernel-loom kernel-span kernel-elide toyos-fat32 \
-                       toyos-fat32-check; do
+                       toyos-keymap kernel-loom kernel-span kernel-elide \
+                       toyos-fat32 toyos-fat32-check bcachefs; do
             echo "=== $crate" | tee -a /tmp/host.log
             cargo test --manifest-path "$crate/Cargo.toml" 2>&1 | tee -a /tmp/host.log
           done
@@ -149,7 +155,7 @@ jobs:
               | tee -a /tmp/host.log
           done
 
-      # Sixteen `cargo test` invocations in three steps, and a red is one line
+      # Nineteen `cargo test` invocations in three steps, and a red is one line
       # somewhere among them; the summary names which crate and the first
       # thing that failed in it.
       - name: failure summary

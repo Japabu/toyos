@@ -1,13 +1,15 @@
-//! Loom harness for the kernel's two memory-ordering primitives.
+//! Loom harness for the kernel's three memory-ordering primitives.
 //!
-//! `kernel/src/sync.rs` and `kernel/src/shootdown.rs` are compiled into this
-//! crate with `feature = "loom"` on, so their atomics and cells resolve to
-//! loom's instrumented ones and the models drive the real primitives rather than
+//! `kernel/src/sync.rs`, `kernel/src/shootdown.rs` and
+//! `kernel/src/sched/reap_gate.rs` are compiled into this crate with
+//! `feature = "loom"` on, so their atomics and cells resolve to loom's
+//! instrumented ones and the models drive the real primitives rather than
 //! transliterations of them — a transliteration is exactly the divergence risk a
 //! model checker is meant to remove. What the kernel files name through
 //! `crate::` is supplied below: the lock takes a preempt count and a log macro
 //! from its environment, and neither is what the models are about;
-//! `shootdown.rs` names nothing at all, which is why it has no shim here.
+//! `shootdown.rs` and `reap_gate.rs` name nothing at all, which is why neither
+//! has a shim here.
 //!
 //! Scope for the lock, stated because it is narrower than the file: the models
 //! drive `try_lock` and `LockGuard::drop`. `lock()`'s spin cannot be modelled —
@@ -120,3 +122,6 @@ pub use log_shard as shard;
 
 #[path = "../../kernel/src/log/registry.rs"]
 pub mod log_registry;
+
+#[path = "../../kernel/src/sched/reap_gate.rs"]
+pub mod reap_gate;

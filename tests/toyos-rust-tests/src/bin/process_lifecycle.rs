@@ -14,6 +14,11 @@
 //! spend it, a process that never started the child can still wait for it, and
 //! a pid on its own reaches nothing at all.
 //!
+//! One arm is about the wait rather than the shape.
+//! `an_unrelated_wake_does_not_end_the_wait` provokes a wake that is not this
+//! child's exit while the wait is parked on it, which used to return the wait
+//! and panic the kernel on the exit code that was not there yet.
+//!
 //! Two roles besides the test. `held` exits with a code of the parent's
 //! choosing, but not until its stdin closes — which is what lets every arm here
 //! order the exit against the wait without a clock deciding anything. `waiter`
@@ -22,6 +27,8 @@
 use std::io::Read;
 use std::os::toyos::process::{ChildExt, CommandExt};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use toyos::endow::{Endowments, SYSCAP_LABEL};
 use toyos::AsHandle;
@@ -51,6 +58,7 @@ fn main() {
 fn test() {
     reading_the_code_does_not_spend_it();
     a_wait_before_the_exit_is_woken_by_it();
+    an_unrelated_wake_does_not_end_the_wait();
     two_handles_answer_the_same();
     a_kill_publishes_like_an_exit();
     a_handle_is_the_whole_of_the_right();
@@ -91,6 +99,99 @@ fn a_wait_before_the_exit_is_woken_by_it() {
     assert_eq!(child.wait().expect("wait").code(), Some(7), "the woken wait");
     releaser.join().expect("the releasing thread");
     println!("  a wait taken before the exit is woken by it");
+}
+
+/// **The kernel-crash gate.** A wait is a wait *for a condition*, and a wake
+/// that arrives for some other reason must not end it.
+///
+/// The other reason is ordinary and needs nothing staged: a thread's exit wakes
+/// its process's main thread *by name* (`process::thread_exit`), whatever that
+/// thread is waiting for. Before `scheduler::wait_until` looped, the wake was
+/// the answer — `sys_process_wait` read an exit code that had not been
+/// published and the kernel panicked on `expect`, from a plain userland
+/// `Child::wait()`. So this arm makes that wake land, on purpose, in the middle
+/// of a wait whose condition is provably false.
+///
+/// The two handshakes are what make it land rather than merely be likely, and
+/// both read a state the kernel publishes for `ps` and nothing else can
+/// announce: the poker does not exit until the kernel says this process's main
+/// thread is parked, and the releaser does not let the child go until the
+/// kernel says a thread of this process has reached its own zombie mark — which
+/// `release_thread` writes under the table lock immediately before the wake it
+/// then posts. Until that release the child is blocked reading a pipe this
+/// process holds the only write end of, so it cannot have exited: the condition
+/// the wait holds for is false at the instant the unrelated wake arrives.
+fn an_unrelated_wake_does_not_end_the_wait() {
+    static POKED: AtomicBool = AtomicBool::new(false);
+    static RELEASED: AtomicBool = AtomicBool::new(false);
+
+    let (mut child, release) = start(5);
+    let poker = std::thread::spawn(|| {
+        await_true("the main thread never parked", main_thread_is_parked);
+        POKED.store(true, Ordering::Release);
+        // Returning is the poke: nothing else in this closure matters, because
+        // `thread_exit` is what wakes the main thread.
+    });
+    let releaser = std::thread::spawn(move || {
+        await_true("the poking thread never exited", a_thread_of_mine_has_exited);
+        RELEASED.store(true, Ordering::Release);
+        drop(release);
+    });
+
+    assert_eq!(child.wait().expect("wait").code(), Some(5), "the poked wait");
+    assert!(POKED.load(Ordering::Acquire), "the poking thread never ran: nothing was proved");
+    assert!(
+        RELEASED.load(Ordering::Acquire),
+        "the wait answered before the child could exit — an unrelated wake ended it",
+    );
+    poker.join().expect("the poking thread");
+    releaser.join().expect("the releasing thread");
+    println!("  a wake meant for something else does not end a wait");
+}
+
+/// Poll until `cond` holds. The bound is a hang guard and not a timing
+/// assumption: both callers wait for a state the kernel has already decided and
+/// reaches in microseconds, and the `sysinfo` call inside `cond` is the loop's
+/// preemption point (`thread::yield_now` is a spin hint on this platform).
+fn await_true(what: &str, cond: fn() -> bool) {
+    let give_up = Instant::now() + Duration::from_secs(5);
+    while !cond() {
+        assert!(Instant::now() < give_up, "{what}");
+    }
+}
+
+/// `sched::payload::SCHED_BLOCKED` — the state column `ps` prints.
+const BLOCKED: u8 = 2;
+
+/// `SCHED_UNKNOWN`, which `sys_sysinfo` also answers for a thread whose entry
+/// is a zombie. A live thread's scheduler record is installed under the same
+/// table lock that inserts its entry, so a thread of ours reading this has
+/// exited and nothing else.
+const ZOMBIE: u8 = 3;
+
+fn main_thread_is_parked() -> bool {
+    my_threads().iter().any(|&(is_thread, state)| !is_thread && state == BLOCKED)
+}
+
+fn a_thread_of_mine_has_exited() -> bool {
+    my_threads().iter().any(|&(is_thread, state)| is_thread && state == ZOMBIE)
+}
+
+/// This process's threads as the kernel publishes them: `(is a child thread,
+/// scheduler state)`.
+fn my_threads() -> Vec<(bool, u8)> {
+    const HEADER: usize = toyos::system::SYSINFO_HEADER_SIZE;
+    const ENTRY: usize = toyos::system::SYSINFO_ENTRY_SIZE;
+    let mut buf = vec![0u8; HEADER + ENTRY * 256];
+    let n = toyos::system::sysinfo(&mut buf);
+    assert!((HEADER..=buf.len()).contains(&n), "sysinfo answered {n}");
+    let me = syscall::getpid().raw();
+    (HEADER..)
+        .step_by(ENTRY)
+        .take_while(|pos| pos + ENTRY <= n)
+        .filter(|&pos| u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) == me)
+        .map(|pos| (buf[pos + 9] != 0, buf[pos + 8]))
+        .collect()
 }
 
 /// A second handle is a second name for one object, and the object is where the
