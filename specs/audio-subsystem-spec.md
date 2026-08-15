@@ -6,7 +6,12 @@
    device buffers. Clients never initiate a cycle; they fill their rings when
    signalled.
 2. **Multiple simultaneous clients**, each with its own sample rate, channel
-   count and format; soundd converts and mixes additively.
+   count and format; soundd converts and mixes additively. Bounded: at most
+   `MAX_CONTROL_CLIENTS` (63) at once — the derivation lives on the constant
+   in soundd (a power-of-two poller ring minus the acceptor, past what the
+   mixer renders in one period, 189 of the kernel's 1024 fds) — and the
+   64th connect is refused, never queued: an unbounded acceptor is a
+   resource-exhaustion path.
 3. **A missed deadline produces silence for the client that missed it**, and
    nothing else: no stall, no artifact for other clients, no effect on the
    pipeline.
