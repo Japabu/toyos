@@ -304,16 +304,22 @@ fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
 /// told anything on — and what they most need to be told is that there will be
 /// nothing to read afterwards.
 ///
-/// **Half a sentence, since L6, and the other half is `/bin/logd`'s** (§5.6).
-/// This used to be a four-way table over `(console, /log)`, and the kernel no
-/// longer knows the second: it does not open the file, does not name it and
-/// cannot say whether the volume answered. So it says the half it knows — this
-/// machine has a console, or it has not — and logd says the half it knows, on
-/// its own console handle, as soon as it has tried. Two lines from the two
-/// things that know beat one line from something guessing at both.
+/// **The four-way table survives L6 and its second axis changed, which is not
+/// the same as losing it** (§5.6). It was `(console, the file logd opened)`, and
+/// the kernel does not open a file any more — it does not name one and cannot
+/// say whether logd got anywhere. What it *does* still know is whether the log
+/// **volume mounted**, which is the fact this line exists to carry: a machine
+/// with no `/log` partition leaves no account of itself once userland owns the
+/// screen, and that is the sentence the owner needs on the panel.
 ///
-/// `alert!` is what says the row is red, and it is used for the state in which
-/// the kernel's own channel is a screen userland is about to take. Nothing in
+/// **It has to be the kernel's, because the panel is the kernel's.**
+/// `panic_console` paints records, so a userland line reaches a console and
+/// never the screen — and this line's whole audience is somebody looking at a
+/// T14 with no serial port. `/bin/logd` says the half only it knows, on its own
+/// console handle: which file, or that it could not open one.
+///
+/// `alert!` is what says the row is red, and it is used for the two states in
+/// which this boot leaves no readable account of itself anywhere. Nothing in
 /// the text says so: the panel reads `Level` off the record, so a refusal wears
 /// the colour without having to spell it.
 ///
@@ -321,10 +327,16 @@ fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
 /// codepoints 0x20..=0x7E and `draw_glyph` renders everything else as a dot, so
 /// an em dash reaches the one reader this line has as three of them.
 fn report_log_destination() {
-    if drivers::serial::has_console() {
-        log!("log: this boot is on the console");
-    } else {
-        alert!("log: no serial console - this boot is on this screen while the kernel owns it");
+    let has_log = vfs::lock().has_mount(fat32_adapter::Role::Log.mount());
+    match (drivers::serial::has_console(), has_log) {
+        (true, true) => log!("log: this boot is on the console and on /log"),
+        (false, true) => log!("log: no serial console - this boot is on /log and on the screen"),
+        (true, false) => {
+            alert!("log: no /log - this boot is on the console only, and nothing outlives the power")
+        }
+        (false, false) => {
+            alert!("log: no serial console and no /log - this boot is on this screen and nowhere else")
+        }
     }
 }
 

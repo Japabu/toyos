@@ -2297,14 +2297,25 @@ the entry.
 ### 5.6 What logd does when there is no `/log` at all
 
 It says so once, on the console, and carries on. **As built at L6 the split is
-made and the second half is not a logger.** `report_log_destination`
-(`kernel/src/main.rs`) keeps the half the kernel knows — this machine has a
-console, or it has not — and `/bin/logd` says the half it knows, on its own
-console handle, as soon as it has tried: `logd: this boot's kernel log is
-/log/<file>` or `logd: no /log on this machine - this boot's kernel log is on
-the console only`. The four-way table is two lines from the two things that know,
-and the panel still paints the kernel's red because of `Level` rather than
-because of three exclamation marks.
+made, and the four-way table stays with the kernel because the panel is the
+kernel's.** `report_log_destination` (`kernel/src/main.rs`) keeps both axes: it
+no longer knows *which file*, and it still knows whether the log **volume
+mounted**, which is the fact the line exists to carry — a machine with no `/log`
+partition leaves no account of itself once userland owns the screen. `/bin/logd`
+adds the half only it knows, on its own console handle: `logd: this boot's
+kernel log is /log/<file> (<wall clock>)`, or `logd: no /log on this machine -
+this boot's kernel log is on the console only`.
+
+**The first draft of this split moved the whole table to logd and that was
+wrong, caught by `screen_log_absent`.** `panic_console` paints *records*, so a
+userland line reaches a console and never the screen — and this line's whole
+audience is somebody looking at a T14 with no serial port. A split that leaves
+the panel silent about `/log` deletes the diagnostic on the one machine the
+subsystem exists for. `NO_LOG_ALERT` is what the gate reads and it is the
+kernel's line.
+
+The panel still paints it red because of `Level` rather than because of three
+exclamation marks.
 
 **What "console-only logger" does *not* mean, and the draft above invites the
 wrong reading.** logd does not write kernel records to the console, with a volume
@@ -3709,18 +3720,26 @@ cache flush. **CONFIRMED against this tree, 2026-08-09:**
   **only** `crate::vfs::lock().flush_file(...)` at `:644`. There is no
   `sync_mount` and no `dev.flush()` anywhere on that path.
 
-So today's `SYS_FSYNC` stops one level short of what `log_file` does. **The
-earlier draft said "L6 owes the equivalent regardless of what C12 does to
-parking"; under the ruled order the hedge is gone and L6 owes it, full stop** —
-C12 does not exist yet, and a logd that fsyncs and calls the result durable
-without it is a spec lying about its own guarantee. That is a change to a shipped
-syscall's semantics and therefore a decision rather than an implementation
-detail: either `SYS_FSYNC` gains the mount sync for every caller — which makes
-every `fsync` in the machine slower and more honest — or logd gets a distinct
-call and the asymmetry is written down. **L6 raises it; the second option needs a
-new syscall number, which needs discussion, and it would be a *second* number on
-a branch §11 has already structured around one.** `log_is_durable_after_fsync`
-(§9.5) is the gate, and it reds on today's behaviour.
+So `SYS_FSYNC` stopped one level short of what `log_file` did. **The earlier
+draft said "L6 owes the equivalent regardless of what C12 does to parking";
+under the ruled order the hedge is gone and L6 owed it, full stop** — C12 does
+not exist yet, and a logd that fsyncs and calls the result durable without it is
+a spec lying about its own guarantee.
+
+**As built at L6 the first option is taken: `SYS_FSYNC` gains the mount sync,
+for every caller.** `ops::fsync` runs `flush_file` and then `Vfs::sync_for_path`
+under one acquisition of the VFS lock — one and not two, because two would let
+the file's own mount be unmounted between them. The second option, a distinct
+call for logd, needs a new syscall number, which needs discussion, and it would
+be a *second* number on a branch §11 has already structured around one; it would
+also leave every other `fsync` in the machine quietly weaker than the one program
+that noticed. Every `fsync` is slower for this and more honest.
+
+**The gate is `usb_flush_optional` and not a name of its own** (§9.5): its whole
+subject is a device that refuses SYNCHRONIZE CACHE, so it reds the moment the
+syscall stops issuing one, which is exactly the regression this row exists
+against. `kernel_log_file`'s mid-run read is the positive half — the log is on
+the *image*, read host-side, while the guest is still running.
 
 **What C12 then inherits.** compl §13 says *"`SYS_FSYNC` parks on a real
 completion"* and separately that parking is not durability. After L6 the two

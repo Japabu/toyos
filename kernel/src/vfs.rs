@@ -702,6 +702,17 @@ impl Vfs {
         self.mounts.get_mut(name).ok_or(SyscallError::NotFound)?.fs.sync()
     }
 
+    /// Is there a filesystem mounted under this name?
+    ///
+    /// The one thing the kernel still knows about `/log` after L6 of
+    /// `specs/log-architecture-spec.md`: it mounts the volume and hands it to
+    /// userland, and `/bin/logd` is what knows whether a file was opened on it.
+    /// `report_log_destination` is the caller and the panel is why it exists —
+    /// logd's own line reaches a console and never the screen.
+    pub fn has_mount(&self, name: &str) -> bool {
+        self.mounts.contains_key(name)
+    }
+
     /// Sync whichever filesystem `path` lives on, the root included.
     ///
     /// **What `SYS_FSYNC` means since L6.** `flush_file` puts the data, the FAT
