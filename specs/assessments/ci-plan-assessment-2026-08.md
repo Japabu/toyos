@@ -1564,9 +1564,12 @@ clock, except where a red bought a re-run — so the residual 94 s is not the
 profile. It is that `tests/toyos.rs` calls `Shard::keep` three times, for the
 parallel tasks, the serial tail and gate A's configs, and each call starts from
 twelve empty bins: three good partitions, three imbalances, added.
-`specs/issues/build/the-shard-partition-is-taken-three-times.md` has the per-shard
-table and the one-accumulator fix. Its call sites are in `tests/toyos.rs`, which
-this task did not have.
+`build/the-shard-partition-is-taken-three-times`, since closed, had the
+per-shard table and the one-accumulator fix; its call sites are in
+`tests/toyos.rs`, which this task did not have. Landed 2026-08-15 — `keep` takes
+the load vector and the three calls thread one through — into a Fast tier that
+by then had no serial phase and no audio configs left to crowd, so the 94 s is
+the nightly tier's now.
 
 The `durations` job is what stops the profile rotting again: it runs
 `--merge-durations` over the twelve artifacts on every
