@@ -132,6 +132,7 @@ audio_tone_load (smp=8) 11121
 blocked_dump 4497
 boot_partition_identity 5511
 boot_volume_metadata_error 6779
+c_capture_ignores_daemon_lines 18446744073709551615
 cache_eviction 4795
 connect_before_serve 16
 console_line_atomicity 5421

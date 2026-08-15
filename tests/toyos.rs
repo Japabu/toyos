@@ -501,6 +501,12 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // its own machine because what it reads is the console capture, which a
     // shared boot fills with everything else.
     ("console_line_atomicity", Sched::Parallel, Tier::Fast),
+    // What the C family is allowed to conclude from the line above being whole:
+    // a guest writes a daemon-shaped line into a real capture window on purpose
+    // and the real comparison ignores it, with the filter turned off as the
+    // control. Parallel and Fast: one boot, two `echo`s, and every verdict is a
+    // string comparison the host makes over a capture — no clock in it.
+    ("c_capture_ignores_daemon_lines", Sched::Parallel, Tier::Fast),
     // A poll on the machine's log against a *handle* going away. Parallel and
     // Fast: both halves are verdicts the guest computes — a completion count
     // immediately after a close, retried against a record arriving in the same
@@ -1392,10 +1398,24 @@ fn check_c_result(result: &TestResult) -> bool {
             let expect_file = compile::testcases_dir().join(format!("{test_name}.expect"));
             if expect_file.exists() {
                 let expected = fs::read_to_string(&expect_file).unwrap();
-                if result.stdout.trim_end() != expected.trim_end() {
-                    eprintln!("FAIL c::{test_name}: output mismatch");
-                    eprintln!("--- expected ---\n{}", expected.trim_end());
-                    eprintln!("--- actual ---\n{}", result.stdout.trim_end());
+                // **The one comparison in this suite that reads a whole capture
+                // as one program's output, on a console every process shares.**
+                // `common::console::verdict` takes the lines that are some
+                // other process's out of it first, and hands them back so they
+                // can be printed rather than vanish —
+                // `specs/issues/build/daemon-lines-land-in-any-test-window.md`
+                // and `c_capture_ignores_daemon_lines` are what that rests on.
+                let verdict = common::console::c_verdict(&result.stdout, &expected);
+                if !verdict.filtered.is_empty() {
+                    eprintln!(
+                        "  [c] {test_name}: {} console line(s) in this window were another \
+                         process's and did not decide the verdict:\n    {}",
+                        verdict.filtered.len(),
+                        verdict.filtered.join("\n    "),
+                    );
+                }
+                if let Some(mismatch) = verdict.mismatch {
+                    eprintln!("FAIL c::{test_name}: {mismatch}");
                     return false;
                 }
             }
@@ -7183,6 +7203,9 @@ fn run_machine_test(
             common::logread::log_poll_outlives_a_close(test_config, c_bins, rust_bins)
         }
         // Body in `tests/common/console.rs`, same reason.
+        "c_capture_ignores_daemon_lines" => {
+            common::console::c_capture_ignores_daemon_lines(test_config, c_bins, rust_bins)
+        }
         "console_line_atomicity" => {
             common::console::console_line_atomicity(test_config, c_bins, rust_bins)
         }

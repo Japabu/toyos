@@ -810,6 +810,46 @@ pub fn harness_kernel_build_is_declared(features: &str, debug_wait: bool) -> boo
     }
 }
 
+/// Every name in which a process of this boot config can speak a console line
+/// that is not the program under test's.
+///
+/// **Derived, never listed.** The point of reading it out of the config is that
+/// a daemon added to `[boot] start` tomorrow is in this set the moment it
+/// exists — a hardcoded list would let the next `netd` silently rejoin
+/// `specs/issues/build/daemon-lines-land-in-any-test-window.md`. `/bin/init`
+/// itself is added by hand because it is the one speaker that is not a
+/// `[programs]` key: it is the parent that starts every one of them, and it
+/// speaks before any of them exists (`init: netd: no nic on this machine` is on
+/// the console before netd is loaded).
+///
+/// The union of the two lists rather than `[boot] start` alone: a program the
+/// config declares is a binary this image carries and a name init can be asked
+/// to speak in, and the whole value of deriving the set is that it is the
+/// config's answer rather than an author's.
+///
+/// **A program also speaks in the name of every device it claims, and that is
+/// measured rather than supposed.** `userland/soundd/src/virtio.rs` writes
+/// `virtio-sound: configured stream 0: 44100Hz 2ch s16le` — the driver layer
+/// says which device is talking, not which program — and a plain
+/// `tests/testcases` boot puts three such lines on the console before the test
+/// runner is ready. `devices` is where those names are declared, so it is where
+/// they are read from; `c_capture_ignores_daemon_lines` walks a real boot log
+/// and reds on any line this set cannot account for, which is what keeps this
+/// derivation honest as the tree grows.
+///
+/// `config` is the `system.toml` itself, not its directory.
+pub fn console_speakers(config: &Path) -> std::collections::BTreeSet<String> {
+    let parsed = parse_config(config);
+    let mut names = std::collections::BTreeSet::new();
+    for (program, entry) in parsed.programs {
+        names.insert(program);
+        names.extend(entry.devices);
+    }
+    names.extend(parsed.boot.start);
+    names.insert("init".to_string());
+    names
+}
+
 /// Every actuator `kernel/src/actuator.rs` declares, read out of the file that
 /// declares them.
 ///
