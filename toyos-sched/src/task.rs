@@ -474,7 +474,7 @@ impl<M> TaskShared<M> {
 /// lose the lend before it has spent any of it (spec §8.5, invariant I9).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct RtState {
-    /// Granted by the privilege-gated `SYS_SET_RT_PRIORITY`.
+    /// Granted by the privilege-gated `SYS_RT_ENTER`.
     pub permanent: bool,
     /// Lent by a waker. Holds the instant the lend runs out; re-armed at
     /// dispatch if it lapsed while the task was queued (see [`RtState::arm`]).

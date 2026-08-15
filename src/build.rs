@@ -1,23 +1,80 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use serde::Deserialize;
 
 use crate::assets;
 use crate::buildlock;
+use crate::hostws;
 use crate::image;
 use crate::toolchain;
+
+thread_local! {
+    /// Time this worker has spent constructing memoized boot artifacts.
+    ///
+    /// A suite worker is also the thread that asks for its boot image, so a
+    /// cumulative thread-local clock lets the harness remove a cold build from
+    /// the test that happened to ask for it first. A process-wide counter would
+    /// subtract another worker's concurrent build instead.
+    static ARTIFACT_BUILD_TIME: Cell<Duration> = Cell::new(Duration::ZERO);
+}
+
+/// One reading of the artifact-build clock for the current thread.
+///
+/// Test duration profiles are execution prices, not ownership of a shared
+/// cache miss. Without this distinction, each CI shard charges its first
+/// shipping- and test-kernel users tens of seconds, relegating those names;
+/// the next run then charges the same builds to two different names. The raw
+/// suite wall clock still includes every build. Only per-test prices use this
+/// mark to remove construction of memoized kernel, bootloader, and initrd
+/// artifacts.
+#[derive(Clone, Copy)]
+pub struct ArtifactBuildMark(Duration, PhantomData<Rc<()>>);
+
+/// Read the current thread's cumulative artifact-build time.
+pub fn mark_artifact_build_time() -> ArtifactBuildMark {
+    ArtifactBuildMark(ARTIFACT_BUILD_TIME.get(), PhantomData)
+}
+
+impl ArtifactBuildMark {
+    /// Remove artifact construction since this mark from a raw elapsed time.
+    pub fn execution_part(self, raw: Duration) -> Duration {
+        let built = ARTIFACT_BUILD_TIME.get().saturating_sub(self.0);
+        raw.saturating_sub(built)
+    }
+}
+
+/// Charges the slow, cache-filling half of [`build_test_image`] to the build
+/// clock even if it unwinds. Image creation on a memo hit is deliberately
+/// outside this guard: every boot pays that work, so it is part of the test's
+/// repeatable execution price.
+struct ArtifactBuildTimer(Instant);
+
+impl ArtifactBuildTimer {
+    fn start() -> Self {
+        Self(Instant::now())
+    }
+}
+
+impl Drop for ArtifactBuildTimer {
+    fn drop(&mut self) {
+        let elapsed = self.0.elapsed();
+        ARTIFACT_BUILD_TIME.set(ARTIFACT_BUILD_TIME.get().saturating_add(elapsed));
+    }
+}
 
 // --- Config ---
 
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case")]
 struct SystemConfig {
-    init: Vec<String>,
     #[serde(default)]
     programs: HashMap<String, ProgramConfig>,
     #[serde(default)]
@@ -26,6 +83,18 @@ struct SystemConfig {
     hosted_rustc: bool,
     #[serde(default)]
     assets: Vec<String>,
+    /// What `/bin/init` starts at boot. Program *keys*, never paths — a path
+    /// here is a second spelling of a `[programs]` key and is what let a boot
+    /// list smuggle an argument through. Arguments live on the program entry's
+    /// `args` instead.
+    #[serde(default)]
+    boot: BootConfig,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default, rename_all = "kebab-case")]
+struct BootConfig {
+    start: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -33,6 +102,23 @@ struct SystemConfig {
 struct ProgramConfig {
     path: Option<String>,
     no_default_features: bool,
+    /// Argv this program is started with, after argv[0].
+    args: Vec<String>,
+    /// Names init creates **one machine-wide port** for and endows this program
+    /// the *acceptor* of.
+    serves: Vec<String>,
+    /// Names this program creates a port for **itself**, once per instance, and
+    /// hands the connector down to its own children. init creates nothing and
+    /// holds nothing for these — `surface` is the whole of this kind.
+    provides: Vec<String>,
+    /// Names in this program's namespace, each a *connector*.
+    receives: Vec<String>,
+    /// Device classes init mints a claim for and endows.
+    devices: Vec<String>,
+    /// Rights on the `SysCap` duplicate init endows this program, by the names
+    /// `toyos_manifest::syscap_rights` takes. Two programs in the whole tree
+    /// declare one.
+    syscap: Vec<String>,
 }
 
 impl ProgramConfig {
@@ -45,8 +131,13 @@ impl ProgramConfig {
         }
     }
 
-    /// Whether this program is a workspace member of the userland workspace.
-    /// Programs with explicit paths or special flags are standalone.
+    /// Whether this program is a member of the **userland** workspace, the one
+    /// `-p` selects a package from and whose `target/` holds the result.
+    /// Programs with explicit paths or special flags are built from their own
+    /// directory instead — which is not the same as being built into it:
+    /// `toyos-ld` and `toyos-cc` have explicit paths and are members of the
+    /// *host* workspace, so cargo writes them to the repository root's
+    /// `target/`. `hostws::target_dir` is what answers that, never this.
     fn is_workspace_member(&self) -> bool {
         self.path.is_none() && !self.no_default_features
     }
@@ -94,15 +185,21 @@ fn external_fingerprint(root: &Path) -> String {
         }
     }
 
+    // Content, not `len:mtime`: `toyos-ld` relinks every CI job because a fresh
+    // `actions/checkout` gives its sources a mtime cargo's own path-dependency
+    // fingerprint has never seen, and the relink is a few MB — hashing it is
+    // milliseconds against the `cargo clean` a changed mtime used to trigger on
+    // every crate this fingerprint gates, `tests/toyos-rust-tests/tls-cranelift`
+    // among them at 570 MiB. The sysroot rlibs above stay on `len:mtime`: CI
+    // unpacks a byte-identical toolchain artifact with `tar`, which restores
+    // mtimes, so their triple is already stable across jobs of one toolchain
+    // tag and hashing every rlib would cost what the clean does today.
     let linker = toolchain::toyos_ld_binary(root);
-    if let Ok(meta) = linker.metadata() {
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        entries.push(format!("toyos-ld:{}:{mtime}", meta.len()));
+    if let Ok(data) = fs::read(&linker) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        data.hash(&mut h);
+        entries.push(format!("toyos-ld:{:016x}", h.finish()));
     }
 
     entries.sort();
@@ -114,18 +211,35 @@ fn external_fingerprint(root: &Path) -> String {
 enum Clean {
     All,
     /// Crates with explicit paths (toyos-ld, toyos-cc) also have host builds
-    /// that must survive: the host toyos-ld *is* the cross linker.
+    /// that must survive: the host toyos-ld *is* the cross linker. Both are
+    /// host-workspace members, so the directory this empties is the
+    /// workspace's `target/x86_64-unknown-toyos` — the guest halves of the two,
+    /// and nothing the host builds.
     ToyosOnly,
 }
 
-fn stale(crate_dir: &Path, fingerprint: &str) -> bool {
-    let stamp = crate_dir.join("target/.deps-stamp");
+fn stale(root: &Path, crate_dir: &Path, fingerprint: &str) -> bool {
+    let stamp = hostws::target_dir(root, crate_dir).join(".deps-stamp");
     fs::read_to_string(&stamp).map_or(true, |stored| stored != fingerprint)
 }
 
-fn clean(crate_dir: &Path, kind: Clean, fingerprint: &str) {
+fn clean(root: &Path, crate_dir: &Path, kind: Clean, fingerprint: &str) {
+    // Where cargo actually wrote it. `toyos-ld` and `toyos-cc` are members of
+    // the host workspace, so their guest builds land in the root's `target/`
+    // and both answer with the same directory: the second clean of a pass finds
+    // it already gone and does nothing, which is the right amount of work.
+    let target = hostws::target_dir(root, crate_dir);
     match kind {
         Clean::All => {
+            // `cargo clean` in a member's directory cleans the whole workspace,
+            // this build system's own target directory included. Nothing asks
+            // for that today; refusing it by name is cheaper than finding out.
+            assert!(
+                !hostws::is_member(root, crate_dir),
+                "{} is a host-workspace member, and `cargo clean` there would empty the \
+                 workspace's whole target directory rather than this crate's",
+                crate_dir.display(),
+            );
             eprintln!("external deps changed: cleaning {}", crate_dir.display());
             let _ = Command::new("cargo")
                 .arg("clean")
@@ -133,7 +247,7 @@ fn clean(crate_dir: &Path, kind: Clean, fingerprint: &str) {
                 .status();
         }
         Clean::ToyosOnly => {
-            let toyos_dir = crate_dir.join("target/x86_64-unknown-toyos");
+            let toyos_dir = target.join("x86_64-unknown-toyos");
             if toyos_dir.exists() {
                 eprintln!("external deps changed: cleaning {}", toyos_dir.display());
                 fs::remove_dir_all(&toyos_dir).ok();
@@ -141,8 +255,8 @@ fn clean(crate_dir: &Path, kind: Clean, fingerprint: &str) {
         }
     }
 
-    fs::create_dir_all(crate_dir.join("target")).ok();
-    fs::write(crate_dir.join("target/.deps-stamp"), fingerprint).ok();
+    fs::create_dir_all(&target).ok();
+    fs::write(target.join(".deps-stamp"), fingerprint).ok();
 }
 
 /// Drop the target directories the changed external deps invalidated.
@@ -161,14 +275,14 @@ fn invalidate_stale(root: &Path, lock: &mut buildlock::Held, targets: &[(PathBuf
             let fp = external_fingerprint(root);
             let work: Vec<(PathBuf, Clean)> = targets
                 .iter()
-                .filter(|(dir, _)| stale(dir, &fp))
+                .filter(|(dir, _)| stale(root, dir, &fp))
                 .cloned()
                 .collect();
             (!work.is_empty()).then_some((fp, work))
         },
         |(fp, work)| {
             for (dir, kind) in work {
-                clean(&dir, kind, &fp);
+                clean(root, &dir, kind, &fp);
             }
         },
     );
@@ -252,23 +366,38 @@ fn cargo_build(
 
 // --- Artifact staging ---
 //
-// The bootloader's init list is *compiled in* (`bootloader/build.rs` declares
-// `rerun-if-env-changed=INIT_PROGRAMS`; `main.rs` reads `env!("INIT_PROGRAMS")`),
-// and the kernel's features likewise change its binary. But cargo keys the
-// artifact path on (crate, target, profile) and nothing else, so every config
-// writes and reads one path.
+// A kernel's feature list changes its binary, but cargo keys the artifact path
+// on (crate, target, profile) and nothing else, so every config writes and reads
+// one path.
 //
-// The window is not a moment: `build_test_image` builds the bootloader, then
-// runs the entire userland build and initrd assembly, and only then reads the
-// `.efi`. Seconds to minutes, during which another config's build overwrites it.
-// Observed: an image carrying metalcase's initrd and another config's bootloader,
-// whose 28-byte init string was `"/bin/soundd;/bin/test-runner"`. The compositor
-// was never spawned and the test failed as though the daemon under test were
-// broken.
+// The window is not a moment: `build_test_image` builds, then runs the entire
+// userland build and initrd assembly, and only then reads the artifact back.
+// Seconds to minutes, during which another config's build overwrites it.
 //
 // So: hold [`buildlock::artifact`] across each build→stage pair, and copy the
 // artifact to a name carrying what it is actually keyed by. Readers use the
 // staged name, which no other config can overwrite.
+//
+// The bootloader used to be here for the same reason and no longer is: its init
+// list was compiled into it, so the `.efi` was a function of the boot config,
+// and an image once carried metalcase's initrd beside another config's
+// bootloader whose 28-byte init string was `"/bin/soundd;/bin/test-runner"` —
+// the compositor was never spawned and the test failed as though the daemon
+// under test were broken. The bootloader carries no config now, so it is
+// memoized once per profile and that hazard is not expressible.
+
+/// The staged-artifact key of a kernel built with `features`.
+///
+/// **Both build paths go through this and that is the whole of the claim** that
+/// a test which asks for no feature boots the binary an image ships: the staged
+/// file is named for this key, so an equal key is not a similar kernel but the
+/// same file. `cargo run --build-only` passes what `kernel_features` made of an
+/// empty request; the harness passes `BootOptions::kernel_features` joined.
+/// Nothing between them may add a name — which is what `qemu::fold_inert` used
+/// to do to every boot in the suite.
+fn kernel_key(features: &str) -> u64 {
+    key_hash(&[PROFILE, features])
+}
 
 fn key_hash(parts: &[&str]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -364,6 +493,51 @@ fn assert_overflow_checked(what: &str, image: &[u8]) {
 // --- Shared initrd assembly ---
 
 /// Build all programs from a config and assemble an initrd.
+/// The one program the kernel starts, in **every** image whatever `[programs]`
+/// says. It reads the manifest below and starts what that names, so an initrd
+/// without it is a machine with a kernel and no userland at all.
+const INIT_PROGRAM: &str = "init";
+
+/// Names `/bin/init` serves itself.
+///
+/// init is in every image and is no `[programs]` key, so these have no
+/// declaration to come from. They travel in the manifest so init creates
+/// exactly the ports the build-time gate counted as provided — one producer,
+/// rather than a constant here and a string in init.
+const INIT_SERVED: &[&str] = &["launcher"];
+
+/// The resolved config as the records `/bin/init` reads.
+///
+/// The format, the renderer and the parser are `toyos-manifest/`, whose
+/// round-trip test is what makes "what the build writes is what init reads" a
+/// fact rather than two hand-matched implementations.
+fn render_manifest(config: &SystemConfig) -> Vec<u8> {
+    let mut names: Vec<&String> = config.programs.keys().collect();
+    names.sort();
+    let manifest = toyos_manifest::Manifest {
+        programs: names
+            .iter()
+            .map(|name| {
+                let cfg = &config.programs[*name];
+                toyos_manifest::Program {
+                    name: (*name).clone(),
+                    path: format!("/bin/{name}"),
+                    args: cfg.args.clone(),
+                    serves: cfg.serves.clone(),
+                    provides: cfg.provides.clone(),
+                    receives: cfg.receives.clone(),
+                    devices: cfg.devices.clone(),
+                    syscap: cfg.syscap.clone(),
+                }
+            })
+            .collect(),
+        init_serves: INIT_SERVED.iter().map(|s| (*s).to_string()).collect(),
+        start: config.boot.start.clone(),
+    };
+    toyos_manifest::render(&manifest)
+        .unwrap_or_else(|e| panic!("system.toml cannot be rendered as a manifest: {e:?}"))
+}
+
 fn build_and_assemble(
     root: &Path,
     config: &SystemConfig,
@@ -373,7 +547,7 @@ fn build_and_assemble(
 ) -> Vec<u8> {
     let userland_dir = root.join("userland");
 
-    let mut workspace_packages: Vec<&str> = Vec::new();
+    let mut workspace_packages: Vec<&str> = vec![INIT_PROGRAM];
     let mut standalone: Vec<(&String, &ProgramConfig)> = Vec::new();
     for (name, cfg) in &config.programs {
         let crate_dir = cfg.crate_dir(root, name);
@@ -438,12 +612,18 @@ fn build_and_assemble(
                 ws_target.join(name)
             } else {
                 let crate_dir = cfg.crate_dir(root, name);
-                crate_dir.join(format!("target/x86_64-unknown-toyos/{PROFILE}/{name}"))
+                hostws::target_dir(root, &crate_dir)
+                    .join(format!("x86_64-unknown-toyos/{PROFILE}/{name}"))
             };
             let data =
                 fs::read(&binary).unwrap_or_else(|_| panic!("Failed to read binary for {name}"));
             initrd_files.push((format!("bin/{name}"), data));
         }
+
+        let init = ws_target.join(INIT_PROGRAM);
+        let data = fs::read(&init).expect("Failed to read binary for init");
+        initrd_files.push((format!("bin/{INIT_PROGRAM}"), data));
+        initrd_files.push((toyos_manifest::PATH.to_string(), render_manifest(config)));
 
         if config.hosted_rustc {
             collect_hosted_rustc(root, &mut initrd_files);
@@ -477,8 +657,9 @@ fn build_and_assemble(
 #[derive(Clone, Copy, PartialEq)]
 pub enum Boot {
     Normal,
-    /// `diag/system.toml`: nothing in the image can claim the framebuffer, so
-    /// the kernel's last boot checkpoint stays on screen. `tests/toyos.rs`'s
+    /// `diag/system.toml`: the config declares no `devices`, so nothing
+    /// started there claims the framebuffer and the kernel's last boot
+    /// checkpoint stays on screen. `tests/toyos.rs`'s
     /// `screen_diag_boot` boots this same config, so the tested image and the
     /// flashed image are the same image.
     Diag,
@@ -520,17 +701,28 @@ impl Boot {
 /// than listed here, so the check cannot drift from what cargo would accept —
 /// and, more to the point, so that deleting a feature takes its own command
 /// lines down with it. That is what a temporary feature needs: when
-/// `hda-probe` goes at `specs/hda-driver-plan.md` H9, an invocation still
+/// `hda-probe` goes at `specs/plans/hda-driver-plan.md` H9, an invocation still
 /// asking for it fails saying so instead of quietly producing a kernel with no
 /// probe in it, which is the same image and a different machine.
 ///
 /// Cargo would refuse an unknown feature too — after the build lock, the
 /// toolchain check and the userland build, and with `kernel` in the message
 /// rather than the flag the user typed. This runs before any of them.
-fn kernel_features(root: &Path, debug: bool, requested: &[String]) -> String {
+fn kernel_features(
+    root: &Path,
+    debug: bool,
+    requested: &[String],
+    params: &[String],
+) -> String {
     let mut features: Vec<&str> = Vec::new();
     if debug {
-        features.push("debug-wait");
+        features.push(DEBUG_KERNEL_BUILD);
+    }
+    // A parameter names an actuator, and only a kernel compiled with them can
+    // be told to arm one. This is the whole of what `--kernel-param` decides
+    // about the build — which actuator is a boot's business, not a build's.
+    if !params.is_empty() {
+        features.push("boot-actuators");
     }
     if !requested.is_empty() {
         let declared = declared_kernel_features(root);
@@ -538,13 +730,38 @@ fn kernel_features(root: &Path, debug: bool, requested: &[String]) -> String {
             assert!(
                 declared.contains(name),
                 "--kernel-feature {name}: the kernel declares no such feature.\n\
-                 Features it declares: {}.",
+                 Features it declares: {}.\n\
+                 Every actuator is now a --kernel-param; `cargo run -- --kernel-param --help` \
+                 lists them.",
                 declared.join(", ")
             );
             features.push(name);
         }
     }
     features.join(",")
+}
+
+/// The boot parameter this build writes to the ESP, with every name checked
+/// against `kernel/src/actuator.rs`.
+///
+/// Refused here as well as in the kernel, and before any lock, so that deleting
+/// an actuator takes its stale command lines down with it instead of quietly
+/// producing an image that arms nothing — the same rule `--kernel-feature` runs
+/// on, one layer further in.
+fn kernel_cmdline(root: &Path, params: &[String]) -> String {
+    if params.is_empty() {
+        return String::new();
+    }
+    let declared = declared_actuators(root);
+    for name in params {
+        assert!(
+            declared.contains(name),
+            "--kernel-param {name}: the kernel declares no such actuator.\n\
+             Actuators it declares: {}.",
+            declared.join(", ")
+        );
+    }
+    params.join(",")
 }
 
 #[derive(Deserialize)]
@@ -562,6 +779,198 @@ fn declared_kernel_features(root: &Path) -> Vec<String> {
     manifest.features.into_keys().collect()
 }
 
+/// The kernel every test that needs an actuator boots: all of them compiled in
+/// and none of them armed, plus the `SYS_DEBUG` number.
+///
+/// **One list, so one build.** `kernel_key` is over the joined string, so a
+/// second spelling of this set would be a second kernel and nothing would say
+/// so.
+pub const TEST_KERNEL: &[&str] = &["boot-actuators", "test-actuators"];
+
+/// Kernel builds the ordinary test suite is allowed to make.
+pub const TEST_SUITE_KERNEL_BUILDS: [&str; 4] =
+    ["", "boot-actuators,test-actuators", "fpu-save-nothing", "sched-check"];
+
+/// The scheduler core's own asserts, compiled in: `toyos-sched/check`.
+///
+/// One name, read from here by the one test that boots it, for
+/// [`TEST_KERNEL`]'s reason — a second spelling is a second kernel and nothing
+/// would say so.
+pub const SCHED_CHECK_KERNEL: &[&str] = &["sched-check"];
+
+/// The kernel build used only by the harness's interactive debugger.
+pub const DEBUG_KERNEL_BUILD: &str = "debug-wait";
+
+/// Whether the test harness's current mode declares this kernel build.
+pub fn harness_kernel_build_is_declared(features: &str, debug_wait: bool) -> bool {
+    if debug_wait {
+        features == DEBUG_KERNEL_BUILD
+    } else {
+        TEST_SUITE_KERNEL_BUILDS.contains(&features)
+    }
+}
+
+/// Every name in which a process of this boot config can speak a console line
+/// that is not the program under test's.
+///
+/// **Derived, never listed.** The point of reading it out of the config is that
+/// a daemon added to `[boot] start` tomorrow is in this set the moment it
+/// exists — a hardcoded list would let the next `netd`'s lines start deciding C
+/// tests again, which is what task #84 was (`tests/common/console.rs`).
+/// `/bin/init` itself is added by hand because it is the one speaker that is not a
+/// `[programs]` key: it is the parent that starts every one of them, and it
+/// speaks before any of them exists (`init: netd: no nic on this machine` is on
+/// the console before netd is loaded).
+///
+/// The union of the two lists rather than `[boot] start` alone: a program the
+/// config declares is a binary this image carries and a name init can be asked
+/// to speak in, and the whole value of deriving the set is that it is the
+/// config's answer rather than an author's.
+///
+/// **A program also speaks in the name of every device it claims, and that is
+/// measured rather than supposed.** `userland/soundd/src/virtio.rs` writes
+/// `virtio-sound: configured stream 0: 44100Hz 2ch s16le` — the driver layer
+/// says which device is talking, not which program — and a plain
+/// `tests/testcases` boot puts three such lines on the console before the test
+/// runner is ready. `devices` is where those names are declared, so it is where
+/// they are read from; `c_capture_ignores_daemon_lines` walks a real boot log
+/// and reds on any line this set cannot account for, which is what keeps this
+/// derivation honest as the tree grows.
+///
+/// `config` is the `system.toml` itself, not its directory.
+pub fn console_speakers(config: &Path) -> std::collections::BTreeSet<String> {
+    let parsed = parse_config(config);
+    let mut names = std::collections::BTreeSet::new();
+    for (program, entry) in parsed.programs {
+        names.insert(program);
+        names.extend(entry.devices);
+    }
+    names.extend(parsed.boot.start);
+    names.insert("init".to_string());
+    names
+}
+
+/// Every actuator `kernel/src/actuator.rs` declares, read out of the file that
+/// declares them.
+///
+/// Read rather than listed here for `declared_kernel_features`' reason, one
+/// layer in: deleting an actuator has to take its own command lines and its own
+/// `BootOptions` with it, rather than leaving a name that quietly arms nothing.
+/// The kernel's own parser refuses an unknown token as well, so this is the
+/// early half of a two-sided answer and not the only one.
+pub fn declared_actuators(root: &Path) -> Vec<String> {
+    let path = root.join("kernel/src/actuator.rs");
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
+    let body = text
+        .split_once("\nactuators! {\n")
+        .expect("kernel/src/actuator.rs has no `actuators!` block")
+        .1;
+    let body = body.split_once("\n}\n").expect("the `actuators!` block does not end").0;
+    let names: Vec<String> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("///"))
+        .filter_map(|line| line.split_once(" = \"")?.1.strip_suffix("\";").map(str::to_string))
+        .collect();
+    assert!(!names.is_empty(), "{} declares no actuators", path.display());
+    names
+}
+
+/// Refuse to write an image whose kernel does not carry exactly the actuators
+/// its feature set says it does.
+///
+/// [`assert_overflow_checked`]'s shape and for its reason: the property is
+/// about the artifact, so the artifact is what is asked. Two builds quietly
+/// becoming one build with test hooks in it is the failure mode this exists
+/// for, and a convention nothing enforces is not a bar.
+///
+/// **Both directions, because one of them is a spelling of `true`.** A shipping
+/// kernel must name none of them; the test kernel must name all of them, which
+/// is what says the search works at all — measured on the two binaries this
+/// build produces, 0 of 47 at 3,829,440 bytes and 47 of 47 at 4,247,272.
+///
+/// A kernel built with no features is the shipping one, because that is what
+/// "shipping" means here: `--kernel-feature`, `--kernel-param` and `--debug`
+/// each say out loud that this image is not one.
+fn assert_actuators_match_features(root: &Path, features: &str, kernel: &[u8]) {
+    let want = match features {
+        "" => false,
+        f if f == TEST_KERNEL.join(",") => true,
+        _ => return,
+    };
+    let names = declared_actuators(root);
+    let named = |name: &String| {
+        let needle = name.as_bytes();
+        kernel.windows(needle.len()).any(|w| w == needle)
+    };
+    let wrong: Vec<&String> = names.iter().filter(|n| named(n) != want).collect();
+    assert!(
+        wrong.is_empty(),
+        "the {} kernel {} {} of the {} actuators `kernel/src/actuator.rs` declares: {wrong:?}.\n\
+         Everything under that file belongs to a kernel built with `boot-actuators`, and an \
+         image that ships must not be able to be told to break.",
+        if want { "test" } else { "shipping" },
+        if want { "is missing" } else { "names" },
+        wrong.len(),
+        names.len(),
+    );
+}
+
+/// The scheduler core's `feature = "check"` asserts, by their own panic text,
+/// and the two kernels that must disagree about carrying them.
+///
+/// Every one of these is a `#[cfg(feature = "check")]` site in `toyos-sched`:
+/// invariant P is `cpu::check_pass_duration`'s budget, and the other two are
+/// `invariants::check_cpu` — invariant T's armed-timer bound and the
+/// container-versus-state-word agreement. Their format strings are the only
+/// part of the check build with a literal the linker keeps, which is what makes
+/// the artifact answerable at all.
+const SCHED_CHECK_ASSERTS: [&str; 3] = [
+    "invariant P: a scheduler pass took",
+    "invariant T: cpu",
+    "disagrees with its state word",
+];
+
+/// Refuse to write an image whose scheduler asserts do not match the feature
+/// set that decides whether they exist.
+///
+/// [`assert_actuators_match_features`]'s shape and its reason: the property is
+/// about the artifact, so the artifact is what is asked, and a convention
+/// nothing enforces is not a bar. **Both directions, because one of them is a
+/// spelling of `true`** — a shipping kernel must carry none of these, and the
+/// `sched-check` kernel must carry all of them, which is what says the search
+/// works at all.
+///
+/// This is the half of the check-build gate that a booted guest cannot supply.
+/// A guest proves the asserts did not *fire*; a kernel with the feature quietly
+/// dropped proves that too, and rather more easily. Measured on the two binaries
+/// this build produces: 0 of 3 in the shipping kernel, 3 of 3 in the
+/// `sched-check` one.
+fn assert_sched_check_matches_features(features: &str, kernel: &[u8]) {
+    let want = match features {
+        "" => false,
+        f if f == SCHED_CHECK_KERNEL.join(",") => true,
+        _ => return,
+    };
+    let named = |needle: &&str| {
+        let needle = needle.as_bytes();
+        kernel.windows(needle.len()).any(|w| w == needle)
+    };
+    let wrong: Vec<&&str> = SCHED_CHECK_ASSERTS.iter().filter(|a| named(a) != want).collect();
+    assert!(
+        wrong.is_empty(),
+        "the {} kernel {} {} of the {} scheduler check asserts: {wrong:?}.\n\
+         `sched-check` forwards to `toyos-sched/check`, so a build that carries the feature \
+         and not the asserts is a check build in name only — which is what a green \
+         `sched_check_build` would then be certifying.",
+        if want { "sched-check" } else { "shipping" },
+        if want { "is missing" } else { "names" },
+        wrong.len(),
+        SCHED_CHECK_ASSERTS.len(),
+    );
+}
+
 /// Full build: kernel, bootloader, all programs, boot image. Returns the image.
 pub fn build(
     root: &Path,
@@ -570,11 +979,13 @@ pub fn build(
     rebuild_toolchain: bool,
     claim_sysroot: bool,
     kernel_feature: &[String],
+    kernel_param: &[String],
 ) -> PathBuf {
-    // Before the locks: a misspelled feature is the user's own command line and
+    // Before the locks: a misspelled name is the user's own command line and
     // has to come back now, not after this build has waited out every other
     // worktree's hold on the sysroot.
-    let kernel_features = kernel_features(root, debug, kernel_feature);
+    let kernel_features = kernel_features(root, debug, kernel_feature, kernel_param);
+    let cmdline = kernel_cmdline(root, kernel_param);
 
     // Outermost, before any build lock, and that order is the whole deadlock
     // argument: every acquirer of both takes the sysroot lock first. It waits
@@ -597,8 +1008,6 @@ pub fn build(
     let config = parse_config(&root.join(boot.config()));
 
     invalidate_stale(root, &mut lock, &config_targets(root, &config));
-
-    let init_programs = config.init.join(";");
 
     // Same lock-and-stage as `build_test_image`: `cargo run --build-only` and
     // `cargo test` share these paths, so this races the harness too.
@@ -630,7 +1039,7 @@ pub fn build(
                 "x86_64-unknown-uefi",
                 &[],
                 &path_env,
-                &[("INIT_PROGRAMS", init_programs.as_str())],
+                &[],
                 false,
             );
         }
@@ -640,7 +1049,7 @@ pub fn build(
                 root,
                 &root.join(format!("kernel/target/x86_64-unknown-none/{PROFILE}/kernel")),
                 "kernel",
-                key_hash(&[PROFILE, &kernel_features]),
+                kernel_key(&kernel_features),
             ),
             stage_artifact(
                 root,
@@ -648,7 +1057,7 @@ pub fn build(
                     "bootloader/target/x86_64-unknown-uefi/{PROFILE}/bootloader.efi"
                 )),
                 "bootloader.efi",
-                key_hash(&[PROFILE, &init_programs]),
+                key_hash(&[PROFILE]),
             ),
         )
     };
@@ -658,9 +1067,11 @@ pub fn build(
 
     let kernel_bytes = fs::read(&kernel_art).expect("Failed to read staged kernel");
     assert_overflow_checked("kernel", &kernel_bytes);
+    assert_actuators_match_features(root, &kernel_features, &kernel_bytes);
+    assert_sched_check_matches_features(&kernel_features, &kernel_bytes);
     assert_kernel_is_softfloat(&path_env);
     let bl_bytes = fs::read(&bl_art).expect("Failed to read staged bootloader");
-    let disk_bytes = image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes);
+    let disk_bytes = image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes, &cmdline);
     let image_path = root.join(boot.image());
     fs::write(&image_path, disk_bytes).expect("Failed to write image");
 
@@ -725,18 +1136,19 @@ pub fn designate_for_format(path: &Path, len: u64) {
 
 /// One part of a boot image, built once per key for the life of this process.
 ///
-/// A `cargo test` run boots ~76 machines, and 41 of those boots ask for an image
-/// some earlier boot already built; the three `cargo` invocations then take
-/// ~1.4 s between them to answer "nothing changed" (`specs/test-cost-audit.md`
-/// §1.4). In memory and never on disk, so a run gets one answer for the tree it
-/// started against and the next run asks cargo again.
+/// A `cargo test` run boots ~76 machines, and most of those boots ask for an
+/// image some earlier boot already built; the three `cargo` invocations then
+/// take ~1.4 s between them to answer "nothing changed"
+/// (`specs/assessments/test-cost-audit.md` §1.4). In memory and never on disk, so a run gets
+/// one answer for the tree it started against and the next run asks cargo
+/// again.
 ///
 /// Per part rather than per image, because a part is what a key can be true of:
 /// the kernel is its feature set, the bootloader is its init list, the initrd is
 /// its config and the caller's extra files. That is the same split
 /// [`stage_artifact`] already writes into the artifact names, and it is what
-/// makes this affordable — the 31 kernel feature sets a full run builds share a
-/// handful of initrds, and an initrd is hundreds of megabytes.
+/// makes this affordable — the kernels a full run builds share a handful of
+/// initrds, and an initrd is hundreds of megabytes.
 ///
 /// What it does not see is a source edit that lands mid-run. A run is a
 /// measurement of one tree, so that is the behaviour wanted either way; a run
@@ -798,14 +1210,23 @@ pub fn build_test_image(
     root: &Path,
     config_path: &Path,
     kernel_features: &[&str],
+    kernel_params: &[&str],
     quiet: bool,
     extra_files: &[(String, Vec<u8>)],
 ) -> Vec<u8> {
     let config = parse_config(config_path);
-    let init_programs = config.init.join(";");
     let features = kernel_features.join(",");
-    let kernel_key = key_hash(&[PROFILE, &features]);
-    let bl_key = key_hash(&[PROFILE, &init_programs]);
+    // **The kernel is not keyed on this and that is the whole change.** A
+    // parameter picks which actuator the one test kernel arms, so 45 builds
+    // became two; keying the image on it is what keeps two boots asking for
+    // different actuators from sharing one disk.
+    assert!(
+        kernel_params.is_empty() || kernel_features == TEST_KERNEL,
+        "a boot asking for {kernel_params:?} must boot the test kernel, not {kernel_features:?}"
+    );
+    let cmdline = kernel_params.join(",");
+    let kernel_key = kernel_key(&features);
+    let bl_key = key_hash(&[PROFILE]);
     let initrd_key = initrd_key(config_path, extra_files);
 
     // Nothing left to build, so nothing for the lock, the toolchain check or the
@@ -813,8 +1234,14 @@ pub fn build_test_image(
     if let (Some(kernel), Some(bl), Some(initrd)) =
         (KERNEL.get(kernel_key), BOOTLOADER.get(bl_key), INITRD.get(initrd_key))
     {
-        return image::create_boot_image(&kernel, &bl, &initrd);
+        return image::create_boot_image(&kernel, &bl, &initrd, &cmdline);
     }
+
+    // A cache miss is shared setup, not a property of whichever test happened
+    // to be first on this shard. Keep it on a separate clock until all missing
+    // memo parts have been constructed. The fresh per-boot image below remains
+    // outside the charge because every execution needs one.
+    let build_timer = ArtifactBuildTimer::start();
 
     // **Below the memo's early return, so a boot that builds nothing queues for
     // nothing.** Above every build lock, per the module header. This is the
@@ -861,6 +1288,8 @@ pub fn build_test_image(
             {
                 let bytes = fs::read(&staged).expect("Failed to read staged kernel");
                 assert_overflow_checked("kernel", &bytes);
+                assert_actuators_match_features(root, &features, &bytes);
+                assert_sched_check_matches_features(&features, &bytes);
                 assert_kernel_is_softfloat(&path_env);
                 bytes
             }
@@ -871,7 +1300,7 @@ pub fn build_test_image(
                 "x86_64-unknown-uefi",
                 &[],
                 &path_env,
-                &[("INIT_PROGRAMS", init_programs.as_str())],
+                &[],
                 quiet,
             );
             let staged = stage_artifact(
@@ -889,7 +1318,9 @@ pub fn build_test_image(
         build_and_assemble(root, &config, &path_env, extra_files, quiet)
     });
 
-    image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes)
+    drop(build_timer);
+
+    image::create_boot_image(&kernel_bytes, &bl_bytes, &initrd_bytes, &cmdline)
 }
 
 /// Build all binaries in a multi-binary crate. Returns vec of (binary_name, bytes).
@@ -1084,23 +1515,448 @@ fn find_host_rlibs(root: &Path) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn an_artifact_build_is_not_part_of_a_test_execution_price() {
+        let before = mark_artifact_build_time();
+        ARTIFACT_BUILD_TIME.set(
+            ARTIFACT_BUILD_TIME
+                .get()
+                .saturating_add(Duration::from_millis(70)),
+        );
+        assert_eq!(
+            before.execution_part(Duration::from_millis(83)),
+            Duration::from_millis(13)
+        );
+
+        let after = mark_artifact_build_time();
+        assert_eq!(
+            after.execution_part(Duration::from_millis(13)),
+            Duration::from_millis(13)
+        );
+
+        // A coarse build clock must not underflow a very short failed outcome.
+        ARTIFACT_BUILD_TIME.set(
+            ARTIFACT_BUILD_TIME
+                .get()
+                .saturating_add(Duration::from_millis(70)),
+        );
+        assert_eq!(
+            after.execution_part(Duration::from_millis(13)),
+            Duration::ZERO
+        );
+    }
+
+    /// A test that asks for no kernel feature boots the binary an image ships.
+    ///
+    /// **That claim is a file, not a resemblance.** A kernel is staged under
+    /// [`kernel_key`] and read back from there, so the two paths agreeing about
+    /// the key means one artifact — and the day something re-inserts a name
+    /// between `BootOptions::kernel_features` and the build, this goes red.
+    /// Until 2026-08-10 something did: `qemu::fold_inert` prepended
+    /// `test-actuators` to every boot in the suite, so no test had ever booted
+    /// the shipping kernel and nothing in the tree could have said so.
+    ///
+    /// The third assertion is the negative control: a key that ignored its
+    /// features would satisfy the first two and certify nothing.
+    #[test]
+    fn a_boot_that_asks_for_no_feature_gets_the_shipping_kernel() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let shipping = kernel_features(root, false, &[], &[]);
+        assert_eq!(shipping, "", "`cargo run` asks the kernel for {shipping:?}, not nothing");
+        let harness = <&[&str]>::default().join(",");
+        assert_eq!(
+            kernel_key(&shipping),
+            kernel_key(&harness),
+            "a featureless boot and the shipping build stage different kernels"
+        );
+        assert_ne!(
+            kernel_key(&shipping),
+            kernel_key("test-actuators"),
+            "the key ignores the features, so it cannot tell two kernels apart"
+        );
+    }
+
+    /// Interactive debug mode deliberately builds one variant the ordinary
+    /// suite does not, and the mode bit must not become a blanket exemption.
+    #[test]
+    fn debug_mode_declares_only_its_debug_kernel() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let debug = kernel_features(root, true, &[], &[]);
+        assert_eq!(debug, DEBUG_KERNEL_BUILD);
+        assert!(!TEST_SUITE_KERNEL_BUILDS.contains(&debug.as_str()));
+        assert!(harness_kernel_build_is_declared(&debug, true));
+        assert!(!harness_kernel_build_is_declared(&debug, false));
+        assert!(!harness_kernel_build_is_declared(
+            "fpu-save-nothing,debug-wait",
+            true
+        ));
+        for suite_build in TEST_SUITE_KERNEL_BUILDS {
+            assert!(harness_kernel_build_is_declared(suite_build, false));
+            assert!(!harness_kernel_build_is_declared(suite_build, true));
+        }
+    }
+
+    /// **An actuator is a boot parameter and never a kernel build.**
+    ///
+    /// A name that reappears in `kernel/Cargo.toml` is a 46th kernel, and the
+    /// suite would build it without anything saying so — which is the state
+    /// `specs/assessments/test-cost-audit.md` §5.9.7 replaced. The two lists are read from
+    /// the two files that declare them, so neither can be satisfied by editing
+    /// this test.
+    #[test]
+    fn no_actuator_is_also_a_cargo_feature() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let actuators = declared_actuators(root);
+        let features = declared_kernel_features(root);
+        let both: Vec<&String> = actuators.iter().filter(|a| features.contains(a)).collect();
+        assert!(both.is_empty(), "declared as both an actuator and a kernel feature: {both:?}");
+        assert!(
+            actuators.iter().all(|a| a.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')),
+            "an actuator name is ASCII `[a-z0-9-]`, and these are not: {actuators:?}"
+        );
+    }
+
+    /// The features a kernel build may still carry, and the whole list.
+    ///
+    /// **The gate on the count this landing is about.** Each name here is a
+    /// kernel `cargo test` may build beside the two, so adding one is a
+    /// decision to pay ~6.9 s of wall clock and ~29.6 s of CPU per full run
+    /// after any kernel edit (§5.9.2) — and `boot-actuators` exists so that
+    /// the answer is almost always a parameter instead.
+    #[test]
+    fn the_kernel_declares_only_the_builds_that_earned_one() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut declared = declared_kernel_features(root);
+        declared.sort();
+        assert_eq!(
+            declared,
+            [
+                "boot-actuators",
+                "debug-wait",
+                "fpu-save-nothing",
+                "loom",
+                "sched-check",
+                "test-actuators",
+                // Costs no kernel build at all, for `loom`'s reason: declared
+                // so `cfg` checking knows the name, and turned on only by
+                // `kernel-loom` — to remove §2.6a's two `SeqCst` fences and
+                // prove `log_wake` reds without them.
+                "wake-fence-off",
+            ],
+            "the kernel declares a feature `specs/assessments/test-cost-audit.md` §5.9.7 does not account for"
+        );
+    }
+
+    /// `test-actuators` is one name and pulls in nothing.
+    ///
+    /// The seven it replaced were seven kernel builds differing only in which
+    /// unreachable `SYS_DEBUG` arm they carried. Re-introducing one as an implied
+    /// feature rebuilds that, silently, and only this notices.
+    #[test]
+    fn the_actuator_umbrella_is_a_leaf() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text = fs::read_to_string(root.join("kernel/Cargo.toml")).expect("read the manifest");
+        let manifest: KernelManifest = toml::from_str(&text).expect("parse the manifest");
+        let implied = manifest
+            .features
+            .get("test-actuators")
+            .expect("the kernel declares no `test-actuators`");
+        assert!(
+            implied.is_empty(),
+            "`test-actuators` implies {implied:?}, so it is several kernel builds again"
+        );
+    }
+
     /// No image this repository ships starts sshd.
     ///
     /// It listens on every interface and authenticates against a file that is
     /// absent on a fresh install, so on a default boot it would be a port that
     /// accepts connections and refuses all of them. Whoever wants it runs
-    /// `/bin/sshd` themselves. It stays in `[programs]` — the gate is on the
-    /// init list, not on the binary being present.
+    /// `/bin/sshd` themselves. It stays in `[programs]` — the gate is on what
+    /// init starts, not on the binary being present.
     #[test]
     fn no_shipped_boot_config_starts_sshd() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         for boot in [Boot::Normal, Boot::Diag, Boot::Console] {
             let config = boot.config();
-            let init = parse_config(&root.join(config)).init;
+            let start = parse_config(&root.join(config)).boot.start;
             assert!(
-                !init.iter().any(|p| p.ends_with("/sshd")),
-                "{config} starts sshd from init: {init:?}",
+                !start.iter().any(|p| p == "sshd"),
+                "{config} starts sshd: {start:?}",
             );
         }
+    }
+
+    /// **Every config with a `[boot] start` runs `/bin/logd`, and `logread` is
+    /// held by exactly the programs that read a cursor.**
+    ///
+    /// `specs/log-architecture-spec.md` §5.1a and §9.5. The kernel stopped
+    /// writing `/log` at L6, so a boot config that does not start `logd` is an
+    /// image whose log partition stays empty for the whole of that boot — and on
+    /// the machine this subsystem exists for, a T14 with no serial port, that is
+    /// the boot with no record of itself anywhere. A thirteenth config added
+    /// later fails the first clause **by default**, which is the direction this
+    /// bound has to fail in.
+    ///
+    /// The second clause is the capability half: `logread` is
+    /// `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate, which is authority
+    /// over every record every CPU wrote, and a right with no caller is a
+    /// capability handed out for a plan. Two programs read a cursor —
+    /// `/bin/logd`, which writes the file, and `test-runner`, which runs the
+    /// conservation gates inside itself — so those two carry it and nothing
+    /// else may. `/bin/console` is the near miss the spec argues about: it
+    /// *could* show this boot's records live off a cursor instead of seeding
+    /// from the previous boot's files, and it does not hold the right until
+    /// something in it reads one.
+    ///
+    /// It reads the **parsed** `ProgramConfig` and never the file text (§3.2):
+    /// a grep over the TOML would pass on a row that is commented out and on a
+    /// key `serde` never saw.
+    #[test]
+    fn every_boot_config_runs_logd() {
+        const READERS: &[&str] = &["logd", "test-runner"];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for config in ALL_CONFIGS {
+            let parsed = parse_config(&root.join(config));
+            assert!(
+                parsed.boot.start.iter().any(|p| p == "logd"),
+                "{config} declares `[boot] start = {:?}` and no `logd` in it, so this image's \
+                 /log is empty for the whole boot",
+                parsed.boot.start,
+            );
+            assert!(
+                parsed.programs.contains_key("logd"),
+                "{config} starts `logd` and has no `[programs.logd]` row to say what it holds",
+            );
+            for (name, program) in &parsed.programs {
+                let holds = program.syscap.iter().any(|s| s == "logread");
+                assert_eq!(
+                    holds,
+                    READERS.contains(&name.as_str()),
+                    "{config}: `{name}` {} `logread`, and the programs that read a cursor are \
+                     exactly {READERS:?}",
+                    if holds { "holds" } else { "does not hold" },
+                );
+            }
+        }
+    }
+
+    /// The twelve `system.toml` files this repository builds an image from.
+    /// `every_shipped_boot_config_is_covered` asserts this equals what a walk of
+    /// the tree finds, so a config added without a gate row reds rather than
+    /// slipping through uncovered.
+    const ALL_CONFIGS: &[&str] = &[
+        "system.toml",
+        "diag/system.toml",
+        "console/system.toml",
+        "tests/desktopcase/system.toml",
+        "tests/desktopaudiocase/system.toml",
+        "tests/doomcase/system.toml",
+        "tests/doommusiccase/system.toml",
+        "tests/logrotatecase/system.toml",
+        "tests/metalcase/system.toml",
+        "tests/netcase/system.toml",
+        "tests/sshdcase/system.toml",
+        "tests/testcases/system.toml",
+    ];
+
+    fn load(cfg: &str) -> SystemConfig {
+        parse_config(&Path::new(env!("CARGO_MANIFEST_DIR")).join(cfg))
+    }
+
+    /// Every name a program `receives` must be served or provided by some
+    /// program in the *same* config, or served by init. The build-time form of
+    /// "a client cannot name a service the system does not have", and the gate
+    /// with the sharpest teeth: no guest, no mutated tree.
+    fn receives_have_providers(cfg: &SystemConfig) -> Result<(), String> {
+        let mut providers: Vec<&str> = INIT_SERVED.to_vec();
+        for prog in cfg.programs.values() {
+            providers.extend(prog.serves.iter().map(String::as_str));
+            providers.extend(prog.provides.iter().map(String::as_str));
+        }
+        for (name, prog) in &cfg.programs {
+            for r in &prog.receives {
+                if !providers.contains(&r.as_str()) {
+                    return Err(format!(
+                        "program `{name}` receives `{r}`, which no program serves or provides"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_receives_names_a_provider() {
+        for cfg in ALL_CONFIGS {
+            receives_have_providers(&load(cfg)).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        }
+        let bad: SystemConfig =
+            toml::from_str("init = []\n[programs.client]\nreceives = [\"ghost\"]\n").unwrap();
+        assert!(receives_have_providers(&bad).is_err());
+    }
+
+    /// A `serves` name is one port machine-wide; a `provides` name is one port
+    /// per instance. A name declared both ways is a config where init makes a
+    /// port nobody accepts from while the real one is made elsewhere.
+    fn provides_disjoint_from_serves(cfg: &SystemConfig) -> Result<(), String> {
+        let serves: Vec<&str> = cfg
+            .programs
+            .values()
+            .flat_map(|p| p.serves.iter().map(String::as_str))
+            .collect();
+        for (name, prog) in &cfg.programs {
+            for p in &prog.provides {
+                if serves.contains(&p.as_str()) {
+                    return Err(format!(
+                        "`{p}` is both a serves name and `{name}`'s provides name"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_provides_name_is_never_also_a_serves_name() {
+        for cfg in ALL_CONFIGS {
+            provides_disjoint_from_serves(&load(cfg)).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        }
+        let bad: SystemConfig = toml::from_str(
+            "init = []\n[programs.a]\nserves = [\"x\"]\n[programs.b]\nprovides = [\"x\"]\n",
+        )
+        .unwrap();
+        assert!(provides_disjoint_from_serves(&bad).is_err());
+    }
+
+    /// A device class init can mint exactly one claim for, so two programs
+    /// naming the same class is a config init cannot satisfy — a runtime
+    /// first-come race today.
+    fn one_claimant_per_device(cfg: &SystemConfig) -> Result<(), String> {
+        let mut seen: BTreeMap<&str, &str> = BTreeMap::new();
+        for (name, prog) in &cfg.programs {
+            for d in &prog.devices {
+                if let Some(prev) = seen.insert(d, name) {
+                    return Err(format!(
+                        "device class `{d}` is claimed by both `{prev}` and `{name}`"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_device_class_has_at_most_one_claimant() {
+        for cfg in ALL_CONFIGS {
+            one_claimant_per_device(&load(cfg)).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        }
+        let bad: SystemConfig = toml::from_str(
+            "init = []\n[programs.a]\ndevices = [\"framebuffer\"]\n\
+             [programs.b]\ndevices = [\"framebuffer\"]\n",
+        )
+        .unwrap();
+        assert!(one_claimant_per_device(&bad).is_err());
+    }
+
+    /// A class name the ABI does not know renders fine and leaves init with a
+    /// `devices` entry it cannot mint — a dead machine for a typo, where this is
+    /// a red in milliseconds. Same for a `syscap` right.
+    fn names_only_real_capabilities(cfg: &SystemConfig) -> Result<(), String> {
+        for (name, prog) in &cfg.programs {
+            for class in &prog.devices {
+                if toyos_manifest::DeviceType::from_class_name(class).is_none() {
+                    return Err(format!("`{name}` names device class `{class}`, which is not one"));
+                }
+            }
+            toyos_manifest::syscap_rights(&prog.syscap)
+                .map_err(|e| format!("`{name}`: {e}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_declared_capability_is_one_the_abi_has() {
+        for cfg in ALL_CONFIGS {
+            names_only_real_capabilities(&load(cfg)).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        }
+        let bad_class: SystemConfig =
+            toml::from_str("[programs.a]\ndevices = [\"gpu\"]\n").unwrap();
+        assert!(names_only_real_capabilities(&bad_class).is_err());
+        let bad_right: SystemConfig =
+            toml::from_str("[programs.a]\nsyscap = [\"root\"]\n").unwrap();
+        assert!(names_only_real_capabilities(&bad_right).is_err());
+    }
+
+    fn claims_no_device(cfg: &SystemConfig) -> Result<(), String> {
+        for (name, prog) in &cfg.programs {
+            if !prog.devices.is_empty() {
+                return Err(format!("program `{name}` claims {:?}", prog.devices));
+            }
+        }
+        Ok(())
+    }
+
+    /// The diagnostic image's whole reason for existing: nothing in it can claim
+    /// the framebuffer, so the kernel's boot log stays on the panel. `/bin/init`
+    /// is in every image and could reach a device, so the property becomes "the
+    /// config declares no `devices`" — checkable here for the first time.
+    #[test]
+    fn no_diag_program_claims_the_screen() {
+        claims_no_device(&load("diag/system.toml"))
+            .unwrap_or_else(|e| panic!("diag/system.toml: {e}"));
+        let bad: SystemConfig =
+            toml::from_str("init = []\n[programs.x]\ndevices = [\"framebuffer\"]\n").unwrap();
+        assert!(claims_no_device(&bad).is_err());
+    }
+
+    /// `[boot] start` names program keys, so a typo is a build error rather than
+    /// a refusal `/bin/init` reports at boot.
+    fn started_programs_are_declared(cfg: &SystemConfig) -> Result<(), String> {
+        for name in &cfg.boot.start {
+            if !cfg.programs.contains_key(name) {
+                return Err(format!("[boot] start names `{name}`, not a [programs] key"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_started_program_is_declared() {
+        for cfg in ALL_CONFIGS {
+            started_programs_are_declared(&load(cfg)).unwrap_or_else(|e| panic!("{cfg}: {e}"));
+        }
+        let bad: SystemConfig = toml::from_str("init = []\n[boot]\nstart = [\"ghost\"]\n").unwrap();
+        assert!(started_programs_are_declared(&bad).is_err());
+    }
+
+    fn walk_configs(dir: &Path, root: &Path, out: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let name = entry.file_name();
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                let skip = matches!(name.to_str(), Some("target") | Some("rust"))
+                    || name.to_string_lossy().starts_with('.');
+                if !skip {
+                    walk_configs(&path, root, out);
+                }
+            } else if name == "system.toml" {
+                out.push(path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+
+    /// `ALL_CONFIGS` is the list the gates above iterate; a config added without
+    /// a row would leave a hole in that coverage. Assert the list is exactly
+    /// what a walk of the tree finds, so it cannot silently drift.
+    #[test]
+    fn every_shipped_boot_config_is_covered() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut found = Vec::new();
+        walk_configs(root, root, &mut found);
+        found.sort();
+        let mut expected: Vec<String> = ALL_CONFIGS.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(found, expected);
     }
 }

@@ -1,43 +1,94 @@
-# Init programs (run at boot, in order)
-#
-# sshd is deliberately not here. It is built into the image and started by hand
-# (`/bin/sshd &`) on a machine that wants remote access: it listens on every
-# interface, so carrying it in every boot is a listening port nobody asked for.
+# sshd is deliberately not in `[boot] start`. It is built into the image and
+# started by hand (`/bin/sshd &`) on a machine that wants remote access: it
+# listens on every interface, so carrying it in every boot is a listening port
+# nobody asked for.
 # `src/build.rs`'s `no_shipped_boot_config_starts_sshd` is the gate.
-init = [
-    "/bin/compositor",
-    "/bin/soundd",
-    "/bin/netd",
-]
 
 hosted-rustc = false
 
 # `assets/soundfont.sf2` is in here and is doom's music: GeneralUser GS cut down
 # to the 37 melodic programs and 23 percussion keys `assets/DOOM1.WAD`'s own MUS
 # headers select, by `src/soundfont.rs`. `NOTICE` carries its licence and the
-# provenance caveat that comes with it; `specs/doom-music-soundfont.md` prices
+# provenance caveat that comes with it; `specs/assessments/doom-music-soundfont.md` prices
 # the alternatives, including the zero-byte OPL3 path that may one day delete it.
 assets = ["assets"]
 
+# What `/bin/init` starts at boot. Program keys, not paths, and the order means
+# nothing: every port exists before any server runs.
+[boot]
+# `filepicker` is a `serves` daemon like the three beside it: a machine-wide
+# port with one server, started where every other one is. It was called interim
+# while the compositor had no way to ask for a program's *declared* authority —
+# the launcher gives it one, and starting a service from `[boot] start` is not
+# the thing that needed fixing.
+start = ["logd", "compositor", "soundd", "netd", "filepicker"]
+
 [programs]
-shell = {}
-terminal = {}
-compositor = {}
-soundd = {}
-netd = {}
-sshd = {}
-doom = {}
-snake = {}
-editor = {}
-paint = {}
-files = {}
-filepicker = {}
-toybox = {}
 input-test = {}
 proctest = {}
 toyos-ld = { path = "toyos-ld" }
 toyos-cc = { path = "toyos-cc" }
 # cargo = { path = "userland/cargo", no-default-features = true }
+
+# **Every image that carries a `TOYOS-LOG` partition runs this**, and every
+# image does. The kernel stopped writing files at L6 of
+# `specs/log-architecture-spec.md`, so a boot config without `logd` is a boot
+# whose `/log` is empty — `every_boot_config_runs_logd` is what refuses one.
+# It claims no device and serves no port yet (§5.1, §5.2): its whole authority
+# is `logread`, which is `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
+[programs.logd]
+syscap = ["logread"]
+
+[programs.compositor]
+serves = ["compositor"]
+receives = ["soundd", "filepicker", "launcher"]
+devices = ["framebuffer", "keyboard", "mouse"]
+
+[programs.soundd]
+serves = ["soundd"]
+devices = ["hda-audio", "virtio-sound"]
+syscap = ["rt"]
+
+[programs.netd]
+serves = ["netd"]
+devices = ["nic"]
+
+[programs.sshd]
+receives = ["netd", "launcher"]
+
+[programs.filepicker]
+serves = ["filepicker"]
+receives = ["compositor"]
+
+[programs.terminal]
+provides = ["surface"]
+receives = ["compositor", "launcher"]
+
+[programs.shell]
+receives = ["surface", "launcher"]
+
+[programs.doom]
+receives = ["compositor", "soundd"]
+
+[programs.snake]
+receives = ["compositor", "filepicker"]
+
+# calc opens a window and reads nothing off the disk, so a connector to the
+# compositor is the whole of its authority.
+[programs.calc]
+receives = ["compositor"]
+
+[programs.editor]
+receives = ["compositor", "filepicker"]
+
+[programs.paint]
+receives = ["compositor", "filepicker"]
+
+[programs.files]
+receives = ["compositor", "filepicker"]
+
+[programs.toybox]
+receives = ["compositor", "soundd", "surface"]
 
 # Symlinks created in the initrd at build time.
 # Paths are relative to the filesystem root (no leading /).

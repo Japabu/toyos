@@ -8,19 +8,48 @@
 # one this config left out, so nothing anywhere ran the branch where it finds
 # no network. It costs the boot the second `NetdConn::connect_blocking` spends
 # retrying a netd that will never come
-# (`specs/issues/hardware/network-clients-pay-a-boot-retry.md`), which is the price of
+# (`hardware/network-clients-pay-a-boot-retry`, since closed), which is the price of
 # certifying the line at all.
 # test-runner makes the boot announce itself, so the harness waits for a
 # marker instead of guessing from pixels — and it is what lets an in-guest
 # binary run on the machine shape that gets flashed. Under `mute` it simply
 # parks on a console that never produces a byte.
-init = ["/bin/compositor", "/bin/soundd", "/bin/netd", "/bin/sshd", "/bin/test-runner"]
 
 assets = ["assets"]
 
-[programs]
-compositor = {}
-soundd = {}
-netd = {}
-sshd = {}
-test-runner = {}
+[boot]
+start = ["logd", "compositor", "soundd", "netd", "sshd", "test-runner"]
+
+# **Every image that carries a `TOYOS-LOG` partition runs this**, and every
+# image does. The kernel stopped writing files at L6 of
+# `specs/log-architecture-spec.md`, so a boot config without `logd` is a boot
+# whose `/log` is empty — `every_boot_config_runs_logd` is what refuses one.
+# It claims no device and serves no port yet (§5.1, §5.2): its whole authority
+# is `logread`, which is `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
+[programs.logd]
+syscap = ["logread"]
+
+[programs.compositor]
+serves = ["compositor"]
+receives = ["soundd", "launcher"]
+devices = ["framebuffer", "keyboard", "mouse"]
+
+[programs.soundd]
+serves = ["soundd"]
+devices = ["hda-audio", "virtio-sound"]
+syscap = ["rt"]
+
+[programs.netd]
+serves = ["netd"]
+devices = ["nic"]
+
+[programs.sshd]
+receives = ["netd", "launcher"]
+
+# The union its guest binaries need on this machine shape.
+# `logread` is the log gate's own: a spawned test binary does not inherit a
+# `SysCap` dup, so the gate that reads the kernel's records runs inside
+# `test-runner` itself (`specs/log-architecture-spec.md` §3.2, §9.5).
+[programs.test-runner]
+receives = ["compositor", "soundd", "netd"]
+syscap = ["logread"]

@@ -2,7 +2,7 @@
 //!
 //! Separate from the tests because the simulator checks these after *every*
 //! step of every generated sequence, where a test checks an outcome after a
-//! sequence it chose. `specs/xhci-port-machine-plan.md` §3 X0 lists them.
+//! sequence it chose. `specs/plans/xhci-port-machine-plan.md` §3 X0 lists them.
 
 use crate::port::{PortState, Step};
 use crate::portsc::{self, Portsc};

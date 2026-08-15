@@ -329,6 +329,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "calc"
+version = "0.1.0"
+dependencies = [
+ "font",
+ "fontdue",
+ "softbuffer",
+ "winit",
+]
+
+[[package]]
 name = "cbc"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1516,6 +1526,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "init"
+version = "0.1.0"
+dependencies = [
+ "toyos",
+ "toyos-abi",
+ "toyos-manifest",
+]
+
+[[package]]
 name = "inout"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1731,6 +1750,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
+name = "logd"
+version = "0.1.0"
+dependencies = [
+ "toyos",
+ "toyos-abi",
+ "toyos-wallclock",
+]
+
+[[package]]
 name = "mach2"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1770,7 +1798,7 @@ dependencies = [
 [[package]]
 name = "mio"
 version = "1.2.0"
-source = "git+https://github.com/Japabu/mio?branch=toyos#6356461d5e2cb467c1b815b58efafe1adb47de65"
+source = "git+https://github.com/Japabu/mio?branch=toyos#e8068c286627f60a299f842726d998e909e032aa"
 dependencies = [
  "libc",
  "toyos",
@@ -3172,6 +3200,9 @@ dependencies = [
 [[package]]
 name = "shell"
 version = "0.1.0"
+dependencies = [
+ "toyos",
+]
 
 [[package]]
 name = "shlex"
@@ -3270,7 +3301,7 @@ dependencies = [
 [[package]]
 name = "socket2"
 version = "0.6.3"
-source = "git+https://github.com/Japabu/socket2?branch=toyos#6b23a957f06ffbc08d8a259af5985078cf88f2de"
+source = "git+https://github.com/Japabu/socket2?branch=toyos#b55ee41fc88613ce73c628c9eb503996eba80832"
 dependencies = [
  "libc",
  "toyos",
@@ -3452,6 +3483,10 @@ dependencies = [
 [[package]]
 name = "test-runner"
 version = "0.1.0"
+dependencies = [
+ "toyos",
+ "toyos-abi",
+]
 
 [[package]]
 name = "thiserror"
@@ -3609,6 +3644,17 @@ version = "0.1.0"
 
 [[package]]
 name = "toyos-keymap"
+version = "0.1.0"
+
+[[package]]
+name = "toyos-manifest"
+version = "0.1.0"
+dependencies = [
+ "toyos-abi",
+]
+
+[[package]]
+name = "toyos-wallclock"
 version = "0.1.0"
 
 [[package]]

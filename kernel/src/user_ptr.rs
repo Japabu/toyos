@@ -45,16 +45,24 @@ unsafe impl UserSafe for [u32; 2] {}
 unsafe impl UserSafe for [u64; 2] {}
 
 // Kernel types.
-unsafe impl UserSafe for crate::fd::Stat {}
+unsafe impl UserSafe for crate::object::ops::Stat {}
 
 // ABI types.
 unsafe impl UserSafe for toyos_abi::syscall::SpawnArgs {}
+unsafe impl UserSafe for toyos_abi::syscall::NamespaceBuild {}
 unsafe impl UserSafe for toyos_abi::syscall::SchedInfo {}
 unsafe impl UserSafe for toyos_abi::syscall::ProcessStats {}
 unsafe impl UserSafe for toyos_abi::FramebufferInfo {}
+unsafe impl UserSafe for toyos_abi::syscall::IoUringSetup {}
 
 unsafe impl UserSafe for toyos_abi::input::RawKeyEvent {}
 unsafe impl UserSafe for toyos_abi::input::MouseEvent {}
+
+/// 88 bytes of `u32`, `u32`, `u64`, `u64` and `[u64; 8]` — `#[repr(C)]`, no
+/// padding by its own `const` size assertion, and valid for every bit pattern:
+/// the kernel clamps each number where it uses it rather than trusting it where
+/// it arrives (`log::read::Cursor::from_reader`).
+unsafe impl UserSafe for toyos_abi::log::LogCursor {}
 
 /// Translate a user virtual address to its direct-map address, demand-paging
 /// it in if it is not mapped yet.
@@ -205,7 +213,7 @@ impl<'a> SyscallContext<'a> {
 ///
 /// Read-only, and [`UserBytesMut`] is the other direction, because `&[u8]` and
 /// `&mut [u8]` told a syscall's two paths apart and a single type would not:
-/// `SYS_WRITE`'s buffer is the caller's to read and nothing below `fd::try_write`
+/// `SYS_WRITE`'s buffer is the caller's to read and nothing below `ops::try_write`
 /// has any business storing into it.
 pub struct UserBytes<'a> {
     kptr: *const u8,
@@ -310,11 +318,14 @@ impl UserBytesMut<'_> {
 
 /// Bytes the kernel copies *from*, wherever they live.
 ///
-/// Exists for one caller: `file_cache::write_page` is reached both by a syscall
-/// carrying a [`UserBytes`] window and by `log_file`, whose bytes are the
-/// kernel's own. A slice cannot express the first and a `UserBytes` cannot
-/// express the second, so the page cache names the capability it needs instead
-/// of one of the two representations.
+/// It existed for two callers: `file_cache::write_page` was reached both by a
+/// syscall carrying a [`UserBytes`] window and by `log_file`, whose bytes were
+/// the kernel's own. **`log_file` is gone at L6 of
+/// `specs/log-architecture-spec.md`** and `/bin/logd` reaches the page cache
+/// through `SYS_WRITE` like any other program, so the second caller is a
+/// kernel-owned buffer no more. The abstraction stays because the page cache
+/// naming the capability it needs is still the right shape and the kernel still
+/// has non-syscall writers; if it ever has none, this goes with them.
 pub trait ByteSource {
     fn len(&self) -> usize;
     fn read_at(&self, off: usize, dst: &mut [u8]);

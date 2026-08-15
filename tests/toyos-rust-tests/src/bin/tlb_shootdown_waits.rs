@@ -3,7 +3,7 @@
 //!
 //! **Why this needs an actuator at all.** A correct wait and no wait whatsoever
 //! measure the same zero on a machine where every CPU answers in microseconds,
-//! so nothing a guest can do distinguishes them. `test-tlb-ack-delay` makes the
+//! so nothing a guest can do distinguishes them. `SYS_DEBUG` action 12 makes the
 //! last CPU an initiator waits for answer late — after flushing, so what is
 //! staged is a slow answer and never an incorrect one — and the wait becomes a
 //! duration userland can read off its own clock.
@@ -17,7 +17,7 @@
 //! landed within microseconds, so the window it left open is far below anything
 //! a guest can schedule into. What is gated instead is the property that closes
 //! the window — the free happens after the flush — measured where it is
-//! observable. `specs/memory-boundary-spec.md` §3.3 carries that reasoning.
+//! observable. `specs/plans/memory-boundary-spec.md` §3.3 carries that reasoning.
 
 use toyos_abi::syscall::{self, MmapFlags, MmapProt, SYS_DEBUG};
 
@@ -34,8 +34,7 @@ const FLOOR_NANOS: u64 = DELAY_NANOS / 2;
 
 const PAGE_2M: usize = 2 * 1024 * 1024;
 
-const ARM: u64 = 12;
-const DISARM: u64 = 13;
+use toyos_abi::syscall::debug_action::{TLB_ACK_DELAY_ARM as ARM, TLB_ACK_DELAY_DISARM as DISARM};
 
 fn debug(action: u64, arg: u64) -> u64 {
     let ret: u64;

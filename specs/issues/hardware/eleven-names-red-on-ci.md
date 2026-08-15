@@ -6,12 +6,19 @@ opened: 2026-08-08
 
 # Eleven names are red on CI, at a rate that is now measured
 
+**Do not answer "is this test known-red" out of this file.** Every table and
+every list below is transcribed into `src/redlist.rs`, one row per measurement,
+and `cargo run -- --known-red <test>` is what answers. A `rg` here hits the
+twelve names that came *off* the list exactly as readily as the eleven that are
+on it, and that has been read the wrong way round. What is here is the reasoning
+and the evidence; what is there is the verdict.
+
 Supersedes *a runner reds a rotating handful every run, and the rate is
 unmeasured*, whose whole ask was this run. `probe-rate.yml`, run `31258202923`,
 tree `f8f73e1`: **five reps of the exact twelve-shard configuration `ci.yml`
 runs** — same image, same accelerator, same `--jobs 1` — sixty jobs, **all sixty
 finished**, 292 tests each, 1460 outcomes. **281 of the 292 names were green in
-all five.** `specs/ci-plan.md` §9.1 has the per-shard clocks.
+all five.** `specs/assessments/ci-plan-assessment-2026-08.md` §9.1 has the per-shard clocks.
 
 | test | red | shard | `Sched` | what it says |
 |---|---|---|---|---|

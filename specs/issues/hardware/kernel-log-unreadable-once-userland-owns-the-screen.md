@@ -9,8 +9,9 @@ opened: 2026-08-01
 The T14 booted from `target/bootable-diet.img` (sha256
 `9bda620d…e531aa`, the file still on disk and re-hashed) and reached the
 compositor with the integrated keyboard and the TrackPoint dead. The driver's
-entire contingency for that — `specs/metal-boot-plan.md` M2, the pre-flash
-gate's "what this gate does NOT cover" item 1, and `1bf5f61`'s commit message —
+entire contingency for that — `specs/plans/metal-boot-plan.md` M2, the
+pre-flash checklist's "what this gate does NOT cover" item 1, and `1bf5f61`'s
+commit message —
 is **"one loud line on the laptop's own screen instead of a bisect"**. That line
 is not readable, and this is the defect that made the first metal input attempt
 uninterpretable.
@@ -140,5 +141,5 @@ Three things it does **not** give, in the order they will bite:
   render the three-byte sequence as a single `-`; the honest one is to stop
   putting non-ASCII in `log!`.
 
-`specs/metal-log-capture.md` is the durable version of the same problem and its
+`specs/assessments/metal-log-capture.md` is the durable version of the same problem and its
 Phase 2 fixed the *panic* half only.

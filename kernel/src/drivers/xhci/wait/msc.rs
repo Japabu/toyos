@@ -123,7 +123,6 @@ impl MscDevice {
 
     /// Which slot this disk is on, for a caller holding an event that needs to
     /// know whether a disk is behind it.
-    #[cfg(feature = "usb-slow-device")]
     pub fn slot_id(&self) -> u8 {
         self.slot_id
     }
@@ -229,7 +228,7 @@ impl core::fmt::Display for Broke {
 /// state a transfer that ran out [`USB_TIMEOUT_NS`] leaves behind. So the
 /// recovery below runs against a real endpoint state, which is the whole thing
 /// under test. Same reason `xhci-one-slot` and `xhci-slow-connect` exist.
-#[cfg(feature = "usb-transport-break")]
+#[cfg(feature = "boot-actuators")]
 mod transport_break {
     use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -238,6 +237,9 @@ mod transport_break {
 
     /// Called where the driver is about to run a WRITE(10) data phase.
     pub fn arm() {
+        if !crate::actuator::usb_transport_break() {
+            return;
+        }
         ARMED.store(UNSPENT.swap(false, Ordering::Relaxed), Ordering::Relaxed);
     }
 
@@ -267,7 +269,7 @@ mod transport_break {
 /// Only the residue is the injection's, and it names bytes that really are not
 /// this transfer's. Same reason `usb-transport-break` and `xhci-one-slot`
 /// exist.
-#[cfg(feature = "usb-short-read")]
+#[cfg(feature = "boot-actuators")]
 pub(in crate::drivers::xhci) mod short_read {
     use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -283,6 +285,9 @@ pub(in crate::drivers::xhci) mod short_read {
     static ARMED: AtomicBool = AtomicBool::new(false);
 
     pub fn arm() {
+        if !crate::actuator::usb_short_read() {
+            return;
+        }
         ARMED.store(true, Ordering::Relaxed);
     }
 
@@ -376,13 +381,15 @@ fn log_refusal(cdb: &[u8], key: u8, asc: u8, ascq: u8) {
 /// cache answers, and must not be a failure; HARDWARE ERROR / INTERNAL TARGET
 /// FAILURE is a flush that was tried and did not work, and must reach the
 /// caller as one.
-const FLUSH_SENSE: Option<(u8, u8, u8)> = if cfg!(feature = "usb-flush-unimplemented") {
-    Some((0x05, 0x20, 0x00))
-} else if cfg!(feature = "usb-flush-fails") {
-    Some((0x04, 0x44, 0x00))
-} else {
-    None
-};
+fn flush_sense() -> Option<(u8, u8, u8)> {
+    if crate::actuator::usb_flush_unimplemented() {
+        Some((0x05, 0x20, 0x00))
+    } else if crate::actuator::usb_flush_fails() {
+        Some((0x04, 0x44, 0x00))
+    } else {
+        None
+    }
+}
 
 /// Which way a block transfer moves, so one batching loop serves both without
 /// a `&[u8]` pretending to be a `&mut [u8]`.
@@ -441,7 +448,7 @@ impl XhciController {
             // a cache flush above a block device can mean.
             let cdb = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
             let issued = ctrl.scsi(dev, &cdb, 10, 0, 0, false);
-            let outcome = match FLUSH_SENSE {
+            let outcome = match flush_sense() {
                 Some((key, asc, ascq)) => Scsi::Refused { key, asc, ascq },
                 None => issued,
             };
@@ -708,11 +715,11 @@ impl XhciController {
         // the CSW's residue is checked against below.
         let mut moved = 0u32;
         if data_len > 0 {
-            #[cfg(feature = "usb-transport-break")]
+            #[cfg(feature = "boot-actuators")]
             if cdb.first() == Some(&0x2A) {
                 transport_break::arm();
             }
-            #[cfg(feature = "usb-short-read")]
+            #[cfg(feature = "boot-actuators")]
             let held = short_read::hold(
                 &dma,
                 (data_phys - dma.phys()) as usize,
@@ -720,7 +727,7 @@ impl XhciController {
                 data_in && cdb.first() == Some(&0x28),
             );
             let completion = self.bulk(dev, data_in, data_phys, data_len);
-            #[cfg(feature = "usb-short-read")]
+            #[cfg(feature = "boot-actuators")]
             let completion = short_read::release(&dma, held, completion);
             match completion {
                 Some((CC_SUCCESS | CC_SHORT_PACKET, unmoved)) => {
@@ -809,7 +816,7 @@ impl XhciController {
         ring.enqueue(trb);
         let slot = dev.slot_id;
         self.ring_doorbell(slot, dci);
-        #[cfg(feature = "usb-transport-break")]
+        #[cfg(feature = "boot-actuators")]
         if transport_break::take() {
             return None;
         }
@@ -977,7 +984,7 @@ pub(in crate::drivers::xhci) fn prepare(
 ///
 /// **The last blocking path a scheduler pass can reach**, and the one door in
 /// the split X2b builds: everything below is Bulk-Only Transport, which is a
-/// machine of its own and `specs/xhci-port-machine-plan.md` X2c is where it
+/// machine of its own and `specs/plans/xhci-port-machine-plan.md` X2c is where it
 /// gets one. A hot-plugged disk has to be brought up by *some*body and there is
 /// no other context that may block, so until then this runs where it always
 /// did.

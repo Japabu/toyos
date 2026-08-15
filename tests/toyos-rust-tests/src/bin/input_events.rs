@@ -9,6 +9,9 @@
 
 use std::time::{Duration, Instant};
 use toyos::device::{Keyboard, Mouse};
+use toyos::endow::Endowments;
+use toyos::syscap::SysCap;
+use toyos_abi::syscall::{DeviceType, SYSCAP_LABEL};
 use toyos_abi::input::RawKeyEvent;
 
 const KEY_SIZE: usize = std::mem::size_of::<RawKeyEvent>();
@@ -19,8 +22,10 @@ const MOUSE_SIZE: usize = 6;
 const RIGHT: u8 = 0x02;
 
 fn main() {
-    let keyboard = Keyboard::open().expect("input_events: no keyboard device");
-    let mouse = Mouse::open().expect("input_events: no mouse device");
+    let cap = capability();
+    let keyboard: Keyboard =
+        cap.claim(DeviceType::Keyboard).expect("input_events: no keyboard device");
+    let mouse: Mouse = cap.claim(DeviceType::Mouse).expect("input_events: no mouse device");
     let mut translator = window::configured_translator();
     println!("===INPUT_READY===");
 
@@ -78,4 +83,14 @@ fn main() {
         }
     }
     println!("input done keys={keys} pointer={pointer}");
+}
+
+/// The device-minting capability the test estate is endowed
+/// (`specs/capability-endowment-spec.md` §3). A claim is `/bin/init`'s to
+/// mint everywhere else; here test-runner passes a `DEVICE` duplicate down, so
+/// a boot can run several binaries that each need an input device.
+fn capability() -> SysCap {
+    Endowments::get()
+        .take(SYSCAP_LABEL)
+        .expect("the test estate is endowed a device-minting capability")
 }

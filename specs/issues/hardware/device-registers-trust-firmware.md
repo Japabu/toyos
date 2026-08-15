@@ -23,6 +23,6 @@ be wrong: `mtrr::range_type` can answer per BAR and no boot has been asked.
 
 The measurement that decides it: log `range_type` for each BAR `map_mmio` is
 given, on the T14 and on QEMU, and see whether any comes back other than UC.
-`specs/userspace-drivers-spec.md` §"It works because firmware's MTRRs make the
+`specs/plans/userspace-drivers-spec.md` §"It works because firmware's MTRRs make the
 PCI hole uncacheable" and `specs/iommu-spec.md` both record the same
 dependency; this is the entry that says the machinery to remove it now exists.

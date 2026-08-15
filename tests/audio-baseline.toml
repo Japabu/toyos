@@ -1,6 +1,6 @@
 # Audio gate (gate A) baselines — one section per (test, smp) config.
-# specs/scheduler-core-spec.md §11, specs/audio-subsystem-spec.md §5.4/§5.9,
-# specs/audio-glitch-distribution-2026-07-28.md.
+# specs/testing-strategy.md §5, specs/audio-subsystem-spec.md §5.4/§5.9,
+# specs/assessments/audio-glitch-distribution-2026-07-28.md.
 #
 # Every config must appear here. A missing section is a hard error, not a
 # pass: an ungated config would go green by omission.
@@ -33,36 +33,38 @@
 #                     the count site in soundd for the two conditions.
 #   underruns         Periods submitted with no client audio behind them.
 #
-# RE-RECORDED 2026-07-31 on tree 17a6c88, justified by a measured mechanism
-# change: the drain_irqs audio completion fan-out (aeeaa01) restored the CQE
-# path Stage 7a (f4d8fa7) had unintentionally deleted, so a streaming soundd
-# now wakes on the completion IRQ instead of on its own DLL timer guessing
-# when the completion will land. The prior sample (2026-07-29, f9dc851 — see
-# git log for its full narrative) was measured on the half-wired kernel and
-# describes timer-quantised behaviour this kernel no longer has.
+# RE-RECORDED 2026-08-15 on tree 4c7d809, justified by an instrument change:
+# the dev host's QEMU moved 11.0.3 -> 11.1.0 (owner-approved upgrade; CI's
+# runner had already moved and `.github/qemu-version` declares 11.1.0), and
+# `specs/assessments/ci-plan-assessment-2026-08.md` §7.3 is the measurement
+# that the QEMU version decides verdicts — so every comparison of a fresh
+# 11.1.0 arm against the 11.0.3 sample was cross-instrument and void. The
+# prior sample (2026-07-31, 17a6c88 — see git log for its full narrative,
+# including the CQE fan-out A/B that justified it) described the old
+# instrument.
 #
-# The re-record was gated on a same-session A/B, 30 iterations per arm, arms
-# BASE=bcf1fa1 (pre-fan-out) and NEW=17a6c88, machine agent-quiet:
+# The recording was taken TWICE, back to back, 30 iterations per arm, and the
+# second run is the sample below — its host-conditions line is the clean one
+# (1-min load 1.2-2.1). The first run, whose load briefly spiked to 10.2,
+# reproduces the second's shape, which is the control that says the shift is
+# the instrument and not the spike:
 #
-#   max_wake_lat_us  medians 7.4-7.8ms -> 6.7-7.1ms, DOWN on all four configs
-#                    (z 3.6-5.2). The timer-arming quantisation is gone from
-#                    the tail: worst observed fell 11.0 -> 10.1ms (tone.smp1)
-#                    and 9.9 -> 8.1ms (load.smp8).
-#   wakes            medians -3% to -18%, DOWN on all four (z 5.0-6.3). Timer
-#                    wakes that found no completions yet are gone; the ring
-#                    wakes exactly when work exists. The BASE load configs
-#                    were bimodal (~840 vs ~1050 clusters — timer phase);
-#                    NEW collapses each to one tight mode.
-#   harm             null in BOTH arms: underruns all-zero, drains all-zero
-#                    (z=0.00), dropouts 0/120 and 0/120, ceiling breaches
-#                    0/120 and 0/120.
+#   max_wake_lat_us  medians, old -> run1 / run2:
+#                    tone.smp1  6698 -> 9123 / 8972   UP ~34%
+#                    tone.smp8  6658 -> 8626 / 9249   UP ~30-39%
+#                    load.smp1  7042 -> 5813 / 5765   DOWN ~18%
+#                    load.smp8  7134 -> 6121 / 6097   DOWN ~15%
+#                    The no-load configs got slower and the load configs got
+#                    faster on 11.1.0 — a reshuffle only an instrument change
+#                    produces; a kernel regression does not speed up the
+#                    harder case.
+#   harm             null in BOTH runs: underruns all-zero, drains all-zero,
+#                    dropouts 0/120 and 0/120, ceiling breaches 0/120 and
+#                    0/120. The quality bar holds on the new instrument.
 #
-# Fewer, better-timed wakes with zero starvation is the desired direction;
-# the gate correctly flagged the wakes decrease against the old sample on all
-# four configs, which is exactly the "understood and justified" re-record
-# case this file's protocol demands — and the only such case: a green run
-# would have needed no re-record, and a harm-measure shift would have been a
-# regression to fix, not to re-record around.
+# This recording also takes the `wakes` re-record the fourth drift instance
+# below recorded as owed-but-not-taken: the mechanism that paragraph was
+# waiting for is the instrument itself.
 #
 # Drift note, third instance: the BASE arm itself — zero suspend-series
 # commits — failed the old sample on audio_tone.smp1 wakes (median 1011 ->
@@ -91,6 +93,46 @@
 # 6691 with the sink off, 7346 with it on (recorded 6658). That is the ESP
 # log's residual flush cost on the idle path, not drift, and it is written up
 # in `specs/issues/boot-media/` rather than recorded here.
+#
+# Drift note, FIFTH instance, 2026-08-15, and the first one measured against
+# the sample below rather than against a superseded one — so the instrument
+# argument that closed the fourth instance does not apply to it. Two N=30 arms
+# back to back (904 s and 907 s), differing only in the four soundd commits of
+# `wt/toyos-soundfix`; BASE is `a0729cf`, the tree this sample was recorded on:
+#
+#                                  recorded   soundfix     BASE a0729cf
+#   audio_tone.smp1  wakes              882   870 z=3.47   870 z=3.14
+#   audio_tone.smp8  wakes              877   849 z=5.29   854 z=5.44
+#   audio_tone_load.smp1 wake_lat      5765   6051 pass    6151 z=3.54
+#
+# `wakes` reds downward in BOTH arms again, and the BASE arm reds one statistic
+# MORE than the branch under test. Harm null in both: underruns 0/0/0 in all
+# eight config-arms, dropouts 0/120 and 0/120, ceiling breaches 0/120 and
+# 0/120, drains all-zero except a single run in BASE's audio_tone_load.smp8.
+# That is five consecutive sessions of fewer-wakes-all-harm-clean, two of them
+# now with a same-session control.
+#
+# What is new here is a candidate mechanism, which is what this file's protocol
+# has been waiting for and what the fourth instance could not offer. The
+# conditions differ in the one figure that is exact rather than lagging:
+#
+#   recorded   qemu 3-3, toyos-build 1-1, 1-min load 1.2-2.1 (median 1.6)
+#   soundfix   qemu 1-1, toyos-build 1-2, 1-min load 1.0-8.6 (median 2.3)
+#   BASE       qemu 3-3, toyos-build 2-2, 1-min load 0.9-2.3 (median 1.6)
+#
+# `wakes` counts iterations of a loop woken by completions and by a predicted
+# timeout, and the pipeline retires in batches of 8 on this host in every run of
+# all three: fewer wakes for the same ~1110 periods submitted is the host
+# handing soundd more completions per wake. A guest sharing the host with two
+# other guests is descheduled more often, which is more wakes, not fewer — so
+# the *recorded* arm being the contended one is the direction that matches.
+# Not established: the BASE arm above ran at `qemu 3-3` like the recording and
+# still red, so competition alone does not close it either. Recorded as the
+# next thing to test, not as the answer.
+#
+# NO RE-RECORD IS TAKEN HERE. Not by this branch and not for this statistic:
+# the owner's ruling and this file both want a mechanism first, and a candidate
+# is not one.
 #
 # Why the counters are here at all: the wav is a rare-event detector. One 3s
 # tone samples ~1100 device periods once per run, so it only fires when a
@@ -144,15 +186,13 @@
 # will not announce itself either.
 #
 # WHAT THESE NUMBERS ADMIT. The spec-derived bar — never wake later than the
-# pipeline you are feeding — is met on all 120 config-runs. The median sits at
-# roughly a third of a pipeline depth (6652-7130us across the four configs) and
-# the worst single run reaches 0.43 pl (10090us, on `audio_tone.smp1`); no run
-# on any config reached a whole pipeline depth, and `ceiling_runs` is 0
-# everywhere. The previous sample's tail pair on `audio_tone.smp1` — 54345 and
-# 56909us, 2.3-2.5 pl, one of them the only ceiling breach this file has
-# recorded — did not reappear. It was suspected host suspend, and the ceiling
-# was deliberately left where it was rather than raised to cover it, so if the
-# tail is real the next sample says so.
+# pipeline you are feeding — is met on all 120 config-runs. The medians span
+# 5765-9249us across the four configs (a quarter to two-fifths of a pipeline
+# depth) and the worst single run reaches 0.98 pl (22744us, on
+# `audio_tone.smp1`) — under a whole pipeline depth, but barely, and the
+# ceilings stay where they are so a tail that grows says so. `ceiling_runs`
+# is 0 everywhere. The 54/57ms suspected-suspend tail pair did not reappear
+# in either 11.1.0 run.
 #
 # The three paragraphs this replaced said the bar was NOT met on any config,
 # blamed "mode-B client misses under single-CPU load", and described
@@ -199,7 +239,7 @@
 #   What it CANNOT certify: any statement about a rate. One run is one sample.
 #
 # THOROUGH TIER — `cargo test --test toyos-build -- --audio-gate 30`, ~17 minutes.
-#   What a scheduler-migration stage transition gates on (spec §11 gate A).
+#   What the nightly runs (specs/testing-strategy.md §5).
 #   N iterations of all four configs; every per-run outcome becomes a rate or a
 #   distribution, and the fresh sample is compared against the RECORDED SAMPLE
 #   below — Mann-Whitney for the counters, Fisher exact for the yes/no
@@ -293,41 +333,40 @@
 #   A real measurement, and the reason the 1-minute figure leads the triple: a
 #   fresh reading compares directly against it.
 #
-#   2026-07-31, THE SAMPLE BELOW — the one both tiers compare against: "quiet
-#   host, one QEMU at a time, no concurrent agents or builds for the whole
-#   session". That is an attestation by whoever took it, not a measurement, and
-#   no per-run conditions were stored. It cannot be recovered in retrospect: the
-#   runs are gone and nothing sampled the host while they ran.
+#   2026-08-15, THE SAMPLE BELOW — the one both tiers compare against — closes
+#   the asymmetry the previous recording left: its conditions are MEASURED,
+#   the line the gate itself printed over the recording run:
 #
-# So the thorough tier's Mann-Whitney and Fisher comparisons run between a fresh
-# arm whose conditions are measured and a recorded arm whose conditions are
-# attested, and that bounds what a rejection means. It is a further reason —
-# beyond the four drift instances above — that only a same-session A/B is worth
-# acting on. The next re-record closes it by carrying the
-# `host conditions over N runs` line the gate now prints.
+#     host conditions over 120 runs: 1-min load 1.2-2.1 (median 1.6),
+#     qemu 3-3, toyos-build 1-1
+#
+#   So both arms of every future thorough-tier comparison rest on measured
+#   conditions, which is what the previous version of this paragraph asked the
+#   next re-record to deliver.
 #
 # ===========================================================================
 # THE RECORDED SAMPLE
 # ===========================================================================
 #
-# 30 serial invocations of the audio suite, quiet host (one QEMU at a time,
-# no concurrent agents or builds for the whole session), tree 17a6c88 —
-# the NEW arm of the same-session A/B described at the top of this file.
+# 30 serial invocations of the audio suite, tree 4c7d809, QEMU 11.1.0, the
+# second of the two back-to-back recordings described at the top of this
+# file; measured conditions: 1-min load 1.2-2.1 (median 1.6), qemu 3-3,
+# toyos-build 1-1, no concurrent agents.
 #
 # Zero parse casualties this pass: all 120 config-runs produced a full stats
 # line and a gap histogram (`gap_sample` = 30 everywhere), every capture
-# analyzed `gaps: none`, dither 24.5-25.9% against the 25% expectation.
+# analyzed `gaps: none`.
 #
 # `ceiling_runs` is 0 everywhere: no run in 120 breached the per-run limits
 # above. That is the intended relationship between the tiers — the ceilings are
 # a catastrophe detector, the distributions are the sensitive instrument.
 
 [audio_tone.smp1]
-# wake_lat median 6686us, max 10090us (0.43 pl); drains 0; underruns 0.
-# Dropouts: 0 of 30. No run's worst wake reached a pipeline depth. The old
-# sample's 54/57ms tail pair (suspected host suspend, and the config that
-# breached its ceiling 1/120) did not reappear; worst is now 10.1ms. Ceiling
-# kept at the 2026-07-29 derivation — 5.6x the observed maximum.
+# wake_lat median 8972us, max 22744us (0.98 pl); drains 0; underruns 0.
+# Dropouts: 0 of 30. The worst run sits just under one pipeline depth — the
+# widest tail of the four configs on 11.1.0, and both recording runs put it
+# here (run 1's max was 14953). Ceiling kept at the 2026-07-29 derivation,
+# now 2.46x the observed maximum — still above the 2x rule.
 max_wake_lat_us = 56000   # 2.41 pl
 drains = 8
 underruns = 40
@@ -336,19 +375,19 @@ underruns = 40
 gap_sample = 30
 gap_runs = 0
 ceiling_runs = 0
-max_wake_lat_us = [5666, 5922, 6044, 6110, 6230, 6279, 6311, 6325, 6356, 6539, 6587, 6587, 6597, 6619, 6674, 6698, 6808, 7018, 7070, 7083, 7219, 7280, 7397, 7420, 7564, 8049, 8099, 8214, 8261, 10090]
+max_wake_lat_us = [7052, 7362, 7600, 7619, 7852, 8186, 8192, 8335, 8364, 8401, 8529, 8615, 8759, 8867, 8914, 8972, 9432, 9457, 9953, 10003, 10044, 10117, 10591, 11154, 13162, 15077, 15945, 16184, 20251, 22744]
 underruns = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-wakes = [881, 887, 903, 906, 906, 906, 909, 911, 911, 914, 915, 915, 916, 916, 917, 920, 922, 922, 924, 924, 927, 928, 931, 932, 932, 932, 932, 932, 934, 936]
+wakes = [858, 860, 868, 870, 871, 871, 873, 874, 874, 874, 875, 876, 879, 880, 882, 882, 884, 884, 885, 886, 886, 888, 889, 890, 893, 893, 895, 896, 898, 898]
 drains = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
 [audio_tone.smp8]
-# wake_lat median 6652us, max 8074us (0.35 pl); drains 0; underruns 0.
+# wake_lat median 9249us, max 15399us (0.66 pl); drains 0; underruns 0.
 # Dropouts: 0 of 30. No run's worst wake reached a pipeline depth.
 # drains stays at 4 rather than dropping to the observed 0: a bar of 0 on a
 # counter whose whole sample is 0 would fail on the first single event, and one
 # event is not evidence of anything. The ceilings are a catastrophe detector;
 # the distributional test below is what has the power here. Ceiling kept —
-# 5.9x the observed maximum.
+# 3.12x the observed maximum.
 max_wake_lat_us = 48000   # 2.07 pl
 drains = 4
 underruns = 12
@@ -357,19 +396,20 @@ underruns = 12
 gap_sample = 30
 gap_runs = 0
 ceiling_runs = 0
-max_wake_lat_us = [5931, 5952, 5994, 6048, 6262, 6272, 6319, 6360, 6407, 6491, 6524, 6535, 6572, 6612, 6645, 6658, 6705, 6707, 6788, 6886, 7024, 7231, 7298, 7367, 7376, 7388, 7521, 7628, 7697, 8074]
+max_wake_lat_us = [6320, 6672, 6929, 7228, 7233, 7299, 7461, 7613, 8035, 8331, 8863, 8904, 8923, 9034, 9205, 9249, 9271, 9314, 9410, 9456, 10856, 10897, 11076, 11445, 11779, 12292, 12333, 13590, 15369, 15399]
 underruns = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-wakes = [779, 789, 794, 806, 815, 848, 854, 854, 862, 865, 867, 867, 867, 870, 871, 872, 872, 873, 875, 875, 876, 876, 876, 879, 881, 881, 881, 885, 887, 990]
+wakes = [846, 857, 859, 859, 860, 863, 863, 864, 868, 869, 870, 870, 874, 874, 877, 877, 878, 878, 879, 881, 882, 885, 889, 890, 890, 892, 892, 898, 899, 905]
 drains = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
 [audio_tone_load.smp1]
-# wake_lat median 6957us, max 8250us (0.36 pl); drains 0; underruns 0.
+# wake_lat median 5765us, max 7064us (0.30 pl); drains 0; underruns 0.
 # Dropouts: 0 of 30. No run's worst wake reached a pipeline depth.
 # The spec's first-class case (§5.10: glitch-free on one CPU under load)
-# stays the flattest config: lateness spans 6057-8250us, a 1.36x ratio.
-# The 186000 ceiling is now ~22.5x the observed maximum and is left
-# deliberately loose: it is the catastrophe detector, and the distributional
-# test on the sample below is what actually holds this config.
+# stays the flattest config, and 11.1.0 made it faster: lateness spans
+# 5271-7064us, a 1.34x ratio. The 186000 ceiling is now ~26.3x the observed
+# maximum and is left deliberately loose: it is the catastrophe detector, and
+# the distributional test on the sample below is what actually holds this
+# config.
 max_wake_lat_us = 186000   # 8.01 pl
 drains = 26
 underruns = 70
@@ -378,20 +418,18 @@ underruns = 70
 gap_sample = 30
 gap_runs = 0
 ceiling_runs = 0
-max_wake_lat_us = [6057, 6392, 6408, 6436, 6438, 6442, 6510, 6580, 6676, 6706, 6731, 6731, 6780, 6837, 6872, 7042, 7052, 7134, 7139, 7143, 7170, 7214, 7237, 7275, 7298, 7328, 7333, 7440, 7450, 8250]
+max_wake_lat_us = [5271, 5298, 5301, 5305, 5315, 5328, 5328, 5333, 5341, 5347, 5427, 5430, 5444, 5506, 5526, 5765, 5867, 5945, 5946, 5948, 6023, 6063, 6074, 6154, 6182, 6274, 6304, 6335, 6841, 7064]
 underruns = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-wakes = [820, 823, 827, 828, 828, 831, 832, 832, 832, 833, 833, 833, 836, 838, 838, 839, 839, 840, 844, 844, 846, 847, 848, 849, 852, 852, 853, 856, 856, 941]
+wakes = [856, 860, 861, 862, 863, 863, 866, 867, 868, 871, 871, 872, 872, 873, 874, 874, 875, 875, 875, 875, 875, 876, 876, 879, 880, 881, 882, 883, 887, 887]
 drains = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
 [audio_tone_load.smp8]
-# wake_lat median 7130us, max 8082us (0.35 pl); drains 0; underruns 0.
-# Dropouts: 0 of 30. No run's worst wake reached a pipeline depth. The old
-# sample's unexplained second mode (three runs at 22-33ms) is GONE: the whole
-# sample sits in 6415-8082us, 1.26x. The explanation the old note asked for
-# arrived with aeeaa01 — timer-phase artifacts of the half-wired kernel
-# (soundd's timer racing completions it received no CQE for); waking on the
-# IRQ removed the mechanism. Same collapse in `wakes`: the BASE arm's bimodal
-# ~840/~1050 clusters became one 804-859 mode. Ceiling kept — 9.9x observed.
+# wake_lat median 6097us, max 17501us (0.75 pl); drains 0; underruns 0.
+# Dropouts: 0 of 30. No run's worst wake reached a pipeline depth. 29 of 30
+# runs sit in 5122-6967us (1.36x); the one outlier at 17501us has run 1's
+# counterpart (15430us in that arm's load.smp1), so a rare high single wake
+# under load is a property of this instrument, not of one afternoon.
+# Ceiling kept — 4.57x observed.
 max_wake_lat_us = 80000   # 3.45 pl
 drains = 6
 underruns = 32
@@ -400,7 +438,7 @@ underruns = 32
 gap_sample = 30
 gap_runs = 0
 ceiling_runs = 0
-max_wake_lat_us = [6415, 6683, 6848, 6853, 6912, 6955, 6984, 7035, 7038, 7053, 7061, 7069, 7097, 7113, 7127, 7134, 7138, 7168, 7180, 7190, 7238, 7319, 7523, 7623, 7749, 7749, 7848, 7885, 7889, 8082]
+max_wake_lat_us = [5122, 5416, 5558, 5705, 5722, 5841, 5841, 5872, 5879, 5901, 5911, 5982, 5993, 6044, 6096, 6097, 6101, 6128, 6209, 6239, 6248, 6372, 6503, 6623, 6672, 6678, 6683, 6835, 6967, 17501]
 underruns = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-wakes = [804, 814, 816, 817, 818, 819, 819, 820, 823, 826, 826, 826, 828, 829, 831, 831, 833, 833, 835, 836, 837, 838, 839, 840, 841, 844, 846, 848, 850, 859]
+wakes = [882, 883, 887, 888, 889, 893, 893, 893, 893, 894, 894, 895, 895, 895, 897, 897, 897, 898, 900, 900, 900, 900, 901, 901, 902, 902, 903, 903, 904, 904]
 drains = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]

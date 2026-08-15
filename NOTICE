@@ -6,7 +6,7 @@ the repository: `LICENSE-MIT` and `LICENSE-APACHE`.
 
 Some of what this repository carries is not ours and is under other terms.
 This file is the list. It exists because until 2026-08-08 there wasn't one:
-`specs/dependency-audit-2026-08-08.md` §7 found six committed binary files —
+`specs/assessments/dependency-audit-2026-08-08.md` §7 found six committed binary files —
 11,094,369 bytes of the 14,634,080 git tracks — plus a source corpus, all
 outside the declared licence and none of them documented. Nothing here is a
 violation. Everything here is an obligation somebody has to be able to find.
@@ -96,7 +96,7 @@ to obtain it rather than a restriction on redistributing it, and this repository
 carries its own copy rather than fetching one.
 
 **This entry is meant to become deletable**, exactly as the `DOOM1.WAD` entry
-is. `specs/doom-music-soundfont.md` §5 records the intended exit: an OPL3
+is. `specs/assessments/doom-music-soundfont.md` §5 records the intended exit: an OPL3
 synthesiser driven by the `GENMIDI` lump already inside `DOOM1.WAD`, which adds
 zero bytes and raises no licence question at all, priced at 3–6 days. Taking it
 deletes this file and this section — though not the 15,546,764 bytes already in
@@ -197,7 +197,7 @@ dev host uses them. **`DEBUGX64_OVMF.fd` is referenced by nothing**: it is
 all three load-bearing; whether to keep it is the owner's.
 
 Two open questions for the owner, both recorded in
-`specs/dependency-audit-2026-08-08.md` §7e: whether to record a real upstream
+`specs/assessments/dependency-audit-2026-08-08.md` §7e: whether to record a real upstream
 and version for these, and whether to take the firmware from QEMU's own
 installation instead — which would put it inside the "comes with QEMU"
 allowance and delete 6,291,456 bytes from the repository.

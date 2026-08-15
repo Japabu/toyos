@@ -183,7 +183,12 @@ pub fn request() {
 
     let cpus = online_cpus();
     let me = percpu::cpu_id() as usize;
-    let from = crate::drivers::log_ring::mark();
+    // The bracket is two instants rather than two byte positions in one stream,
+    // because there is no one stream any more: a byte position has no meaning
+    // across shards. It is also exact where a byte range was not — the dump's
+    // own records are stamped by this same clock, so nothing a sibling CPU logs
+    // meanwhile can widen it.
+    let from = crate::clock::nanos_since_boot();
     log!("=== blocked-task dump: {cpus} cpu(s), and this report takes the screen ===");
 
     for cpu in 0..cpus {
@@ -227,7 +232,7 @@ pub fn request() {
 
     let census = census();
     summary(cpus, silent, census);
-    crate::drivers::panic_console::paint_report(from, crate::drivers::log_ring::mark());
+    crate::drivers::panic_console::paint_report(from, crate::clock::nanos_since_boot());
     IN_PROGRESS.store(false, Ordering::Release);
 }
 
@@ -299,7 +304,7 @@ fn probe_silent(asked: &[bool; MAX_CPUS], cpus: usize) {
 /// [`ANSWER_BUDGET_NS`] so the CPU is named silent, and short enough that it
 /// rejoins and the guest shuts down cleanly — which is itself part of the
 /// assertion, since a CPU the NMI merely interrupted must come back.
-#[cfg(feature = "dump-deaf-cpu")]
+#[cfg(feature = "boot-actuators")]
 pub(super) fn deaf_window() {
     /// Late enough that the machine is up and every CPU has joined.
     const ARM_AT_NS: u64 = 3_000_000_000;
@@ -309,9 +314,13 @@ pub(super) fn deaf_window() {
     /// How long cpu0 waits for the victim to reach its idle loop and go deaf.
     ///
     /// **A kicked CPU does not arrive at the top of its loop promptly and there
-    /// is no bound to give**: the pass it is finishing runs
-    /// `flush_log_file_if_affordable` with preemption off, and on a machine
-    /// whose `/log` is a USB device that is a string of bulk transfers. CI run
+    /// is no bound to give.** The measurement below was taken when the pass it
+    /// was finishing ran `flush_log_file_if_affordable` with preemption off, on
+    /// a machine whose `/log` is a USB device — a string of bulk transfers.
+    /// **That statement is deleted at log architecture L6** and the conclusion
+    /// is not: `drain_irqs` still reaches USB enumeration from a pass, so a
+    /// kicked CPU still has no bound, and this is now the record of how large
+    /// "no bound" was measured to be rather than of its only cause. CI run
     /// `31284962381` measured 251 ms of it — cpu0 gave up at 11.417 s and the
     /// victim went deaf at 11.568 s, so nothing was staged, no dump ran, and a
     /// CPU sat deaf for 400 ms for nobody. So this is generous and, more to the
@@ -595,6 +604,12 @@ fn summary(cpus: usize, silent: u32, c: Census) {
              open, so nothing here can say what no cpu holds",
         );
     }
+    // The one thread the report cannot ask about by walking a queue, because
+    // what it is doing is the reason this report is readable at all. `lost` is
+    // the number a reader of the console can never derive: it names the lines
+    // that are not there.
+    let (drained, lost, parks) = crate::log::console::stats();
+    log!("== klogd: {drained} record(s) drained, {lost} lost, {parks} park(s)");
     let unprinted = tally::UNPRINTED.load(Ordering::Relaxed);
     if unprinted > 0 {
         log!("== {unprinted} ordinary parked task(s) not listed; every anomaly is");

@@ -43,13 +43,18 @@ pub fn create_initrd(
 /// Takes the artifacts as bytes rather than reading them: the caller stages them
 /// under a build-key-derived name first, because cargo's own path is shared by
 /// every config and is overwritten by any concurrent build (see `build.rs`).
-pub fn create_boot_image(kernel_bytes: &[u8], bl_bytes: &[u8], initrd_bytes: &[u8]) -> Vec<u8> {
+pub fn create_boot_image(
+    kernel_bytes: &[u8],
+    bl_bytes: &[u8],
+    initrd_bytes: &[u8],
+    cmdline: &str,
+) -> Vec<u8> {
     // Drawn here and written twice: into the GPT entry that *is* the log
     // partition, and into a file on the ESP that the bootloader hands the
     // kernel. The kernel is given the partition by name; nothing anywhere goes
     // looking for one by type or by format.
     let log_guid = uuid::Uuid::new_v4();
-    let esp_volume = create_esp_volume(kernel_bytes, bl_bytes, initrd_bytes, log_guid);
+    let esp_volume = create_esp_volume(kernel_bytes, bl_bytes, initrd_bytes, log_guid, cmdline);
     let log_volume = create_log_volume();
     create_gpt_disk(esp_volume, log_volume, log_guid)
 }
@@ -245,6 +250,7 @@ fn create_esp_volume(
     bootloader: &[u8],
     initrd: &[u8],
     log_guid: uuid::Uuid,
+    cmdline: &str,
 ) -> Vec<u8> {
     let content_size = kernel.len() + bootloader.len() + initrd.len();
     let total_size = round_up_sectors(
@@ -267,6 +273,12 @@ fn create_esp_volume(
             // and nothing converts the table's, so the comparison that decides
             // which partition holds the log cannot be got backwards.
             ("toyos/log.guid", &log_guid.to_bytes_le()),
+            // The actuators this boot arms, comma-separated and empty on every
+            // image anyone ships. Read by the bootloader beside the three above
+            // and handed to the kernel in `KernelArgs`, because the earliest
+            // actuator fires before `mm::init` and there is nowhere later to
+            // fetch it from. `kernel/src/actuator.rs` is the list.
+            ("toyos/cmdline", cmdline.as_bytes()),
         ],
     );
 
@@ -276,9 +288,9 @@ fn create_esp_volume(
 /// The partition the kernel's log lives on, empty until a machine boots.
 ///
 /// Exactly [`FAT32_MIN_BYTES`], because the floor is not ours to choose and the
-/// log cannot use much of it: two generations of `kernel.log` come to 8 MiB at
-/// `log_file::MAX_LOG_BYTES`, under a quarter of what this volume has free, and
-/// there is no smaller FAT32 to cut it down to.
+/// log cannot use much of it: sixteen boots at `/bin/logd`'s `MAX_LOG_BYTES`
+/// come to 16 MiB, under half of what this volume has free, and there is no
+/// smaller FAT32 to cut it down to.
 fn create_log_volume() -> Vec<u8> {
     let mut volume = format_fat32(FAT32_MIN_BYTES, "TOYOS-LOG");
     populate(&mut volume, "TOYOS-LOG", &[]);
@@ -306,7 +318,7 @@ mod tests {
     #[test]
     fn the_volumes_this_build_writes_break_no_format_rule() {
         for (what, volume) in [
-            ("ESP", create_esp_volume(b"kernel", b"bootloader", b"initrd", uuid::Uuid::new_v4())),
+            ("ESP", create_esp_volume(b"kernel", b"bootloader", b"initrd", uuid::Uuid::new_v4(), "")),
             ("log volume", create_log_volume()),
         ] {
             let complaints = toyos_fat32_check::check(&volume);
@@ -322,11 +334,18 @@ mod tests {
     /// `populate` that wrote nothing at all would satisfy the gate above.
     #[test]
     fn the_esp_carries_what_the_bootloader_looks_for() {
-        let mut esp = create_esp_volume(b"kernel", b"bootloader", b"initrd", uuid::Uuid::new_v4());
+        let mut esp =
+            create_esp_volume(b"kernel", b"bootloader", b"initrd", uuid::Uuid::new_v4(), "");
         let mut fs = Fat32::mount(VolumeIo(&mut esp)).expect("mount the ESP we just built");
         let found: Vec<String> =
             fs.walk(64).expect("walk the ESP").into_iter().map(|(path, _)| path).collect();
-        for want in ["EFI/BOOT/BOOTx64.EFI", "toyos/kernel.elf", "toyos/initrd.img", "toyos/log.guid"]
+        for want in [
+            "EFI/BOOT/BOOTx64.EFI",
+            "toyos/kernel.elf",
+            "toyos/initrd.img",
+            "toyos/log.guid",
+            "toyos/cmdline",
+        ]
         {
             assert!(found.iter().any(|p| p.trim_start_matches('/') == want), "{want} is not on the ESP; it holds {found:?}");
         }

@@ -2,7 +2,11 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::os::toyos::process::CommandExt;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::OnceLock;
+
+use toyos::port::Connector;
 
 const HISTORY_PATH: &str = "/home/root/.config/shell_history";
 const HISTORY_MAX: usize = 200;
@@ -684,10 +688,34 @@ fn execute_simple(cmd: &SimpleCommand, piped_stdin: Option<std::process::ChildSt
     }
 }
 
+/// The connectors whoever started this shell transferred to it.
+///
+/// **A shell forwards them and holds no opinion about what they are.** The
+/// terminal above gives this shell a `surface`, and `locale` run from here has
+/// `surface` in *its* manifest row — but init cannot supply a name there is one
+/// port of per terminal, so it travels down the chain instead. Nothing here
+/// knows the name is `surface`, which is what stops a shell from being the
+/// place a second such name has to be added.
+fn provided() -> &'static [(&'static str, Connector)] {
+    static PROVIDED: OnceLock<Vec<(&'static str, Connector)>> = OnceLock::new();
+    PROVIDED.get_or_init(|| {
+        let mut slots: [Option<(&'static str, Connector)>; toyos::launch::MAX_LAUNCH_EXTRAS] =
+            [const { None }; toyos::launch::MAX_LAUNCH_EXTRAS];
+        let n = toyos::endow::provided(&mut slots);
+        slots.into_iter().take(n).flatten().collect()
+    })
+}
+
 fn build_command(cmd: &SimpleCommand) -> Option<Command> {
     if cmd.args.is_empty() { return None; }
     let mut command = Command::new(&cmd.args[0]);
     command.args(&cmd.args[1..]);
+    for (name, connector) in provided() {
+        // A duplicate per child: this shell keeps its own for the next one.
+        if let Ok(handed) = connector.duplicate() {
+            command.provide(name, handed.into_raw().0);
+        }
+    }
     Some(command)
 }
 

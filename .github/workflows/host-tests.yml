@@ -1,21 +1,28 @@
 name: host tests
 
-# Everything that needs no ToyOS toolchain and boots no guest, so it answers
-# before the toolchain job has finished restoring one.
+# The host suites (specs/testing-strategy.md §2): everything that needs no
+# ToyOS toolchain and boots no guest, so it answers before the toolchain job
+# has finished restoring one.
 #
-# macOS because the dev host is macOS and because `toyos-fat32` still builds its
-# volumes with `newfs_msdos` and `hdiutil` — the *judge* is ours now
-# (`toyos-fat32-check`, written from fatgen103), so that is the only macOS-only
-# thing left here and the only reason this job is not on Linux.
-
+# macOS because the dev host is macOS and `toyos-fat32` still builds its
+# volumes with `newfs_msdos` and `hdiutil` — the judge is ours now
+# (`toyos-fat32-check`), so that is the only macOS-only thing left here.
+#
+# `03:05 UTC`, five minutes behind `ci.yml`'s `03:00`; `nightly-red.sh`'s
+# find-by-title idempotency, not the offset, is what guards against the two
+# scheduled runs racing to open the same standing issue.
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: '5 3 * * *'
 
+# The nightly run gets its own group, same reason as `ci.yml`'s: a push to
+# `main` must not be cancelled by, or wait behind, a scheduled run.
 concurrency:
-  group: host-tests-${{ github.ref }}
+  group: host-tests-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -30,31 +37,31 @@ jobs:
           rustc -vV
           cargo -V
 
-      # Cold, this job is 594 s and all of it is compilation. A cache written
-      # on `main` is readable from every branch, which is the only reason this
-      # helps a branch's first run at all.
+      # Cold, this job is 398 s and all of it is compilation — 594 s before the
+      # host workspace, measured the same way, on the run that introduced it
+      # (the eighteen deleted member lockfiles moved `hashFiles`, so that run
+      # restored nothing and is a clean cold reading). The three steps below
+      # were 133 s, 184 s and 48 s of it. A cache written on `main` is readable
+      # from every branch, which is the only reason this helps a branch's first
+      # run at all.
       - uses: actions/cache@v4
         with:
+          # One `target` per workspace, which is all there is: a member builds
+          # into its workspace root's `target`, never its own. The sixteen
+          # per-crate entries that used to be here are directories that stopped
+          # existing when those crates joined the host workspace.
+          #
+          # `userland/sshd/target` was on this list and never existed at all —
+          # `sshd` and `calc` are both members of `userland/Cargo.toml`'s
+          # workspace, so their host builds land in `userland/target`, and the
+          # step below has been recompiling them from scratch every run. The
+          # gate in `src/hostws.rs` now reds on a path like that.
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            toyos-sched/target
-            toyos-ps2/target
-            toyos-gpt/target
-            toyos-elf/target
-            toyos-cc/target
-            toyos-ld/target
-            toyos-hda/target
-            toyos-pci/target
-            toyos-xhci/target
-            toyos-desktop/target
-            kernel-loom/target
-            kernel-span/target
-            toyos-fat32/target
-            toyos-fat32-check/target
-            userland/sshd/target
+            userland/target
           key: host-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: host-${{ runner.os }}-
 
@@ -62,26 +69,159 @@ jobs:
       # protocol, the sysroot witness, and the format check on the two volumes
       # the image builder writes.
       - name: build system
-        run: cargo test --lib
+        run: |
+          set -o pipefail
+          cargo test --lib 2>&1 | tee -a /tmp/host.log
 
-      # CLAUDE.md's list, whole. It used to be nine of the thirteen — the four
-      # that were missing (`toyos-elf`, `toyos-ld`, `toyos-pci`,
-      # `toyos-desktop`) are pure crates whose whole point is that a decision
-      # is testable without a guest, so a CI that skipped them skipped exactly
-      # the tests it was cheapest to run.
+      # Every host-tested crate, and **this step no longer holds the list of
+      # them** — root `Cargo.toml`'s `[workspace] members` does, and
+      # `--workspace` reads it from there.
+      #
+      # That is the repair, not a tidy-up. This used to be a shell loop naming
+      # sixteen crates, and the same set was also the set of standalone
+      # workspace roots, so it was a list in two places. The two drifted three
+      # times: nine of thirteen until 2026-08-08 (`toyos-elf`, `toyos-ld`,
+      # `toyos-pci` and `toyos-desktop` missing — pure crates whose whole point
+      # is that a decision is testable without a guest, so a CI that skipped
+      # them skipped exactly the tests it was cheapest to run); `toyos-keymap`
+      # and `bcachefs` until 2026-08-14, 108 tests reaching no gate; and
+      # `toyos-abi` and `toyos-manifest`, 23 tests, which were named in no
+      # workflow at all until the workspace landed.
+      #
+      # `--exclude toyos-build` because the root package's integration test is
+      # the QEMU harness — `ci.yml` runs that, sharded, on Linux with a guest.
+      # `cargo test --lib` above is the root package's half that belongs here,
+      # and one of the gates it runs (`src/hostws.rs`) reds on a `Cargo.toml`
+      # in the tree that joined neither `members` nor `exclude`. So a crate
+      # added and forgotten is a red in this job rather than a silent gap in
+      # it, which is the property the loop could never have.
       - name: host crates
         run: |
-          set -e
-          for crate in toyos-sched toyos-ps2 toyos-gpt toyos-elf toyos-cc \
-                       toyos-ld toyos-hda toyos-pci toyos-xhci toyos-desktop \
-                       kernel-loom kernel-span toyos-fat32 toyos-fat32-check; do
-            echo "=== $crate"
-            cargo test --manifest-path "$crate/Cargo.toml"
+          set -e -o pipefail
+          cargo test --workspace --exclude toyos-build 2>&1 | tee -a /tmp/host.log
+
+      # **`kernel-loom`'s supported matrix is two commands, and the `--workspace`
+      # step above is one of them.** The `loom` feature is default-on and is what makes the
+      # crate's atomics loom's instrumented ones; `log_zeroed_init` is about
+      # byte-zeroability, which loom's atomics do not have, and `log_body_words`
+      # about a message wider than the one word `MSG_WORDS` is under loom. Both
+      # are gated `cfg(not(feature = "loom"))`, so the default invocation runs
+      # *nothing* from either — which read as a pass for as long as nobody
+      # counted.
+      #
+      # Scoped to those targets rather than the crate:
+      # specs/issues/build/kernel-loom-ungated-models-red-without-loom.md
+      # records that `tlb_shootdown.rs` reds deterministically under
+      # --no-default-features, on main as much as here.
+      - name: kernel-loom without loom
+        run: |
+          set -e -o pipefail
+          echo "=== kernel-loom --no-default-features --test log_zeroed_init --test log_body_words" \
+            | tee -a /tmp/host.log
+          cargo test --manifest-path kernel-loom/Cargo.toml --no-default-features \
+            --test log_zeroed_init --test log_body_words 2>&1 | tee -a /tmp/host.log
+
+      # **W3's teeth, run rather than recorded.** `wake-fence-off` removes the
+      # two `SeqCst` fences from `shard.rs`'s wake pair and `log_wake` must red
+      # under it; a model that has never failed proves nothing, and this is the
+      # only obligation in the tree whose *negative* no guest test can express —
+      # on x86 a build with either fence gone behaves identically, which is the
+      # whole reason it is a model. `specs/log-architecture-spec.md` §2.5.
+      #
+      # **A non-zero exit is not the check, and until 2026-08-15 it was the
+      # whole of it.** Anything that stops `cargo test` before a model runs — a
+      # syntax error in `shard.rs`, a `wake-fence-off` block that no longer
+      # compiles, a manifest path that moved — exits non-zero and read here as
+      # proof that the model has teeth. That is the one failure mode a negative
+      # control must not have: the less it ran, the greener it looked. So the
+      # step demands the model's own verdict line by name, and a build that
+      # produced no verdict fails whichever way it exited.
+      - name: kernel-loom wake fences have teeth
+        run: |
+          set -o pipefail
+          echo "=== kernel-loom --features wake-fence-off --test log_wake (must red)" \
+            | tee -a /tmp/host.log
+          if cargo test --manifest-path kernel-loom/Cargo.toml \
+               --features wake-fence-off --test log_wake 2>&1 \
+               | tee /tmp/wake-fence-off.log | tee -a /tmp/host.log; then
+            echo "log_wake passed with both fences removed: the model has no teeth" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+          if ! grep -q 'a_commit_and_an_arm_cannot_both_miss \.\.\. FAILED' \
+               /tmp/wake-fence-off.log; then
+            echo "the fence-off build failed without a_commit_and_an_arm_cannot_both_miss reaching a verdict: this step proved nothing, and whatever stopped the model from running is what to fix" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+
+      # `userland/.cargo/config.toml` cross-compiles by default, so a userland
+      # crate's host tests have to name the host. `calc` is here for the reason
+      # the pure crates above are: its arithmetic is decided without a guest,
+      # so a CI that skipped it would skip the cheapest tests it has.
+      #
+      # `soundd` for the same reason, and it arrived here already carrying two
+      # tests that ran nowhere: the mixer's bit-exact passthrough and its
+      # full-scale clamp compiled and passed on the host while no workflow ever
+      # invoked them. Everything decided without a device — the deferral floor,
+      # the device shapes it refuses, which witness of a client's departure
+      # wins — is decided here, where a weakening reds in seconds instead of
+      # waiting for a nightly audio boot.
+      #
+      # These stay a loop, and cannot stop being one: that same
+      # `.cargo/config.toml` is why `userland` is *excluded* from the host
+      # workspace, and cargo refuses to merge an inherited `build.target` away.
+      # They are named in `userland/Cargo.toml`'s own workspace, so the list
+      # here is a list in two places — a smaller instance of the defect above,
+      # left standing deliberately rather than papered over.
+      - name: userland host crates
+        run: |
+          set -e -o pipefail
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          for crate in sshd calc soundd; do
+            echo "=== userland/$crate" | tee -a /tmp/host.log
+            cargo test --manifest-path "userland/$crate/Cargo.toml" --target "$host" 2>&1 \
+              | tee -a /tmp/host.log
           done
 
-      # `userland/.cargo/config.toml` cross-compiles by default, so its host
-      # tests have to name the host.
-      - name: sshd
+      # Four `cargo test` invocations in three steps, down from nineteen: the
+      # root package's `--lib`, one `--workspace` over the other twenty-one
+      # members, and the two userland crates. A red is still one line somewhere
+      # among them, and `--workspace` prints a `Running ...` line naming the
+      # binary rather than the `=== <crate>` the loop used to echo, so the
+      # summary matches both.
+      - name: failure summary
+        if: failure()
         run: |
-          host=$(rustc -vV | sed -n 's/^host: //p')
-          cargo test --manifest-path userland/sshd/Cargo.toml --target "$host"
+          {
+            echo "### host tests"
+            echo ""
+            echo '```'
+            grep -E '^(=== |error(\[|:)|test .* FAILED|failures:$|    [a-z_:]+$|test result: FAILED| +Running )' \
+              /tmp/host.log | tail -40 || echo "(nothing matched; read the log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The same standing issue `ci.yml`'s `nightly-red` files or updates. Only on
+  # `schedule` — a dispatched run is somebody watching it directly. Named
+  # `nightly-red-host`, not `nightly-red`: a job id becomes a check run name,
+  # and two jobs sharing one id across workflows would collide under it.
+  nightly-red-host:
+    needs: [host]
+    if: ${{ !cancelled() && github.event_name == 'schedule' && needs.host.result != 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: file or update "nightly is red"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HOST_RESULT: ${{ needs.host.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          export TITLE="nightly is red"
+          export BODY="Run: $RUN_URL"$'\n'"Failed jobs: host($HOST_RESULT)"
+          .github/nightly-red.sh

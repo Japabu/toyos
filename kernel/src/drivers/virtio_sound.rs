@@ -1,6 +1,6 @@
 //! The virtio-sound stub: bring-up, the virtqueues, and the allow-list.
 //!
-//! `specs/hda-driver-plan.md` §4.1 is the design and this device is the second
+//! `specs/plans/hda-driver-plan.md` §4.1 is the design and this device is the second
 //! to take that shape. **The line is who writes an address**, and a split
 //! virtqueue puts every address a virtio driver ever programs in one place: the
 //! descriptor table. So the three tables here live in a page no process maps,
@@ -31,7 +31,7 @@ use super::DmaPool;
 use crate::log;
 use crate::mm::paging::CachePolicy;
 use crate::mm::{KernelSlice, Mmio};
-use crate::shared_memory;
+use crate::object::shm::Region;
 use crate::sync::Lock;
 
 const VIRTIO_VENDOR: u16 = 0x1AF4;
@@ -301,11 +301,11 @@ struct Bound {
 }
 
 static CONTROLLER: Lock<Option<Bound>> = Lock::new(None);
-static INFO: Lock<Option<abi::VirtioSoundInfo>> = Lock::new(None);
+static INFO: Lock<Option<(abi::VirtioSoundInfo, Region)>> = Lock::new(None);
 static REFUSALS: AtomicU32 = AtomicU32::new(0);
 
-pub fn info() -> Option<abi::VirtioSoundInfo> {
-    *INFO.lock()
+pub fn info() -> Option<(abi::VirtioSoundInfo, Region)> {
+    INFO.lock().clone()
 }
 
 // --- the allow-list ---
@@ -344,7 +344,7 @@ pub fn reg_read(offset: u64, width: RegWidth) -> Result<u32, SyscallError> {
 }
 
 pub fn reg_write(offset: u64, width: RegWidth, value: u32) -> Result<(), SyscallError> {
-    let info = info().ok_or(SyscallError::NotFound)?;
+    let (info, _) = info().ok_or(SyscallError::NotFound)?;
     if !write_permit(&info, offset, width) {
         return Err(refuse("write", offset, width));
     }
@@ -430,14 +430,15 @@ pub fn init(devices: &[PciDevice]) {
 
     // `DmaPool` allocations are whole 2 MiB pages, so the slice base is the page
     // the driver maps and the ABI's offsets are relative to it.
-    let token = shared_memory::register(
-        crate::DirectMap::from_phys(shared.phys()),
-        crate::mm::PAGE_2M,
-        CachePolicy::DeferToMtrr,
-    );
+    let dma_region = Region {
+        phys: crate::DirectMap::from_phys(shared.phys()),
+        size: crate::mm::PAGE_2M,
+        cache: CachePolicy::DeferToMtrr,
+        pages: None,
+    };
     let multiplier = device.notify_off_multiplier();
     let info = abi::VirtioSoundInfo {
-        dma_token: token.raw(),
+        dma: toyos_abi::HANDLE_INVALID,
         notify_control: controlq.notify_bytes(multiplier) as u32,
         notify_event: eventq.notify_bytes(multiplier) as u32,
         notify_tx: txq.notify_bytes(multiplier) as u32,
@@ -451,7 +452,7 @@ pub fn init(devices: &[PciDevice]) {
         _dma_kernel: dma_kernel,
         _dma_shared: dma_shared,
     });
-    *INFO.lock() = Some(info);
+    *INFO.lock() = Some((info, dma_region));
 
     log!(
         "virtio-sound: bound, {} periods of {} bytes, doorbells at {:#x}/{:#x}/{:#x}",

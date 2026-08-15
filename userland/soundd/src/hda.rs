@@ -1,6 +1,6 @@
 //! soundd as the driver of an Intel HDA controller.
 //!
-//! `specs/hda-driver-plan.md` §4.1: the kernel brought the controller up, owns
+//! `specs/plans/hda-driver-plan.md` §4.1: the kernel brought the controller up, owns
 //! the buffer descriptor list and the interrupt, and answers five register
 //! writes and two reads. Everything that is a *decision* is here and in
 //! `toyos-hda` — which codecs answered, which pin, which converter, the
@@ -59,7 +59,6 @@ pub struct Hda {
 /// prints before falling back to the null sink — "no sound" without which of
 /// these it was is a report nobody can act on.
 pub enum Refusal {
-    NoDevice(SyscallError),
     /// The kernel's answers stopped making sense, which is a bug here or there
     /// and never a property of the machine.
     Kernel(SyscallError),
@@ -75,7 +74,6 @@ pub enum Refusal {
 impl core::fmt::Display for Refusal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::NoDevice(e) => write!(f, "no HDA controller the kernel bound ({e})"),
             Self::Kernel(e) => write!(f, "the kernel refused a call this driver has to make ({e})"),
             Self::NoCodec => write!(f, "no codec STATESTS named answered a verb"),
             Self::NoOutput(PathError::NoOutputPin { codecs }) => {
@@ -107,9 +105,12 @@ impl core::fmt::Display for Refusal {
 }
 
 impl Hda {
-    /// Claim the controller, walk its codecs, choose an output and configure it.
-    pub fn claim() -> Result<(Self, OutputPath, u8), Refusal> {
-        let dev = HdaDev::open().map_err(Refusal::NoDevice)?;
+    /// Walk the controller's codecs, choose an output and configure it.
+    ///
+    /// The claim is the argument: `/bin/init` minted it and endowed it, so
+    /// "does this machine have an HDA?" was already answered before soundd's
+    /// first instruction.
+    pub fn claim(dev: HdaDev) -> Result<(Self, OutputPath, u8), Refusal> {
         let info = dev.info().map_err(Refusal::Kernel)?;
         let mut hda = Hda { dev, info, running: false };
 

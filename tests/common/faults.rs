@@ -14,7 +14,7 @@
 //! corrupted.
 use std::io::Write;
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::qemu::{self, BootOptions, QemuInstance};
 
@@ -36,7 +36,7 @@ pub fn double_fault_stack(
         rust_bins,
         BootOptions {
             profile: qemu::Profile::Metal,
-            kernel_features: &["test-double-fault"],
+            kernel_features: toyos_build::build::TEST_KERNEL,
             ..Default::default()
         },
     );
@@ -92,14 +92,16 @@ pub fn double_fault_stack(
 /// That stack is 16 KiB of ordinary heap, so an overflow off its bottom did
 /// not fault — it rewrote whatever the allocator had put underneath, and the
 /// damage surfaced somewhere else entirely (a `BTreeMap` node with an
-/// out-of-range index, a write to `0x4`). The idle loop runs `log_file::poll`,
-/// a filesystem write reaching a block device, whose measured high water was
-/// 11,505 bytes of the 16,384 with the USB command path still below the probe.
+/// out-of-range index, a write to `0x4`). The idle loop ran `log_file::poll`
+/// when that was measured — a filesystem write reaching a block device, whose
+/// high water was 11,505 bytes of the 16,384 with the USB command path still
+/// below the probe. That caller is gone at log architecture L6 and `drain_irqs`
+/// still reaches a device from the same stack.
 ///
 /// Absence is invisible to every log line and every screendump, so the only
 /// way to ask whether the page is really gone is to touch it — which nothing
-/// in the kernel does, that being the point of a guard page. `test-idle-guard`
-/// supplies the one read.
+/// in the kernel does, that being the point of a guard page. `SYS_DEBUG` action
+/// 9 supplies the one read.
 pub fn idle_stack_guard(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
@@ -110,7 +112,7 @@ pub fn idle_stack_guard(
         c_bins,
         rust_bins,
         BootOptions {
-            kernel_features: &["test-idle-guard"],
+            kernel_features: toyos_build::build::TEST_KERNEL,
             ..Default::default()
         },
     );
@@ -126,7 +128,7 @@ pub fn idle_stack_guard(
         .find_map(|l| l.split("reading the idle stack guard at ").nth(1))
         .map(|rest| rest.split_whitespace().next().unwrap_or("").to_string())
         .ok_or_else(|| {
-            format!("the kernel never reached the guard read — is `test-idle-guard` on?\n{log}")
+            format!("the kernel never reached the guard read — is `test-actuators` on?\n{log}")
         })?;
 
     // The tell of a guard that is not there: `SYS_DEBUG` returned, so the read
@@ -218,15 +220,18 @@ pub fn virtio_net_no_msix() -> Result<(), String> {
     // refusal reached userland rather than stopping at a log line.
     let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/netcase");
     let mut qemu = QemuInstance::boot_with_options(&config, &[], &[], options);
-    let mut log = crate::common::serial::Serial::boot(&qemu);
     // netd is spawned before the ready marker and speaks after it, so its line
-    // is drained for rather than read out of the boot capture. A ceiling and
-    // not a measurement: what is asserted is that the line came, never when.
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline && !log.text().contains("netd: ") {
-        let more = qemu.drain_serial(Duration::from_millis(200));
-        log.push(&more);
-    }
+    // is drained for rather than read out of the boot capture. **What is waited
+    // for is the whole line and not a prefix naming the program**: init reports
+    // the claim it could not make as `init: netd: no nic on this machine
+    // (NotFound)`, and that is already in the boot capture before netd has run
+    // at all, so a `"netd: "` predicate is satisfied by the wrong speaker.
+    const NETD_EXITS: &str = "netd: no NIC on this machine, exiting";
+    let mut text = qemu.boot_log().to_string();
+    let stalled =
+        qemu::await_guest(&mut qemu, &mut text, "netd's own answer", |c| c.contains(NETD_EXITS))
+            .err();
+    let log = crate::common::serial::Serial::named("boot console", text);
 
     // Refused by name, at a named function, and not by claiming a mode it does
     // not have: the xHCI driver's `polled mode` line is the defect this whole
@@ -235,7 +240,13 @@ pub fn virtio_net_no_msix() -> Result<(), String> {
     log.must_not_say("VirtIO net: MSI-X vector")?;
     // All the way out to userland, rather than a kernel that logged a refusal
     // and handed netd a NIC anyway.
-    log.must_say("netd: no NIC on this machine, exiting")?;
+    if !log.text().contains(NETD_EXITS) {
+        return Err(format!(
+            "{}{NETD_EXITS:?} never reached the boot console:\n{}",
+            stalled.map(|why| format!("{why}\n")).unwrap_or_default(),
+            log.text()
+        ));
+    }
     // And the machine is otherwise whole. `must_be_clean` is what makes the
     // change from `panic!` an assertion rather than a hope.
     log.must_say("virtio-sound: MSI-X vector")?;
@@ -318,7 +329,7 @@ pub fn dump_nmi_probe(
         c_bins,
         rust_bins,
         BootOptions {
-            kernel_features: &["dump-deaf-cpu"],
+            kernel_params: &["dump-deaf-cpu"],
             ..Default::default()
         },
     );

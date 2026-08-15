@@ -18,6 +18,7 @@ use crate::pipe::PipeId;
 use crate::process::{self, Pid, Tid};
 use crate::sched::driver::{self, cpus, preempt_off, Dispose, NewTask};
 use crate::sched::payload::{KShare, KWaitQueue, KernelLock, ThreadSched};
+use crate::sched::reap_gate::ReapGate;
 use crate::sched::waitqs;
 use crate::sync::Lock;
 use crate::DirectMap;
@@ -69,6 +70,31 @@ const BASELINE_TRAP: u32 = 1;
 /// path only calls in at zero. The idle loop reaches it through the third —
 /// `reap_poisoned`'s `PROCESS_TABLE` guard drop — not as a route of its own.
 const BASELINE_IRQ_EXIT: u32 = 0;
+
+/// The depth a *blocking* site is entitled to, which is not the same for every
+/// context and was assumed to be until a kernel thread existed.
+///
+/// [`BASELINE_TRAP`] for a user thread: `common_entry`'s `lock add` covers the
+/// whole of every syscall and exception, so a park reached from one starts a
+/// level up. **Zero for a kernel thread's body**, which is not a trap at all —
+/// `driver::trampoline_entry` discharged the single level `spawn` put in its
+/// context and nothing has raised one since.
+///
+/// Reading the entitlement from the context rather than assuming the trap is
+/// what keeps §6.4's tripwire a tripwire for both: a kernel thread that parks
+/// holding a `Lock` still trips it, one level lower.
+///
+/// **Answered from `sched::kthread`'s rows and never from the `CpuSched`.**
+/// This runs on every blocking call in the machine and `prepare_wait` has not
+/// raised the preempt count yet, so a reader that walked the running task
+/// would be aliasing the `&mut CpuSched` a preempting pass takes.
+fn blocking_baseline() -> u32 {
+    if crate::sched::kthread::current_is_kernel_thread() {
+        0
+    } else {
+        BASELINE_TRAP
+    }
+}
 
 /// Process-scoped thread identity. Tids are per-process, so the scheduler
 /// needs the pair to name a thread system-wide.
@@ -168,7 +194,7 @@ pub fn enqueue_new(
 #[must_use = "a wait ticket must be blocked on or cancelled"]
 #[track_caller]
 pub fn prepare_wait(queue: &KWaitQueue) -> Ticket<'_> {
-    assert_baseline(BASELINE_TRAP);
+    assert_baseline(blocking_baseline());
     Ticket::register(queue)
 }
 
@@ -179,20 +205,58 @@ pub fn prepare_wait(queue: &KWaitQueue) -> Ticket<'_> {
 /// is no other way to construct one. `deadline = 0` means no timeout.
 #[track_caller]
 pub fn block_on(ticket: Ticket<'_>, deadline: u64) {
-    // One level above the trap baseline: the ticket has held the registration
-    // window's own level since `prepare_wait`, and `pass_block` inherits it.
-    assert_baseline(BASELINE_TRAP + 1);
+    // One level above the calling context's baseline: the ticket has held the
+    // registration window's own level since `prepare_wait`, and `pass_block`
+    // inherits it.
+    assert_baseline(blocking_baseline() + 1);
     driver::pass_block(ticket, (deadline > 0).then(|| Nanos(deadline)));
 }
 
-/// Register, re-check, park — for a site whose condition is exactly `ready`.
+/// Register, re-check, park — for a site whose condition is exactly `ready` —
+/// and **hold the wait until that condition is true**.
+///
+/// A return from a park is not evidence that this queue is what woke the
+/// thread. A task is woken *by name* as well as by queue: every child thread's
+/// exit posts `wake_task` to its process's main thread (`process::thread_exit`),
+/// panic recovery wakes a joiner, a futex bucket is shared by every word that
+/// hashes into it, and a deadline fires on the task's own CPU. Checking once
+/// and returning made every caller's answer depend on which of those arrived
+/// first — `sys_process_wait` read an exit code that had not been published
+/// yet and killed the kernel from a plain `Child::wait()`. So the predicate is
+/// re-checked after every wake and the thread re-parks until it holds, which
+/// is what `sched::waitqs` already documents every blocking site as doing and
+/// what spec §2's invariant 10 requires of one. A site that parks with
+/// `prepare_wait`/`block_on` directly owns that loop itself — `sys_nanosleep`
+/// is the one that does not
+/// (`specs/issues/kernel/nanosleep-ends-early-when-a-sibling-thread-exits.md`).
+///
+/// Looping does not weaken spec §2's no-lost-wake invariant, because each trip
+/// is the whole two-phase handshake again: the re-registration happens *before*
+/// the re-check, so a wake landing in between claims the new ticket and the
+/// commit refuses to park.
+///
+/// `deadline` still bounds the wait. It is absolute, so a re-park carries the
+/// same one and the wait ends no later than it was going to; an expiry returns
+/// with the condition false, which is what the one timed caller
+/// (`sys_read`'s console) needs — it re-derives its answer from the object
+/// rather than from this return, inside a loop of its own.
+///
+/// A killed task never comes back round: a retire that lands while it is
+/// deciding to park turns the block into an exit (`Commit::Killed`, spec §6.3),
+/// and one that lands while it is parked releases it where it lies (§2.7). No
+/// path here can hold a dying thread in a wait.
 #[track_caller]
 pub fn wait_until(queue: &KWaitQueue, deadline: u64, ready: impl Fn() -> bool) {
-    let ticket = prepare_wait(queue);
-    if ready() {
-        ticket.cancel();
-    } else {
+    loop {
+        let ticket = prepare_wait(queue);
+        if ready() {
+            ticket.cancel();
+            return;
+        }
         block_on(ticket, deadline);
+        if deadline != 0 && crate::hw::now_ns() >= deadline {
+            return;
+        }
     }
 }
 
@@ -238,7 +302,7 @@ pub fn exit_current(code: i32) -> ! {
         let table = guard.as_mut().unwrap();
         let tid = percpu::current_tid().unwrap();
         let pid = percpu::current_pid().unwrap();
-        process::zombify_tid(table, pid, tid, code);
+        process::mark_thread_zombie(table, pid, tid, code);
     }
     driver::pass(Dispose::Exit);
     unreachable!("exit_current: returned from the exit pass");
@@ -305,10 +369,10 @@ pub fn boost_current_rt_inherited() {
     driver::boost_current(boost_window());
 }
 
-/// `SYS_SET_RT_PRIORITY`. Gated at the dispatch site on a sound-device
-/// claim, not here — this must stay callable from kernel init. That is not yet
-/// spec §9.4's privilege gate: `SYS_OPEN_DEVICE` is first-come and ungated, so
-/// whoever wins the claim race gets the RT band with it.
+/// `SYS_RT_ENTER`. Gated at the dispatch site on `Rights::RT`, not here — this
+/// must stay callable from kernel init. That right is spec §9.4's privilege
+/// gate, and it is endowed per manifest rather than won: what gated the band
+/// before was a sound-device claim, which is not a privilege at all.
 pub fn set_current_rt(enable: bool) {
     driver::set_current_rt(enable);
 }
@@ -397,6 +461,21 @@ pub fn retire_task(sched: &ThreadSched) {
 /// is the thread's only cleanup site.
 static POISONED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(u64::MAX) }; MAX_CPUS];
 
+/// Whether [`reap_poisoned`] has anything to do. Raised by both sites that make
+/// work for it — a thread poisoned below, and a process publishing its exit
+/// ([`crate::object::process::ProcessObject::publish_exit`], which is what makes
+/// a table entry collectable) — and claimed by whichever idle trip takes the
+/// work. `sched::reap_gate` carries the argument.
+static REAP_GATE: ReapGate = ReapGate::new();
+
+/// Tell the idle loop there is a table entry to collect.
+///
+/// Called *after* the object's `finished` flag is stored, so the gate's release
+/// is what publishes it to the reaper.
+pub fn note_reapable() {
+    REAP_GATE.raise();
+}
+
 pub fn poison_tid(id: TaskId) {
     let cpu = percpu::cpu_id() as usize;
     let Some(slot) = POISONED.get(cpu) else {
@@ -404,6 +483,9 @@ pub fn poison_tid(id: TaskId) {
         return;
     };
     let prev = slot.swap(id.pack(), Ordering::Release);
+    // After the slot is written, never before: the gate's release is what
+    // carries it to the CPU that claims the work.
+    REAP_GATE.raise();
     if prev != u64::MAX {
         crate::log!(
             "poison_tid: cpu {cpu} slot still held {} — its waiter is stranded",
@@ -412,15 +494,32 @@ pub fn poison_tid(id: TaskId) {
     }
 }
 
-/// Zombify threads that died in panic recovery and wake whoever was joining
-/// them. Called from the idle loop, which is the one context that provably
-/// holds none of the locks the panicking thread may have been holding.
+/// Zombify threads that died in panic recovery, collect the entries of
+/// processes that have published their exit, and wake whoever was joining them.
+/// Called from the idle loop, which is the one context that provably holds none
+/// of the locks the panicking thread may have been holding.
+///
+/// **Nothing to reap costs no lock.** This took `PROCESS_TABLE` unconditionally
+/// until 2026-08-14, so every CPU with nothing to run held it for a slice of
+/// every trip round the idle loop — against a crash report whose
+/// `process::with_user_symbols` may only `try_lock` that table, and which
+/// therefore lost the faulting function's name whenever the two met. The gate
+/// is the whole of the fix on this side; `sched::reap_gate` argues why a raise
+/// cannot be lost, and `process::with_user_symbols` documents what the reader
+/// now says when it loses anyway.
 pub(crate) fn reap_poisoned() {
-    let mut wakes = [None; MAX_CPUS];
+    if !REAP_GATE.take() {
+        return;
+    }
+    let mut wakes: [Option<process::PoisonWake>; MAX_CPUS] = [const { None }; MAX_CPUS];
+    // Both are dropped after the guard: an entry's drop reaches
+    // `remove_vruntime`, and a process whose teardown never ran still holds its
+    // whole `ProcessData` here.
+    let reaped;
     {
         let mut guard = process::PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
-        process::collect_orphan_zombies(table, unsafe { process::IdleProof::new_unchecked() });
+        reaped = process::reap_finished(table, unsafe { process::IdleProof::new_unchecked() });
         for (slot, wake) in POISONED.iter().zip(wakes.iter_mut()) {
             let raw = slot.load(Ordering::Relaxed);
             if raw == u64::MAX {
@@ -431,8 +530,20 @@ pub(crate) fn reap_poisoned() {
             slot.store(u64::MAX, Ordering::Relaxed);
         }
     }
-    for (pid, tid) in wakes.into_iter().flatten() {
-        wake_task(TaskId(pid, tid));
+    drop(reaped);
+    for wake in wakes.into_iter().flatten() {
+        match wake {
+            process::PoisonWake::Joiner(pid, tid) => wake_task(TaskId(pid, tid)),
+            // The code a killed process gets: nobody asked for this exit, and
+            // the accounting the teardown would have taken was never taken.
+            process::PoisonWake::Process(object) => {
+                let stats = toyos_abi::syscall::ProcessStats {
+                    pid: object.pid().raw(),
+                    ..Default::default()
+                };
+                object.publish_exit(crate::object::process::Exit { code: -1, stats })
+            }
+        }
     }
 }
 

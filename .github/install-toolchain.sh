@@ -1,0 +1,74 @@
+#!/bin/sh
+# The toolchain `toolchain.yml` published for this tree, installed and linked
+# as `toyos`. One script rather than a copy in each caller (the shards, `tcg`,
+# `cache-writer`, gate A), so a retry-loop disagreement is not possible.
+#
+# The asset, not the tag: `gh release create` makes the release and then
+# uploads to it, so a tag that answers 200 is not an installable toolchain.
+# `ci.yml`'s `toolchain-ready` asks the same question before any of these jobs
+# start, so the wait here is short — anything still missing is the API rather
+# than a build.
+#
+# `$TAG` if the caller already computed it (a `cache` key wants it as a step
+# output), otherwise the same `git rev-parse` `toolchain.yml` publishes under.
+# `$GH_TOKEN` authenticates the release download; `gh` itself is not here —
+# the `debian:sid` image has none.
+set -eu
+
+: "${GH_TOKEN:?the release asset download is authenticated}"
+
+git config --global --add safe.directory "$PWD"
+tag=${TAG:-}
+if [ -z "$tag" ]; then
+  tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+        HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
+fi
+echo "toolchain: $tag"
+
+api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag"
+asset=""
+for _ in $(seq 10); do
+  asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
+    | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
+  if [ -n "$asset" ]; then
+    break
+  fi
+  echo "$tag does not carry toyos-toolchain.tar.zst yet; retrying"
+  sleep 15
+done
+
+if [ -z "$asset" ]; then
+  echo "::error::$tag carries no toyos-toolchain.tar.zst, so there is nothing to install."
+  echo "::error::toolchain.yml publishes it on a pull request and on a push to main, and"
+  echo "::error::nothing else builds one. A dispatch against a ref that has never been"
+  echo "::error::through it lands here."
+  exit 1
+fi
+
+# The retry belongs on the transfer, not only on the lookup above: this is
+# 401 MiB over TLS, so a handshake that gets part-way is the failure mode.
+# `--retry-all-errors` covers it, where plain `--retry` only covers transient
+# HTTP status and connection refusals; the outer loop covers curl exiting
+# after its own attempts are spent. The unpack is inside the loop because a
+# truncated body is a `zstd` failure rather than a `curl` one, and retrying
+# without it would install a corrupt toolchain and blame the compiler.
+for attempt in 1 2 3; do
+  if curl -sSL --retry 3 --retry-all-errors --retry-delay 5 \
+       -H "Authorization: Bearer $GH_TOKEN" \
+       -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst \
+     && mkdir -p rust/build \
+     && zstd -dc /tmp/t.tar.zst | tar -C rust/build -x; then
+    break
+  fi
+  if [ "$attempt" = 3 ]; then
+    echo "::error::the toolchain asset did not download and unpack in three attempts."
+    echo "::error::The last failure is above; this is the transfer, not the build."
+    exit 1
+  fi
+  echo "toolchain download/unpack attempt $attempt failed; retrying"
+  rm -f /tmp/t.tar.zst
+  sleep 10
+done
+stage2="$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+rustup toolchain link toyos "$stage2"
+"$stage2/bin/rustc" -vV

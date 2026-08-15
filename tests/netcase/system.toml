@@ -9,8 +9,36 @@
 # test-runner is here for the same reason it is in metalcase: it makes the boot
 # announce itself and lets an in-guest binary be driven over the
 # ===TEST_START=== protocol.
-init = ["/bin/netd", "/bin/test-runner"]
 
-[programs]
-netd = {}
-test-runner = {}
+[boot]
+start = ["logd", "netd", "test-runner"]
+
+# **Every image that carries a `TOYOS-LOG` partition runs this**, and every
+# image does. The kernel stopped writing files at L6 of
+# `specs/log-architecture-spec.md`, so a boot config without `logd` is a boot
+# whose `/log` is empty — `every_boot_config_runs_logd` is what refuses one.
+# It claims no device and serves no port yet (§5.1, §5.2): its whole authority
+# is `logread`, which is `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
+[programs.logd]
+syscap = ["logread"]
+
+[programs.netd]
+serves = ["netd"]
+devices = ["nic"]
+
+# `launcher` for `launcher_refusals`, whose subject is what a client can make
+# `/bin/init` do — so the test estate has to be able to reach it somewhere.
+# This is also the only config whose test binaries take the launcher path to
+# `Command::spawn` at all: everywhere else test-runner holds no connector and
+# every spawn is direct.
+# `logread` is the log gate's own: a spawned test binary does not inherit a
+# `SysCap` dup, so the gate that reads the kernel's records runs inside
+# `test-runner` itself (`specs/log-architecture-spec.md` §3.2, §9.5).
+[programs.test-runner]
+receives = ["netd", "launcher"]
+syscap = ["logread"]
+
+# What `launcher_refusals` asks init to start. A declared program that serves
+# nothing and provides nothing, so a refused launch of it takes no acceptor
+# with it and a granted one is a clean round trip.
+[programs.toybox]

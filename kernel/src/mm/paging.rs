@@ -487,7 +487,7 @@ impl AddressSpace {
             top = start.raw();
         }
         // Gap below all regions
-        if top >= total + vma::ALLOC_FLOOR {
+        if top >= total + vma::alloc_floor() {
             return Some(UserAddr::new(top - total));
         }
         None

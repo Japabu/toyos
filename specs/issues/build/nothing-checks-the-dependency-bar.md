@@ -15,7 +15,7 @@ committed third-party file with its `sha256`, its upstream and its licence — s
 the remaining work there is a `#[test]` that reads it, not the research. Nothing
 reads it today, so a new binary file still arrives unremarked.
 
-`specs/dependency-audit-2026-08-08.md` §11 proposes three, all offline, all
+`specs/assessments/dependency-audit-2026-08-08.md` §11 proposes three, all offline, all
 inside `cargo test --lib`, and prices each including what it cannot catch — the
 crate ledger is the one with teeth, the binary-literal scan is the weakest, and
 neither reaches `rust/`'s own dependencies or a third-party build script. The

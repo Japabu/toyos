@@ -105,8 +105,8 @@ trusting the answer, this one is a hole where the answer would be.
    it against 96% / 69% / 99%, and forcing the balance condition false takes it
    to 0% and reds the test. **A/B that number across the redesign; a collapse is
    as loud as a violation.** Named as the third gate-failure shape in
-   `specs/spec-staleness-sweep.md`, with the evidence in
-   `specs/metal-track-history.md`.
+   `specs/README.md`'s spec-checking method, with the evidence in
+   `specs/assessments/metal-track-history.md`.
 3. **The margin at 32 CPUs is 1.2× and trending up** — 10 ms at one CPU to
    50 ms at 32 against a 60 ms bound — with nothing measured above 32, while
    spec §11 Stage 9 gates on 1–128. Measure 64 and 128 first, or a red at high
@@ -121,4 +121,4 @@ Found only because I5 measures *service* — nanoseconds actually delivered — 
 than checking vruntime bookkeeping against itself, which would have been true by
 construction. The dead-gate lesson from the other side: the first question about a
 gate is not whether it passes, but whether it measures the quantity you care
-about (`specs/spec-staleness-sweep.md`).
+about (`specs/README.md`).

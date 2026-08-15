@@ -30,7 +30,7 @@ const GUEST_BLOCKS: [i64; 2] = [2, -2];
 const RUN_START: u64 = 4;
 const RUN_LEN: u64 = 9;
 
-/// The one kernel feature these boots need. A raw block device has no path to
+/// The one actuator these boots need. A raw block device has no path to
 /// userland, so the kernel is the only in-guest actor that can drive one — the
 /// same reason `xhci-one-slot` exists. What decides *which* disk gets written
 /// is the stamp in block 0 and not this flag, which is why the unstamped boot
@@ -197,7 +197,7 @@ fn boot_and_shutdown(
     qemu.flush_stdin();
     log.push_str(&qemu.drain_serial(Duration::from_secs(20)));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} during the USB gate boot\n{log}"));
         }
@@ -244,7 +244,7 @@ pub fn usb_storage_gate(
         rust_bins,
         BootOptions {
             profile: Profile::UsbDisk,
-            kernel_features: GATE,
+            kernel_params: GATE,
             usb_images: vec![image.clone()],
             ..Default::default()
         },
@@ -271,7 +271,7 @@ pub fn usb_storage_gate(
         rust_bins,
         BootOptions {
             profile: Profile::UsbDisk,
-            kernel_features: GATE,
+            kernel_params: GATE,
             usb_images: vec![foreign.clone()],
             ..Default::default()
         },
@@ -293,7 +293,7 @@ pub fn usb_storage_gate(
     // was ever attached".
     let options = BootOptions {
         profile: Profile::Metal,
-        kernel_features: GATE,
+        kernel_params: GATE,
         ..Default::default()
     };
     let argv = qemu::profile_argv(&options);
@@ -327,7 +327,7 @@ pub fn usb_storage_gate(
 /// never arrived — a different LBA's data, under this LBA's number, with no
 /// error anywhere.
 ///
-/// **The actuator is a kernel feature and it corrupts the transfer, not the
+/// **The actuator corrupts the transfer, not the
 /// verdict.** QEMU derives the CSW residue from the same transfer the xHC
 /// completed, so the two accounts are one number there and can never
 /// contradict each other; `rerror` fails the whole command instead. The
@@ -346,7 +346,7 @@ pub fn usb_short_read(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURES: &[&str] = &["usb-storage-gate", "usb-short-read"];
+    const PARAMS: &[&str] = &["usb-storage-gate", "usb-short-read"];
     /// Mirrors `short_read::SHORT_BY`. One wire format with the kernel's, in
     /// the same sense the stamp is: a change to either without the other stops
     /// the line below matching rather than passing silently.
@@ -362,7 +362,7 @@ pub fn usb_short_read(
         rust_bins,
         BootOptions {
             profile: Profile::UsbDisk,
-            kernel_features: FEATURES,
+            kernel_params: PARAMS,
             usb_images: vec![image.clone()],
             ..Default::default()
         },
@@ -505,7 +505,7 @@ pub fn usb_disk_index_stable(
     qemu.flush_stdin();
     let log = format!("{boot}{}", qemu.drain_serial(Duration::from_secs(20)));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} after a disk arrived on the other controller\n{log}"));
         }
@@ -595,7 +595,7 @@ pub fn usb_pool_exhausted(
         rust_bins,
         BootOptions {
             profile: Profile::UsbDiskCrowd,
-            kernel_features: GATE,
+            kernel_params: GATE,
             usb_images: vec![bound.clone(), refused.clone()],
             ..Default::default()
         },
@@ -662,7 +662,7 @@ pub fn usb_storage_shapes(
         rust_bins,
         BootOptions {
             profile: Profile::UsbDisk4k,
-            kernel_features: GATE,
+            kernel_params: GATE,
             usb_images: vec![image.clone()],
             ..Default::default()
         },
@@ -687,7 +687,7 @@ pub fn usb_storage_shapes(
         rust_bins,
         BootOptions {
             profile: Profile::UsbDiskHuge,
-            kernel_features: GATE,
+            kernel_params: GATE,
             ..Default::default()
         },
     )?;
@@ -729,7 +729,7 @@ pub fn usb_storage_write_error(
 
     let options = BootOptions {
         profile: Profile::UsbDiskReadOnly,
-        kernel_features: GATE,
+        kernel_params: GATE,
         usb_images: vec![image.clone()],
         ..Default::default()
     };
@@ -809,7 +809,7 @@ fn check_geometry(log: &str, bytes: u64, lba: u32) -> Result<(), String> {
 /// SYNCHRONIZE CACHE (0x35) is optional in SBC and a great many USB flash
 /// drives answer ILLEGAL REQUEST / INVALID COMMAND OPERATION CODE. `msc_flush`
 /// read that as a failed flush; `FatFs::sync` logged the failure and returned
-/// `()`; the line it logged was new pending content in the ring `log_file` was
+/// `()`; the line it logged was new pending content in the shard `/bin/logd` was
 /// draining, and `Sink::flush` still said `Ok`, so the sink's disable path
 /// never ran. Every idle pass was then a file write, a FAT write and another
 /// SYNCHRONIZE CACHE on the stick the machine booted from, forever — and
@@ -826,7 +826,7 @@ fn check_geometry(log: &str, bytes: u64, lba: u32) -> Result<(), String> {
 ///   notice once and stop. Fixing `msc_flush` alone cannot produce that: the
 ///   error is swallowed and the loop is the one above.
 ///
-/// Neither boot can be green because the feature was not on: each asserts a
+/// Neither boot can be green because the actuator was not armed: each asserts a
 /// line that only the injected answer produces.
 pub fn usb_flush_optional(
     test_config: &Path,
@@ -843,11 +843,11 @@ fn optional_flush_keeps_the_log(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURE: &[&str] = &["usb-flush-unimplemented"];
+    const PARAMS: &[&str] = &["usb-flush-unimplemented"];
     const REPORTED: &str = "usb-storage: disk 0 does not implement SYNCHRONIZE CACHE";
 
     let image_path = test_dir().join("usb-flush-optional.img");
-    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, FEATURE);
+    let image = qemu::build_boot_image(test_config, c_bins, rust_bins, PARAMS);
     std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;
     let (start, len) = super::volumes::log_extent(&image, &image_path)?;
 
@@ -858,7 +858,7 @@ fn optional_flush_keeps_the_log(
         BootOptions {
             profile: Profile::Metal,
             boot_image: Some(image_path.clone()),
-            kernel_features: FEATURE,
+            kernel_params: PARAMS,
             ..Default::default()
         },
     );
@@ -884,7 +884,7 @@ fn optional_flush_keeps_the_log(
     qemu.flush_stdin();
     let log = format!("{boot}{}", qemu.drain_serial(Duration::from_secs(20)));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} on a stick with no write cache\n{log}"));
         }
@@ -907,8 +907,8 @@ fn optional_flush_keeps_the_log(
             ));
         }
     }
-    if log.contains("stops at") {
-        return Err(format!("the sink gave up on a stick that is working\n{log}"));
+    if log.contains("logd: /log has not answered") {
+        return Err(format!("logd gave up on a stick that is working\n{log}"));
     }
     if !on_device.contains("Boot: complete") {
         return Err(format!(
@@ -935,18 +935,40 @@ fn optional_flush_keeps_the_log(
     Ok(())
 }
 
-/// Boot with a stick whose flush genuinely fails. The sink says so once and
+/// Boot with a stick whose flush genuinely fails. The writer says so once and
 /// stops, rather than writing the device that just refused it.
+///
+/// **Re-pointed at `/bin/logd` at L6, and the policy it observes changed shape
+/// with the writer.** The kernel sink disabled itself on the *first* error,
+/// because the alternative from an idle loop was an error every pass. logd's
+/// give-up is a *duration* — `LOG_WRITE_BUDGET`, five seconds
+/// (`specs/log-architecture-spec.md` §5.4) — because a userland writer can
+/// afford to tell a stick that is busy apart from one that is gone, and a
+/// device that answers slowly under load is not a device to abandon.
+///
+/// The probes below are what make "and stops" a claim rather than an absence:
+/// each names a binary that is not there, so each commits a kernel record, so
+/// each is something logd would write if it had not given up. Twelve of them
+/// after the give-up and the failing-flush count still has to hold.
 fn failed_flush_stops_once(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURE: &[&str] = &["usb-flush-fails"];
+    const PARAMS: &[&str] = &["usb-flush-fails"];
+    /// Probes after the boot, each of which spawns a name that is not there and
+    /// so commits a kernel record logd would write if it were still writing.
+    const PROBES: usize = 12;
     /// A per-failure line, and the thing that has to stay bounded. Before the
     /// fix it is emitted by every pass of the idle loop for the life of the
-    /// boot; after it, once by the flush that gives up and once by the
+    /// boot. After it: one by the write that gives up, and one per mount by the
     /// shutdown's `sync_all`, which is the last caller left.
+    ///
+    /// **This is the number that caught the retry**, and it is worth saying what
+    /// it caught. A logd that retried inside `LOG_WRITE_BUDGET` measured
+    /// **1,737** failing flushes here, because the driver logs each failure, the
+    /// failure is a kernel record, and the record is something logd then tries
+    /// to write. The loop is in the coupling and not in either half.
     const BOUND: usize = 4;
 
     let mut qemu = QemuInstance::boot_with_options(
@@ -955,19 +977,24 @@ fn failed_flush_stops_once(
         rust_bins,
         BootOptions {
             profile: Profile::Metal,
-            kernel_features: FEATURE,
+            kernel_params: PARAMS,
             ..Default::default()
         },
     );
-    let boot = qemu.boot_log().to_string();
-    // Long enough for a loop to be a loop: the flush runs from the idle loop,
-    // which on this machine goes round thousands of times a second.
-    std::thread::sleep(Duration::from_secs(2));
+    let mut boot = qemu.boot_log().to_string();
+    // Long enough for the give-up to be reachable, and *driven* rather than
+    // waited out: each probe names a binary that is not there, which commits a
+    // kernel record, which is what gives logd something to fail to write.
+    for i in 0..PROBES {
+        let _ = writeln!(qemu.stdin_mut(), "run flush-probe-{i}");
+        qemu.flush_stdin();
+        boot.push_str(&qemu.drain_serial(Duration::from_millis(500)));
+    }
     writeln!(qemu.stdin_mut(), "run shutdown").expect("write to QEMU stdin");
     qemu.flush_stdin();
     let log = format!("{boot}{}", qemu.drain_serial(Duration::from_secs(20)));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} on a stick that cannot flush\n{log}"));
         }
@@ -976,14 +1003,14 @@ fn failed_flush_stops_once(
     if !log.contains("usb-storage: SCSI 0x35 failed, sense 0x04/0x44/0x00") {
         return Err(format!("the injected flush failure never reached the driver\n{log}"));
     }
-    // By step and not by code alone: the sink's four failure points all answer
-    // `SyscallError::Io` now, and the one this test stages is the sync rather
-    // than the append or the write-back ahead of it.
-    let gave_up = log.matches("log-file: the volume sync was refused").count();
+    // By step and not by code alone: logd names which of the two calls refused
+    // it, and the one this test stages is the sync rather than the append ahead
+    // of it.
+    let gave_up = log.matches("logd: /log has not answered (the sync").count();
     if gave_up != 1 {
         return Err(format!(
-            "the sink gave up {gave_up} times, wanted exactly one — a failed sync has to reach \
-             `Sink::flush` as an error\n{log}"
+            "logd gave up {gave_up} times, wanted exactly one — a failed `SYS_FSYNC` has to \
+             reach it as an error, and once it has given up it must not start again\n{log}"
         ));
     }
     let failures = log.matches("usb-storage: cache flush failed").count();
@@ -994,8 +1021,8 @@ fn failed_flush_stops_once(
         ));
     }
     eprintln!(
-        "  [usb] a flush the device refuses: {failures} failing flushes over a 2 s idle run, sink \
-         disabled once"
+        "  [usb] a flush the device refuses: {failures} failing flushes with {PROBES} probes \
+         after it, logd stopped once and never started again"
     );
     Ok(())
 }
@@ -1058,7 +1085,7 @@ pub fn xhci_deaf_registers(
         rust_bins,
         BootOptions {
             profile: Profile::Metal,
-            kernel_features: &["xhci-deaf-controller"],
+            kernel_params: &["xhci-deaf-controller"],
             ..Default::default()
         },
     )?;
@@ -1085,7 +1112,7 @@ pub fn xhci_deaf_registers(
         rust_bins,
         BootOptions {
             profile: Profile::Metal,
-            kernel_features: &["xhci-deaf-port"],
+            kernel_params: &["xhci-deaf-port"],
             ..Default::default()
         },
     )?;
@@ -1124,7 +1151,7 @@ pub fn xhci_deaf_registers(
 /// `no HID devices` in the same millisecond, on both controllers, while running
 /// off a stick plugged into one of them.
 ///
-/// **The actuator is a kernel feature, and the reason is timing rather than
+/// **The actuator is a boot parameter, and the reason is timing rather than
 /// expressiveness.** QEMU *can* stage a late attach: `usb-bot` and `usb-uas`
 /// are the two devices whose QOM `attached` property is settable, so
 /// `qom-set /machine/peripheral/<id> attached false|true` detaches and
@@ -1144,7 +1171,7 @@ pub fn xhci_slow_connect(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURES: &[&str] = &["usb-storage-gate", "xhci-slow-connect"];
+    const PARAMS: &[&str] = &["usb-storage-gate", "xhci-slow-connect"];
     /// Mirrors `xhci/mod.rs`'s `SLOW_CONNECT_NS` and `PORT_DEBOUNCE_NS`. These
     /// are one wire format with the kernel's in the same sense the gate's stamp
     /// is: a change to either without the other shows up as a failed assertion,
@@ -1181,7 +1208,7 @@ pub fn xhci_slow_connect(
         rust_bins,
         BootOptions {
             profile: Profile::UsbDisk,
-            kernel_features: FEATURES,
+            kernel_params: PARAMS,
             usb_images: vec![image.clone()],
             ..Default::default()
         },
@@ -1245,16 +1272,34 @@ pub fn xhci_slow_connect(
         return Err(format!("the guest did not report a clean pass\n{log}"));
     }
     verify(&image, bytes, nonce)?;
-    if !log.contains("Boot: complete") {
+    // The guest's own boot stamp, printed rather than asserted on.
+    //
+    // **This is `specs/log-architecture-spec.md` §1.4's and §9.6's named
+    // instrument, and until 2026-08-15 it could not be read off the test that
+    // *is* it.** Both sections ask for an interleaved A/B of a producer-path
+    // cost against this boot's `Boot: complete`, and the stamp reached only the
+    // per-run UART file, which goes when the guest does. So the measurement had
+    // to instrument something — and the lesson
+    // `specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md` leaves is that
+    // the reading taken on an instrumented build is the one that misleads. One
+    // line of output, `i8042_absent`'s arrangement, and the obligation is
+    // re-runnable by anybody. It decides nothing: what is asserted is that the
+    // boot finished, which is the `else` below.
+    let Some(boot_ms) = log
+        .split("Boot: complete (")
+        .nth(1)
+        .and_then(|rest| rest.split("ms)").next())
+    else {
         return Err(format!("the boot did not finish\n{log}"));
-    }
+    };
+    let boot_ms = boot_ms.to_string();
     serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
     let _ = std::fs::remove_file(&image);
 
     eprintln!(
         "  [usb] controller started at {started:.3} s and the ports read empty to \
          {HELD_EMPTY_S} s; first port named at {first_seen:.3} s, both sticks bound, host bytes \
-         verified host-side"
+         verified host-side; Boot: complete at {boot_ms} ms"
     );
     Ok(())
 }
@@ -1272,7 +1317,7 @@ pub fn xhci_slow_connect(
 /// enabled — on every port, on every controller, on any machine whose PORTSC is
 /// made of silicon.
 ///
-/// **The actuator is a kernel feature because nothing on the host side can
+/// **The actuator is a boot parameter because nothing on the host side can
 /// reach it.** QEMU's `xhci_port_write` clears only
 /// `CSC|PEC|WRC|OCC|PRC|PLC|CEC` on a written '1', and PED is in neither that
 /// set nor its read/write set, so writing PED=1 there does nothing at all
@@ -1284,7 +1329,7 @@ pub fn xhci_slow_connect(
 /// clears it, because a reset is what takes a real port out of Disabled
 /// (§4.19.1.1.3).
 ///
-/// The count line is what stops this from passing because the feature was off.
+/// The count line is what stops this from passing because nothing was armed.
 /// Only the emulation prints it, and it has to say zero — so "the injection is
 /// live" and "the driver never wrote PED" are separate assertions, and the
 /// per-port ones below are the register's own consequence rather than a verdict.
@@ -1299,7 +1344,7 @@ pub fn xhci_portsc_rw1c(
     // stick attaches at SuperSpeed, so both protocols' reset paths run here.
     let options = BootOptions {
         profile: Profile::MetalUsb,
-        kernel_features: &["xhci-portsc-rw1c"],
+        kernel_params: &["xhci-portsc-rw1c"],
         ..Default::default()
     };
     let argv = qemu::profile_argv(&options);
@@ -1398,7 +1443,7 @@ pub fn xhci_portsc_rw1c(
 /// offline for the rest of the boot with `/boot/toyos/kernel.log` — the only
 /// diagnostic channel that machine has — stopped where it stood.
 ///
-/// **The actuator is a kernel feature, and it replaces no verdict.** QEMU's
+/// **The actuator is a boot parameter, and it replaces no verdict.** QEMU's
 /// `usb-storage` answers every CBW, data phase and CSW it is handed; nothing on
 /// the host side makes one bulk transfer not complete, and `rerror`/`werror`
 /// fail a whole drive rather than leaving a transfer in flight.
@@ -1428,7 +1473,7 @@ pub fn usb_transport_break(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    const FEATURES: &[&str] = &["usb-storage-gate", "usb-transport-break"];
+    const PARAMS: &[&str] = &["usb-storage-gate", "usb-transport-break"];
 
     let (bytes, lba) = Profile::UsbDisk.usb_disk().expect("UsbDisk declares a disk");
     let image = test_dir().join("usb-transport-break.img");
@@ -1440,7 +1485,7 @@ pub fn usb_transport_break(
         rust_bins,
         BootOptions {
             profile: Profile::UsbDisk,
-            kernel_features: FEATURES,
+            kernel_params: PARAMS,
             usb_images: vec![image.clone()],
             ..Default::default()
         },
@@ -1756,7 +1801,7 @@ pub fn xhci_full_speed_device(
 /// that never delivered at all — which is the shape the T14 showed and the one
 /// whose recovery has to work before any report has ever arrived.
 ///
-/// The actuator is a kernel feature and `xhci/hid.rs`'s `stage_break` says why
+/// The actuator is a boot parameter and `xhci/hid.rs`'s `stage_break` says why
 /// nothing on the host side can reach it. What it replaces is the completion
 /// code **and the report that transfer delivered**: QEMU really moved a mouse
 /// report into the buffer, so a driver that dispatched it despite the error
@@ -1795,7 +1840,7 @@ fn hid_break_boot(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
-    features: &'static [&'static str],
+    params: &'static [&'static str],
     which: &str,
 ) -> Result<(), String> {
     /// The delta the assertion is about, injected after the break is spent.
@@ -1816,7 +1861,7 @@ fn hid_break_boot(
         // QEMU delivers the keystrokes over PS/2 and every assertion below
         // passes with the interrupt endpoint dead.
         i8042: false,
-        kernel_features: features,
+        kernel_params: params,
         ..Default::default()
     };
     let argv = qemu::profile_argv(&options);
@@ -1885,7 +1930,7 @@ fn hid_break_boot(
         return Err(format!("{err}\n{}\n{}", result.serial, result.stdout));
     }
     let log = format!("{boot}{}", result.serial);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} with the break staged at {which}\n{log}"));
         }
@@ -1971,7 +2016,7 @@ fn hid_break_boot(
 /// same `usb_device_attach` → `xhci_port_update` → `xhci_port_notify` path a
 /// device attached at startup does, so what the guest sees is a real Port
 /// Status Change Event with a real device behind it. That is the whole
-/// difference from `xhci_slow_connect`, which needs a kernel feature because
+/// difference from `xhci_slow_connect`, which needs an actuator because
 /// it has to aim at a window the boot opens and closes in milliseconds; here
 /// the window is the entire life of the machine.
 ///
@@ -2121,7 +2166,7 @@ pub fn xhci_hotplug(
         return Err(format!("{err}\n{}\n{}", result.serial, result.stdout));
     }
     let log = format!("{boot}{}", result.serial);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} while devices came and went\n{log}"));
         }
@@ -2235,7 +2280,7 @@ fn hotplug_delivered(stdout: &str, word: &str, want: (i32, i32)) -> Result<(), S
 /// Four times, once per ordinary unplug.
 ///
 /// The actuator is QEMU's own `device_del`/`device_add` with no wait between
-/// them, which lands both edges inside one debounce. No kernel feature: the
+/// them, which lands both edges inside one debounce. No actuator: the
 /// window is 100 ms wide and two QMP commands on a unix socket cross it easily.
 pub fn xhci_flap(
     test_config: &Path,
@@ -2310,7 +2355,7 @@ pub fn xhci_flap(
         return Err(format!("{err}\n{}\n{}", result.serial, result.stdout));
     }
     let log = &result.serial;
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} while the port was flapped\n{log}"));
         }
@@ -2489,7 +2534,7 @@ fn hotplug_unbound(log: &str) -> Result<(), String> {
 ///
 /// Every other USB profile puts the boot stick on port 1, where it binds and
 /// the reuse cannot happen; that is why a full gate boot never reached this.
-/// The actuator is not a kernel feature: QEMU can already stage a disk this
+/// The actuator is not a boot parameter: QEMU can already stage a disk this
 /// driver refuses (3 TB, more sectors than READ(10) addresses) and it assigns
 /// ports in device-creation order, so attaching it ahead of the boot stick is
 /// the whole injection. Nothing about the driver is modified to run this.
@@ -2523,7 +2568,7 @@ pub fn usb_refused_disk_first(
     // order".
     let options = BootOptions {
         profile: Profile::UsbDiskRefusedFirst,
-        kernel_features: GATE,
+        kernel_params: GATE,
         qmp: true,
         ..Default::default()
     };
@@ -2564,7 +2609,7 @@ pub fn usb_refused_disk_first(
     qemu.flush_stdin();
     let log = format!("{boot}{}", qemu.drain_serial(Duration::from_secs(20)));
     drop(qemu);
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} during the USB gate boot\n{log}"));
         }
@@ -2688,17 +2733,18 @@ pub fn usb_boot_stick_pulled(
     /// never carries on.
     const ANSWERED: usize = 8;
 
-    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/metalcase");
+    // metalcase's machine shape with `/bin/logd` rotating at 256 bytes rather
+    // than a mebibyte, so the log writer is not just appending when the device
+    // goes: every few probes it creates a file, sweeps the volume, deletes the
+    // oldest and syncs the mount. That is FAT allocation and directory writes
+    // in flight at the moment of the pull, which is the state the owner's
+    // machine is in and the one a quiet idle desktop never reaches. It was a
+    // kernel parameter until L6 and is a manifest row now, because the writer
+    // is a userland program.
+    let config = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/logrotatecase");
     let options = BootOptions {
         profile: Profile::Metal,
         qmp: true,
-        // Rotation at 256 bytes rather than a mebibyte, so the sink is not just
-        // appending when the device goes: every few probes it creates a file,
-        // sweeps the volume, deletes the oldest and syncs the mount. That is
-        // FAT allocation and directory writes in flight at the moment of the
-        // pull, which is the state the owner's machine is in and the one a
-        // quiet idle desktop never reaches.
-        kernel_features: &["log-rotate-fast"],
         // The T14's core count. How many CPUs are in the idle loop when the
         // device goes is the whole question on one hypothesis.
         smp: 8,
@@ -2726,11 +2772,11 @@ pub fn usb_boot_stick_pulled(
 
     // And it has to be writing to the stick, or the pull is a disconnect with
     // nothing in flight — which is not the state the owner's machine is in.
-    // The sink names the file it installed on `/log`, and that volume is on the
+    // `/bin/logd` names the file it opened on `/log`, and that volume is on the
     // device this test is about to take away.
-    if !console.contains("log-file: this boot's kernel log is /log/") {
+    if !console.contains("logd: this boot's kernel log is /log/") {
         return Err(format!(
-            "no log sink installed on /log, so the stick is not being written to and this gate \
+            "logd opened no file on /log, so the stick is not being written to and this gate \
              stages nothing:\n{console}"
         ));
     }
@@ -2751,11 +2797,11 @@ pub fn usb_boot_stick_pulled(
              drumbeat this gate measures does not work on a healthy machine:\n{console}"
         ));
     }
-    // The rotation actually ran, so "the sink was busy" is a fact rather than a
-    // feature flag that might have been dropped.
-    if !console.contains("log-file: /log/") || !console.contains("and this boot continues in") {
+    // The rotation actually ran, so "the writer was busy" is a fact rather than
+    // a manifest row that might have been dropped.
+    if !console.contains("logd: /log/") || !console.contains("and this boot continues in") {
         return Err(format!(
-            "the log sink never rotated, so the pull below lands on a sink that is only \
+            "logd never rotated, so the pull below lands on a writer that is only \
              appending:\n{console}"
         ));
     }
@@ -2807,7 +2853,7 @@ pub fn usb_boot_stick_pulled(
         ));
     }
 
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if console.contains(bad) {
             return Err(format!("{bad:?} after the boot stick was pulled\n{console}"));
         }

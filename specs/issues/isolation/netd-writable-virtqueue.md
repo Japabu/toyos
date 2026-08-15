@@ -60,7 +60,7 @@ pages and keeps its `DMA` pool private (`virtio_gpu.rs:464-479`, `:678`).
 virtio-net is the one device that hands its virtqueue out, and it predates both.
 
 **Standing.** No test stages a netd that writes outside its buffers, and none
-can while the mapping is one 2 MiB grant. `specs/type-safety-audit/kernel-drivers.md`
+can while the mapping is one 2 MiB grant. `specs/assessments/type-safety-audit/kernel-drivers.md`
 F1 audits the *reading* half (`poll-used-descriptor-unchecked`) and does not reach this: it
 argues from a misbehaving device throughout, which is a hardware-failure
 argument, where this is a process-isolation one. Splitting the pool the way

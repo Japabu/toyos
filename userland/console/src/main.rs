@@ -24,19 +24,23 @@
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::toyos::process;
+use std::os::toyos::process::CommandExt;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 use terminal::Console;
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos::shm::SharedMemory;
+use toyos::endow;
+use toyos::port::{self, Connector};
 use toyos::surface::{self, Delivery, Host, Notice};
-use toyos::{gpu, FramebufferDev, Keyboard};
+use toyos::{FramebufferDev, Keyboard};
+use toyos_abi::syscall::DeviceType;
 use window::Screen;
 
 const FONT: &str = "/share/fonts/JetBrainsMono-Regular-8x16.font";
 
-/// Where `log_file` puts one file per boot, each named for the wall clock at
-/// the moment that boot's sink installed.
+/// Where `/bin/logd` puts one file per boot, each named for the wall clock at
+/// the moment that boot's logd opened it.
 const KERNEL_LOG_DIR: &str = "/log";
 
 /// How many of those files seed the screen, oldest first.
@@ -53,37 +57,48 @@ const SEED_FILES: usize = 2;
 const KEY_PAGE_UP: u8 = 0x4B;
 const KEY_PAGE_DOWN: u8 = 0x4E;
 
-/// The kernel's log ring is 64 KiB (`kernel/src/drivers/log_ring.rs`), so no
-/// more than this was ever in it at one time. The line bound below is the one
-/// that normally applies; this one bounds a file with no newlines in it.
+/// The most of a seed file [`seed_tail`] will look at.
+///
+/// **A bound on this program's work, and no longer a statement about the
+/// kernel.** It read *"the kernel's log ring is 64 KiB
+/// (`kernel/src/drivers/log_ring.rs`), so no more than this was ever in it at
+/// one time"* — that file no longer exists
+/// (`specs/log-architecture-spec.md` §8.1), and what replaced it holds far
+/// more: a per-CPU ring of whole records, 512 KiB a shard and 4 MiB at the
+/// shipped eight CPUs, written to `/log` by a daemon that rotates on a byte
+/// count rather than by anything shaped like a ring.
+///
+/// So the number stands on its own reason instead. The scrollback bound below
+/// is what normally decides how far back a seed goes; this one is what stops a
+/// file with **no newlines in it** — a truncated write, something that is not a
+/// log at all — from being walked end to end before that bound can apply.
 const SEED_MAX_BYTES: usize = 64 * 1024;
 
 fn main() {
     // This console *is* the root of its surface tree — there is no compositor
     // in this image — so it both owns the translator and serves the channel a
     // child asks for raw keys on.
-    let mut name = [0u8; surface::MAX_NAME];
-    let name = surface::service_name(std::process::id(), &mut name).to_string();
-    let mut host = Host::listen(&name).expect("console: cannot serve its own surface name");
+    // Its own port, one per instance, whose connector goes into the namespace
+    // of the shell it spawns and nowhere else.
+    let (acceptor, connector) =
+        port::create().expect("console: the kernel refused a port of its own");
+    let mut host = Host::serve(acceptor);
     let mut translator = window::configured_translator();
 
     // Spawned first so it initialises while the font loads, as `/bin/terminal`
     // does.
-    let mut shell = Shell::spawn(&name);
+    let mut shell = Shell::spawn(&connector);
 
-    let fb_dev = match FramebufferDev::open() {
-        Ok(dev) => dev,
-        Err(e) => {
-            // The same answer soundd and netd give for their absent device: a
-            // console with no screen has nothing to report a failure *to*, and
-            // a panic here would replace the boot log with a crash report.
-            eprintln!("console: no framebuffer ({e:?}), exiting");
-            return;
-        }
+    let Some(fb_dev) = endow::device::<FramebufferDev>(DeviceType::Framebuffer) else {
+        // The same answer soundd and netd give for their absent device: a
+        // console with no screen has nothing to report a failure *to*, and a
+        // panic here would replace the boot log with a crash report.
+        eprintln!("console: no framebuffer, exiting");
+        return;
     };
     let info = fb_dev.info().expect("console: framebuffer info");
-    let shm = SharedMemory::map(info.token[0], info.stride as usize * info.height as usize * 4)
-        .expect("console: the scanout token the framebuffer device just reported");
+    let shm = SharedMemory::adopt(info.scanout[0], info.stride as usize * info.height as usize * 4)
+        .expect("console: the scanout buffer the framebuffer claim just handed over");
     let screen = Screen::new(
         shm.as_ptr(),
         info.width as usize,
@@ -102,9 +117,10 @@ fn main() {
     let mut console = Console::new(screen, font);
 
     let seeded = seed_kernel_log(&mut console);
-    present(info.width, info.height);
+    present(&fb_dev, info.width, info.height);
 
-    let kb = Keyboard::open().expect("console: no keyboard device");
+    let kb: Keyboard = endow::device(DeviceType::Keyboard)
+        .expect("the manifest gives this program the keyboard");
     // What the panel cost, on a machine whose only instrument is the panel.
     // The seed is the heaviest thing this program ever draws — a screenful of
     // log per scrolled row — so a boot that felt slow says so here.
@@ -125,10 +141,10 @@ fn main() {
     const TOKEN_CLIENT: u64 = 4;
 
     loop {
-        poller.poll_add_fd(toyos::Fd(shell.stdout.as_raw_fd()), IORING_POLL_IN, TOKEN_STDOUT);
-        poller.poll_add_fd(toyos::Fd(shell.stderr.as_raw_fd()), IORING_POLL_IN, TOKEN_STDERR);
+        poller.poll_add_fd(toyos::RawHandle(shell.stdout.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDOUT);
+        poller.poll_add_fd(toyos::RawHandle(shell.stderr.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDERR);
         poller.poll_add(&kb, IORING_POLL_IN, TOKEN_KEYBOARD);
-        poller.poll_add_fd(host.listener_fd(), IORING_POLL_IN, TOKEN_LISTEN);
+        poller.poll_add_fd(host.acceptor_fd(), IORING_POLL_IN, TOKEN_LISTEN);
         for fd in host.client_fds() {
             poller.poll_add_fd(fd, IORING_POLL_IN, TOKEN_CLIENT);
         }
@@ -150,7 +166,7 @@ fn main() {
                     // needs a reboot to be asked anything, which is the state
                     // this program exists to get out of. `exit` at the prompt
                     // is an ordinary thing to type.
-                    shell.restart(&name);
+                    shell.restart(&connector);
                     console.write_bytes(b"\n[console] the shell exited; a new one is running\n");
                     painted = true;
                 }
@@ -185,11 +201,15 @@ fn main() {
                     host.notify_layout();
                     eprintln!("console: keyboard layout is now {}", translator.layout());
                 }
-                Notice::Grabbed { pid } => {
-                    eprintln!("console: pid {pid} has the keyboard until it exits")
+                Notice::Grabbed { client } => {
+                    eprintln!("console: client {client} has the keyboard until it exits")
                 }
-                Notice::Released { pid } => eprintln!("console: pid {pid} gave the keyboard back"),
-                Notice::Dropped { pid, why } => eprintln!("console: dropping pid {pid} — {why}"),
+                Notice::Released { client } => {
+                    eprintln!("console: client {client} gave the keyboard back")
+                }
+                Notice::Dropped { client, why } => {
+                    eprintln!("console: dropping client {client} — {why}")
+                }
             }
         }
 
@@ -238,14 +258,14 @@ fn main() {
         }
 
         if painted {
-            present(info.width, info.height);
+            present(&fb_dev, info.width, info.height);
         }
     }
 }
 
 /// The newest [`SEED_FILES`] kernel logs on `/log`, oldest first.
 ///
-/// By name, which is by time: `log_file` names each boot's file for the wall
+/// By name, which is by time: `/bin/logd` names each boot's file for the wall
 /// clock in a form that sorts chronologically, and a boot's continuation parts
 /// sort directly after the file they continue.
 ///
@@ -268,11 +288,15 @@ fn newest_kernel_logs() -> Vec<std::path::PathBuf> {
 
 /// Push this boot's kernel log into the scrollback; returns the bytes written.
 ///
-/// Reading a file rather than the ring itself is not a workaround: `log_file`
-/// seeds the sink from the ring's *retained* window, so the file opens at this
-/// boot's first line and carries everything up to the last idle pass. What it
-/// cannot carry is anything logged after this program read it — for that the
-/// owner has a shell and `cat` on the file this names, which is the whole point.
+/// Reading a file rather than a cursor is a **choice this program has not made
+/// yet**, not a workaround. `/bin/logd` starts from a fresh `LogTail`, which is
+/// the oldest record every shard still holds, so the file opens at this boot's
+/// first line and carries everything logd has written. What it cannot carry is
+/// anything logged after this program read it — for that the owner has a shell
+/// and `cat` on the file this names. Reading the cursor directly would show this
+/// boot live and with no file in the path, and it needs `logread` on this
+/// program's manifest row; `specs/log-architecture-spec.md` §5.1a declines to
+/// grant that until something here asks for it.
 fn seed_kernel_log(console: &mut Console) -> usize {
     let mut log = Vec::new();
     for path in newest_kernel_logs() {
@@ -319,8 +343,8 @@ fn seed_tail(log: &[u8]) -> &[u8] {
 /// `gop.rs`'s `present_rect` is empty, because the scanout *is* the memory just
 /// written — and one transfer per batch on virtio-gpu, the only backend where
 /// it costs anything.
-fn present(width: u32, height: u32) {
-    gpu::present(0, 0, width, height).expect("console owns the framebuffer");
+fn present(fb: &FramebufferDev, width: u32, height: u32) {
+    fb.present(0, 0, width, height).expect("console holds the framebuffer claim");
 }
 
 struct Shell {
@@ -331,9 +355,14 @@ struct Shell {
 }
 
 impl Shell {
-    fn spawn(surface_name: &str) -> Shell {
+    fn spawn(surface: &Connector) -> Shell {
+        // `[programs.shell]`'s row plus this console's surface, which is the
+        // one name no manifest can carry: there is a port per console instance.
+        let surface_copy = surface
+            .duplicate()
+            .expect("console: the kernel refused a duplicate of its own surface connector");
         let mut child = Command::new("/bin/shell")
-            .env(surface::HOST_ENV, surface_name)
+            .provide(surface::SERVICE, surface_copy.into_raw().0)
             .stdin(process::tty_piped())
             .stdout(process::tty_piped())
             .stderr(process::tty_piped())
@@ -347,8 +376,8 @@ impl Shell {
         }
     }
 
-    fn restart(&mut self, surface_name: &str) {
+    fn restart(&mut self, surface: &Connector) {
         self.child.wait().ok();
-        *self = Shell::spawn(surface_name);
+        *self = Shell::spawn(surface);
     }
 }

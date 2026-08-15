@@ -12,21 +12,16 @@ cranelift-object = "0.128"
 target-lexicon = { git = "https://github.com/Japabu/target-lexicon", branch = "toyos" }
 toyos-ld = { path = "../toyos-ld" }
 
-[patch.crates-io]
-target-lexicon = { git = "https://github.com/Japabu/target-lexicon", branch = "toyos" }
+# Reading back what the compiler emitted. `tests/emission.rs` is the only
+# consumer: that a translation unit compiled says nothing about whether the
+# object does what the source asked for.
+[dev-dependencies]
+object = { version = "0.38", default-features = false, features = ["read", "elf", "std"] }
 
 [lints.rust]
 warnings = "deny"
 
-# The one profile every guest binary is built with — `specs/boot-image-split.md`
-# §6. Optimised, because an unoptimised guest mismeasures everything under TCG;
-# debug-assertions and overflow-checks on, because fail-fast beats speed here
-# and both crafted-ELF kernel panics in `specs/issues/` were *found* by
-# an overflow check. `--release` would turn the last two off silently, so this
-# build system no longer has the flag.
-[profile.toyos]
-inherits = "dev"
-opt-level = 2
-debug = true
-debug-assertions = true
-overflow-checks = true
+# `[patch.crates-io]` for the `target-lexicon` fork and `[profile.toyos]` used
+# to be declared here. Cargo honours neither in a workspace member, and this is
+# one — both now live in the root `Cargo.toml`, verbatim, and reach this crate
+# from there. `src/hostws.rs` reds on a member that declares either.

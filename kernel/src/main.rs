@@ -20,13 +20,14 @@ mod drivers;
 
 #[macro_use]
 mod log;
+mod actuator;
 mod mm;
 
 mod keyboard;
 mod mouse;
-#[cfg(feature = "test-input-merge")]
+#[cfg(feature = "boot-actuators")]
 mod input_merge_test;
-#[cfg(feature = "usb-storage-gate")]
+#[cfg(feature = "boot-actuators")]
 mod usb_gate;
 mod block;
 mod gpt;
@@ -36,8 +37,7 @@ mod tmpfs;
 mod file_backing;
 mod bcachefs_adapter;
 mod fat32_adapter;
-mod log_file;
-#[cfg(feature = "heartbeat")]
+#[cfg(feature = "boot-actuators")]
 mod heartbeat;
 #[allow(dead_code)]
 mod vfs;
@@ -54,14 +54,14 @@ mod irq_ring;
 mod trace;
 mod clock;
 mod rtc;
-mod fd;
+
+mod object;
 mod io_uring;
 mod pipe;
-mod listener;
+
 mod device;
 mod net;
 mod gpu;
-mod shared_memory;
 mod user_ptr;
 mod vma;
 
@@ -75,7 +75,7 @@ mod vma;
 /// same symbol are then on different display rows. It is a real backtrace
 /// frame off a real panic, which a synthetic wide `log!` line was only ever
 /// standing in for.
-#[cfg(feature = "test-late-panic")]
+#[cfg(feature = "boot-actuators")]
 mod late_panic {
     pub struct Nest<T>(core::marker::PhantomData<T>);
 
@@ -89,7 +89,6 @@ mod late_panic {
 
 use crate::mm::paging::CachePolicy;
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 use arch::{apic, cpu, idt, pat, percpu, smp, syscall};
 use drivers::{acpi, gop, i8042, ioapic, nvme, pci, serial, virtio_console, virtio_gpu, virtio_net, virtio_sound, xhci};
 use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
@@ -172,7 +171,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
     // Early boot: percpu not ready, just halt (single CPU at this point)
     if !log::PERCPU_READY.load(core::sync::atomic::Ordering::Relaxed) {
-        log!("!!! EARLY PANIC !!!: {}", info);
+        alert!("EARLY PANIC: {}", info);
         // This branch halts directly and never reaches halt_all_cpus, so it
         // owns both halves itself — and inverts halt_all_cpus' order. It runs
         // before idt::init, the one window with no exception handlers at all,
@@ -206,7 +205,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let prev = percpu::swap_fault_state(percpu::CpuFaultState::Panic);
     if prev != percpu::CpuFaultState::Normal {
         // Nested: Panic→Panic, Fatal→Panic, PageFault→Panic. Escalate.
-        log!("!!! DOUBLE PANIC !!!");
+        alert!("DOUBLE PANIC");
         apic::halt_all_cpus();
     }
 
@@ -234,7 +233,18 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // If in syscall context: kill the process, rejoin scheduler. This panic
     // is fully handled — reset the reentry guard so a future, independent
     // panic on this CPU still reports.
-    if percpu::syscall_rip() != 0 && percpu::current_tid().is_some() {
+    //
+    // **A kernel thread answers from its own row and never from the two words
+    // below**, because for one of them the words do not merely give the wrong
+    // answer — they give a *nondeterministic* one. `syscall_rip` is never
+    // cleared (`specs/issues/panic-path/syscall-rip-never-cleared.md`), so a
+    // kernel task reads whatever user thread last ran on this CPU left behind:
+    // the same panic on the same build would recover or halt depending on which
+    // CPU work stealing had put the thread on. `sched::kthread` is where the
+    // answer is a property of the thread instead.
+    let recoverable = sched::kthread::panic_recovers_here()
+        .unwrap_or_else(|| percpu::syscall_rip() != 0 && percpu::current_tid().is_some());
+    if recoverable {
         depth.store(0, core::sync::atomic::Ordering::SeqCst);
         // The captured report dies with the panic it belongs to. Left set, it
         // outlives a panic the machine survived, and the next fatal path —
@@ -267,47 +277,65 @@ pub unsafe extern "sysv64" fn _start(_kernel_args: &KernelArgs) -> ! {
 }
 
 fn register_gpu(driver: Box<dyn gpu::Gpu>, info: gpu::GpuInfo) {
-    let fb_info = fd::FramebufferInfo {
-        token: [info.tokens[0].raw(), info.tokens[1].raw()],
-        cursor_token: info.cursor_token.raw(),
-        width: info.width,
-        height: info.height,
-        stride: info.stride,
-        pixel_format: info.pixel_format,
-        flags: info.flags,
-    };
-    crate::device::set_framebuffer_info(fb_info);
+    crate::device::set_framebuffer_info(crate::device::Screen {
+        // A description carries handles into whichever process reads it, and
+        // that process does not exist yet: `try_claim` mints them.
+        info: toyos_abi::FramebufferInfo {
+            scanout: [toyos_abi::HANDLE_INVALID; 2],
+            cursor: toyos_abi::HANDLE_INVALID,
+            width: info.width,
+            height: info.height,
+            stride: info.stride,
+            pixel_format: info.pixel_format,
+            flags: info.flags,
+        },
+        scanout: info.scanout.clone(),
+        cursor: info.cursor.clone(),
+    });
     gpu::register(driver, info);
 }
 
 /// Say where this boot's log can be read, on the last surface that still shows
 /// it.
 ///
-/// The final boot checkpoint paints the tail of the ring, so a line logged
+/// The final boot checkpoint paints the tail of the records, so a line logged
 /// immediately before it is on the panel until userland claims the screen. On
 /// the machine this exists for that panel is the only thing a person can be
 /// told anything on — and what they most need to be told is that there will be
-/// nothing to read afterwards. A `/log` that refused to mount already says so,
-/// once, in the middle of phase 5, in white, among sixty-seven other rows.
+/// nothing to read afterwards.
 ///
-/// `!!!` is the panic console's alert marker (`panic_console::has_alert`),
-/// which paints the row red. It is claimed here for the two states in which
-/// this boot leaves no readable account of itself anywhere.
+/// **The four-way table survives L6 and its second axis changed, which is not
+/// the same as losing it** (§5.6). It was `(console, the file logd opened)`, and
+/// the kernel does not open a file any more — it does not name one and cannot
+/// say whether logd got anywhere. What it *does* still know is whether the log
+/// **volume mounted**, which is the fact this line exists to carry: a machine
+/// with no `/log` partition leaves no account of itself once userland owns the
+/// screen, and that is the sentence the owner needs on the panel.
+///
+/// **It has to be the kernel's, because the panel is the kernel's.**
+/// `panic_console` paints records, so a userland line reaches a console and
+/// never the screen — and this line's whole audience is somebody looking at a
+/// T14 with no serial port. `/bin/logd` says the half only it knows, on its own
+/// console handle: which file, or that it could not open one.
+///
+/// `alert!` is what says the row is red, and it is used for the two states in
+/// which this boot leaves no readable account of itself anywhere. Nothing in
+/// the text says so: the panel reads `Level` off the record, so a refusal wears
+/// the colour without having to spell it.
 ///
 /// ASCII throughout, unlike the rest of the kernel's prose: the panel's font is
 /// codepoints 0x20..=0x7E and `draw_glyph` renders everything else as a dot, so
 /// an em dash reaches the one reader this line has as three of them.
 fn report_log_destination() {
-    match (drivers::serial::has_console(), log_file::destination()) {
-        (true, Some(path)) => log!("log: this boot is on the console and in {path}"),
-        (false, Some(path)) => {
-            log!("log: no serial console - this boot is in {path} and on the screen")
+    let has_log = vfs::lock().has_mount(fat32_adapter::Role::Log.mount());
+    match (drivers::serial::has_console(), has_log) {
+        (true, true) => log!("log: this boot is on the console and on /log"),
+        (false, true) => log!("log: no serial console - this boot is on /log and on the screen"),
+        (true, false) => {
+            alert!("log: no /log - this boot is on the console only, and nothing outlives the power")
         }
-        (true, None) => {
-            log!("!!! log: no /log - this boot is on the console only, and nothing outlives the power !!!")
-        }
-        (false, None) => {
-            log!("!!! log: no serial console and no /log - this boot is on this screen and nowhere else !!!")
+        (false, false) => {
+            alert!("log: no serial console and no /log - this boot is on this screen and nowhere else")
         }
     }
 }
@@ -331,6 +359,22 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     serial::init();
 
+    // After the two channels a refusal can be read on, and before every
+    // actuator site — the earliest of them is a dozen lines below.
+    //
+    // The length is asked first because an empty `Vec` in the bootloader has no
+    // allocation behind it to point at, and every image anyone ships carries an
+    // empty one.
+    actuator::init(if kernel_args.cmdline_len == 0 {
+        ""
+    } else {
+        core::str::from_utf8(core::slice::from_raw_parts(
+            DirectMap::from_phys(kernel_args.cmdline_addr).as_ptr::<u8>(),
+            kernel_args.cmdline_len as usize,
+        ))
+        .expect("the boot parameter is not UTF-8")
+    });
+
     // Before `pat::init`, which restores the CR0 it found around its own
     // no-fill window and would carry a firmware CD straight through it.
     arch::control_regs::init_cr0(0);
@@ -343,10 +387,8 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     // The window this exists to cover: percpu is not up, no allocator, no
     // paging of our own, so the early-panic branch is the whole reporting
-    // mechanism. black_box keeps the rest of kernel_main reachable to the
-    // compiler; a bare `panic!` would make every later line dead code.
-    #[cfg(feature = "test-early-panic")]
-    if core::hint::black_box(true) {
+    // mechanism.
+    if actuator::test_early_panic() {
         panic!("test-early-panic: on-screen console check");
     }
 
@@ -358,7 +400,42 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         }
     }
 
-    log!("{:?}", kernel_args);
+    // **Six records rather than one `{:?}`.** The derived debug of `KernelArgs`
+    // is the one call site in the tree whose message exceeds the record bound —
+    // everything above 200 characters in the measured corpus is this line, 18
+    // of 12,497 — and unlike a demangled symbol it is a producer the kernel can
+    // split. So it is split, grouped by the question each field answers, rather
+    // than truncated with a count of what was lost
+    // (`specs/log-architecture-spec.md` §2.1).
+    log!(
+        "boot: memory map {:#x}+{:#x}, kernel {:#x}+{:#x}, stack {:#x}+{:#x}",
+        kernel_args.memory_map_addr, kernel_args.memory_map_size,
+        kernel_args.kernel_memory_addr, kernel_args.kernel_memory_size,
+        kernel_args.kernel_stack_addr, kernel_args.kernel_stack_size
+    );
+    log!(
+        "boot: initrd {:#x}+{:#x}, kernel elf {:#x}+{:#x}, rsdp {:#x}, boot pml4 {:#x}",
+        kernel_args.initrd_addr, kernel_args.initrd_size,
+        kernel_args.kernel_elf_addr, kernel_args.kernel_elf_size,
+        kernel_args.rsdp_addr, kernel_args.boot_pml4_addr
+    );
+    log!(
+        "boot: gop {:#x}+{:#x} {}x{} stride {} format {}",
+        kernel_args.gop_framebuffer, kernel_args.gop_framebuffer_size,
+        kernel_args.gop_width, kernel_args.gop_height,
+        kernel_args.gop_stride, kernel_args.gop_pixel_format
+    );
+    log!(
+        "boot: boot partition present={} lba {} +{} blocks guid {:02x?}",
+        kernel_args.boot_partition_present, kernel_args.boot_partition_start_lba,
+        kernel_args.boot_partition_blocks, kernel_args.boot_partition_guid
+    );
+    log!("boot: log partition guid {:02x?}", kernel_args.log_partition_guid);
+    log!(
+        "boot: rtc utc offset {} minutes (known={}), cmdline {:#x}+{}",
+        kernel_args.rtc_utc_offset_minutes, kernel_args.rtc_utc_offset_known,
+        kernel_args.cmdline_addr, kernel_args.cmdline_len
+    );
 
     let initrd = core::slice::from_raw_parts(
         DirectMap::from_phys(kernel_args.initrd_addr).as_ptr::<u8>(),
@@ -368,11 +445,6 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         DirectMap::from_phys(kernel_args.kernel_elf_addr).as_ptr::<u8>(),
         kernel_args.kernel_elf_size as usize,
     );
-    let init_bytes = core::slice::from_raw_parts(
-        DirectMap::from_phys(kernel_args.init_program_addr).as_ptr::<u8>(),
-        kernel_args.init_program_len as usize,
-    );
-    let init_programs = core::str::from_utf8(init_bytes).expect("init_programs: invalid UTF-8");
     let kernel_args = &kernel_args;
 
     // Phase 1: Memory
@@ -384,11 +456,8 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         mm::Region { start: 0x8000, end: 0x9000 }, // AP trampoline page
     ];
 
-    // Copy init_programs into heap before mm::init reclaims bootloader memory.
     mm::init(maps, &reserved);
     drivers::panic_console::remap();
-    let init_programs = alloc::string::String::from(init_programs);
-    let init_programs: &str = &init_programs;
 
     // Phase 2: CPU — exceptions, LAPIC, clock
     // Get exception handlers up ASAP so bugs in later phases produce diagnostics
@@ -472,12 +541,23 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     boot_phase!("storage ready", t_storage);
 
+    // **Four phases before the idle loop, which is where the log used to become
+    // sayable.** Under `Drain::Inline` every record above is already on the wire
+    // when this runs, so what the gate reads is the whole boot and then silence
+    // — where before this branch it was silence and nothing else.
+    #[cfg(feature = "boot-actuators")]
+    if actuator::pre_idle_wedge() {
+        pre_idle_wedge();
+    }
+
     // Phase 4: Peripherals
     let t_periph = clock::nanos_since_boot();
 
     xhci::init(&pci_devices);
-    #[cfg(feature = "usb-storage-gate")]
-    usb_gate::run();
+    #[cfg(feature = "boot-actuators")]
+    if actuator::usb_storage_gate() {
+        usb_gate::run();
+    }
     // Here rather than beside the NVMe probe: this machine boots off a USB
     // stick, so the disk carrying the boot partition does not exist until the
     // controller above has bound it.
@@ -487,8 +567,10 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // Last in the phase, so a probe of hardware nobody has driven cannot land
     // between two devices this kernel depends on, and so its verdict block is
     // the newest thing in the log ring the boot checkpoint paints.
-    #[cfg(feature = "hda-probe")]
-    drivers::hda_probe::run(kernel_args.rsdp_addr, &pci_devices);
+    #[cfg(feature = "boot-actuators")]
+    if actuator::hda_probe() {
+        drivers::hda_probe::run(kernel_args.rsdp_addr, &pci_devices);
+    }
 
     boot_phase!("peripherals ready", t_periph);
 
@@ -501,8 +583,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     scheduler::init();
     pipe::init();
     io_uring::init();
-    listener::init();
-    shared_memory::init();
+
 
     // Mount initrd as read-only root filesystem (bcachefs, no extraction)
     assert!(!initrd.is_empty(), "No initrd provided");
@@ -545,14 +626,10 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     match fat32_adapter::mount(Role::Log) {
         Some(fs) => {
             vfs::lock().mount(Role::Log.mount(), Box::new(fs), UserAccess::ReadWrite);
-            // Immediately after the mount and before anything else can fail:
-            // what a machine with no serial port most needs in the file is the
-            // boot that did not finish.
-            log_file::install();
         }
         // A refusal `gpt:` has already named the missing GUID for, and never a
         // fallback onto `/boot`: a stick with no log partition keeps its log in
-        // the ring, where the screen and the console can still reach it.
+        // the shards, where the screen and the console can still reach it.
         None => log!("log-volume: not mounted; this boot's kernel log stays in memory"),
     }
 
@@ -597,17 +674,18 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     boot_phase!("devices ready", t_devices);
 
     // Before userland, so nothing else is reading the input queues.
-    #[cfg(feature = "test-input-merge")]
-    input_merge_test::run();
-
-    // Phase 7: Userland
-    assert!(!init_programs.is_empty(), "bootloader must provide init_programs");
-    for entry in init_programs.split(';') {
-        let args: Vec<&str> = entry.split_whitespace().collect();
-        assert!(!args.is_empty(), "empty entry in init_programs");
-        let pid = process::spawn_kernel(&args);
-        log!("spawned {} pid={pid}", args[0]);
+    #[cfg(feature = "boot-actuators")]
+    if actuator::test_input_merge() {
+        input_merge_test::run();
     }
+
+    // Phase 7: Userland. One program, and it is not a choice the boot config
+    // makes any more: init reads `/etc/system.manifest` and starts what that
+    // says. What the bootloader used to carry — a `;`-joined argv blob baked
+    // into its own binary — made the `.efi` a function of the boot config, and
+    // a concurrent build could hand an image another config's init string.
+    let pid = process::spawn_init();
+    log!("spawned {} pid={pid}", process::INIT_PATH);
 
     report_log_destination();
     boot_phase!("complete", 0);
@@ -621,13 +699,38 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // longer true and was measured false: a drain no longer erases what the
     // console reads, so this test passes with `capture` stubbed out. See the
     // note on `panic_console::capture` for what still justifies it.
-    #[cfg(feature = "test-late-panic")]
-    if core::hint::black_box(true) {
+    #[cfg(feature = "boot-actuators")]
+    if actuator::test_late_panic() {
         late_panic::Nest::<late_panic::Nest<late_panic::Nest<late_panic::Nest<
             late_panic::Nest<late_panic::Nest<late_panic::Nest<late_panic::Nest<
             late_panic::Nest<late_panic::Nest<()>>>>>>>>>>::on_screen_console_check();
     }
 
+    // The last thing before the machine hands itself to the scheduler, because
+    // that is the first moment anything can run: the APs spin on `SMP_READY`
+    // below and the BSP reaches no pass before `enter_idle_loop`. A `klogd`
+    // spawned earlier would sit in a run queue through phases 5, 6 and 7 —
+    // which is the window a machine with no console wedges in — while the boot
+    // believed it had a drainer. `specs/log-architecture-spec.md` §4.2.
+    log::console::start();
+
     smp::set_ready();
     crate::scheduler::enter_idle_loop();
+}
+
+/// Stop this machine where nothing can report it, and say so first.
+///
+/// **Interrupts off and then a spin, which is a wedge rather than a machine
+/// that is merely idle.** No timer tick, no scheduler pass, no idle loop: the
+/// two things that used to drain the byte ring are both unreachable from here,
+/// and so is `klogd`, which is not spawned for another four phases. Everything
+/// the boot has said is therefore already on the wire or it never will be —
+/// which is the whole of what `pre_idle_wedge_speaks` reads.
+#[cfg(feature = "boot-actuators")]
+fn pre_idle_wedge() -> ! {
+    log!("pre-idle-wedge: the boot stops here, and this line is the last thing this machine says");
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+    loop {
+        core::hint::spin_loop();
+    }
 }

@@ -1,8 +1,10 @@
-# Its own workspace, like toyos-fat32 and toyos-gpt: `cargo test` runs here on
-# the host with no target-triple juggling. No dependencies, and in particular
-# not on `toyos-fat32` — this is the outside judge of that crate's output and of
-# the image builder's, so it may not share a line of code with either.
-[workspace]
+# A member of the host workspace (root `Cargo.toml`), like toyos-fat32 and
+# toyos-gpt: its tests run on the host with no target-triple juggling. No
+# dependencies, and in particular not on `toyos-fat32` — this is the outside
+# judge of that crate's output and of the image builder's, so it may not share a
+# line of code with either. Sharing a workspace is not sharing a line of code:
+# the two resolve together and depend on each other in one direction only, the
+# judge's, and never the reverse.
 
 [package]
 name = "toyos-fat32-check"

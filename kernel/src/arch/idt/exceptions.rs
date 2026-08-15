@@ -1,6 +1,6 @@
 use crate::arch::{apic, cpu, debug, syscall, percpu};
 use crate::arch::percpu::CpuFaultState;
-use crate::{log, mm, process, scheduler, symbols};
+use crate::{alert, log, mm, process, scheduler, symbols};
 
 use super::{Vector, TrapFrame, RPL_MASK, PF_PRESENT, PF_WRITE, PF_INSTRUCTION_FETCH};
 
@@ -25,9 +25,7 @@ fn user_backtrace(pid: crate::process::Pid, start_rbp: u64, pml4: *const u64, ma
         let Some(saved_rbp) = safe_read_u64(rbp, pml4) else { break };
         let Some(return_addr) = safe_read_u64(rbp + 8, pml4) else { break };
         if return_addr == 0 { break; }
-        if !process::resolve_user_symbol_return(pid, return_addr) {
-            log!("    {:#x}", return_addr);
-        }
+        process::resolve_user_symbol_return(pid, return_addr).log_bare(return_addr);
         rbp = saved_rbp;
     }
 }
@@ -203,9 +201,7 @@ fn crash_report_exception(ctx: &ExceptionContext) {
     log!("  rip:");
     if is_user {
         if let Some(pid) = pid {
-            if !process::resolve_user_symbol(pid, ctx.frame.rip) {
-                log!("    {:#x}", ctx.frame.rip);
-            }
+            process::resolve_user_symbol(pid, ctx.frame.rip).log_bare(ctx.frame.rip);
         } else {
             log!("    {:#x}", ctx.frame.rip);
         }
@@ -250,7 +246,7 @@ fn crash_report_exception(ctx: &ExceptionContext) {
                 log!("  Syscall: num={} user_rip={:#x} user_rsp={:#x}",
                     percpu::syscall_num(), user_rip, percpu::user_rsp());
                 log!("  User backtrace:");
-                process::resolve_user_symbol(pid, user_rip);
+                process::resolve_user_symbol(pid, user_rip).log_bare(user_rip);
                 let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64;
                 user_backtrace(pid, percpu::syscall_rbp(), pml4, 20);
             }
@@ -273,7 +269,7 @@ fn crash_report_exception(ctx: &ExceptionContext) {
 }
 
 fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
-    log!("!!! PANIC !!!: {}", info);
+    alert!("PANIC: {}", info);
 
     log!("  Backtrace:");
     kernel_backtrace(rbp, 20);
@@ -285,7 +281,7 @@ fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
         if let Some(guard) = process::PROCESS_TABLE.try_lock() {
             if let Some(table) = guard.as_ref() {
                 if let Some(proc) = table.get(pid) {
-                    log!("  Process: {} pid={} state={}", proc.name_str(), proc.pid(), proc.state().name());
+                    log!("  Process: {} pid={} state={}", proc.name_str(), proc.pid(), if proc.tearing_down() { "TearingDown" } else { "Live" });
                 }
             }
         }
@@ -295,7 +291,7 @@ fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
             log!("  Syscall: num={} user_rip={:#x} user_rsp={:#x}",
                 percpu::syscall_num(), user_rip, percpu::user_rsp());
             log!("  User backtrace:");
-            process::resolve_user_symbol(pid, user_rip);
+            process::resolve_user_symbol(pid, user_rip).log_bare(user_rip);
             let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64;
             user_backtrace(pid, percpu::syscall_rbp(), pml4, 20);
         }
@@ -351,6 +347,16 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
     }
 
     let dr6 = debug::read_dr6();
+    // Disable the watchpoint before the first `log!`: the watched word may be
+    // the log shard's own head or body, in which case reserving this report
+    // would otherwise enter #DB again before this handler reached its old
+    // clear-at-exit site. This returning handler emits at most 32 records
+    // (including a 20-frame backtrace), far short of one 512-record lap; the
+    // publication guard's safety argument relies on both facts.
+    unsafe {
+        core::arch::asm!("mov dr7, {}", in(reg) 0u64);
+        core::arch::asm!("mov dr6, {}", in(reg) 0u64);
+    }
     let is_user = frame.cs & RPL_MASK != 0;
     let tid = percpu::current_tid();
     let pid = percpu::current_pid();
@@ -371,9 +377,7 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
     log!("  Instruction that wrote:");
     if is_user {
         if let Some(pid) = pid {
-            if !process::resolve_user_symbol(pid, frame.rip) {
-                log!("    {:#x}", frame.rip);
-            }
+            process::resolve_user_symbol(pid, frame.rip).log_bare(frame.rip);
         }
     } else {
         symbols::resolve_kernel(frame.rip);
@@ -397,12 +401,6 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
     }
 
     log!("=== END WATCHPOINT ===");
-
-    // Clear DR6 so we don't re-trigger, then disable watchpoint
-    unsafe {
-        core::arch::asm!("mov dr6, {}", in(reg) 0u64);
-        core::arch::asm!("mov dr7, {}", in(reg) 0u64);
-    }
 }
 
 /// Double fault handler — runs on IST1. Always from kernel. Never returns.
@@ -467,9 +465,7 @@ pub(super) fn double_fault_handler(frame: &TrapFrame) -> ! {
                     let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>();
                     log!("  User backtrace:");
                     if let Some(pid) = pid {
-                        if !process::resolve_user_symbol(pid, maybe_rip) {
-                            log!("    {:#x}", maybe_rip);
-                        }
+                        process::resolve_user_symbol(pid, maybe_rip).log_bare(maybe_rip);
                         user_backtrace(pid, user_rbp, pml4, 20);
                     } else {
                         log!("    {:#x}", maybe_rip);
@@ -569,10 +565,10 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
 
     let tid_raw = percpu::current_tid().map_or(u32::MAX, |t| t.raw());
     if recursive {
-        log!("!!! FAULT rip={:#018x} cr2={:#018x} err={:#018x} cr3={:#018x} rsp={:#018x} tid={} RECURSIVE",
+        alert!("FAULT rip={:#018x} cr2={:#018x} err={:#018x} cr3={:#018x} rsp={:#018x} tid={} RECURSIVE",
             ctx.frame.rip, ctx.cr2, ctx.frame.error_code, cpu::read_cr3(), ctx.frame.rsp, tid_raw);
     } else {
-        log!("!!! FAULT rip={:#018x} cr2={:#018x} err={:#018x} cr3={:#018x} rsp={:#018x} tid={}",
+        alert!("FAULT rip={:#018x} cr2={:#018x} err={:#018x} cr3={:#018x} rsp={:#018x} tid={}",
             ctx.frame.rip, ctx.cr2, ctx.frame.error_code, cpu::read_cr3(), ctx.frame.rsp, tid_raw);
     }
 

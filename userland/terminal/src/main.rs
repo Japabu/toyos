@@ -9,12 +9,14 @@
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::toyos::process;
+use std::os::toyos::process::CommandExt;
 use std::process::Command;
 
 use terminal::Console;
 use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::port;
 use toyos::surface::{self, Delivery, Host, Notice};
-use toyos::Fd;
+use toyos::RawHandle;
 use window::Window;
 
 const TOKEN_STDOUT: u64 = 0;
@@ -37,20 +39,18 @@ fn present(console: &Console, window: &Window) {
 }
 
 fn main() {
-    let mut name = [0u8; surface::MAX_NAME];
-    let name = surface::service_name(std::process::id(), &mut name).to_string();
-    // The name is this process's pid, so nothing else can be holding it: a
-    // refusal here is the kernel's registry disagreeing with `getpid`.
-    let mut host = Host::listen(&name).expect("terminal: cannot serve its own surface name");
+    // **This terminal's surface is a port it makes, not a name it registers.**
+    // One per instance: the connector goes into the namespace of the shell it
+    // spawns and nowhere else, so nothing outside that subtree can reach this
+    // terminal's keyboard and nothing inside it can name a service this
+    // process was not given. `TOYOS_SURFACE` — an ambient string naming a
+    // machine-wide service — is what that replaces.
+    let (acceptor, connector) =
+        port::create().expect("terminal: the kernel refused a port of its own");
+    let mut host = Host::serve(acceptor);
 
     // Spawn shell first so it initializes while we load the font
-    let mut child = Command::new("/bin/shell")
-        .env(surface::HOST_ENV, &name)
-        .stdin(process::tty_piped())
-        .stdout(process::tty_piped())
-        .stderr(process::tty_piped())
-        .spawn()
-        .expect("failed to spawn shell");
+    let mut child = shell(&connector);
 
     let mut window = Window::create_with_title(0, 0, "Terminal").unwrap_or_else(|e| {
         eprintln!("terminal: {e}");
@@ -75,10 +75,10 @@ fn main() {
     eprintln!("terminal: ready");
 
     loop {
-        poller.poll_add_fd(Fd(shell_stdout.as_raw_fd()), IORING_POLL_IN, TOKEN_STDOUT);
-        poller.poll_add_fd(Fd(shell_stderr.as_raw_fd()), IORING_POLL_IN, TOKEN_STDERR);
+        poller.poll_add_fd(RawHandle(shell_stdout.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDOUT);
+        poller.poll_add_fd(RawHandle(shell_stderr.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDERR);
         poller.poll_add_fd(window.fd(), IORING_POLL_IN, TOKEN_WINDOW);
-        poller.poll_add_fd(host.listener_fd(), IORING_POLL_IN, TOKEN_LISTEN);
+        poller.poll_add_fd(host.acceptor_fd(), IORING_POLL_IN, TOKEN_LISTEN);
         for fd in host.client_fds() {
             poller.poll_add_fd(fd, IORING_POLL_IN, TOKEN_CLIENT);
         }
@@ -119,12 +119,14 @@ fn main() {
                 // broadcasts to every window, this one included, so the
                 // re-read arrives back through `Event::LayoutChanged`.
                 Notice::LayoutChanged => window.notify_layout_changed(),
-                Notice::Grabbed { pid } => {
-                    eprintln!("terminal: pid {pid} has the keyboard until it exits")
+                Notice::Grabbed { client } => {
+                    eprintln!("terminal: client {client} has the keyboard until it exits")
                 }
-                Notice::Released { pid } => eprintln!("terminal: pid {pid} gave the keyboard back"),
-                Notice::Dropped { pid, why } => {
-                    eprintln!("terminal: dropping pid {pid} — {why}")
+                Notice::Released { client } => {
+                    eprintln!("terminal: client {client} gave the keyboard back")
+                }
+                Notice::Dropped { client, why } => {
+                    eprintln!("terminal: dropping client {client} — {why}")
                 }
             }
         }
@@ -137,7 +139,7 @@ fn main() {
                 window::Event::KeyInput(key) if key.gui() && key.keycode == 0x06 => {
                     // Cmd+C: copy selection to clipboard
                     if let Some(text) = console.get_selection() {
-                        window::clipboard_set(&text);
+                        window::clipboard_set(&text).ok();
                     }
                 }
                 window::Event::KeyInput(key) => {
@@ -164,7 +166,7 @@ fn main() {
                         }
                         window::MOUSE_RELEASE if ev.changed == 1 => {
                             if let Some(text) = console.mouse_up(col, row) {
-                                window::clipboard_set(&text);
+                                window::clipboard_set(&text).ok();
                             }
                             present(&console, &window);
                         }
@@ -193,4 +195,26 @@ fn main() {
     drop(shell_stdout);
     drop(shell_stderr);
     child.wait().ok();
+}
+
+/// Start the shell: `[programs.shell]`'s own row, plus this terminal's surface.
+///
+/// **The row is init's to build and the surface is this terminal's to give.**
+/// A shell's authority is a decision the manifest makes, and until the launcher
+/// existed a terminal could hand a child only what it held itself — so it
+/// handed over a hand-written union of its own names. `provide` is the shape
+/// that replaces it: the one connector no manifest can name travels from here,
+/// everything else comes from the declaration, and a name this terminal happens
+/// to hold is no longer a name its shell inherits.
+fn shell(surface: &toyos::port::Connector) -> std::process::Child {
+    let handed = surface
+        .duplicate()
+        .expect("terminal: the kernel refused a duplicate of its own surface connector");
+    Command::new("/bin/shell")
+        .provide(surface::SERVICE, handed.into_raw().0)
+        .stdin(process::tty_piped())
+        .stdout(process::tty_piped())
+        .stderr(process::tty_piped())
+        .spawn()
+        .expect("failed to spawn shell")
 }

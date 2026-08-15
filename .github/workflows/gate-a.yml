@@ -1,11 +1,16 @@
 name: gate A, thorough
 
-# `tests/audio-baseline.toml`'s thorough tier, one audio test per job.
+# `tests/audio-baseline.toml`'s thorough tier, one audio test per job. N boots
+# per config taken strictly one at a time, and each job's guest has a runner to
+# itself — the quiet host the recorded sample was attested on.
 #
-# The tier is N boots per config taken strictly one at a time, so it is the one
-# thing in this tree that a second machine shortens rather than perturbs — and
-# each job's guest has a runner to itself, which is the quiet host the recorded
-# sample was attested on and the dev host can no longer offer.
+# Same `debian:sid`/QEMU 11.1.0 container the twelve shards run, since a QEMU
+# version this job does not share with the rest of CI and the dev host would
+# make the one arm that exists to be compared a third instrument
+# (specs/assessments/ci-plan-assessment-2026-08.md §7.3, §12.1). What still
+# differs from the dev host, deliberately, is the accelerator (KVM against
+# cross-arch TCG) and the host CPU — the axis this configuration is arranged
+# to isolate (specs/testing-strategy.md §2).
 
 on:
   workflow_dispatch:
@@ -17,6 +22,12 @@ on:
       ref:
         description: branch to run against
         required: false
+  # `03:10 UTC`, clear of `ci.yml`'s `03:00` and `host-tests.yml`'s `03:05`
+  # (specs/testing-strategy.md §5). A `schedule` event carries no `inputs`, so
+  # `iterations` below falls back to the same N=30 `workflow_dispatch` defaults
+  # to.
+  schedule:
+    - cron: '10 3 * * *'
 
 concurrency:
   group: gate-a-${{ github.ref }}
@@ -29,49 +40,102 @@ jobs:
       fail-fast: false
       matrix:
         shard: [1, 2]
+    # `--device=/dev/kvm` and root inside the container, exactly as the shards:
+    # the node ships `crw-rw---- root:kvm` and root opens it, with no chmod.
+    container:
+      image: debian:sid
+      options: --device=/dev/kvm
     steps:
+      # Before the checkout: `actions/checkout` wants git and this image has
+      # none. Three attempts, for the reason `ci.yml`'s own `deps` carries:
+      # `sid` is a rolling release and its mirror is not a fixed artifact. No
+      # `ovmf` package: the firmware is `ovmf/` in this repository on every
+      # host.
+      - name: deps
+        run: |
+          got=no
+          for attempt in 1 2 3; do
+            if apt-get update -qq \
+               && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                    git curl ca-certificates jq zstd xz-utils build-essential \
+                    qemu-system-x86 > /dev/null; then
+              got=yes
+              break
+            fi
+            echo "apt attempt $attempt failed"
+            [ "$attempt" = 3 ] || sleep 20
+          done
+          if [ "$got" != yes ]; then
+            echo "::error::apt failed three times against sid's mirror. Nothing here is about"
+            echo "::error::the tree — re-run the job."
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: unlock kvm
-        run: sudo chmod 666 /dev/kvm
+      # A gate A verdict is only comparable with the sample it is compared
+      # against, so the instrument is named before anything boots.
+      - name: the instrument
+        run: .github/instrument.sh
 
-      - name: deps
+      - name: rust
         run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            qemu-system-x86 ovmf zstd
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - id: key
-        run: |
-          sum=$(git rev-parse HEAD:rust HEAD:toyos-abi/src HEAD:toyos/src \
-                              HEAD:userland/libc/src | sha256sum | cut -c1-16)
-          echo "tag=toolchain-linux-x86_64-$sum" >> "$GITHUB_OUTPUT"
-
+      # This workflow builds no toolchain and never waits for one: a dispatch
+      # runs after the branch's pull request already went through
+      # `toolchain.yml`, and a scheduled run targets `main`, whose push already
+      # triggers it. A missing release here is a mistake about which ref was
+      # dispatched, or a race with that push.
       - name: install the toolchain
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release download "${{ steps.key.outputs.tag }}" \
-            -p 'toyos-toolchain.tar.zst' -O /tmp/toolchain.tar.zst
-          mkdir -p rust/build
-          zstd -dc /tmp/toolchain.tar.zst | tar -C rust/build -x
-          rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+        run: .github/install-toolchain.sh
 
-      # The host conditions line every run prints is the point of running it
-      # here, so nothing is captured away from it.
+      # `inputs.iterations || '30'`: a `schedule` event carries no `inputs`,
+      # where `workflow_dispatch`'s `required: true, default: '30'` always
+      # populates it, so the fallback is reached only on the trigger that has
+      # no other way to say 30.
       - name: gate
         run: |
           cargo test --test toyos-build -- \
-            --audio-gate ${{ inputs.iterations }} \
+            --audio-gate ${{ inputs.iterations || '30' }} \
             --shard ${{ matrix.shard }}/2 --host-slots 0 2>&1 | tee /tmp/gate-a.log
           exit "${PIPESTATUS[0]}"
 
-      - name: the sample, whatever the verdict
+      - name: gate sample
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gate-a-shard-${{ matrix.shard }}
           path: /tmp/gate-a.log
           retention-days: 30
+
+  # Files or updates the standing "nightly is red" issue, same as `ci.yml`'s
+  # `nightly-red`. Only on `schedule` — a dispatch of this workflow is somebody
+  # watching the run directly. Named `nightly-red-gate-a`, not `nightly-red`:
+  # a job id becomes a check run name, and two jobs sharing one id across
+  # workflows would collide under it.
+  nightly-red-gate-a:
+    needs: [gate]
+    if: ${{ !cancelled() && github.event_name == 'schedule' && needs.gate.result != 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: file or update "nightly is red"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE_RESULT: ${{ needs.gate.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          export TITLE="nightly is red"
+          export BODY="Run: $RUN_URL"$'\n'"Failed jobs: gate-a($GATE_RESULT)"
+          .github/nightly-red.sh

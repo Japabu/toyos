@@ -1,6 +1,35 @@
 use super::*;
 
 impl Codegen {
+    /// The address of a local, computed in the block that is asking for it.
+    ///
+    /// `None` for [`LocalStorage::Ssa`], which has no address at all until it
+    /// is spilled — whether to spill is the caller's decision.
+    pub(super) fn local_addr(&mut self, ctx: &mut FuncCtx, storage: LocalStorage) -> Option<Value> {
+        Some(match storage {
+            LocalStorage::Ssa(_) => return None,
+            LocalStorage::Slot(ss) => ctx.builder.ins().stack_addr(I64, ss, 0),
+            LocalStorage::Static(data_id) => {
+                let gv = self.module.declare_data_in_func(data_id, ctx.builder.func);
+                ctx.builder.ins().global_value(I64, gv)
+            }
+            LocalStorage::Vla(ss) => ctx.builder.ins().stack_load(I64, ss, 0),
+        })
+    }
+
+    /// Store a value into a local variable, whatever its storage.
+    pub(super) fn store_to_local(&mut self, ctx: &mut FuncCtx, name: &str, val: Value) {
+        let storage = ctx.locals.get(name)
+            .map(|(s, _)| *s)
+            .unwrap_or_else(|| panic!("store_to_local: unknown variable '{name}'"));
+        if let LocalStorage::Ssa(var) = storage {
+            ctx.builder.def_var(var, val);
+            return;
+        }
+        let ptr = self.local_addr(ctx, storage).expect("only Ssa has no address");
+        ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
+    }
+
     pub(super) fn compile_addr(&mut self, ctx: &mut FuncCtx, expr: &Expr) -> Value {
         verbose_enter!("compile_addr", "{:?}", std::mem::discriminant(expr));
         let result = self.compile_addr_inner(ctx, expr);
@@ -12,10 +41,6 @@ impl Codegen {
         match expr {
             Expr::Ident(name) => {
                 match ctx.locals.get(name).map(|(s, t)| (*s, t.clone())) {
-                    Some((LocalStorage::Ptr(ptr), _)) => return ptr,
-                    Some((LocalStorage::Spilled(slot), _)) => {
-                        return ctx.builder.ins().stack_addr(I64, slot, 0);
-                    }
                     Some((LocalStorage::Ssa(var), ty)) => {
                         // Spill SSA variable to stack permanently so aliases
                         // through pointers (e.g. strstart(&r1)) see updates.
@@ -26,8 +51,11 @@ impl Codegen {
                         let ptr = ctx.builder.ins().stack_addr(I64, ss, 0);
                         let val = ctx.builder.use_var(var);
                         ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
-                        ctx.locals.insert(name.clone(), (LocalStorage::Spilled(ss), ty));
+                        ctx.locals.insert(name.clone(), (LocalStorage::Slot(ss), ty));
                         return ptr;
+                    }
+                    Some((storage, _)) => {
+                        return self.local_addr(ctx, storage).expect("only Ssa has no address");
                     }
                     None => {}
                 }

@@ -1,0 +1,10 @@
+[package]
+name = "logd"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+toyos = { path = "../../toyos" }
+toyos-abi = { path = "../../toyos-abi" }
+toyos-wallclock = { path = "../../toyos-wallclock" }

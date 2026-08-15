@@ -7,6 +7,8 @@ pub mod lane;
 #[allow(dead_code)]
 pub mod compile;
 #[allow(dead_code)]
+pub mod console;
+#[allow(dead_code)]
 pub mod faults;
 #[allow(dead_code)]
 pub mod gpt;
@@ -16,6 +18,8 @@ pub mod hda;
 pub mod hostload;
 #[allow(dead_code)]
 pub mod iommu;
+#[allow(dead_code)]
+pub mod logread;
 #[allow(dead_code)]
 pub mod qemu;
 #[allow(dead_code)]

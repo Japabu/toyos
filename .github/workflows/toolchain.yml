@@ -1,20 +1,19 @@
 name: toolchain
 
-# A toolchain is 1.1 GB of product out of an hour of x.py, and it is a function
-# of the rust fork plus the three trees that end up inside the sysroot — which
-# is `toolchain::witness`'s own question, asked of git so a shell can ask it
-# too. Nearly every branch changes none of them and this workflow does nothing.
+# A toolchain is a function of the rust fork plus the three trees that end up
+# in the sysroot — `toolchain::witness`'s own question, asked of git so a
+# shell can ask it too. Nearly every branch changes none of them and this
+# workflow does nothing.
 #
-# **Its own workflow because it must never be cancelled.** `ci.yml` cancels a
-# superseded run by design; a second push during an hour-long bootstrap would
-# throw that hour away and the next run would start it again.
-
-# **On pull requests too, and that is not optional.** `ci.yml` waits up to two
-# hours for the release keyed on the four trees it is about to build against, and
-# a branch is no longer pushed *and* opened as a pull request — it is one event.
-# A branch that changes one of those trees and never got a `push` event would
-# have every shard wait that out and then fail. A pull-request checkout is the
-# merge of head and base, which is the commit `ci.yml` keys on, so the two agree.
+# Its own workflow because it must never be cancelled: `ci.yml` cancels a
+# superseded run by design, and a second push during an hour-long bootstrap
+# would throw that hour away.
+#
+# Runs on pull requests too: `ci.yml` waits up to two hours for the release
+# keyed on the four trees it is about to build against, and a branch that
+# changed one of them but never got a bare `push` event would wait that out
+# and fail. A pull-request checkout is the merge of head and base, the same
+# commit `ci.yml` keys on.
 
 on:
   push:
@@ -78,24 +77,46 @@ jobs:
           git submodule update --init rust
           echo "SUBMODULE-SECONDS: $(( $(date +%s) - t0 ))"
 
-      # GITHUB_ACTIONS=true puts bootstrap on its own CI path, where it assumes
+      # `GITHUB_ACTIONS=true` puts bootstrap on its own CI path, which assumes
       # HEAD is a PR merge commit and takes HEAD^1 as the upstream commit whose
-      # LLVM to fetch. In this fork HEAD^1 is our own merge of upstream, which
-      # rust-lang CI never built: four 404s and `failed to download llvm from
-      # ci`. Unset, it walks back to a real bors commit as it does on the dev
-      # host.
+      # LLVM to fetch; in this fork HEAD^1 is our own merge of upstream, which
+      # rust-lang CI never built. Unset, bootstrap walks back to a real bors
+      # commit as it does on the dev host.
       - name: build
+        id: build
         if: steps.have.outputs.build == 'yes'
         run: |
+          set -o pipefail
           t0=$(date +%s)
-          env -u GITHUB_ACTIONS -u CI cargo run -- --build-only
+          env -u GITHUB_ACTIONS -u CI cargo run -- --build-only 2>&1 | tee /tmp/build.log
           echo "BUILD-ONLY-SECONDS: $(( $(date +%s) - t0 ))"
           df -h /
           du -sh rust/build
 
-      # `lib/rustlib/<host>` is a symlink into whatever stable toolchain built
-      # it, which is not a path any artifact can carry. `Owner::Installed`
-      # recreates it.
+      # The first compile error and the panic that ended the run, lifted onto
+      # the run's own front page rather than left for `gh run view --log-failed`
+      # to find inside an hour-long log.
+      - name: compile error
+        if: failure() && steps.build.outcome == 'failure'
+        run: |
+          {
+            echo "### the toolchain did not build"
+            echo ""
+            echo '```'
+            grep -m1 -A5 -E '^error(\[|: could not compile)' /tmp/build.log \
+              || echo "(no compile error in the log)"
+            echo ""
+            grep -A2 -E "^thread '.*' panicked at" /tmp/build.log | tail -20 \
+              || echo "(the build system did not panic)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # `lib/rustlib/<host>` and `<host>/stage2/bin/cargo` are symlinks into
+      # whatever toolchain this runner has, which is not a path any artifact can
+      # carry. `Owner::Installed` recreates both —
+      # `toolchain::provision_toolchain_cargo` is the one step that makes the
+      # second, and a link shipped from here would dangle on the consumer and
+      # narrate a fallback while looking provisioned.
       - name: publish
         if: steps.have.outputs.build == 'yes'
         env:
@@ -105,6 +126,7 @@ jobs:
           t0=$(date +%s)
           tar -C rust/build \
               --exclude="x86_64-unknown-toyos/stage2/lib/rustlib/$host" \
+              --exclude="$host/stage2/bin/cargo" \
               -c "$host/stage2" x86_64-unknown-toyos/stage2 toyos-sysroot-witness \
             | zstd -T0 -3 -o /tmp/toyos-toolchain.tar.zst
           echo "PACKAGE-SECONDS: $(( $(date +%s) - t0 ))"
@@ -117,3 +139,27 @@ jobs:
             --notes "x86_64-unknown-linux-gnu toolchain for rust $(git rev-parse HEAD:rust), built from ${{ github.sha }}." \
             /tmp/toyos-toolchain.tar.zst \
             || gh release view "${{ steps.key.outputs.tag }}"
+
+      # `create` makes the release and then uploads to it, so a failed upload
+      # leaves a tag that answers 200 with nothing installable — and this job
+      # reporting success either way is the verdict `ci.yml` reads before
+      # starting the shards. The wait here is for the *other* branch's upload,
+      # in the idempotent case the `publish` step's `||` exists for.
+      - name: release asset
+        if: steps.have.outputs.build == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for _ in $(seq 20); do
+            if gh release view "${{ steps.key.outputs.tag }}" --json assets \
+                 --jq '.assets[].name' | grep -qx toyos-toolchain.tar.zst; then
+              echo "${{ steps.key.outputs.tag }} carries toyos-toolchain.tar.zst."
+              exit 0
+            fi
+            echo "the release is there and the asset is not on it yet; waiting"
+            sleep 15
+          done
+          echo "::error::${{ steps.key.outputs.tag }} exists and carries no"
+          echo "::error::toyos-toolchain.tar.zst. Nothing can install this toolchain, and a"
+          echo "::error::green here is what lets ci.yml start thirteen shards."
+          exit 1

@@ -66,6 +66,22 @@ pub fn eoi() {
     cpu::wrmsr(X2APIC_EOI, 0);
 }
 
+/// Send an IPI to **this** CPU (self shorthand), for the one caller that needs
+/// an interrupt whose delivery time is decided by `IF` alone.
+///
+/// `log-nested-emit` (§9.2) is that caller: it sends this from inside `emit`,
+/// and the whole verdict is *when* it lands — after the publication bracket
+/// with §2.3a's guard, inside the body copy without it. No device interrupt can
+/// serve, because nothing about a device's timing is under a test's control.
+#[cfg(feature = "boot-actuators")]
+pub fn send_self(vector: u8) {
+    if !X2APIC_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    // Destination shorthand = self (0b01 << 18), fixed delivery, level assert.
+    cpu::wrmsr(X2APIC_ICR, 0x0004_4000 | vector as u64);
+}
+
 /// Send an IPI to all CPUs except self (shorthand destination).
 fn ipi_all_excluding_self(vector: u8) {
     // destination shorthand = all-excluding-self (0b11 << 18), fixed delivery
@@ -108,52 +124,66 @@ pub fn send_nmi(cpu_id: u32) {
     cpu::wrmsr(X2APIC_ICR, ((apic_id as u64) << 32) | 0x4400);
 }
 
-/// How long a dying machine gives its siblings to put the report on `/log`.
+/// How long a dying machine gives `/bin/logd` to put the report on `/log`.
 ///
-/// The idle loop goes round in microseconds and a flush is one FAT append plus
-/// a sync, so a machine with a healthy CPU left finishes far inside this; the
-/// bound is what a machine with none pays, once, on its way down. Half a second
-/// against the ~460 ms the panel paint costs on the T14 anyway.
+/// **Re-derived at L6, because what it bounds changed kind and not only size.**
+/// It used to bound the idle loop, which goes round in microseconds, doing one
+/// FAT append and a sync itself. What it bounds now is a *userland process*
+/// being scheduled: a wake reaching whichever CPU logd is parked on, its
+/// `SYS_LOG_READ`, a page-cache write-back, a FAT append, the device's own
+/// cache flush, and a second `SYS_LOG_READ` to publish `durable`. Every one of
+/// those is a step the old number did not cover.
+///
+/// It stays at half a second, and the reason is what the number is *for* rather
+/// than what it now contains: it is not a prediction of how long the write
+/// takes, it is what a machine with nobody left to do the writing pays on its
+/// way down. Half a second against the ~460 ms the panel paint costs on the T14
+/// anyway, and a machine whose logd is alive and schedulable finishes far
+/// inside it. `screen_fatal_halt_composited`'s `/log` half is what says so on
+/// every run.
 const LOG_FILE_DRAIN_NANOS: u64 = 500_000_000;
 
-/// Does the log volume still owe this boot bytes?
+/// Does `/log` still owe this boot the report?
 ///
-/// **Both halves, and the second is not belt-and-braces.** The ring's own
-/// predicate goes false at `drain_to_file`, which is before `flush_file` and
-/// `sync_mount` have put anything on the device — so waiting on it alone
-/// returns mid-write and the halt IPI then stops the CPU doing the writing.
-/// Measured: the wait was satisfied, no timeout line was printed, and the
-/// report was still absent from the file.
-fn owed() -> bool {
-    crate::drivers::log_ring::file_has_pending() || crate::log_file::flush_in_progress()
+/// **One predicate now, where it was two.** The kernel's own file sink is gone
+/// (§8.1), and with it the pair of questions — "has the cursor moved" and "is a
+/// flush between the ring and the device" — that had to be asked together
+/// because the first went false in the middle of the second. `LOG_DURABLE_NS`
+/// has no such gap by construction: `/bin/logd` publishes it *after* the
+/// `fsync` returns, so the word going past a record's timestamp means that
+/// record is on the stick and not that somebody has started putting it there.
+fn owed(want: u64) -> bool {
+    crate::log::user::durable_ns() < want
 }
 
-/// Give the log sink a chance to put this report on the stick before the
-/// machine stops.
+/// Give `/bin/logd` a chance to put this report on the stick before the machine
+/// stops.
 ///
-/// **The panic path still writes nothing itself, and that is the design.**
-/// `log_file`'s own module doc rules a panic-time flush out on locks alone —
-/// it would need this module's lock, the VFS lock, the file cache lock, the
-/// kernel heap, the volume's device lock and the xHCI lock, and a panicking
-/// thread may hold any of them. `try_lock` does not rescue it either: a
-/// spinlock's `try_lock` fails for its own holder, so the cases where the
-/// report matters most are exactly the cases it would decline, and the heap is
-/// not try-able at all. That is "sometimes writes and sometimes hangs", which
-/// is worse than the panel alone.
+/// **The panic path writes nothing itself, and that is the design.** A
+/// panic-time write would need the VFS lock, the file cache lock, the kernel
+/// heap, the volume's device lock and the xHCI lock, and a panicking thread may
+/// hold any of them. `try_lock` does not rescue it either: a spinlock's
+/// `try_lock` fails for its own holder, so the cases where the report matters
+/// most are exactly the ones it would decline, and the heap is not try-able at
+/// all. That is "sometimes writes and sometimes hangs", which is worse than the
+/// panel alone. **After L6 it is not even available**: the writer is a userland
+/// process and the kernel has no path to `/log` to take.
 ///
 /// What this does instead takes no lock, allocates nothing and touches no
-/// device: **it waits.** The report is already in the log ring, the halt IPI has
-/// not gone out yet, and every other CPU's idle loop is still running
-/// `log_file::poll`, which is the ordinary, proven path to the stick. So the
-/// dying CPU spins on one relaxed atomic against a deadline and lets a healthy
-/// sibling do the write.
+/// device: **it waits.** The report is already committed in the shards, the halt
+/// IPI has not gone out yet, and `emit` has already posted `klogd`'s wake — so
+/// `klogd` drains, posts the log's readiness source, and `/bin/logd` is made
+/// runnable by the ordinary mechanism rather than by anything on this path. The
+/// dying CPU spins on one relaxed atomic against a deadline and lets the rest of
+/// the machine do the writing.
 ///
-/// It cannot deadlock and it cannot make a panic worse: `file_has_pending` is a
-/// load, the deadline is absolute, and every outcome ends in the same
-/// `halt_all_cpus` tail that ran before. A machine where no CPU can flush —
-/// the VFS lock stranded, the sink disabled, no `/log` at all — pays the bound
-/// and halts exactly as it used to, with the panel as the only copy and a line
-/// saying so.
+/// It cannot deadlock and it cannot make a panic worse: [`owed`] is a load, the
+/// deadline is absolute, and every outcome ends in the same `halt_all_cpus` tail
+/// that ran before. A machine where nothing can write — no scheduler able to
+/// pick logd, a logd that died earlier in the boot, a logd that has given up on
+/// the volume, no `/log` at all — pays the bound and halts with the panel as the
+/// only copy and a line saying so. Those are §6.6's cases and §6.6's subject:
+/// they are what a pstore would cover and this cannot.
 ///
 /// Placed before the halt IPI rather than after, because after it there is
 /// nobody left to do the writing.
@@ -173,15 +203,21 @@ fn wait_for_log_file() {
     if crate::drivers::serial::has_console() {
         return;
     }
-    if !owed() {
+    // **What is waited for is sampled once, here.** The report's own records
+    // are already committed — `panic_console::capture` ran before this — so the
+    // newest committed timestamp *is* the report's, and taking it once means a
+    // sibling that keeps logging on its way down cannot extend this wait
+    // indefinitely by moving the target.
+    let want = crate::log::read::newest_committed_at_ns();
+    if !owed(want) {
         return;
     }
-    // Wake them first. A sibling with nothing to run is sitting in `sti; hlt`
-    // and is not going round its idle loop at all, so waiting for it to flush
-    // waits for something that is not happening — the LAPIC timer is one-shot
-    // and a quiet machine may have none armed. This is the ordinary wake IPI,
-    // the same one a scheduler wake sends, and the halt IPI has not gone out
-    // yet, so there is still somebody to wake.
+    // Wake them first. A sibling with nothing to run is sitting in `sti; hlt`,
+    // so waiting for the machine to schedule logd waits for something that is
+    // not happening — the LAPIC timer is one-shot and a quiet machine may have
+    // none armed. This is the ordinary wake IPI, the same one a scheduler wake
+    // sends, and the halt IPI has not gone out yet, so there is still somebody
+    // to wake.
     let cpus = crate::arch::smp::cpu_count();
     let me = percpu::cpu_id();
     for cpu in 0..cpus {
@@ -190,7 +226,7 @@ fn wait_for_log_file() {
         }
     }
     let deadline = crate::clock::nanos_since_boot().saturating_add(LOG_FILE_DRAIN_NANOS);
-    while owed() {
+    while owed(want) {
         if crate::clock::nanos_since_boot() >= deadline {
             // Reaches the panel only on the fatal paths that paint the live
             // ring rather than a snapshot taken before this ran, and reaches
@@ -277,7 +313,7 @@ pub fn init_timer_ap() {}
 /// count too small to outlast the interrupt it schedules is not one late tick
 /// but a livelock nothing recomputes its way out of. Ring 3 can ask for one — a
 /// deadline already past when the pass arms it — and did (`#156`,
-/// `specs/metal-logs/2026-08-08-cpu0/`).
+/// `specs/assessments/metal-logs/2026-08-08-cpu0/`).
 ///
 /// Policy, not physics, and it sits between two bounds. Below: an interrupt
 /// entry and `iretq`, which is what the interval has to be worth more than for
@@ -338,7 +374,7 @@ pub fn arm_one_shot(nanos: u64) {
 ///
 /// Traces nothing, unlike [`arm_one_shot`]: no scheduler deadline is being set
 /// here, and a `TimerArm` record would make the trace say one was.
-#[cfg(feature = "diag-tick")]
+#[cfg(feature = "boot-actuators")]
 pub fn arm_within(nanos: u64) {
     let want = OneShot::after(nanos);
     // A running count never reaches zero without the fire that reloads it, so

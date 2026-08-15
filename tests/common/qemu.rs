@@ -30,6 +30,57 @@ pub fn live_instances() -> u32 {
     LIVE.load(Ordering::SeqCst)
 }
 
+/// Guests this run has started, how many of them were not the shipping kernel,
+/// and every distinct kernel build it asked cargo for.
+///
+/// A registration is not a boot — several tests boot two machines and one boots
+/// four — so the count that decides whether a scheduling or build change worked
+/// cannot be read off the test lists. It was static analysis until now, and
+/// `specs/assessments/test-cost-audit.md` §6 records that as a lower bound.
+///
+/// **The third is the one this run is judged on.** A kernel build is ~6.9 s of
+/// wall clock and ~29.6 s of CPU after any edit to `kernel/` (§5.9.2), and
+/// until 2026-08-10 a full run made 45 of them. The set is what a run reports
+/// and what [`declared_kernel_builds`] refuses an addition to.
+static BOOTS: AtomicU32 = AtomicU32::new(0);
+static FEATURE_BOOTS: AtomicU32 = AtomicU32::new(0);
+static KERNELS: std::sync::Mutex<std::collections::BTreeSet<String>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// `(boots, boots that were not the shipping kernel, the kernels built)`.
+pub fn boot_census() -> (u32, u32, Vec<String>) {
+    (
+        BOOTS.load(Ordering::Relaxed),
+        FEATURE_BOOTS.load(Ordering::Relaxed),
+        KERNELS.lock().expect("the kernel census").iter().cloned().collect(),
+    )
+}
+
+/// The kernel builds an ordinary suite run is allowed to make, and the whole
+/// list.
+///
+/// `""` is what an image ships. [`toyos_build::build::TEST_KERNEL`] is every
+/// actuator compiled in, armed by boot parameter. `fpu-save-nothing` is the one
+/// actuator that could not become a parameter — it takes the `fxsave64` out of
+/// `arch::entry`'s `naked_asm!` bracket, which is the path its own gate is
+/// about — and `specs/assessments/test-cost-audit.md` §5.9.7 is where that is argued.
+///
+/// [`toyos_build::build::SCHED_CHECK_KERNEL`] is the fourth, and it is the one
+/// this list's own warning was written about: an entry here is a decision to pay
+/// a kernel build per suite run forever, made in the shared declaration rather
+/// than by adding a `kernel_features` to a `BootOptions`. It was made because
+/// the alternative had already been paid for and delivered nothing —
+/// `kernel/Cargo.toml` has forwarded `sched-check = ["toyos-sched/check"]` since
+/// the check build was written, and nothing in `src/` or `tests/` ever asked for
+/// it, so `cpu::MAX_PASS_NS`, invariant P and `invariants::check_cpu` were
+/// compiled by no CI run at all. `sched_check_build` is the test that asks.
+///
+/// A fifth entry is that decision again, and it gets this paragraph's argument
+/// made afresh. Interactive debug mode is separate: it builds
+/// [`toyos_build::build::DEBUG_KERNEL_BUILD`] and returns before the suite.
+pub const DECLARED_KERNEL_BUILDS: [&str; 4] =
+    toyos_build::build::TEST_SUITE_KERNEL_BUILDS;
+
 /// How many guests the phase now running may have up at once.
 ///
 /// The harness's own wall-clock margins are margins on the *host*, and they were
@@ -94,7 +145,8 @@ fn record_boot(took: Duration) {
 /// corrected for how fast the machine *is*, and that is the other half of the
 /// same mistake: a number reasoned about on an M4 Pro is not a liveness ceiling
 /// on a four-core Azure vCPU, it is a verdict about which of the two is running
-/// the test. `specs/ci-plan.md` §7.1 counted 307 bare timeouts in one CI run and
+/// the test. `specs/assessments/ci-plan-assessment-2026-08.md` §7.1 counted
+/// 307 bare timeouts in one CI run and
 /// every one of them was that.
 ///
 /// **Only ever upward.** On a faster host the number in the source stands,
@@ -480,7 +532,7 @@ pub enum Profile {
     ///
     /// The T14's shape for the one thing no profile stages: its Thunderbolt
     /// xHCI at 00:0d.0 has five ports and has never had a device on them
-    /// (`specs/metal-hardware-inventory.md`), so the controller a user plugs
+    /// (`specs/reference/metal-hardware-inventory.md`), so the controller a user plugs
     /// into is the one that enumerated nothing at boot. Here the second
     /// controller is that one and the boot stick is on the first.
     ///
@@ -517,7 +569,7 @@ pub enum Profile {
     /// that cannot are different facts a user can act on differently.
     IommuNoIntremap,
     /// metal-sim with three Intel HDA controllers, shaped so that one boot
-    /// runs both arms of every question `specs/hda-driver-plan.md` H0 asks.
+    /// runs both arms of every question `specs/plans/hda-driver-plan.md` H0 asks.
     ///
     /// A machine nobody ships, and deliberately so: H0's probe is a diagnostic
     /// aimed at one laptop, and the only thing the harness can certify is that
@@ -582,7 +634,7 @@ pub struct Iommu {
 
 /// What every profile but the three that vary it declares: the widest address
 /// width QEMU offers and interrupt remapping on, which is
-/// `specs/iommu-spec.md` §9 stage I0's configuration.
+/// `specs/iommu-spec.md` §8's configuration.
 pub const IOMMU_DEFAULT: Iommu = Iommu { aw_bits: 48, intremap: true };
 
 /// The controller every profile but [`Profile::MetalUsb`] gets. `nec-usb-xhci`
@@ -754,7 +806,7 @@ struct Shape {
     ///
     /// Presence of a class-0403 *function* is the shape dimension, and it is
     /// separate from whether anything answers on the link behind it — which is
-    /// `specs/hda-driver-plan.md` H0's question (b), and what the codec
+    /// `specs/plans/hda-driver-plan.md` H0's question (b), and what the codec
     /// arguments in this list decide per controller.
     hda: &'static [&'static str],
     /// The unit that decodes this machine's DMA, or its absence. Stated per
@@ -1257,7 +1309,14 @@ pub struct BootOptions {
     /// Open a per-instance QMP socket, which `screendump` needs. Per-instance
     /// because screen tests boot their own QEMU and several may exist at once.
     pub qmp: bool,
+    /// Which of [`DECLARED_KERNEL_BUILDS`] this boot wants, and empty for the
+    /// kernel an image ships. Only a test whose subject *is* a build sets it —
+    /// `fpu-save-nothing`, and the `SYS_DEBUG` boot; everything else names an
+    /// actuator in [`BootOptions::kernel_params`] instead.
     pub kernel_features: &'static [&'static str],
+    /// The actuators this boot arms, by the names `kernel/src/actuator.rs`
+    /// declares. Non-empty selects the test kernel, which carries all of them.
+    pub kernel_params: &'static [&'static str],
     /// Give the machine an i8042 at all. `-machine q35,i8042=off` is the one
     /// absence scenario QEMU can stage.
     pub i8042: bool,
@@ -1326,6 +1385,7 @@ impl Default for BootOptions {
             profile: Profile::Headless,
             qmp: false,
             kernel_features: &[],
+            kernel_params: &[],
             i8042: true,
             mute: false,
             ready_marker: DEFAULT_READY,
@@ -1343,6 +1403,28 @@ pub struct TestResult {
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub serial: String,
+    /// Every console line that arrived **before** this test announced itself.
+    ///
+    /// **It used to be dropped on the floor, and that is a hole in the capture
+    /// rather than a tidiness.** A boot's capture is `boot_log()` up to the
+    /// ready marker and then this function's `stdout`/`serial` from
+    /// `===TEST_START===` onwards; between those two points the reader thread
+    /// goes on delivering lines and nothing kept them. The window is not
+    /// hypothetical and it is not narrow — measured on `wall_clock_file`,
+    /// 2026-08-15: one run in three carried five real lines in it, including
+    /// `soundd: null sink idle` and the kernel's `spawn: /bin/test-runner`
+    /// record, so the ready marker fires before the runner is even loaded and
+    /// every daemon still finishing its startup writes into a hole.
+    ///
+    /// That is how a `logd:` line went missing from a `wall_clock_file` capture
+    /// while the *next* line logd writes was present: the two are either side of
+    /// a file creation on the log volume, which is milliseconds, and the window
+    /// closed between them.
+    ///
+    /// A caller that reads a daemon's startup out of a boot appends this to its
+    /// capture. It is separate from `serial` because `serial` means "while this
+    /// test ran" and audio gates count lines in it.
+    pub before: String,
     pub error: Option<String>,
     /// Whether the guest ever announced *this* test.
     ///
@@ -1391,8 +1473,74 @@ pub fn build_boot_image(
     test_crate: &Path,
     c_tests: &[(String, Vec<u8>)],
     rust_tests: &[(String, Vec<u8>)],
-    kernel_features: &[&str],
+    kernel_params: &[&str],
 ) -> Vec<u8> {
+    let kernel: &[&str] =
+        if kernel_params.is_empty() { &[] } else { toyos_build::build::TEST_KERNEL };
+    build_boot_image_with(test_crate, c_tests, rust_tests, kernel, kernel_params, false)
+}
+
+/// Which of [`DECLARED_KERNEL_BUILDS`] this boot wants.
+///
+/// **A parameter never decides a build.** Every actuator lives in the one test
+/// kernel, so asking for one selects that kernel and nothing more; the third
+/// build is asked for by name and by one test.
+fn kernel_of(options: &BootOptions) -> Vec<&'static str> {
+    if options.kernel_params.is_empty() {
+        return options.kernel_features.to_vec();
+    }
+    assert!(
+        options.kernel_features.is_empty(),
+        "a boot asking to arm {:?} also asks for the kernel build {:?}; an actuator is a \
+         parameter and the test kernel carries all of them",
+        options.kernel_params,
+        options.kernel_features,
+    );
+    toyos_build::build::TEST_KERNEL.to_vec()
+}
+
+fn build_boot_image_with(
+    test_crate: &Path,
+    c_tests: &[(String, Vec<u8>)],
+    rust_tests: &[(String, Vec<u8>)],
+    kernel_features: &[&str],
+    kernel_params: &[&str],
+    debug_wait: bool,
+) -> Vec<u8> {
+    // **The two fields have the same type, so swapping them compiles.** It
+    // happened once, in this file's own conversion: the shared boot handed
+    // `["boot-actuators", "test-actuators"]` to `kernel_params` and every
+    // `SYS_DEBUG` test died with the kernel refusing `boot-actuators` as a
+    // parameter it does not declare. The kernel's refusal is what found it and
+    // it is the right refusal, but a name is a name on this side of the wire
+    // too, and the guest need not be started to know which kind it is.
+    static ACTUATORS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let actuators =
+        ACTUATORS.get_or_init(|| toyos_build::build::declared_actuators(&compile::repo_root()));
+    for name in kernel_params {
+        assert!(
+            actuators.iter().any(|a| a == name),
+            "{name:?} is a `kernel_params` and `kernel/src/actuator.rs` declares no such actuator"
+        );
+    }
+    for name in kernel_features {
+        assert!(
+            !actuators.iter().any(|a| a == name),
+            "{name:?} is an actuator and was passed as a `kernel_features`; it is a boot \
+             parameter, so it belongs in `kernel_params`"
+        );
+    }
+
+    let joined = kernel_features.join(",");
+    assert!(
+        toyos_build::build::harness_kernel_build_is_declared(&joined, debug_wait),
+        "this boot asks for the kernel build {joined:?}, which is not one of the {} an ordinary \
+         suite run may make: {DECLARED_KERNEL_BUILDS:?}; interactive debug mode may instead \
+         make {:?}",
+        DECLARED_KERNEL_BUILDS.len(),
+        toyos_build::build::DEBUG_KERNEL_BUILD,
+    );
+    KERNELS.lock().expect("the kernel census").insert(joined);
     let mut extra_files: Vec<(String, Vec<u8>)> = Vec::new();
     for (name, data) in c_tests {
         extra_files.push((format!("bin/test_c_{name}"), data.clone()));
@@ -1416,47 +1564,11 @@ pub fn build_boot_image(
     toyos_build::build::build_test_image(
         &compile::repo_root(),
         &config_path,
-        &fold_inert(kernel_features),
+        kernel_features,
+        kernel_params,
         quiet,
         &extra_files,
     )
-}
-
-/// Actuators that are a `SYS_DEBUG` action arm and nothing else.
-///
-/// A boot cannot reach any of them; only a test that asks for one by number
-/// can. So the kernels that differ only in which of them they carry are
-/// several builds of the same machine, and [`fold_inert`] makes them one.
-///
-/// **Membership is a claim about the kernel, not about the test that uses it**,
-/// and the claim is checkable: each name below has its `#[cfg]` sites in
-/// `arch/syscall.rs`'s `SYS_DEBUG` match and nowhere on any path a boot runs.
-/// A feature that changes what `init` does, what a driver reads, or what a
-/// ceiling is worth belongs in its own build and is not eligible.
-/// `specs/test-cost-audit.md` §5.4.3 classifies every one of them.
-///
-/// `test-tlb-ack-delay` is the one member whose code is not confined to the
-/// match arm: `arch::tlb::serve_ipi` loads one relaxed word per flush. Nothing
-/// writes that word except the arm, and its own gate re-measures with the delay
-/// disarmed, so a kernel carrying the feature and never asked flushes exactly as
-/// one without it. Stated rather than assumed, because the claim above is what
-/// makes folding sound.
-const INERT_ACTUATORS: &[&str] = &[
-    "test-fatal-halt",
-    "test-screen-graffiti",
-    "test-double-fault",
-    "test-heap-ceiling",
-    "test-kernel-canary",
-    "test-tlb-ack-delay",
-];
-
-/// The feature set to build, with every inert actuator replaced by the union of
-/// them. A test still names the actuator it needs — that is what its assertion
-/// is about — and the build system stops treating the name as a distinct kernel.
-fn fold_inert<'a>(requested: &[&'a str]) -> Vec<&'a str> {
-    let mut out: Vec<&'a str> = vec!["test-actuators"];
-    out.extend(requested.iter().copied().filter(|f| !INERT_ACTUATORS.contains(f)));
-    out
 }
 
 /// Build all binaries in a test crate.
@@ -1470,6 +1582,27 @@ pub fn build_toyos_bins(crate_path: &Path) -> Vec<(String, Vec<u8>)> {
 /// User program output goes through serial::write directly with no prefix.
 pub fn is_kernel_line(line: &str) -> bool {
     line.starts_with("[kernel ")
+}
+
+/// File the userland half of one captured console line under `stdout`.
+///
+/// The kernel drains its own records straight to the backend rather than
+/// through any process's line buffer, so a record can follow bytes a program
+/// left unterminated and the host's splitter joins the two. Splitting the
+/// record back off is what has always let a `printf` with no newline reach a
+/// capture at all — and it is why `71_macro_empty_arg` passes most runs and
+/// not all: when the next writer is *userland* rather than the kernel there is
+/// no `[kernel ` to cut at. That half is `common::console`'s, on the boot
+/// config's own list of who else may speak; this is only the kernel's.
+fn push_user_half(line: &str, stdout: &mut String) {
+    if is_kernel_line(line) {
+        return;
+    }
+    match line.find("[kernel ") {
+        Some(idx) => stdout.push_str(&line[..idx]),
+        None => stdout.push_str(line),
+    }
+    stdout.push('\n');
 }
 
 /// The in-guest runner's end-of-test marker. Matched anywhere in the line, not
@@ -1496,11 +1629,22 @@ impl QemuInstance {
         rust_tests: &[(String, Vec<u8>)],
         options: BootOptions,
     ) -> Self {
-        let mut features: Vec<&str> = options.kernel_features.to_vec();
+        let mut features: Vec<&str> = kernel_of(&options);
         if options.debug_wait {
-            features.push("debug-wait");
+            features.push(toyos_build::build::DEBUG_KERNEL_BUILD);
         }
-        let disk = build_boot_image(test_crate, c_tests, rust_tests, &features);
+        BOOTS.fetch_add(1, Ordering::Relaxed);
+        if !features.is_empty() {
+            FEATURE_BOOTS.fetch_add(1, Ordering::Relaxed);
+        }
+        let disk = build_boot_image_with(
+            test_crate,
+            c_tests,
+            rust_tests,
+            &features,
+            options.kernel_params,
+            options.debug_wait,
+        );
 
         let test_dir = super::lane::dir();
         let seq = BOOT_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -1860,6 +2004,9 @@ impl QemuInstance {
         let start = Instant::now();
         let mut stdout = String::new();
         let mut serial = String::new();
+        // Every line seen before this test announced itself. Kept, never
+        // dropped — `TestResult::before` is the argument.
+        let mut before = String::new();
         let mut in_test = false;
         // **Which of the two things the ceiling caught.** A test's `timeout` is
         // a liveness guard and never a verdict, and until now its expiry said
@@ -1897,6 +2044,7 @@ impl QemuInstance {
                     exit_code: None,
                     stdout,
                     serial,
+                    before,
                     error: Some(error),
                     started: in_test,
                 };
@@ -1923,13 +2071,29 @@ impl QemuInstance {
                         if parts[0] != want {
                             continue;
                         }
-                        // Everything before the marker is a line some other
-                        // console writer was in the middle of when the runner
+                        // Everything before the marker is what some console
+                        // writer had said without a newline when the runner
                         // printed; it is still real output and the audio gate
                         // reads soundd's stats out of it.
+                        //
+                        // **And it goes to `stdout` as well, because the writer
+                        // is usually the test's own child.** A program whose
+                        // output does not end in a newline — `printf("%d", …)`
+                        // and nothing after it — has its last bytes flushed by
+                        // `ConsoleObject::drop` with no terminator, so the
+                        // runner's `===TEST_END` lands on the same line the
+                        // host's splitter builds. Filing that head under
+                        // `serial` alone is how `71_macro_empty_arg` came back
+                        // with an *empty* capture against an expected `17` —
+                        // the half no filter over whole lines reaches, and
+                        // `common::console` has the rest of it. Nothing is
+                        // dropped either way; this only stops the capture from
+                        // losing its own tail.
                         if at > 0 && in_test {
-                            serial.push_str(&line[..at]);
+                            let head = &line[..at];
+                            serial.push_str(head);
                             serial.push('\n');
+                            push_user_half(head, &mut stdout);
                         }
                         let (exit_code, error) = if parts.len() > 1 {
                             if let Some(code_str) = parts[1].strip_prefix("exit=") {
@@ -1947,6 +2111,7 @@ impl QemuInstance {
                             exit_code,
                             stdout,
                             serial,
+                            before,
                             error,
                             started: in_test,
                         };
@@ -1956,22 +2121,19 @@ impl QemuInstance {
                             exit_code: None,
                             stdout,
                             serial,
+                            before,
                             error: Some(format!("kernel panic: {line}")),
                             started: in_test,
                         };
+                    } else if !in_test {
+                        // **The window between two tests, kept rather than
+                        // dropped.** See [`TestResult::before`].
+                        before.push_str(&line);
+                        before.push('\n');
                     } else if in_test {
                         serial.push_str(&line);
                         serial.push('\n');
-                        if is_kernel_line(&line) {
-                            // pure kernel line
-                        } else if let Some(idx) = line.find("[kernel ") {
-                            // user output with kernel suffix on same line
-                            stdout.push_str(&line[..idx]);
-                            stdout.push('\n');
-                        } else {
-                            stdout.push_str(&line);
-                            stdout.push('\n');
-                        }
+                        push_user_half(&line, &mut stdout);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => continue,
@@ -1981,6 +2143,7 @@ impl QemuInstance {
                         exit_code: None,
                         stdout,
                         serial,
+                        before,
                         error: Some("QEMU disconnected".to_string()),
                         started: in_test,
                     };
@@ -2409,7 +2572,7 @@ fn qemu_command(
     // Ahead of every other `-device`: QEMU gives a PCI function the bypassing
     // address space unless the unit exists when the function is created, so a
     // unit emitted after the devices it is meant to decode is a unit that
-    // decodes nothing — the vacuity trap `specs/userspace-drivers-spec.md` §7.2
+    // decodes nothing — the vacuity trap `specs/plans/userspace-drivers-spec.md` §7.2
     // is built around, in its harness-side form.
     if let Some(unit) = shape.iommu {
         qemu.arg("-device").arg(format!(
@@ -2692,7 +2855,7 @@ fn wait_for_ready(
     let panic_aborts = ready == DEFAULT_READY;
     // Ten seconds per guest this phase may have up, and never fewer than two
     // guests' worth — the tree runs 15-25 suites a day across several agents
-    // (`specs/test-cost-audit.md` §4), so one guest on a quiet host stopped being
+    // (`specs/assessments/test-cost-audit.md` §4), so one guest on a quiet host stopped being
     // the regime some time before this did. Measured on 2026-08-03 with other
     // agents building: two boots exceeded the flat ten seconds, one of them in a
     // phase running a single guest.
@@ -2714,7 +2877,14 @@ fn wait_for_ready(
     loop {
         if !no_timeout && start.elapsed() > boot_timeout {
             let _ = child.kill();
-            panic!("[qemu] Boot timed out waiting for {ready}");
+            // With what it did say. A timeout that discards the console is the
+            // one failure in this harness that arrives with no evidence at all,
+            // and "the guest printed nothing" and "the guest printed sixty
+            // lines and then stopped" are different machines.
+            panic!(
+                "[qemu] Boot timed out waiting for {ready}; the console carried:\n{}",
+                if seen.is_empty() { "nothing at all".to_string() } else { seen.clone() }
+            );
         }
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(line) if line.contains(ready) => {
@@ -2730,7 +2900,7 @@ fn wait_for_ready(
                     && !no_timeout
                     && (line.contains("SEGFAULT")
                         || line.contains("KERNEL PANIC")
-                        || line.contains("!!! PANIC !!!")) =>
+                        || line.contains("PANIC:")) =>
             {
                 let mut crash_msg = line.clone();
                 let drain_deadline = Instant::now() + Duration::from_secs(2);

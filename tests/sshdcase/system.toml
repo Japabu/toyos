@@ -9,9 +9,29 @@
 # Its own config rather than a fourth program in `tests/netcase`, because
 # netcase's test measures how many connections netd will hold and sshd's bind
 # would spend one of them.
-init = ["/bin/netd", "/bin/sshd", "/bin/test-runner"]
 
-[programs]
-netd = {}
-sshd = {}
-test-runner = {}
+[boot]
+start = ["logd", "netd", "sshd", "test-runner"]
+
+# **Every image that carries a `TOYOS-LOG` partition runs this**, and every
+# image does. The kernel stopped writing files at L6 of
+# `specs/log-architecture-spec.md`, so a boot config without `logd` is a boot
+# whose `/log` is empty — `every_boot_config_runs_logd` is what refuses one.
+# It claims no device and serves no port yet (§5.1, §5.2): its whole authority
+# is `logread`, which is `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
+[programs.logd]
+syscap = ["logread"]
+
+[programs.netd]
+serves = ["netd"]
+devices = ["nic"]
+
+[programs.sshd]
+receives = ["netd", "launcher"]
+
+# `logread` is the log gate's own: a spawned test binary does not inherit a
+# `SysCap` dup, so the gate that reads the kernel's records runs inside
+# `test-runner` itself (`specs/log-architecture-spec.md` §3.2, §9.5).
+[programs.test-runner]
+receives = ["netd"]
+syscap = ["logread"]

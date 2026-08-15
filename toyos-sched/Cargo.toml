@@ -1,6 +1,7 @@
-[workspace]
-members = [".", "sim", "loom"]
-default-members = [".", "sim", "loom"]
+# This crate, `sim/` and `loom/` are three members of the host workspace (root
+# `Cargo.toml`), which is where all three are listed. They used to be a
+# workspace of their own here; the set of host-tested crates is one list now,
+# and it is that one.
 
 [package]
 name = "toyos-sched"
@@ -23,5 +24,8 @@ protocol-port = []
 # same sources into its own crate with the feature on, so `src/sync.rs`
 # resolves to loom's instrumented atomics. Keeping it a feature of a separate
 # package (rather than a `cfg(loom)` dependency) keeps loom and its 30
-# transitive host crates out of `kernel/Cargo.lock`.
+# transitive host crates out of `kernel/Cargo.lock` — still true, and the
+# reason it is: `kernel/` is excluded from the host workspace and resolves
+# against its own lockfile, and nothing the kernel builds depends on
+# `toyos-sched-loom`.
 loom = []

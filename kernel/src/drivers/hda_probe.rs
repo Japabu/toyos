@@ -1,4 +1,4 @@
-//! Stage H0 of `specs/hda-driver-plan.md`: the boot that decides the track.
+//! Stage H0 of `specs/plans/hda-driver-plan.md`: the boot that decides the track.
 //!
 //! Four questions, one boot, no driver. `00:1f.3` on the T14 has been present
 //! and undriven on every boot this project has ever taken, so nothing here
@@ -8,10 +8,10 @@
 //!
 //! **Why this is a kernel feature and nothing else can reach it**
 //! (`specs/device-test-strategy.md`'s requirement of an actuator): there is no
-//! way for a userland process to touch a codec at all. `SYS_OPEN_DEVICE` hands
+//! way for a userland process to touch a codec at all. `SYS_DEVICE_CLAIM` hands
 //! out a claim on a device the kernel already bound, not a PCI function; the
 //! capability that would let a process map a BAR and drive one is
-//! `specs/userspace-drivers-spec.md` stage 4, and it is unbuilt. The questions
+//! `specs/plans/userspace-drivers-spec.md` stage 4, and it is unbuilt. The questions
 //! here are precisely the ones that
 //! decide whether that capability will ever be given this device, so the thing
 //! that answers them cannot be built on top of it.
@@ -21,7 +21,7 @@
 //! hangs leaves its owner a black screen and no information, which is the
 //! outcome the exercise exists to avoid.
 //!
-//! **The output is a fixture.** `specs/hda-driver-plan.md` §5.2 makes the T14's
+//! **The output is a fixture.** `specs/plans/hda-driver-plan.md` §5.2 makes the T14's
 //! own widget graph the fixture `toyos-hda`'s output-path traversal is
 //! host-tested against, so every line below that describes the codec is
 //! `key=value` after a `hda:` prefix, carries the device's raw word beside any
@@ -101,7 +101,7 @@ const SETTLE_NS: u64 = 100_000_000;
 const CODEC_DETECT_NS: u64 = 1_000_000;
 
 pub fn run(rsdp_addr: u64, devices: &[PciDevice]) {
-    log!("hda: === H0 probe: specs/hda-driver-plan.md §6 ===");
+    log!("hda: === H0 probe: specs/plans/hda-driver-plan.md §6 ===");
 
     // Every function of the class, never the first: the display audio on an
     // Iris Xe is a codec on the same controller, but a machine with two
@@ -150,7 +150,7 @@ pub fn run(rsdp_addr: u64, devices: &[PciDevice]) {
 
 // --- (a) Is this function handoff-able to userspace at all? ---
 
-/// `specs/iommu-spec.md` §7.3 and §7.4, `specs/userspace-drivers-spec.md` §4.3
+/// `specs/iommu-spec.md` §7.3 and §7.4, `specs/plans/userspace-drivers-spec.md` §4.3
 /// and §4.5, asked of one function.
 ///
 /// Not one of these is audio's alone. The T14's HDA is function 3 of a
@@ -316,9 +316,9 @@ fn reserved_regions(rsdp_addr: u64, hda: &PciDevice) {
     }
 }
 
-/// `specs/userspace-drivers-spec.md` §4.5: a function offering neither MSI-X
+/// `specs/plans/userspace-drivers-spec.md` §4.5: a function offering neither MSI-X
 /// nor MSI is ineligible for userspace, because there is no way to deliver its
-/// interrupt to a driver process. §4.2 of `specs/hda-driver-plan.md` argues
+/// interrupt to a driver process. §4.2 of `specs/plans/hda-driver-plan.md` argues
 /// plain MSI is the *better* of the two here — an MSI-X table lives inside a
 /// BAR and cannot be carved out at 2 MiB granularity, and a capability in
 /// config space simply has no such hole.
@@ -357,7 +357,7 @@ fn interrupts(hda: &PciDevice) {
 /// BAR0's size, width, prefetchability, whether its address bits are writable,
 /// and who else is inside the 2 MiB page it currently sits in.
 ///
-/// The last is the sharpest of the four. `specs/userspace-drivers-spec.md` §4.3
+/// The last is the sharpest of the four. `specs/plans/userspace-drivers-spec.md` §4.3
 /// maps a BAR into a driver process at 2 MiB granularity, so a BAR sharing its
 /// page with another function's registers is a BAR that cannot be handed over
 /// without handing that function's registers over too.

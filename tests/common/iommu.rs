@@ -184,9 +184,9 @@ const SECOND_LEVEL: &[&str] = &["read-permission", "write-permission", "paging-e
 /// A function whose context entry the kernel deliberately never wrote must
 /// fault on its first transaction, and the fault must name it.
 ///
-/// This is `specs/iommu-spec.md` §9's exit criterion for I2 and the isolation
-/// negative control at the same time, because at this stage they are the same
-/// question. Identity mapping means a translated machine and an untranslated
+/// This is `specs/plans/iommu-plan.md`'s exit criterion for I2 and the
+/// isolation negative control at the same time, because at this stage they are
+/// the same question. Identity mapping means a translated machine and an untranslated
 /// one produce the same result for every device that is *in* the tables, so
 /// the only way to tell the two apart is a device that is not: with the unit
 /// bypassing, or never enabled, or pointed at a context entry naming
@@ -313,7 +313,7 @@ fn fault_boot(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
-    features: &'static [&'static str],
+    params: &'static [&'static str],
 ) -> Result<(Serial, Blocked), String> {
     let mut qemu = QemuInstance::boot_with_options(
         test_config,
@@ -321,7 +321,7 @@ fn fault_boot(
         rust_bins,
         BootOptions {
             profile: Profile::Metal,
-            kernel_features: features,
+            kernel_params: params,
             ready_marker: FAULT,
             ..Default::default()
         },
@@ -490,7 +490,7 @@ fn profile_name(profile: Profile) -> &'static str {
 
 /// Presence, configuration and *position* of the unit in the argv.
 ///
-/// The last one is the vacuity trap `specs/userspace-drivers-spec.md` §7.2
+/// The last one is the vacuity trap `specs/plans/userspace-drivers-spec.md` §7.2
 /// names, in its harness-side form: QEMU hands a PCI function the bypassing
 /// address space when the function is created before the unit exists, so a
 /// `-device intel-iommu` emitted after the devices it is meant to decode is a

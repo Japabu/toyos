@@ -23,10 +23,10 @@
 //! `/boot` at runtime; the log partition is the only writable FAT32 volume on
 //! the stick with room, and it starts with 33 MiB free.
 //!
-//! Which means sharing with `log_file`. [`LEAVE_FREE`] is set so that after the
-//! copy that succeeds there are still about two megabytes for `kernel.log` —
-//! a boot's log is a few tens of kilobytes, and the sink disables itself and
-//! says so if a flush ever fails, so a squeeze here would be visible rather
+//! Which means sharing with `/bin/logd`. [`LEAVE_FREE`] is set so that after the
+//! copy that succeeds there are still about two megabytes for this boot's log —
+//! a boot's log is a few tens of kilobytes, and logd stops and says so if a
+//! write ever fails, so a squeeze here would be visible rather
 //! than silent.
 
 use std::io::{Cursor, Write};

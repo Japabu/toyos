@@ -20,14 +20,6 @@ const MODULE_EXE: u64 = 1;
 /// The kernel's fixed DTV capacity (`loader::DTV_INITIAL_CAPACITY`).
 const DTV_CAPACITY: u64 = 64;
 
-fn alloc_block(module_id: u64) -> Result<u64, SyscallError> {
-    let r = syscall::tls_alloc_block(module_id);
-    match SyscallError::from_u64(r) {
-        Some(e) => Err(e),
-        None => Ok(r),
-    }
-}
-
 /// This thread's DTV, from the TCB at `fs:[8]`.
 fn dtv_entry(module_id: u64) -> *mut u64 {
     let p: u64;
@@ -42,7 +34,7 @@ fn dtv_entry(module_id: u64) -> *mut u64 {
 fn alloc_block_preserving_dtv(module_id: u64) -> Result<u64, SyscallError> {
     let slot = dtv_entry(module_id);
     let saved = unsafe { *slot };
-    let r = alloc_block(module_id);
+    let r = syscall::tls_alloc_block(module_id);
     unsafe { *slot = saved };
     r
 }
@@ -89,19 +81,23 @@ fn main() {
     // 1. Every module id the process does not have is an error return, never a
     //    panic: zero, one past the DTV's capacity, a saturated one, and one
     //    inside the capacity that no module claims.
-    assert_eq!(alloc_block(0).unwrap_err(), SyscallError::InvalidArgument, "module_id 0");
     assert_eq!(
-        alloc_block(DTV_CAPACITY).unwrap_err(),
+        syscall::tls_alloc_block(0).unwrap_err(),
+        SyscallError::InvalidArgument,
+        "module_id 0",
+    );
+    assert_eq!(
+        syscall::tls_alloc_block(DTV_CAPACITY).unwrap_err(),
         SyscallError::InvalidArgument,
         "module id inside the DTV but not in the module list",
     );
     assert_eq!(
-        alloc_block(DTV_CAPACITY + 1).unwrap_err(),
+        syscall::tls_alloc_block(DTV_CAPACITY + 1).unwrap_err(),
         SyscallError::ResourceExhausted,
         "module id past the DTV's capacity",
     );
     assert_eq!(
-        alloc_block(u64::MAX).unwrap_err(),
+        syscall::tls_alloc_block(u64::MAX).unwrap_err(),
         SyscallError::ResourceExhausted,
         "saturated module id",
     );

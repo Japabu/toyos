@@ -1,6 +1,6 @@
 //! The Intel HDA stub: bring-up, one output stream, and the allow-list.
 //!
-//! `specs/hda-driver-plan.md` §4.1 is the design and §4.1.6 is the shape this
+//! `specs/plans/hda-driver-plan.md` §4.1 is the design and §4.1.6 is the shape this
 //! file implements. **The line is who touches a register.** The kernel resets
 //! the controller, allocates the PCM ring and the buffer descriptor list,
 //! programs every register whose value is an address or indexes one of those
@@ -29,7 +29,7 @@ use super::pci::PciDevice;
 use crate::log;
 use crate::mm::paging::CachePolicy;
 use crate::mm::Mmio;
-use crate::shared_memory;
+use crate::object::shm::Region;
 use crate::sync::Lock;
 
 const CLASS_MULTIMEDIA: u8 = 0x04;
@@ -279,11 +279,11 @@ struct HdaController {
 }
 
 static CONTROLLER: Lock<Option<HdaController>> = Lock::new(None);
-static INFO: Lock<Option<HdaInfo>> = Lock::new(None);
+static INFO: Lock<Option<(HdaInfo, Region)>> = Lock::new(None);
 static REFUSALS: AtomicUsize = AtomicUsize::new(0);
 
-pub fn info() -> Option<HdaInfo> {
-    *INFO.lock()
+pub fn info() -> Option<(HdaInfo, Region)> {
+    INFO.lock().clone()
 }
 
 // --- the allow-list ---
@@ -349,7 +349,7 @@ pub fn reg_read(offset: u64, width: RegWidth) -> Result<u32, SyscallError> {
 }
 
 pub fn reg_write(offset: u64, width: RegWidth, value: u32) -> Result<(), SyscallError> {
-    let stream_offset = info().ok_or(SyscallError::NotFound)?.stream_offset as u64;
+    let stream_offset = info().ok_or(SyscallError::NotFound)?.0.stream_offset as u64;
     if write_permit(stream_offset, offset, width).is_err() {
         return Err(refuse("write", offset, width));
     }
@@ -528,21 +528,22 @@ pub fn init(devices: &[PciDevice]) {
     }
     regs.write_u32(INTCTL, INTCTL_GIE | (1 << stream_index));
 
-    let pcm_token = shared_memory::register(
-        crate::DirectMap::from_phys(pcm_slice.phys()),
-        crate::mm::PAGE_2M,
-        CachePolicy::DeferToMtrr,
-    );
+    let pcm_region = Region {
+        phys: crate::DirectMap::from_phys(pcm_slice.phys()),
+        size: crate::mm::PAGE_2M,
+        cache: CachePolicy::DeferToMtrr,
+        pages: None,
+    };
 
     *CONTROLLER.lock() = Some(HdaController { regs, stream, _bdl: bdl, _pcm: pcm });
-    *INFO.lock() = Some(HdaInfo {
-        pcm_token: pcm_token.raw(),
+    *INFO.lock() = Some((HdaInfo {
+        pcm: toyos_abi::HANDLE_INVALID,
         period_bytes: PERIOD_BYTES as u32,
         stream_offset: stream_offset as u32,
         statests,
         stream_tag: STREAM_TAG,
         periods: PERIODS as u8,
-    });
+    }, pcm_region));
 
     log!(
         "hda: {:02x}:{:02x}.{} bound, statests={statests:#06x}, output stream {stream_index} at \
@@ -552,8 +553,10 @@ pub fn init(devices: &[PciDevice]) {
         pci.func
     );
 
-    #[cfg(feature = "hda-allowlist-selftest")]
-    allowlist_selftest(stream_offset);
+    #[cfg(feature = "boot-actuators")]
+    if crate::actuator::hda_allowlist_selftest() {
+        allowlist_selftest(stream_offset);
+    }
 }
 
 /// Every arm of [`write_permit`] and [`read_permit`], run against the bound
@@ -568,7 +571,7 @@ pub fn init(devices: &[PciDevice]) {
 /// The permitted cases really write: `ICW` takes a null verb nothing has told
 /// the controller to send, and `SDnFMT` takes back the word it already holds,
 /// so what runs is the shipped path and not a rehearsal of the table.
-#[cfg(feature = "hda-allowlist-selftest")]
+#[cfg(feature = "boot-actuators")]
 fn allowlist_selftest(stream_offset: u64) {
     let sd = |field: u64| stream_offset + field;
     let cases: &[(&str, u64, RegWidth, u32)] = &[

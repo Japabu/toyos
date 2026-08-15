@@ -15,21 +15,35 @@
 //!
 //! # Relationship to `toyos_sched::hw::TraceEvent`
 //!
-//! Spec §10.4 asks for one trace format shared by the kernel and the
-//! simulator, so a QEMU capture replays host-side. The two are *one
-//! vocabulary, two representations*, and deliberately so:
+//! The kernel and the simulator share one event vocabulary in two
+//! representations, and deliberately so:
 //!
 //! * `hw::TraceEvent` is the vocabulary — a closed Rust enum the simulator
 //!   holds by value and asserts on. It has no layout guarantee, so it cannot
 //!   be the thing on the wire.
 //! * [`Record`] below is the wire form — `repr(C)`, 24 bytes, discriminants
-//!   fixed by hand — because the readers are `memory read` in LLDB and, later,
-//!   `toyos-sched-sim replay --from-qemu`. Neither can parse a Rust enum.
+//!   fixed by hand — because its reader is `memory read` in LLDB, which cannot
+//!   parse a Rust enum.
 //!
 //! [`record`] is the total mapping from the first onto the second, and is what
 //! [`crate::hw::KernelHw`] installs as `Machine::trace`. The ring also keeps
 //! kinds the core cannot produce ([`Kind::IrqDrain`], [`Kind::TimerArm`],
 //! [`Kind::Preempt`]) — kernel observations from below the boundary.
+//!
+//! **There is one reader, not two, and that is settled rather than pending.**
+//! This paragraph said the wire form also existed for a `toyos-sched-sim replay
+//! --from-qemu` that was coming. It is not coming, and the reasoning is
+//! `toyos_sched::hw::TraceEvent`'s: a sim `Scenario` is a *workload* — which
+//! queue each thread blocks on, what makes its condition true, how long it runs
+//! — and this ring records none of that. It records an observed schedule, from
+//! a buffer of [`RING_CAPACITY`] entries that wraps, so a capture is a tail
+//! with no initial state to replay from. The subcommand that claimed otherwise
+//! was an `unimplemented!()` and was deleted.
+//!
+//! The wire form survives that deletion unchanged, because LLDB alone wants
+//! every property of it. What does not survive is the idea that a numeric
+//! discriminant has a second consumer: it has one, and the const assertions
+//! below are what make "do not reorder" a build error rather than a comment.
 
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -41,8 +55,8 @@ use crate::arch::percpu;
 pub const MAX_CPUS: usize = 8;
 pub const RING_CAPACITY: usize = 4096;
 
-/// Event kind discriminant. Stable — do not reorder (LLDB and the replay
-/// tool read by numeric value).
+/// Event kind discriminant. Stable — do not reorder; LLDB reads these by
+/// numeric value off a hexdump, with no symbol to check them against.
 ///
 /// 1..=13 are the kernel's own observations. 14.. are the `hw::TraceKind`
 /// variants with no kernel-native counterpart, which arrive through
@@ -81,6 +95,70 @@ pub enum Kind {
     Retire = 17,
     /// The core observed an interrupt. `data` = 0.
     Irq = 18,
+}
+
+/// Every discriminant, pinned.
+///
+/// `Kind`'s doc says "do not reorder", and until this block nothing made that
+/// true: the only reader is an LLDB hexdump, which sees a `u16` and has no
+/// symbol to check it against, so a variant inserted mid-list renames every
+/// event after it in every capture ever taken — including the ones already
+/// written down in `specs/assessments/metal-logs/`, which cannot be re-read.
+/// The failure is silent, retroactive and unrecoverable, which is exactly the
+/// shape that belongs in a compile-time assertion rather than a test.
+///
+/// Listed rather than derived, so that adding a variant means writing its
+/// number here on purpose. What stops this list from silently covering a
+/// *prefix* of the enum is [`every_kind_is_pinned`] below, not anything here.
+const _: () = {
+    assert!(Kind::SchedPick as u16 == 1);
+    assert!(Kind::SchedIdle as u16 == 2);
+    assert!(Kind::Preempt as u16 == 3);
+    assert!(Kind::Block as u16 == 4);
+    assert!(Kind::Wake as u16 == 5);
+    assert!(Kind::TimerArm as u16 == 6);
+    assert!(Kind::TimerStop as u16 == 7);
+    assert!(Kind::TimerFire as u16 == 8);
+    assert!(Kind::Mark as u16 == 9);
+    assert!(Kind::IdleEnter as u16 == 10);
+    assert!(Kind::IdleExit as u16 == 11);
+    assert!(Kind::TimerFireBurst as u16 == 12);
+    assert!(Kind::IrqDrain as u16 == 13);
+    assert!(Kind::ParkCommit as u16 == 14);
+    assert!(Kind::Migrate as u16 == 15);
+    assert!(Kind::Adopt as u16 == 16);
+    assert!(Kind::Retire as u16 == 17);
+    assert!(Kind::Irq as u16 == 18);
+};
+
+/// The other half of the pin: a variant added to [`Kind`] makes this `match`
+/// non-exhaustive and the kernel stops compiling, so the flat list above cannot
+/// silently come to cover a prefix of the enum instead of all of it.
+///
+/// Never called. A wildcard arm here would delete the whole guarantee, which is
+/// `record`'s reason for having no wildcard either.
+#[allow(dead_code)]
+const fn every_kind_is_pinned(kind: Kind) {
+    match kind {
+        Kind::SchedPick
+        | Kind::SchedIdle
+        | Kind::Preempt
+        | Kind::Block
+        | Kind::Wake
+        | Kind::TimerArm
+        | Kind::TimerStop
+        | Kind::TimerFire
+        | Kind::Mark
+        | Kind::IdleEnter
+        | Kind::IdleExit
+        | Kind::TimerFireBurst
+        | Kind::IrqDrain
+        | Kind::ParkCommit
+        | Kind::Migrate
+        | Kind::Adopt
+        | Kind::Retire
+        | Kind::Irq => (),
+    }
 }
 
 /// The wire record. 24 bytes, `repr(C)`; field order chosen so an LLDB

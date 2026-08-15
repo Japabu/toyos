@@ -9,7 +9,7 @@ opened: 2026-08-08
 Nine of the owner's review notes asked whether a large file could become a
 crate, a host test, or both. Four have been answered and five have not; the
 numbers below are 2026-08-08 and exist so the next reader does not re-measure.
-Full verdicts and target shapes: `specs/code-quality-review-2026-08.md` §2.
+Full verdicts and target shapes: `specs/assessments/code-quality-review-2026-08.md` §2.
 
 **Answered:**
 
@@ -19,7 +19,7 @@ Full verdicts and target shapes: `specs/code-quality-review-2026-08.md` §2.
   effects shell is `userland/compositor/` at 2,085 over five files with a
   68-line `main.rs`, `72705d9`.
 - `xhci/mod.rs` → the port machine is `toyos-xhci/` (2,082 lines with a host
-  simulator), `2e81ae8`, with `specs/xhci-port-machine-plan.md` as the plan of
+  simulator), `2e81ae8`, with `specs/plans/xhci-port-machine-plan.md` as the plan of
   record. `xhci/mod.rs` is still 1,825 lines, so the shell has not shrunk to
   match.
 - `loader.rs` → `kernel/src/loader/` (1,397 over four files), `42b29c9`, with

@@ -7,7 +7,7 @@
 //! compositor's, and it is the only caller.
 //!
 //! The split exists because a QEMU boot is a poor way to ask any of these
-//! questions. `specs/code-quality-review-2026-08.md` §1.1 is the doctrine, and
+//! questions. `specs/assessments/code-quality-review-2026-08.md` §1.1 is the doctrine, and
 //! the ladder it names ends here for the compositor: the arithmetic that
 //! decides what a frame costs is exercised on the host in milliseconds, and the
 //! guest tests are left to certify what only a guest can — that the right

@@ -85,7 +85,7 @@ pub enum Structure {
     Drhd(Drhd),
     Rmrr(Rmrr),
     /// A type this kernel walks past. Carried rather than dropped so the skip
-    /// can be logged with its type: a machine carrying an `ATSR` — which §11.1
+    /// can be logged with its type: a machine carrying an `ATSR` — which §10.1
     /// rejects along with device-TLB itself — is a machine somebody will want
     /// to know is under-configured, rather than silently served.
     Skipped { kind: u16, at: usize, len: usize },

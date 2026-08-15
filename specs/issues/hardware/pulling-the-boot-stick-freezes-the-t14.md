@@ -47,7 +47,7 @@ aims all of them at a dead device on one event.
 **What it does not close, stated so a green suite does not imply otherwise:**
 
 - ~~Teardown and `recover_endpoints` still block a pass~~ — **closed by X2a**
-  (`specs/xhci-port-machine-plan.md`). Both are submit-and-return against one
+  (`specs/plans/xhci-port-machine-plan.md`). Both are submit-and-return against one
   outstanding operation per controller: the pass that starts one gives itself
   back, and the completion arrives through the event ring the poll already
   drains. What is left on that path is `device::configure`, which is X2b; the
@@ -421,7 +421,7 @@ absent from QEMU by construction, and can produce the observed state without
 reaching any software error path.
 
 **Corroborated independently, and the other reading goes further — read it
-before touching any of this.** `specs/memory-boundary-spec.md` §2.3 reached the
+before touching any of this.** `specs/plans/memory-boundary-spec.md` §2.3 reached the
 same conclusion from the memory-safety track on the same day, and it is the
 authority for the fix: it names the same `ipi_all_excluding_self` one-ICR-write,
 states that **the six existing call sites are therefore already wrong** rather
@@ -466,7 +466,7 @@ so *by name* turns the freeze's own precondition into a printed line — on a
 machine where, as of the probe, a fatal report reaches the panel.
 
 That change is not made here, and it is **not** M3 being started early: M3 is
-`specs/memory-boundary-spec.md` §3.3 and it belongs to the memory-safety track,
+`specs/plans/memory-boundary-spec.md` §3.3 and it belongs to the memory-safety track,
 which has already priced it, enumerated the sites and written the deadlock rule.
 Whoever builds this A/B builds a throwaway to test a hypothesis about the
 freeze, obeys §3.3's rule about `log!` between issue and ack, and lands nothing.
@@ -484,7 +484,7 @@ the field means what it says from `diag-tick` on.
 
 **Already answered: the probe painted.** Kept as the record of what it settled.
 No further reflash for that question.
-`cargo run -- --console-boot --kernel-feature metal-panic-probe --build-only`
+`cargo run -- --console-boot --kernel-param metal-panic-probe --build-only`
 (or `--diag-boot`, or the ordinary image — the probe is orthogonal to the boot
 mode). Flash it, boot to the desktop, and wait. Five seconds after a process
 claims the framebuffer the kernel raises a real fatal panic from an idle CPU —
@@ -507,7 +507,7 @@ measures ~460 ms there.
 
 #### CLOSED — the heartbeat's first build was blind on an idle machine, and the eight boots that proved it
 
-Eight `--console-boot --kernel-feature heartbeat --kernel-feature
+Eight `--console-boot --kernel-param heartbeat --kernel-param
 metal-panic-probe` boots, logs at `2026-08-07-15{3347,3603,3819,3854,4108,4203,
 4259,4532}.log`. Every one has the same shape:
 
@@ -571,7 +571,7 @@ mask that **varies**, so it was satisfied by the defect and certified it.
 #### What the owner should run next — the ninth boot
 
 ```
-cargo run -- --kernel-feature heartbeat --build-only
+cargo run -- --kernel-param heartbeat --build-only
 ```
 
 The **ordinary** image and not `--console-boot`: the desktop is what freezes and

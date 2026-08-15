@@ -1,6 +1,6 @@
 //! What the kernel's HDA stub hands its driver.
 //!
-//! `specs/hda-driver-plan.md` §4.1 is the design. The line through the device
+//! `specs/plans/hda-driver-plan.md` §4.1 is the design. The line through the device
 //! is **who touches a register**: the kernel programs every register whose
 //! value is an address or indexes a structure it allocated, and the driver
 //! reaches the rest through [`syscall::device_reg_read`] and
@@ -30,7 +30,7 @@ pub struct HdaInfo {
     /// The PCM ring, mapped writable. `periods` buffers of `period_bytes` laid
     /// end to end from the start of the region, with the buffer descriptor
     /// list already pointing at them.
-    pub pcm_token: u32,
+    pub pcm: crate::RawHandle,
     pub period_bytes: u32,
     /// Byte offset of the output stream descriptor inside the register window,
     /// so the driver names `SDnCTL` and `SDnFMT` by the same arithmetic the

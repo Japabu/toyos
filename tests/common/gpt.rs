@@ -55,7 +55,7 @@ pub fn boot_partition_identity(
     // not exist until it is built. `create_gpt_disk` draws a fresh random GUID
     // every time, so there is no second build that would agree with this one.
     let quiet = !qemu::VERBOSE.load(std::sync::atomic::Ordering::Relaxed);
-    let bytes = toyos_build::build::build_test_image(&repo, &config, &[], quiet, &[]);
+    let bytes = toyos_build::build::build_test_image(&repo, &config, &[], &[], quiet, &[]);
     let boot_image = dir.join("gpt-boot.img");
     std::fs::write(&boot_image, &bytes).map_err(|e| format!("write the boot image: {e}"))?;
 
@@ -208,7 +208,7 @@ fn boot(
     );
     let mut log = qemu.boot_log().to_string();
     log.push_str(&qemu.drain_serial(std::time::Duration::from_millis(500)));
-    for bad in ["!!! PANIC !!!", "panicked at"] {
+    for bad in ["PANIC:", "panicked at"] {
         if log.contains(bad) {
             return Err(format!("{bad:?} during the boot:\n{log}"));
         }

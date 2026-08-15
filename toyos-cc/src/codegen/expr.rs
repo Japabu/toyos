@@ -168,25 +168,17 @@ impl Codegen {
             let gv = self.module.declare_data_in_func(data_id, ctx.builder.func);
             return TypedValue::unsigned(ctx.builder.ins().global_value(I64, gv));
         }
-        if let Some((storage, ty)) = ctx.locals.get(name) {
-            let (storage, sign) = (*storage, ty.signedness());
-            match storage {
-                LocalStorage::Ssa(var) => {
-                    return TypedValue::new(ctx.builder.use_var(var), sign);
-                }
-                LocalStorage::Spilled(slot) => {
-                    let ptr = ctx.builder.ins().stack_addr(I64, slot, 0);
-                    let load_ty = self.clif_type(ty);
-                    return TypedValue::new(ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, 0), sign);
-                }
-                LocalStorage::Ptr(ptr) => {
-                    if ty.is_aggregate() || matches!(ty, CType::Array(..)) {
-                        return TypedValue::unsigned(ptr);
-                    }
-                    let load_ty = self.clif_type(ty);
-                    return TypedValue::new(ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, 0), sign);
-                }
+        if let Some((storage, ty)) = ctx.locals.get(name).map(|(s, t)| (*s, t.clone())) {
+            let sign = ty.signedness();
+            if let LocalStorage::Ssa(var) = storage {
+                return TypedValue::new(ctx.builder.use_var(var), sign);
             }
+            let ptr = self.local_addr(ctx, storage).expect("only Ssa has no address");
+            if ty.is_aggregate() || matches!(ty, CType::Array(..)) {
+                return TypedValue::unsigned(ptr);
+            }
+            let load_ty = self.clif_type(&ty);
+            return TypedValue::new(ctx.builder.ins().load(load_ty, MemFlags::new(), ptr, 0), sign);
         }
         if let Some(&val) = self.type_env.enum_constants.get(name) {
             return TypedValue::signed(ctx.builder.ins().iconst(I32, val));
@@ -498,7 +490,7 @@ impl Codegen {
             // aarch64 Apple: va_list is a pointer to contiguous arg area
             let result = ctx.builder.ins().load(load_ty, MemFlags::new(), ap_val, 0);
             let new_ap = ctx.builder.ins().iadd_imm(ap_val, 8);
-            ctx.store_to_local(ap_name, new_ap);
+            self.store_to_local(ctx, ap_name, new_ap);
             TypedValue::new(result, ty.signedness())
         }
         Arch::X86_64 => {
@@ -637,7 +629,7 @@ impl Codegen {
                     Arch::Aarch64 => {
                         // aarch64 Apple: va_list is just a pointer to the arg area
                         let va_addr = ctx.builder.ins().stack_addr(I64, va_slot, 0);
-                        ctx.store_to_local(ap_name, va_addr);
+                        self.store_to_local(ctx, ap_name, va_addr);
                         TypedValue::unsigned(va_addr)
                     }
                     Arch::X86_64 => {
@@ -656,7 +648,7 @@ impl Codegen {
                         let reg_save = ctx.builder.ins().stack_addr(I64, va_slot, 0);
                         ctx.builder.ins().stack_store(reg_save, va_struct, 16); // reg_save_area
                         let struct_addr = ctx.builder.ins().stack_addr(I64, va_struct, 0);
-                        ctx.store_to_local(ap_name, struct_addr);
+                        self.store_to_local(ctx, ap_name, struct_addr);
                         TypedValue::unsigned(struct_addr)
                     }
                 }
@@ -670,7 +662,7 @@ impl Codegen {
                 match self.arch {
                     Arch::Aarch64 => {
                         // aarch64: va_list is a pointer, just copy it
-                        ctx.store_to_local(dest_name, src_val);
+                        self.store_to_local(ctx, dest_name, src_val);
                         TypedValue::unsigned(src_val)
                     }
                     Arch::X86_64 => {
@@ -685,7 +677,7 @@ impl Codegen {
                         ctx.builder.ins().stack_store(v1, new_struct, 8);
                         ctx.builder.ins().stack_store(v2, new_struct, 16);
                         let new_addr = ctx.builder.ins().stack_addr(I64, new_struct, 0);
-                        ctx.store_to_local(dest_name, new_addr);
+                        self.store_to_local(ctx, dest_name, new_addr);
                         TypedValue::unsigned(new_addr)
                     }
                 }
@@ -817,9 +809,14 @@ impl Codegen {
 
         let lhs_sign = self.expr_type(ctx, lhs).signedness();
 
-        // Direct variable assignment (SSA or spilled — Ptr falls through to memory path)
+        // Direct assignment to a named scalar in a stack slot or a cranelift
+        // variable. Everything else — an aggregate, a static local, a VLA —
+        // falls through to the memory path below, which is what emits the
+        // memcpy an aggregate assignment is: a slot holding a struct answering
+        // here would store its first eight bytes and drop the rest.
         if let Expr::Ident(name) = lhs {
             if let Some((storage, ty)) = ctx.locals.get(name) {
+                let aggregate = ty.is_aggregate() || matches!(ty, CType::Array(..));
                 let (storage, var_clif) = (*storage, self.clif_type(ty));
                 match storage {
                     LocalStorage::Ssa(var) => {
@@ -835,7 +832,7 @@ impl Codegen {
                         ctx.builder.def_var(var, val);
                         return TypedValue::new(val, lhs_sign);
                     }
-                    LocalStorage::Spilled(slot) => {
+                    LocalStorage::Slot(slot) if !aggregate => {
                         let ptr = ctx.builder.ins().stack_addr(I64, slot, 0);
                         let val = if op == AssignOp::Assign {
                             rhs_val
@@ -849,7 +846,7 @@ impl Codegen {
                         ctx.builder.ins().store(MemFlags::new(), val, ptr, 0);
                         return TypedValue::new(val, lhs_sign);
                     }
-                    LocalStorage::Ptr(_) => {} // fall through to memory assignment
+                    LocalStorage::Slot(_) | LocalStorage::Static(_) | LocalStorage::Vla(_) => {}
                 }
             }
         }
@@ -923,7 +920,7 @@ impl Codegen {
             let is_var = ctx.locals.contains_key(name)
                 || self.data_ids.contains_key(name);
             if is_var {
-                return self.compile_indirect_call_var(ctx, func, &arg_vals, &arg_tvs);
+                return self.compile_indirect_call_expr(ctx, func, &arg_vals, &arg_tvs);
             }
 
             // Detect struct return (uses sret convention)
@@ -1091,22 +1088,14 @@ impl Codegen {
         }
     }
 
-    /// Indirect call through a named variable that holds a function pointer.
-    fn compile_indirect_call_var(&mut self, ctx: &mut FuncCtx, func: &Expr, arg_vals: &[Value], arg_tvs: &[TypedValue]) -> TypedValue {
-        let func_ptr = if let Expr::Ident(name) = func {
-            if matches!(ctx.locals.get(name), Some((LocalStorage::Ptr(_), _))) {
-                let addr = self.compile_expr(ctx, func).raw();
-                ctx.builder.ins().load(I64, MemFlags::new(), addr, 0)
-            } else {
-                self.compile_expr(ctx, func).raw()
-            }
-        } else {
-            self.compile_expr(ctx, func).raw()
-        };
-        self.compile_indirect_call_common(ctx, func, func_ptr, arg_vals, arg_tvs)
-    }
-
-    /// Indirect call through a computed function pointer expression.
+    /// Indirect call: `compile_expr` on the callee gives the pointer to call.
+    ///
+    /// A named local used to get a second load on top of that, on the theory
+    /// that its storage held an address rather than a value. Only a *static*
+    /// local could ever reach it — the other storages that carried an address
+    /// are aggregates, and no aggregate is callable — and there the extra load
+    /// dereferenced the callee's own first eight bytes and jumped to whatever
+    /// they spelled.
     fn compile_indirect_call_expr(&mut self, ctx: &mut FuncCtx, func: &Expr, arg_vals: &[Value], arg_tvs: &[TypedValue]) -> TypedValue {
         let func_ptr = self.compile_expr(ctx, func).raw();
         self.compile_indirect_call_common(ctx, func, func_ptr, arg_vals, arg_tvs)

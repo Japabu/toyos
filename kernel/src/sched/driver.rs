@@ -66,6 +66,36 @@ pub fn preempt_off<R>(f: impl FnOnce(&PreemptOff) -> R) -> R {
     result
 }
 
+/// The same proof, bought with `cli` instead of the preempt count.
+///
+/// **`log::emit` may pay neither of [`preempt_off`]'s two locked
+/// read-modify-writes.** `preempt::disable` is `lock add` and `enable` is a
+/// `lock sub` plus a `need_resched` poll that can reach `do_preempt`, which is
+/// a scheduling pass — and one locked RMW per log line cost 350 ms of boot
+/// (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`). `IrqGuard` is
+/// `pushfq`/`pop`/`cli` with `push`/`popfq` on drop: no locked operation at
+/// all, and on the dominant path `IF` is already clear.
+pub struct IrqOff(());
+
+// SAFETY: **preemption in this kernel is delivered at an interrupt.**
+// `do_preempt` has exactly three callers — the LAPIC timer
+// (`arch/idt/timer.rs:101`), the exit-to-user epilogue (`arch/idt/mod.rs:370`,
+// which `sti`s before it calls) and `preempt::enable`'s poll
+// (`preempt.rs:126`). With `IF` masked the first two are unreachable, and the
+// region `irq_off` brackets calls `wake_direct` and nothing else, so it reaches
+// neither `preempt::enable` nor a voluntary pass. A voluntary pass is the one
+// way to be descheduled with `IF` clear, which is why this type has no
+// constructor but the bracket below. The scheduler core grants the same impl to
+// an IRQ context in its own loom model and the trait's SAFETY paragraph names
+// one.
+unsafe impl PreemptGuard for IrqOff {}
+
+/// Run `f` with interrupts masked, holding [`IrqOff`] for exactly that region.
+pub fn irq_off<R>(f: impl FnOnce(&IrqOff) -> R) -> R {
+    let _guard = crate::hw::IrqGuard::close();
+    f(&IrqOff(()))
+}
+
 static CPUS: AtomicPtr<CpuHandles<KMsg>> = AtomicPtr::new(ptr::null_mut());
 static FRONTIER: Frontier = Frontier::new();
 static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
@@ -208,6 +238,11 @@ fn placement() -> CpuId {
 
 /// Everything a new thread needs. `entry_rsp` points at the trampoline frame
 /// `alloc_kernel_stack` built.
+///
+/// **`address_space: None` is a kernel thread and not an error.** It was one
+/// until L3 of `specs/log-architecture-spec.md`: `spawn` expected the `Option`
+/// and the field has always been one, so the whole of "the scheduler cannot
+/// host a kernel task" was a single `.expect` in the line below.
 pub struct NewTask {
     pub id: TaskId,
     pub kernel_stack: OwnedAlloc,
@@ -220,12 +255,15 @@ pub struct NewTask {
 /// Place a new task by message — never by reaching into the destination's
 /// queue (spec §9.4). Returns what the process table keeps.
 pub fn spawn(new: NewTask) -> ThreadSched {
-    let cr3 = new
-        .address_space
-        .as_ref()
-        .expect("spawn: task without an address space")
-        .lock()
-        .cr3();
+    // A task with no address space of its own runs in the kernel's, which is
+    // the address space every CPU is already in between two user threads —
+    // `idle_ctx` above names the same `cr3` for the same reason. There is
+    // nothing to take a reference to and nothing to release: the kernel's
+    // page tables outlive every task by construction.
+    let cr3 = match new.address_space.as_ref() {
+        Some(space) => space.lock().cr3(),
+        None => crate::mm::paging::kernel_cr3(),
+    };
     let kernel_stack_top = new.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64;
     let ctx = KernelCtx {
         rsp: new.entry_rsp,
@@ -314,6 +352,11 @@ pub fn pass(dispose: Dispose) {
     // request still standing on every iteration.
     crate::preempt::clear_need_resched();
     drain_irqs();
+    // The object layer's second drain site. After `drain_irqs` and before the
+    // pass picks, so a wake a zero-handle hook posts is in the run queue by the
+    // time this pass chooses — the same placement, and the same reason, as the
+    // irq drain above it.
+    crate::object::drain_zero_handles();
     let now = HW.now();
     let action = with_cpu(|cpu| {
         let pass = SchedPass::begin(cpu, env(&PreemptOff(())), now);
@@ -490,37 +533,6 @@ fn execute(action: Action<KernelPayload>) {
                 || crate::preempt::need_resched()
                 || crate::irq_ring::any_pending_self()
                 || !with_cpu(|c| c.mailbox_is_empty())
-                // The log ring owes the host bytes, so this CPU must not sleep
-                // on them. `idle_loop` drains *before* the pass, and a line
-                // logged after that drain — by `drain_irqs`, by a driver it
-                // polls, by anything inside the pass — would otherwise wait for
-                // the next wake. The LAPIC timer is one-shot, so on a genuinely
-                // quiet machine there may not be one: the last thing the kernel
-                // said before going silent is then not evidence of anything.
-                //
-                // It closes the window rather than narrowing it, by the same
-                // argument §7.5 makes for the mailbox. A write that lands
-                // between this load and the `hlt` came from an interrupt on this
-                // CPU (which ends the halt through the STI shadow) or from
-                // another CPU that is still running — and that CPU runs this
-                // same check before it halts. The ring is one global buffer, so
-                // whoever drains drains everything: the last CPU to sleep
-                // flushes what all of them wrote.
-                //
-                // Declining rather than draining here is the point. A drain is
-                // serial I/O, and `uart_write_bytes` spins on THRE; doing that
-                // with interrupts off would put an unbounded wait exactly where
-                // the machine is trying to go quiet. Returning sends this CPU
-                // round the idle loop, which drains with interrupts on, one
-                // bounded chunk per backend acquisition.
-                //
-                // The condition self-clears, which is what stops it becoming
-                // the spin `i8042::service` documents for `any_pending_self`:
-                // `drain_serial` loops until the ring reports empty, so one
-                // trip round the idle loop always satisfies it. What would spin
-                // a CPU is something on the *pass* path logging unconditionally
-                // — which would also flood the ring, so it is already a bug.
-                || crate::drivers::log_ring::has_pending()
                 // A CPU with nothing left to run is the moment the i8042's
                 // "the pin has never asserted" verdict stops being premature:
                 // before it, silence only says the boot is still busy. A
@@ -532,24 +544,18 @@ fn execute(action: Action<KernelPayload>) {
                 // ring above: the next pass emits the line and moves the state
                 // on, so this costs one trip round the loop and never a spin.
                 || crate::drivers::i8042::verdict_due()
-                // And the same argument for the *file* sink, which has its own
-                // cursor into the same ring: a machine with no serial port is
-                // the one this matters on, and there the log ring drains into
-                // nothing while `/boot/toyos/kernel.log` is the only surviving
-                // copy. Self-clearing like the two above — `log_file::poll`
-                // runs at the top of the loop and writes everything it is
-                // owed, and the paths on which it cannot (a VFS lock a dead
-                // thread still holds) turn the sink off after a bounded number
-                // of tries, which clears this too.
+                // **No log condition survives L6, and its absence is the
+                // point.** Two used to be here. `log_ring::has_pending` went at
+                // L3, when the commit started posting `klogd`'s wake and the
+                // halt became refusable by the doorbell like any other runnable
+                // task's; `log_file_flush_due` goes here, with the kernel file
+                // sink it asked about. What writes `/log` now is a userland
+                // process made runnable through the mailbox, so a CPU with a
+                // log to write is a CPU with something in its run queue and the
+                // three conditions above already refuse the halt for it.
+                // `idle_loop_is_the_declared_body` is what keeps a fourth from
+                // being quietly re-added.
                 //
-                // Asked as "would the next trip write it", not "is anything
-                // owed", or the condition stops self-clearing: a CPU that
-                // declines the flush and then stays awake *because* the log is
-                // unwritten spins for as long as the bytes sit there. Declining
-                // costs it the halt and nothing else — it holds a deadline, so
-                // its own timer brings it back, and the deferral ceiling makes
-                // the flush its own if nobody else has taken it.
-                || log_file_flush_due()
                 // A root-hub port whose connect state the driver has not
                 // finished acting on. The connect edge that started it was the
                 // last interrupt that controller has to give — a device sitting
@@ -578,7 +584,7 @@ fn execute(action: Action<KernelPayload>) {
 fn drain_irqs() {
     // First in the function, so the stamp means "this CPU reached a pass" and
     // not "this CPU got all the way through one".
-    #[cfg(feature = "heartbeat")]
+    #[cfg(feature = "boot-actuators")]
     crate::heartbeat::note_pass();
     // xHCI (keyboard/mouse): the controller poll dispatches HID reports, which
     // wake the keyboard/mouse queues from inside the driver.
@@ -668,103 +674,30 @@ extern "C" fn idle_loop() -> ! {
     loop {
         // The idle loop and not a pass: the state it stages is a CPU that never
         // reaches one.
-        #[cfg(feature = "dump-deaf-cpu")]
-        super::dump::deaf_window();
+        #[cfg(feature = "boot-actuators")]
+        if crate::actuator::dump_deaf_cpu() {
+            super::dump::deaf_window();
+        }
         // Here and not from a syscall: the panic handler recovers rather than
         // paints when a userland thread is current, and this context has none.
-        #[cfg(feature = "metal-panic-probe")]
+        #[cfg(feature = "boot-actuators")]
         if crate::drivers::panic_console::probe_due() {
             panic!("metal-panic-probe: a fatal report over a desktop that owns the screen");
         }
         crate::scheduler::log_health();
         crate::scheduler::reap_poisoned();
-        drain_serial();
-        // Immediately before the sink's poll, so the line it appends is flushed
-        // by the very next statement rather than waiting a trip round the loop.
-        #[cfg(feature = "heartbeat")]
+        // `pass` below covers this too; it is here so a CPU that reaches the
+        // loop and then halts has run every hook first, rather than leaving one
+        // queued behind an interrupt that may be 102 s away.
+        crate::object::drain_zero_handles();
+        // A heartbeat is a record like any other now, so it reaches the wire on
+        // the commit rather than waiting for a sink that used to run in the
+        // statement below it. What that statement was — the log file's flush —
+        // is gone with the file (§8.1), and the idle loop no longer touches a
+        // filesystem, a volume or a controller at all.
+        #[cfg(feature = "boot-actuators")]
         crate::heartbeat::poll();
-        // After the serial drain and before the pass, for the same reason that
-        // one is here: both are I/O off the critical path, and this is the one
-        // context that provably holds none of the locks a filesystem needs.
-        flush_log_file_if_affordable();
         pass(Dispose::None);
-    }
-}
-
-/// The longest the log file may go unwritten because every CPU that reached
-/// the idle loop owed a wake.
-///
-/// A ceiling and not a target. On a machine with a spare CPU it never expires;
-/// it exists so that "prefer a CPU that owes nothing" cannot become "never" —
-/// on one core there is no other CPU, and on any number of them a busy machine
-/// could owe a deadline everywhere at once.
-const LOG_DEFERRAL_CEILING_NS: u64 = 1_000_000_000;
-
-/// When the first CPU declined to write the log, or 0 if none has since the
-/// last flush. Global rather than per-CPU: the question is how long the *file*
-/// has been owed bytes, and any CPU may answer it.
-static LOG_DEFERRED_SINCE: AtomicU64 = AtomicU64::new(0);
-
-/// Write the log file, unless this CPU is the wrong one to spend the time on.
-///
-/// A flush is a device transfer — on the machine this matters on, a USB one,
-/// whose whole duration `xhci::wait_transfer` spends with preemption disabled.
-/// It cannot be abandoned once begun, so the only place to decline is before.
-///
-/// A CPU that owes a wake is the wrong one to spend it: a task parks on the CPU
-/// with nothing else to run, so the CPU an audio daemon is waiting on is
-/// exactly the CPU that reaches this loop first. Whoever owes nothing takes the
-/// bytes instead — and if nobody has for [`LOG_DEFERRAL_CEILING_NS`], this CPU
-/// takes them anyway.
-///
-/// The one writer of the deferral clock, so that [`log_file_flush_due`] can
-/// answer the pre-halt check without consuming an expiry this has not acted on.
-fn flush_log_file_if_affordable() {
-    if !crate::drivers::log_ring::file_has_pending() {
-        LOG_DEFERRED_SINCE.store(0, Ordering::Relaxed);
-        return;
-    }
-    if owes_wake() {
-        let now = crate::clock::nanos_since_boot().max(1);
-        match LOG_DEFERRED_SINCE.load(Ordering::Relaxed) {
-            0 => {
-                LOG_DEFERRED_SINCE.store(now, Ordering::Relaxed);
-                return;
-            }
-            since if now.saturating_sub(since) < LOG_DEFERRAL_CEILING_NS => return,
-            _ => {}
-        }
-    }
-    LOG_DEFERRED_SINCE.store(0, Ordering::Relaxed);
-    crate::log_file::poll();
-}
-
-/// Would the next trip round the idle loop write the log file? Read-only.
-fn log_file_flush_due() -> bool {
-    if !crate::drivers::log_ring::file_has_pending() {
-        return false;
-    }
-    if !owes_wake() {
-        return true;
-    }
-    match LOG_DEFERRED_SINCE.load(Ordering::Relaxed) {
-        0 => false,
-        since => {
-            crate::clock::nanos_since_boot().saturating_sub(since) >= LOG_DEFERRAL_CEILING_NS
-        }
-    }
-}
-
-/// Flush buffered log output before sleeping. One chunk per backend
-/// acquisition: the guard holds interrupts off for its lifetime, so a
-/// full-ring drain under one guard would block them for up to 64 KiB of
-/// serial I/O.
-fn drain_serial() {
-    loop {
-        let mut backend = crate::drivers::serial::BackendGuard::lock();
-        if crate::drivers::log_ring::drain_chunk_to_serial(&mut backend) == 0 {
-            break;
-        }
     }
 }
 
@@ -814,23 +747,6 @@ pub fn ready_len() -> usize {
 
 pub fn parked_len() -> usize {
     try_with_cpu(|cpu| cpu.parked().count()).unwrap_or(0)
-}
-
-/// Is any task parked here? The idle loop's admission test for unbounded I/O.
-///
-/// A deadline is not the question, though it was: a timed waiter is only the
-/// subset of owed wakes whose *time* this CPU happens to know, and the audio
-/// path's producer is not in it — a client filling soundd's ring parks on a
-/// pipe with no deadline at all, and is woken by an RT daemon that expects it
-/// back inside one 2.9 ms period. Deferring only for deadlines steers the flush
-/// off the daemon's CPU and onto its client's, where it costs the same audio.
-///
-/// A CPU cannot answer for a sibling, and does not need to: the question is
-/// only ever asked about the CPU that is about to spend the time. `true` when
-/// the answer is unavailable — declining costs a trip round the loop, and
-/// proceeding costs whatever the device takes.
-pub fn owes_wake() -> bool {
-    try_with_cpu(|cpu| cpu.parked().next().is_some()).unwrap_or(true)
 }
 
 /// The thread this CPU has loaded, if any.

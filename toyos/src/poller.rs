@@ -1,7 +1,7 @@
 //! Event-driven I/O polling via io_uring.
 
 use core::sync::atomic::Ordering;
-use toyos_abi::Fd;
+use toyos_abi::RawHandle;
 use toyos_abi::syscall;
 use toyos_abi::io_uring::{
     IoUringSqe, IoUringCqe, IoUringRingHeader, IoUringParams,
@@ -39,7 +39,7 @@ pub use toyos_abi::io_uring::{IORING_POLL_IN, IORING_POLL_OUT};
 /// counter — an assert that should now be unreachable, kept because that is
 /// the shape a fail-fast check is supposed to have.
 pub struct Poller {
-    ring_fd: Fd,
+    ring_fd: RawHandle,
     base: *mut u8,
     capacity: u32,
     sq_size: u32,
@@ -72,10 +72,10 @@ impl Poller {
             Self::MAX_HANDLES,
         );
         let entries = capacity.next_power_of_two();
-        let (ring_fd, shm_token) = syscall::io_uring_setup(entries)
+        // The ring owns its page and the kernel maps it: one call, and no
+        // second lifetime for a mapping that is only ever this ring's.
+        let (ring_fd, base) = unsafe { syscall::io_uring_setup(entries) }
             .expect("Poller::new: io_uring_setup failed");
-        let base = unsafe { syscall::try_map_shared(shm_token) }
-            .expect("Poller::new: map_shared failed");
         let params = unsafe { &*(base as *const IoUringParams) };
         let sq_size = params.sq_ring_size;
         let cq_size = params.cq_ring_size;
@@ -98,7 +98,7 @@ impl Poller {
     /// Submit a poll request for a raw fd.
     ///
     /// Prefer [`poll_add`](Self::poll_add) when you have a typed handle.
-    pub fn poll_add_fd(&self, fd: Fd, flags: u32, token: u64) {
+    pub fn poll_add_fd(&self, fd: RawHandle, flags: u32, token: u64) {
         // A panic, because this is first-party code exceeding a bound it
         // declared itself. There used to be a mid-batch flush here instead;
         // that is what made completions reachable while the caller was still
@@ -121,7 +121,7 @@ impl Poller {
         };
         *sqe = IoUringSqe::default();
         sqe.op = IORING_OP_POLL_ADD;
-        sqe.fd = fd.0;
+        sqe.fd = fd;
         sqe.op_flags = flags;
         sqe.user_data = token;
         sq_hdr.tail.store(tail.wrapping_add(1), Ordering::Release);

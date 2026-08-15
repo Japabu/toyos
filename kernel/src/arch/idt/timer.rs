@@ -67,8 +67,8 @@ pub(super) extern "sysv64" fn timer_entry() {
 extern "sysv64" fn timer_handler() {
     // Only the Ring 3 tick reaches here — the stub above branches away first
     // — so the interrupted context is user code and this CPU holds no `Lock`.
-    // Everything below rests on that: the log ring is a spinning ticket lock,
-    // and the pass at the bottom drains the input drivers. `Lock::lock` raises
+    // Everything below rests on that: the pass at the bottom drains the input
+    // drivers. `Lock::lock` raises
     // the preempt count, so a nonzero count here is that gate having gone.
     assert_eq!(
         crate::preempt::count(),
@@ -86,17 +86,6 @@ extern "sysv64" fn timer_handler() {
         kind: TraceKind::TimerFire,
     });
     crate::arch::apic::eoi();
-
-    // Drain pending log output. With sustained user-mode load both CPUs
-    // never enter the idle loop, so without a tick-driven drain the ring
-    // would silently fill and never reach the host. try_lock keeps this
-    // non-blocking — if another CPU is already draining we skip. One
-    // bounded chunk only: this runs with IF=0 ahead of do_preempt, and an
-    // unbounded drain (up to 64KiB of per-byte UART waits) would add
-    // milliseconds of preemption latency. The idle loop drains fully.
-    if let Some(mut g) = crate::drivers::serial::BackendGuard::try_lock() {
-        crate::drivers::log_ring::drain_chunk_to_serial(&mut g);
-    }
 
     crate::scheduler::do_preempt();
 }

@@ -99,7 +99,7 @@ same width against a second worktree's suite, and it is red again with three of
 the same victims (`metal_sim_window_caps`, `metal_sim_ipc_hostile_peer`,
 `metal_sim_compositor_stall`) and the same `tlb:` lines. What the third row does
 show is that **4-wide beat 12-wide on wall clock by a factor of two on a quiet
-host** — `specs/test-cost-audit.md` §4.1 constraint 3 arriving from a new
+host** — `specs/assessments/test-cost-audit.md` §4.1 constraint 3 arriving from a new
 direction, and a measurement worth re-taking on its own terms.
 
 So `--land --gate cargo test --test toyos-build -- --jobs 4` is a way through

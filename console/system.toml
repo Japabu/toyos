@@ -5,20 +5,39 @@
 # boot checkpoint stays on the glass — which is the only thing that works on a
 # machine that wedges before userland, and is the answer to exactly one
 # question. This image answers the rest by being asked them: `/bin/console`
-# claims the screen, seeds its scrollback from `/boot/toyos/kernel.log` so the
+# claims the screen, seeds its scrollback from the newest `/log` files so the
 # boot log is not lost with the checkpoint, and puts a prompt underneath.
 #
 # Deliberately three programs. Every extra one is something that can fail
 # between the kernel and a prompt, on the machine where a failure costs a
 # reflash — and there is no daemon here that a shell needs.
-init = ["/bin/console"]
 
 assets = ["assets"]
 
-[programs]
-console = {}
-shell = {}
-toybox = {}
+[boot]
+start = ["logd", "console"]
+
+# `/bin/console` owns the screen and provides the surface its shell and the
+# shell's children inherit. No compositor here, so nothing receives one.
+# **Every image that carries a `TOYOS-LOG` partition runs this**, and every
+# image does. The kernel stopped writing files at L6 of
+# `specs/log-architecture-spec.md`, so a boot config without `logd` is a boot
+# whose `/log` is empty — `every_boot_config_runs_logd` is what refuses one.
+# It claims no device and serves no port yet (§5.1, §5.2): its whole authority
+# is `logread`, which is `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
+[programs.logd]
+syscap = ["logread"]
+
+[programs.console]
+provides = ["surface"]
+receives = ["launcher"]
+devices = ["framebuffer", "keyboard", "mouse"]
+
+[programs.shell]
+receives = ["surface", "launcher"]
+
+[programs.toybox]
+receives = ["surface"]
 
 [symlinks]
 "bin/cat" = "/bin/toybox"

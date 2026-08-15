@@ -16,9 +16,9 @@ independently of the kernel's own self-check.
 
 What that leaves is a number nobody has: **how much an uncached AP cost.** It is
 worth having because every multi-CPU measurement in this tree predates the fix
-— the audio numbers, the scheduler work, the boot timings, and
-`specs/user-machine-state.md` §12's `+123 cycles` per syscall, whose two arms
-were both taken on a machine where three of four cores were uncached. None of
+— the audio numbers, the scheduler work, the boot timings, and the FPU
+bracket's measured `+123 cycles` on `SYS_CLOCK` (TCG, 870→993), whose two
+arms were both taken on a machine where three of four cores were uncached. None of
 them is wrong; each is a measurement of a different machine, and without this
 number there is no way to say how different.
 
@@ -49,7 +49,7 @@ same boot answered `11000/10000/5000` with byte-identical registers, a fourfold
 spread that is the host's scheduling rather than the guest's.
 
 **The instrument is built and has never been run on silicon.**
-`cargo run -- --diag-boot --kernel-feature control-regs-bench --build-only`,
+`cargo run -- --diag-boot --kernel-param control-regs-bench --build-only`,
 flash, and read the per-CPU rows off the panel; cpu0's row is the control,
 because it arrives with caching already on, and every AP's `pre` against its own
 `warm` is the number. Nothing shorter reaches it: there is no CPU affinity, so
@@ -60,9 +60,9 @@ on a host that prices `CD` at zero it would answer the same on both.
 
 ## What is *not* open, recorded because three places used to say it was
 
-**`CR4.OSXSAVE` diverging between the BSP and the APs** —
-`specs/user-machine-state.md` §7's hypothesis 1, firmware leaving it set so cpu0
-permits AVX and an AP `#UD`s on it, killing a thread that migrates. The
+**`CR4.OSXSAVE` diverging between the BSP and the APs** — the hypothesis
+that firmware leaves it set so cpu0 permits AVX and an AP `#UD`s on it,
+killing a thread that migrates. The
 declaration is written whole rather than OR'd, so `write_cr4` clears the bit on
 the BSP as well; it is in neither `CR4_REQUIRED` nor `CR4_OPTIONAL`, the gate
 asserts it clear on every CPU by name, and a second arm refuses any bit the gate

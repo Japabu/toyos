@@ -6,7 +6,7 @@ opened: 2026-08-08
 
 # The audio pops are four spinlocks, not one spinning driver
 
-**`specs/blocking-io-plan.md` is the finding, the evidence and the wave that
+**`specs/plans/blocking-io-plan.md` is the finding, the evidence and the wave that
 closes it.** What belongs here is the sentence an agent must not miss and the
 two commands.
 

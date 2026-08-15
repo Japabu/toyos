@@ -237,10 +237,13 @@ static ARMED_NS: AtomicU64 = AtomicU64::new(0);
 // The period is policy. 10 s is the PMM dump's cadence, which is what the log
 // already costs a reader per idle minute, and it bounds the line to one per
 // 10 s of *typing* — an idle machine pays nothing.
-#[cfg(not(feature = "i8042-fast-health"))]
-const HEALTH_PERIOD_NS: u64 = 10_000_000_000;
-#[cfg(feature = "i8042-fast-health")]
-const HEALTH_PERIOD_NS: u64 = 500_000_000;
+fn health_period_ns() -> u64 {
+    if crate::actuator::i8042_fast_health() {
+        500_000_000
+    } else {
+        10_000_000_000
+    }
+}
 static NEXT_REPORT_NS: AtomicU64 = AtomicU64::new(u64::MAX);
 static REPORTED_IRQS: AtomicU32 = AtomicU32::new(0);
 
@@ -267,27 +270,34 @@ static REPORTED_IRQS: AtomicU32 = AtomicU32::new(0);
 ///
 /// Written only from `drain`, which holds `PS2` and is the one place that knows
 /// both the byte and whether anything came of it.
-#[cfg(not(feature = "hda-probe"))]
-const UNEXPLAINED_LEN: usize = 8;
-/// The other half of `specs/hda-driver-plan.md` H0: the owner presses Mute,
-/// Volume Down and Volume Up on a diagnostic boot and reads off what the EC
-/// sent, because H8 adds `toyos-ps2` entries for exactly those three and
-/// nothing in this repository knows whether they reach the i8042 at all. Three
-/// keys are twelve bytes of make and break under set 1 and the shipped report
-/// holds eight, so the whole answer would not fit in one boot — and H0 is the
-/// boot that is meant to answer everything.
+/// The report holds eight, and `hda-probe` reports 24 of them: the owner
+/// presses Mute, Volume Down and Volume Up on a diagnostic boot and reads off
+/// what the EC sent, because H8 adds `toyos-ps2` entries for exactly those
+/// three and nothing in this repository knows whether they reach the i8042 at
+/// all. Three keys are twelve bytes of make and break under set 1, so the whole
+/// answer would not fit in one shipped-length report — and H0 is the boot that
+/// is meant to answer everything.
 ///
-/// Only the bound moves: the list, the run-blaming and the line are the
-/// shipped ones, exactly as `log-rotate-fast` moves a size and nothing else.
-#[cfg(feature = "hda-probe")]
-const UNEXPLAINED_LEN: usize = 24;
-static UNEXPLAINED: [AtomicU16; UNEXPLAINED_LEN] = [const { AtomicU16::new(0) }; UNEXPLAINED_LEN];
+/// The array is the longer one in every build and the *bound* is what moves, so
+/// a boot with nothing armed reports exactly the eight the shipping kernel
+/// does. Only the bound moves: the list, the run-blaming and the line are the
+/// shipped ones, exactly as `test-small-caches` moves a ceiling and nothing else.
+const UNEXPLAINED_CAP: usize = 24;
+
+fn unexplained_len() -> usize {
+    if crate::actuator::hda_probe() {
+        UNEXPLAINED_CAP
+    } else {
+        8
+    }
+}
+static UNEXPLAINED: [AtomicU16; UNEXPLAINED_CAP] = [const { AtomicU16::new(0) }; UNEXPLAINED_CAP];
 static UNEXPLAINED_N: AtomicU32 = AtomicU32::new(0);
 const UNEXPLAINED_AUX: u16 = 1 << 8;
 
 fn record_unexplained(byte: u8, aux: bool) {
     let n = UNEXPLAINED_N.fetch_add(1, Ordering::Relaxed) as usize;
-    if let Some(slot) = UNEXPLAINED.get(n) {
+    if let Some(slot) = UNEXPLAINED.get(n).filter(|_| n < unexplained_len()) {
         slot.store(u16::from(byte) | if aux { UNEXPLAINED_AUX } else { 0 }, Ordering::Relaxed);
     }
 }
@@ -304,7 +314,7 @@ impl core::fmt::Display for Unexplained {
             return Ok(());
         }
         write!(f, " no event from [")?;
-        for (i, slot) in UNEXPLAINED.iter().take(seen).enumerate() {
+        for (i, slot) in UNEXPLAINED.iter().take(seen.min(unexplained_len())).enumerate() {
             let value = slot.load(Ordering::Relaxed);
             if i > 0 {
                 write!(f, ", ")?;
@@ -314,8 +324,8 @@ impl core::fmt::Display for Unexplained {
             }
             write!(f, "{:#04x}", value as u8)?;
         }
-        if seen > UNEXPLAINED_LEN {
-            write!(f, ", +{}", seen - UNEXPLAINED_LEN)?;
+        if seen > unexplained_len() {
+            write!(f, ", +{}", seen - unexplained_len())?;
         }
         write!(f, "],")
     }
@@ -413,10 +423,10 @@ fn report_health(state: u8) {
 }
 
 fn arm_repeat() {
-    NEXT_REPORT_NS.store(crate::clock::nanos_since_boot() + HEALTH_PERIOD_NS, Ordering::Relaxed);
+    NEXT_REPORT_NS.store(crate::clock::nanos_since_boot() + health_period_ns(), Ordering::Relaxed);
 }
 
-/// Say the counters again, at most once per [`HEALTH_PERIOD_NS`] and only when
+/// Say the counters again, at most once per [`health_period_ns`] and only when
 /// the pin has asserted since the last line.
 ///
 /// Thread context, from `service`. On a settled machine it is two relaxed loads
@@ -431,7 +441,7 @@ fn report_counters() {
     let next = NEXT_REPORT_NS.load(Ordering::Relaxed);
     if now < next
         || NEXT_REPORT_NS
-            .compare_exchange(next, now + HEALTH_PERIOD_NS, Ordering::Relaxed, Ordering::Relaxed)
+            .compare_exchange(next, now + health_period_ns(), Ordering::Relaxed, Ordering::Relaxed)
             .is_err()
     {
         return;
@@ -476,7 +486,7 @@ fn report_counters() {
 /// Behind `heartbeat` because it can only be asked from the idle loop and only
 /// a `diag-tick` build reaches that on a machine with nothing to run — which is
 /// exactly the machine it is for.
-#[cfg(feature = "heartbeat")]
+#[cfg(feature = "boot-actuators")]
 pub fn report_line() {
     if !ACTIVE.load(Ordering::Relaxed) {
         return;
@@ -492,10 +502,10 @@ pub fn report_line() {
 }
 
 /// `gsi=1 rte=0x0000000000000024`, or why there is no entry to print.
-#[cfg(feature = "heartbeat")]
+#[cfg(feature = "boot-actuators")]
 struct Rte(u32);
 
-#[cfg(feature = "heartbeat")]
+#[cfg(feature = "boot-actuators")]
 impl core::fmt::Display for Rte {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         if self.0 == u32::MAX {
@@ -595,13 +605,11 @@ fn has_bytes() -> bool {
 /// Under `i8042-fault`, armed at the end of a successful init so the next
 /// interrupt makes the output buffer look permanently full. The only way to
 /// reach the ISR's bound without a controller that is genuinely broken.
-#[cfg(feature = "i8042-fault")]
 static FAULT: AtomicBool = AtomicBool::new(false);
 
 #[inline]
 fn buffer_full(status: u8) -> bool {
-    #[cfg(feature = "i8042-fault")]
-    if FAULT.load(Ordering::Relaxed) {
+    if crate::actuator::i8042_fault() && FAULT.load(Ordering::Relaxed) {
         return true;
     }
     status & OBF != 0
@@ -660,17 +668,17 @@ pub extern "sysv64" fn handler() {
 /// at most two bytes, in a stream that has already lost one — never in the
 /// healthy case this exists for.
 struct Partial {
-    bytes: [u8; UNEXPLAINED_LEN],
+    bytes: [u8; UNEXPLAINED_CAP],
     len: usize,
 }
 
 impl Partial {
     const fn new() -> Self {
-        Self { bytes: [0; UNEXPLAINED_LEN], len: 0 }
+        Self { bytes: [0; UNEXPLAINED_CAP], len: 0 }
     }
 
     fn push(&mut self, byte: u8) {
-        if self.len < UNEXPLAINED_LEN {
+        if self.len < unexplained_len() {
             self.bytes[self.len] = byte;
             self.len += 1;
         }
@@ -755,15 +763,14 @@ pub fn service() {
 ///
 /// Unwidened that window is a handful of instructions on one CPU, which no
 /// injection the harness can time and no load it can stage reaches.
-#[cfg(feature = "i8042-edge-race")]
 fn widen_edge_window() {
+    if !crate::actuator::i8042_edge_race() {
+        return;
+    }
     for _ in 0..200 {
         core::hint::spin_loop();
     }
 }
-
-#[cfg(not(feature = "i8042-edge-race"))]
-fn widen_edge_window() {}
 
 /// Decode what the ISR left in the ring and wake whoever it belongs to.
 /// `recorded` is whether this pass found an `irq_ring` record for the source.
@@ -963,8 +970,10 @@ fn quarantine() {
 /// The `woke_*` fields are the gates the wakes actually ran under, not a
 /// re-derivation of them — so a test can assert the gate agrees with the
 /// event count.
-#[cfg(feature = "i8042-trace")]
 fn trace_drain(bytes: usize, keys: usize, motion: usize, woke_kb: bool, woke_ms: bool) {
+    if !crate::actuator::i8042_trace() {
+        return;
+    }
     log!(
         "i8042: drain bytes={} keys={} motion={} woke_kb={} woke_ms={}",
         bytes,
@@ -974,9 +983,6 @@ fn trace_drain(bytes: usize, keys: usize, motion: usize, woke_kb: bool, woke_ms:
         u8::from(woke_ms)
     );
 }
-
-#[cfg(not(feature = "i8042-trace"))]
-fn trace_drain(_b: usize, _k: usize, _m: usize, _wkb: bool, _wms: bool) {}
 
 // Polled init.
 //
@@ -1020,14 +1026,17 @@ const AUX_RESET_MS: u64 = 600;
 /// case legible. The direction of the fix is forced: each stage number is what
 /// that step is worth waiting *from here*, so shrinking one silently shortens a
 /// real device's wait, and the aux reset's is the last one to touch.
-#[cfg(not(feature = "i8042-budget-expired"))]
-const INIT_BUDGET_MS: u64 = CONTROLLER_MS + SELFTEST_MS + KEYBOARD_MS + AUX_RESET_MS;
-/// Spend the whole budget before the probe starts, so the expiry paths run on a
-/// controller that is answering perfectly. QEMU answers every step in
-/// microseconds and no real EC timing has ever been taken, so nothing else can
-/// reach them.
-#[cfg(feature = "i8042-budget-expired")]
-const INIT_BUDGET_MS: u64 = 0;
+/// `i8042-budget-expired` spends the whole of it before the probe starts, so
+/// the expiry paths run on a controller that is answering perfectly. QEMU
+/// answers every step in microseconds and no real EC timing has ever been
+/// taken, so nothing else can reach them.
+fn init_budget_ms() -> u64 {
+    if crate::actuator::i8042_budget_expired() {
+        0
+    } else {
+        CONTROLLER_MS + SELFTEST_MS + KEYBOARD_MS + AUX_RESET_MS
+    }
+}
 
 /// A stage's own deadline, never past the whole probe's — and `None` when the
 /// probe's is already spent.
@@ -1040,7 +1049,8 @@ const INIT_BUDGET_MS: u64 = 0;
 fn stage(millis: u64, budget: u64, name: &str) -> Option<u64> {
     if crate::clock::nanos_since_boot() >= budget {
         log!(
-            "i8042: {INIT_BUDGET_MS}ms init budget spent before the {name} stage — no PS/2 input"
+            "i8042: {}ms init budget spent before the {name} stage — no PS/2 input",
+            init_budget_ms()
         );
         return None;
     }
@@ -1198,14 +1208,12 @@ fn query_scancode_set(deadline: u64) -> SetQuery {
 /// replaced: the two bytes still go out and the reply the device queued behind
 /// them stays in the output buffer, which is the residue a real EC in an
 /// unnameable state would leave.
-#[cfg(feature = "i8042-kbd-echo")]
-fn echo_the_argument(_real: Option<u8>) -> Option<u8> {
-    Some(0xEE)
-}
-
-#[cfg(not(feature = "i8042-kbd-echo"))]
 fn echo_the_argument(real: Option<u8>) -> Option<u8> {
-    real
+    if crate::actuator::i8042_kbd_echo() {
+        Some(0xEE)
+    } else {
+        real
+    }
 }
 
 /// Same, for the aux port: every byte has to be prefixed with the controller
@@ -1286,14 +1294,11 @@ fn aux_reenable() {
 /// back into the QOM tree the bit is derived from, so on QEMU the claim and the
 /// hardware always agree. Handing the driver a denial on a machine that has a
 /// controller is the only way to test that the denial does not stop it.
-#[cfg(not(feature = "i8042-fadt-denial"))]
 fn firmware_claim(rsdp_addr: u64) -> Result<(u8, u16), crate::drivers::acpi::TableError> {
+    if crate::actuator::i8042_fadt_denial() {
+        return Ok((6, 0x0011));
+    }
     crate::drivers::acpi::iapc_boot_arch(rsdp_addr)
-}
-
-#[cfg(feature = "i8042-fadt-denial")]
-fn firmware_claim(_rsdp_addr: u64) -> Result<(u8, u16), crate::drivers::acpi::TableError> {
-    Ok((6, 0x0011))
 }
 
 pub fn init(rsdp_addr: u64) {
@@ -1333,7 +1338,7 @@ pub fn init(rsdp_addr: u64) {
     // clamps to it, and it is the sum of the stages plus what the controller
     // steps between them are allowed, so no machine can spend it before the
     // last stage has had its own.
-    let budget = deadline(INIT_BUDGET_MS);
+    let budget = deadline(init_budget_ms());
 
     // Firmware may leave scanning on. A keystroke arriving mid-handshake
     // makes the config read return a scancode and everything after garbage.
@@ -1563,7 +1568,8 @@ pub fn init(rsdp_addr: u64) {
         // that cannot be single-stepped.
         if budget_spent(budget) {
             log!(
-                "i8042: DISABLED — the {INIT_BUDGET_MS}ms init budget was spent before the pin could be armed; this is a timeout, not a controller fault"
+                "i8042: DISABLED — the {}ms init budget was spent before the pin could be armed; this is a timeout, not a controller fault",
+                init_budget_ms()
             );
         } else {
             match readback {
@@ -1604,8 +1610,7 @@ pub fn init(rsdp_addr: u64) {
         None => log!("i8042: no pointer on the aux port"),
     }
 
-    #[cfg(feature = "i8042-fault")]
-    {
+    if crate::actuator::i8042_fault() {
         FAULT.store(true, Ordering::Relaxed);
         log!("i8042: fault injection armed");
     }

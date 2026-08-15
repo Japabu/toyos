@@ -1,7 +1,34 @@
+mod log_close;
+mod log_gate;
+
 use std::io::{self, BufRead, Write};
+use std::os::toyos::process::CommandExt;
 use std::process::{Command, Stdio};
 
+use toyos::endow::{Endowments, SYSCAP_LABEL};
+use toyos::syscap::SysCap;
+
+/// Tests that run **inside** this process rather than in a binary it spawns.
+///
+/// **Not a shortcut: a spawned binary cannot hold what these need.** This
+/// process passes its whole namespace to every child, and a `SysCap` dup is not
+/// a namespace entry — so a gate whose subject is a right on this program's own
+/// capability has nowhere else to run (`specs/capability-endowment-spec.md`
+/// §6.7a). They answer the same `===TEST_START===`/`===TEST_END===` protocol as
+/// a binary, so the host cannot tell the difference and does not have to.
+const BUILTINS: &[(&str, fn(Option<&SysCap>) -> i32)] =
+    &[("log-gate", log_gate::run), ("log-close", log_close::run)];
+
 fn main() {
+    // **The test estate's authority, and the one place least authority is not
+    // enforced** (`specs/capability-endowment-spec.md` §4). The guest
+    // binaries are not `[programs]` keys, so no manifest row can name what any
+    // of them holds: a test binary holds what test-runner holds. The namespace
+    // travels by inheritance; this capability is handed over explicitly, as a
+    // duplicate rather than the cap itself, because one boot runs several
+    // binaries that each need the keyboard and a device claim moves.
+    let cap: Option<SysCap> = Endowments::get().take(SYSCAP_LABEL);
+
     println!("===READY===");
     let _ = io::stdout().flush();
 
@@ -34,9 +61,44 @@ fn main() {
         println!("===TEST_START {name}===");
         let _ = io::stdout().flush();
 
+        if let Some((_, builtin)) = BUILTINS.iter().find(|(n, _)| *n == name) {
+            let code = builtin(cap.as_ref());
+            println!("===TEST_END {name} exit={code}===");
+            let _ = io::stdout().flush();
+            continue;
+        }
+
         // Spawn with piped stdin (so child doesn't consume serial commands)
         // but inherited stdout/stderr (output goes directly to serial).
-        match Command::new(&path).args(&args).stdin(Stdio::piped()).spawn() {
+        let mut command = Command::new(&path);
+        command.args(&args).stdin(Stdio::piped());
+        // **A refused dup is an answer and not a failure — but only one
+        // refusal is.** `duplicate` needs `DUP` on the capability, which a
+        // manifest grants by name, so `PermissionDenied` says this cap is one
+        // the program holds *for itself* and the child gets the namespace and
+        // no capability at all. `logread` is exactly such a cap, as `realtime`
+        // is: the estate does not hand either down
+        // (`specs/capability-endowment-spec.md` §6.7a). The `expect` here
+        // assumed every cap was dup-able and took the whole boot down on the
+        // first config that endowed one without `dup`.
+        //
+        // **Every other refusal stays loud**, and `.ok()` swallowed them with
+        // the intended one: a table that cannot hold another handle is a test
+        // estate that has leaked, and a child silently started without the
+        // capability its test needs reds somewhere else entirely, on a
+        // assertion about the log rather than about the handle.
+        match cap.as_ref().map(SysCap::duplicate) {
+            Some(Ok(dup)) => {
+                command.endow(SYSCAP_LABEL, dup.into_raw().0);
+            }
+            Some(Err(toyos_abi::syscall::SyscallError::PermissionDenied)) | None => {}
+            Some(Err(e)) => {
+                println!("===TEST_END {name} error=the capability would not duplicate: {e:?}===");
+                let _ = io::stdout().flush();
+                continue;
+            }
+        }
+        match command.spawn() {
             Ok(mut child) => {
                 // Drop stdin pipe so child gets EOF if it tries to read
                 drop(child.stdin.take());

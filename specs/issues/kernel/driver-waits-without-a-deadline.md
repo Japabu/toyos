@@ -39,13 +39,13 @@ copies of the spin delay beside it (`hda.rs:769`, `hda_probe.rs:990`), plus
 `scheduler.rs:190`'s `wait_until`, plus an IOMMU variant that `assert!`s where
 the others return (`iommu/vtd/queue.rs:125-130`, `iommu/vtd/mod.rs:271-276`).
 
-**Standing.** `specs/type-safety-audit/kernel-drivers.md` F10 (`:928`, deadlines
+**Standing.** `specs/assessments/type-safety-audit/kernel-drivers.md` F10 (`:928`, deadlines
 and durations as bare `u64` in two different units, so `wait_writable(500)`
 compiles and means "expired at boot") and F11 (`:987`, the
 `wait(off, until, pred) -> Result<u32, Timeout>` primitive and its blast radius)
 are the design; F11's own closing line is "**Standing.** Not filed." Two
 corrections to it: its count of eight unbounded MMIO polls is **five** today,
 because the xHCI sites it named are the ones that closed; and `CAP.TO` appears
-nowhere in it. **Not** `specs/iouring-blocking-spec.md` — that spec owns the
+nowhere in it. **Not** `specs/plans/iouring-blocking-spec.md` — that spec owns the
 *park* deadline (§9.1–9.2, `Instant`/`Duration`/`Deadline`, "no `0 = forever`"),
 never a driver register poll, and does not mention NVMe at all.

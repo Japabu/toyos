@@ -86,7 +86,7 @@ const PAGE_SIZE: u64 = 4096;
 /// stay under 14,336 or the hashbrown index crosses the 16,384-bucket bound
 /// `nvme_large_device` asserts.
 pub fn metadata_cache_blocks() -> usize {
-    if cfg!(feature = "test-small-caches") {
+    if crate::actuator::test_small_caches() {
         return 64;
     }
     let (total, _) = crate::mm::pmm::stats();
@@ -102,7 +102,7 @@ pub fn metadata_cache_blocks() -> usize {
 /// enough that losing all of it is invisible, large enough to hold every
 /// binary the system boots.
 pub fn file_cache_pages() -> usize {
-    if cfg!(feature = "test-small-caches") {
+    if crate::actuator::test_small_caches() {
         return 64;
     }
     let (total, _) = crate::mm::pmm::stats();
