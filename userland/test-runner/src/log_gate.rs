@@ -323,7 +323,8 @@ fn account(record: &Record, run: &mut Run, shards: u32) -> Result<(), String> {
             None => run.declared = Some(emitted),
             Some(declared) if declared != emitted => {
                 return Err(format!(
-                    "producer t={thread} emitted {emitted} records where another declared                      {declared}"
+                    "producer t={thread} emitted {emitted} records where another \
+                     declared {declared}"
                 ))
             }
             Some(_) => {}
@@ -556,7 +557,11 @@ fn verdict(tail: &LogTail, run: &Run) -> Result<(), String> {
             ));
         }
         println!(
-            "log-gate: nest declared={declared} read={} dropped={} shards={}",
+            // `nest_shards` and not `shards`: the line below reports the
+            // machine's shard count under that name, and two lines defining one
+            // name is a host-side reader that silently takes whichever came
+            // last (`tests/common/logread.rs`).
+            "log-gate: nest declared={declared} read={} dropped={} nest_shards={}",
             burst.read,
             declared - burst.read,
             burst.shards,

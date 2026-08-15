@@ -9,7 +9,10 @@
 //!
 //! **Kernel threads at preempt depth 0 with `IF` set, one per shard**, so the
 //! records really are written by every CPU at once and through the shipped
-//! `emit`, the shipped reservation and the shipped publication.
+//! `emit`, the shipped reservation and the shipped publication. *One per
+//! shard* is how many are spawned and not where they land — nothing in this
+//! kernel pins a task to a CPU, and [`body`]'s barrier is what makes two of
+//! them meeting on one shard cost drops rather than liveness.
 //!
 //! **What this workload cannot reach, measured rather than assumed**: a
 //! producer that moves between CPUs *mid-storm*. A Ring 0 loop that takes no
@@ -28,7 +31,7 @@
 //! the first `SYS_LOG_READ` of the boot is what spawns the threads, which makes
 //! the overlap a property of the mechanism instead of of the harness's timing.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::sched::kthread::{self, OnPanic};
 
@@ -91,6 +94,21 @@ pub fn emit_patterned(thread: u64, index: u64) {
 
 static STARTED: AtomicBool = AtomicBool::new(false);
 
+/// How many producers this storm has, published before the first one runs.
+static PRODUCERS: AtomicU64 = AtomicU64::new(0);
+
+/// How many have stopped emitting their patterned records.
+static FINISHED: AtomicU64 = AtomicU64::new(0);
+
+/// How long a finished producer parks between looks at [`FINISHED`].
+///
+/// A park and not a spin, and that is the whole of why the barrier below is
+/// safe: a Ring 0 loop that takes no lock is never preempted in this kernel, so
+/// two producers sharing a CPU means the second does not run at all until the
+/// first blocks. Spinning here would therefore deadlock exactly the case the
+/// barrier exists to survive.
+const BARRIER_PARK_NANOS: u64 = 1_000_000;
+
 /// Spawn one storm thread per shard, once for the life of the machine.
 ///
 /// Called from `SYS_LOG_READ`'s implementation, which is what makes the storm
@@ -100,6 +118,9 @@ pub fn start_once() {
         return;
     }
     let threads = super::shard_count();
+    // Before the first spawn, because a producer that reached the barrier
+    // before this was stored would read a target of zero and pass it.
+    PRODUCERS.store(threads as u64, Ordering::Relaxed);
     // The reader learns the shape of the storm from the log it is reading,
     // rather than from a constant it would have to be kept in step with — and
     // this line is a record like any other, so a storm that laps a shard before
@@ -118,10 +139,31 @@ extern "C" fn body(thread: u64) -> ! {
     for index in 0..STORM_RECORDS {
         emit_patterned(thread, index);
     }
-    // **The last record this shard's producer writes, so nothing overwrites
-    // it.** One producer per shard is what makes that true: a second producer
-    // on the same shard would lap this generation and a reader waiting for a
-    // `done` that was dropped would wait for ever.
+    // **Every `done` is written after every producer has stopped, and that is a
+    // barrier rather than an assumption about placement.**
+    //
+    // The gate reads a producer's `done` to know it finished, so a `done` that
+    // is lapped out of its shard is a reader waiting for ever — a 30 s ceiling
+    // red in a Fast gate. What used to stand between the storm and that was the
+    // sentence "one producer per shard", which **nothing guarantees**:
+    // `sched::driver::placement` picks the least-loaded CPU from a rotating
+    // start, so eight threads spawned back to back land on eight CPUs only
+    // while every published load is equal. One CPU with a ready task at that
+    // moment is enough to send two of them to the same place, and a task is
+    // stealable between its spawn and its first run either way.
+    //
+    // What *is* guaranteed is this: after the barrier no producer emits another
+    // patterned record, so the only records that can follow a `done` are the
+    // other `done`s — at most `MAX_LOG_SHARDS` of them — and the handful of
+    // ordinary kernel lines a boot produces, against a shard of
+    // `SHARD_RECORDS`. Sharing a shard then costs the run drops, which the
+    // conservation law already accounts for, instead of costing it liveness.
+    FINISHED.fetch_add(1, Ordering::Relaxed);
+    while FINISHED.load(Ordering::Relaxed) < PRODUCERS.load(Ordering::Relaxed) {
+        let deadline = crate::clock::nanos_since_boot().saturating_add(BARRIER_PARK_NANOS);
+        let ticket = crate::scheduler::prepare_wait(crate::scheduler::park_lot());
+        crate::scheduler::block_on(ticket, deadline);
+    }
     crate::log!("logstorm done t={thread} emitted={STORM_RECORDS}");
 
     // **It parks rather than exiting**, because `sched::kthread`'s rows are

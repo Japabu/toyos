@@ -70,16 +70,31 @@ fn main() {
         // but inherited stdout/stderr (output goes directly to serial).
         let mut command = Command::new(&path);
         command.args(&args).stdin(Stdio::piped());
-        // **A refused dup is an answer and not a failure.** `duplicate` needs
-        // `DUP` on the capability, which a manifest grants by name — so a cap
-        // without it is one this program holds *for itself*, and the child gets
-        // the namespace and no capability at all. `logread` is exactly such a
-        // cap, as `realtime` is: the estate does not hand either down
+        // **A refused dup is an answer and not a failure — but only one
+        // refusal is.** `duplicate` needs `DUP` on the capability, which a
+        // manifest grants by name, so `PermissionDenied` says this cap is one
+        // the program holds *for itself* and the child gets the namespace and
+        // no capability at all. `logread` is exactly such a cap, as `realtime`
+        // is: the estate does not hand either down
         // (`specs/capability-endowment-spec.md` §6.7a). The `expect` here
         // assumed every cap was dup-able and took the whole boot down on the
         // first config that endowed one without `dup`.
-        if let Some(dup) = cap.as_ref().and_then(|cap| cap.duplicate().ok()) {
-            command.endow(SYSCAP_LABEL, dup.into_raw().0);
+        //
+        // **Every other refusal stays loud**, and `.ok()` swallowed them with
+        // the intended one: a table that cannot hold another handle is a test
+        // estate that has leaked, and a child silently started without the
+        // capability its test needs reds somewhere else entirely, on a
+        // assertion about the log rather than about the handle.
+        match cap.as_ref().map(SysCap::duplicate) {
+            Some(Ok(dup)) => {
+                command.endow(SYSCAP_LABEL, dup.into_raw().0);
+            }
+            Some(Err(toyos_abi::syscall::SyscallError::PermissionDenied)) | None => {}
+            Some(Err(e)) => {
+                println!("===TEST_END {name} error=the capability would not duplicate: {e:?}===");
+                let _ = io::stdout().flush();
+                continue;
+            }
         }
         match command.spawn() {
             Ok(mut child) => {
