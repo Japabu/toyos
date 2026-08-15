@@ -1,3 +1,4 @@
+mod log_close;
 mod log_gate;
 
 use std::io::{self, BufRead, Write};
@@ -15,7 +16,8 @@ use toyos::syscap::SysCap;
 /// capability has nowhere else to run (`specs/capability-endowment-spec.md`
 /// §6.7a). They answer the same `===TEST_START===`/`===TEST_END===` protocol as
 /// a binary, so the host cannot tell the difference and does not have to.
-const BUILTINS: &[(&str, fn(Option<&SysCap>) -> i32)] = &[("log-gate", log_gate::run)];
+const BUILTINS: &[(&str, fn(Option<&SysCap>) -> i32)] =
+    &[("log-gate", log_gate::run), ("log-close", log_close::run)];
 
 fn main() {
     // **The test estate's authority, and the one place least authority is not

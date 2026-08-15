@@ -417,6 +417,19 @@ actuators! {
     /// See `arch::percpu_fetch_add`.
     log_shared_reservation = "log-shared-reservation";
 
+    /// Let a `SysCap` or a `Console` close cancel every poll in the machine on
+    /// the source it names — the log's readiness and the keyboard's.
+    ///
+    /// **A real prior behaviour and the defect `/bin/logd` would have lived
+    /// under.** `ops::close` cancelled by source across every ring, which is
+    /// right for a pipe and wrong for a stream that outlives every handle: any
+    /// process closing any capability posted `-NotFound` into logd's parked
+    /// poll. It cannot be staged from the host — which process closes which
+    /// handle is decided inside the guest, and the two processes involved need
+    /// not know about each other at all, which is the whole shape of the bug.
+    /// `specs/log-architecture-spec.md` §3.2.
+    log_close_cancels_any_syscap = "log-close-cancels-any-syscap";
+
     /// Bypass `ConsoleObject`'s line buffer: every userland `write` reaches the
     /// backend as it arrives.
     ///

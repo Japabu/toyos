@@ -195,11 +195,62 @@ pub fn close(
             }
         }
     }
-    let sources = [read_source(&object), write_source(&object)];
+    let sources = if ends_its_sources(&object) {
+        [read_source(&object), write_source(&object)]
+    } else {
+        [None, None]
+    };
     if sources.iter().any(|s| s.is_some()) {
         crate::io_uring::remove_fd(&sources);
     }
     Ok(())
+}
+
+/// Does releasing one handle to `object` end the sources it names?
+///
+/// **`io_uring::remove_fd` cancels by source across every ring in the machine**,
+/// which is what a pipe needs — a client closing its end must complete the
+/// server's poll on the other, and an fd number means nothing outside the
+/// process that owns it. It is also why the question has to be asked: a source
+/// that does *not* end when a handle does gets every poll on it cancelled by
+/// whoever happened to close a handle naming it, in every other process.
+///
+/// **Two rows answer `false` and both are named by a handle any number of
+/// processes hold.** `SysCap` maps to [`Source::Log`], and the machine's log is
+/// not something a capability going away ends: closing one is one process
+/// putting down its authority to read a stream that outlives every handle. That
+/// was live and latent — `ops::close` on *any* `SysCap` cancelled *every*
+/// pending log poll in the machine with `-NotFound`, which `/bin/logd`'s
+/// read-then-park loop turns from latent into a daemon that stops reading the
+/// moment anything anywhere closes a capability. `Console` maps to
+/// [`Source::Keyboard`] for the same reason and has the same shape: every
+/// process that has a console has its own object over the one keyboard (§4.4),
+/// so one of them closing stdin would cancel the compositor's key poll.
+///
+/// Every other row answers `true` because its source really is the object's:
+/// a pipe end, a connection, a port and a device claim each go away with their
+/// last handle, and a claim admits exactly one handle by construction, so
+/// "every ring watching it" is the one holder's.
+fn ends_its_sources(object: &KObjectRef) -> bool {
+    match object {
+        KObjectRef::PipeRead(_)
+        | KObjectRef::PipeWrite(_)
+        | KObjectRef::Connection(_)
+        | KObjectRef::Acceptor(_)
+        | KObjectRef::Device(_) => true,
+        KObjectRef::Console(_) | KObjectRef::SysCap(_) => {
+            // The negative control: the behaviour above, restored, so
+            // `log_poll_outlives_a_close` reds on the tree that had it.
+            crate::actuator::log_close_cancels_any_syscap()
+        }
+        // No source at all, so the answer decides nothing.
+        KObjectRef::File(_)
+        | KObjectRef::IoUring(_)
+        | KObjectRef::Connector(_)
+        | KObjectRef::Namespace(_)
+        | KObjectRef::SharedMem(_)
+        | KObjectRef::Process(_) => false,
+    }
 }
 
 /// Release every handle a process holds. Called by exit *and by kill*, so the

@@ -1411,11 +1411,34 @@ pub fn log_read(
     once more, and park only if that read was empty. `Rights::WAIT` on the
     `SysCap` is what makes the poll expressible and `Rights::LOG` is what makes
     the read answerable, which is why `logread` grants both.
-  - **A machine with no console posts nothing at all**, because `klogd` does not
-    drain there and parks unarmed. Nothing reaches it at L4 — the gate's profile
-    has a console — and it becomes L6's the moment `/bin/logd` is the program
-    parking on it:
-    `specs/issues/diagnostics/a-console-less-machine-posts-no-log-readiness.md`.
+  - **A machine with no console posted nothing at all until L6**, because
+    `klogd` did not drain there and parked unarmed — so it never woke, so it
+    never reached the post, so the one machine shape this whole design exists
+    for told a reader nothing. Nothing reached it at L4, whose gate's profile
+    has a console; it became live the moment `/bin/logd` was the program parking
+    on it. **Closed by removing the premise rather than by a second post**:
+    `klogd` advances the drain position over records nothing can carry
+    (`log::console::discard_pending`), so `DRAINED.any_pending()` goes false as
+    it does with a console, `arm_waiter` is called unconditionally, and a commit
+    wakes the thread on every shape.
+    `specs/issues/diagnostics/a-console-less-machine-posts-no-log-readiness.md`
+    carries the argument and what it does not close.
+  - **A handle closing is not the log ending, and `ops::close` said it was.**
+    `read_source` maps every `SysCap` to `Source::Log`, and `close` handed that
+    to `io_uring::remove_fd`, which cancels across every ring in the machine —
+    right for a pipe whose other end has really gone, wrong for a stream no
+    handle owns. So any process closing any capability posted `-NotFound` into
+    every pending log poll there was, and `/bin/logd`'s whole loop is
+    read-then-park. `ops::ends_its_sources` is the fix, and the question is
+    asked of the *object*: `SysCap` and `Console` answer `false` because each is
+    one of many handles on a machine-wide facility, while a pipe end, a
+    connection, a port and a device claim each really do go away with their last
+    handle. `log_poll_outlives_a_close` (§9.5) is the gate and
+    `log-close-cancels-any-syscap` the control. **`Console` is in it for a
+    defect L5 would otherwise have introduced**: `read_source` answers
+    `Source::Keyboard` for a console, and after §4.4 every process has its own
+    console object, so one of them closing stdin would have cancelled the
+    compositor's key poll.
 
 **`MAX_LOG_SHARDS` is `MAX_CPUS`** and the cursor is **88 bytes** at the
 shipped 8 — `24 + 8 * MAX_LOG_SHARDS`, which `toyos-abi/src/log.rs` asserts. It
@@ -1917,11 +1940,11 @@ serves = ["log"]
 syscap = ["logread"]     # Rights::LOG on a SysCap dup, §3.2
 ```
 
-**There is no `console = true` and no `serves` row as built**, and both
-absences are argued where they belong: §4.4 for the console — logd's console
+**The `console = true` row is struck**, and §4.4 is the argument: logd's console
 object is minted for it at spawn like every other program's, so a manifest key
-and a labelled endowment would arrange something the spawn path already arranges
-— and §5.2 for the port, whose only client is L7's.
+and a labelled endowment would arrange something the spawn path already
+arranges. The `serves` row stands as written, and §5.2 is where the question of
+whether its port has a client before L7 belongs.
 
 It `receives` nothing. It claims no device. It cannot open a compositor
 connection, reach netd, or name a process. Its whole authority is: accept
@@ -1934,12 +1957,12 @@ endowment architecture's whole point is that every port exists before any server
 runs, so a client can connect before `logd` has executed an instruction — but
 because the sooner it runs the fewer boot records sit in a shard with no reader.
 
-**One new name and one new key were planned; only the name is built.** `logread` is a row in `SYSCAP_RIGHTS`
+**One new name and one new key were planned; the key is struck.** `logread` is a row in `SYSCAP_RIGHTS`
 (`toyos-manifest/src/lib.rs`) that a program asks for by name in `syscap`, and
 init already narrows and endows a `SysCap` duplicate for exactly that
 (`init/src/main.rs:527-539`) — nothing new is built. `console` is a
 `#[serde(default)] bool` on `ProgramConfig` (`src/build.rs:44`) and on
-`toyos_manifest::Program`, **and it is not built** — §4.4 is why.
+`toyos_manifest::Program`, **and it is struck** — §4.4 is why.
 
 ### 5.1a Eleven manifests, and the two that exist for the machine this is all for
 
@@ -2705,22 +2728,20 @@ guest that computes it.
 dropped, and the ledger accounts for those too — which is the point of computing
 the law over sequence numbers rather than over the storm.
 
-**The workload's liveness does not rest on placement, and this section's first
-build said it did.** `storm.rs` claimed one producer per shard, which nothing
-guarantees — `sched::driver::placement` picks the least-loaded CPU from a
-rotating start, so eight threads spawned back to back are spread only while
-every published load is equal, and a task is stealable between its spawn and its
-first run either way. Two producers on one shard would lap the first one's
-`done` record and the reader would wait for a record that is never coming, which
-is this gate's 60 s ceiling in the fast tier. As built, **every producer parks
-until every producer has finished emitting and only then says `done`** (the
-L4 review's F2), so the only records that can follow a `done` are the other
-`done`s and a boot's handful of ordinary lines, against a shard of 512. Sharing
-a shard costs the run drops the law already accounts for, and never liveness. It
-is a *park* and not a spin because a Ring 0 loop that takes no lock is never
-preempted in this kernel: two producers sharing a CPU means the second does not
-run until the first blocks, so a spin barrier would deadlock the very case it is
-there to survive.
+**The workload's liveness rests on placement, and this section said it did not
+have to.** `storm.rs` claimed one producer per shard, which nothing guarantees —
+`sched::driver::placement` picks the least-loaded CPU from a rotating start, so
+eight threads spawned back to back are spread only while every published load is
+equal, and a task is stealable between its spawn and its first run either way.
+Two producers on one shard lap the first one's `done` record and the reader
+waits for a record that is never coming, which is this gate's 60 s ceiling in
+the fast tier. That is the L4 review's F2 and **it is open rather than closed**:
+`specs/issues/kernel/the-log-storm-gate-needs-a-record-a-shard-may-drop.md`
+carries the analysis, the measurement that rejected the obvious fix — a
+park-based barrier passed alone and passed a whole suite and then hung
+`log_conservation_smp4` in a 12-wide one — and the shape that would answer it,
+which is a reader that needs no `done` at all. What is closed is the claim: the
+comment now derives what it can and names what it cannot.
 
 **It does not cover §2.3a, and neither does anything else of this shape**: a
 producer that moves between CPUs mid-storm is not reachable on this tree at all.
@@ -2835,6 +2856,7 @@ holds them out of a shipping kernel.
 | `log-unbracketed-reserve` | §2.3a's complete IF/TF guard is removed from shard selection through final publication, so a producer can resume its body copy after a newer generation committed | `log_nested_emit`'s patterned mid-body lap — **measured 2026-08-15**, 2 of 2 |
 | `log-trusts-durable` | the §6.4 clamp on `LogCursor::durable` is removed | a test logd publishing `u64::MAX` makes `wait_for_log_file` return with nothing written, and `screen_fatal_halt_composited`'s `/log` half reds |
 | `log-writes-the-file` | `klogd`'s drain appends records to `/log` through the VFS, from the idle loop — the coupling, rebuilt in miniature | `io-depth-probe`'s depth, and §9.3 reading 1 by the recorded margin |
+| `log-close-cancels-any-syscap` | `ops::close` hands `remove_fd` the sources a `SysCap` or a `Console` names, so a handle going away cancels every poll in the machine on the log or the keyboard — **the behaviour this tree had** until L6 | `log_poll_outlives_a_close` — **measured 2026-08-15**, *"closing a second handle to the same capability completed the log poll with no record behind it"*, red 2 of 2 |
 | `console-unbuffered` | `ConsoleObject`'s line buffer is bypassed; each `write` reaches the backend — **which is literally L3's own intermediate state** (§8.1), and as built it calls L3's own function | `console_line_atomicity` — **measured 2026-08-15**, `4 of 2000` mixed lines in the parallel phase and `2 of 2000` on the ALONE re-run, red 2 of 2 |
 
 **`log-commit-early` is not built at L4, and the reason is the workload rather
@@ -2946,6 +2968,19 @@ existing. Named rather than discovered at compl's C14.
   kernel, 4 of 2000 and then 2 of 2000 under `console-unbuffered`, red 2 of 2.
   The writers are two *processes* and not two threads, because the buffer is per
   console object and two threads of one process share one.
+- **`log_poll_outlives_a_close`** — §3.2's second bullet, in guest and
+  deterministic. `test-runner` submits a `POLL_ADD` on its own `SysCap`,
+  **enters the kernel with it** — `poll_add` only queues a submission entry, and
+  a round that closed first would stage nothing and pass on a tree with the
+  defect — duplicates the capability, closes the duplicate, and asserts no
+  completion. Then a child that runs and exits commits one kernel record
+  (`process.rs`'s `exit:` line, which needs no actuator and no privilege) and
+  the poll completes on it, so what the close did not take was a live arming
+  rather than an absent one. A completion in the immediate window is
+  distinguishable from the defect — an honest one leaves records in the cursor —
+  and sends the round again, bounded at five. It needs `dup` beside `logread`,
+  which `tests/testcases/system.toml` has. **Measured 2026-08-15**:
+  `survived=1 records_after=6` green, red 2 of 2 under the control.
 - **`pre_idle_wedge_speaks`** — an actuator (`pre-idle-wedge`, not a feature:
   §0.0) that wedges deliberately at the end of boot phase 3 with interrupts off;
   the host asserts the console carries every line up to the wedge and nothing

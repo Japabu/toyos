@@ -501,6 +501,12 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // its own machine because what it reads is the console capture, which a
     // shared boot fills with everything else.
     ("console_line_atomicity", Sched::Parallel, Tier::Fast),
+    // A poll on the machine's log against a *handle* going away. Parallel and
+    // Fast: both halves are verdicts the guest computes — a completion count
+    // immediately after a close, retried against a record arriving in the same
+    // microseconds, and a completion afterwards bounded far above the two
+    // scheduler passes it needs.
+    ("log_poll_outlives_a_close", Sched::Parallel, Tier::Fast),
     // One boot that stops dead in phase 3, read for what it managed to say.
     ("pre_idle_wedge_speaks", Sched::Parallel, Tier::Fast),
     ("i8042_health", Sched::Parallel, Tier::Nightly),
@@ -7148,6 +7154,9 @@ fn run_machine_test(
             common::logread::log_conservation_smp8(test_config, c_bins, rust_bins)
         }
         "log_nested_emit" => common::logread::log_nested_emit(test_config, c_bins, rust_bins),
+        "log_poll_outlives_a_close" => {
+            common::logread::log_poll_outlives_a_close(test_config, c_bins, rust_bins)
+        }
         // Body in `tests/common/console.rs`, same reason.
         "console_line_atomicity" => {
             common::console::console_line_atomicity(test_config, c_bins, rust_bins)

@@ -187,6 +187,38 @@ pub fn drain_locked(guard: &mut BackendGuard) {
     drain_bounded(guard, u64::MAX);
 }
 
+/// Advance the console's position over records nothing can carry.
+///
+/// **`klogd`'s, and nobody else's.** A machine with no backend has nowhere to
+/// put a record, and until 2026-08-15 `klogd` answered that by parking
+/// *unarmed*: with the position standing still, an armed waiter would find a
+/// committed record on every rescan and spin for the life of the machine. That
+/// was right about the spin and wrong about the consequence — an unarmed
+/// `klogd` never wakes, so it never reaches `user::post_readiness`, so **the one
+/// machine shape this whole design exists for posts no log readiness at all**
+/// and `/bin/logd` parks for ever with `/log` unwritten
+/// (`specs/issues/diagnostics/a-console-less-machine-posts-no-log-readiness.md`).
+///
+/// Advancing costs nothing that machine had: the records stay in their shards
+/// for the panel, which reads them through `snapshot_committed` and not through
+/// this position; `panic_flush` refuses on `has_console()` before it looks at
+/// it; and a backend arriving later rewinds it whole ([`backend_changed`]).
+/// What it buys is a `klogd` that can park armed, so a commit wakes it, so a
+/// reader watching `Source::Log` hears about records on a machine with no
+/// console — which is every T14 and every `--diag-boot` image.
+///
+/// It is deliberately **not** in [`drain_inline`], whose other two callers are a
+/// producer mid-`emit` and a panicking machine: a `Drain::Inline` boot with no
+/// console would then walk every shard per record, which is exactly the cost
+/// §4.2 gates that mode on `has_console()` to avoid.
+fn discard_pending() {
+    let mut cursor = DRAINED.take();
+    let mut sink = Discard;
+    drain_ordered(&mut cursor, &mut sink);
+    DRAINED.put(&cursor);
+    LOST.store(DRAINED.lost(), Ordering::Relaxed);
+}
+
 /// At most `budget` records to a held backend. Returns how many went.
 fn drain_bounded(guard: &mut BackendGuard, budget: u64) -> u64 {
     let mut cursor = DRAINED.take();
@@ -245,8 +277,9 @@ pub fn backend_changed() {
         DRAINED.rewind();
     }
     drain_inline();
-    // `klogd` parks unarmed while there is no console (see `body`), so on the
-    // machine where this matters most it is asleep with nothing to wake it.
+    // The rewind above moved the position backwards under a parked `klogd`,
+    // and nothing commits a record to wake it: the whole boot is now pending
+    // and the producer that would have posted has long since returned.
     post_wake();
 }
 
@@ -366,6 +399,16 @@ impl RecordSink for Wire<'_> {
     }
 }
 
+/// Records nothing can carry, on a machine with no backend. The position moves
+/// and the bytes are never built.
+struct Discard;
+
+impl RecordSink for Discard {
+    fn put(&mut self, _record: &LogRecord) -> bool {
+        true
+    }
+}
+
 /// Records straight to the 16550, for the bypass. No lock, bounded per byte.
 struct Raw;
 
@@ -388,8 +431,14 @@ extern "C" fn body(_arg: u64) -> ! {
     loop {
         // One bounded chunk per backend acquisition, exactly as
         // `drain_chunk_to_serial` was, so an interrupts-off window is never
-        // longer than `CHUNK_RECORDS` lines.
-        drain_inline();
+        // longer than `CHUNK_RECORDS` lines. With no backend the position moves
+        // and nothing is rendered — `discard_pending` says why that is this
+        // thread's job and not `drain_inline`'s.
+        if serial::has_console() {
+            drain_inline();
+        } else {
+            discard_pending();
+        }
 
         // **The one context in the machine that has just observed committed
         // records and may take a lock**, which is why the readiness post is
@@ -410,17 +459,15 @@ extern "C" fn body(_arg: u64) -> ! {
         // `klogd`, takes `Claim::Lost`, drops the wake, and `klogd` parks on a
         // committed record.
         let ticket = scheduler::prepare_wait(scheduler::park_lot());
-        // **A machine with no console arms nothing, and that is what keeps this
-        // thread off a CPU it cannot use.** With no backend the drain above
-        // takes nothing and leaves the records where the panel can still find
-        // them, so an armed waiter would find a committed record on every
-        // rescan and never park — one kernel thread spinning for the whole life
-        // of a T14. Unarmed, no producer pays a post either, and the wake that
-        // matters is `serial::console_changed`'s: a console arriving is the one
-        // event that turns an accumulated boot into something to say.
-        if serial::has_console()
-            && shard::arm_waiter(shard::log_waiter(), || DRAINED.any_pending())
-        {
+        // **A machine with no console arms exactly like one that has a
+        // console, and it did not until 2026-08-15.** It parked unarmed then,
+        // on the reasoning that an armed waiter with a standing position would
+        // find a committed record on every rescan and spin — true of the
+        // position standing still, which `discard_pending` is what fixes. The
+        // consequence of the unarmed park was that this thread never woke, so
+        // it never reached `post_readiness`, so on the one machine shape this
+        // design exists for a userland reader was never told records had moved.
+        if shard::arm_waiter(shard::log_waiter(), || DRAINED.any_pending()) {
             ticket.cancel();
             continue;
         }
