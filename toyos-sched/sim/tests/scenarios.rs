@@ -24,7 +24,6 @@ use toyos_sched_sim::explore::run;
 use toyos_sched_sim::scenarios;
 use toyos_sched_sim::shrink;
 use toyos_sched_sim::sweep;
-use toyos_sched_sim::workload::ParkShape;
 
 /// Seeds per scenario in the in-test sweep. Every seed is a complete
 /// exploration with all of I1–I13 checked after every step.
@@ -734,7 +733,7 @@ fn a_pass_that_overruns_its_budget_is_caught() {
 /// again and every clean I9 report above it means nothing.
 #[test]
 fn old_park_keeping_the_lend_is_caught() {
-    let scenario = scenarios::old_park_kept_the_lend().with_park(ParkShape::KeepLapsedLend);
+    let scenario = scenarios::old_park_kept_the_lend();
     let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
     let mut caught = 0;
     for seed in 0..SEEDS {
@@ -762,7 +761,7 @@ fn old_park_keeping_the_lend_is_caught() {
 
     // The control: the same workload under the shipped park must be clean, or
     // the gate is only detecting the workload.
-    let fixed = scenarios::old_park_kept_the_lend();
+    let fixed = scenarios::lend_then_block();
     for seed in 0..SEEDS {
         let mut choices = ChoiceStream::from_seed(seed);
         let outcome = run(fixed.clone(), &mut choices);

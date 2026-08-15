@@ -966,7 +966,7 @@ pub fn all() -> Vec<Scenario> {
         fairness_storm(1),
         fairness_storm(2),
         sibling_storm(),
-        old_park_kept_the_lend(),
+        lend_then_block(),
     ]
 }
 
@@ -986,6 +986,7 @@ pub fn by_name(name: &str) -> Option<Scenario> {
         "fair_identity_within_share" => Some(fair_identity_within_share()),
         "overlong_pass" => Some(overlong_pass()),
         "old_park_kept_the_lend" => Some(old_park_kept_the_lend()),
+        "lend_then_block" => Some(lend_then_block()),
         "old_commit_before_pass" => Some(old_commit_before_pass()),
         "old_commit_fused" => Some(old_commit_fused()),
         "old_preemptible_window" => Some(old_preemptible_window()),
@@ -993,25 +994,24 @@ pub fn by_name(name: &str) -> Option<Scenario> {
     }
 }
 
-/// Negative gate for invariant I9: one lend, then a task that always blocks
-/// before its quantum ends.
+/// Invariant I9's workload, and the control half of its gate: one lend, then a
+/// task that always blocks before its quantum ends.
 ///
 /// The victim is woken over and over by a waker that lends **nothing** — only
-/// the very first wake carries a window. Under [`ParkShape::ReleaseLend`] that
-/// window dies at the victim's first park and the victim spends the rest of the
-/// run as a normal task. Under [`ParkShape::KeepLapsedLend`] — commit
-/// `9c2fc4d`'s park — it survives every block, `RtState::arm` re-arms it at
-/// every dispatch, and the victim runs at the borrowed priority forever off a
-/// lend nobody renewed.
+/// the very first wake carries a window. Under [`ParkShape::ReleaseLend`], which
+/// is what this carries and what the kernel ships, that window dies at the
+/// victim's first park and the victim spends the rest of the run as a normal
+/// task. [`old_park_kept_the_lend`] is the same workload under commit
+/// `9c2fc4d`'s park and is the negative gate.
 ///
 /// The victim's `Run(MS)` is deliberately far below the 10 ms quantum: that is
 /// the whole point, since a task that ran a quantum would have its window
 /// cleared at the preempt and the hole needs the *park*. Twenty iterations put
 /// ~20 ms of boosted running time on one lend, comfortably past I9's bound, so
 /// the gate fires early rather than on the last step.
-pub fn old_park_kept_the_lend() -> Scenario {
+pub fn lend_then_block() -> Scenario {
     scenario(
-        "old_park_kept_the_lend",
+        "lend_then_block",
         1,
         vec![queue(WaitClass::Pipe)],
         vec![
@@ -1058,4 +1058,28 @@ pub fn old_park_kept_the_lend() -> Scenario {
             ),
         ],
     )
+}
+
+/// Negative gate for invariant I9: [`lend_then_block`] under commit `9c2fc4d`'s
+/// park, which cleared the borrowed window only `if now >= until`.
+///
+/// It **must fail**. A lend blocked on before it ran out survives the block, and
+/// with `RtState::arm` re-arming at every dispatch a task that obtains one lend
+/// and thereafter runs less than a quantum before blocking holds inherited RT
+/// forever — off a single pipe interaction, with nobody renewing anything.
+///
+/// The I9 that shipped alongside that park could not see it, and the giveaway
+/// was that it needed no change: it compared a *running* task's `until` against
+/// the clock, and a re-armed `until` is by construction fresh. A check that
+/// passes because it stopped measuring is gate A's instrument-defect shape, so
+/// I9 is the cumulative form now and this is what says so.
+///
+/// **A named constructor rather than a `with_park` at one call site**, which is
+/// what it was until the CLI's `gate` was found to be running eight of the nine
+/// negative gates: a gate reachable only through a modifier one test applies is
+/// a gate the exit criterion cannot name.
+pub fn old_park_kept_the_lend() -> Scenario {
+    let mut scenario = lend_then_block().with_park(ParkShape::KeepLapsedLend);
+    scenario.name = "old_park_kept_the_lend";
+    scenario
 }
