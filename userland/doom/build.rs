@@ -35,9 +35,16 @@ fn main() {
         fs::write(dg_dir.join(PIN_STAMP), DOOMGENERIC_COMMIT).expect("failed to record the pin");
     }
 
-    // Use pre-built toyos-cc host binary (built by the build system's toolchain phase).
+    // Use pre-built toyos-cc host binary (built by the build system's toolchain
+    // phase). `<repo>/target/`, not `<repo>/toyos-cc/target/`: `toyos-cc` is a
+    // member of the host workspace the root `Cargo.toml` declares, and a member
+    // builds into the workspace root's target directory. `src/toolchain.rs`'s
+    // `toyos_cc_binary` is the same path, and this build script is too far
+    // outside that crate to share it — `userland/` is excluded from that
+    // workspace on purpose, so the two agree by the assert below and by nothing
+    // else.
     let host = std::env::var("HOST").unwrap();
-    let toyos_cc = root.join(format!("../../toyos-cc/target/{host}/release/toyos-cc"));
+    let toyos_cc = root.join(format!("../../target/{host}/release/toyos-cc"));
     assert!(
         toyos_cc.exists(),
         "toyos-cc host binary not found at {} — run `cargo run` from repo root first",

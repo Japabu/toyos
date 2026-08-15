@@ -12,13 +12,19 @@ publish = false
 # transliteration of it — a transliteration is exactly the divergence risk a
 # model checker is meant to remove.
 #
-# A separate package with its own lockfile, so `loom` and its transitive host
-# crates stay out of `kernel/Cargo.lock` — the same arrangement, and the same
-# reason, as `toyos-sched/loom`. It sits beside `kernel/` rather than inside it
-# because `kernel/.cargo/config.toml` cross-compiles everything below it to
+# A separate package, so `loom` and its transitive host crates stay out of
+# `kernel/Cargo.lock` — the same arrangement, and the same reason, as
+# `toyos-sched/loom`. It sits beside `kernel/` rather than inside it because
+# `kernel/.cargo/config.toml` cross-compiles everything below it to
 # `x86_64-unknown-none`, and cargo refuses to merge an inherited `build.target`
 # away.
-[workspace]
+#
+# The lockfile that isolates loom is no longer this package's own: it is a
+# member of the host workspace (root `Cargo.toml`) and resolves in
+# `/Cargo.lock`. What matters is unchanged and is what that sentence always
+# meant — `kernel/` is *excluded* from that workspace and resolves against
+# `kernel/Cargo.lock`, and nothing the kernel builds depends on this package,
+# so loom and its transitive crates appear in neither.
 
 [features]
 default = ["loom"]

@@ -1,11 +1,10 @@
-# Its own workspace, like toyos-gpt, toyos-hda and toyos-ps2: the kernel
-# depends on it by path and `cargo test` runs here on the host. What lives here
-# is the arithmetic between a capability structure a *device* published and the
-# address the kernel is about to write an interrupt vector through — the one
-# place where believing a device costs the machine a write to a physical
-# address of its choosing. That has to be exercised against values no QEMU
-# device will ever publish.
-[workspace]
+# A member of the host workspace (root `Cargo.toml`), like toyos-gpt, toyos-hda
+# and toyos-ps2: the kernel depends on it by path and its tests run on the host.
+# What lives here is the arithmetic between a capability structure a *device*
+# published and the address the kernel is about to write an interrupt vector
+# through — the one place where believing a device costs the machine a write to
+# a physical address of its choosing. That has to be exercised against values no
+# QEMU device will ever publish.
 
 [package]
 name = "toyos-pci"

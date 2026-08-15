@@ -15,7 +15,7 @@ publish = false
 # It sits beside `kernel/` rather than inside it for `kernel-loom`'s reason:
 # `kernel/.cargo/config.toml` cross-compiles everything below it to
 # `x86_64-unknown-none`, and cargo refuses to merge an inherited `build.target`
-# away.
-[workspace]
+# away. Beside it, and in the host workspace (root `Cargo.toml`), where a host
+# harness belongs.
 
 [dependencies]
