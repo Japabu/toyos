@@ -8,7 +8,8 @@ publish = false
 # This package exists only to run the loom model checker over the scheduler
 # primitives (spec §10.6). It compiles `../src/*.rs` into its own crate with
 # `feature = "loom"` on, so every atomic in those files becomes a
-# loom-instrumented one. Nothing depends on this package, so loom never
+# loom-instrumented one. Nothing depends on this package, and `kernel/` is
+# excluded from the host workspace this package is a member of, so loom never
 # reaches `kernel/Cargo.lock`.
 
 [features]

@@ -43,7 +43,14 @@ changes its verdict or its price — is **Nightly**.
 
 Required checks: `host`, `abi-split`, `gate-stage`, `guest-suite`, `build`.
 
-- `host` runs every host suite.
+- `host` runs every host suite, and *every* is enforced rather than
+  maintained. The host-tested crates are the members of the workspace root
+  `Cargo.toml` declares; one `cargo test --workspace` runs them all, and a gate
+  in `cargo test --lib` reds on a crate in the tree that joined neither that
+  list nor the excluded list beside it. A crate added and forgotten is a red,
+  not a gap — before the gate, the list lived in the workflow and in the tree
+  at once, and three times a set of host-testable crates reached no gate for
+  weeks.
 - `guest-suite` aggregates the KVM shards, which run exactly the Fast tier,
   and the `durations` verdict.
 - The shards are a partition: every Fast test runs exactly once per run, and

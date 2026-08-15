@@ -1,3 +1,68 @@
+# The host workspace: every crate in this repository that is tested on the host
+# rather than inside a guest, resolved once.
+#
+# Each of these used to be its own workspace root with its own lockfile, and
+# `host-tests.yml` named them in a shell loop. That made the set of host-tested
+# crates a list in two places, and the two drifted three times — four pure
+# crates until 2026-08-08, `toyos-keymap` and `bcachefs` until 2026-08-14, and
+# `toyos-abi` and `toyos-manifest`, which reached no workflow at all. Membership
+# here is now the only list: `cargo test --workspace --exclude toyos-build` runs
+# every one of them, and `src/hostws.rs` reds on a `Cargo.toml` in this tree
+# that is neither a member nor excluded below with a reason.
+#
+# `default-members` is the root package alone, so a bare `cargo test` at the
+# root is still the QEMU harness and a bare `cargo run` is still the dev loop.
+# Naming the whole workspace is the deliberate act.
+[workspace]
+members = [
+    "bcachefs",
+    "kernel-loom",
+    "kernel-span",
+    "toyos-abi",
+    "toyos-cc",
+    "toyos-desktop",
+    "toyos-elf",
+    "toyos-fat32",
+    "toyos-fat32-check",
+    "toyos-gpt",
+    "toyos-hda",
+    "toyos-keymap",
+    "toyos-ld",
+    "toyos-manifest",
+    "toyos-pci",
+    "toyos-ps2",
+    "toyos-sched",
+    "toyos-sched/loom",
+    "toyos-sched/sim",
+    "toyos-xhci",
+    "toyos-xhci/sim",
+]
+default-members = ["."]
+# Everything that keeps its own resolution. Each is excluded for a reason, and
+# `src/hostws.rs` holds this list against the tree — an entry that stops naming
+# a directory with a `Cargo.toml` under it is a red, so a stale excuse cannot
+# outlive what it excused.
+exclude = [
+    # Cross-compiled by a `.cargo/config.toml` below them, to targets no host
+    # test can run. Cargo refuses to merge an inherited `build.target` away, so
+    # these cannot be members at any price.
+    "bootloader",
+    "kernel",
+    "userland",
+    # The Rust compiler/std fork: its own workspaces, its own lockfiles, and a
+    # submodule this repository does not resolve for.
+    "rust",
+    # The userland SDK. It compiles against the ToyOS sysroot and is a path
+    # dependency of `rust/library/std`; there is nothing in it a host `cargo
+    # test` could run.
+    "toyos",
+    # Guest programs `src/build.rs` builds for `x86_64-unknown-toyos`, each from
+    # its own directory. The harness's own integration test lives here too
+    # (`tests/toyos.rs`), and that one is a target of the root package rather
+    # than a package of its own.
+    "tests",
+]
+
 [package]
 name = "toyos-build"
 version = "0.1.0"
@@ -28,12 +93,34 @@ toyos-ld = { path = "toyos-ld" }
 [profile.release]
 opt-level = 2
 
+# The two host tools every build runs are built `--release` by
+# `src/toolchain.rs`, and `[profile.release]` above would otherwise drop them
+# from the default `opt-level = 3` to 2 now that they are members here rather
+# than workspace roots of their own. The linker runs once per guest binary and
+# the compiler once per translation unit: neither pays for the harness's
+# compile-time tradeoff.
+[profile.release.package.toyos-cc]
+opt-level = 3
+
+[profile.release.package.toyos-ld]
+opt-level = 3
+
 # The test harness is a compute-bound host program, not a debug build of the
 # thing under test: it decodes a 2.07 M-pixel screendump per poll and formats a
 # 300 MB disk image per boot. Nothing here is cross-compiled — the kernel,
 # bootloader and userland are separate cargo invocations with their own
-# profiles — so this reaches the harness, `toyos_build`, and their host deps and
-# nothing else. `debug` stays on (the dev default), so LLDB still works on it.
+# profiles, and are excluded from this workspace. `debug` stays on (the dev
+# default), so LLDB still works on it.
+#
+# It reaches every member now rather than the harness alone, and that is a gain
+# rather than a side effect: the host suite's warm wall clock went from 111 s
+# over sixteen invocations to 34 s over one, measured on the dev host, and
+# almost all of the difference is the members' tests no longer running at
+# `opt-level = 0`. Nothing fail-fast is traded for it — `opt-level` does not
+# touch `debug-assertions`, which cargo still passes as `on` (checked with
+# `cargo build -p toyos-fat32 -v`), and rustc derives `overflow-checks` from
+# that. The pure crates' hostile-input tests keep both knobs that *found* the
+# two crafted-ELF kernel panics in `specs/issues/`.
 [profile.dev]
 opt-level = 2
 
@@ -42,6 +129,27 @@ opt-level = 3
 
 [profile.dev.package.toyos-ld]
 opt-level = 3
+
+# The one profile every guest binary is built with — `specs/plans/boot-image-split.md`
+# §6. Optimised, because an unoptimised guest mismeasures everything under TCG;
+# debug-assertions and overflow-checks on, because fail-fast beats speed here
+# and both crafted-ELF kernel panics in `specs/issues/` were *found* by
+# an overflow check. `--release` would turn the last two off silently, so this
+# build system no longer has the flag.
+#
+# It is declared here rather than in `toyos-cc/Cargo.toml` and
+# `toyos-ld/Cargo.toml` because cargo ignores `[profile]` in a workspace member
+# and those two are members now. They are the only members the profile reaches:
+# both are `[programs]` in `system.toml` as well as host tools, so
+# `src/build.rs` builds each of them a second time for
+# `x86_64-unknown-toyos`. `kernel/`, `bootloader/` and `userland/` are excluded
+# from this workspace and each declares its own copy.
+[profile.toyos]
+inherits = "dev"
+opt-level = 2
+debug = true
+debug-assertions = true
+overflow-checks = true
 
 [[test]]
 name = "toyos-build"

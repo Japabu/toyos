@@ -52,8 +52,8 @@ only a feature we have declined would satisfy is declined with it, by name.
 ## 2. Reproducing
 
 ```
-cd toyos-cc && cargo build --bins                       # host binary, 14 s cold
-./toyos-cc/target/debug/toyos-cc -c --target x86_64-unknown-toyos \
+cargo build -p toyos-cc --bins                          # host binary, 14 s cold
+./target/debug/toyos-cc -c --target x86_64-unknown-toyos \
     -I userland/libc/include -I tests/testcases/tinycc \
     tests/testcases/tinycc/<case>.c -o /tmp/x.o          # one case
 readelf -sW /tmp/x.o                                     # what it did or did not define
