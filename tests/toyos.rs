@@ -464,8 +464,10 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("fpu_isolation", Sched::Parallel, Tier::Nightly),
     ("short_sleep_livelock", Sched::Parallel, Tier::Fast),
     // The kernel thread and the row that says what its panic means. Two
-    // boots, both headless: the second one halts on purpose.
-    ("klogd_hosted", Sched::Parallel, Tier::Fast),
+    // boots, both headless: the second one halts on purpose — and the pair
+    // measured 11.8 s on CI KVM, over the fast line, so the whole verdict is
+    // nightly until the split the relegation row names.
+    ("klogd_hosted", Sched::Parallel, Tier::Nightly),
     // One boot that stops dead in phase 3, read for what it managed to say.
     ("pre_idle_wedge_speaks", Sched::Parallel, Tier::Fast),
     ("i8042_health", Sched::Parallel, Tier::Nightly),

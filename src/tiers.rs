@@ -120,6 +120,21 @@ pub struct Relegated {
 /// Every test the fast tier does not run.
 pub const RELEGATED: &[Relegated] = &[
     Relegated {
+        test: "klogd_hosted",
+        ci_ms: 11_805,
+        why: Why::Cost,
+        guards: "The kernel-thread machinery: klogd spawns with a process-table row, \
+                 `ps` and the census name it, and a deliberate panic in it halts the \
+                 machine instead of being recovered off a stale `syscall_rip` — the \
+                 nondeterminism §4.3 exists to forbid. Two boots, and the second (the \
+                 `klogd-panic` actuator) is the cost; the spawn half alone is one \
+                 cheap boot, and \
+                 specs/issues/build/klogd-hosted-pays-two-boots-for-one-fast-verdict.md \
+                 is the split that puts it back in the fast tier. What still runs per \
+                 pull request: every boot's console output is klogd's drain, so the \
+                 thread starving or dying is visible in any test that reads a line.",
+    },
+    Relegated {
         test: "desktop_window_child",
         ci_ms: 65_217,
         why: Why::Cost,
