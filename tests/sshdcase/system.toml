@@ -20,5 +20,9 @@ devices = ["nic"]
 [programs.sshd]
 receives = ["netd", "launcher"]
 
+# `logread` is the log gate's own: a spawned test binary does not inherit a
+# `SysCap` dup, so the gate that reads the kernel's records runs inside
+# `test-runner` itself (`specs/log-architecture-spec.md` §3.2, §9.5).
 [programs.test-runner]
 receives = ["netd"]
+syscap = ["logread"]

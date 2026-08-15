@@ -361,6 +361,62 @@ actuators! {
     /// See `log_file::max_log_bytes`.
     log_rotate_fast = "log-rotate-fast";
 
+    /// Every CPU emitting patterned log records at once, from kernel threads the
+    /// boot's first `SYS_LOG_READ` spawns.
+    ///
+    /// **Nothing else can reach it.** A real workload's record rate is set by
+    /// what the kernel happens to log — a handful of lines a second — and
+    /// cannot be made to saturate a shard however long a test waits, while the
+    /// property under test is exactly what happens when producers outrun the
+    /// one reader and the ring begins to drop. Nothing is faked: the records go
+    /// through the shipped `emit`, the shipped reservation and the shipped
+    /// publication, and only their number and their text belong to the test.
+    /// See `kernel/src/log/storm.rs`; `specs/log-architecture-spec.md` §9.1.
+    log_storm = "log-storm";
+
+    /// Remove §2.3a's IF/TF bracket from shard selection through final
+    /// publication, leaving `LogCommitGuard` a guard that masks nothing.
+    ///
+    /// **This is the correctness claim the whole design rests on, and the only
+    /// thing that can make it fail on purpose.** With the bracket gone a
+    /// producer can migrate between reading its shard pointer and its unlocked
+    /// `xadd` — two CPUs then read-modify-write one `head` — and can resume its
+    /// body copy after a whole newer generation has committed into the same
+    /// slot. Neither is stageable from the host: there is no injection that
+    /// preempts a kernel between two instructions, and no QEMU property
+    /// migrates a thread. `log_migration_storm` at `--smp 8` is what reads it.
+    /// See `arch::LogCommitGuard::close`.
+    log_unbracketed_reserve = "log-unbracketed-reserve";
+
+    /// Send this CPU its own IPI from halfway through a log record's body copy,
+    /// and have the handler emit exactly one shard generation of patterned
+    /// records — an interrupt that logs, inside another `emit`, on one CPU.
+    ///
+    /// **The case loom cannot express.** Loom models threads, not CPU flags and
+    /// not strict LIFO reentrancy on one CPU, so §2.4's fourth property has no
+    /// model; and nothing on the host can interrupt a kernel between two
+    /// instructions of one function. With §2.3a's bracket the IPI is pending
+    /// across the whole publication and lands the instant the guard drops, so
+    /// the burst laps the shard and the outer record goes by the ring's own
+    /// drop-oldest policy. Without it the same IPI lands inside the copy.
+    /// See `kernel/src/log/nested.rs`; `specs/log-architecture-spec.md` §9.2.
+    log_nested_emit = "log-nested-emit";
+
+    /// Turn the reservation's one unlocked `xadd` into a load, an open
+    /// interrupt window and a store — the shape §2.3a says is not
+    /// interrupt-atomic.
+    ///
+    /// **The window is what makes it deterministic rather than a race.** The
+    /// defect being staged is precisely "something came between the load and
+    /// the store", and the only thing that can be made to come between them on
+    /// one CPU is an interrupt this kernel sent itself: `log-nested-emit`'s
+    /// one-shot is consumed here instead of mid-body, so the handler's first
+    /// record takes the sequence number the interrupted writer had already
+    /// read. Nothing else changes; every other reservation is the same two
+    /// instructions with nothing admitted between them.
+    /// See `arch::percpu_fetch_add`.
+    log_shared_reservation = "log-shared-reservation";
+
     /// Panic inside `klogd`, the kernel thread, on its first instruction.
     ///
     /// **Nothing outside the kernel can make a kernel thread panic**, and the

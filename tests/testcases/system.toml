@@ -11,9 +11,12 @@ syscap = ["rt"]
 # `device` because five of the guest binaries claim the keyboard or the mouse
 # and no manifest row can name them — they are not `[programs]` keys — and `dup`
 # because a claim moves and one boot runs several of them.
+# `logread` because the log gate reads the kernel's own records and cannot be
+# a spawned binary: a `SysCap` dup is not part of the namespace test-runner
+# hands down (`specs/log-architecture-spec.md` §3.2, §9.5).
 [programs.test-runner]
 receives = ["soundd"]
-syscap = ["device", "dup"]
+syscap = ["device", "dup", "logread"]
 
 [programs.toybox]
 receives = ["soundd"]

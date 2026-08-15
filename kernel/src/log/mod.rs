@@ -9,9 +9,13 @@
 
 pub mod console;
 pub mod elide;
+pub mod nested;
 pub mod read;
 pub mod registry;
 pub mod shard;
+#[cfg(feature = "boot-actuators")]
+pub mod storm;
+pub mod user;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -57,6 +61,16 @@ pub fn shards() -> [Option<&'static Shard>; MAX_LOG_SHARDS] {
         *slot = registry::published(registry::kernel_slots(), ap);
     }
     out
+}
+
+/// How many shards a reader can be answered from right now.
+///
+/// **Counted rather than read off `MAX_CPUS`**, because a shard exists when the
+/// BSP has published it and not when a CPU is declared: a reader that sized its
+/// buffer by the declaration would be asking for room for shards this machine
+/// has not brought up. It only ever grows, and never past [`MAX_LOG_SHARDS`].
+pub fn shard_count() -> u32 {
+    shards().iter().filter(|shard| shard.is_some()).count() as u32
 }
 
 /// The formatter `emit` runs, writing the message into the record in place.

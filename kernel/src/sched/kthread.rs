@@ -38,7 +38,17 @@ use super::payload::ThreadSched;
 /// Three, which is every one either open design names: `klogd` here, and
 /// `usbd` and `iod` from the completion branch's C6. A fourth is a design
 /// decision and gets to notice that it is one.
+///
+/// **The test kernel carries room for one `log-storm` thread per shard on top,
+/// and the shipping kernel carries none of it.** That storm is one ordinary
+/// stealable task per CPU — which is the whole reason it can exercise the
+/// migration §2.3a's bracket exists to survive — and it exists only in the
+/// build that has the actuator. A shipping kernel spawning a fourth still dies
+/// naming it, so the rule above is untouched where it applies.
+#[cfg(not(feature = "boot-actuators"))]
 const MAX_KERNEL_TASKS: usize = 3;
+#[cfg(feature = "boot-actuators")]
+const MAX_KERNEL_TASKS: usize = 3 + toyos_abi::log::MAX_LOG_SHARDS;
 
 /// No task. `TaskId::pack` puts a `Pid` in the high word and a `Tid` in the
 /// low one, and neither id map ever issues `u32::MAX`, so this collides with

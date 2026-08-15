@@ -601,6 +601,19 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_DEVICE_CLAIM => sys_device_claim(RawHandle(a1 as u32), a2),
         SYS_RT_ENTER => sys_rt_enter(RawHandle(a1 as u32)),
+        SYS_LOG_READ => {
+            // The record count is userland's, so the byte length is computed
+            // from it before anything is mapped: a product that does not fit is
+            // a caller's argument being wrong, not the kernel's arithmetic
+            // wrapping into a window it then trusts.
+            let Some(bytes) = (a4 as usize).checked_mul(toyos_abi::log::RECORD_BYTES) else {
+                return SyscallError::InvalidArgument.to_u64();
+            };
+            let Some(mut out) = ctx.user_bytes_mut(UserAddr::new(a3), bytes as u64) else {
+                return bad_addr;
+            };
+            sys_log_read(&ctx, RawHandle(a1 as u32), UserAddr::new(a2), &mut out, a4 as usize)
+        }
         SYS_ACCEPT => sys_accept(RawHandle(a1 as u32)),
         SYS_HANDLE_SEND => {
             if a3 as usize > MAX_TRANSFER_HANDLES {
@@ -1513,6 +1526,44 @@ fn sys_rt_enter(syscap: RawHandle) -> u64 {
     }
     crate::scheduler::set_current_rt(true);
     0
+}
+
+/// Copy kernel log records into a caller's buffer, presenting a `SysCap` that
+/// carries [`Rights::LOG`].
+///
+/// **Every record every CPU wrote, which is every process's business and no
+/// process's right by default** — so it rides a right rather than being
+/// ambient, exactly as minting a device claim and entering the RT band do.
+///
+/// The cursor is the caller's own memory in both directions: read once here,
+/// walked by `log::user::read`, written back. **A cursor that cannot be written
+/// back costs that caller the records this call took**, and nothing else — it
+/// is the caller's own address, mapped a moment ago for the read, so a failure
+/// is a process that unmapped its cursor under its own syscall.
+fn sys_log_read(
+    ctx: &SyscallContext,
+    syscap: RawHandle,
+    cursor_ptr: UserAddr,
+    out: &mut UserBytesMut,
+    capacity: usize,
+) -> u64 {
+    if let Err(e) = process::with_fd_owner_data(|data| {
+        data.handles.get::<crate::object::syscap::SysCap>(syscap, Rights::LOG)
+    }) {
+        return e.refuse();
+    }
+    let mut cursor = match ctx.copy_in::<toyos_abi::log::LogCursor>(cursor_ptr) {
+        Ok(cursor) => cursor,
+        Err(e) => return e.to_u64(),
+    };
+    let count = match log::user::read(&mut cursor, out, capacity) {
+        Ok(count) => count,
+        Err(e) => return e.to_u64(),
+    };
+    match ctx.copy_out(cursor_ptr, &cursor) {
+        Ok(()) => count as u64,
+        Err(e) => e.to_u64(),
+    }
 }
 
 /// Answer this process's endowment table.

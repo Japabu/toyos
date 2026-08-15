@@ -49,9 +49,19 @@ impl LogCommitGuard {
             core::arch::asm!(
                 "pushfq",
                 "pop {saved}",
-                "cli",
                 saved = out(reg) rflags,
             );
+            // **`log-unbracketed-reserve` is the negative control on this whole
+            // type** (§9.4): the guard is constructed and dropped exactly as it
+            // is now, and it masks nothing — so a producer can migrate between
+            // reading its shard pointer and the `xadd`, and can resume its body
+            // copy after a whole newer generation has committed into the same
+            // slot. In the shipping kernel the accessor is `const fn … { false }`
+            // and this folds to the unconditional `cli` it replaced.
+            if crate::actuator::log_unbracketed_reserve() {
+                return Self { rflags, _not_send_sync: core::marker::PhantomData };
+            }
+            core::arch::asm!("cli");
             if rflags & TF != 0 {
                 let masked = rflags & !(TF | IF);
                 core::arch::asm!(
@@ -103,6 +113,32 @@ pub unsafe fn percpu_fetch_add(
     counter: &core::sync::atomic::AtomicU64,
     _guard: &LogCommitGuard,
 ) -> u64 {
+    // **`log-shared-reservation` is the negative control on the instruction
+    // itself** (§9.4): a load, a window, and a store, which is the shape that
+    // is *not* atomic against an interrupt on its own CPU. The window is what
+    // makes it deterministic rather than a race — the defect being staged is
+    // exactly "something came between the load and the store", and on one CPU
+    // the only thing that can be made to come between them is an interrupt this
+    // kernel sent itself. `log::nested`'s one-shot is consumed here instead of
+    // mid-body, so the handler's first record takes the sequence number the
+    // interrupted writer had already read. In a shipping kernel the accessor is
+    // `const fn … { false }` and this whole branch folds away.
+    if crate::actuator::log_shared_reservation() {
+        let previous = counter.load(core::sync::atomic::Ordering::Relaxed);
+        if crate::log::nested::inject() {
+            unsafe {
+                // The window, and nothing else in the machine opens one here.
+                core::arch::asm!("sti");
+                for _ in 0..256 {
+                    core::hint::spin_loop();
+                }
+                core::arch::asm!("cli");
+            }
+        }
+        counter.store(previous + 1, core::sync::atomic::Ordering::Relaxed);
+        return previous;
+    }
+
     let previous: u64;
     unsafe {
         // No `preserves_flags`: `xadd` changes arithmetic flags. The guard's
