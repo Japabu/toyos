@@ -2903,6 +2903,31 @@ rebase, never amend.
 **Dependencies.** L-ABI → L1. L1 → L2, L3, L4. L3 and L4 → L6. L5 → L7. L6 → L7.
 L8 after L7. L9 last. L10 independent of everything after L4.
 
+**Two corrections L4 owes, found by L3's review on 2026-08-15 and deliberately
+not made here.** Both are in `toyos-abi/src/log.rs`, which landed at L-ABI on
+its own branch; §11's rule is that the ABI moves on its own pull request, and a
+documentation-only edit to it would either drag this branch's kernel work onto
+that PR or spend a second ABI landing on two comments. So they are written down
+as owed rather than fixed, and **L4 is the next chunk that opens the file**:
+
+1. **§3.2's `LogCursor` block is missing `durable`.** The shipped struct is
+   `shards`, `_pad`, `lost`, **`durable`**, `next` — and this spec's own "88
+   bytes, `24 + 8 * MAX_LOG_SHARDS`" is only true with it (without, the block
+   shown sums to 80). §10's L-ABI row names "`LogCursor` with its clamped
+   `durable`", so the field was always intended and only the code block in §3.2
+   dropped it. Fix the block, and carry the field's own reason with it: it is a
+   number that crossed the trust boundary and is clamped to the newest record
+   the kernel holds, because an unclamped `u64::MAX` from a buggy `logd` would
+   silently shorten a dying kernel's wait for its own report.
+2. **`LogRecord::EMPTY`'s doc gives a reason that is false.** It says a record
+   of all zeroes is valid because *"sequence numbers start at zero"*. They start
+   at one — `FIRST_SEQ`, and §2.4 is the whole argument for why they must, since
+   a zeroed slot would otherwise read as record 0 of every shard on every boot.
+   The conclusion the comment draws is still right (`EMPTY` is filler and must
+   not be `Default`), so what is owed is the reason, not the type: an all-zero
+   record is indistinguishable from a *zeroed slot*, which is exactly the state
+   `FIRST_SEQ` exists to keep out of a reader's hands.
+
 **One row moved at L2.** `drain_ordered` is **L3's, not L2's.** L2's callers
 are the panic surface and the boot checkpoint, and both want
 `snapshot_committed`; the streaming reader's first caller is `klogd`, which is
