@@ -83,6 +83,13 @@ impl ProcessObject {
     ///
     /// Idempotent by assertion rather than by tolerance: two publishes mean two
     /// teardowns claimed one process, which `claim_teardown` exists to prevent.
+    ///
+    /// This is also the moment the process's table entry becomes collectable —
+    /// `process::reap_finished` takes exactly the entries whose object answers
+    /// `finished` — so the idle loop is told, after the store it has to see.
+    /// That signal is the only one it gets: without it the loop would have to
+    /// take the process table to find out, which is what it did on every trip
+    /// until `sched::reap_gate`.
     pub fn publish_exit(&self, exit: Exit) {
         {
             let mut slot = self.exit.lock();
@@ -96,6 +103,7 @@ impl ProcessObject {
             *slot = Some(exit);
         }
         self.finished.store(true, Ordering::Release);
+        crate::scheduler::note_reapable();
         wake_all(&self.waiters);
     }
 }

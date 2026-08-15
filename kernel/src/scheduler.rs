@@ -18,6 +18,7 @@ use crate::pipe::PipeId;
 use crate::process::{self, Pid, Tid};
 use crate::sched::driver::{self, cpus, preempt_off, Dispose, NewTask};
 use crate::sched::payload::{KShare, KWaitQueue, KernelLock, ThreadSched};
+use crate::sched::reap_gate::ReapGate;
 use crate::sched::waitqs;
 use crate::sync::Lock;
 use crate::DirectMap;
@@ -434,6 +435,21 @@ pub fn retire_task(sched: &ThreadSched) {
 /// is the thread's only cleanup site.
 static POISONED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(u64::MAX) }; MAX_CPUS];
 
+/// Whether [`reap_poisoned`] has anything to do. Raised by both sites that make
+/// work for it — a thread poisoned below, and a process publishing its exit
+/// ([`crate::object::process::ProcessObject::publish_exit`], which is what makes
+/// a table entry collectable) — and claimed by whichever idle trip takes the
+/// work. `sched::reap_gate` carries the argument.
+static REAP_GATE: ReapGate = ReapGate::new();
+
+/// Tell the idle loop there is a table entry to collect.
+///
+/// Called *after* the object's `finished` flag is stored, so the gate's release
+/// is what publishes it to the reaper.
+pub fn note_reapable() {
+    REAP_GATE.raise();
+}
+
 pub fn poison_tid(id: TaskId) {
     let cpu = percpu::cpu_id() as usize;
     let Some(slot) = POISONED.get(cpu) else {
@@ -441,6 +457,9 @@ pub fn poison_tid(id: TaskId) {
         return;
     };
     let prev = slot.swap(id.pack(), Ordering::Release);
+    // After the slot is written, never before: the gate's release is what
+    // carries it to the CPU that claims the work.
+    REAP_GATE.raise();
     if prev != u64::MAX {
         crate::log!(
             "poison_tid: cpu {cpu} slot still held {} — its waiter is stranded",
@@ -449,10 +468,23 @@ pub fn poison_tid(id: TaskId) {
     }
 }
 
-/// Zombify threads that died in panic recovery and wake whoever was joining
-/// them. Called from the idle loop, which is the one context that provably
-/// holds none of the locks the panicking thread may have been holding.
+/// Zombify threads that died in panic recovery, collect the entries of
+/// processes that have published their exit, and wake whoever was joining them.
+/// Called from the idle loop, which is the one context that provably holds none
+/// of the locks the panicking thread may have been holding.
+///
+/// **Nothing to reap costs no lock.** This took `PROCESS_TABLE` unconditionally
+/// until 2026-08-14, so every CPU with nothing to run held it for a slice of
+/// every trip round the idle loop — against a crash report whose
+/// `process::with_user_symbols` may only `try_lock` that table, and which
+/// therefore lost the faulting function's name whenever the two met. The gate
+/// is the whole of the fix on this side; `sched::reap_gate` argues why a raise
+/// cannot be lost, and `process::with_user_symbols` documents what the reader
+/// now says when it loses anyway.
 pub(crate) fn reap_poisoned() {
+    if !REAP_GATE.take() {
+        return;
+    }
     let mut wakes: [Option<process::PoisonWake>; MAX_CPUS] = [const { None }; MAX_CPUS];
     // Both are dropped after the guard: an entry's drop reaches
     // `remove_vruntime`, and a process whose teardown never ran still holds its
