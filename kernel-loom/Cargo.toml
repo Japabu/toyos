@@ -12,13 +12,19 @@ publish = false
 # transliteration of it — a transliteration is exactly the divergence risk a
 # model checker is meant to remove.
 #
-# A separate package with its own lockfile, so `loom` and its transitive host
-# crates stay out of `kernel/Cargo.lock` — the same arrangement, and the same
-# reason, as `toyos-sched/loom`. It sits beside `kernel/` rather than inside it
-# because `kernel/.cargo/config.toml` cross-compiles everything below it to
+# A separate package, so `loom` and its transitive host crates stay out of
+# `kernel/Cargo.lock` — the same arrangement, and the same reason, as
+# `toyos-sched/loom`. It sits beside `kernel/` rather than inside it because
+# `kernel/.cargo/config.toml` cross-compiles everything below it to
 # `x86_64-unknown-none`, and cargo refuses to merge an inherited `build.target`
 # away.
-[workspace]
+#
+# The lockfile that isolates loom is no longer this package's own: it is a
+# member of the host workspace (root `Cargo.toml`) and resolves in
+# `/Cargo.lock`. What matters is unchanged and is what that sentence always
+# meant — `kernel/` is *excluded* from that workspace and resolves against
+# `kernel/Cargo.lock`, and nothing the kernel builds depends on this package,
+# so loom and its transitive crates appear in neither.
 
 [features]
 default = ["loom"]
@@ -46,9 +52,11 @@ toyos-abi = { path = "../toyos-abi" }
 # 4,416-byte `Shard` and the records that go through it overflow it before the
 # first assertion. Nothing loom checks depends on the optimisation level: its
 # atomics and cells are ordinary types whose instrumentation survives inlining,
-# and the schedule exploration is loom's own.
-[profile.test]
-opt-level = 2
+# and the schedule exploration is loom's own. The optimisation comes from the
+# root workspace's `[profile.dev] opt-level = 2` (the `test` profile inherits
+# it; a member's own `[profile]` table is ignored by cargo and refused by
+# `src/hostws.rs`) — so lowering the root's opt-level does not slow these
+# models, it overflows their stacks.
 
 [lib]
 path = "src/lib.rs"

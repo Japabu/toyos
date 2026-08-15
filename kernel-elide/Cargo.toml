@@ -15,7 +15,8 @@ publish = false
 # `kernel-span`'s arrangement, for `kernel-span`'s reason: it sits beside
 # `kernel/` rather than inside it because `kernel/.cargo/config.toml`
 # cross-compiles everything below it to `x86_64-unknown-none`, and cargo refuses
-# to merge an inherited `build.target` away.
-[workspace]
+# to merge an inherited `build.target` away. A member of the root host
+# workspace, like `kernel-span`: the root `Cargo.lock` pins it and
+# `cargo test --workspace` is what runs it.
 
 [dependencies]

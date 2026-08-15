@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 use crate::assets;
 use crate::buildlock;
+use crate::hostws;
 use crate::image;
 use crate::toolchain;
 
@@ -130,8 +131,13 @@ impl ProgramConfig {
         }
     }
 
-    /// Whether this program is a workspace member of the userland workspace.
-    /// Programs with explicit paths or special flags are standalone.
+    /// Whether this program is a member of the **userland** workspace, the one
+    /// `-p` selects a package from and whose `target/` holds the result.
+    /// Programs with explicit paths or special flags are built from their own
+    /// directory instead — which is not the same as being built into it:
+    /// `toyos-ld` and `toyos-cc` have explicit paths and are members of the
+    /// *host* workspace, so cargo writes them to the repository root's
+    /// `target/`. `hostws::target_dir` is what answers that, never this.
     fn is_workspace_member(&self) -> bool {
         self.path.is_none() && !self.no_default_features
     }
@@ -205,18 +211,35 @@ fn external_fingerprint(root: &Path) -> String {
 enum Clean {
     All,
     /// Crates with explicit paths (toyos-ld, toyos-cc) also have host builds
-    /// that must survive: the host toyos-ld *is* the cross linker.
+    /// that must survive: the host toyos-ld *is* the cross linker. Both are
+    /// host-workspace members, so the directory this empties is the
+    /// workspace's `target/x86_64-unknown-toyos` — the guest halves of the two,
+    /// and nothing the host builds.
     ToyosOnly,
 }
 
-fn stale(crate_dir: &Path, fingerprint: &str) -> bool {
-    let stamp = crate_dir.join("target/.deps-stamp");
+fn stale(root: &Path, crate_dir: &Path, fingerprint: &str) -> bool {
+    let stamp = hostws::target_dir(root, crate_dir).join(".deps-stamp");
     fs::read_to_string(&stamp).map_or(true, |stored| stored != fingerprint)
 }
 
-fn clean(crate_dir: &Path, kind: Clean, fingerprint: &str) {
+fn clean(root: &Path, crate_dir: &Path, kind: Clean, fingerprint: &str) {
+    // Where cargo actually wrote it. `toyos-ld` and `toyos-cc` are members of
+    // the host workspace, so their guest builds land in the root's `target/`
+    // and both answer with the same directory: the second clean of a pass finds
+    // it already gone and does nothing, which is the right amount of work.
+    let target = hostws::target_dir(root, crate_dir);
     match kind {
         Clean::All => {
+            // `cargo clean` in a member's directory cleans the whole workspace,
+            // this build system's own target directory included. Nothing asks
+            // for that today; refusing it by name is cheaper than finding out.
+            assert!(
+                !hostws::is_member(root, crate_dir),
+                "{} is a host-workspace member, and `cargo clean` there would empty the \
+                 workspace's whole target directory rather than this crate's",
+                crate_dir.display(),
+            );
             eprintln!("external deps changed: cleaning {}", crate_dir.display());
             let _ = Command::new("cargo")
                 .arg("clean")
@@ -224,7 +247,7 @@ fn clean(crate_dir: &Path, kind: Clean, fingerprint: &str) {
                 .status();
         }
         Clean::ToyosOnly => {
-            let toyos_dir = crate_dir.join("target/x86_64-unknown-toyos");
+            let toyos_dir = target.join("x86_64-unknown-toyos");
             if toyos_dir.exists() {
                 eprintln!("external deps changed: cleaning {}", toyos_dir.display());
                 fs::remove_dir_all(&toyos_dir).ok();
@@ -232,8 +255,8 @@ fn clean(crate_dir: &Path, kind: Clean, fingerprint: &str) {
         }
     }
 
-    fs::create_dir_all(crate_dir.join("target")).ok();
-    fs::write(crate_dir.join("target/.deps-stamp"), fingerprint).ok();
+    fs::create_dir_all(&target).ok();
+    fs::write(target.join(".deps-stamp"), fingerprint).ok();
 }
 
 /// Drop the target directories the changed external deps invalidated.
@@ -252,14 +275,14 @@ fn invalidate_stale(root: &Path, lock: &mut buildlock::Held, targets: &[(PathBuf
             let fp = external_fingerprint(root);
             let work: Vec<(PathBuf, Clean)> = targets
                 .iter()
-                .filter(|(dir, _)| stale(dir, &fp))
+                .filter(|(dir, _)| stale(root, dir, &fp))
                 .cloned()
                 .collect();
             (!work.is_empty()).then_some((fp, work))
         },
         |(fp, work)| {
             for (dir, kind) in work {
-                clean(&dir, kind, &fp);
+                clean(root, &dir, kind, &fp);
             }
         },
     );
@@ -589,7 +612,8 @@ fn build_and_assemble(
                 ws_target.join(name)
             } else {
                 let crate_dir = cfg.crate_dir(root, name);
-                crate_dir.join(format!("target/x86_64-unknown-toyos/{PROFILE}/{name}"))
+                hostws::target_dir(root, &crate_dir)
+                    .join(format!("x86_64-unknown-toyos/{PROFILE}/{name}"))
             };
             let data =
                 fs::read(&binary).unwrap_or_else(|_| panic!("Failed to read binary for {name}"));

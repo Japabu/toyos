@@ -1,6 +1,7 @@
-[workspace]
-members = [".", "sim"]
-default-members = [".", "sim"]
+# This crate and `sim/` are two members of the host workspace (root
+# `Cargo.toml`), which is where both are listed. They used to be a workspace of
+# their own here; the set of host-tested crates is one list now, and it is that
+# one.
 
 [package]
 name = "toyos-xhci"

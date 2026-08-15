@@ -37,33 +37,31 @@ jobs:
           rustc -vV
           cargo -V
 
-      # Cold, this job is 594 s and all of it is compilation. A cache written
-      # on `main` is readable from every branch, which is the only reason this
-      # helps a branch's first run at all.
+      # Cold, this job is 398 s and all of it is compilation — 594 s before the
+      # host workspace, measured the same way, on the run that introduced it
+      # (the eighteen deleted member lockfiles moved `hashFiles`, so that run
+      # restored nothing and is a clean cold reading). The three steps below
+      # were 133 s, 184 s and 48 s of it. A cache written on `main` is readable
+      # from every branch, which is the only reason this helps a branch's first
+      # run at all.
       - uses: actions/cache@v4
         with:
+          # One `target` per workspace, which is all there is: a member builds
+          # into its workspace root's `target`, never its own. The sixteen
+          # per-crate entries that used to be here are directories that stopped
+          # existing when those crates joined the host workspace.
+          #
+          # `userland/sshd/target` was on this list and never existed at all —
+          # `sshd` and `calc` are both members of `userland/Cargo.toml`'s
+          # workspace, so their host builds land in `userland/target`, and the
+          # step below has been recompiling them from scratch every run. The
+          # gate in `src/hostws.rs` now reds on a path like that.
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
             target
-            toyos-sched/target
-            toyos-ps2/target
-            toyos-gpt/target
-            toyos-elf/target
-            toyos-cc/target
-            toyos-ld/target
-            toyos-hda/target
-            toyos-pci/target
-            toyos-xhci/target
-            toyos-desktop/target
-            toyos-keymap/target
-            kernel-loom/target
-            kernel-span/target
-            toyos-fat32/target
-            toyos-fat32-check/target
-            bcachefs/target
-            userland/sshd/target
+            userland/target
           key: host-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: host-${{ runner.os }}-
 
@@ -75,35 +73,35 @@ jobs:
           set -o pipefail
           cargo test --lib 2>&1 | tee -a /tmp/host.log
 
-      # Every crate in this repository with host tests. It used to be nine of
-      # the thirteen CLAUDE.md's layout names — the four that were missing
-      # (`toyos-elf`, `toyos-ld`, `toyos-pci`, `toyos-desktop`) are pure crates
-      # whose whole point is that a decision is testable without a guest, so a
-      # CI that skipped them skipped exactly the tests it was cheapest to run.
-      # `toyos-keymap` and `bcachefs` were that same omission a second time,
-      # found on 2026-08-14: 37 tests over dead-key composition, layout tables,
-      # layout detection and translation, and 71 over bcachefs, all of them
-      # reaching no gate in any workflow.
+      # Every host-tested crate, and **this step no longer holds the list of
+      # them** — root `Cargo.toml`'s `[workspace] members` does, and
+      # `--workspace` reads it from there.
       #
-      # **This list is longer than that layout table**, and deliberately: the
-      # two `kernel-*` harnesses compile a kernel source file for the host
-      # rather than being crates of their own (`kernel-span` for
-      # `mm/user_span.rs`, `kernel-elide` for `log/elide.rs`), and each says so
-      # in its own manifest. The list to keep current is this one — a harness
-      # that runs nowhere is the failure this file exists to prevent.
+      # That is the repair, not a tidy-up. This used to be a shell loop naming
+      # sixteen crates, and the same set was also the set of standalone
+      # workspace roots, so it was a list in two places. The two drifted three
+      # times: nine of thirteen until 2026-08-08 (`toyos-elf`, `toyos-ld`,
+      # `toyos-pci` and `toyos-desktop` missing — pure crates whose whole point
+      # is that a decision is testable without a guest, so a CI that skipped
+      # them skipped exactly the tests it was cheapest to run); `toyos-keymap`
+      # and `bcachefs` until 2026-08-14, 108 tests reaching no gate; and
+      # `toyos-abi` and `toyos-manifest`, 23 tests, which were named in no
+      # workflow at all until the workspace landed.
+      #
+      # `--exclude toyos-build` because the root package's integration test is
+      # the QEMU harness — `ci.yml` runs that, sharded, on Linux with a guest.
+      # `cargo test --lib` above is the root package's half that belongs here,
+      # and one of the gates it runs (`src/hostws.rs`) reds on a `Cargo.toml`
+      # in the tree that joined neither `members` nor `exclude`. So a crate
+      # added and forgotten is a red in this job rather than a silent gap in
+      # it, which is the property the loop could never have.
       - name: host crates
         run: |
           set -e -o pipefail
-          for crate in toyos-sched toyos-ps2 toyos-gpt toyos-elf toyos-cc \
-                       toyos-ld toyos-hda toyos-pci toyos-xhci toyos-desktop \
-                       toyos-keymap kernel-loom kernel-span kernel-elide \
-                       toyos-fat32 toyos-fat32-check bcachefs; do
-            echo "=== $crate" | tee -a /tmp/host.log
-            cargo test --manifest-path "$crate/Cargo.toml" 2>&1 | tee -a /tmp/host.log
-          done
+          cargo test --workspace --exclude toyos-build 2>&1 | tee -a /tmp/host.log
 
-      # **`kernel-loom`'s supported matrix is two commands, and the loop above
-      # is one of them.** The `loom` feature is default-on and is what makes the
+      # **`kernel-loom`'s supported matrix is two commands, and the `--workspace`
+      # step above is one of them.** The `loom` feature is default-on and is what makes the
       # crate's atomics loom's instrumented ones; `log_zeroed_init` is about
       # byte-zeroability, which loom's atomics do not have, and `log_body_words`
       # about a message wider than the one word `MSG_WORDS` is under loom. Both
@@ -145,6 +143,13 @@ jobs:
       # crate's host tests have to name the host. `calc` is here for the reason
       # the pure crates above are: its arithmetic is decided without a guest,
       # so a CI that skipped it would skip the cheapest tests it has.
+      #
+      # These two stay a loop, and cannot stop being one: that same
+      # `.cargo/config.toml` is why `userland` is *excluded* from the host
+      # workspace, and cargo refuses to merge an inherited `build.target` away.
+      # They are named in `userland/Cargo.toml`'s own workspace, so the pair
+      # here is a list in two places — a smaller instance of the defect above,
+      # left standing deliberately rather than papered over.
       - name: userland host crates
         run: |
           set -e -o pipefail
@@ -155,9 +160,12 @@ jobs:
               | tee -a /tmp/host.log
           done
 
-      # Nineteen `cargo test` invocations in three steps, and a red is one line
-      # somewhere among them; the summary names which crate and the first
-      # thing that failed in it.
+      # Four `cargo test` invocations in three steps, down from nineteen: the
+      # root package's `--lib`, one `--workspace` over the other twenty-one
+      # members, and the two userland crates. A red is still one line somewhere
+      # among them, and `--workspace` prints a `Running ...` line naming the
+      # binary rather than the `=== <crate>` the loop used to echo, so the
+      # summary matches both.
       - name: failure summary
         if: failure()
         run: |
@@ -165,7 +173,7 @@ jobs:
             echo "### host tests"
             echo ""
             echo '```'
-            grep -E '^(=== |error(\[|:)|test .* FAILED|failures:$|    [a-z_:]+$|test result: FAILED)' \
+            grep -E '^(=== |error(\[|:)|test .* FAILED|failures:$|    [a-z_:]+$|test result: FAILED| +Running )' \
               /tmp/host.log | tail -40 || echo "(nothing matched; read the log)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
