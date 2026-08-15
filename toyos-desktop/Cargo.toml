@@ -1,9 +1,9 @@
-# Its own workspace, like toyos-hda, toyos-keymap and toyos-ps2: `cargo test`
-# runs here on the host with no target-triple juggling, and the compositor
-# depends on it by path. Everything the desktop *decides* — where a window is,
-# what changed, what the pointer hit, who has the focus, what a key means — is
-# a pure function of state, and a QEMU boot is a poor way to ask any of them.
-[workspace]
+# A member of the host workspace (root `Cargo.toml`), like toyos-hda,
+# toyos-keymap and toyos-ps2: its tests run on the host with no target-triple
+# juggling, and the compositor depends on it by path. Everything the desktop
+# *decides* — where a window is, what changed, what the pointer hit, who has the
+# focus, what a key means — is a pure function of state, and a QEMU boot is a
+# poor way to ask any of them.
 
 [package]
 name = "toyos-desktop"
