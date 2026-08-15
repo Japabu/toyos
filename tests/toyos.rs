@@ -150,7 +150,7 @@ const ACTUATOR_TESTS: &[&str] = &[
     // Actions 12 and 13: hold one CPU's shootdown acknowledgement back, so that
     // whether the initiator waits becomes a duration userland can read.
     "tlb_shootdown_waits",
-    // Actions 14 to 16, the live-object census, and 17 and 18 for the idle
+    // Action 16, the live-object census per kind, and 17 and 18 for the idle
     // stack the deferred release path runs on. A leak is two readings and a
     // comparison, so on a kernel that answers `InvalidArgument` both readings
     // are the same error and the assertion passes having counted nothing.

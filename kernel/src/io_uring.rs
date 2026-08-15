@@ -106,16 +106,16 @@ impl Drop for RingRef {
 pub enum IoUringOp {
     Nop,
     PollAdd,
-    PollRemove,
     Accept,
 }
 
 impl IoUringOp {
     fn from_raw(raw: u8) -> Result<Self, SyscallError> {
+        // 2 is retired (`toyos_abi::io_uring`, formerly IORING_OP_POLL_REMOVE)
+        // and falls to the refusal like every other number nothing declares.
         match raw {
             0 => Ok(Self::Nop),
             1 => Ok(Self::PollAdd),
-            2 => Ok(Self::PollRemove),
             3 => Ok(Self::Accept),
             _ => Err(SyscallError::InvalidArgument),
         }
@@ -528,9 +528,6 @@ fn process_sqe(ring_id: RingId, sqe: &IoUringSqe) {
         IoUringOp::PollAdd => {
             process_poll_add(ring_id, sqe);
         }
-        IoUringOp::PollRemove => {
-            process_poll_remove(ring_id, sqe.user_data);
-        }
         IoUringOp::Accept => {
             process_accept(ring_id, sqe);
         }
@@ -618,19 +615,6 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
     drop(guard);
     if let Some(queue) = woken {
         wake_all(&queue);
-    }
-}
-
-fn process_poll_remove(ring_id: RingId, target_user_data: u64) {
-    let mut guard = IO_URINGS.lock();
-    let map = guard.as_mut().expect("io_uring not initialized");
-    if let Some(instance) = map.get_mut(ring_id) {
-        if let Some(pos) = instance.pending_polls.iter().position(|p| p.user_data == target_user_data) {
-            take_poll(instance, pos);
-            instance.post_cqe(target_user_data, 0, 0);
-        } else {
-            instance.post_cqe(target_user_data, -(SyscallError::NotFound as i32), 0);
-        }
     }
 }
 

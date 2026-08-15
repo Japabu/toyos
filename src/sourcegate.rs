@@ -16,6 +16,11 @@
 //! the history of what a name used to mean is worth keeping and the
 //! retired-syscall gravestone table names every one of them as a string on
 //! purpose.
+//!
+//! The third runs the same walk over [`RETIRED_ABI_NAMES`]: every syscall,
+//! `SYS_DEBUG` action and io_uring op code this project has deleted. Its
+//! *number* is what is retired, and a number is not a thing a scan can look
+//! for — the name that used to carry it is.
 
 use std::path::{Path, PathBuf};
 
@@ -126,6 +131,30 @@ const RETIRED_REGISTRY: &[&str] = &[
     "SYS_SOCKET_CREATE",
     "SharedToken",
     "services::connect",
+];
+
+/// Every other ABI name this project has retired: a deleted syscall, debug
+/// action or io_uring op code, whose *number* is retired with it and never
+/// reused (`CLAUDE.md`, "Syscall ABI").
+///
+/// The number is what the rule protects and a number cannot be scanned for —
+/// so the name is, and a name back in code is how a number gets reissued by
+/// accident. Retired numbers themselves are recorded where they can be read
+/// beside the live ones: the comments in `toyos-abi/src/syscall.rs` and
+/// `toyos-abi/src/io_uring.rs`, which this scan is blind to by construction
+/// because it strips comments.
+const RETIRED_ABI_NAMES: &[&str] = &[
+    // Syscall 107. Nothing called it; a region's mappings go with its last
+    // handle, so the handle is the whole of letting go.
+    "SYS_SHM_UNMAP",
+    // `SYS_DEBUG` actions 14 and 15. A total hides a leak of one kind behind
+    // churn in another, and a breakdown in the kernel log is a reading no guest
+    // test can see; every leak assertion in the estate is `CENSUS_KIND`.
+    "CENSUS_TOTAL",
+    "CENSUS_BREAKDOWN",
+    // io_uring op code 2. No submitter anywhere: this kernel's polls are
+    // one-shot and mio re-arms rather than cancels.
+    "IORING_OP_POLL_REMOVE",
 ];
 
 /// Everything this repository compiles into the guest.
@@ -361,6 +390,25 @@ mod tests {
         assert!(
             complaints.is_empty(),
             "the registry is deleted, and these still name it:\n  {}",
+            complaints.join("\n  "),
+        );
+    }
+
+    /// **A retired ABI number is never reused**, and the name is the only part
+    /// of it a scan can hold on to. A retired name back in guest-compiled code
+    /// is either the number coming back or a new call wearing a dead one's
+    /// identity, and the two are indistinguishable from the outside.
+    #[test]
+    fn a_retired_abi_name_is_gone_from_the_code() {
+        let mut complaints = Vec::new();
+        for needle in RETIRED_ABI_NAMES {
+            for at in named_in_code(needle) {
+                complaints.push(format!("{at}: names `{needle}`"));
+            }
+        }
+        assert!(
+            complaints.is_empty(),
+            "these names are retired and their numbers with them:\n  {}",
             complaints.join("\n  "),
         );
     }

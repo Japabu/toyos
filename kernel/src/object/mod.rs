@@ -259,12 +259,13 @@ macro_rules! kobject {
             )+
 
             /// `(type name, live count)`, in declaration order.
+            ///
+            /// Per kind and only per kind. The machine-wide sum this used to
+            /// offer beside it hid a leak of one kind behind ordinary churn in
+            /// another, and once every leak assertion in the estate was per
+            /// kind it had no reader left.
             pub fn live() -> impl Iterator<Item = (&'static str, u64)> {
                 [$((stringify!($variant), $variant.load(Ordering::Relaxed)),)+].into_iter()
-            }
-
-            pub fn total() -> u64 {
-                live().map(|(_, n)| n).sum()
             }
         }
     };

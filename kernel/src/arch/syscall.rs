@@ -653,7 +653,6 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_SHM_CREATE => sys_shm_create(a1),
         SYS_SHM_MAP => sys_shm_map(RawHandle(a1 as u32)),
-        SYS_SHM_UNMAP => sys_shm_unmap(RawHandle(a1 as u32)),
         SYS_PORT_CREATE => sys_port_create(),
         SYS_NAMESPACE_BUILD => {
             let Ok(args) = ctx.copy_in::<NamespaceBuild>(UserAddr::new(a1)) else {
@@ -758,20 +757,14 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // syscall and learn whether *its* free path shoots down.
             DA::TLB_ACK_DELAY_ARM => crate::arch::tlb::debug_arm_ack_delay(a2),
             DA::TLB_ACK_DELAY_DISARM => crate::arch::tlb::debug_disarm_ack_delay(),
-            // The two leaks this object model accepts — an `Arc` stranded on a
-            // killed thread's stack, and the cross-pair connection cycle — are
-            // visible in no other way, so the census needs a reader or it is a
-            // counter nothing ever reads.
-            DA::CENSUS_TOTAL => crate::object::census::total(),
-            DA::CENSUS_BREAKDOWN => {
-                for (kind, live) in crate::object::census::live() {
-                    log!("census: {kind} {live}");
-                }
-                0
-            }
-            // The same count for one kind. A total hides a leak of one kind
-            // behind churn in another, and six of the thirteen kinds had no
-            // census assertion anywhere in the estate.
+            // The live-object count for one kind. The two leaks this object
+            // model accepts — an `Arc` stranded on a killed thread's stack, and
+            // the cross-pair connection cycle — are visible in no other way, so
+            // the census needs a reader or it is a counter nothing ever reads.
+            //
+            // Per kind and not a total: a total hides a leak of one kind behind
+            // churn in another, and six of the thirteen kinds had no census
+            // assertion anywhere in the estate.
             //
             // The names are checked rather than the order assumed: this is the
             // one place two declarations of the same list meet, and an index
@@ -1919,24 +1912,6 @@ fn sys_shm_map(h: RawHandle) -> u64 {
         Ok(vaddr) => vaddr,
         Err(e) => e.to_u64(),
     }
-}
-
-/// Take this process's mapping away without giving the handle up.
-///
-/// A no-op where there is no mapping: unmapping something you are not looking
-/// at is not an error, and the caller has no way to know it was already gone.
-fn sys_shm_unmap(h: RawHandle) -> u64 {
-    let shm = match process::with_fd_owner_data(|data| {
-        data.handles.get::<crate::object::shm::SharedMemObject>(h, Rights::MAP)
-    }) {
-        Ok(shm) => shm,
-        Err(e) => return e.refuse(),
-    };
-    // The flush is `Unmapped`'s drop and it happens here, with nothing held:
-    // the address goes back to this process's allocator, so a sibling thread
-    // holding a stale entry would otherwise read whatever lands there next.
-    drop(shm.unmap_from(process::current_process()));
-    0
 }
 
 /// Move handles to the peer of a connection, all or nothing.

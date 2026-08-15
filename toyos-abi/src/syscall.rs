@@ -37,8 +37,8 @@ pub const SYS_GPU_PRESENT: u64 = 35;
 // Syscall numbers 36-39 unused (formerly SYS_ALLOC_SHARED, SYS_GRANT_SHARED,
 // SYS_MAP_SHARED and SYS_RELEASE_SHARED: a shared-memory token was an id
 // treated as a capability and the grant list was a pid ACL. A region is a
-// handle now — [`SYS_SHM_CREATE`], [`SYS_SHM_MAP`], [`SYS_SHM_UNMAP`] — and
-// giving one away is [`SYS_HANDLE_SEND`]).
+// handle now — [`SYS_SHM_CREATE`] and [`SYS_SHM_MAP`] — and giving one away is
+// [`SYS_HANDLE_SEND`]).
 pub const SYS_THREAD_SPAWN: u64 = 40;
 pub const SYS_THREAD_JOIN: u64 = 41;
 pub const SYS_CLOCK_REALTIME: u64 = 42;
@@ -179,8 +179,13 @@ pub const SYS_SHM_CREATE: u64 = 105;
 /// Map a region into the caller. Idempotent: a second call answers the first
 /// call's address. See [`shm_map`].
 pub const SYS_SHM_MAP: u64 = 106;
-/// Unmap a region from the caller. See [`shm_unmap`].
-pub const SYS_SHM_UNMAP: u64 = 107;
+// Syscall number 107 is retired and unused: it was SYS_SHM_UNMAP, which took a
+// process's mapping away while it kept the handle. It had no caller anywhere —
+// not in the SDK, not in userland, not in a test. A region's mappings go with
+// its last handle (`ZeroHandles for SharedMemObject`), so letting the handle go
+// is the whole of letting the mapping go, and unmapping behind a handle its
+// holder still has was a second spelling of the same event that the two could
+// disagree about.
 
 /// Wait for the process a handle names and take its exit code, gated by
 /// [`Rights::WAIT`]. See [`process_wait`].
@@ -705,12 +710,17 @@ pub mod debug_action {
     /// and take it away again.
     pub const TLB_ACK_DELAY_ARM: u64 = 12;
     pub const TLB_ACK_DELAY_DISARM: u64 = 13;
-    /// How many kernel objects are alive right now, machine-wide.
-    pub const CENSUS_TOTAL: u64 = 14;
-    /// The same, per kind, into the kernel log.
-    pub const CENSUS_BREAKDOWN: u64 = 15;
-    /// The same for one [`OBJECT_KINDS`](super::OBJECT_KINDS) index, which is
-    /// the argument. The one a guest test can assert on.
+    // Actions 14 and 15 are retired and unused: they were CENSUS_TOTAL and
+    // CENSUS_BREAKDOWN. A total hides a leak of one kind behind churn in
+    // another, and a breakdown written into the kernel log is a reading no
+    // guest test can see — so every leak assertion in the estate is
+    // `CENSUS_KIND`, and neither of the two had a caller left.
+    /// How many kernel objects of one kind are alive right now. The argument is
+    /// an [`OBJECT_KINDS`](super::OBJECT_KINDS) index.
+    ///
+    /// **Per kind and not a total**, because a total is what every leak
+    /// assertion in the estate used to be against: an object of one kind that
+    /// is never released is invisible behind ordinary churn in another.
     pub const CENSUS_KIND: u64 = 16;
     /// The deepest any CPU's idle stack has been this boot, in bytes.
     ///
@@ -1399,13 +1409,6 @@ pub unsafe fn shm_map(shm: RawHandle) -> Result<*mut u8, SyscallError> {
         .map(|addr| core::ptr::with_exposed_provenance_mut(addr as usize))
 }
 
-/// Unmap the region `shm` names from this process. Needs [`Rights::MAP`].
-///
-/// [`Rights::MAP`]: crate::handle::Rights::MAP
-pub fn shm_unmap(shm: RawHandle) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_SHM_UNMAP, shm.0 as u64, 0, 0, 0))
-}
-
 /// Query system information (memory, CPUs, processes).
 /// Returns the number of bytes written to `buf`.
 pub fn sysinfo(buf: &mut [u8]) -> usize {
@@ -1557,9 +1560,30 @@ pub fn cpu_count() -> u32 {
 
 /// Map anonymous memory. Returns pointer on success, null on failure.
 ///
-/// If `addr` is non-null and `flags` includes `MmapFlags::FIXED`, the mapping
-/// is placed at exactly that address (must be 2MB-aligned).
-/// If `addr` is null, the kernel chooses the address.
+/// If `addr` is null, the kernel chooses the address — and so it does for
+/// `MmapFlags::FIXED` with a null `addr`, which asks for a placement and names
+/// none. With `FIXED` and a non-null `addr` the mapping is placed at exactly
+/// that address, which must be 2 MiB-aligned and must name a range lying whole
+/// inside the region the kernel's own placement search allocates from.
+///
+/// **A placed mapping answers for the range it names**, because it takes the
+/// question `find_gap` answers by construction for every other mapping:
+///
+/// - Over free space it maps, and the call answers `addr`.
+/// - Over exactly one whole mapping this process's own `mmap` made — the same
+///   address and the same 2 MiB-rounded size — it replaces it, and the address
+///   keeps its meaning while changing what it names. The old range leaves the
+///   address space and the process's mapping list before the new one enters
+///   either, its pages go back to the allocator, and the shootdown a sibling
+///   thread's stale translation owes is done before the call returns.
+/// - Anything else is refused with `InvalidArgument` having created, replaced
+///   or unmapped nothing: part of a region, several regions, a region that
+///   merely starts at `addr`, and any whole range this process's `mmap` did
+///   not make — an ELF segment, a library image, a stack, a shared window.
+///
+/// POSIX unmaps whatever is in the way and says nothing. This address crossed
+/// the trust boundary like any other syscall argument, and a kernel that
+/// silently took a range it was not offered would be taking it from the loader.
 ///
 /// # Safety
 /// Caller is responsible for managing the returned memory region.
