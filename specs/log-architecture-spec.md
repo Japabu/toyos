@@ -348,10 +348,12 @@ state, which is `Drain::Thread`, and no boot-time instrument can see its
 removal.**
 
 **What it buys is the thing §4.1's second constraint asks for**, and that is
-measured too: a machine wedged in phase 3 puts 61 kernel lines on the console
-where it previously put none (§9.5's `pre_idle_wedge_speaks`). The trade was
-taken with the number in hand: 4.4 ms of boot against the tree's worst
-diagnostic hole. `Drain::Inline` is gated on `has_console()`, so a machine that
+measured too: a machine wedged in phase 3 puts **63** kernel lines on the
+console where it previously put none (§9.5's `pre_idle_wedge_speaks`,
+re-measured 2026-08-15 on this branch's tip, 63 on three consecutive runs; it
+read 61 when the A/B above was taken and the boot has gained two lines since).
+The trade was taken with the number in hand: 4.4 ms of boot against the tree's
+worst diagnostic hole. `Drain::Inline` is gated on `has_console()`, so a machine that
 cannot speak — the T14 as flashed — pays none of it.
 
 ---
@@ -1588,11 +1590,24 @@ for the wake, so there is no second flag to disagree with the first.
 less", the entry's own wording — because every record reaches the wire as it is
 written, for the whole boot. Its cost is the boot log at backend speed during
 boot: nothing on the T14 (`has_console()` is false, so the mode is a branch and
-the records wait in their shards), nothing measurable under QEMU, and on a
-machine with a real 115200-baud UART the boot log's ~40 KB at ~87 µs/byte would
-be seconds. **`Drain::Inline` is gated on `has_console()` as built** — not as a
-cost measure but because a record must not be marked spoken when nothing could
-carry it — and §1.4's A/B is what says the mode is free on this instrument.
+the records wait in their shards), **+4.4 ms under QEMU** (§1.4a, measured
+2026-08-15 on metal-sim, distributions not overlapping on either machine shape),
+and on a machine with a real 115200-baud UART the boot log's ~40 KB at ~87
+µs/byte would be seconds. **`Drain::Inline` is gated on `has_console()` as
+built** — not as a cost measure but because a record must not be marked spoken
+when nothing could carry it.
+
+**This paragraph said "nothing measurable under QEMU" and cited §1.4's A/B as
+saying the mode is free on this instrument, and both were wrong.** §1.4's A/B is
+L1's: it compares a tree with the record ring added *behind* the byte ring
+against `main`, so its arms differ by the shard's reserve-and-commit and by
+nothing else — there is no `Drain::Inline` in either of them. It is evidence
+about the ring and can never be cited about the mode. §1.4a is the mode's own
+measurement and it is a cost, for the reason §1.4a gives: the boot swaps
+`RingGuard`'s CAS for `BackendGuard`'s one for one and *adds* the synchronous
+backend write the ring existed to defer. The trade was taken with the number in
+hand — 4.4 ms of boot against 63 kernel lines from a machine that never reaches
+a scheduler pass (§9.5) — and it is a trade rather than a wash.
 
 **Three things about the mode as built.**
 
@@ -2697,8 +2712,11 @@ existing. Named rather than discovered at compl's C14.
   does not bring up until phase 6, so on that shape a phase-3 wedge has nowhere
   to put a byte and the records wait for a backend that never arrives. metal-sim
   keeps a 16550 that is up from the second statement of `kernel_main`, and it is
-  the shape that gets flashed. **Measured 2026-08-15: 61 kernel lines reached
-  the console from a machine that never reached a scheduler pass.**
+  the shape that gets flashed. **Measured 2026-08-15 on the branch tip: 63
+  kernel lines reached the console from a machine that never reached a scheduler
+  pass**, the same on three consecutive runs. The test prints the count and does
+  not assert on it, so the figure is re-read rather than re-derived; it read 61
+  when §1.4a's A/B was taken and the boot has gained two lines since.
 - **`logd_gone`** — kill logd; the machine survives, `init: logd exited` reaches
   the console, kernel records keep arriving, a client that keeps printing does
   not die, and `Serial::interleaved().is_none()` on the capture.
@@ -2735,7 +2753,17 @@ existing. Named rather than discovered at compl's C14.
 - **The boot A/B on the per-record CAS** (§1.4), `xhci_slow_connect`'s
   `Boot: complete` as the instrument, interleaved, on the source and never on an
   instrumented build — that issue's own second lesson. L1.
-- **`Drain::Inline`'s cost on a real UART** (§4.2). L3.
+- **`Drain::Inline`'s cost on a real UART** (§4.2). **Re-scoped 2026-08-15 and
+  it is not L3's**: the instrument does not exist in this tree. The cost is a
+  115200-baud port writing every boot record synchronously, and QEMU's 16550
+  answers instantly — the only thing a guest can measure is §1.4a's +4.4 ms,
+  which is the metal-sim UART and is already recorded there. **It moves to the
+  metal session checklist**, `specs/plans/metal-boot-plan.md` item 2, which also
+  records why that closes only half of it: the T14 has no SuperIO, so what a
+  metal session can establish is the *other* claim in §4.2 — that a machine
+  with `has_console()` false pays nothing — and the baud-rate arm waits for a
+  machine with a port. §4.2's "would be seconds" is arithmetic and is labelled
+  as arithmetic.
 - **The RMW budget**, counted rather than asserted, and **counted per mode**
   because the two differ:
   - `Drain::Thread` (everything after `scheduler::init`): loses one
@@ -2762,6 +2790,65 @@ existing. Named rather than discovered at compl's C14.
   instrument as §1.4's — `xhci_slow_connect`'s `Boot: complete`, interleaved —
   because it arrives with the wake and not with the ring, and it is separable
   behind a `#[cfg]` if that chunk moves the number.
+
+  **RUN, 2026-08-15, and the fence is free.** Interleaved A/B in one session,
+  five reps per arm alternating, `xhci_slow_connect`'s own `Boot: complete` as
+  the instrument; the arms are the tip and the tip with `shard.rs`'s two
+  `SeqCst` fences removed (the `wake-fence-off` `cfg` replaced by `any()`, so
+  the harness's declared-build gate still sees the ordinary kernel), restored
+  before commit.
+
+  | arm | reps | mean |
+  |---|---|---|
+  | both fences (shipping) | 491, 494, 494, 494, 495 | **493.6 ms** |
+  | both fences removed | 494, 495, 495, 496, 494 | **494.8 ms** |
+
+  The distributions overlap almost entirely and the sign is the wrong way round
+  for a cost — removing the fences read 1.2 ms *slower*. So the fence is free at
+  this instrument's resolution and there is nothing for the `#[cfg]` this
+  paragraph reserved to separate. **The instrument itself is what had to be
+  built to close this**: `xhci_slow_connect` reached its boot stamp only through
+  the per-run UART file, which the harness deletes with the guest, so the test
+  now prints it (`tests/common/usb.rs`) — one line of output, `i8042_absent`'s
+  arrangement, and nothing about the guest is instrumented.
+- **What bounding `write_console`'s interrupts-off window costs** (§8.1, L3's
+  review finding F1). **MEASURED 2026-08-15** on the tree's own audio/latency
+  instrument, gate A's `max_wake_lat_us` — soundd waking later than a DMA
+  completion it armed a timer on. Interleaved A/B in one session, arms
+  alternating, the tip's single acquisition against the `MAX_CONSOLE_LINE`
+  chunking, `µs`:
+
+  | config | arm | n | median | mean | worst |
+  |---|---|---|---|---|---|
+  | `audio_tone` smp=1 | tip | 10 | 9,518 | 9,338 | 12,210 |
+  | | bounded | 10 | **8,165** | **7,892** | **10,456** |
+  | `audio_tone` smp=8 | tip | 10 | 7,150 | 7,198 | 9,643 |
+  | | bounded | 10 | 7,070 | 7,735 | 11,173 |
+  | `audio_tone_load` smp=1 | tip | 15 | 6,102 | 6,195 | 6,617 |
+  | | bounded | 15 | 6,256 | 6,585 | 11,852 |
+  | `audio_tone_load` smp=8 | tip | 15 | 5,865 | 6,757 | 20,856 |
+  | | bounded | 15 | 5,707 | 8,858 | 30,560 |
+
+  **What it says is "no regression", and it is honest about not saying more.**
+  Only `audio_tone` smp=1 moves at all — 14% down on the median and 15% on the
+  mean, with the distributions still overlapping — and the two `_load` configs
+  put a 20–30 ms outlier in *both* arms, which is that config's own tail and not
+  the change's. Nothing regresses. **And gate A cannot see the property that
+  actually changed**, which is stated rather than implied: every line these
+  guests write is far under `MAX_CONSOLE_LINE`, so it takes exactly one
+  acquisition on both arms. What the fix removes is an interrupts-off window
+  whose length was a userland argument, and no workload that writes ordinary
+  lines can exhibit it — the argument in §8.1 is what carries that, and the
+  measurement's job is to show the re-acquisitions cost nothing.
+- **The `--slow-usb` A/B, unmoved** (§10's L3 gate column, §9.3's first
+  reading). **RUN 2026-08-15**, five reps on the branch tip: `audio_tone` smp=1
+  under `--slow-usb` reads 165,212 / 164,377 / 166,219 / 164,564 / 161,366 µs,
+  **mean 164,348 µs**, against the 165,948 µs §9.3 records — unmoved, as that
+  column requires, because nothing about the disk has changed. The ordinary
+  stick on the same tree in the same session is 7,892 µs (the table above), so
+  the slow-stick penalty is **20.8x** here against the 23.3x §9.3's pair of
+  figures gives; the two absolute controls come from different trees and
+  different sessions and the ratio is the comparable quantity.
 - **`LOG_FILE_DRAIN_NANOS` re-derived** against a userland writer under
   `usb-slow-device` (§6.4). L6.
 
@@ -2788,7 +2875,7 @@ rebase, never amend.
 | **L-ABI** | **its own branch off `main`, landed before L1** (§11). `toyos-abi/src/log.rs` — `LogRecord`, `Level`, `LogCursor` with its clamped `durable`, `MAX_LOG_SHARDS`, the two layout `const` assertions and the `Display` of §3.3; `SYS_LOG_READ = 114`; `Rights::LOG`; the `toyos` SDK wrapper. **No kernel dispatch**: there is no shard to read until L1, so the number falls to the dispatch's default and answers `InvalidArgument`, which is what an unassigned number answers | `cargo test` in `toyos-abi/`: the layout asserts, and the `Display` rendering a known record byte for byte |
 | **L1** | `kernel/src/log/`: `Slot` over L-ABI's `LogRecord` and `Level`, `Shard`, `emit` with §2.3a's bracket, `log!`/`alert!`/`boot_phase!`, the seven `alert!` conversions **carrying the level with their text unchanged** (below). Wired **behind** the existing byte ring — every `emit` also does today's `write_chunk`, so nothing observable changes. The AP shard in `alloc_percpu` (§2.2) | `kernel-loom/tests/log_record.rs` (W1, W2, W4); host-fast `log_zeroed_init`; the full suite indistinguishable from `main`'s; the boot A/B of §9.6. W2b's CPU-flags negative arrives with `log_nested_emit` at L4 |
 | **L2** | `snapshot_committed`; `panic_console`, `boot_checkpoint` and `sched::dump` re-pointed at records and at `Level`; **the `!!!` sentinel deleted from the seven `alert!` texts and from the ~20 assertions that read it**; the `KernelArgs` `{:?}` site split into several records; `Mark` → a pair of instants; the backtrace producer's head-and-tail elision (§2.1a), and `nmi_does_not_log`'s two clauses with it | `screen_panic_muted`, `screen_fatal_halt`, `screen_fatal_halt_composited`, `blocked_dump`, `screen_blocked_dump`, `dump_nmi_probe`, `screen_console_*` all green; `screen_late_panic`, whose stimulus is a symbol wider than any grid — **it gates the panel keeping a tail and not the elision**, which is `kernel-elide`'s nine host tests |
-| **L3** | `drain_ordered`, with the first caller that streams; `Drain::{Inline,Thread}`; **the kernel-thread machinery for one thread** (§4.3) — trampoline, kernel-address-space `ProcessObject`, `driver::spawn`, dump naming, the recoverable-panic predicate with `klogd`'s non-recoverable row; `klogd`'s body and §2.6a's wake (`signal_after_commit`/`arm_waiter`, the IRQ-off `PreemptGuard` witness, `wake_direct`, the park-lot park); `panic_flush`/`flush_final` on records; `log_file::poll` re-pointed at a `drain_ordered` cursor so the file sink survives; **`object/ops.rs:469`'s console arm re-pointed straight at `BackendGuard`** (§8.1) so the chunk builds. **Delete `log_ring.rs` whole**, `SerialWriter`, `drain_serial` and the idle loop's serial statement; **delete the `:523` pre-`hlt` condition** | `kernel-loom/tests/log_wake.rs` (W3, with its negative case); `pre_idle_wedge_speaks`; the `--slow-usb` A/B unmoved (nothing about the disk has changed yet); §9.6's `Drain::Inline` measurement and the fence's A/B |
+| **L3** | `drain_ordered`, with the first caller that streams; `Drain::{Inline,Thread}`; **the kernel-thread machinery for one thread** (§4.3) — trampoline, kernel-address-space `ProcessObject`, `driver::spawn`, dump naming, the recoverable-panic predicate with `klogd`'s non-recoverable row; `klogd`'s body and §2.6a's wake (`signal_after_commit`/`arm_waiter`, the IRQ-off `PreemptGuard` witness, `wake_direct`, the park-lot park); `panic_flush`/`flush_final` on records; `log_file::poll` re-pointed at a `drain_ordered` cursor so the file sink survives; **`object/ops.rs:469`'s console arm re-pointed straight at `BackendGuard`** (§8.1) so the chunk builds. **Delete `log_ring.rs` whole**, `SerialWriter`, `drain_serial` and the idle loop's serial statement; **delete the `:523` pre-`hlt` condition** | `kernel-loom/tests/log_wake.rs` (W3, with its negative case); `pre_idle_wedge_speaks`; the `--slow-usb` A/B unmoved (nothing about the disk has changed yet); the fence's A/B. **All three run and recorded in §9.6, 2026-08-15**; the fourth this column used to name, §9.6's `Drain::Inline` measurement, is not L3's and not this tree's — §9.6 says where it went |
 | **L4** | the kernel's half of L-ABI, which touches no sysroot source: the `SYS_LOG_READ` dispatch over `drain_ordered`, `Source::Log` and its watcher static (§3.2), `logread` in `toyos_manifest`'s `SYSCAP_RIGHTS` and on `test-runner`'s row in the six test configs that have one | `test-runner` reads its own kernel log and §9.1's conservation law holds across the syscall |
 | **L5** | one `ConsoleObject` per endowment over one backend, its line buffer, `Console` losing `DUP`; the ANSI strip moves; `MAX_CONSOLE_LINE` | `console_line_atomicity`; `console-unbuffered` reds both its clauses; `one_console_holder` |
 | **L6** | `/bin/logd`: the program, **its row in all eleven manifests** (§5.1a) including `diag/`'s and its restated comment, the protocol, rotation, retention, per-client backlog, the give-up policy on today's live 2 s transport bound (§5.4); **`SYS_FSYNC`'s device flush, outright — there is no C12 to hand it to (§12.4)**. **Delete `log_file.rs` whole**, `flush_log_file_if_affordable` and everything in §8.1's `driver.rs` list; `wait_for_log_file` re-pointed at `LOG_DURABLE_NS`, **including `apic.rs:146`'s comment and its kick loop, which name the idle loop's `log_file::poll`**; §6.3's shutdown | `kernel_log_file` re-pointed and green mid-run and after shutdown; `log_is_durable_after_fsync`; `screen_fatal_halt_composited`'s `/log` half green; `logd_gone`; `shutdown_last_line`; `idle_loop_is_the_declared_body`; `log-writes-the-file` and `log-trusts-durable` red |

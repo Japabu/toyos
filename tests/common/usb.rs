@@ -1245,16 +1245,34 @@ pub fn xhci_slow_connect(
         return Err(format!("the guest did not report a clean pass\n{log}"));
     }
     verify(&image, bytes, nonce)?;
-    if !log.contains("Boot: complete") {
+    // The guest's own boot stamp, printed rather than asserted on.
+    //
+    // **This is `specs/log-architecture-spec.md` §1.4's and §9.6's named
+    // instrument, and until 2026-08-15 it could not be read off the test that
+    // *is* it.** Both sections ask for an interleaved A/B of a producer-path
+    // cost against this boot's `Boot: complete`, and the stamp reached only the
+    // per-run UART file, which goes when the guest does. So the measurement had
+    // to instrument something — and the lesson
+    // `specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md` leaves is that
+    // the reading taken on an instrumented build is the one that misleads. One
+    // line of output, `i8042_absent`'s arrangement, and the obligation is
+    // re-runnable by anybody. It decides nothing: what is asserted is that the
+    // boot finished, which is the `else` below.
+    let Some(boot_ms) = log
+        .split("Boot: complete (")
+        .nth(1)
+        .and_then(|rest| rest.split("ms)").next())
+    else {
         return Err(format!("the boot did not finish\n{log}"));
-    }
+    };
+    let boot_ms = boot_ms.to_string();
     serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
     let _ = std::fs::remove_file(&image);
 
     eprintln!(
         "  [usb] controller started at {started:.3} s and the ports read empty to \
          {HELD_EMPTY_S} s; first port named at {first_seen:.3} s, both sticks bound, host bytes \
-         verified host-side"
+         verified host-side; Boot: complete at {boot_ms} ms"
     );
     Ok(())
 }
