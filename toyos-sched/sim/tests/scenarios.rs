@@ -1,21 +1,67 @@
-//! The Stage 4 gate (spec §11).
+//! The scheduler harness's exit criterion, and the register of what proves it
+//! has teeth.
 //!
-//! The exit criterion is two claims, and the second is worth nothing without
-//! the first:
+//! The criterion is two claims, and the second is worth nothing without the
+//! first:
 //!
-//! 1. **`old_steal_port` fails.** A deliberate port of the OLD scheduler's
-//!    steal-and-scan algorithm must be caught. A harness that has never
-//!    rejected the bug class it was written for is decoration, so this test
-//!    asserts the failure, and asserts it is the *right* failure.
+//! 1. **Every negative gate fails**, and fails for the *right* reason. A
+//!    harness that has never rejected the bug class it was written for is
+//!    decoration.
 //! 2. **Every scenario passes**, over a seed sweep and a fuzz-byte sweep.
 //!
+//! # The nine negative gates, and the two controls
+//!
+//! Each is a `scenarios::` constructor that *is* a broken scheduler, and each
+//! has a `#[test]` below asserting both that it is caught and which invariant
+//! catches it. That second column is the point: a gate caught by the wrong
+//! check says nothing about the one it was written for.
+//!
+//! | gate | breaks | caught by |
+//! |---|---|---|
+//! | `old_steal_port` | the old steal-and-scan algorithm | I1 **and** I8 |
+//! | `old_commit_before_pass` | the pre-`8508b37` blocking shape | I1, on every seed |
+//! | `old_preemptible_window` | preemption left on in the registration window | an abort inside `check_cpu` |
+//! | `old_migrate_kept_the_corpse` | the balance path handing on a killed task | I14 |
+//! | `old_park_kept_the_lend` | commit `9c2fc4d`'s park keeping a lapsed lend | I9 |
+//! | `fair_share_per_thread` | one fair share per thread, not per process | I5, and nothing else |
+//! | `fair_double_charge` | a share charged twice for what it runs | I5, in the opposite direction |
+//! | `fair_identity_within_share` | the lowest-keyed sibling served, not the earliest-inserted | I13, and nothing else |
+//! | `overlong_pass` | a pass costing five times its budget | an abort inside `check_pass_duration` |
+//!
+//! The controls are `old_commit_fused` and `fair_identity_tiebreak`, and both
+//! must come back **clean**. They are what make two of those gates measurements
+//! rather than guesses about which break was needed: the first is the same
+//! blocking bug with no step boundary to expose it, which is the blind spot
+//! this harness used to have; the second is the tie-break `queue.rs` warns
+//! about, ported literally and invisible to I13 — which is why the gate beside
+//! it had to be the stronger `fair_identity_within_share`.
+//!
+//! # The liveness gates, which are a different claim
+//!
+//! Three checks below are not negative gates. They guard the third failure
+//! shape in `specs/README.md`'s method — a gate that goes *quiet* rather than
+//! red — by asserting that an invariant had a comparison open for a recorded
+//! fraction of the run: `the_fairness_storm_is_measured_and_holds` for I5,
+//! `invariant_i13_is_measured_and_holds` for I13, and
+//! `a_retire_completes_inside_its_derived_bound` for I14, which requires some
+//! retire to have outlived the instant it was posted in. A change that closes
+//! those windows is then as loud as one that violates them.
+//!
+//! # Running it
+//!
 //! The budgets here are what a `cargo test` can afford. The full criterion —
-//! 10⁴ seeds and 10⁷ fuzz steps per scenario class — runs from the CLI:
+//! 10⁴ seeds and 10⁷ fuzz steps per scenario class — runs from the CLI, where
+//! `gate` carries all nine gates and both controls:
 //!
 //! ```text
 //! cargo run --release -p toyos-sched-sim -- gate 10000
 //! cargo run --release -p toyos-sched-sim -- fuzz-sweep 10000000
 //! ```
+//!
+//! The on-target half is `sched_check_build` (`tests/toyos.rs`), which boots a
+//! kernel carrying the same `feature = "check"` asserts. `overlong_pass` proves
+//! the pass budget's assert compiles and fires against a *modelled* cost; only
+//! a booted kernel reads a TSC.
 
 use std::collections::BTreeMap;
 
@@ -79,7 +125,7 @@ fn every_scenario_survives_raw_fuzz_bytes() {
     );
 }
 
-/// The self-validation gate. Both failure modes the old algorithm has are
+/// The first self-validation gate. Both failure modes the old algorithm has are
 /// required to show up, because they are different bugs wearing one name:
 ///
 /// * **I1** — the task is in no container at all (carried on the thief's
@@ -714,7 +760,7 @@ fn a_pass_that_overruns_its_budget_is_caught() {
     assert!(free.passed(), "{}", free.report());
 }
 
-/// The fourth self-validation gate, and the newest: invariant I9's teeth.
+/// The ninth self-validation gate, and the newest: invariant I9's teeth.
 ///
 /// I9 says one lend buys at most one quantum of running time at the borrowed
 /// priority. Commit `9c2fc4d` shipped a park that cleared the window only
