@@ -112,15 +112,18 @@ pub fn local_now() -> Wall {
         }
         let lsod =
             local.hours as u64 * 3_600 + local.minutes as u64 * 60 + local.seconds as u64;
+        // **Two answers and not three.** There used to be a `Recovery::NoZone`
+        // arm here for "past UTC+14 going east and past UTC−12 going west at
+        // once", called the middle of the band — and the band has no middle,
+        // because the band *is* where the two ranges overlap. Their widths sum
+        // to 26 hours against a day's 24, so every second of the day is placed
+        // by one of the two arms below; `toyos_wallclock`'s `const` assertion
+        // is the proof and its whole-domain test is the measurement.
         return match resolve(after, lsod) {
             Recovery::Offset(offset_secs) => {
                 Wall::Local { secs: after.saturating_add_signed(offset_secs), offset_secs }
             }
             Recovery::Ambiguous { east, west } => Wall::Ambiguous { east, west },
-            // Past UTC+14 going east and past UTC−12 going west at once: the
-            // middle of the band, which is not a place. A clock reporting it is
-            // a clock reporting nonsense, and nonsense is not a date.
-            Recovery::NoZone => Wall::Unknown,
         };
     }
     // Three brackets in a row that would not close is a clock this program

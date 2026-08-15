@@ -202,12 +202,13 @@ pub fn durable_ns() -> u64 {
     DURABLE_NS.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Is there a committed record newer than anything `/bin/logd` has made
-/// durable?
-///
-/// The predicate both waits are written against, in one place because they are
-/// one question asked by two callers: the panic path before the halt IPI, and
-/// `SYS_SHUTDOWN` before the power goes.
-pub fn owed() -> bool {
-    super::read::newest_committed_at_ns() > durable_ns()
-}
+// **There was a `pub fn owed() -> bool` here and it is deleted rather than
+// wired up.** Its doc called it "the predicate both waits are written against,
+// in one place", and neither wait called it: `apic::owed` and
+// `log::wait_for_durable` each snapshot `newest_committed_at_ns()` *once*, as
+// `want`, and then wait for `durable_ns()` to reach that. This one re-read the
+// newest record on every call, which is a different question and a worse one —
+// a machine still committing records while it shuts down would never satisfy
+// it, so calling it from either site would have turned a bounded wait into one
+// that always pays its whole ceiling. Dead code with a claim in it about two
+// callers it did not have.

@@ -231,6 +231,20 @@ pub fn close(
 /// a pipe end, a connection, a port and a device claim each go away with their
 /// last handle, and a claim admits exactly one handle by construction, so
 /// "every ring watching it" is the one holder's.
+///
+/// **That argument is about the object and the condition it needs is about the
+/// source, which is not the same thing — and one `true` row does not meet it.**
+/// What makes cancelling safe is that no *other kind* of object names the same
+/// [`Source`]. A `Device(Keyboard)` claim names [`Source::Keyboard`], and so
+/// does every `Console` (see `read_source`), so the claim's holder closing its
+/// handle cancels every pending poll on stdin in the machine — which is what
+/// libc's terminal read arms — with `-NotFound`. That is a live
+/// cross-cancellation on this tree and not a hypothetical; what keeps it quiet
+/// is that the compositor takes the keyboard claim at boot and holds it until
+/// the machine stops, so nothing closes one first. It is stated here as the
+/// residual of this function rather than as a property it has, and it is filed
+/// rather than fixed on this branch — the fix is on the keyboard side, where a
+/// source would have to name its object the way a pipe's already does.
 fn ends_its_sources(object: &KObjectRef) -> bool {
     match object {
         KObjectRef::PipeRead(_)

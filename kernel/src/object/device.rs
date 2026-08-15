@@ -210,9 +210,26 @@ pub struct ConsoleObject {
     pub(super) core: ObjectCore,
     /// Bytes written but not yet ended by a newline.
     ///
-    /// A leaf lock: the only things that take it are this type's `write` — from
-    /// `ops::try_write`, under the process's own lock — and its `Drop`, which
-    /// runs where the last handle did. Nothing it calls takes another.
+    /// **Not a leaf, and this comment used to say it was.** `ConsoleLine::write`
+    /// flushes every whole line it completes, and `Stripped::flush` takes
+    /// `serial::BackendGuard` — so the backend's spinlock is held *underneath*
+    /// this one, once per line, for as long as the device write takes.
+    ///
+    /// The order is **`fd_owner_data` → `line` → `BackendGuard`**, and it is
+    /// consistent because nothing takes those three in any other order:
+    ///
+    /// - Only two things take `line`: this type's `write`, reached from
+    ///   `ops::try_write` under the writing process's own `fd_owner_data`, and
+    ///   its `Drop`, which runs where the last handle did — also under that
+    ///   lock, and holding nothing below it yet.
+    /// - Nothing that holds `BackendGuard` takes `line` or `fd_owner_data`. The
+    ///   other three producers write the *backend* and never an object:
+    ///   `klogd`'s drain, `panic_flush`/`flush_final`, and the input path. That
+    ///   is §4.1's split, and it is what makes a console object something a
+    ///   dying machine does not need.
+    /// - `BackendGuard` is `cli` plus a global spin, so what is bounded under it
+    ///   is one `MAX_CONSOLE_LINE` and never a userland length — the reason
+    ///   `ConsoleLine` cuts a long line into pieces at all.
     line: crate::sync::Lock<crate::drivers::serial::ConsoleLine>,
 }
 

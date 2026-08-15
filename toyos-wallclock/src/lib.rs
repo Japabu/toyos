@@ -147,10 +147,20 @@ pub enum Recovery {
     /// Two real zones a day apart, both consistent with the readings. Seconds
     /// east of UTC, so a caller reporting the refusal can name them.
     Ambiguous { east: i64, west: i64 },
-    /// An offset no zone has — past UTC+14 going east and past UTC−12 going
-    /// west at once, which is the middle of the band and not a place.
-    NoZone,
 }
+
+/// **There is no third answer, and this is the proof of it.**
+///
+/// [`Recovery`] used to carry a `NoZone` for "past UTC+14 going east and past
+/// UTC−12 going west at once", described as *the middle of the band*. The band
+/// has no middle: it **is** the overlap of the two ranges. Their widths sum to
+/// 26 hours against a day's 24, so every one of the 86,400 offsets is
+/// east-real, or west-real, or both — and the variant stood for a state the
+/// arithmetic cannot reach, which every caller then had to write an arm for.
+/// `every_offset_of_the_day_is_placed` is the empirical half, over the whole
+/// domain rather than over examples; this is the half that holds at compile
+/// time and fails the build if either bound is ever narrowed.
+const _: () = assert!(MAX_EAST_SECS + MAX_WEST_SECS >= DAY);
 
 /// Recover the local zone's offset from a UTC instant and a local time of day.
 ///
@@ -169,11 +179,14 @@ pub fn resolve(epoch: u64, local_secs_of_day: u64) -> Recovery {
     let east_real = off <= MAX_EAST_SECS;
     let west_real = DAY - off <= MAX_WEST_SECS;
 
+    // `(false, false)` is not written because it cannot be produced — the
+    // `const` assertion above the enum is the argument — so `(false, _)` is
+    // exactly "west and only west" and says so without a fourth arm that no
+    // input reaches and no test can cover.
     match (east_real, west_real) {
         (true, true) => Recovery::Ambiguous { east, west },
         (true, false) => Recovery::Offset(east),
-        (false, true) => Recovery::Offset(west),
-        (false, false) => Recovery::NoZone,
+        (false, _) => Recovery::Offset(west),
     }
 }
 
@@ -334,12 +347,39 @@ mod tests {
                     assert!(off == east || off == west, "offset {off} is neither candidate");
                     ambiguous += 1;
                 }
-                Recovery::NoZone => panic!("offset {off} is a real zone and was called none"),
             }
             minutes += 15;
         }
         // The band is two hours wide at quarter-hour steps, counted from both
         // ends of the range: nine offsets east and nine west name each other.
         assert_eq!(ambiguous, 18, "the ambiguous band changed width");
+    }
+
+    /// Every second of the day is placed, and the counts are what say there is
+    /// no third answer.
+    ///
+    /// The test above walks the *real* offsets a quarter-hour apart; this one
+    /// walks the whole input domain, including the 79,199 seconds-of-day that
+    /// no zone sits on. Neither `Offset` nor `Ambiguous` may go missing and
+    /// nothing may be left over: 43,200 east-only, 35,999 west-only and 7,201
+    /// in the overlap is 86,400 exactly, which is why the fourth case
+    /// [`Recovery`] used to have a variant for is a state the arithmetic cannot
+    /// produce.
+    #[test]
+    fn every_offset_of_the_day_is_placed() {
+        let epoch = 1_786_795_200;
+        let (mut offset, mut ambiguous) = (0u32, 0u32);
+        for lsod in 0..DAY {
+            match resolve(epoch, lsod) {
+                Recovery::Offset(_) => offset += 1,
+                Recovery::Ambiguous { east, west } => {
+                    assert_eq!(east - west, DAY as i64, "the two candidates are a day apart");
+                    ambiguous += 1;
+                }
+            }
+        }
+        assert_eq!(offset, 79_199);
+        assert_eq!(ambiguous, 7_201);
+        assert_eq!(u64::from(offset + ambiguous), DAY);
     }
 }
