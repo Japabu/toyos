@@ -114,9 +114,12 @@ const _: () = assert!(core::mem::offset_of!(LogRecord, at_ns) == core::mem::size
 impl LogRecord {
     /// A record no shard ever wrote, for sizing a read buffer.
     ///
-    /// Not `Default`: `seq` and `at_ns` of zero are a *valid* record — sequence
-    /// numbers start at zero — so a type whose default is indistinguishable
-    /// from real data is one a reader can mistake. The name says it is filler.
+    /// Not `Default`, and the reason is the state this is indistinguishable
+    /// from: an all-zero record is exactly a **zeroed slot** — a shard's `.bss`
+    /// or `alloc_zeroed` storage that nothing has ever written. Sequence
+    /// numbers start at *one* (`FIRST_SEQ`) precisely so that state can never be
+    /// read as a record; a type whose `Default` produced it would hand that
+    /// state back through the front door. The name says it is filler.
     pub const EMPTY: Self = Self {
         seq: 0,
         at_ns: 0,
