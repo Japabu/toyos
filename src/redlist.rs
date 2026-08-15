@@ -699,8 +699,11 @@ pub const KNOWN_RED: &[Red] = &[
         finding: Finding::fires(1, 10),
         standing: Standing::Retired(
             "soundd builds each line and issues one `write_all` (its local `say!`) now: 0 of 10 in \
-             run 31283095698. The other 176 `eprintln!` sites in `userland/` do not, so the shape \
-             is open for every other daemon",
+             run 31283095698. The other 176 `eprintln!` sites in `userland/` still do not — and \
+             the shape that left open is closed at the kernel by L5 of the log architecture: a \
+             `ConsoleObject` per holder buffers its line and emits it whole under one \
+             `BackendGuard`, so a kernel record cannot land inside one. `console_line_atomicity` \
+             is the gate, 0 of 2000",
         ),
         what: "`STALLED` waiting for both clients to leave the mixer: `soundd: client ` and \
                `1 removed` came back either side of the kernel's four `exit:` accounting lines, so \
@@ -708,7 +711,7 @@ pub const KNOWN_RED: &[Red] = &[
                rather than chance — soundd prints a client's removal exactly while the kernel \
                prints that client's exit",
         evidence: "probe-green run 31282019974 rep 10, and run 31271983043 on `main`",
-        source: "specs/issues/diagnostics/serial-console-has-no-line-atomicity.md",
+        source: "specs/log-architecture-spec.md §4.4",
         measured: "2026-08-09",
     },
     // ---------------------------------------------------------------------
@@ -924,23 +927,31 @@ pub const KNOWN_RED: &[Red] = &[
         test: "hda_tone",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(1, 3),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the splice is unrepresentable since L5 of the log architecture: a `ConsoleObject` per \
+             holder buffers its line and emits it whole under one `BackendGuard`, so the kernel \
+             record that cut this needle open has nowhere to be acquired. `console_line_atomicity` \
+             is the gate, 0 of 2000 with 2 of 2 red under `console-unbuffered`",
+        ),
         what: "the needle `soundd: hda codec0 vendor=1af4` split in half by another writer, between \
                `codec` and `0`. Three full suites on one tree in one session, red on the third — so \
                it is not the audio path and not load in any way a re-run answers; it is which two \
                writers happen to collide",
         evidence: "landing-1786130703-71774.log, a documentation-only branch",
-        source: "specs/issues/diagnostics/serial-console-has-no-line-atomicity.md",
+        source: "specs/log-architecture-spec.md §4.4",
         measured: "2026-08-07",
     },
     Red {
         test: "hda_tone",
         instrument: Instrument::DevHostAlone,
         finding: Finding::quiet(3),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the loaded arm it was the control for is retired above; a quiet reading whose red \
+             half has gone is not evidence of anything on its own",
+        ),
         what: "green 3 of 3 alone on a quiet host, against the splice red in the same session",
         evidence: "the same session as the splice above",
-        source: "specs/issues/diagnostics/serial-console-has-no-line-atomicity.md",
+        source: "specs/log-architecture-spec.md §4.4",
         measured: "2026-08-07",
     },
     Red {

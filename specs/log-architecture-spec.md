@@ -1924,6 +1924,32 @@ arrange something the spawn path already arranges. §5.1's row loses `console =
 true`, and §9.5's gate keeps its other two clauses under a name that says what
 it checks (`every_boot_config_runs_logd`).
 
+**The two reds this buffer retires, kept here because the issue file that held
+them closed with it.** `specs/issues/diagnostics/serial-console-has-no-line-atomicity.md`
+was the write-up, and it is deleted at L5 — but three rows of `src/redlist.rs`
+cite it as their evidence, so its measurements move here rather than becoming
+pointers that miss. Both are a *splice*, one writer's line cut open by another's:
+
+- **`hda_tone`, dev host loaded, 1 of 3.** The needle
+  `soundd: hda codec0 vendor=1af4` split between `codec` and `0` by a kernel
+  record — `landing-1786130703-71774.log`, on a branch whose whole diff was one
+  spec file, so the audio path was not in it. Three suites in one session on one
+  tree, red on the third; the same test alone on a quiet host was 0 of 3 in that
+  session, which is the pair a contention red is read from.
+- **`desktop_audio_client`, CI, 1 of 10.** `soundd: client ` and `1 removed`
+  came back either side of the kernel's four `exit:` accounting lines, so the
+  test counted one removal of two and waited out its 300 s guard —
+  systematically, because soundd prints a client's removal exactly while the
+  kernel prints that client's exit. Probe-green run `31282019974` rep 10, and
+  run `31271983043` on `main`.
+
+Both are a kernel record landing inside a userland line, which is what a buffer
+per holder makes unrepresentable: the line reaches the backend whole, under one
+`BackendGuard`, and a record cannot be acquired in the middle of it.
+`console_line_atomicity` is what holds it — 0 of 2000, and 2 of 2 red under
+`console-unbuffered`. The rows stay in the index as `Retired`, because a
+measurement that was taken is still a measurement and this is what took it off.
+
 The ANSI CSI strip that `SerialWriter` does today (`serial.rs:354`) moves onto
 the same path and keeps its reason: the backend must never carry bytes it would
 drop.

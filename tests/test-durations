@@ -134,7 +134,7 @@ boot_partition_identity 5511
 boot_volume_metadata_error 6779
 cache_eviction 4795
 connect_before_serve 16
-console_line_atomicity 18446744073709551615
+console_line_atomicity 5421
 console_locale_detect 5000
 control_regs 4238
 control_regs_negative 3935
@@ -206,7 +206,7 @@ log_conservation_smp8 5054
 log_nested_emit 5514
 log_partition_identity 6421
 log_partition_layout 454
-log_poll_outlives_a_close 18446744073709551615
+log_poll_outlives_a_close 4649
 log_volume_reread 11
 metal_sim_client_death 3908
 metal_sim_compositor 8625
