@@ -1636,8 +1636,18 @@ re-parks.
   name in one machine is a collision a dump report cannot survive.
 - It never takes a filesystem lock, never touches a block device, and holds only
   `BackendGuard` — for one bounded chunk at a time, exactly as
-  `drain_chunk_to_serial` does today, so an IRQs-off window is never longer than
-  one chunk.
+  `drain_chunk_to_serial` did, so an IRQs-off window is never longer than one
+  chunk. **Eight records, and the number is an interrupt latency rather than a
+  batch size.** L3 first held the guard across the whole backlog, which its own
+  comment said it did not, and the difference is measurable from outside: over
+  five full suites `i8042_undecoded_bytes` red twice on a controller whose byte
+  arrived while a drain had interrupts masked, and `71_macro_empty_arg` red
+  three times because a daemon's own `write` waited behind the same guard and
+  landed after a marker it was written before. Neither reds on the byte-ring
+  commit. Bounding the window took the second to zero in five and the first to
+  one (`specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`
+  is what is left of it, and it is a driver race this branch's timing moves
+  rather than one it made).
 - **It is not `usbd` and not `iod`.** Those two stay exactly as compl §10 defines
   them, and neither exists until that branch lands.
 

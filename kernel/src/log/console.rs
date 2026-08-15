@@ -134,6 +134,9 @@ pub fn post_wake() {
 /// — and one function rather than a mode of anything.** What differs between
 /// the phases is who calls it, never what it does.
 ///
+/// **One acquisition per chunk, not one per drain**, so the interrupts-off
+/// window is bounded by [`CHUNK_RECORDS`] however long the backlog is.
+///
 /// **`try_lock` and not `lock`, and the reason is a deadlock rather than
 /// latency.** `BackendGuard::lock` clears IF and then spins, so it is not
 /// re-entrant on its own CPU — and in `Drain::Inline` the caller is an
@@ -148,21 +151,52 @@ pub fn drain_inline() {
     if !serial::has_console() {
         return;
     }
-    let Some(mut guard) = BackendGuard::try_lock() else { return };
-    drain_locked(&mut guard);
+    loop {
+        let Some(mut guard) = BackendGuard::try_lock() else { return };
+        let records = drain_bounded(&mut guard, CHUNK_RECORDS);
+        drop(guard);
+        if records < CHUNK_RECORDS {
+            return;
+        }
+    }
 }
 
-/// The same drain, for a caller that already holds the backend: the panic flush
-/// and the shutdown flush, which want it held across the whole report rather
-/// than re-taken per line.
+/// Records per backend acquisition on the live paths.
+///
+/// **`BackendGuard` holds interrupts off for its whole life, so this number is
+/// an interrupt latency and not a batch size.** Draining the whole backlog under
+/// one guard is what the code did until 2026-08-15 and it is measurable from
+/// outside: `i8042_undecoded_bytes` red 2 times in 5 full suites, on a
+/// controller whose byte arrived while a drain had interrupts masked, and
+/// `71_macro_empty_arg` red 3 in 5 because a daemon's own `write` waited behind
+/// the same guard and landed after a marker it was written before. Neither reds
+/// on the byte-ring commit, so both were this window.
+///
+/// Eight is the byte ring's 512-byte `DRAIN_CHUNK` in the unit this drain moves:
+/// the corpus's mean rendered line is 89.4 bytes, so a chunk was five or six
+/// lines. The outer loop re-acquires, so a backlog still drains in one visit —
+/// it just lets an interrupt in between chunks, which is the whole point.
+const CHUNK_RECORDS: u64 = 8;
+
+/// The whole backlog under one guard, for a caller that already holds it: the
+/// panic flush and the shutdown flush. **Interrupt latency is not a
+/// consideration on either** — one is halting the machine and the other is
+/// cutting the power — and both would rather have the report whole than let
+/// anything in between its lines.
 pub fn drain_locked(guard: &mut BackendGuard) {
+    drain_bounded(guard, u64::MAX);
+}
+
+/// At most `budget` records to a held backend. Returns how many went.
+fn drain_bounded(guard: &mut BackendGuard, budget: u64) -> u64 {
     let mut cursor = DRAINED.take();
-    let mut sink = Wire { out: guard, records: 0 };
+    let mut sink = Wire { out: guard, records: 0, budget };
     drain_ordered(&mut cursor, &mut sink);
     let records = sink.records;
     DRAINED.put(&cursor);
     RECORDS.fetch_add(records, Ordering::Relaxed);
     LOST.store(DRAINED.lost(), Ordering::Relaxed);
+    records
 }
 
 /// Drain with no lock at all, straight to the 16550.
@@ -309,14 +343,23 @@ pub fn write_line(record: &LogRecord, emit: impl FnMut(&[u8])) {
     line.finish();
 }
 
-/// Records through a backend the caller holds.
+/// Records through a backend the caller holds, up to a budget.
+///
+/// **`false` before the record rather than after it**, which is what
+/// `RecordSink` means by it: `drain_ordered` leaves the cursor *at* the record
+/// it was refused, so the next acquisition starts exactly there and the budget
+/// costs nothing but a re-scan.
 struct Wire<'a> {
     out: &'a mut BackendGuard,
     records: u64,
+    budget: u64,
 }
 
 impl RecordSink for Wire<'_> {
     fn put(&mut self, record: &LogRecord) -> bool {
+        if self.records >= self.budget {
+            return false;
+        }
         write_line(record, |bytes| self.out.write_raw(bytes));
         self.records += 1;
         true
@@ -343,9 +386,9 @@ extern "C" fn body(_arg: u64) -> ! {
     }
 
     loop {
-        // One bounded chunk at a time, exactly as `drain_chunk_to_serial` was:
-        // the drain takes and drops the backend around one walk, and the walk
-        // writes whole lines.
+        // One bounded chunk per backend acquisition, exactly as
+        // `drain_chunk_to_serial` was, so an interrupts-off window is never
+        // longer than `CHUNK_RECORDS` lines.
         drain_inline();
 
         // **Register, then arm, then park — in that order, and the order is the
