@@ -189,17 +189,64 @@ impl ZeroHandles for DeviceClaim {
     }
 }
 
-/// The machine's serial console.
+/// One holder's view of the machine's serial console.
 ///
-/// Not a [`DeviceClaim`] — a claim's whole content is exclusivity and every
-/// kernel-spawned process holds one of these at once — and not a file: it has
-/// no path, no cursor and no backing.
+/// Not a [`DeviceClaim`] — a claim's whole content is exclusivity — and not a
+/// file: it has no path, no cursor and no backing. What it *is* is the line
+/// buffer in front of one backend, which is where console line atomicity comes
+/// from (`specs/log-architecture-spec.md` §4.4).
+///
+/// **One backend, one object per holder, and the second half is load-bearing.**
+/// A buffer on one object every process shares is one buffer two processes
+/// accumulate into, and their two half-lines splice inside the very mechanism
+/// that exists to stop splicing. So `ConsoleObject::new()` is called once by
+/// `spawn_init` and once per inherited console slot in
+/// `loader::start::build_child_handles`: a child gets its own object over the
+/// one backend rather than a duplicate of its parent's handle. Authority is
+/// unchanged by that — a process has a console exactly when its parent gave it
+/// one, which is the rule the slot map already expressed — and the panic path
+/// depends on none of them, because `panic_flush` writes the backend directly.
 pub struct ConsoleObject {
     pub(super) core: ObjectCore,
+    /// Bytes written but not yet ended by a newline.
+    ///
+    /// A leaf lock: the only things that take it are this type's `write` — from
+    /// `ops::try_write`, under the process's own lock — and its `Drop`, which
+    /// runs where the last handle did. Nothing it calls takes another.
+    line: crate::sync::Lock<crate::drivers::serial::ConsoleLine>,
 }
 
 impl ConsoleObject {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { core: Self::new_core() })
+        Arc::new(Self {
+            core: Self::new_core(),
+            line: crate::sync::Lock::new(crate::drivers::serial::ConsoleLine::new()),
+        })
+    }
+
+    /// Take a userland write, emitting every whole line it completes.
+    pub fn write(&self, buf: &crate::user_ptr::UserBytes) {
+        // The negative control, and it is literally the state this tree shipped
+        // between L3 and L5: every `write` reaches the backend as it arrives,
+        // so a `println!` hands the kernel half a line and a kernel record can
+        // land in the gap. `console_line_atomicity` reds under it.
+        if crate::actuator::console_unbuffered() {
+            crate::drivers::serial::write_console(buf);
+            return;
+        }
+        self.line.lock().write(buf);
+    }
+}
+
+/// The last handle going is the one moment a partial line stops being
+/// unfinished and becomes all there will ever be.
+///
+/// A process that exits mid-line said those bytes; a buffer that dropped them
+/// would be a way to lose output rather than a way to keep it whole. `Console`
+/// is an `immediate` row, so this runs where the last handle did — a bounded
+/// flush of at most `MAX_CONSOLE_LINE`, taking the backend once.
+impl Drop for ConsoleObject {
+    fn drop(&mut self) {
+        self.line.lock().finish();
     }
 }

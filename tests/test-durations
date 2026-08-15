@@ -134,6 +134,7 @@ boot_partition_identity 5511
 boot_volume_metadata_error 6779
 cache_eviction 4795
 connect_before_serve 16
+console_line_atomicity 18446744073709551615
 console_locale_detect 5000
 control_regs 4238
 control_regs_negative 3935

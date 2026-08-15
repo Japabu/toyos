@@ -417,6 +417,20 @@ actuators! {
     /// See `arch::percpu_fetch_add`.
     log_shared_reservation = "log-shared-reservation";
 
+    /// Bypass `ConsoleObject`'s line buffer: every userland `write` reaches the
+    /// backend as it arrives.
+    ///
+    /// **A real prior build rather than an invented defect** — it is exactly
+    /// what this tree shipped between L3 and L5, and before that the byte ring
+    /// made the unit of interleaving a `write` syscall in a lossier way still.
+    /// The host cannot stage it: `println!` is `LineWriter`, whose two syscalls
+    /// per line are decided inside the guest's own `std`, and no host-side
+    /// stimulus can make the kernel forget a buffer it holds. What it produces
+    /// is a line one process began and another finished —
+    /// `console_line_atomicity` counts them and `Serial::interleaved` names the
+    /// kernel-into-userland half. `specs/log-architecture-spec.md` §4.4, §9.4.
+    console_unbuffered = "console-unbuffered";
+
     /// Panic inside `klogd`, the kernel thread, on its first instruction.
     ///
     /// **Nothing outside the kernel can make a kernel thread panic**, and the

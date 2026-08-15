@@ -172,6 +172,10 @@ const MAX_SHARED_REBOOTS: usize = 3;
 
 // Rust helper binaries that are spawned by tests, not tests themselves.
 const RUST_SKIP: &[&str] = &[
+    // Its verdict is a property of the *console capture*, which only a boot of
+    // its own can hold: in the shared boot every other binary's output is in the
+    // same stream. `console_line_atomicity` runs it.
+    "console_line_atomicity",
     "segfault_child",
     "disk_backtrace_child",
     "fault_gate_child",
@@ -490,6 +494,13 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("log_conservation_smp4", Sched::Parallel, Tier::Fast),
     ("log_conservation_smp8", Sched::Parallel, Tier::Fast),
     ("log_nested_emit", Sched::Parallel, Tier::Fast),
+    // Two processes building a fixed-width line out of two `write`s each, and a
+    // count of the lines that carry both of them. Parallel and Fast: the verdict
+    // is a count over a fixed number of lines the guest declares, so a loaded
+    // host changes when the writers run and not whether a line is whole. It boots
+    // its own machine because what it reads is the console capture, which a
+    // shared boot fills with everything else.
+    ("console_line_atomicity", Sched::Parallel, Tier::Fast),
     // One boot that stops dead in phase 3, read for what it managed to say.
     ("pre_idle_wedge_speaks", Sched::Parallel, Tier::Fast),
     ("i8042_health", Sched::Parallel, Tier::Nightly),
@@ -7137,6 +7148,10 @@ fn run_machine_test(
             common::logread::log_conservation_smp8(test_config, c_bins, rust_bins)
         }
         "log_nested_emit" => common::logread::log_nested_emit(test_config, c_bins, rust_bins),
+        // Body in `tests/common/console.rs`, same reason.
+        "console_line_atomicity" => {
+            common::console::console_line_atomicity(test_config, c_bins, rust_bins)
+        }
         "iommu_context_absent" => common::iommu::iommu_context_absent(test_config, c_bins, rust_bins),
         "iommu_empty_domain" => common::iommu::iommu_empty_domain(test_config, c_bins, rust_bins),
         // Body in `tests/common/hda.rs`, same reason.

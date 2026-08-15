@@ -476,16 +476,18 @@ pub fn try_write(object: &KObjectRef, buf: &UserBytes) -> Option<u64> {
         }),
         KObjectRef::PipeWrite(w) => write_pipe(w.id(), buf),
         KObjectRef::Connection(c) => write_pipe(c.tx(), buf),
-        KObjectRef::Console(_) => {
-            // Straight to the backend in bounded flushes — `write_console`
-            // stages into a `MAX_CONSOLE_LINE` buffer and takes the guard per
-            // flush — where it used to be a lossless append to the byte ring
-            // that something else drained later. **L5 puts `ConsoleObject`'s
-            // line buffer in front of this** (§4.4); until then a `println!`
-            // still hands the kernel half a line at a time, which is what
-            // L5's `console-unbuffered` actuator will stage — so this state is
-            // a real prior build rather than an invented one.
-            serial::write_console(buf);
+        KObjectRef::Console(c) => {
+            // Into this holder's line buffer, which emits whole lines under one
+            // `BackendGuard` (§4.4). It used to be a lossless append to the byte
+            // ring that something else drained later, then a direct bounded
+            // write to the backend; both made the unit of interleaving a `write`
+            // syscall, and `println!` issues two of those per line. The
+            // `console-unbuffered` actuator restores the second of those states.
+            //
+            // **The whole write is always accepted.** The buffer is the kernel's
+            // and a short count would make a caller re-send bytes it already
+            // handed over.
+            c.write(buf);
             Some(buf.len() as u64)
         }
         KObjectRef::PipeRead(_) | KObjectRef::Device(_) | KObjectRef::Acceptor(_)

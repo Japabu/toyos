@@ -7,6 +7,8 @@ pub mod lane;
 #[allow(dead_code)]
 pub mod compile;
 #[allow(dead_code)]
+pub mod console;
+#[allow(dead_code)]
 pub mod faults;
 #[allow(dead_code)]
 pub mod gpt;

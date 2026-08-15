@@ -15,7 +15,7 @@
 //! is bounded and no holder may take its length from userland** — a rendered
 //! record is one 1 KiB `LogRecord`, the live drain takes eight of them, the
 //! panic report is a fixed buffer, and a `write` of arbitrary length is cut
-//! into [`MAX_CONSOLE_LINE`] pieces by [`write_console`]. The one deliberate
+//! into [`MAX_CONSOLE_LINE`] pieces by [`ConsoleLine`]. The one deliberate
 //! exception is the panic path's `drain_locked`, which takes the whole backlog
 //! under one hold — a machine that is dying pays latency to say why, and
 //! `log/console.rs` argues it at the site. Nothing that holds a kernel lock
@@ -301,7 +301,7 @@ pub fn flush_final() {
     }
 }
 
-/// A userland `write` to a console object.
+/// A userland `write` to a console object, **unbuffered**.
 ///
 /// **One backend acquisition per [`MAX_CONSOLE_LINE`] of output, ANSI stripped,
 /// no buffering.** It replaced `SerialWriter::console()` and the lossless
@@ -310,8 +310,13 @@ pub fn flush_final() {
 /// `specs/issues/diagnostics/serial-console-has-no-line-atomicity.md` has four
 /// recorded splices to show for it. Taking the guard here is what makes this
 /// write whole against a kernel record and against another process; what it
-/// does *not* fix is `println!` handing the kernel half a line at a time, which
-/// is L5's line buffer on `ConsoleObject` and not this function's.
+/// does *not* fix is `println!` handing the kernel half a line at a time.
+///
+/// **That is what [`ConsoleLine`] fixes, and this function is now the thing it
+/// is measured against.** Every ordinary write goes through the line buffer;
+/// this path survives as the `console-unbuffered` actuator's behaviour, which
+/// is the state the tree shipped between L3 and L5 rather than an invented one
+/// (`specs/log-architecture-spec.md` §9.4).
 ///
 /// **The guard is taken and released per chunk, and the bound is the reason
 /// this function may be called with a userland length at all.** `BackendGuard`
@@ -342,18 +347,82 @@ pub fn flush_final() {
 /// [`Stripped`] both outlive every guard this function takes, so a sequence
 /// split by a flush is stripped exactly as one that is not.
 pub fn write_console(src: &crate::user_ptr::UserBytes) {
-    let mut out = Stripped { buf: [0; MAX_CONSOLE_LINE], len: 0 };
-    let mut csi = Csi::Text;
-    let mut chunk = [0u8; STRIP_CHUNK];
-    let mut off = 0;
-    while off < src.len() {
-        let n = chunk.len().min(src.len() - off);
-        src.read_at(off, &mut chunk[..n]);
-        csi.feed(&mut out, &chunk[..n]);
-        off += n;
+    let mut line = ConsoleLine::new();
+    line.out.on_newline = false;
+    line.write(src);
+    // Nothing is held back: a lone trailing ESC is the caller's byte and the
+    // buffer is not carried anywhere, so both are emitted here.
+    line.finish();
+}
+
+/// One console holder's partly-written line.
+///
+/// **This is where line atomicity comes from, and it is per holder.** The unit
+/// that reaches the backend under one [`BackendGuard`] is what other producers
+/// cannot get inside, and `println!` does not hand the kernel one:
+/// `LineWriter` issues `flush_buf()` and then `inner.write(rest)`, two syscalls
+/// per line. So the whole of a line is accumulated here and leaves on the
+/// newline that ends it, whatever number of `write`s built it.
+///
+/// **Per holder is the whole of it.** One buffer shared by two processes is two
+/// half-lines spliced inside the very mechanism that exists to stop splicing,
+/// so this lives on a `ConsoleObject` and every process that has a console has
+/// its own — `loader::start::build_child_handles` mints one per spawn rather
+/// than duplicating its parent's. The *backend* is still one, and
+/// [`BackendGuard`] is still its only serialiser.
+///
+/// **A line longer than [`MAX_CONSOLE_LINE`] is emitted in pieces of it**, and
+/// that bound is an interrupt latency before it is a line bound: the guard
+/// masks interrupts for whatever is written under it and a userland `write` has
+/// no length. So the claim is "whole up to `MAX_CONSOLE_LINE`", the same claim
+/// [`write_console`] already made for its chunking, and nothing that was atomic
+/// before this existed stops being so.
+///
+/// The CSI filter's state lives here for the same reason the buffer does: a
+/// sequence split across two `write`s must come out the same as one that is
+/// not.
+pub struct ConsoleLine {
+    out: Stripped,
+    csi: Csi,
+}
+
+impl ConsoleLine {
+    pub const fn new() -> Self {
+        Self {
+            out: Stripped { buf: [0; MAX_CONSOLE_LINE], len: 0, on_newline: true },
+            csi: Csi::Text,
+        }
     }
-    csi.finish(&mut out);
-    out.flush();
+
+    /// Accumulate a userland write, emitting every whole line it completes.
+    pub fn write(&mut self, src: &crate::user_ptr::UserBytes) {
+        let mut chunk = [0u8; STRIP_CHUNK];
+        let mut off = 0;
+        while off < src.len() {
+            let n = chunk.len().min(src.len() - off);
+            src.read_at(off, &mut chunk[..n]);
+            self.csi.feed(&mut self.out, &chunk[..n]);
+            off += n;
+        }
+    }
+
+    /// Emit whatever is held back, whether or not a newline ever came.
+    ///
+    /// The last handle to a console going away is the one moment a partial line
+    /// stops being "not finished yet" and becomes "all there will ever be", and
+    /// a process that exits mid-line said those bytes: dropping them would make
+    /// the buffer a way to lose output rather than a way to keep it whole.
+    pub fn finish(&mut self) {
+        let csi = core::mem::replace(&mut self.csi, Csi::Text);
+        csi.finish(&mut self.out);
+        self.out.flush();
+    }
+}
+
+impl Default for ConsoleLine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// How much of a user write is copied out of user memory at a time.
@@ -368,8 +437,8 @@ const STRIP_CHUNK: usize = 256;
 /// the longest interrupts-off window a userland `write` can buy.
 ///
 /// §4.4's console-line bound, 1024, which is what `SerialWriter::SW_BUF_SIZE`
-/// was. L5's line buffer emits in pieces of the same size, so a whole line is
-/// still one acquisition then and is one now.
+/// was. [`ConsoleLine`] emits a longer line in pieces of the same size, so a
+/// whole line is one acquisition either side of the buffer arriving.
 const MAX_CONSOLE_LINE: usize = 1024;
 
 /// Bytes on their way to the backend, buffered so that a per-byte filter does
@@ -381,6 +450,11 @@ const MAX_CONSOLE_LINE: usize = 1024;
 struct Stripped {
     buf: [u8; MAX_CONSOLE_LINE],
     len: usize,
+    /// Whether a newline ends a unit. True is [`ConsoleLine`]'s line buffer —
+    /// the buffer is the line and it leaves when the line does; false is
+    /// [`write_console`]'s unbuffered chunking, where the only reason to stop
+    /// is a full buffer.
+    on_newline: bool,
 }
 
 impl Stripped {
@@ -390,6 +464,9 @@ impl Stripped {
         }
         self.buf[self.len] = b;
         self.len += 1;
+        if self.on_newline && b == b'\n' {
+            self.flush();
+        }
     }
 
     fn flush(&mut self) {

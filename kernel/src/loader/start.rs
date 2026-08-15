@@ -269,6 +269,9 @@ pub fn build_child_handles(
     // caller decides *where* it happens, and a site that is right by accident
     // is one an added slot kind makes wrong.
     let mut displaced = Vec::new();
+    // Parent console objects this call has already minted a replacement for,
+    // by the parent object's address. See the console arm below.
+    let mut minted: Vec<(usize, crate::object::KObjectRef)> = Vec::new();
     for i in 0..slot_map.len() / SLOT_PAIR_LEN {
         let mut pair = [0u8; SLOT_PAIR_LEN];
         slot_map.read_at(i * SLOT_PAIR_LEN, &mut pair);
@@ -284,6 +287,37 @@ pub fn build_child_handles(
         // without a handle it asked for — the endowment vector below is the
         // move that *can* carry one.
         let entry = data.handles.duplicate_entry(parent, rights)?;
+        // **A console is minted for the child, never duplicated into it.** The
+        // object *is* the line buffer (`object::device::ConsoleObject`), so a
+        // child sharing its parent's would accumulate into one buffer with it
+        // and the two half-lines would splice inside the mechanism that exists
+        // to stop splicing (`specs/log-architecture-spec.md` §4.4). Authority
+        // does not move: a child gets a console exactly when this pair says it
+        // does, which is the rule that was already here, and the duplicate above
+        // is still what refuses a handle without `DUP`. Aliasing does not move
+        // either — two slots naming one parent object get one child object, so a
+        // program whose stdout and stderr are the same console still writes one
+        // stream.
+        let entry = match entry.object() {
+            crate::object::KObjectRef::Console(parent_console) => {
+                let key = alloc::sync::Arc::as_ptr(parent_console) as usize;
+                let object = match minted.iter().find(|(seen, _)| *seen == key) {
+                    Some((_, object)) => object.clone(),
+                    None => {
+                        let object = crate::object::KObjectRef::Console(
+                            crate::object::device::ConsoleObject::new(),
+                        );
+                        minted.push((key, object.clone()));
+                        object
+                    }
+                };
+                // The duplicate goes back with everything else this loop
+                // displaces, outside the parent's lock.
+                displaced.push(Some(entry));
+                crate::object::HandleEntry::new(object, rights)
+            }
+            _ => entry,
+        };
         let slot = u16::try_from(child_slot)
             .map_err(|_| SyscallError::ResourceExhausted)?;
         let (_, replaced) = handles
