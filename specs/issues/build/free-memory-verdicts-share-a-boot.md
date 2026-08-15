@@ -35,6 +35,37 @@ pipes — one kernel pipe is exactly one 2 MiB page — and shared-memory region
 Sixteen megabytes is eight of them. The three gates are not wrong to do it;
 a whole-machine measurement is wrong to be a verdict beside them.
 
+## It fires more often since `/bin/logd`, and the mechanism is the entry's own
+
+**2026-08-15, `wt/toyos-logd56` at L6 of `specs/log-architecture-spec.md`.** The
+shared boot gained one more process — `logd`, which every image now starts — and
+this went from "red once in three full runs" to red in the parallel phase of
+**two of two** twelve-wide dev-host runs, green alone both times with the same
+sentence the harness prints itself:
+
+```
+a killed process kept 14680064 bytes of its io_urings
+```
+
+Nothing about the measurement changed and nothing about the object layer's
+release queue changed. What changed is the number of things in that guest
+holding and releasing pages across the window, which is exactly what the
+paragraph above says the verdict cannot survive: logd holds an `io_uring` for
+the whole boot, a 64 KiB record buffer, and a `File` whose page-cache pages come
+and go as it writes.
+
+**`va_exhaustion` joined it on the same runs** — `Sched::Parallel`, red in one
+twelve-wide phase with `QEMU disconnected` and *"the guest did not survive
+exhaustion"*, green alone, `62 mappings` and the kernel intact. It is a
+different binary and the same shape: a verdict about how much of a resource the
+machine has, taken while other guests are competing for the host's.
+
+Neither is re-classified here, and that is deliberate: `Sched::Serial` for the
+memory verdicts is one of the two shapes below, the second one is better, and
+this branch has no standing to pick between them for a defect it only made
+louder. **`Instrument::Ci` cannot see any of this** — one guest per machine,
+`--jobs 1` — so nothing here is a claim about a CI red.
+
 ## What to do
 
 Not "make the margin bigger": a margin that absorbs another binary's working set
