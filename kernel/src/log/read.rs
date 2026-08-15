@@ -275,6 +275,25 @@ pub fn drain_ordered(cursor: &mut Cursor, out: &mut impl RecordSink) -> usize {
             // The slot was recycled between the timestamp and the body. The
             // record is gone; `open` below re-clamps and counts it, which is
             // the same subtraction every other loss goes through.
+            //
+            // **This arm does not advance `next[i]` and does not have to, and
+            // the reason is worth writing down because the shape invites the
+            // opposite conclusion.** `open` offered this candidate, so
+            // `at_ns(next[i])` answered `Some` — which means `next[i] < head`
+            // and the slot held `next[i]`. For `read` to answer `None` a moment
+            // later, one of the two tests they share must have flipped, and
+            // only one of them can: `head` never shrinks, so `seq >= head`
+            // cannot become true; what changed is that a writer reserved
+            // `next[i] + SHARD_RECORDS` and entered the slot. That reservation
+            // puts `head` at `next[i] + SHARD_RECORDS + 1` or beyond, so
+            // `oldest_readable` — which is `head - SHARD_RECORDS` and is also
+            // monotonic — is now **strictly greater than `next[i]`**. The
+            // `open` call below therefore clamps the position *up*, counting
+            // the difference as loss, and the iteration that took this arm
+            // still ends with `next[i]` larger than it started. Every arm of
+            // this loop either emits, advances, or returns, so a shard cannot
+            // stall the drain by losing a race it is losing because it is being
+            // written to.
             None => {}
         }
         cand[i] = cursor.open(i, shards[i]);

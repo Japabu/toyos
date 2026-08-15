@@ -98,9 +98,12 @@ fn header(record: &LogRecord, len: u16) -> [u64; HEADER_WORDS] {
 /// How many message words a record of this length occupies.
 ///
 /// **The writer stores these and the reader loads these, and neither touches
-/// the rest.** A record's mean message over the measured corpus is 68 bytes, so
-/// the publication a producer pays for is nine words rather than 127 — the
-/// bound is the tail of the distribution and the cost is the record in hand.
+/// the rest.** A record's mean message over the measured corpus is 68 bytes,
+/// which is **nine of the 124 message words**; [`HEADER_WORDS`] is always
+/// stored, so the publication a producer pays for is **twelve of the body's
+/// 127** — the bound is the tail of the distribution and the cost is the record
+/// in hand. (This said "nine rather than 127" until 2026-08-15, which compares
+/// message words against body words and drops the header from the count.)
 fn msg_words(len: u16) -> usize {
     (len as usize).min(MSG_BYTES).div_ceil(8)
 }

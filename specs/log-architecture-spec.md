@@ -432,8 +432,10 @@ ordered. `kernel-loom/tests/log_body_words.rs` is the round trip, under the
 `--no-default-features` invocation because `MSG_WORDS` is 1 under loom.
 
 **A producer stores the words its message occupies and no more**, which is
-`3 + ceil(len/8)` of the 127 — nine words at the corpus's 68-byte mean message
-rather than a full 1,016-byte copy. The reader loads the same count, from a
+`3 + ceil(len/8)` of the 127 — **twelve** words at the corpus's 68-byte mean
+message (three header and nine of the 124 message words) rather than a full
+1,016-byte copy. This said "nine words" until 2026-08-15, which is the message
+half of the sum compared against the whole body's 127. The reader loads the same count, from a
 `len` it clamps first because that word may be mid-recycle; the worst a garbage
 value can do is make it read the whole message area, which is in bounds and is
 then thrown away by the re-check.
