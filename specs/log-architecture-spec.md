@@ -915,9 +915,22 @@ Four properties, each structural rather than checked:
 
   **`kernel-loom` found both of these on its first run**, before any guest test
   existed to disagree, and neither is reachable on x86 in a way a test could
-  catch: `a_committed_record_is_whole_or_absent` and
-  `a_recycled_slot_does_not_answer_for_the_record_it_replaced` are the models.
-  This is the thing the model was built for and it earned itself immediately.
+  catch. **Which model holds which half was written down wrongly here until
+  2026-08-15, and the correction is the whole of L3's review finding F2.**
+  `a_committed_record_is_whole_or_absent` holds the publication edge.
+  `a_recycled_slot_does_not_answer_for_the_record_it_replaced` does **not** hold
+  the mark: it is single-threaded, so its reader always sees the fresh `head`,
+  and the lower bound `seq < oldest_readable` alone answers every one of its
+  assertions — **measured**, it stays green with the `WRITING` store and its
+  release fence deleted outright. What it holds is that the window moves before
+  the body does. The mark's own model is
+  `a_reader_racing_a_recycle_gets_nothing_rather_than_a_mixture`, which is
+  `a_key_and_the_record_it_names_come_from_one_generation` with one word changed
+  — it asks the racing reader for the number the slot *holds* rather than the
+  one it is *about to* hold, so the reader's stale `head` admits the old
+  generation and nothing but the mark and the two acquire fences stands between
+  it and a mixture. `shard.rs`'s comment has cited that name since the two-store
+  publish landed; until F2 it named no test.
 
   **The body is read word by word as atomics, and that is a requirement rather
   than a style.** Reading bytes that a writer may concurrently be storing into
@@ -994,14 +1007,36 @@ exactly the mistake the paragraph above records.
 | obligation | shape | model | when |
 |---|---|---|---|
 | **W1** publication | body stores → `seq.store(Release)`; reader's `seq.load(Acquire) == s` implies the body is visible | `kernel-loom/tests/log_record.rs` | L1 |
-| **W2** recycle detection | the readable window is exactly the last `SHARD_RECORDS`, and a slot a writer has entered answers for neither generation. **Deterministic, not raced** — a two-thread model over a whole ring is hundreds of thousands of interleavings, which did not finish in ten minutes here. (Until 2026-08-14 there was a second reason: loom's `UnsafeCell` recorded every access as a write and reported the unsynchronised *pair*, so a seqlock read looked to it like a second writer. The body is atomic words now and loom models the accesses themselves.) What loom checks concurrently is W1; what makes W2 a state rather than a schedule is that the mark is published before the body | same | L1 |
+| **W2** recycle detection | the readable window is exactly the last `SHARD_RECORDS`, and a slot a writer has entered answers for neither generation. **Deterministic, not raced** — a two-thread model over a whole ring is hundreds of thousands of interleavings, which did not finish in ten minutes here. (Until 2026-08-14 there was a second reason: loom's `UnsafeCell` recorded every access as a write and reported the unsynchronised *pair*, so a seqlock read looked to it like a second writer. The body is atomic words now, so loom models each access as the atomic access it is — which is what makes a *raced* recycle expressible at all, and is a statement about the instrument and not about coverage: no shipped model exercised the mark until `a_reader_racing_a_recycle_gets_nothing_rather_than_a_mixture` was added on 2026-08-15.) What loom checks concurrently is W1 and, since that model, the mark and both readers' acquire fences; what the deterministic model holds is that the window moves before the body does | same | L1; the raced half 2026-08-15 |
 | **W2b** non-preemptible publication | one `LogCommitGuard` witnesses shard selection, reservation, `WRITING`, body copy and the final sequence store. A stale writer can neither migrate nor resume after a newer generation. CPU flags and strict same-CPU preemption are outside Loom; §9.2's guest actuator is the negative proof | `log_nested_emit` plus `log-unbracketed-reserve` | L4 |
 | **W3** the wake edge | `signal_after_commit`: `fence(SeqCst); LOG_WAITER.load(Relaxed)` after `seq.store(Release)`, against `arm_waiter`: `LOG_WAITER.store(true, Relaxed); fence(SeqCst); rescan for a committed record; park`. **Invariant: no committed record is left with a parked reader.** Store-buffer shaped, so TSO hides the missing fence and only loom sees it. Carries its own negative case — either fence removed behind a `cfg`, and the model must red — because a model that has never failed proves nothing | `kernel-loom/tests/log_wake.rs` | L3 |
 | **W4** the reservation | `head` is written by one CPU through inline asm and read by others as an `AtomicU64` | shimmed | L1 |
 
-**L1's models are green and they have teeth, which is checked rather than
-claimed**: with the commit store's `Release` weakened to `Relaxed`,
-`a_committed_record_is_whole_or_absent` reds and the other four stay green.
+**These models are green and they have teeth, which is checked rather than
+claimed — and the count this paragraph gave was wrong for a year of nothing:**
+it said one model reds under the commit store's `Release` weakened to `Relaxed`
+and "the other four stay green", against six models. **Re-run 2026-08-15 on the
+dev host, seven models: two red.** `a_committed_record_is_whole_or_absent`
+(*"torn: at_ns is another record's, left 0 right 1007"*) and
+`a_key_and_the_record_it_names_come_from_one_generation` (*"a key from the
+generation the slot used to hold, left 1007 right 5007"*); the other five stay
+green, `a_reader_racing_a_recycle_gets_nothing_rather_than_a_mixture` among
+them, because the edges that model is about are the mark's release fence and
+the readers' acquire fences rather than the publishing store's.
+
+**Each of the three edges has a weakening that reds exactly one model**, all
+four runs measured 2026-08-15 and each restored before commit:
+
+| weakening | red | on |
+|---|---|---|
+| `slot.seq.store(seq, Release)` → `Relaxed` | `a_committed_record_is_whole_or_absent`, `a_key_and_the_record_it_names_come_from_one_generation` | the publication edge |
+| `slot.seq.store(WRITING)` + its `fence(Release)` deleted | `a_reader_racing_a_recycle_gets_nothing_rather_than_a_mixture` (*"a key from the generation the slot is being given, left 5007 right 1007"*) | the mark |
+| `Shard::read`'s `fence(Acquire)` deleted | the same model (*"torn: the message body is another record's, left [5,0,…] right [1,0,…]"*) | the copy's re-check |
+| `Shard::at_ns`'s `fence(Acquire)` deleted | the same model (*"a key from the generation the slot is being given"*) | the key's re-check |
+
+The last three are F2's, and the two readers being separable is the point: they
+are two chances to get the seqlock wrong and each is now checked on its own.
+
 `SHARD_RECORDS` is 4 under loom, which is what makes the recycle cases
 reachable at all — at 512 a model that has to lap a slot explores a branch it
 never finishes. The layout `const` assertions are skipped in that build,

@@ -131,16 +131,18 @@ fn the_readable_window_is_exactly_the_last_shard_records() {
     });
 }
 
-/// **The defect the two-store publish exists to prevent, as a state rather than
-/// a schedule.**
+/// **The window moves before the body does, as a state rather than a
+/// schedule.**
 ///
-/// Until 2026-08-11 `commit` wrote the body and *then* stored the sequence
-/// number, so throughout the body write the word still read the previous
-/// generation's number — and a reader that loaded it, copied a
-/// half-overwritten body and re-checked saw the same value twice and accepted
-/// the tear. Marking the slot before touching the body is what closes it, and
-/// this asserts the mark is observable: mid-recycle, the slot answers for
-/// neither generation.
+/// A reservation is out of the readable window from the moment `head` moves,
+/// which is before a byte of the new body is written — so a reader that sees
+/// the fresh `head` is refused by the lower bound alone and never looks at the
+/// slot. That is what this asserts, and it is all it asserts: the checks below
+/// are satisfied by `seq < oldest_readable` and would still pass with the
+/// `WRITING` mark deleted outright. **The mark is
+/// [`a_reader_racing_a_recycle_gets_nothing_rather_than_a_mixture`]'s**, which
+/// is the model where the reader's `head` is the stale one and the lower bound
+/// therefore admits the old generation.
 ///
 /// Deterministic on purpose. The window is a state a writer is in, not a
 /// schedule two threads have to be caught in, so a race is the wrong instrument
@@ -171,6 +173,79 @@ fn a_recycled_slot_does_not_answer_for_the_record_it_replaced() {
         unsafe { shard.commit(recycling, &record(recycling), &guard) };
         assert_whole(&shard.read(recycling).expect("the new record is readable"), recycling);
         assert!(shard.read(FIRST_SEQ).is_none(), "the replaced record came back");
+    });
+}
+
+/// **The `WRITING` mark and the reader's acquire fence, which nothing else
+/// here can fail on.**
+///
+/// [`a_key_and_the_record_it_names_come_from_one_generation`] with one word
+/// changed: it asks for the sequence number the recycling writer is *about to*
+/// publish, and this asks for the one the slot still holds. That is the whole
+/// difference, and it is what moves the property from the upper bound to the
+/// lower one. Asking for the new number, a reader that has not seen `head` move
+/// is refused by `seq >= head`; asking for the old number, a reader that has
+/// not seen `head` move computes `oldest_readable` from the *stale* head and
+/// finds the old generation inside its window. Nothing but the mark and the
+/// fences stands between it and a body two writers wrote half of each.
+///
+/// **The two weakenings it exists to catch**, each measured red against this
+/// model and green against all five of the others:
+///
+/// - `commit`'s `slot.seq.store(WRITING)` and the `fence(Release)` under it
+///   deleted. The reader then loads the old number, copies a body the writer
+///   is overwriting, and re-checks against a word whose only change is the
+///   *final* store — which has not happened yet. It reads the old number
+///   twice and accepts the mixture.
+/// - `read`'s and `at_ns`'s `fence(Acquire)` deleted. The mark is stored, but
+///   nothing makes the reader's view of the sequence word as new as its view
+///   of the body words it just copied: it can hold generation two's `at_ns`
+///   under generation one's number and see nothing wrong.
+///
+/// With both in place the release fence and the acquire fence pair through the
+/// body word the reader loaded, so the `WRITING` store that precedes the
+/// release fence happens-before the re-check that follows the acquire fence.
+/// The re-check cannot answer the old number, and the mixture is refused.
+///
+/// It is `Some` or whole and never both halves of two generations, which is why
+/// the assertion is [`assert_whole`] rather than a field probe.
+#[test]
+fn a_reader_racing_a_recycle_gets_nothing_rather_than_a_mixture() {
+    loom::model(|| {
+        let shard = Arc::new(Shard::new());
+        // One full lap, so the next reservation lands on `FIRST_SEQ`'s slot
+        // while `FIRST_SEQ` is still the oldest number in the window.
+        for _ in 0..SHARD_RECORDS {
+            commit_one(&shard);
+        }
+        assert_eq!(shard.oldest_readable(), FIRST_SEQ);
+
+        let writer = shard.clone();
+        let w = loom::thread::spawn(move || {
+            // SAFETY: this thread is the shard's sole writer.
+            let guard = kernel_loom::arch::LogCommitGuard::close();
+            let seq = unsafe { writer.reserve(&guard) };
+            let r = record(seq);
+            unsafe { writer.commit(seq, &r, &guard) };
+        });
+
+        // The old generation: gone, or entirely itself.
+        if let Some(got) = shard.read(FIRST_SEQ) {
+            assert_whole(&got, FIRST_SEQ);
+        }
+        // Its key is the same question asked of the second reader.
+        if let Some(at_ns) = shard.at_ns(FIRST_SEQ) {
+            assert_eq!(
+                at_ns,
+                record(FIRST_SEQ).at_ns,
+                "a key from the generation the slot is being given"
+            );
+        }
+
+        w.join().unwrap();
+        assert!(shard.read(FIRST_SEQ).is_none(), "the replaced record came back");
+        let recycled = FIRST_SEQ + SHARD_RECORDS as u64;
+        assert_whole(&shard.read(recycled).expect("the new record is readable"), recycled);
     });
 }
 
