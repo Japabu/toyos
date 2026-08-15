@@ -692,6 +692,14 @@ pub fn revoke_pipe_maps(maps: &mut Vec<PipeMap>, pt: &PageTables, pipe: pipe::Pi
     crate::arch::tlb::shootdown();
 }
 
+/// One live `mmap`, and the physical pages behind it.
+///
+/// The range itself is registered in the address space's `regions`, which is
+/// what the placement search reads and what `munmap` frees; this is the
+/// ownership of the memory and the accounting, and every entry here has a
+/// region of exactly its extent. It carried a `fixed` flag once, for a second
+/// `munmap` path that unmapped a placed mapping without unregistering it —
+/// there was nothing registered to unregister, which was the defect.
 pub struct MmapRegion {
     pub addr: UserAddr,
     pub size: usize,
@@ -699,8 +707,6 @@ pub struct MmapRegion {
     /// else is placed in it, and no physical memory backs a page whose whole
     /// purpose is to fault.
     pub _pages: Option<PageAlloc>,
-    /// True if this is a MAP_FIXED mapping (virt addr != phys addr).
-    pub fixed: bool,
 }
 
 // IdleProof — zero-cost proof that code runs on the per-CPU idle stack

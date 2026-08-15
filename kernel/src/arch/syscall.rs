@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use super::entry::{restore_user_state, ring3_naked_asm, save_user_state, Ring3Entry};
 use super::{cpu, gdt};
 use crate::drivers::acpi;
-use crate::mm::paging::CachePolicy;
+use crate::mm::paging::{CachePolicy, Occupancy};
 use crate::user_ptr::{SyscallContext, UserBytes, UserBytesMut};
 use crate::object::{ops, port, KObjectRef};
 use crate::{device, log, pipe, process, vfs};
@@ -2053,6 +2053,15 @@ fn sys_handle_recv(
 /// memory is pinned behind a page whose purpose is to fault, and
 /// `process::handle_page_fault` refuses to fill a `RegionKind::Mapped` region
 /// so the reservation cannot be demand-paged back into existence.
+///
+/// `MmapFlags::FIXED` places the mapping at exactly `req_addr` rather than
+/// wherever the placement search would put it, and the range it names is its
+/// own to answer for: it may replace exactly one whole mapping this same
+/// syscall made, and every other overlap — part of a region, several regions,
+/// a range belonging to the loader or a device claim — is refused with
+/// `InvalidArgument`. POSIX unmaps whatever is in the way and says nothing;
+/// this kernel does not have that silence to give, and the address a C program
+/// passes is as untrusted as any other syscall argument.
 fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
     // `size` crossed the trust boundary. Zero is a request for nothing and a
     // size whose 2 MiB rounding does not fit cannot be expressed at all;
@@ -2109,30 +2118,90 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
 
     if let Some(start) = fixed_start {
         let pt = process::current_address_space();
-        let end = start + aligned as u64;
-        let mut cur = start;
-        let mut offset = 0u64;
-        while cur < end {
-            match &pages {
-                Some(pages) => pt.lock().remap(UserAddr::new(cur), pages.phys() + offset, writable),
-                // A fixed request over a range that already carries a mapping
-                // must take it away, or the caller gets an accessible page
-                // exactly where it asked for a fault.
-                None => pt.lock().unmap(UserAddr::new(cur)),
+        let start = UserAddr::new(start);
+        // Both ledgers move together, under both locks, in the order the
+        // arm below established: the fd-owner data, then the address space.
+        let replaced = process::with_fd_owner_data(|data| {
+            let mut as_guard = pt.lock();
+            // A placed mapping names its own range, so the question `find_gap`
+            // answers for every other mapping has to be asked here — and it
+            // was not asked at all. The mapping went into `mmap_regions` and
+            // nowhere near `regions`, which is what the placement search
+            // reads, so the next anonymous `mmap` was handed the range this
+            // one was living in and `map_range` asserted on a present PDE:
+            // three ordinary syscalls from any C program that passes
+            // `MAP_FIXED`, and the machine was gone.
+            //
+            // One whole mapping of this process's own making is replaced — the
+            // address keeps its meaning and changes what it names. Every other
+            // overlap is refused: taking part of a region would need a split
+            // the address space has no machinery for, and a range an ELF
+            // segment, a library image, the stack or a shared window owns is
+            // not `mmap`'s to take. Neither is honoured halfway, and neither
+            // reaches `map_range`, whose assert is a kernel-bug assert again
+            // rather than one syscall away.
+            let replacing = match as_guard.occupancy(start, aligned as u64) {
+                Occupancy::Free => None,
+                Occupancy::Whole => {
+                    let mine = data
+                        .mmap_regions
+                        .iter()
+                        .position(|r| r.addr == start && r.size == aligned);
+                    match mine {
+                        Some(idx) => Some(idx),
+                        None => return Err(SyscallError::InvalidArgument),
+                    }
+                }
+                Occupancy::Partial => return Err(SyscallError::InvalidArgument),
+            };
+            // Out of both ledgers before the new mapping goes into either, so
+            // `insert_region` is never asked to overlap and the pages of what
+            // was there leave with it.
+            let old = replacing.map(|idx| {
+                let old = data.mmap_regions.swap_remove(idx);
+                as_guard
+                    .free_and_unmap(old.addr)
+                    .expect("an mmap region is registered in the address space it was placed in");
+                old
+            });
+            as_guard.insert_region(
+                start,
+                crate::vma::Region {
+                    size: aligned as u64,
+                    writable,
+                    kind: crate::vma::RegionKind::Mapped,
+                },
+            );
+            if let Some(pages) = &pages {
+                as_guard.map_range(
+                    start,
+                    pages.phys(),
+                    aligned as u64,
+                    writable,
+                    CachePolicy::DeferToMtrr,
+                );
             }
-            cur += crate::mm::PAGE_2M;
-            offset += crate::mm::PAGE_2M;
-        }
-        crate::arch::tlb::shootdown();
-        process::with_fd_owner_data(|data| {
             data.mmap_regions.push(process::MmapRegion {
-                addr: UserAddr::new(start), size: aligned, _pages: pages, fixed: true,
+                addr: start, size: aligned, _pages: pages,
             });
             data.alloc_count += 1;
             let mem = data.mmap_regions.iter().map(|r| r.size as u64).sum::<u64>();
             if mem > data.peak_memory { data.peak_memory = mem; }
+            Ok(old.map(crate::mm::Unmapped::new))
         });
-        req_addr
+        match replaced {
+            // Dropped out here, with nothing held: the drop shoots down and
+            // waits, and a replacement is what owes that wait — a sibling
+            // thread holds a translation for exactly this range and the pages
+            // behind the old mapping are on their way back to the PMM. A
+            // mapping placed where nothing was owes none, which is why the arm
+            // below shoots down nowhere either.
+            Ok(old) => {
+                drop(old);
+                req_addr
+            }
+            Err(e) => e.to_u64(),
+        }
     } else {
         let pt = process::current_address_space();
         let vaddr = process::with_fd_owner_data(|data| {
@@ -2142,7 +2211,7 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
             };
             let Some(vaddr) = placed else { return Err(()) };
             data.mmap_regions.push(process::MmapRegion {
-                addr: vaddr, size: aligned, _pages: pages, fixed: false,
+                addr: vaddr, size: aligned, _pages: pages,
             });
             data.alloc_count += 1;
             let mem = data.mmap_regions.iter().map(|r| r.size as u64).sum::<u64>();
@@ -2159,24 +2228,19 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
 /// The pages go back to the PMM here, so this is the syscall the shootdown
 /// matters most on: a sibling thread of the same process holds translations for
 /// exactly this range, and until M3 nothing told it otherwise.
+///
+/// One path for every mapping. A placed one used to be freed by a second,
+/// which cleared its page-table entries and left it registered nowhere — the
+/// half of the FIXED defect that outlived the mapping.
 fn sys_munmap(addr: u64, _size: u64) -> u64 {
     let pt = process::current_address_space();
     let taken = process::with_fd_owner_data(|data| {
         let idx = data.mmap_regions.iter().position(|r| r.addr.raw() == addr)?;
         let region = data.mmap_regions.swap_remove(idx);
         data.free_count += 1;
-        if region.fixed {
-            let mut cur = region.addr.raw();
-            let end = region.addr.raw() + region.size as u64;
-            while cur < end {
-                pt.lock().unmap(UserAddr::new(cur));
-                cur += crate::mm::PAGE_2M;
-            }
-        } else {
-            let mut as_guard = pt.lock();
-            as_guard.unmap_range(region.addr, region.size as u64);
-            as_guard.free_region(region.addr);
-        }
+        pt.lock()
+            .free_and_unmap(region.addr)
+            .expect("an mmap region is registered in the address space it was placed in");
         Some(crate::mm::Unmapped::new(region))
     });
     let Some(unmapped) = taken else {
