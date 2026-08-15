@@ -12354,9 +12354,13 @@ fn check_shard_partition(all_tests: &[TestDef]) {
             let mut mine_p = parallel.clone();
             let mut mine_s = serial.clone();
             let mut mine_a = audio_names.clone();
-            shard.keep(&mut mine_p, cost);
-            shard.keep(&mut mine_s, cost);
-            shard.keep(&mut mine_a, |name| {
+            // One accumulator across the three pools, in the order `main` takes
+            // them: the partition a shard gets is a function of all three calls,
+            // so a check that took them apart would be checking something else.
+            let mut load = shard.bins();
+            shard.keep(&mut mine_p, &mut load, cost);
+            shard.keep(&mut mine_s, &mut load, cost);
+            shard.keep(&mut mine_a, &mut load, |name| {
                 AUDIO_SMP.iter().try_fold(Duration::ZERO, |a, smp| {
                     Some(a + *pricing.get(&format!("{name} (smp={smp})"))?)
                 })
@@ -12740,7 +12744,9 @@ fn main() {
         // splitting it is the only thing that shortens it. A filter cannot do
         // the same job — `audio_tone` is a substring of `audio_tone_load`.
         if let Some(shard) = shard {
-            shard.keep(&mut audio_to_run, |_| None);
+            // Gate A runs this tier and nothing else, so its configs are the
+            // whole of what this process's bins ever hold.
+            shard.keep(&mut audio_to_run, &mut shard.bins(), |_| None);
             assert!(
                 !audio_to_run.is_empty(),
                 "shard {}/{} owns no audio config, and a gate that ran nothing would \
@@ -12928,9 +12934,17 @@ fn main() {
         };
         longest_first(&mut parallel, &pricing);
         longest_first(&mut serial, &pricing);
-        shard.keep(&mut parallel, cost);
-        shard.keep(&mut serial, cost);
-        shard.keep(&mut audio_to_run, |name| {
+        // One accumulator for the whole run, heaviest pool first: this process
+        // runs all three pools one after another, so its wall clock is the one
+        // bin they share and the serial tail belongs in whichever bin the
+        // parallel phase left lightest. Three partitions from three empty
+        // accumulators are each good and their sum is not
+        // (`Shard::keep`, and run `31377439504`'s 466.1 s against a 369.1 s
+        // even split).
+        let mut load = shard.bins();
+        shard.keep(&mut parallel, &mut load, cost);
+        shard.keep(&mut serial, &mut load, cost);
+        shard.keep(&mut audio_to_run, &mut load, |name| {
             AUDIO_SMP.iter().try_fold(Duration::ZERO, |a, smp| {
                 Some(a + *pricing.get(&format!("{name} (smp={smp})"))?)
             })
