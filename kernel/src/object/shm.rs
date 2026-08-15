@@ -34,6 +34,10 @@ use super::{KObjectVariant, ObjectCore, ZeroHandles};
 /// window is a fresh [`SharedMemObject`] per claim — an object whose handle
 /// count has reached zero is retired for good and can never be named again —
 /// while the pages under it are the driver's and outlive every claimant.
+// Never read: holding the vector *is* the job, and the pages go back to the
+// PMM when the last `Arc` to this drops. `expect` rather than `allow`, so a
+// reader that appears has to justify itself.
+#[expect(dead_code)]
 pub struct Pages(Vec<pmm::PhysPage>);
 
 impl Pages {
@@ -61,6 +65,7 @@ pub struct Region {
     pub cache: CachePolicy,
     /// The pages, when somebody in the kernel owns them. `None` for a window
     /// the kernel does not own — firmware's framebuffer, an MMIO aperture.
+    #[expect(dead_code, reason = "the Arc is what keeps the pages alive; nothing reads it")]
     pub pages: Option<Arc<Pages>>,
 }
 

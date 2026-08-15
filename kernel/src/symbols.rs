@@ -1,9 +1,9 @@
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use alloc::boxed::Box;
-use elf::ElfBytes;
-use elf::endian::AnyEndian;
 use toyos_abi::log::MAX_RECORD_MESSAGE;
+use toyos_elf::section::{SectionTable, SHT_SYMTAB};
+use toyos_elf::sym::SymTab;
 
 use crate::log::elide::{self, Elided};
 use crate::process::PageAlloc;
@@ -60,6 +60,20 @@ fn symbol_text<D>(name: D) -> Elided<D, SYMBOL_HEAD, SYMBOL_TAIL> {
     Elided(name)
 }
 
+/// `[offset, offset + len)` of `data`, or `None` when that is not wholly inside
+/// it. Both numbers came out of the file, so the addition is checked.
+fn file_range(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
+    let start = usize::try_from(offset).ok()?;
+    let end = usize::try_from(offset.checked_add(len)?).ok()?;
+    data.get(start..end)
+}
+
+/// Bytes the section header table occupies. Cannot overflow: both factors are
+/// `u16`, and `e_shentsize` is honoured rather than assumed.
+fn shdr_table_len(ehdr: &toyos_elf::FileHeader) -> u64 {
+    ehdr.shnum as u64 * ehdr.shentsize as u64
+}
+
 /// Zero-allocation symbol table. Points directly into ELF sections in memory.
 /// Resolution is a linear scan over raw Elf64_Sym entries — O(n) but lock-free,
 /// allocation-free, and safe to call from any context including panic/double-fault.
@@ -78,9 +92,12 @@ pub struct SymbolTable {
     /// die with it — and the pointers survive the struct moving, because 2 MiB
     /// physical pages do not move when a `Vec` header does.
     pages: Option<PageAlloc>,
-    /// Raw .symtab section data in memory.
+    /// Raw `.symtab` section data in memory, and its length in *bytes* — the
+    /// entry count is `SymTab`'s to derive, because 24 is the only width an
+    /// `Elf64_Sym` has and a file that declares another one is a file whose
+    /// count and whose stride would disagree.
     symtab: *const u8,
-    symtab_entries: usize,
+    symtab_len: usize,
     /// Raw .strtab section data in memory.
     strtab: *const u8,
     strtab_len: usize,
@@ -109,7 +126,7 @@ impl SymbolTable {
         Self {
             pages: None,
             symtab: core::ptr::null(),
-            symtab_entries: 0,
+            symtab_len: 0,
             strtab: core::ptr::null(),
             strtab_len: 0,
             base: 0,
@@ -125,7 +142,7 @@ impl SymbolTable {
     /// separately and cannot disagree about where the second one starts.
     pub fn from_pages(
         pages: PageAlloc,
-        symtab_len: usize, entry_size: usize,
+        symtab_len: usize,
         strtab_len: usize,
         base: u64,
         prog_base: u64, prog_end: u64,
@@ -134,7 +151,7 @@ impl SymbolTable {
         let start = pages.ptr();
         Self {
             symtab: start,
-            symtab_entries: symtab_len / entry_size,
+            symtab_len,
             strtab: unsafe { start.add(symtab_len) },
             strtab_len,
             pages: Some(pages),
@@ -143,59 +160,63 @@ impl SymbolTable {
         }
     }
 
-    /// Parse an ELF in memory and create a SymbolTable pointing into its sections.
-    /// No copying — only stores pointers into `data`.
+    /// Find `.symtab` and its `.strtab` in an ELF already in memory, and point
+    /// at them. No copying — only pointers into `data`.
+    ///
+    /// Decoded through `toyos-elf`, which is the tree's one ELF decoder: this
+    /// file used to hold the second, on crates.io `elf` 0.8, reached from two
+    /// lines of the whole kernel. Every refusal below answers with a table that
+    /// names nothing, because a kernel that cannot find its symbols still
+    /// boots — it prints bare addresses.
     fn from_elf(data: &[u8], base: u64) -> Self {
-        let elf = match ElfBytes::<AnyEndian>::minimal_parse(data) {
-            Ok(e) => e,
-            Err(_) => return Self::empty(),
+        let Ok(ehdr) = toyos_elf::FileHeader::parse(data) else { return Self::empty() };
+        let Some(shdrs) = file_range(data, ehdr.shoff, shdr_table_len(&ehdr)) else {
+            return Self::empty();
         };
-
-        let shdrs = match elf.section_headers() {
-            Some(s) => s,
-            None => return Self::empty(),
+        let Some((syms, strs)) = SectionTable::new(shdrs).symbols(SHT_SYMTAB) else {
+            return Self::empty();
         };
-
-        const SHT_SYMTAB: u32 = 2;
-        let mut symtab_shdr = None;
-        for shdr in shdrs.iter() {
-            if shdr.sh_type == SHT_SYMTAB {
-                symtab_shdr = Some(shdr);
-                break;
-            }
-        }
-        let Some(shdr) = symtab_shdr else { return Self::empty() };
-
-        let symtab_off = shdr.sh_offset as usize;
-        let symtab_size = shdr.sh_size as usize;
-        let entsize = if shdr.sh_entsize > 0 { shdr.sh_entsize as usize } else { 24 };
-        let link = shdr.sh_link as usize;
-
-        if symtab_off + symtab_size > data.len() { return Self::empty(); }
-
-        let strtab_shdr = match shdrs.get(link) {
-            Ok(s) => s,
-            Err(_) => return Self::empty(),
+        // Both extents came out of the file, so both are bounded against it
+        // rather than trusted. A section running past EOF would otherwise be
+        // read as whatever follows the image in the direct map.
+        let (Some(symtab), Some(strtab)) = (
+            file_range(data, syms.offset, syms.size),
+            file_range(data, strs.offset, strs.size),
+        ) else {
+            return Self::empty();
         };
-        let strtab_off = strtab_shdr.sh_offset as usize;
-        let strtab_size = strtab_shdr.sh_size as usize;
-        if strtab_off + strtab_size > data.len() { return Self::empty(); }
-
-        let symtab_ptr = unsafe { data.as_ptr().add(symtab_off) };
-        let strtab_ptr = unsafe { data.as_ptr().add(strtab_off) };
-        let entries = symtab_size / entsize;
 
         Self {
             pages: None,
-            symtab: symtab_ptr,
-            symtab_entries: entries,
-            strtab: strtab_ptr,
-            strtab_len: strtab_size,
+            symtab: symtab.as_ptr(),
+            symtab_len: symtab.len(),
+            strtab: strtab.as_ptr(),
+            strtab_len: strtab.len(),
             base,
             prog_base: 0,
             prog_end: 0,
             stack_base: 0,
             stack_end: 0,
+        }
+    }
+
+    /// The two tables as one view, for the resolve path.
+    ///
+    /// The one `unsafe` left in this file's lookup, and it is the whole of
+    /// what the raw pointers cost: the bytes are either the kernel image in the
+    /// direct map, which outlives the machine, or pages this table owns and
+    /// frees in its own `Drop`, and both lengths were bounded against the file
+    /// they were read from. Everything past this line is `toyos-elf`, which
+    /// forbids `unsafe` and indexes nothing unchecked.
+    fn tables(&self) -> SymTab<'_> {
+        if self.symtab.is_null() || self.strtab.is_null() {
+            return SymTab::empty();
+        }
+        unsafe {
+            SymTab::new(
+                core::slice::from_raw_parts(self.symtab, self.symtab_len),
+                core::slice::from_raw_parts(self.strtab, self.strtab_len),
+            )
         }
     }
 
@@ -209,38 +230,15 @@ impl SymbolTable {
             || (addr >= self.stack_base && addr < self.stack_end)
     }
 
-    /// Resolve an address to (mangled_name, offset). Linear scan — no allocation, no lock.
+    /// Resolve an address to (mangled_name, offset). Linear scan — no
+    /// allocation, no lock, no panic.
+    ///
+    /// The scan itself is [`SymTab::resolve`], whose rules — `STT_FUNC` only,
+    /// the nearest symbol below, the sized winner of an alias pair, and no
+    /// answer past a sized symbol's last byte — are argued and tested there.
+    /// An address below the load base belongs to no symbol in this module.
     pub fn resolve(&self, addr: u64) -> Option<(&str, u64)> {
-        if self.symtab.is_null() || self.symtab_entries == 0 { return None; }
-
-        const SYM_SIZE: usize = 24; // Elf64_Sym
-        let mut best_addr = 0u64;
-        let mut best_name_off = 0u32;
-        let mut best_size = 0u64;
-
-        for i in 0..self.symtab_entries {
-            let entry = unsafe { self.symtab.add(i * SYM_SIZE) };
-            let st_info = unsafe { *entry.add(4) };
-            if (st_info & 0xf) != 2 { continue; } // STT_FUNC only
-            let st_value = unsafe { u64::from_le_bytes(core::ptr::read_unaligned(entry.add(8) as *const [u8; 8])) };
-            if st_value == 0 { continue; }
-            let sym_addr = self.base + st_value;
-            let st_size = unsafe { u64::from_le_bytes(core::ptr::read_unaligned(entry.add(16) as *const [u8; 8])) };
-            if sym_addr <= addr && (sym_addr > best_addr
-                || (sym_addr == best_addr && best_size == 0 && st_size > 0))
-            {
-                best_addr = sym_addr;
-                best_name_off = unsafe { u32::from_le_bytes(core::ptr::read_unaligned(entry as *const [u8; 4])) };
-                best_size = st_size;
-            }
-        }
-
-        if best_addr == 0 { return None; }
-        let offset = addr - best_addr;
-        if best_size > 0 && offset >= best_size { return None; }
-
-        let name = self.strtab_name(best_name_off as usize)?;
-        Some((name, offset))
+        self.tables().resolve(addr.checked_sub(self.base)?)
     }
 
     /// [`resolve`](Self::resolve) for a *return address*.
@@ -254,15 +252,6 @@ impl SymbolTable {
     pub fn resolve_return(&self, return_addr: u64) -> Option<(&str, u64)> {
         let (name, offset) = self.resolve(return_addr.saturating_sub(1))?;
         Some((name, offset + 1))
-    }
-
-    fn strtab_name(&self, off: usize) -> Option<&str> {
-        if self.strtab.is_null() || off >= self.strtab_len { return None; }
-        let start = unsafe { self.strtab.add(off) };
-        let max_len = self.strtab_len - off;
-        let len = (0..max_len).find(|&i| unsafe { *start.add(i) } == 0).unwrap_or(max_len);
-        let bytes = unsafe { core::slice::from_raw_parts(start, len) };
-        core::str::from_utf8(bytes).ok()
     }
 
     pub fn prog_base(&self) -> u64 {
@@ -283,7 +272,7 @@ pub fn set_kernel_base(base: u64) {
 /// Stores pointers into the ELF data — the only allocation is the ~72-byte SymbolTable struct.
 pub fn load_kernel(data: &[u8], base: u64) {
     let table = SymbolTable::from_elf(data, base);
-    let count = table.symtab_entries;
+    let count = table.tables().count();
     KERNEL_SYMS.store(Box::into_raw(Box::new(table)), Ordering::Release);
     log!("symbols: loaded {} kernel symbols", count);
 }

@@ -25,7 +25,8 @@
 use core::fmt;
 
 use crate::arch::cpu;
-use crate::clock::{self, Civil};
+use crate::clock;
+use toyos_wallclock::Civil;
 
 const CMOS_ADDR: u16 = 0x70;
 const CMOS_DATA: u16 = 0x71;

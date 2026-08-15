@@ -14,6 +14,11 @@ use toyos_elf::rela::{self, RelaCounts, RelaTable, RelocError, RelocKind};
 use toyos_elf::section::{SectionTable, SHT_DYNSYM, SHT_RELA, SHT_SYMTAB};
 use toyos_elf::sym::SymTab;
 
+/// `st_info` for a global `STT_FUNC`, and for the data object it is told apart
+/// from.
+const FUNC: u8 = (1 << 4) | 2;
+const OBJECT: u8 = (1 << 4) | 1;
+
 // ── PT_DYNAMIC ──────────────────────────────────────────────────────────
 
 /// A tag naming zero is a tag naming zero, which is a legal address in a
@@ -228,6 +233,119 @@ fn lookups_skip_undefined_symbols_and_the_null_entry() {
     assert_eq!(table.find_tls("tls_var"), Some(0x40));
     assert_eq!(table.find("tls_var").map(|(i, _)| i), Some(2));
     assert_eq!(table.defined().count(), 1);
+}
+
+// ── Address to symbol ───────────────────────────────────────────────────
+//
+// `SymTab::resolve` is what a backtrace frame is named by, and the kernel's
+// panic path is its caller — so every case here is one an address in a crash
+// report can land on. Before this lived in the crate it was a raw-pointer scan
+// in `kernel/src/symbols.rs` with no test of any kind.
+
+/// The ordinary answer: the nearest function at or below the address, and how
+/// far into it the address is.
+#[test]
+fn an_address_resolves_to_the_function_that_contains_it() {
+    let syms = [
+        sym(0, 0, 0, 0),
+        sym_sized(1, FUNC, 1, 0x1000, 0x40),  // first
+        sym_sized(7, FUNC, 1, 0x2000, 0x100), // second
+    ]
+    .concat();
+    let table = SymTab::new(&syms, b"\0first\0second\0");
+
+    assert_eq!(table.resolve(0x1000), Some(("first", 0)));
+    assert_eq!(table.resolve(0x103f), Some(("first", 0x3f)));
+    assert_eq!(table.resolve(0x2010), Some(("second", 0x10)));
+    // Below every symbol, and between two of them where the first one's size
+    // says the address is not inside it.
+    assert_eq!(table.resolve(0x0fff), None);
+    assert_eq!(table.resolve(0x1040), None);
+}
+
+/// **A return address is the instruction after the `call`**, so a call in tail
+/// position lands one byte past its function's last byte — and refusing that is
+/// deliberate, because the alternative is naming the *next* function as the one
+/// that was executing. `resolve_return` is the kernel's answer to it and this
+/// is the property it rests on.
+#[test]
+fn one_byte_past_a_sized_symbol_is_not_that_symbol() {
+    let syms = [sym(0, 0, 0, 0), sym_sized(1, FUNC, 1, 0x1000, 0x10)].concat();
+    let table = SymTab::new(&syms, b"\0f\0");
+    assert_eq!(table.resolve(0x100f), Some(("f", 0xf)));
+    assert_eq!(table.resolve(0x1010), None);
+}
+
+/// A symbol with no size bounds nothing, so every address above it is inside
+/// it until a later symbol takes over. That is the assembly case — hand-written
+/// entry points carry `st_size` 0 — and losing it would leave every frame in
+/// `arch/entry.rs` unnamed.
+#[test]
+fn a_symbol_with_no_size_owns_everything_above_it() {
+    let syms = [sym(0, 0, 0, 0), sym_sized(1, FUNC, 1, 0x1000, 0)].concat();
+    let table = SymTab::new(&syms, b"\0naked\0");
+    assert_eq!(table.resolve(0x1000), Some(("naked", 0)));
+    assert_eq!(table.resolve(0xffff_ffff), Some(("naked", 0xffff_efff)));
+}
+
+/// Two symbols at one address is what an alias produces — `__memcpy` and
+/// `memcpy` on the same byte — and the sized one is the one that can say
+/// whether an address is still inside it. **Both orders, because the tie-break
+/// is what a scan in table order gets wrong.**
+#[test]
+fn an_alias_pair_resolves_to_the_one_that_carries_a_size() {
+    let sized_last = [
+        sym(0, 0, 0, 0),
+        sym_sized(1, FUNC, 1, 0x1000, 0),
+        sym_sized(7, FUNC, 1, 0x1000, 0x20),
+    ]
+    .concat();
+    let table = SymTab::new(&sized_last, b"\0plain\0sized\0");
+    assert_eq!(table.resolve(0x1004), Some(("sized", 4)));
+
+    let sized_first = [
+        sym(0, 0, 0, 0),
+        sym_sized(1, FUNC, 1, 0x1000, 0x20),
+        sym_sized(7, FUNC, 1, 0x1000, 0),
+    ]
+    .concat();
+    let table = SymTab::new(&sized_first, b"\0sized\0plain\0");
+    assert_eq!(table.resolve(0x1004), Some(("sized", 4)));
+}
+
+/// Only `STT_FUNC`, and never a symbol at zero. A data object at the address
+/// would otherwise name a frame after a variable, and `st_value == 0` is what
+/// an undefined symbol and an empty section both look like.
+#[test]
+fn data_symbols_and_zero_valued_ones_name_no_frame() {
+    let syms = [
+        sym(0, 0, 0, 0),
+        sym_sized(1, OBJECT, 1, 0x1000, 0x40), // data at the address
+        sym_sized(7, FUNC, 1, 0, 0x40),        // a function at zero
+    ]
+    .concat();
+    let table = SymTab::new(&syms, b"\0table\0nowhere\0");
+    assert_eq!(table.resolve(0x1000), None);
+    assert_eq!(table.resolve(0x10), None);
+}
+
+/// A hostile or truncated table answers nothing rather than panicking or
+/// reading past its bytes — the same property every other view in this crate
+/// has, on the one path that runs inside a panic handler.
+#[test]
+fn a_symbol_table_that_cannot_be_read_names_nothing() {
+    assert_eq!(SymTab::empty().resolve(0x1000), None);
+
+    // A last entry one byte short: `count` does not see it.
+    let mut short = sym(0, 0, 0, 0).to_vec();
+    short.extend_from_slice(&sym_sized(1, FUNC, 1, 0x1000, 0x10)[..23]);
+    assert_eq!(SymTab::new(&short, b"\0f\0").resolve(0x1000), None);
+
+    // A name offset past the string table is no name, and no name is no
+    // answer: a frame reading `+0x4` with nothing in front of it is worse than
+    // a bare address.
+    let syms = [sym(0, 0, 0, 0), sym_sized(u32::MAX, FUNC, 1, 0x1000, 0x10)].concat();
+    assert_eq!(SymTab::new(&syms, b"\0f\0").resolve(0x1004), None);
 }
 
 // ── Section headers ─────────────────────────────────────────────────────

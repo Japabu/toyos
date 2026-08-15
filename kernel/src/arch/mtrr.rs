@@ -65,7 +65,7 @@ impl MemoryType {
 /// the two here would turn it into a claim.
 pub enum Unknown {
     /// A variable MTRR holds an encoding the architecture does not define.
-    ReservedEncoding(u8),
+    ReservedEncoding,
     /// Overlapping MTRRs whose types the architecture leaves undefined.
     Conflicting,
     /// Part of the range is covered and part is not.
@@ -84,7 +84,7 @@ impl Effective {
         match self {
             Self::Known(t) => t.name(),
             Self::MtrrsDisabled => "UC (MTRRs disabled)",
-            Self::Unknown(Unknown::ReservedEncoding(_)) => "unknown (reserved MTRR encoding)",
+            Self::Unknown(Unknown::ReservedEncoding) => "unknown (reserved MTRR encoding)",
             Self::Unknown(Unknown::Conflicting) => "unknown (overlapping MTRRs disagree)",
             Self::Unknown(Unknown::PartiallyCovered) => "unknown (range only partly covered)",
         }
@@ -137,7 +137,7 @@ pub fn range_type(base: u64, size: u64) -> Effective {
     }
     let default = match MemoryType::from_encoding(def_type as u8) {
         Some(t) => t,
-        None => return Effective::Unknown(Unknown::ReservedEncoding(def_type as u8)),
+        None => return Effective::Unknown(Unknown::ReservedEncoding),
     };
 
     let end = base + size;
@@ -164,7 +164,7 @@ pub fn range_type(base: u64, size: u64) -> Effective {
         }
         let t = match MemoryType::from_encoding(base_msr as u8) {
             Some(t) => t,
-            None => return Effective::Unknown(Unknown::ReservedEncoding(base_msr as u8)),
+            None => return Effective::Unknown(Unknown::ReservedEncoding),
         };
         covering = Some(match covering {
             None => t,

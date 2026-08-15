@@ -293,12 +293,6 @@ pub enum ThreadLocation {
 }
 
 impl ThreadLocation {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Self::Scheduled => "Scheduled",
-            Self::Zombie(_) => "Zombie",
-        }
-    }
 }
 
 // ProcessEntry + ThreadEntry — hierarchical process/thread table
@@ -392,7 +386,6 @@ impl ProcessEntry {
         core::str::from_utf8(&self.name).unwrap_or("?").trim_end_matches('\0')
     }
     pub fn process_data(&self) -> &Arc<Lock<ProcessData>> { &self.process_data }
-    pub fn symbols(&self) -> &Arc<Lock<SymbolTable>> { &self.symbols }
     pub fn main_tid(&self) -> Tid { self.main_tid }
     pub fn threads(&self) -> &crate::id_map::IdMap<Tid, ThreadEntry> { &self.threads }
     pub fn threads_mut(&mut self) -> &mut crate::id_map::IdMap<Tid, ThreadEntry> { &mut self.threads }
@@ -1510,7 +1503,6 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     struct RegionSnap {
         start: u64,
         end: u64,
-        writable: bool,
         kind: RegionSnapKind,
     }
     enum RegionSnapKind {
@@ -1562,7 +1554,6 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
             snaps.push(RegionSnap {
                 start: start_addr.raw(),
                 end: start_addr.raw() + region.size,
-                writable: region.writable,
                 kind: snap_kind,
             });
         }

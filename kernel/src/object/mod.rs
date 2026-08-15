@@ -113,10 +113,6 @@ impl ObjectCore {
         self.koid
     }
 
-    pub fn handle_count(&self) -> u32 {
-        self.handle_count.load(Ordering::Acquire)
-    }
-
     pub fn retired(&self) -> bool {
         self.retired.load(Ordering::Acquire)
     }
@@ -159,7 +155,6 @@ pub trait ZeroHandles {
 pub trait KObjectVariant: ZeroHandles + Send + Sync + Sized + 'static {
     const NAME: &'static str;
     fn from_ref(r: &KObjectRef) -> Option<&Arc<Self>>;
-    fn into_ref(this: Arc<Self>) -> KObjectRef;
     fn core(&self) -> &ObjectCore;
     /// A fresh core, enrolled in this type's census. The only way to build one.
     fn new_core() -> ObjectCore;
@@ -230,10 +225,6 @@ macro_rules! kobject {
                     }
                 }
 
-                fn into_ref(this: Arc<Self>) -> KObjectRef {
-                    KObjectRef::$variant(this)
-                }
-
                 fn core(&self) -> &ObjectCore {
                     &self.core
                 }
@@ -251,7 +242,7 @@ macro_rules! kobject {
         /// cycle — because neither is visible any other way. A churn test
         /// asserts these return to the baseline they started from.
         pub mod census {
-            use core::sync::atomic::{AtomicU64, Ordering};
+            use core::sync::atomic::AtomicU64;
 
             $(
                 #[allow(non_upper_case_globals)]
@@ -259,10 +250,16 @@ macro_rules! kobject {
             )+
 
             /// `(type name, live count)`, in declaration order.
+            ///
+            /// Read by `SYS_DEBUG` alone, which is `test-actuators`; the
+            /// counters themselves are kept by every build.
+            #[cfg(feature = "test-actuators")]
             pub fn live() -> impl Iterator<Item = (&'static str, u64)> {
+                use core::sync::atomic::Ordering;
                 [$((stringify!($variant), $variant.load(Ordering::Relaxed)),)+].into_iter()
             }
 
+            #[cfg(feature = "test-actuators")]
             pub fn total() -> u64 {
                 live().map(|(_, n)| n).sum()
             }

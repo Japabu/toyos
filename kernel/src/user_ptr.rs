@@ -226,10 +226,6 @@ impl UserBytes<'_> {
         self.len
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
     /// Copy `dst.len()` bytes out of the window at `off`.
     ///
     /// The bound is an assertion rather than a refusal because `off` and

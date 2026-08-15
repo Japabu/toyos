@@ -5,6 +5,7 @@ use toyos::audio::{
     MSG_STREAM_OPEN, MSG_STREAM_OPENED, MSG_STREAM_SET_VOLUME, MSG_STREAM_CLOSE, MSG_STREAM_ERROR,
 };
 use toyos::endow::{self, Endowments};
+use toyos::ipc::{self, RxStep};
 use toyos::poller::{Poller, IORING_POLL_IN};
 use toyos::port::Acceptor;
 use toyos::shm::SharedMemory;
@@ -1664,65 +1665,83 @@ fn null_sink_thread(
     }
 }
 
-/// Reassembles one framed control message across nonblocking reads. The
-/// control thread must never block on a client: a client parking a partial
-/// header would otherwise wedge accept and volume/close/disconnect handling
-/// for every other client (the mix thread is unaffected either way).
-struct MsgBuf {
-    buf: [u8; Self::MAX],
-    len: usize,
+/// The widest control payload soundd decodes, **plus one**.
+///
+/// `StreamOpenRequest` is the only payload wider than a bare signal. The `+ 1`
+/// is what keeps an over-long frame a refusal rather than a truncation, and it
+/// is the one behaviour the hand-written buffer this replaced had that the
+/// SDK's does not: `FrameRx` keeps `min(declared, N)` bytes, so with `N` equal
+/// to the struct, a client declaring a hundred bytes of `MSG_STREAM_OPEN` would
+/// report exactly the struct's width and open a stream from its first eight.
+/// One byte of slack makes that client report one more than the struct instead,
+/// which [`classify`]'s exact-width guard refuses by name. Nothing legitimate
+/// reaches it — the SDK sends the struct — so the byte costs a byte of stack
+/// and buys back a refusal.
+const MAX_KEPT_PAYLOAD: usize = core::mem::size_of::<StreamOpenRequest>() + 1;
+
+const _: () = assert!(
+    core::mem::size_of::<StreamSetVolume>() < MAX_KEPT_PAYLOAD,
+    "a control payload wider than the frame buffer would be refused as malformed",
+);
+
+/// One client's inbound framing.
+///
+/// **soundd never reads a client with a blocking read.** `ipc::recv_header` and
+/// `ipc::recv_payload` park the caller until the peer sends the bytes it
+/// promised, which hands a client the decision of when the control thread runs
+/// again: one client parking a partial header would wedge accept and
+/// volume/close/disconnect handling for every other client (the mix thread is
+/// unaffected either way). This was soundd's own buffer until the SDK's grew a
+/// non-blocking one; the doctrine is `userland/CLAUDE.md`'s, and the type is
+/// the same one init, the compositor, netd and every surface host read with.
+///
+/// A client may declare anything up to `ipc::MAX_FRAME_LEN`; the excess past
+/// [`MAX_KEPT_PAYLOAD`] is counted down and discarded rather than waited for, so
+/// the connection stays framed whatever a peer declares — the SDK's rule, which
+/// the compositor states too (`compositor::client::MAX_KEPT_PAYLOAD`). What such
+/// a frame is *worth* is [`classify`]'s answer rather than this type's: it
+/// arrives reporting exactly `MAX_KEPT_PAYLOAD` bytes, one more than any payload
+/// here is wide, and is refused there.
+type ControlRx = ipc::FrameRx<MAX_KEPT_PAYLOAD>;
+
+/// What one framed control message asks for, decided before anything is done.
+///
+/// This is the whole of the framing soundd still owns: [`ControlRx`] decides
+/// where a frame ends, and this decides whether what came out of it is a
+/// message this client may send at all. A payload that is not exactly as long
+/// as the struct its type names is refused here rather than decoded — the
+/// `expect` on the open path rests on this guard and not on the peer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Control {
+    Open,
+    SetVolume { idx: usize },
+    Close { idx: usize },
+    /// An unknown message type, a payload the wrong width for its type, or a
+    /// message this connection is not in the state to send. All three are the
+    /// client getting it wrong, and all three end the connection.
+    Violation,
 }
 
-impl MsgBuf {
-    const HDR: usize = core::mem::size_of::<toyos::ipc::IpcHeader>();
-    const PAYLOAD_MAX: usize = core::mem::size_of::<StreamOpenRequest>();
-    const MAX: usize = Self::HDR + Self::PAYLOAD_MAX;
-
-    fn new() -> Self {
-        Self { buf: [0; Self::MAX], len: 0 }
+fn classify(msg_type: u32, payload_len: usize, stream_idx: Option<usize>) -> Control {
+    // **A frame wider than anything this server decodes is a violation whatever
+    // its type**, and this is where the buffer this replaced refused it — at the
+    // header, before the type was looked at. `FrameRx` reports an over-long
+    // frame as `MAX_KEPT_PAYLOAD` exactly (see that constant's `+ 1`), so one
+    // comparison is the whole of that refusal.
+    if payload_len >= MAX_KEPT_PAYLOAD {
+        return Control::Violation;
     }
-
-    fn payload_len(&self) -> usize {
-        u32::from_le_bytes(self.buf[4..8].try_into().unwrap()) as usize
-    }
-
-    /// Pull bytes until a full message is buffered or the pipe runs dry.
-    /// `Ok(Some(_))` is a complete `(msg_type, payload_len, payload)`;
-    /// `Ok(None)` parks a partial message until the next readiness event;
-    /// `Err(())` means EOF, a read error, or an oversized length — the
-    /// caller must disconnect the client.
-    fn recv(&mut self, conn: &Connection) -> Result<Option<(u32, usize, [u8; Self::PAYLOAD_MAX])>, ()> {
-        loop {
-            if self.len >= Self::HDR {
-                let plen = self.payload_len();
-                if self.len == Self::HDR + plen {
-                    let msg_type = u32::from_le_bytes(self.buf[0..4].try_into().unwrap());
-                    let mut payload = [0u8; Self::PAYLOAD_MAX];
-                    payload[..plen].copy_from_slice(&self.buf[Self::HDR..Self::HDR + plen]);
-                    self.len = 0;
-                    return Ok(Some((msg_type, plen, payload)));
-                }
-            }
-            let needed = if self.len < Self::HDR {
-                Self::HDR
-            } else {
-                Self::HDR + self.payload_len()
-            };
-            match conn.read_nonblock(&mut self.buf[self.len..needed]) {
-                Ok(0) => return Err(()),
-                Ok(n) => {
-                    self.len += n;
-                    // Reads stop at the header boundary, so the length field
-                    // is validated the moment it completes — before it can
-                    // size a payload read.
-                    if self.len == Self::HDR && self.payload_len() > Self::PAYLOAD_MAX {
-                        return Err(());
-                    }
-                }
-                Err(syscall::SyscallError::WouldBlock) => return Ok(None),
-                Err(_) => return Err(()),
-            }
+    match (msg_type, stream_idx) {
+        (MSG_STREAM_OPEN, None) if payload_len == core::mem::size_of::<StreamOpenRequest>() => {
+            Control::Open
         }
+        (MSG_STREAM_SET_VOLUME, Some(idx))
+            if payload_len == core::mem::size_of::<StreamSetVolume>() =>
+        {
+            Control::SetVolume { idx }
+        }
+        (MSG_STREAM_CLOSE, Some(idx)) => Control::Close { idx },
+        _ => Control::Violation,
     }
 }
 
@@ -1800,7 +1819,7 @@ fn control_thread(
 
     struct ControlClient {
         conn: Connection,
-        msg: MsgBuf,
+        rx: ControlRx,
         // Set once MSG_STREAM_OPEN succeeds; accepted-but-silent connections
         // stay pending so they cannot stall the control plane.
         stream_idx: Option<usize>,
@@ -1841,7 +1860,7 @@ fn control_thread(
                 Ok(conn) => {
                     clients.push(ControlClient {
                         conn,
-                        msg: MsgBuf::new(),
+                        rx: ControlRx::new(),
                         stream_idx: None,
                         pending_volume: None,
                     });
@@ -1857,22 +1876,44 @@ fn control_thread(
             }
             let mut disconnected = false;
             'msgs: loop {
-                let c = &mut clients[i];
-                let (msg_type, plen, payload) = match c.msg.recv(&c.conn) {
-                    Ok(Some(m)) => m,
-                    Ok(None) => break 'msgs,
-                    Err(()) => {
-                        if let Some(idx) = c.stream_idx {
+                let step = {
+                    let c = &mut clients[i];
+                    c.rx.pump(&c.conn)
+                };
+                let (msg_type, payload_len) = match step {
+                    RxStep::Idle => break 'msgs,
+                    // The client's process is gone; whether it exited or
+                    // crashed is not knowable here.
+                    RxStep::Eof => {
+                        if let Some(idx) = clients[i].stream_idx {
                             remove(cmd_ring, cmd_pipe_write, idx, Departure::Disconnected, period_nanos);
                         }
                         dead.push(i);
                         disconnected = true;
                         break 'msgs;
                     }
+                    // A length no frame here can carry. Nothing after it can be
+                    // located, so there is nothing to resynchronise to — and
+                    // unlike the EOF above, this one soundd caused.
+                    RxStep::Malformed => {
+                        say!("soundd: frame this protocol cannot describe, disconnecting client");
+                        if let Some(idx) = clients[i].stream_idx {
+                            remove(cmd_ring, cmd_pipe_write, idx, Departure::Refused, period_nanos);
+                        }
+                        dead.push(i);
+                        disconnected = true;
+                        break 'msgs;
+                    }
+                    RxStep::Frame { msg_type, payload_len } => (msg_type, payload_len),
                 };
-                match (msg_type, clients[i].stream_idx) {
-                    (MSG_STREAM_OPEN, None) if plen == core::mem::size_of::<StreamOpenRequest>() => {
-                        let req: StreamOpenRequest = toyos::ipc::decode_payload(&payload[..plen])
+                // The payload travels with the frame instead of being read off
+                // the fd during dispatch: the read side is finished before
+                // anything below acts on the message.
+                let mut payload = [0u8; MAX_KEPT_PAYLOAD];
+                payload[..payload_len].copy_from_slice(clients[i].rx.payload(payload_len));
+                match classify(msg_type, payload_len, clients[i].stream_idx) {
+                    Control::Open => {
+                        let req: StreamOpenRequest = ipc::decode_payload(&payload[..payload_len])
                             .expect("a payload as long as the struct decodes");
                         if let Some(reason) = reject_open(&req) {
                             say!("soundd: rejecting stream ({reason}): {}Hz {}ch fmt={}",
@@ -1904,7 +1945,7 @@ fn control_thread(
                         submit(cmd_ring, cmd_pipe_write, MixCommand::AddClient(Box::new(client)), period_nanos);
                         clients[i].stream_idx = Some(idx);
                     }
-                    (MSG_STREAM_SET_VOLUME, Some(idx)) if plen == core::mem::size_of::<StreamSetVolume>() => {
+                    Control::SetVolume { idx } => {
                         let raw = f32::from_le_bytes(payload[0..4].try_into().unwrap());
                         let Some(gain) = Gain::from_wire(raw) else {
                             say!("soundd: volume is not a number, disconnecting client");
@@ -1915,14 +1956,14 @@ fn control_thread(
                         };
                         clients[i].pending_volume = Some(gain);
                     }
-                    (MSG_STREAM_CLOSE, Some(idx)) => {
+                    Control::Close { idx } => {
                         remove(cmd_ring, cmd_pipe_write, idx, Departure::Closed, period_nanos);
                         dead.push(i);
                         disconnected = true;
                         break 'msgs;
                     }
-                    (other, _) => {
-                        say!("soundd: protocol violation (msg {other}), disconnecting client");
+                    Control::Violation => {
+                        say!("soundd: protocol violation (msg {msg_type}), disconnecting client");
                         if let Some(idx) = clients[i].stream_idx {
                             remove(cmd_ring, cmd_pipe_write, idx, Departure::Refused, period_nanos);
                         }
@@ -2246,6 +2287,81 @@ mod tests {
         // every period until the ramp finishes — changes nothing.
         for how in [Closed, Refused, Disconnected, SignalPipeGone] {
             assert_eq!(how.refine(how), how);
+        }
+    }
+
+    /// Every framing decision soundd still makes for itself, with a lying peer
+    /// on the other side.
+    ///
+    /// `ipc::FrameRx` decides where a frame ends and this decides whether what
+    /// came out of it is a message the client may send: a payload that is not
+    /// exactly as wide as the struct its type names never reaches
+    /// `decode_payload`, and a message arriving in the wrong state is refused
+    /// whatever it carries. Both used to be inline guards on a hand-rolled
+    /// buffer that nothing tested.
+    ///
+    /// What this cannot reach is `FrameRx`'s own reassembly — a split header, a
+    /// declared length past `ipc::MAX_FRAME_LEN` — because pumping one needs a
+    /// `Connection`, and reading a `Connection` on the host would issue the
+    /// ToyOS `syscall` instruction at a macOS kernel. That half is gated in
+    /// QEMU, and soundd has no gate of its own there yet.
+    #[test]
+    fn a_control_message_is_refused_unless_its_width_and_its_state_both_fit() {
+        const OPEN: usize = core::mem::size_of::<StreamOpenRequest>();
+        const VOL: usize = core::mem::size_of::<StreamSetVolume>();
+
+        assert_eq!(classify(MSG_STREAM_OPEN, OPEN, None), Control::Open);
+        // Every width short of the struct, which is what a peer that declared
+        // less than it owes produces — and what a truncated payload looks like
+        // from here.
+        for short in 0..OPEN {
+            assert_eq!(
+                classify(MSG_STREAM_OPEN, short, None),
+                Control::Violation,
+                "a {short}-byte open must be refused, not decoded from whatever follows",
+            );
+        }
+        // A second open on a connection that already carries a stream: one
+        // client is one stream, and the `None` in the guard is what says so.
+        assert_eq!(classify(MSG_STREAM_OPEN, OPEN, Some(3)), Control::Violation);
+
+        assert_eq!(classify(MSG_STREAM_SET_VOLUME, VOL, Some(3)), Control::SetVolume { idx: 3 });
+        // Volume before there is a stream to aim it at, and volume of the wrong
+        // width — the `f32` read on the other side is unchecked, so this guard
+        // is the only thing standing between a short frame and stale bytes.
+        assert_eq!(classify(MSG_STREAM_SET_VOLUME, VOL, None), Control::Violation);
+        for wrong in [0, VOL - 1, VOL + 1, OPEN] {
+            assert_eq!(classify(MSG_STREAM_SET_VOLUME, wrong, Some(3)), Control::Violation);
+        }
+
+        // Close is a bare signal: it needs a stream and it ignores whatever a
+        // client chose to attach to it, up to the width the frame buffer keeps.
+        assert_eq!(classify(MSG_STREAM_CLOSE, 0, Some(3)), Control::Close { idx: 3 });
+        assert_eq!(classify(MSG_STREAM_CLOSE, OPEN, Some(3)), Control::Close { idx: 3 });
+        assert_eq!(classify(MSG_STREAM_CLOSE, 0, None), Control::Violation);
+
+        // **The over-long frame, which is the one refusal the SDK's reader does
+        // not make for us.** A peer that declares more than any payload here is
+        // wide is refused whatever type it names, because `FrameRx` reports the
+        // excess as exactly `MAX_KEPT_PAYLOAD` — this is the header check the
+        // hand-written buffer used to do, kept.
+        for kind in [MSG_STREAM_OPEN, MSG_STREAM_SET_VOLUME, MSG_STREAM_CLOSE] {
+            for stream_idx in [None, Some(3)] {
+                assert_eq!(
+                    classify(kind, MAX_KEPT_PAYLOAD, stream_idx),
+                    Control::Violation,
+                    "an over-long {kind} frame must be refused, not truncated into a message",
+                );
+            }
+        }
+
+        // Nothing else is a message — including the two soundd only ever sends.
+        for other in [0, MSG_STREAM_OPENED, MSG_STREAM_ERROR, u32::MAX] {
+            for stream_idx in [None, Some(3)] {
+                for len in [0, VOL, OPEN] {
+                    assert_eq!(classify(other, len, stream_idx), Control::Violation);
+                }
+            }
         }
     }
 }

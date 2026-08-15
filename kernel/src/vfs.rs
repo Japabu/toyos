@@ -30,22 +30,6 @@ pub fn lock() -> VfsGuard {
     VfsGuard(VFS.lock())
 }
 
-/// The VFS, or `None` if another CPU has it.
-///
-/// For a caller that must not wait on a filesystem — the idle loop, which is
-/// about to run a scheduler pass — and for the one case where waiting would
-/// not merely be slow: a thread that panicked while holding this lock never
-/// releases it, and `Lock::lock` turns that into a second panic after 500M
-/// spins. `specs/issues/panic-path/panic-holding-process-table-hangs.md` records
-/// that hazard; this is how a caller declines to inherit it.
-pub fn try_lock() -> Option<VfsGuard> {
-    let guard = VFS.try_lock()?;
-    if guard.is_none() {
-        return None;
-    }
-    Some(VfsGuard(guard))
-}
-
 /// Trait abstracting filesystem operations so the VFS can hold
 /// heterogeneous mount points (initrd on SliceDisk, nvme on NvmeDisk).
 ///
@@ -277,10 +261,6 @@ impl Vfs {
 
     pub fn set_root(&mut self, fs: Box<dyn FileSystem>) {
         self.root = Some(fs);
-    }
-
-    pub fn root_mut(&mut self) -> &mut dyn FileSystem {
-        self.root.as_deref_mut().expect("no root filesystem")
     }
 
     pub fn mount(&mut self, name: &str, fs: Box<dyn FileSystem>, access: UserAccess) {

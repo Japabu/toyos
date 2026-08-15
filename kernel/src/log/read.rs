@@ -123,10 +123,6 @@ impl Cursor {
         Self { next: [FIRST_SEQ; MAX_LOG_SHARDS], lost: 0 }
     }
 
-    pub fn lost(&self) -> u64 {
-        self.lost
-    }
-
     /// The walk state a caller's own [`LogCursor`] describes.
     ///
     /// **Nothing here is validated and nothing here has to be.** Both fields

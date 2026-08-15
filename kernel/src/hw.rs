@@ -144,6 +144,7 @@ impl Machine for KernelHw {
 /// line a CPU whose wake landed just the wrong side of the boundary would drop
 /// out of the mask, and a field that flickers on a healthy machine cannot be
 /// read as "that CPU stopped" on a sick one.
+#[cfg(feature = "boot-actuators")]
 const DIAG_TICK_NS: u64 = 100_000_000;
 
 impl Hw for KernelHw {

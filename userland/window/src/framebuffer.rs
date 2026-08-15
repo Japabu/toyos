@@ -155,15 +155,15 @@ impl Screen {
 /// Cumulative; a caller sampling a window subtracts its previous sample.
 #[derive(Clone, Copy, Default)]
 pub struct Traffic {
-    /// Bytes written by the bulk paths — `blit`, `fill_rect`, `scroll_*`.
+    /// Bytes written by the bulk paths — `blit` and `fill_rect`.
     ///
     /// `put_pixel` is not counted. It is the per-pixel path — every glyph a
     /// font draws goes through it one pixel at a time — so a counter there
     /// would tax every program that draws text to pay for one program's
     /// instrument.
     pub written: u64,
-    /// Bytes read back *out of* the surface: `get_pixel`, the row replication
-    /// inside `fill_rect`, `scroll_*`.
+    /// Bytes read back *out of* the surface: `get_pixel`, and the row
+    /// replication inside `fill_rect`.
     ///
     /// Zero for a surface that is only ever drawn into. A caller holding a
     /// scanout mapping should read this as its bill: a read of write-combining
@@ -172,7 +172,7 @@ pub struct Traffic {
     pub read: u64,
     /// Reads of a single pixel (`get_pixel`) — each one a separate round trip.
     pub pixel_reads: u64,
-    /// Reads of a whole row or region (`fill_rect`, `scroll_*`).
+    /// Reads of a whole row or region (`fill_rect`).
     pub bulk_reads: u64,
 }
 
@@ -229,13 +229,6 @@ impl Framebuffer {
             pixel_reads: self.pixel_reads.get(),
             bulk_reads: self.bulk_reads.get(),
         }
-    }
-
-    /// A copy of the surface into itself: the same bytes read and written.
-    fn record_self_copy(&self, bytes: usize) {
-        self.written.set(self.written.get() + bytes as u64);
-        self.read.set(self.read.get() + bytes as u64);
-        self.bulk_reads.set(self.bulk_reads.get() + 1);
     }
 
     pub fn width(&self) -> usize {
@@ -371,39 +364,6 @@ impl Framebuffer {
 
     pub fn clear(&self, color: Color) {
         self.fill_rect(0, 0, self.width, self.height, color);
-    }
-
-    pub fn scroll_up(&self, pixel_rows: usize, bg: Color) {
-        if pixel_rows >= self.height {
-            self.clear(bg);
-            return;
-        }
-        let row_bytes = self.stride * 4;
-        let count = (self.height - pixel_rows) * row_bytes;
-        unsafe {
-            let src = self.buf.add(pixel_rows * row_bytes);
-            let dst = self.buf;
-            ptr::copy(src, dst, count);
-        }
-        self.record_self_copy(count);
-        let fill_y = self.height - pixel_rows;
-        self.fill_rect(0, fill_y, self.width, pixel_rows, bg);
-    }
-
-    pub fn scroll_down(&self, pixel_rows: usize, bg: Color) {
-        if pixel_rows >= self.height {
-            self.clear(bg);
-            return;
-        }
-        let row_bytes = self.stride * 4;
-        let count = (self.height - pixel_rows) * row_bytes;
-        unsafe {
-            let src = self.buf;
-            let dst = self.buf.add(pixel_rows * row_bytes);
-            ptr::copy(src, dst, count);
-        }
-        self.record_self_copy(count);
-        self.fill_rect(0, 0, self.width, pixel_rows, bg);
     }
 }
 

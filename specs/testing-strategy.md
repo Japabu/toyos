@@ -9,6 +9,16 @@
    merged result is clean. Red means the diff is defective. A gate that reds at
    a rate independent of the diff is itself the defect, and is fixed or
    removed.
+3. **A test that asserts on a kernel or daemon log line reads that line from one
+   named constant — the writer's own where the crate is reachable, otherwise a
+   single declaration in `tests/common/` that cites the writer — and never a
+   literal copied at the assertion**, because a copy has nothing holding it to
+   the sentence it copied, and a reworded line then reds a gate that is
+   measuring nothing.
+4. **A ring names its overflow policy in its type or module header and ships the
+   test that reaches it**, because an overflow path runs only when something is
+   already going wrong, which makes it the path most likely never to have run at
+   all.
 
 ## 2. Instruments and ownership
 

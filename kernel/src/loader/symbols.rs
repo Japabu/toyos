@@ -127,11 +127,6 @@ pub fn read_backtrace_table(
         return empty();
     }
 
-    let entry_size = if syms.entry_size > 0 {
-        syms.entry_size as usize
-    } else {
-        toyos_elf::sym::ENTRY_SIZE
-    };
     let total = (syms.size + strs.size) as usize;
     if total > MAX_SYMBOL_BYTES {
         log!(
@@ -162,7 +157,7 @@ pub fn read_backtrace_table(
 
     SymbolTable::from_pages(
         pages,
-        syms.size as usize, entry_size,
+        syms.size as usize,
         strs.size as usize,
         base,
         prog_base, prog_end, stack_base, stack_end,

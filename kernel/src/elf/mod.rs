@@ -150,10 +150,6 @@ impl LoadedLib {
         table_entries(&self.rela).chain(table_entries(&self.jmprel))
     }
 
-    pub fn tls_filesz(&self) -> usize {
-        self.tls_template.as_ref().map_or(0, |s| s.size())
-    }
-
     /// One past the last virtual address this module occupies.
     ///
     /// Derived rather than stored: it was a field, and four sites added the

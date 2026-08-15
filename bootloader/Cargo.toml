@@ -8,9 +8,9 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 toyos-abi = { path = "../toyos-abi" }
+toyos-elf = { path = "../toyos-elf" }
 uefi = { version = "0.26.0", default-features = false }
 uefi-services = { version = "0.23.0", features = ["panic_handler", "logger"] }
-elf = { version = "0.7.4", default-features = false }
 
 # The one profile every guest binary is built with — `specs/plans/boot-image-split.md`
 # §6. Optimised, because an unoptimised guest mismeasures everything under TCG;

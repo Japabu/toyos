@@ -84,6 +84,9 @@ fn modifiers_of(held: &[u64; 4]) -> u8 {
 }
 
 /// The modifier bitmask every keyboard in the machine adds up to.
+/// The held-modifier bitmask, for `test-input-merge`'s assertion that
+/// `release_all` really released them. No shipping caller.
+#[cfg(feature = "boot-actuators")]
 pub fn modifiers() -> u8 {
     modifiers_of(&HELD.lock())
 }

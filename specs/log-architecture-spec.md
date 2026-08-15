@@ -489,7 +489,7 @@ the tail of the distribution, not by its mean).
 |---|---|---|
 | `Info` | `log!`, 654 sites | everyone |
 | `Phase` | `boot_phase!`, 6 sites | the panel repaints on one |
-| `Alert` | `alert!`, **7 sites** — enumerated below | the panel paints the row red |
+| `Alert` | `alert!`, **6 sites** — enumerated below | the panel paints the row red |
 
 `Alert` **deletes a magic-value sentinel**: `panic_console::has_alert`
 (`mod.rs:1035`) scans each row for three consecutive `!` bytes, and its own
@@ -497,19 +497,26 @@ comment enumerates the strings that happen to match. That is the comment the
 root `CLAUDE.md` says is the type you should have written. It is not a severity
 ordering and nothing orders it; every consumer matches exhaustively.
 
-**The conversion is exactly seven sites and a conversion that misses one loses a
-red row on the panel silently, so they are named** (`grep -rn '!!!' --include='*.rs'
-kernel/src/`, **CONFIRMED** 2026-08-09):
+**The conversion is exactly six sites and a conversion that misses one loses a
+red row on the panel silently, so they are named** (`grep -rn 'alert!' --include='*.rs'
+kernel/src/`, re-measured 2026-08-16; the conversion itself was **CONFIRMED**
+2026-08-09 by the `!!!` grep this replaces):
 
 | site | line |
 |---|---|
-| `main.rs:175` | `!!! EARLY PANIC !!!` |
-| `main.rs:209` | `!!! DOUBLE PANIC !!!` |
-| `main.rs:307` | `report_log_destination`, no `/log` |
-| `main.rs:310` | `report_log_destination`, no console and no `/log` |
-| `arch/debug.rs:87` | `!!! PTE CORRUPTION DETECTED !!!` |
-| `arch/idt/exceptions.rs:276` | `!!! PANIC !!!` |
-| `arch/idt/exceptions.rs:572`, `:575` | `!!! FAULT …` (one `alert!`, two arms) |
+| `main.rs:174` | `!!! EARLY PANIC !!!` |
+| `main.rs:208` | `!!! DOUBLE PANIC !!!` |
+| `main.rs:335` | `report_log_destination`, no `/log` |
+| `main.rs:338` | `report_log_destination`, no console and no `/log` |
+| `arch/idt/exceptions.rs:272` | `!!! PANIC !!!` |
+| `arch/idt/exceptions.rs:568`, `:571` | `!!! FAULT …` (one refusal, two arms) |
+
+**Seven until 2026-08-16, and the row that went names why.**
+`arch/debug.rs:87`'s `!!! PTE CORRUPTION DETECTED !!!` belonged to a timer-tick
+PTE poller with no caller, deleted with the rest of that module's arming tools
+(`specs/issues/design-debt/four-deletions-still-owed.md`). The conversion it
+records still happened; the row goes with the code rather than staying as a
+citation of a line that is not there.
 
 **Two more `!!!` producers exist and are deliberately out of scope**:
 `main.rs:195`'s panic-reentry line and `exceptions.rs:348`'s `!!! DB TRAP !!!`

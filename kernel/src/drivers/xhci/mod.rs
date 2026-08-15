@@ -531,10 +531,6 @@ impl TrbRing {
         Self { base: buf.base() as *mut Trb, base_phys: buf.phys(), tail: 0, cycle: true }
     }
 
-    fn new(buf: KernelSlice) -> Self {
-        Self { base: buf.base() as *mut Trb, base_phys: buf.phys(), tail: 0, cycle: true }
-    }
-
     /// Where the controller should resume, with the cycle state it must expect.
     fn dequeue(&self) -> u64 {
         self.base_phys + (self.tail as u64) * 16 | (self.cycle as u64)
@@ -1892,6 +1888,7 @@ pub fn storage_geometry(index: usize) -> Option<StorageGeometry> {
 /// and not `None` for one that was unplugged: the caller asking is one that
 /// already holds a handle, and "it is gone" is an answer where "there is no
 /// such index" would be a lie.
+#[cfg(feature = "boot-actuators")]
 pub fn storage_online(index: usize) -> Option<bool> {
     (index < storage_count()).then(|| {
         with_disk(index, |ctrl, at| ctrl.msc[at].disk.is_some_and(|d| d.dev.online()))
