@@ -1,11 +1,15 @@
 # Completion Architecture — kill every wait
 
-**This supersedes `specs/iouring-blocking-spec.md` and `specs/blocking-io-plan.md`,
-which are marked superseded in place and point here.** It is one deliverable, not
-two tracks: the first spec is written about *blocking syscalls* and the second
-about *a thread that asked to write a file*, and the reason neither could be built
-alone is §7 — a kill in a kernel that does not unwind cannot be a jump, so making
-a lock parkable and making a wait cancellable are the same change.
+**This supersedes `specs/plans/iouring-blocking-spec.md` and
+`specs/plans/blocking-io-plan.md`, which are deleted with the commit that lands
+this document** — a plan dies on completion, and two plans superseded in place
+are two more files an agent has to read before learning they say nothing. It is
+one deliverable, not two tracks: the first spec was written about *blocking
+syscalls* and the second about *a thread that asked to write a file*, and the
+reason neither could be built alone is §7 — a kill in a kernel that does not
+unwind cannot be a jump, so making a lock parkable and making a wait cancellable
+are the same change. Anything either plan measured that is still load-bearing is
+quoted here, with its source named as the commit that deleted it.
 
 The claim, in one sentence: **every wait in this kernel that runs on a CPU the
 scheduler owns becomes a completion, and the three places a wait may still spin —
@@ -16,6 +20,32 @@ Prime directive, unchanged from the rest of the estate: (1) make the bug class
 unrepresentable, (2) fail fast at runtime, (3) test. Every number below came from
 a command run on `wt/toyos-compl` at `19c761e` on 2026-08-09, or is cited to the
 document that measured it.
+
+**Re-verified against the merged tree on 2026-08-15, at `71a0559`.** Both other
+branches have landed, so the tree this plan is written about now exists: every
+count, line number and table row below was re-run, and the ones that moved are
+corrected in place rather than annotated. What that sweep found is worth stating
+up front, because it is an argument about the plan's method and not a list of
+diffs:
+
+- **The line numbers rotted almost completely and the symbols did not.** All
+  twelve rows of §4.1 moved; every one of §4.5's six; seven of §4.4's twelve. Of
+  the enclosing *function* names the §4.6 gate actually keys on, one changed
+  (`hda_probe`'s is `spin_until_ns`, not `spin_ns`) and one was never right
+  (`panic_console`'s is `screen_claimed_by_userland`). **So the site-granular
+  allow-list was the right design and a line-granular one would have been
+  worthless** — which is the sweep's own vindication of §4.6.
+- **Three of C0's predictions came true and one conclusion drawn from them did
+  not.** `log_ring.rs` is gone, `fd.rs` is gone, `FUTEX_WAKE_GEN` is gone. But
+  the total number of spins went **up**, not down, because three actuator spins
+  arrived while one left. §4.4's instruction — *re-run the enumeration rather
+  than adjust it by one* — is the only method that survives, and it is now
+  doubly earned.
+- **Four claims were wrong about the tree rather than stale against it**, and
+  each is rewritten where it occurs: §4.1 was not the inventory it called itself
+  (three park sites were in no class); §5.6 asserted every subject is
+  level-queryable and one structurally is not (§5.3a); §7.2's replacement code
+  neither compiles nor terminates; and §20.4 named a gate that was never built.
 
 **The log subsystem is no longer this spec's, as of 2026-08-09.**
 `specs/log-architecture-spec.md` (branch `wt/toyos-logd`, `59f9bb6`) rebuilds it
@@ -69,17 +99,28 @@ preempt depth **4 from the idle loop and 5 from a syscall**, with the backtrace:
 `log_file::SINK` → `vfs::VFS` → `fat32_adapter::VOLUMES` → `xhci::XHCI`, each a
 ticket spinlock disabling preemption for its whole life. Measured 2026-08-08 on
 `wt/toyos-asyncusb` at `87835d1` (`specs/issues/audio/disk-wait-pins-a-cpu.md`,
-and the full backtrace in the superseded `blocking-io-plan.md` §1). The number is
-not derivable from the call graph: a reader counting names finds three.
+and the full backtrace in `blocking-io-plan.md` §1, which this document's own
+landing commit deletes — the backtrace is quoted in that entry, which is why the
+entry and not the plan is the citation). The number is not derivable from the
+call graph: a reader counting names finds three.
 
 **Under the ruled order this is history by C0 and half of it is already fixed.**
 The *idle-loop* arm of that reading is the log branch's: after its L6 there is no
 `log_file::SINK`, no `log_file::poll`, and no path at all by which an idle CPU
 reaches a block device, so C0 has no idle-loop depth to measure. **The syscall
 arm is what remains and it is this branch's whole subject** — `ProcessData` →
-`VFS` → `VOLUMES` → `XHCI` from `fd.rs:644`, unchanged by that branch. C0
-re-measures and records both, and §20.2's target is written against the
-re-measured number rather than against 4 and 5.
+`VFS` → `VOLUMES` → `XHCI`, unchanged by that branch. C0 re-measures and records
+both, and §20.2's target is written against the re-measured number rather than
+against 4 and 5.
+
+**`fd.rs` no longer exists and every citation of it in this document was
+re-pointed on 2026-08-15.** The endowment branch's chunk 2 (`6d81a73`, on `main`)
+deleted it: `FdTable`/`Descriptor` became `HandleTable`/`KObjectRef` and the
+dispatch moved to `kernel/src/object/ops.rs`. The two sites this document leaned
+on hardest are now `object::ops::fsync` (`kernel/src/object/ops.rs:654`,
+dispatched from `arch/syscall.rs:298`) and the readiness question
+`object::ops::has_data` (`ops.rs:699`, whose `Console` arm is `serial::has_data()`
+at `:703`).
 
 **1.2 A realistic stick costs the audio pipeline seven to eleven times over.**
 `usb-slow-device` holds every mass-storage bulk completion back 2 ms
@@ -104,7 +145,7 @@ because an audio client parks on a pipe owing no time at all.
 against a recorded 0 of 120, Fisher p=8.03e-4**, on `80fe031`
 (`specs/issues/audio/thorough-tier-reds-on-unmodified-main.md`). The first draft
 wrote "7 of 28", which is a real measurement from a *different* document and a
-different session — `specs/memory-boundary-spec.md`'s M3 three-arm run. It
+different session — `specs/plans/memory-boundary-spec.md`'s M3 three-arm run. It
 therefore answers an A/B and never a pass/fail, which §20 turns into a protocol.
 
 ---
@@ -120,7 +161,8 @@ reason is stated in the root `CLAUDE.md` and nowhere in either plan:
 > value is actually dropped — and "killed by another CPU" is not one.
 
 Today a task killed while parked is disposed as an **exit** at the park
-(`Commit::Killed` → `dispose_exit`, `kernel/src/sched/driver.rs:439`). Everything
+(`Commit::Killed => (pass.dispose_exit().finish(), None)`,
+`kernel/src/sched/driver.rs:482`). Everything
 on its kernel stack is abandoned without running a destructor. That is survivable
 only because the one thing on that stack is a *spinlock* guard, and a spinlock
 guard cannot be held across a park at all — `scheduler::assert_baseline` refuses
@@ -162,7 +204,7 @@ A **`Floor`** is a duration used as a bound on *another* duration rather than as
 wait. Nothing expires; there is no caller and no register. Two instances, and the
 first is why this kind has to exist:
 
-- **`apic.rs:286`'s `MIN_ONE_SHOT_NS` (10 µs)** — the LAPIC one-shot floor.
+- **`apic.rs:322`'s `MIN_ONE_SHOT_NS` (10 µs)** — the LAPIC one-shot floor.
   `OneShot::ticks` clamps every arm to it, so a count that does not outlast the
   interrupt it schedules is unrepresentable. This is #156: cpu0 gone off the T14
   on eight boots of eight, reachable from Ring 3 by a deadline already past. Its
@@ -193,27 +235,33 @@ first is why this kind has to exist:
   What survived the strike as a *finding* dies with them: `MAX_BLOCKED_NANOS`
   existed only because `log_file::poll` `try_lock`s the VFS, and neither the poll
   nor the constant reaches this branch.
-- `retire_task`'s `RECHECK_NS` (50 ms) — **covered, but it is a widening and not a
-  deletion, and the first draft's wording will make an implementer delete both
-  halves.** The poster already exists (`payload.rs:155` `publish_released` →
-  `waitqs::wake_all`), so parking is sound. But the 1 s panic at
-  `scheduler.rs:378` is evaluated *only at the top of the `while` loop*, which is
-  re-entered only because the 50 ms deadline returns `block_on`. Park with no
-  deadline and the `Tripwire` never fires: a lost wake parks forever. **The park
-  must carry `Tripwire(1 s)` itself** — one deadline instead of twenty re-polls,
-  expiry a panic instead of a retry. §7.3 then re-derives that 1 s, because it now
-  bounds an unwind.
-- `arch/syscall.rs:783`'s 10 ms — **NOT COVERED. It is the only reason a
+- `retire_task`'s `RECHECK_NS` (50 ms, `scheduler.rs:441`) — **covered, but it is
+  a widening and not a deletion, and the first draft's wording will make an
+  implementer delete both halves.** The poster already exists
+  (`sched/payload.rs:155` `publish_released` → `waitqs::wake_all`), so parking is
+  sound. But the 1 s panic at `scheduler.rs:445` is evaluated *only at the top of
+  the `while` loop*, which is re-entered only because the 50 ms deadline returns
+  `block_on`. Park with no deadline and the `Tripwire` never fires: a lost wake
+  parks forever. **The park must carry `Tripwire(1 s)` itself** — one deadline
+  instead of twenty re-polls, expiry a panic instead of a retry. §7.3 then
+  re-derives that 1 s, because it now bounds an unwind — **and §7.3's correction
+  is that the loop does not wait on the state word at all**, so the re-derivation
+  is against `handle.released()`.
+- The 10 ms behind a serial-console read — **NOT COVERED. It is the only reason a
   serial-console read ever returns**, and the replacement named in §4.1 P5 and
-  §11 is about a different device. Evidence: the 16550's IER is written to zero
-  (`serial.rs:35`, "Disable all interrupts"), `virtio_console.rs` has no interrupt
-  handler at all, readiness is `serial::has_data()` (`fd.rs:672`) but the park is
-  on `waitqs::KEYBOARD`, whose only waker is `keyboard.rs:67` — the i8042/USB
-  keyboard, a different device. **Nothing posts.** §11 gives the *i8042* a `Poll`,
-  and the i8042 is the one device here whose IRQ line does work
-  (`i8042/mod.rs:1554` arms it, `:1586` unmasks it, `:145` counts the edges).
-  **The correct scope is a third `Poll`, on `serial::has_data`, whose `Cadence` is
-  this 10 ms.** The number survives, reclassified; the deletion is withdrawn.
+  §11 is about a different device. On the merged tree it is
+  `ReadBlock::Keyboard(nanos_since_boot() + 10_000_000)` (`arch/syscall.rs:1042`,
+  computed at `:1031`), consumed by the park at `:1100`. Evidence that nothing
+  posts: the 16550's IER is written to zero (`serial.rs:40`, "Disable all
+  interrupts"), `virtio_console.rs` has no interrupt handler at all, readiness is
+  `serial::has_data()` (`object/ops.rs:703`, inside `ops::has_data`) but the park
+  is on `waitqs::KEYBOARD` (`sched/waitqs.rs:39`), whose only waker is
+  `keyboard.rs:67` — the i8042/USB keyboard, a different device. **Nothing
+  posts.** §11 gives the *i8042* a `Poll`, and the i8042 is the one device here
+  whose IRQ line does work (`i8042/mod.rs:1589` unmasks it, `:112`'s `LOST_EDGES`
+  counts what it drops). **The correct scope is a third `Poll`, on
+  `serial::has_data`, whose `Cadence` is this 10 ms.** The number survives,
+  reclassified; the deletion is withdrawn.
 - `USB_TIMEOUT_NS` (2 s) **as a transfer bound.** USB publishes none for a bulk
   transfer, so §12 gives it no bound and names its cancellers instead. **As a
   register-settle bound the first draft's binary is wrong**: there are six settle
@@ -224,11 +272,12 @@ first is why this kind has to exist:
   **xHCI 1.2 publishes no number at all** — §4.2 says only "wait until CNR is
   '0'"). C10 decides each site and says which; the two uncitable ones become
   `Tripwire`s, because a controller that never clears CNR is a broken machine.
-  **Collateral the first draft missed:** `arch/tlb.rs:77` derives `ACK_TIMEOUT_NS`
-  = 5 s from this constant *by name*, so splitting it orphans the one keep §3 was
-  most confident about, and C10 owes that constant a new reason.
-- `apic.rs`'s `LOG_FILE_DRAIN_NANOS` (500 ms, `apic.rs:117`) — **not a
-  `Tripwire`.** `apic.rs:200` logs "the panel is the only copy" and **returns**;
+  **Collateral the first draft missed:** `arch/tlb.rs:77`'s doc derives
+  `ACK_TIMEOUT_NS` = 5 s (`tlb.rs:81`) from this constant *by name*, so splitting
+  it orphans the one keep §3 was most confident about, and C10 owes that constant
+  a new reason.
+- `apic.rs`'s `LOG_FILE_DRAIN_NANOS` (500 ms, `apic.rs:144`) — **not a
+  `Tripwire`.** `apic.rs:236` logs "the panel is the only copy" and **returns**;
   it deliberately does not panic, because the machine is already going down and a
   second panic loses the report. Under §3's own definition ("a duration whose
   expiry is a **panic**") this is a `Bound` whose expiry is a named refusal.
@@ -239,22 +288,24 @@ first is why this kind has to exist:
 
 ### 3.3 What §3 keeps
 
-- `arch/tlb.rs`'s `ACK_TIMEOUT_NS` (5 s) — a `Tripwire`; it already panics
-  (`tlb.rs:139`). Its *derivation* does not survive: see above.
+- `arch/tlb.rs`'s `ACK_TIMEOUT_NS` (5 s, `tlb.rs:81`) — a `Tripwire`; it already
+  panics (`tlb.rs:140`). Its *derivation* does not survive: see above.
 - `sched/dump.rs`'s budgets — **not `Tripwire`s.** The first draft's own sentence
   gives it away: "their expiry degrades the report field by field, which is the
-  point". None of them panics — `ANSWER` (`:213`) logs and breaks, `NMI` (`:265`)
-  breaks, `TABLE` (`:530`) returns `false` and the summary says the census is
-  missing. They are a **sixth shape: a `Budget`, whose expiry is a degraded
-  answer.** That is exactly right for a diagnostic on a machine already known to
-  be broken, and it must be constructible or the dump cannot be written. Also:
-  `ACK` is declared inside `#[cfg(feature = "dump-deaf-cpu")] deaf_window()` —
-  a test actuator, not one of the four, and listing it beside the three
-  production ones while omitting `ABSURD_HORIZON_NS` was an error.
-- `xhci/wait/boot.rs`'s `PORT_POLL_NS` (1 ms) — a `Cadence`. The value and the
-  classification are right; the comment the first draft quoted is from
-  `fat32_adapter.rs:871`, not from `boot.rs`, whose own text is "How often the
-  settle re-reads the port registers."
+  point". None of them panics — `ANSWER_BUDGET_NS` (`:65`, consumed at `:212`)
+  logs and breaks, `NMI_BUDGET_NS` (`:86`, consumed at `:270`) breaks,
+  `TABLE_BUDGET_NS` (`:80`, consumed at `:501`) returns `false` and the summary
+  says the census is missing. They are a **sixth shape: a `Budget`, whose expiry
+  is a degraded answer.** That is exactly right for a diagnostic on a machine
+  already known to be broken, and it must be constructible or the dump cannot be
+  written. Also: `ACK_BUDGET_NS` (`:329`) is declared inside
+  `#[cfg(feature = "dump-deaf-cpu")] deaf_window()` (`:308`) — a test actuator,
+  not one of the four, and listing it beside the three production ones while
+  omitting `ABSURD_HORIZON_NS` (`:59`) was an error.
+- `xhci/wait/boot.rs`'s `PORT_POLL_NS` (1 ms, `boot.rs:66`) — a `Cadence`. The
+  value and the classification are right; the comment the first draft quoted is
+  from `fat32_adapter.rs:874`, not from `boot.rs`, whose own text is "How often
+  the settle re-reads the port registers."
 - `smp.rs`'s 100 ms AP wait — behaves as a `Bound` (`:251` declares the AP absent
   by name) but is a bare inline literal with **no name and no citation**, and SDM
   §8.4.4.1's numbers are the 10 ms and 200 µs beside it, not this. C1 either finds
@@ -266,8 +317,9 @@ The sweep found **41 production durations in `kernel/src/`**; the first draft
 named 12. The 29 it did not name include every one that fits no kind: all six
 i8042 budgets (2,100 ms of boot, whose own comment says no real EC has ever been
 timed), `PORT_SETTLE_CEILING_NS`, `EMPTY_BUS_NS`, `READY_BUDGET_NS`,
-`HANDOFF_TIMEOUT_NS`, `PAGE_HOLD_NS`, `REPORT_HOLD_NS`, `clock.rs:47`,
-`apic.rs:253`, and both `smp.rs` `delay_ms` calls.
+`HANDOFF_TIMEOUT_NS`, `PAGE_HOLD_NS`, `REPORT_HOLD_NS`, `clock.rs:47`'s 50 ms TSC
+calibration, `apic.rs:289`'s 10 ms LAPIC calibration, and both `smp.rs`
+`delay_ms` calls (`:225`, `:228`).
 
 **RT7 plus an incomplete taxonomy is a kernel that does not build**, so C1's
 deliverable is not "the four kinds exist" but **"every production duration in
@@ -288,7 +340,7 @@ Two further shapes C1 must not confuse with durations: `Cadence`'s definition
 kernel has — `REPORT_CHECK_NS`, `HEALTH_PERIOD_NS`, `SNAPSHOT_INTERVAL_NS` are
 cost budgets and log-rate limits, so the definition widens to "how often a thing
 may be re-done, and what makes that rate affordable". And **spin *counts* are not
-durations** — `serial.rs:202`'s `PANIC_LOCK_SPIN_LIMIT`, `serial.rs:422`'s
+durations** — `serial.rs:237`'s `PANIC_LOCK_SPIN_LIMIT`, `serial.rs:534`'s
 `THRE_SPIN_LIMIT`, `sync.rs`'s 50M/500M — even where a doc comment prices them in
 seconds. RT7 must not reach them.
 
@@ -296,72 +348,158 @@ seconds. RT7 must not reach them.
 
 ## 4. The wait inventory
 
-`grep -rn "core::hint::spin_loop();" kernel/src/` returns **39** calls, 23 of them
-under `kernel/src/drivers/`. `scheduler::wait_until` has **6** callers,
-`prepare_wait` **7** and `block_on` **7** (three of each inside `scheduler.rs`
-itself). Every one is below, with its disposition. This table is the refactor's
-inventory and the migration ledger in §18 counts against it.
+`rg -n "core::hint::spin_loop\(\);" kernel/src/` returns **41** calls, **22** of
+them under `kernel/src/drivers/`. `scheduler::wait_until` has **7** call sites,
+`prepare_wait` **9** and `block_on` **9** — three `prepare_wait` and three
+`block_on` inside `scheduler.rs` itself (`:251`/`:389`/`:450` and
+`:256`/`:394`/`:455`), and **no** `wait_until` at all: all seven live in
+`kernel/src/arch/syscall.rs`. Every one is below, with its disposition. This
+table is the refactor's inventory and the migration ledger in §18 counts against
+it.
 
-### 4.1 Class P — a task waits. Twelve sites collapse to one.
+**Re-run 2026-08-15 at `71a0559`, and the header moved in the direction the plan
+did not predict.** 39 became 41 despite `log_ring.rs` leaving with its one spin
+(§4.4): three actuator spins arrived (`log/nested.rs:104`, `arch/mod.rs:133`,
+`main.rs:734`), and the drivers subcount fell from 23 to 22 because the departed
+site was under `kernel/src/drivers/`.
+
+### 4.1 Class P — a task waits. Fifteen sites collapse to one.
+
+**The first draft called this "the refactor's inventory" and listed twelve, and
+the tree has fifteen.** Three park sites appear in no §4 class at all, and all
+three are in the log subsystem: `log/console.rs:461,478` is `klogd`'s park, and
+`log/storm.rs:149,150` and `log/nested.rs:81,82` are the two log actuator threads
+that park forever rather than exit. §21 says "13 park sites → 1", which counted
+`klogd` and neither actuator; **15 is the number, and the two actuators park on
+`park_lot()` exactly as the sites this branch deletes it for do.** They are
+rows P13–P15 and the conversion has to carry them or `park_lot` cannot be
+deleted.
 
 | # | site | waits on | today's bound | after |
 |---|---|---|---|---|
-| P1 | `arch/syscall.rs:690` | pipe writable | none | park on the write end's completion |
-| P2 | `arch/syscall.rs:797` | pipe readable | none | park on the read end's completion |
-| P3 | `arch/syscall.rs:799` | virtio-sound period | none | park on the `DeviceClaim`'s completion |
-| P4 | `arch/syscall.rs:804` | HDA period | none | park on the `DeviceClaim`'s completion |
-| P5 | `arch/syscall.rs:809` | serial-console key | **10 ms re-poll** | **the 10 ms stays, as a `Cadence` in a `Poll` on `serial::has_data`** — nothing posts a serial-console key, and the park is on `waitqs::KEYBOARD`, a different device (§3.2) |
-| P6 | `arch/syscall.rs:1279` | accept | none | park on the **`Acceptor`**'s `PortShared` (§15 row 5) |
-| P7 | `arch/syscall.rs:1202,1213` | child exit | none | `SYS_PROCESS_WAIT(proc_h)`, parking on the `ProcessObject` |
-| P8 | `arch/syscall.rs:1578,1584` | thread exit | none | park on the `ThreadObject`; `SYS_THREAD_JOIN` keeps its `Tid` (§15 row 6) |
-| P9 | `arch/syscall.rs:1715` | an instant | caller's | park on a deadline completion |
-| P10 | `io_uring.rs:410,419` | a CQE | caller's | the ring **is** an inbox (§5.2) |
-| P11 | `scheduler.rs:325,330` | a futex word | caller's | park on the bucket's completion; `FUTEX_WAKE_GEN` deleted |
-| P12 | `scheduler.rs:386,391` | a task's release | **50 ms re-poll + 1 s panic** | park on the release completion **carrying `Tripwire(1 s)` as its own deadline** — the panic is only reachable through the re-poll today, so deleting both parks forever (§3.2). §7.3 re-derives the 1 s: it now bounds an unwind |
+| P1 | `arch/syscall.rs:931` | pipe writable | none | park on the write end's completion |
+| P2 | `arch/syscall.rs:1088` | pipe readable | none | park on the read end's completion |
+| P3 | `arch/syscall.rs:1090` | virtio-sound period | none | park on the `DeviceClaim`'s completion |
+| P4 | `arch/syscall.rs:1095` | HDA period | none | park on the `DeviceClaim`'s completion |
+| P5 | `arch/syscall.rs:1100` | serial-console key | **10 ms re-poll** (`:1042`) | **the 10 ms stays, as a `Cadence` in a `Poll` on `serial::has_data`** — nothing posts a serial-console key, and the park is on `waitqs::KEYBOARD`, a different device (§3.2) |
+| P6 | `arch/syscall.rs:1891` (`sys_accept`, `:1858`) | accept | none | park on the **`Acceptor`**'s `PortShared` (§15 row 5) |
+| P7 | `arch/syscall.rs:1456` (`sys_process_wait`, `:1447`) | child exit | none | `SYS_PROCESS_WAIT(proc_h)`, parking on the `ProcessObject` |
+| P8 | `arch/syscall.rs:2210,2216` (`sys_thread_join`, `:2205`) | thread exit | none | park on the `ThreadObject`; `SYS_THREAD_JOIN` keeps its `Tid` (§15 row 6) |
+| P9 | `arch/syscall.rs:2361,2362` (`sys_nanosleep`, `:2357`) | an instant | caller's | park on a deadline completion |
+| P10 | `io_uring.rs:449,458` | a CQE | caller's | the ring **is** an inbox (§5.2) |
+| P11 | `scheduler.rs:389,394` (`futex_wait`, `:387`) | a futex word | caller's | park on the bucket's completion |
+| P12 | `scheduler.rs:450,455` (`retire_task`, `:422`) | a task's release | **50 ms re-poll + 1 s panic** | park on the release completion **carrying `Tripwire(1 s)` as its own deadline** — the panic is only reachable through the re-poll today, so deleting both parks forever (§3.2). §7.3 re-derives the 1 s: it now bounds an unwind |
+| P13 | `log/console.rs:461,478` | a committed log record | none | `klogd`'s park becomes an `Inbox` park (§11) — **and `discard_pending()` at `:441` stays in front of the arm**, because a console-less machine must arm too (§5.3a) |
+| P14 | `log/storm.rs:149,150` | nothing, ever | none | a log actuator thread that parks forever rather than exit; it parks on `park_lot()`, so the conversion must carry it or `park_lot` survives |
+| P15 | `log/nested.rs:81,82` | nothing, ever | none | as P14 |
+
+**Two rows changed shape rather than position, and both are already half
+landed.** P6 no longer parks on a listener at all: `kernel/src/listener.rs` and
+`wake_poll_waiters` are gone with the endowment branch, and the site already
+parks on `acceptor.waiters()` with the condition `acceptor.has_pending() ||
+acceptor.closed()`. What is left for this branch is turning that queue into a
+completion, not re-pointing it off a listener. And P7 is one `wait_until` call,
+not the `prepare_wait`/`block_on` pair the first draft's two line numbers
+described: `sys_process_wait` takes a `RawHandle` with `Rights::WAIT`, resolves a
+`ProcessObject` and parks once on `object.finished()`. §18's note that P7 "is
+inside `sys_waitpid`, whose number 26 they retire" is spent.
+
+**P11 has nothing left to delete.** `FUTEX_WAKE_GEN` and the wake-generation
+protocol went independently of this branch, in `ba76478` ("Convert futex to wait
+tickets, deleting the wake-generation dance"), already on `main`: `futex_wait` is
+plain register-then-read-then-park and `futex_wake` (`:400`) is one line
+delegating to `waitqs::wake_n`. The row is now only the fold onto the bucket's
+completion.
+
+**P5's and P12's numbers are exactly what they were**, which is worth saying
+because everything around them moved: the 10 ms is
+`ReadBlock::Keyboard(nanos_since_boot() + 10_000_000)` (`:1042`) consumed at
+`:1100` on `waitqs::KEYBOARD`, and P12's are `const RECHECK_NS: u64 =
+50_000_000` (`scheduler.rs:441`) with `give_up = now + 1_000_000_000` (`:442`)
+and the panic at `:445`.
 
 ### 4.2 Class D — a CPU waits for a device on a thread's behalf. Four spins deleted.
 
 | # | site | today | after |
 |---|---|---|---|
-| D1 | `xhci/wait/mod.rs:361` `wait_transfer` | spin, `XHCI` held, 2 s | submit, drop `XHCI`, park on the outstanding slot (§12) |
-| D2 | `xhci/wait/mod.rs:299` `wait_command` | spin, `XHCI` held, 2 s | same |
-| D3 | `nvme.rs:118` `wait_completion` | **unbounded** spin | park on the completion queue's ISR post |
-| D4 | `virtio.rs:416` `submit_and_wait` | **unbounded** spin | park on the used-ring ISR post |
+| D1 | `xhci/wait/mod.rs:363` (`wait_transfer`, `:340`) | spin, `XHCI` held, 2 s | submit, drop `XHCI`, park on the outstanding slot (§12) |
+| D2 | `xhci/wait/mod.rs:299` (`wait_command`, `:292`) | spin, `XHCI` held, 2 s | same |
+| D3 | `nvme.rs:118` (`wait_completion`, `:106`) | **unbounded** spin | park on the completion queue's ISR post |
+| D4 | `virtio.rs:416` (`submit_and_wait`, `:403`) | **unbounded** spin | park on the used-ring ISR post |
 
 These four are the whole finding. They are the only spins in the kernel that run
 on a thread which could have given the CPU back.
 
+**Only D1's line moved, and all four enclosing function names are unchanged** —
+which is what §4.6's function-granular allow-list and §19's by-name deletions
+rest on.
+
 ### 4.3 Class S — a register with no interrupt behind it. Spin becomes `Poll`.
 
-`xhci/wait/mod.rs:169` (`settles`), `hda.rs:764`, `hda_probe.rs:985`,
+`xhci/wait/mod.rs:169` (`settles`), `hda.rs:767`, `hda_probe.rs:985`,
 `iommu/vtd/mod.rs:276`, `iommu/vtd/queue.rs:130`, `nvme.rs:436`, `nvme.rs:460`,
-`virtio.rs:455`, `xhci/legacy.rs:179`, `rtc.rs:180`, `fat32_adapter.rs:875`,
-`xhci/wait/boot.rs:117`, `hda.rs:772` and `hda_probe.rs:993` (`spin_ns`).
+`virtio.rs:455`, `xhci/legacy.rs:181`, `rtc.rs:180`, `fat32_adapter.rs:879`,
+`xhci/wait/boot.rs:117`, `hda.rs:775` (`spin_ns`) and `hda_probe.rs:993`
+(**`spin_until_ns`**).
 
 Three of them are written byte-for-byte three times against three different
-constants — `xhci/wait/mod.rs:163`, `hda.rs:759`, `hda_probe.rs:980` — which
+constants — `xhci/wait/mod.rs:163`, `hda.rs:761`, `hda_probe.rs:979`, all three
+named `settles` — which
 `specs/issues/kernel/driver-waits-without-a-deadline.md` already records. All
 become one `Poll<T> { bound: Bound, cadence: Cadence }`.
 
+**The pair at the end of the list is not one name, and the gate is why that
+matters.** `hda.rs`'s is `fn spin_ns` (`:772`) and `hda_probe.rs`'s is
+`fn spin_until_ns` (`:990`). §4.6's allow-list keys on the enclosing `fn`, so an
+allow-list written from the first draft's "`spin_ns`" would have missed one of
+them by name and red the tree it was written for.
+
 **Where a `Poll` runs on a thread it parks between reads; where it runs at boot it
-spins.** NVMe's two `CSTS.RDY` polls take their bound from `CAP.TO`, which
-`nvme.rs:429` already reads into a local and discards.
+spins.** `fat32_adapter.rs:879` is inside `pub fn probe_boot_disks()` (`:852`) —
+a boot arm, which is the assumption that sentence makes. NVMe's two `CSTS.RDY`
+polls take their bound from `CAP.TO`, which `nvme.rs:429` already reads into a
+local: `cap` is not wholly discarded — `:430` takes the doorbell stride out of it
+— but the `TO` field, bits 31:24, is never read.
 
 ### 4.4 Class R — an inter-CPU rendezvous with no task behind it. Unchanged.
 
-`sync.rs:52` (`Lock::lock`), `arch/tlb.rs:131` (shootdown ack),
-`arch/smp.rs:238,281`, `sched/dump.rs:225,270,352,392,538`,
-`main.rs:357` (`debug-wait`), `i8042/mod.rs:761` and `arch/tlb.rs:234` (test
-actuators).
+**Fifteen sites, and the enclosing `fn` each is inside — which is what the §4.6
+allow-list carries, the line number being the thing that rots.**
 
-**`log_ring.rs:328` (an ISR may log) was in this list and is gone before C0.**
-`RingGuard::lock`'s `cli` bracket and `compare_exchange_weak` spin
-(`log_ring.rs:312-330`) die with the file at log L3, and the record ring that
-replaces it takes no lock on the producer's path at all (log §2.3). So the
-allow-list is one site shorter than the enumeration below counts, `§18`'s 39
-becomes 38 plus the three bare waits, and **C0 re-runs the enumeration rather
-than adjusting it by one** — the log branch is the third thing to move this
-number and each reading of it has differed.
+| site | enclosing `fn` | what it is |
+|---|---|---|
+| `sync.rs:52` | `Lock::lock` | the ticket spinlock itself |
+| `arch/tlb.rs:131` | shootdown ack | the acknowledging CPU is inside an IPI handler |
+| `arch/smp.rs:238` | AP bring-up handshake | boot, no task exists |
+| `arch/smp.rs:281` | AP bring-up handshake | as above |
+| `sched/dump.rs:230` | `request` (`:170`) | the kick's answer budget |
+| `sched/dump.rs:275` | `request` | the NMI budget |
+| `sched/dump.rs:361` | `probe_silent` (`:251`) | |
+| `sched/dump.rs:401` | `probe_silent` | |
+| `sched/dump.rs:547` | `walk_threads` (`:539`) | the census budget |
+| `main.rs:399` | `kernel_main` (`:343`), `#[cfg(feature = "debug-wait")]` | the debugger wait |
+| `drivers/i8042/mod.rs:771` | `widen_edge_window` | test actuator |
+| `arch/tlb.rs:234` | test actuator | |
+| **`log/nested.rs:104`** | **`mid_body`** (in `mod armed`, `:99`) | **new** — the log-nesting injection window |
+| **`arch/mod.rs:133`** | **`percpu_fetch_add`** (`:112`) | **new** — the `log_shared_reservation` actuator's `sti`/spin/`cli` window |
+| **`main.rs:734`** | **`pre_idle_wedge`** (`#[cfg(feature = "boot-actuators")]`) | **new** — a deliberate `cli` + `loop { spin_loop() }` wedge |
+
+**The last three arrived after the 2026-08-09 enumeration and were in no class at
+all**, so the site-granular allow-list as first specified would have red the tree
+it is written for on day one. They belong here, with the two test actuators
+already in the list; they are named because the gate matches on the enclosing
+`fn`.
+
+**`log_ring.rs:328` (an ISR may log) was in this list and is gone.**
+`RingGuard::lock`'s `cli` bracket and `compare_exchange_weak` spin died with the
+file at log L3, and the record ring that replaced it takes no lock on the
+producer's path at all (log §2.3). **The prediction came true and the conclusion
+drawn from it did not**: the first draft concluded "the allow-list is one site
+shorter and §18's 39 becomes 38", and the total went *up* to 41, because the
+three new actuator spins outnumber the one that left. §4.4's own instruction —
+**C0 re-runs the enumeration rather than adjusting it by one** — is the only
+method that survives contact with this tree, and it is now the third time in a
+row that adjusting by one would have been wrong.
 
 **A completion cannot serve any of these**: there is no task to park and, for the
 shootdown, the acknowledging CPU is inside an IPI handler. An agent who tries to
@@ -370,23 +508,47 @@ left to be discovered.
 
 ### 4.5 Class X — a dying machine. Unchanged.
 
-`serial.rs:234,272` (panic-path `try_lock` retry), `serial.rs:433` (THRE),
-`panic_console/mod.rs:270,617`, `apic.rs:203`.
+`serial.rs:269` (`panic_flush`, the panic-path `try_lock` retry), `serial.rs:545`
+(`uart_write_bytes`, THRE), `panic_console/mod.rs:423`
+(`screen_claimed_by_userland`, the 2 s `PAINTING` checkpoint wait),
+`panic_console/mod.rs:771` (`hold`, the halted-machine pager's polled
+`i8042::poll_byte` key loop, reachable only from `page_forever`), `apic.rs:239`
+(`wait_for_log_file`, `:190`).
+
+**Five, not six: `serial.rs:300` was in this list and is not a dying machine.**
+It is inside `pub fn flush_final()` (`:294`), the clean-shutdown drain before
+`acpi::shutdown()`, and the function's own doc comment draws the line in terms —
+it does *not* take `panic_flush`'s bypass, because "every CPU is still live here,
+and reading the ring unsynchronized is only defensible when nothing else will
+ever run." Classifying it as a dying machine is exactly what would let a later
+agent carry `panic_flush`'s reasoning onto a live one. **It is a bounded
+lock-acquire on a running machine — §4.5a's shape, not §4.5's — and it moves
+there.**
 
 ### 4.5a Class L — a hand-rolled lock the four classes missed
 
-`serial.rs:104` is `BackendGuard::lock`'s spin: an `AtomicBool` compare-exchange
-loop taken under `save_and_cli()`, so a CPU inside it is deaf to every IPI. The
+**Two sites.**
+
+`serial.rs:138` is `BackendGuard::lock`'s spin (the `impl` opens at `:130`): a
+`BACKEND_LOCKED.compare_exchange_weak` loop over an `AtomicBool` static (`:120`)
+taken under `save_and_cli()`, so a CPU inside it is deaf to every IPI. The
 root `CLAUDE.md` already names it ("unbounded too, with no contention warning and
 no deadlock panic"). It is **not** a `Lock<T>`, so §9's table of statics does
 not see it, and it is not a dying-machine spin, so §4.5 does not cover it — it is
 the serial backend's mutual exclusion in ordinary operation, taken by every log
 drain.
 
-It stays a spin for now, because the alternative is a sleep lock the panic path
+`serial.rs:300` is `flush_final`'s bounded acquire, moved here from §4.5. Same
+shape and the same reason: a `PANIC_LOCK_SPIN_LIMIT`-bounded `try_lock` retry on
+a machine where every CPU is still live. Its own doc comment is what puts it
+here rather than beside `panic_flush`, and the distinction is load-bearing —
+`panic_flush` may read the ring unsynchronized because nothing else will ever
+run, and `flush_final` may not.
+
+Both stay spins for now, because the alternative is a sleep lock the panic path
 and the ISR path both need `try_lock` on and neither has a `Parkable` — which is
-what the existing `try_lock` already is. **What changes is that it is named**: it
-goes on the §4.6 allow-list with this justification, and §23's rejection 8 is
+what the existing `try_lock` already is. **What changes is that they are named**:
+they go on the §4.6 allow-list with this justification, and §23's rejection 8 is
 corrected, because "the THRE spin runs on a preemptible thread" is false while
 the guard holds `cli`.
 
@@ -394,17 +556,20 @@ the guard holds `cli`.
 have already changed.** The idle loop's `drain_serial` took it on
 pre-log `main`; `specs/log-architecture-spec.md` L3 deleted that caller and gave
 the guard to `klogd`, which holds it for one bounded chunk at a time (log §4.3).
-So C0 finds the *site* exactly as described and its callers already re-pointed.
-The allow-list entry outlives both — `BackendGuard::lock` is still a spin — so
-**C13 must not remove it on the ground that the log branch took the drain
-away.**
+So C0 finds the *site* exactly as described and its callers already re-pointed —
+**verified 2026-08-15: only the line number moved, `:104` → `:138`, and the whole
+justification is intact.** The allow-list entry outlives both —
+`BackendGuard::lock` is still a spin — so **C13 must not remove it on the ground
+that the log branch took the drain away.**
 
 ### 4.5b Class B — a boot-only spin inside a file whose other spins are deleted
 
-`xhci/wait/mod.rs:278` is `settle_outstanding`'s spin. Its own doc comment
-justifies it — "Blocking is correct here and only here: this is the boot scan, so
-there is no scheduler yet". It is correct and it stays. The first draft omitted it
-from all five classes, which is how §4.6's gate came to be file-granular.
+`xhci/wait/mod.rs:278` is `settle_outstanding`'s spin (the `fn` opens at `:270`).
+Its own doc comment justifies it — "Blocking is correct here and only here: this
+is the boot scan, so there is no scheduler yet". It is correct and it stays. The
+first draft omitted it from all five classes, which is how §4.6's gate came to be
+file-granular. **It is also the only §4 citation in the drivers tree that needed
+no correction at all on 2026-08-15.**
 
 ### 4.6 The gate — and why it must be site-granular
 
@@ -413,9 +578,9 @@ listed in 4.3 (boot arms only), 4.4 and 4.5". **A file-granular gate cannot see
 any of the four deletions this document exists to make**, because three of the
 four Class D spins share a file with a Class S spin that stays:
 
-| deleted (§4.2) | survives in the same file (§4.3) |
+| deleted (§4.2) | survives in the same file (§4.3, §4.5b) |
 |---|---|
-| `xhci/wait/mod.rs:361` `wait_transfer` | `xhci/wait/mod.rs:169` `settles`, and `:278` (§4.5b) |
+| `xhci/wait/mod.rs:363` `wait_transfer` | `xhci/wait/mod.rs:169` `settles`, and `:278` `settle_outstanding` |
 | `xhci/wait/mod.rs:299` `wait_command` | as above |
 | `nvme.rs:118` `wait_completion` | `nvme.rs:436`, `nvme.rs:460` |
 | `virtio.rs:416` `submit_and_wait` | `virtio.rs:455` |
@@ -423,37 +588,62 @@ four Class D spins share a file with a Class S spin that stays:
 So the gate is **an allow-list of sites, not of files**: each entry is the
 enclosing function's name plus the one-line reason it may spin, and the test
 matches on the function a spin is inside rather than the path it is in.
-Reintroducing `wait_transfer`'s spin then reds by name. `src/docs.rs`'s family
-walks `kernel/src`, resolves each spin to its enclosing `fn`, and fails on any
-`fn` not on the list. **That list is the scope statement, machine-checked**, and
-shrinking it is the only way a later agent can claim to have removed a spin.
+Reintroducing `wait_transfer`'s spin then reds by name. **That list is the scope
+statement, machine-checked**, and shrinking it is the only way a later agent can
+claim to have removed a spin.
+
+**Its host is `src/sourcegate.rs`, not `src/docs.rs`.** `src/docs.rs` was deleted
+by owner ruling in `8d0db10` ("build: delete the doc tests — owner ruling, no
+tests over documentation"), so every citation of it in this document is void; the
+surviving host-side kernel-source scanner is `src/sourcegate.rs`, which already
+has exactly the machinery this gate needs — `kernel_lines()` (`:190`) walks
+`kernel/src`, `occurrences()` (`:98`) counts per file, and `code_only()` (`:140`)
+strips comments, which is what the two doc-comment false positives below require.
+Five gates already live there in its `#[cfg(test)]` module and the new one joins
+them.
 
 **And it must not key on `spin_loop()`, because a wait need not call it.**
-`grep -rnE "while .*\{\s*\}\s*$" kernel/src/` finds three bare busy-waits that are
-real waits and appear in no `spin_loop` grep:
+`rg -n 'while .*\{\s*\}\s*$' kernel/src/` finds **five** lines, of which **three**
+are real waits:
 
 | site | what it waits for | class |
 |---|---|---|
-| `arch/apic.rs:253` | 10 ms of wall clock, LAPIC calibration | R — boot, no task exists |
+| `arch/apic.rs:289` | 10 ms of wall clock, LAPIC calibration, in `init_timer` (`:280`) | R — boot, no task exists |
 | `arch/smp.rs:297` | `delay_ms`, the AP bring-up delays | R — boot |
 | `clock.rs:53` | the HPET counter, TSC calibration | R — boot |
 
-**Two of those are already in §4.4's own list** — it named `arch/apic.rs:253` and
-`arch/smp.rs:297` as waits, correctly, and they are simply not `spin_loop()`
-calls. A gate that greps for `spin_loop()` therefore licenses converting a
-deleted spin into a bare `while {}` and passing. The gate matches **any** loop
-whose body cannot make progress — `spin_loop()`, a bare `while` with an empty
-body, and `core::hint::spin_loop` under any alias — and the allow-list carries all
-of them.
+**The other two are not waits and the gate must not red on them.**
+`kernel/src/input_merge_test.rs:17` and `:18` are
+`while keyboard::try_read_event().is_some() {}` and its mouse twin: draining
+loops whose *condition* consumes an item each pass, so they make progress and
+terminate. So "a loop whose body cannot make progress" has to be enforced on the
+condition too, or the gate reds on two innocent drains the day it lands.
 
-**The enumeration was re-run on 2026-08-09 at `e6f7769`.** 39 `spin_loop()` calls,
-plus the three bare waits above, is **42 wait sites**. Two corrections to the
-first draft's classification: `serial.rs:104` and `xhci/wait/mod.rs:278` were in no
-class at all (now §4.5a and §4.5b), and `arch/apic.rs:203` appears in both §4.4
-and §4.5 — §4.5 is the right home, and §4.4's entry for it is removed above.
-`grep -rn "spin_loop" kernel/src/` returns 41 lines, two of which are prose in doc
-comments (`xhci/mod.rs:316`, `xhci/wait/mod.rs:160`); a gate matching the bare word
-rather than the call reds on those.
+**None of the three is in §4.4's printed list, and the first draft said two
+were.** §4.4 names `arch/smp.rs:238,281` — two genuine `spin_loop()` calls in the
+AP bring-up handshake, in a different function from the bare `delay_ms` wait at
+`:297` — and it names no `apic` line at all, having deliberately moved
+`apic.rs:239` to §4.5. The *argument* is sound and unchanged: a gate that greps
+only for `spin_loop()` licenses converting a deleted spin into a bare `while {}`
+and passing. The supporting claim was false and would have sent whoever wrote
+the allow-list looking for two rows that do not exist. The gate matches **any**
+loop whose body cannot make progress — `spin_loop()`, a bare `while` with an
+empty body, and `core::hint::spin_loop` under any alias — and the allow-list
+carries all of them.
+
+**The enumeration was re-run on 2026-08-15 at `71a0559`.** 41 `spin_loop()`
+calls, plus the three bare waits above, is **44 wait sites**. Corrections to the
+first draft's classification, all now folded into the sections above:
+`serial.rs:138` and `xhci/wait/mod.rs:278` were in no class at all (now §4.5a and
+§4.5b); `apic.rs:239` appeared in both §4.4 and §4.5, and §4.5 is the right home;
+`serial.rs:300` was in §4.5 and belongs in §4.5a; and `log/nested.rs:104`,
+`arch/mod.rs:133` and `main.rs:734` were in no class because they did not yet
+exist.
+
+`rg -n 'spin_loop' kernel/src/` returns **43** lines, two of which are prose in
+doc comments (`xhci/mod.rs:316`, `xhci/wait/mod.rs:160` — both exact and unmoved);
+43 − 2 = 41, which is the header's count. A gate matching the bare word rather
+than the call reds on those two, which is what `code_only()` is for.
 
 ---
 
@@ -516,6 +706,16 @@ a value rather than an absence.
 pub struct Inbox { .. }
 ```
 
+**Level-readable is a property of the *record in the inbox*, not of the subject
+that posted it**, and the two layers must not be run together — §5.3a is the
+whole of why. A subject whose readiness the kernel cannot query still works here,
+because the record its post leaves in the inbox persists until taken. That is
+live on the tree: `/bin/logd` arms before its first read
+(`userland/logd/src/main.rs:187-188`) and re-arms after an empty read
+(`:213-219`), and a `klogd` post landing between the empty read and the re-arm is
+not lost, because the CQE from the still-outstanding poll sits in the CQ until
+`wait` takes it.
+
 Exactly two kinds exist and both are the same type:
 
 - **A thread's inbox**, in `ThreadData`, holding `MAX_INBOX` records. It is the
@@ -539,10 +739,20 @@ the superseded spec's §13.2 had to plan for.
 #[must_use]
 pub struct Armed<'a> { .. }
 
-/// Arm a watch. Closes the arm-time TOCTOU inside itself: check readiness,
-/// insert the node under the subject's leaf lock, re-check, and fire
-/// immediately if it became ready — exactly what `process_poll_add` does today
-/// (`io_uring.rs:576`), now in one place instead of per source.
+/// Arm a watch.
+///
+/// For a **level** subject (§5.3a) it closes the arm-time TOCTOU inside
+/// itself: check readiness, insert the node under the subject's leaf lock,
+/// re-check, and fire immediately if it became ready — exactly what
+/// `process_poll_add` does today (`io_uring.rs:540`, its recheck at
+/// `:601-616`), now in one place instead of per source.
+///
+/// For an **edge** subject it asks nothing and never fires immediately,
+/// because there is no state to ask about; the waiter's own predicate is
+/// authoritative and is re-derived after this returns. Writing the level
+/// contract as if it were total is what would make a reader implement `arm`
+/// for the log and get a watch that can never fire at arm time while the doc
+/// claims it closes the window.
 pub fn arm<'a>(inbox: &'a Inbox, subject: &Subject, token: Token) -> Armed<'a>;
 
 /// Park until a record is readable. Returns the first record, or `Cancelled`
@@ -554,6 +764,81 @@ pub fn wait(p: &mut Parkable, armed: Armed<'_>) -> Result<Record, Cancelled>;
 listener, a device claim, a process object, an outstanding driver operation, or
 the CPU's deadline list. It is **a reference, never an id**, so a destroyed
 subject cannot be named and §5.1's "maps no id to any object" holds structurally.
+
+### 5.3a Edge-classed subjects — the one the kernel cannot ask
+
+**A `Subject` is level or edge, and the class is a property of the subject.**
+
+- **Level.** The subject can answer "is there something for this waiter" from
+  state the kernel holds. `arm` asks, and fires immediately if the answer is yes.
+  Eight of the nine `io_uring::Source` variants are this
+  (`io_uring.rs:801-809`).
+- **Edge.** The subject cannot be asked, because the readable state belongs to
+  the waiter. `arm` asks nothing and never fires immediately; the posted record
+  means *"state may have moved"*, never *"there is something for you"*. **The
+  waiter's own predicate is authoritative and must be re-derived after `arm`
+  returns and before the park** — the arm-then-rescan shape `shard::arm_waiter`
+  already uses inside the kernel (`kernel/src/log/shard.rs:503`) and `/bin/logd`
+  uses across the syscall boundary (`userland/logd/src/main.rs:187-188`,
+  `:213-219`). It costs nothing at the park site: §5.4's one predicate is still
+  `inbox.has_record()`, and §5.5's "a spurious return is legal" already licenses
+  the re-derive.
+
+**The machine's log is the only edge subject on this tree, and it is one by
+necessity.** Three facts, each from code, and each independently sufficient:
+
+1. **No reader cursor exists in the kernel.** A cursor is the caller's own eight
+   sequence numbers and a loss count, in the caller's own memory
+   (`kernel/src/log/user.rs:1-16`), so there is no state from which any arm-time
+   question could be answered. `Source::is_ready` therefore answers `false`
+   unconditionally for `Source::Log` (`io_uring.rs:815`), and the comment beside
+   it is the argument: answering `true` would complete every poll immediately and
+   turn a parked reader into a spinning one.
+2. **The producer cannot post.** `emit` runs inside `sync.rs`, inside IRQ
+   handlers, inside the scheduler and inside every syscall's locked region, so it
+   may take no lock; its whole contribution is a `SeqCst` fence and a relaxed
+   load, and the single locked RMW is paid at most once per park
+   (`log/shard.rs:445-452`, `:480-492`). One RMW per log line measured 497–504 ms
+   → 812–839 ms of boot under TCG
+   (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`), and that is the
+   number that forbids moving the post to the producer.
+3. **So the poster is `klogd`, once per drain batch**, from the one context that
+   has just observed committed records and may take a lock
+   (`log/console.rs:452` → `log/user.rs:69-75`).
+
+**Four constraints C3's fold must honour, each named from code:**
+
+- **The poster stays `klogd` and stays batched.** A post per record, or a post
+  from `emit`, reintroduces the measured regression. The completion `post` for
+  this subject is therefore callable only from a lock-taking context, and the
+  log's post is not on the producer's path.
+- **`klogd` arms unconditionally, including with no console.** Until 2026-08-15
+  it parked unarmed there, never woke, never posted, and the one machine shape
+  the design exists for told userland nothing (`log/console.rs:190-220`,
+  `:462-473`;
+  `specs/issues/diagnostics/a-console-less-machine-posts-no-log-readiness.md`).
+  Converting P13's park to an `Inbox` park must keep `discard_pending()`
+  (`console.rs:441`) in front of the arm.
+- **A handle closing is not the subject ending.** One `SysCap` object exists
+  machine-wide (`kernel/src/loader/mod.rs:930`) and every reader holds a dup;
+  `ops::ends_its_sources` (`object/ops.rs:248`) answers `false` for `SysCap` and
+  `Console` precisely so one close does not cancel every log poll in the machine.
+  §5.2's "a watch is a node the waiter lends to the object" needs the same
+  question asked of the object at close. `log_poll_outlives_a_close`
+  (`tests/toyos.rs:515`, `tests/common/logread.rs:186`) is the gate and
+  `log-close-cancels-any-syscap` the negative control; neither may be weakened.
+- **The userland half must survive C11.** `toyos::ring::Ring` replacing `Poller`
+  keeps arm-before-read, and `logd`'s 100 ms `IDLE_NANOS`
+  (`userland/logd/src/main.rs:119`) is the bound on a machine that has posted
+  nothing, not pacing.
+
+**Why this is a section and not a footnote.** Without it, §5.6's "readiness is
+the object's own question" reads as a claim that every subject is
+level-queryable, and §23's rejection 3 says the same thing in the strongest form
+available — so a reader who takes either literally builds `arm` with no edge path
+and the log's poll silently never fires. The contradiction is structural rather
+than an oversight, and the tree already carries the answer: `Source::Log`'s own
+doc comment says *"Edge-triggered, and it is the one source that has to be."*
 
 ### 5.4 The one park/recheck site, and its proof
 
@@ -594,28 +879,46 @@ re-open the window, because it has no way to add a second predicate — there is
 `Claim::Lost → continue` arm. The completion core sits **on top** of it: a post is
 "write a record, then do what a wake does today".
 
-**One thing inside `toyos-sched` does change, and it is the retire handshake, not
-a disposition.** §7.2 rewrites `handle_retire`'s two reap-in-place arms
-(`cpu.rs:569`, `:575`) so that a killed task with a live kernel stack is made
-runnable instead of reaped. That is the spine of this document and it carries its
-own termination argument, its own host tests in `toyos-sched/` and its own loom
-model (§7.3). Everything else in the crate is untouched.
+**What changes inside `toyos-sched` is the crate's core state machine, and
+"everything else is untouched" is withdrawn.** §7.2 makes a killed task with a
+live kernel stack runnable instead of reaped, and that reaches every safe point,
+not one: `handle_retire`'s parked and ready arms (`cpu.rs:569`, `:575`),
+`SchedPass::pick`'s kill arm (`:926`), `preempt_if_due`'s interaction with it
+(`:901-916`), `CpuSched::hand_off` (`:461`), `TransitTask::adopt`
+(`task.rs:758`), and either `legal()` (`task.rs:222-248`) or a new
+claim-arbitrated conversion path. On the verification side it reaches sim
+invariant **I14** and the corpus trace that proves I14 has teeth (§7.2a), and
+`scheduler-core-spec.md`'s invariant 7, which it contradicts and must amend. It
+carries its own termination argument, its own host tests in `toyos-sched/` — where
+`cpu.rs` has none today — and its own loom model (§7.3).
 
 This is deliberate de-risking. The scheduler migration cost seventy defects
-(`specs/metal-track-history.md`); this refactor does not reopen it.
+(`specs/assessments/metal-track-history.md`); this refactor does not reopen it.
 
 ### 5.6 The three things that go away
 
-- **The dual-call idiom.** `complete_pending_for_event` has **10** call sites, each
-  paired by hand with a queue wake — the pair
+- **The dual-call idiom.** `complete_pending_for_event` has **11** call sites,
+  **ten of them paired by hand with a queue wake** — the pair
   `specs/issues/kernel/io-uring-source-half-a-wake-pair.md` records losing twice
-  in one cutover. After this there is one `post`, and a ring and a thread are two
-  entries on one watch list.
-- **`io_uring::Source` and its `is_ready` match** (`io_uring.rs:791`). Readiness is
-  the object's own question, asked once inside `arm`.
+  in one cutover. The eleventh is the log's (`log/user.rs:74`, inside
+  `post_readiness`): a single batched call with no paired wake, because `klogd`'s
+  own park handles that side. It is both the eleventh entry and the
+  counter-example to "each paired by hand". After this there is one `post`, and a
+  ring and a thread are two entries on one watch list.
+
+  The ten: `process.rs:1453` and `:1465`, `arch/syscall.rs:1801`, `pipe.rs:346`
+  and `:372`, `sched/driver.rs:613` and `:632`, `drivers/xhci/hid.rs:141`,
+  `drivers/i8042/mod.rs:800` and `:811`.
+- **`io_uring::Source` and its `is_ready` match** (`io_uring.rs:800`, the match at
+  `:801`). Readiness is the object's own question **wherever the object can
+  answer it**; for an edge-classed subject (§5.3a) `arm` asks nothing and the
+  waiter re-derives its own predicate. One of the nine arms — `Source::Log` at
+  `:815` — is that case, and it is structural rather than an oversight.
 - **`waitqs::PARK_BUCKETS` and `scheduler::park_lot`.** `waitpid`, `thread_join`
   and `nanosleep` stop hashing into a parking lot and arm on the object or the
   deadline. `scheduler::wake_task(TaskId)` — the pid/tid lookup — goes with them.
+  **The two log actuator threads (P14, P15) also park on `park_lot()`**, so they
+  are converted in the same chunk or the static survives the deletion.
 
 ---
 
@@ -651,9 +954,15 @@ the token:
   `drain_irqs` and from a halted machine — so they **cannot** call `lock()` at
   all. A diagnostic that blocks is untypeable (§17).
 - Boot has no `Parkable`, because there is no current task before
-  `scheduler::init`. Boot's filesystem access is `vfs::try_lock().expect("boot: the
-  VFS is uncontended")` — a true invariant on one CPU with no scheduler, and a
-  named kernel-bug panic if it ever stops being one.
+  `scheduler::init`. **Boot's filesystem access must therefore become
+  `vfs::try_lock()` with a named `expect`** — a true invariant on one CPU with no
+  scheduler, and a named kernel-bug panic if it ever stops being one.
+  **That is work, not a description of the tree**: `kernel/src/main.rs` calls the
+  plain spinning `vfs::lock()` everywhere on the boot path today (init, mounts,
+  `create_dir`), `vfs::try_lock()` exists (`kernel/src/vfs.rs:41`) with no boot
+  caller at all, and the string "boot: the VFS is uncontended" is nowhere in the
+  tree. The first draft wrote it as an existing fact; it is C8's deliverable, and
+  the boot/task split §21's C7+C8 row names is exactly this.
 - An ISR, `drain_irqs` and every `Drop` impl are in the same position, which is
   §13's argument stated as a type rather than as a rule.
 
@@ -677,9 +986,9 @@ sections require exactly the shape it forbids:
   back *during* the transfer. Whoever flushes a file parks on the disk from
   inside `Vfs::flush_file`, so `VFS` and `VOLUMES` are held across that park by
   construction. **Two callers reach it on the tree C0 opens** and neither can be
-  exempted: a userland `SYS_FSYNC` (`fd.rs:644`) and `iod`'s write-back (§13).
-  The third, the kernel's own file sink, is gone with log L6 — which changes the
-  count and not the argument.
+  exempted: a userland `SYS_FSYNC` (`object/ops.rs:668`) and `iod`'s write-back
+  (§13). The third, the kernel's own file sink, is gone with log L6 — which
+  changes the count and not the argument.
 - §8's own doc comment says it: "a lock that cannot be held across a device round
   trip is the defect".
 - §2's premise — "the same kill abandons a **held VFS lock**" — is a statement
@@ -689,9 +998,9 @@ sections require exactly the shape it forbids:
 It is also unimplementable as an API in two smaller ways, either of which is
 fatal on its own: `SleepLock::lock` must park when the lock is held, and with
 only `&Parkable` it cannot reach a `wait` that demands `&mut`; and two sleep
-locks held at once — which `teardown_resources` does today, `ProcessData` then
-`VFS` (`process.rs:989`, `:1014`) — needs the shared borrow to stack, which a
-`&mut` acquire forbids.
+locks held at once — which `teardown_resources` does today, `ProcessData`
+(`process.rs:1110`) then `VFS` through `ops::close_all` (`:1135`) — needs the
+shared borrow to stack, which a `&mut` acquire forbids.
 
 **Recorded rather than quietly dropped**, because the claim is attractive and the
 next reader will re-derive it. A reviewer who proposes it again should be shown
@@ -705,7 +1014,8 @@ So the type system cannot see a `Lock` guard, and a spinlock held across a park
 stays what it is today — a **runtime** named panic:
 
 - **RT1** `Parkable::of_current()` asserts the context's baseline preempt depth at
-  token construction, so the failure names the trap entry.
+  token construction (`scheduler::assert_baseline`, `kernel/src/scheduler.rs:44`),
+  so the failure names the trap entry.
 - `completion::wait` re-asserts the baseline at the park, which is what
   `prepare_wait` does today and is the arm that actually catches a `Lock` taken
   half-way down the call chain.
@@ -727,61 +1037,171 @@ assertion refuses the park.
 run again on that stack, because the kernel does not unwind and a discarded stack
 takes every `SleepGuard` on it with it.
 
-### 7.1 There are three reap-in-place arms, not one
+### 7.1 There are five reap-in-place arms, not three and not one
 
-The first draft named one — `Commit::Killed` in `sched/driver.rs:439` — and it is
-the least important of the three. `toyos_sched::cpu::handle_retire`
-(`cpu.rs:562`) reaps a task **wherever it finds it**:
+The first draft named one — `Commit::Killed` in `sched/driver.rs:482` — and it is
+the least important. The second draft named three, all inside
+`toyos_sched::cpu::handle_retire` (`cpu.rs:562`), and **the three line numbers
+are exact and the set is not**: `toyos-sched` reaps a killed task in **five**
+places, and the two the second draft missed are the ones that defeat §7.2.
 
-| arm | `cpu.rs` | when | stack |
-|---|---|---|---|
-| `self.parked.remove(&key)` → `reap` | `:569` | the task has been parked for a while | **discarded, guards and all** |
-| `self.rq.remove(key)` → `reap` | `:575` | woken by a release, not yet run | **discarded, guards and all** |
-| `self.running` → `need_resched` | `:582` | running | fine: dies at its next safe point |
+| # | arm | site | when | stack |
+|---|---|---|---|---|
+| 1 | `handle_retire`, `self.parked.remove(&key)` → `reap` | `cpu.rs:569-573` | the task has been parked for a while | **discarded, guards and all** |
+| 2 | `handle_retire`, `self.rq.remove(key)` → `reap` | `cpu.rs:575-580` | woken by a release, not yet run | **discarded, guards and all** |
+| 3 | `handle_retire`, `self.running` → `need_resched` | `cpu.rs:582` | running | dies at its next safe point — **and §7.2 changes what that costs** |
+| 4 | **`SchedPass::pick`** — `if task.shared().kill_pending() { … reap … continue }` | `cpu.rs:926-936` | **every pick, of every killed ready task** | **discarded, guards and all** |
+| 5 | **`CpuSched::hand_off`** — reaps rather than migrating | `cpu.rs:461-469` | a killed task chosen for migration | **discarded** |
+| 6 | **`TransitTask::adopt`** → `Err(DeadTask)`, disposed at `cpu.rs:555-557` | `task.rs:755-764` | a kill that lands after the adopt was posted | **discarded** |
 
-**The first arm is the one that matters and the first draft did not mention it.**
+(Six rows, five *reaps*: row 3 does not reap, and it is listed because §7.2 makes
+it load-bearing.)
+
+**Arm 1 is the one that matters and the first draft did not mention it.**
 A thread parked on a disk transfer while holding the VFS sleep lock is in
 `self.parked`. It is reaped in place, its stack is freed, and the VFS lock is
 stranded forever — which is *precisely* the disaster §2 says the ordering exists
 to prevent. `Commit::Killed` covers only the microscopic window in which the kill
 lands between `prepare_wait` and `commit`, while the victim is still running.
 
-The second arm is the same hazard one step later: a contender woken by a
+Arm 2 is the same hazard one step later: a contender woken by a
 `SleepLock` release, sitting in the run queue with the previous guard still on its
 stack, killed before it is picked.
 
+**Arms 4–6 are why the section had to be rewritten**, and arm 4 is why the second
+draft's replacement code was a no-op. `pick` is the crate's *general* answer to a
+killed ready task, and `handle_retire`'s own comment (`cpu.rs:583-590`) declares
+it load-bearing for termination:
+
+> the sticky kill bit outlives it and *every* safe point honours it: the pick
+> reaps a killed ready task, and `WaitTicket::commit` refuses to park a killed
+> one. Without that second arm a task that parked through this window would never
+> be picked again, so nothing would ever reap it.
+
+So the run-queue arm is not a smaller change than the parked one. Touching either
+without the other deletes the termination argument for row 3 as well.
+
 ### 7.2 What must change
 
-**A retire must never reap a task that has a kernel stack. It must make it
-runnable with the cancel pending.** Both reaping arms become:
+**A killed task with a live kernel stack must be scheduled, not reaped. It must
+run again with the cancel pending.** That is one sentence and it reaches every
+one of §7.1's arms, which is what the earlier drafts got wrong: they changed the
+retire and left the general reaper in place.
+
+**The second draft's replacement code is struck. All three of its lines fail, and
+the failures are independent** — recorded rather than quietly replaced, because
+each is a trap the next reader walks into.
 
 ```rust
-// parked: do not reap. Make it runnable; the kill bit is already sticky.
+// STRUCK — does not compile, is not a legal transition, and is a no-op even
+// if both of those were fixed:
 if let Some(entry) = self.parked.remove(&key) {
     self.rq.push(entry.task.into_ready_cancelled(self.id, now));
     return;
 }
-// ready: leave it alone. It already has the sticky kill bit and will
-// observe it on its own stack at the next `wait`.
+// ready: leave it alone.        // ← also struck; see (d)
 ```
 
-The task runs, `completion::wait` observes the kill bit and returns
-`Err(Cancelled)`, every kernel caller `?`s it out, guards drop on the way, and the
-thread dies at the syscall boundary. `Commit::Killed`'s arm becomes
-`dispose_none` for the same reason: the task returns to its own code rather than
-being switched away from forever.
+- **(a) `Queue` has no `push`.** Its enqueue API is `insert(vruntime, task)`
+  (`toyos-sched/src/queue.rs:87`), and every enqueue in the crate goes through
+  `CpuSched::enqueue`, which first calls
+  `task.share().enter_runnable(env.frontier)` (`cpu.rs:434`). Skipping that
+  desynchronises the per-share runnable refcount the sim walks in
+  `check_share_refcounts`.
+- **(b) `Blocked → Ready` is not a legal edge.** `legal()`
+  (`toyos-sched/src/task.rs:222-248`) admits `(Blocked(a), WakeQueued(b))` and
+  `(Blocked(_), Dead)` out of `Blocked` and nothing else, and an out-of-table
+  `transition` panics — `an_edge_outside_the_table_panics` (`task.rs:1076`) is the
+  gate that says so. The only route is `claim_wake()` (`:412`) → `finish_wake()`
+  (`:434`), i.e. `BlockedTask::wake` (`:927`), which is what `handle_wake` already
+  uses (`cpu.rs:535-537`).
+- **(c) It must therefore *arbitrate*, exactly as `fire_deadlines` does**
+  (`cpu.rs:645-660`): remove-then-convert loses the race. If a remote waker has
+  already claimed the task — word `WakeQueued` — `claim_wake` returns
+  `Claim::Lost`, the in-flight `Msg::Wake` lands on `handle_wake` whose
+  `parked.remove` now returns `None` and no-ops (`cpu.rs:528-534`), and the task
+  ends up in **no container at all**: never runnable, never reaped, and
+  `retire_task` panics at 1 s. The correct shape is
+  `parked.get_mut` → `claim_wake` → `Claim::Parked ⇒ wake + place`,
+  `Claim::Lost ⇒ leave it, the Wake is in flight`.
+- **(d) "ready: leave it alone" is a strict no-op, and it also deletes an
+  argument.** `handle_retire` runs inside `cpu.drain()`, called by
+  `SchedPass::begin` (`cpu.rs:753`); the same pass then runs `finish_inner`
+  (`:875-897`) → `pick()` (`:918`), whose first act on every popped task is the
+  kill reap at `:926-936`. A task pushed into `rq` by the retire is popped and
+  reaped **in the very same pass**, stack and guards discarded — the disaster
+  §7.2 exists to prevent, moved fifteen lines later. And a killed *ready* task is
+  never picked at all: `ReadyTask::dispatch` (`task.rs:783-793`) is reachable only
+  past that check, and its own doc says so.
 
-**Two corrections to the first draft's code, both of which stop it compiling:**
+**So §7 owns four changes inside `toyos-sched`, not two:**
+
+1. `handle_retire`'s parked arm becomes a claim-arbitrated wake-and-place, per
+   (c).
+2. `pick`'s kill arm (`cpu.rs:926`) stops reaping a killed task that has a kernel
+   stack, and §7 must then answer **what does reap a killed task that never parks
+   again** — the question `handle_retire`'s own comment says the pick was there to
+   answer.
+3. `preempt_if_due` (`cpu.rs:901-916`) is in the same position: once
+   `Commit::Killed` is `dispose_none` the killed thread keeps running and
+   unwinds, its next quantum expiry puts it back in `rq`, and the immediately
+   following `pick` reaps it mid-unwind with every `SleepGuard` still on the
+   stack. **A killed task with a live kernel stack is schedulable at *every* safe
+   point, not only at the retire**, and that is the property §7 has to state.
+4. `hand_off` (`cpu.rs:461`) and `TransitTask::adopt` (`task.rs:758`) reap for
+   the same reason and need the same answer.
+
+Once those hold: the task runs, `completion::wait` observes the kill bit and
+returns `Err(completion::Cancelled)`, every kernel caller `?`s it out, guards drop
+on the way, and the thread dies at the syscall boundary. `Commit::Killed`'s arm
+becomes `dispose_none` for the same reason: the task returns to its own code
+rather than being switched away from forever.
+
+**Two corrections to the first draft's code, both of which stop it compiling, and
+both still exact:**
 
 - `Commit::Killed` is a **unit variant** (`waitq.rs:293`), so
   `Commit::Killed => (…, Some(registration))` has no `registration` to bind.
   `commit()`'s `Killed` arm already calls `self.queue.dequeue(&self.shared)`
   (`waitq.rs:384`), so that path needs no registration and `None` is correct.
 - `Cancelled` is **already taken**: `toyos_sched::waitq::Cancelled` is a
-  two-variant enum (`Clean`/`AlreadyWoken`, `waitq.rs:272`) and is already
-  imported into the very file §7 edits (`driver.rs:38`). The new type needs a
-  different name — `completion::Cancelled` in its own module, referred to
-  qualified.
+  two-variant enum (`Clean` `:274` / `AlreadyWoken` `:277`, declared at
+  `waitq.rs:272`) and is already imported into the very file §7 edits
+  (`driver.rs:38`). The new type needs a different name — `completion::Cancelled`
+  in its own module, referred to qualified.
+
+### 7.2a It contradicts the scheduler's own law, and that must be amended in writing
+
+`specs/scheduler-core-spec.md:32` states as **invariant 7**:
+
+> **A killed task is never migrated and never dispatched again.** The kill takes
+> effect wherever the task is; release completes within one pass of the CPU
+> holding the task, after at most one message hop per migration in flight, and
+> never waits on a timer.
+
+§7.2 requires a killed task to be **dispatched again, on its own stack**, and
+requires release to wait for an unwind that may itself park on a device. The same
+spec's failure table (`:102`) says "Task killed while in transit between CPUs |
+The receiving CPU observes the kill and releases the task; **no dispatch**".
+
+**Neither sentence survives this design, and the branch may not land a tree that
+contradicts its own law.** C3+C4 amends `scheduler-core-spec.md` invariant 7 and
+its release-promptness clause explicitly, in the same chunk, with the amended
+form saying what replaces "never dispatched": a killed task is dispatched exactly
+as far as its own unwind, and release completes when the unwind does. The failure
+table's transit row is amended with it.
+
+**And the sim's I14 is where that amendment gets teeth or loses them.**
+`toyos-sched/sim/src/invariants.rs:202-215` hard-codes today's model in two
+halves — "**A killed task is never migrated**", and "a retire completes within
+`retire_latency_bound`", which is `QUANTUM_NS + IPI_LATENCY_NS +
+max_kernel_section + 2 * RUN_CHUNK_NS` (`:43-45`). That bound cannot survive a
+retire that waits for a full kernel unwind and a teardown. The corpus trace
+`toyos-sched/sim/corpus/old_migrate_kept_the_corpse_i14.trace` is the negative
+gate that proves I14 has teeth, and root `CLAUDE.md` forbids weakening a negative
+gate to make a change pass. **C3+C4 owes a written re-derivation of I14's bound
+and of what "never dispatched" now means, with the negative control still
+red.**
 
 ### 7.3 This is a change to `toyos-sched`'s retire handshake, and §5.5 said it was not
 
@@ -795,19 +1215,38 @@ no longer converts anything on arrival — it schedules the victim and waits.
 Consequences the implementer owns:
 
 - **`toyos-sched` needs its own host tests for the new arms**, alongside
-  `retire.rs`'s five existing ones, and `kernel-loom/tests/cancel.rs` (§16.1)
-  must cover retire-of-a-parked-task, not only kill-racing-a-commit.
-- **The retirer's bound now covers an unwind, not a reap.** `retire_task`
-  (`scheduler.rs:358`) blocks until the victim's word reaches `Dead`, with a
-  1 s panic at `:378`. Today that is satisfied by a reap on the retirer's own
-  CPU — effectively instant. After this change the victim must be scheduled,
-  return up its stack, release its locks and exit, all inside 1 s. §4.1 P12 keeps
-  that panic as a `Tripwire` without noticing that what it bounds has grown by
-  the length of a kernel unwind on a loaded machine. **C4 must re-derive it and
-  say what the new number is measured against**, or the first busy kill panics
-  the machine.
+  `retire.rs`'s five existing ones (`retire.rs:150,163,176,194,204`), and the
+  cancel loom model (§16.1) must cover retire-of-a-parked-task, not only
+  kill-racing-a-commit. **`cpu.rs` has no `#[cfg(test)]` module at all**, so
+  `handle_retire`'s and `pick`'s arms have *zero* host coverage today: this is
+  not an addition to existing coverage, it is the first coverage those arms will
+  ever have. `cargo test -p toyos-sched --lib` is 41 passing tests and none of
+  them is in `cpu.rs`.
+- **The retirer's bound now covers an unwind, not a reap — and it is not the
+  state word it waits on.** `retire_task` is `kernel/src/scheduler.rs:422`, and
+  it loops on `sched.handle.released()` (`:443`), not on the word reaching
+  `Dead`. Its own doc (`:404-420`) rejects the word reading in terms: *"Waiting
+  for the state word to read `Dead` would be too weak: `Dead` is published by the
+  reaping transition, one pass before the release, while the dying CPU still
+  stands on that thread's kernel stack."* The 1 s panic is at `:445`, with
+  `give_up` computed at `:442` and tested at `:444`. **This makes §7.3's own
+  warning stronger than it stated**: the bound covers unwind +
+  `teardown_resources` + `close_all` + every sleep-lock acquire on the way + the
+  release, not merely "the length of a kernel unwind". **C4 must re-derive it
+  against `released()` and say what the new number is measured against**, or the
+  first busy kill panics the machine.
+- **The reap that satisfies today's bound is not on the retirer's CPU.**
+  `retire::post` → `post_retire` targets `home_of(shared.state())`
+  (`toyos-sched/src/retire.rs:87-97`) and kicks it with `Urgency::Preempt`
+  (`:79`); the retirer then parks until the *victim's* CPU has run a pass and
+  `Hw::release` has fired. "Effectively instant" is already an IPI plus a remote
+  pass plus a release — which is exactly what `retire_latency_bound` prices. The
+  argument that the new bound is a large multiple of the old still stands; the
+  baseline is not zero and this document should not say it is.
 - `dispose_exit` at a park is deleted; the only remaining disposition that exits
-  is the one a thread chooses (`driver.rs:327`), which is the sole other caller.
+  is the one a thread chooses (`driver.rs:370`), which is the sole other caller.
+  Confirmed by grep: exactly two `dispose_exit` call sites in the whole kernel
+  (`driver.rs:370`, `:482`) and two `dispose_none` (`:368`, `:477`).
 
 ### 7.4 `Cancelled` must be consumed, not sticky — or teardown panics
 
@@ -816,12 +1255,12 @@ cancel and `arm` asserts `!cancelled`, so "a task that re-arms after a cancel
 panics at the offending call site".
 
 **That panics on this spec's own death path.** §7 routes the dying thread through
-`teardown_resources` (`process.rs:974`), which takes `ProcessData`
-(`:989`) and then calls `fd::close_all` under it (`:1014`); releasing a descriptor
-takes the VFS lock. After C8 both are sleep locks, so a cancelled thread whose
-teardown contends on either **parks — which re-arms — and RT4 panics the kernel**.
-A userland process killed while another thread is flushing a file is enough to
-reach it.
+`teardown_resources` (`kernel/src/process.rs:1095`), which takes `ProcessData`
+(`:1110`) and then calls `ops::close_all` under it (`:1135`); releasing a file
+handle takes the VFS lock (`object/file.rs:29`, in `OpenFileState::drop`). After
+C8 both are sleep locks, so a cancelled thread whose teardown contends on either
+**parks — which re-arms — and RT4 panics the kernel**. A userland process killed
+while another thread is flushing a file is enough to reach it.
 
 The rule that works:
 
@@ -829,14 +1268,44 @@ The rule that works:
   `wait` returns `Err(Cancelled)` the flag is clear and the thread may park again,
   which is what teardown needs.
 - **Termination comes from the sticky kill bit, not from the flag.** A caller that
-  loops instead of propagating gets `Cancelled` again from the next `wait`,
-  because `commit()` still refuses to park a killed task. The loop is a live
-  spin — the same hazard, now un-diagnosed.
+  loops instead of propagating gets `Cancelled` again from the next `wait`.
 - So the fail-fast moves to where it can be both correct and cheap: **`wait`
   counts the cancels it has reported to one thread and panics on the second**,
   naming the call site. One cancel is the design; two is a caller that swallowed
-  the first. Teardown's own parks are ordinary parks that never report a cancel,
-  so they do not count.
+  the first.
+
+**But the second bullet's mechanism and the first bullet's promise contradict
+each other against the real `commit()`, and §7 must resolve it rather than assert
+both.** The second draft's reason was "`commit()` still refuses to park a killed
+task", and that is exactly true — which is what breaks the first bullet. The kill
+bit is sticky and never cleared (`toyos-sched/src/task.rs:159-165`: *"Sticky: set
+by the retirer before it posts, never cleared"*; `claim_retire`/`mark_kill` only
+ever `fetch_or`), and `WaitTicket::commit` checks it **before anything else** —
+`if self.shared.kill_pending() { dequeue; cancel_commit; return Commit::Killed }`
+(`waitq.rs:381-387`). **So a killed thread cannot park, ever, including in
+teardown.**
+
+Trace it: under §7.2's `Commit::Killed → dispose_none`, a killed thread contending
+on the VFS `SleepLock` inside `ops::close_all` gets `Commit::Killed` back from
+*every* acquire attempt. It either busy-spins — which is the `sleeplock-spins`
+negative gate in §20.3, staged accidentally by the production path — or it takes
+a second `Err(Cancelled)` and trips RT4. **That is the exact panic §7.4 was
+written to avoid, reached by a different route**, and §5.5's "`Commit` …
+unchanged" forbids all three of the available fixes.
+
+**§7 must pick one and write it down before C3+C4 is implemented:**
+
+1. a **non-cancellable park variant** that ignores the kill bit, used only by
+   teardown;
+2. a **teardown-scoped clearing** of the kill bit, with the termination argument
+   restated for the window it opens;
+3. a **`commit()` that distinguishes cancellable from uncancellable waits**, which
+   is the honest shape and the one that changes `toyos-sched`'s public surface.
+
+The existing test `waitq::tests::a_kill_that_lands_before_the_commit_refuses_the_park`
+(`waitq.rs:549-563`) is green and asserts today's behaviour, so whichever is
+chosen amends that test by name. **§5.5's claim that `Commit` is unchanged is
+withdrawn here as well as in §7.3.**
 
 **RT4 is restated accordingly in §22.**
 
@@ -905,22 +1374,24 @@ away). A `Lock` may be taken while holding a `SleepGuard`. The one bad shape
 
 ## 9. The locks, and the baselines that stay load-bearing
 
-`kernel/src` declares **52** statics holding a `Lock` (§18 states the command and
-why the number moves with the regex) and performs **244** `.lock()` and **11**
-`.try_lock()` calls, all measured on pre-log `main` and all re-derived at C0.
+`kernel/src` declares **45** statics holding a `Lock` (§18 states the command and
+why the number moves with the regex) and performs **259** `.lock()` and **10**
+`.try_lock()` calls, measured 2026-08-15 at `71a0559` and re-derived at C0.
 **Four change, and there is no fifth.**
 
 | lock | today | after |
 |---|---|---|
-| `vfs::VFS` | `Lock<Option<Vfs>>`, 33 textual call sites through 2 doors | `SleepLock<Vfs>`; every task-side door takes `&Parkable`, boot uses `try_lock` |
-| `fat32_adapter::VOLUMES` | `[Lock<Option<FatDevice>>; 2]` | `SleepLock` |
-| `xhci::XHCI` | `Lock<Vec<XhciController>>` | `SleepLock`; `poll_if_pending` uses `try_lock` (§12) |
-| `process::ProcessData` | `Arc<Lock<ProcessData>>`, 55 `with_fd_owner_data` sites | `Arc<SleepLock<ProcessData>>` |
+| `vfs::VFS` | `Lock<Option<Vfs>>`, 29 textual call sites through 2 doors (`vfs.rs:29`, `:41`) | `SleepLock<Vfs>`; every task-side door takes `&Parkable`, boot uses `try_lock` |
+| `fat32_adapter::VOLUMES` | `[Lock<Option<FatDevice>>; 2]` (`fat32_adapter.rs:316`) | `SleepLock` |
+| `xhci::XHCI` | `Lock<Vec<XhciController>>` (`xhci/mod.rs:1775`) | `SleepLock`; `poll_if_pending` uses `try_lock` (§12) |
+| `process::ProcessData` | `Arc<Lock<ProcessData>>`, 68 `with_fd_owner_data` sites | `Arc<SleepLock<ProcessData>>` |
 
 `ProcessData` is on the list because §2's own example needs it: `SYS_FSYNC`
-(`arch/syscall.rs:234`) and `SYS_CLOSE` (`:842`) reach `fd.rs:644`'s
-`flush_file` from inside `with_fd_owner_data`, so a userland `fsync` of a
-disk-backed file waits under `{ProcessData, VFS, VOLUMES, XHCI}`.
+(`arch/syscall.rs:298`) and `SYS_CLOSE` (`:274`) reach `Vfs::flush_file`
+(`vfs.rs:538`) through `object::ops` — `ops::fsync` at `:668` and
+`OpenFileState::drop` at `object/file.rs:31` — from inside `with_fd_owner_data`,
+so a userland `fsync` of a disk-backed file waits under
+`{ProcessData, VFS, VOLUMES, XHCI}`.
 
 **`log_file::SINK` was the fifth row, then a conditional one, and under the ruled
 order it is no row at all.** On pre-log `main` `log_file::poll` holds
@@ -937,8 +1408,9 @@ trace, struck.
 
 ### 9.1 The new baselines, and why weakening one is forbidden
 
-`scheduler::assert_baseline` stays exactly as it is. `BASELINE_TRAP = 1`,
-`BASELINE_IRQ_EXIT = 0`. What changes is *where* it fires and what a trip means:
+`scheduler::assert_baseline` (`kernel/src/scheduler.rs:44`) stays exactly as it
+is. `BASELINE_TRAP = 1` (`:64`), `BASELINE_IRQ_EXIT = 0` (`:72`). What changes is
+*where* it fires and what a trip means:
 
 - `Parkable::of_current()` asserts the baseline **at token construction**, so the
   failure names the entry rather than the park.
@@ -953,9 +1425,10 @@ trace, struck.
   §11.4 shape to attribute one to.
 
 **Weakening is forbidden and here is the argument, unchanged from `scheduler.rs`'s
-own comment.** A park with a spinlock held parks that lock on a stack nothing
-returns to, and every other CPU that takes it spins into `Lock::lock`'s
-500M-spin `DEADLOCK` panic — which names the victim and never the culprit. The
+own comment** (`kernel/src/scheduler.rs:34-39`). A park with a spinlock held parks
+that lock on a stack nothing returns to, and every other CPU that takes it spins
+into `Lock::lock`'s 500M-spin `DEADLOCK` panic — which names the victim and never
+the culprit. The
 assertion is the only thing that names the culprit. After this refactor a trip can
 mean only one thing: a raw `Lock` still held on a path that was supposed to be
 converted, i.e. **the conversion is half done**, and a half-converted path must be
@@ -1013,14 +1486,23 @@ measurement or the reason one is enough**; per-CPU is the obvious escape and
 costs nothing to leave open.
 
 Mechanics: a task with no user address space, at baseline 0, running a Rust
-function. `driver::spawn`'s `.expect("spawn: task without an address space")`
-(`driver.rs:226`) and a trampoline beside `process_start`/`thread_start` are most
-of the arch work — `alloc_kernel_stack` (`loader/start.rs:17`) already takes the
-trampoline as a parameter and a kernel thread's is *simpler* than either existing
-one (no `initial_user_state!`, no `iretq`, no `USER_CS`). Two things beside it:
-`driver::spawn` derives and asserts `cr3` from the address space, and
-`paging::KERNEL` is a `Lock<Option<AddressSpace>>`, so "its address space is the
-kernel address space" has to be wired to that.
+function. **This is built, on `main`, and C6 inherits it rather than owing it.**
+The first draft named `driver::spawn`'s
+`.expect("spawn: task without an address space")` as the arch work still to do;
+commit `c1be7c4` ("kthread: the scheduler could always host one, and a single
+expect was the whole refusal", 2026-08-14, on `main`) removed it. `driver::spawn`
+(`kernel/src/sched/driver.rs:257`) now derives `cr3` with
+`match new.address_space.as_ref() { Some(space) => …, None =>
+crate::mm::paging::kernel_cr3() }` (`:263-265`) — no panic, no assert, and
+`address_space: None` documented at `:242` as *"a kernel thread and not an
+error"*. The trampoline is `loader::start::kernel_start`
+(`kernel/src/loader/start.rs:121`), beside `alloc_kernel_stack` (`:24`), which
+already takes it as a parameter; a kernel thread's is *simpler* than either
+existing one (no `initial_user_state!`, no `iretq`, no `USER_CS`).
+`kernel/src/sched/kthread.rs` exists with the three-thread design and its own
+module header names this chunk — *"the completion branch's C6 spawns `usbd` and
+`iod` on it"* (`:5`, `:39`). **The landed code was written with C6 in mind**, so
+C6's arch work is to use it, not to build it.
 
 **A panic inside a kernel thread halts the machine, and today the same code
 panicking inside a syscall does not.** `main.rs`'s recoverable-panic predicate is
@@ -1059,8 +1541,8 @@ than of what it must wait for:
 | the panel sink | log **L2** |
 | `flush_log_file_if_affordable` (`driver.rs:722`), `LOG_DEFERRAL_CEILING_NS` (`:701`), `LOG_DEFERRED_SINCE` (`:706`), `log_file_flush_due` (`:743`), `owes_wake` (`:832`) | log **L6**, and **before C1 runs**, so C1 classifies none of them — §3.2 |
 | `drain_serial` (`:762`) from the idle loop, and its `BackendGuard::lock` spin with interrupts disabled | log **L3** — the *site* stays on this spec's allow-list, §4.5a |
-| the pre-`hlt` condition `log_file_flush_due` (`:552`) | log **L6** |
-| the pre-`hlt` condition `log_ring::has_pending` (`:523`) | log **L3 re-points it and does not delete it** — it becomes `log::pending()`, because that branch's §2.6a fallback decides the wake inside a pass and needs the condition to cover the gap. **Deleting it is this branch's**, with the wake conversion below |
+| the pre-`hlt` condition `log_file_flush_due` | log **L6** — **deleted, not re-pointed** |
+| the pre-`hlt` condition `log_ring::has_pending` | log **L3** — **deleted, not re-pointed.** The first draft had L3 turning it into `log::pending()` for this branch to delete later; it did not. The kernel's own comment records both removals (`sched/driver.rs:547-557`): *"**No log condition survives L6, and its absence is the point.** Two used to be here."* |
 | `log_file::SINK` from §9's lock table and §19's ledger | log **L6**, unconditionally — §9 |
 | `MAX_BLOCKED_NANOS` (`log_file.rs:190`) | log **L6**, with the file it is in |
 | `idle_loop_is_the_declared_body` | log **L6** (log §9.5), amended twice here — §11.3 |
@@ -1074,8 +1556,8 @@ exist when its L3 runs, and that leaves work here that this plan did not have:
 | what the log branch leaves here | what this branch owes |
 |---|---|
 | `emit` signals with a relaxed `LOG_PENDING` store and `drain_irqs` posts the wake through `waitqs`; `klogd` parks with `prepare_wait`/`block_on` | convert it to the degenerate completion post log §2.6a describes — `commit_and_signal` / `arm_waiter` / a one-waiter `Inbox` — **with its loom model, log §2.5's W3, which nothing has written**; the model is the deliverable, not the conversion, because on x86 a lost wake here is invisible to every guest test |
-| one surviving pre-`hlt` condition, `log::pending()`, in the place `log_ring::has_pending` (`:523`) occupies | delete it **in the same chunk as the conversion**. A posted `klogd` is runnable at the commit, so Invariant T covers the halt and the condition is dead weight. Deleting it earlier reopens `log-ring-flushes-one-line-behind`; leaving it later means `idle_loop_is_the_declared_body` declares a log condition forever |
-| a sixth `io_uring::Source` — `Source::Log` — with its own `IO_URING_WATCHERS` static (log §3.2) | C3 folds it into the one watch list with the other five; §19's deletion list gains it |
+| ~~one surviving pre-`hlt` condition, `log::pending()`~~ | **Void: the log branch left none.** It deleted both log conditions rather than re-pointing one, so C0 finds no log condition on the halt check. What it did leave is an *uncalled* predicate, `log::console::pending()` (`kernel/src/log/console.rs:251`, `serial::has_console() && DRAINED.any_pending()`), with zero callers repo-wide — dead code to delete, not a condition (§19) |
+| a **ninth** `io_uring::Source` — `Source::Log` — carrying the **sixth** `IO_URING_WATCHERS` static (log §3.2) | C3 folds it into the one watch list; §19's deletion list gains it. **And the fold must carry §5.3a's edge contract**, which is the thing this row does not yet say: `Source::Log` is the one subject `arm` cannot ask |
 
 All three belong with C3+C4, which is where the one park site lands, and **none
 of them was in any chunk's stated deliverables** — recorded here and added to
@@ -1084,13 +1566,20 @@ C3+C4's row rather than discovered when the log condition survives to C13.
 What is left is the idle loop, and it is worth stating on its own because §1.1's
 checkable end state is a property of *that* loop and not of the log.
 
-**The pre-`hlt` list C0 finds is `log::pending()`, `i8042::verdict_due` (`:534`)
-and `xhci::port_work_pending` (`:564`).** The first is the log branch's fallback
-and is deleted with the wake conversion, above. The other two are this spec's,
-and each **becomes a runnable task or an armed deadline**, which is why the halt
-check can shed them rather than merely move them: a CPU does not halt while
-anything is runnable, and it does not sleep past an armed deadline. That is
-`toyos-sched`'s Invariant T, already proven (`scheduler-core-spec.md` §8.4).
+**The pre-`hlt` list C0 finds is two conditions, not three:
+`i8042::verdict_due` (`sched/driver.rs:546`) and `xhci::port_work_pending`
+(`:570`); the log branch left none.** Both are this spec's, and each **becomes a
+runnable task or an armed deadline**, which is why the halt check can shed them
+rather than merely move them: a CPU does not halt while anything is runnable, and
+it does not sleep past an armed deadline. That is `toyos-sched`'s Invariant T,
+already proven (`scheduler-core-spec.md` §8.4).
+
+The full disjunction as C0 finds it, for the declared-set gate to be written
+against: `doorbell().kick_pending() || preempt::need_resched() ||
+irq_ring::any_pending_self() || !mailbox_is_empty() || i8042::verdict_due() ||
+xhci::port_work_pending()`. **This removes the halt check's only claimed
+dependency on the wake conversion**, which the struck version of this paragraph
+asserted.
 
 `i8042::verdict_due` in particular: the verdict fires at an instant, so it becomes
 a `usbd` deadline park. And where the i8042's interrupt line is not trustworthy —
@@ -1101,24 +1590,24 @@ workaround belongs. It stops being an invisible 10 ms inside `SYS_READ` (§4.1 P
 ### 11.1 `log_health` stays in the idle loop, and the argument is the code's own
 
 An earlier draft of the log spec asked this one to put `scheduler::log_health()`
-(`driver.rs:679`) on `iod` or give it its own cadence source, on the premise that
+(`driver.rs:687`) on `iod` or give it its own cadence source, on the premise that
 C9 was about to empty the idle loop. **Neither: it stays where it is, the premise
 was only ever that the loop would be empty, and log §12.2 now adopts this answer
 rather than asking the question.**
 It never was — `reap_poisoned` cannot move, below — and three things make the
 move actively wrong:
 
-- **A thread cannot produce the datum.** `NEXT_HEALTH` is per-CPU because
-  *"which CPUs reach idle is most of what the line says"* (`scheduler.rs:488`),
-  and `ready_len`/`parked_len` are `try_with_cpu` on the caller's own `CpuSched`
-  (`driver.rs:811`, `:815`), which is `!Sync`. A single kernel thread runs on one
-  CPU at a time, so it can only ever report the CPU it happens to be on. The line
-  moved onto a thread is not a worse version of the line; it is a different and
-  smaller one.
+- **A thread cannot produce the datum.** `NEXT_HEALTH` (`scheduler.rs:601`) is
+  per-CPU because *"which CPUs reach idle is most of what the line says"*
+  (`:598-600`), and `ready_len`/`parked_len` are `try_with_cpu` on the caller's
+  own `CpuSched` (`driver.rs:744`, `:748`), which is `!Sync`. A single kernel
+  thread runs on one CPU at a time, so it can only ever report the CPU it happens
+  to be on. The line moved onto a thread is not a worse version of the line; it
+  is a different and smaller one.
 - **The line's own doc forbids the reading a deadline park would give it.**
   *"What it must not be read as is a heartbeat: it comes from a CPU passing
   through idle, so a quiet machine prints nothing and a gap is not evidence"*
-  (`scheduler.rs:511`). A periodic park makes it exactly a heartbeat.
+  (`scheduler.rs:622-624`). A periodic park makes it exactly a heartbeat.
 - **A 10 s park is a wake that does not exist today.** `SNAPSHOT_INTERVAL_NS` is
   a *rate limit* on an opportunistic check — §3.4 already reclassifies it as one
   — and converting a rate limit into a deadline wakes a CPU that would otherwise
@@ -1128,24 +1617,25 @@ move actively wrong:
 So `log_health` costs one clock read and one relaxed compare per idle trip, on a
 CPU already awake, and it is a `Cadence` under §3.4's widened definition. **C9
 owns nothing here but saying so**, and the payoff is concrete: the two tests that
-read its `sched: cpu=` counts as upper bounds (`tests/toyos.rs:8229`, `:8722`)
+read its `sched: cpu=` counts as upper bounds (`tests/toyos.rs:8974`, `:9478`)
 **stay live and unmodified**, so the "the CPU still halts" check they document
 keeps its teeth over exactly the change C9 makes to the halt condition. The
 struck plan would have made both vacuous.
 
 ### 11.2 `reap_poisoned` still cannot move
 
-`scheduler::reap_poisoned()` (`driver.rs:680`) zombifies threads that died in
+`scheduler::reap_poisoned()` (defined `scheduler.rs:510`, called from the idle
+loop at `driver.rs:688`) zombifies threads that died in
 panic recovery. **It cannot move to a kernel thread, and the type system says
-so.** `scheduler.rs:421` takes a *blocking* `PROCESS_TABLE.lock()` and calls
+so.** `scheduler.rs:520` takes a *blocking* `process::PROCESS_TABLE.lock()` and calls
 `collect_orphan_zombies(table, IdleProof::new_unchecked())`; `IdleProof`
-(`process.rs:621`) is a zero-sized proof that the caller is on the per-CPU idle
+(`process.rs:713`) is a zero-sized proof that the caller is on the per-CPU idle
 stack, and it exists because dropping the thread entry you are running on is a
 use-after-free. A §10 kernel thread has its own kernel stack and a
 `ProcessObject`, so `iod` is precisely the caller `IdleProof` forbids. Two more
 ties: its own doc names the idle loop as "the one context that provably holds
 none of the locks the panicking thread may have been holding", which an ordinary
-task taking the VFS and `ProcessData` sleep locks is not; and `scheduler.rs:65`
+task taking the VFS and `ProcessData` sleep locks is not; and `scheduler.rs:71`
 names this guard's drop as the idle loop's only route to `BASELINE_IRQ_EXIT`.
 
 **So `reap_poisoned` stays in the idle loop.** C9 owns re-deriving the two
@@ -1157,16 +1647,29 @@ justification, because it is where it already is.
 **C0 already finds the body at its end state**, and the order change is what did
 that: `log_health()`, `reap_poisoned()`, `pass(Dispose::None)` and **three**
 `#[cfg]` probes — `deaf_window`, `metal-panic-probe` and `heartbeat::poll`
-(`driver.rs:671`, `:675`, `:684`). `drain_serial()` and
+(`driver.rs:678`, `:684`, `:699`). `drain_serial()` and
 `flush_log_file_if_affordable()` are gone with log L3 and L6, and no shape of
-§11.4 puts anything back. **This branch removes nothing from the body at all**;
-what it changes is the pre-`hlt` list, which C0 finds at three
-(`log::pending()`, `i8042::verdict_due`, `xhci::port_work_pending`), C9 takes to
-one, and the wake conversion takes to none.
+§11.4 puts anything back. The body also calls
+`crate::object::drain_zero_handles()` (`driver.rs:692`), which §15 row 9 has
+something to say about. **This branch removes nothing from the body at all**;
+what it changes is the pre-`hlt` list, which C0 finds at **two**
+(`i8042::verdict_due`, `xhci::port_work_pending`) and C9 takes to none. The
+struck version said three and had the wake conversion removing a log condition;
+there is none to remove.
 
-`idle_loop_is_the_declared_body` (log §9.5) lands with the log branch and is
-**amended twice here** — once at C9 and once at the conversion. That is what a
-declared-set gate is for: each amendment is a diff a reviewer reads, and a
+**`idle_loop_is_the_declared_body` was to land with the log branch and did
+not.** The name occurs seven times in the repo and every one is prose: six in
+`specs/log-architecture-spec.md` — including its own ledger row, *"|
+`idle_loop_is_the_declared_body` | L6, and amended twice afterwards |"* — and one
+comment at `kernel/src/sched/driver.rs:556` claiming it *"keeps a fourth from
+being quietly re-added"*. There is no such test in `tests/`, in
+`src/sourcegate.rs`, or anywhere else; contrast `every_boot_config_runs_logd`,
+L6's other host gate, which *was* built (`src/build.rs:1716`).
+
+**So this branch builds it rather than amending it** (§20.4), as a
+`src/sourcegate.rs` declared-set test over the pre-`hlt` disjunction, and C9's
+single amendment removes both device conditions at once. That is what a
+declared-set gate is for: the amendment is a diff a reviewer reads, and a
 condition quietly re-added is invisible to every behavioural test.
 
 `drain_irqs` keeps only: consume this CPU's `irq_ring` records and post the
@@ -1180,6 +1683,13 @@ this spec delivers the half that is about waits.
 no kernel file sink left for C7+C8 to re-home.** This section is kept because the
 trace below is the *evidence* that produced the ruling, and because a discharged
 obligation that is simply deleted is one the next reader re-opens.
+
+**Every line number in this section is pre-log `main` and is deliberately not
+re-pointed.** `log_file.rs`, `SINK`, `flush_log_file_if_affordable` and
+`log_file::poll` no longer exist; the trace is a photograph of a tree that is
+gone, and re-pointing it at anything would make it look live. Only the two live
+citations in the paragraph after it — `kernel_log_file` and
+`screen_fatal_halt_composited` — are kept current.
 
 The obligation was: the kernel's file sink outlives this branch, and it cannot
 outlive C7+C8 unchanged, because **this** branch is what makes `VFS`, `VOLUMES`
@@ -1198,8 +1708,8 @@ That is §1.1's stack and `io-depth-probe`'s **4 from the idle loop**. After C7+
 `with_disk` needs a `&Parkable` and the idle loop has none (§6.1), so the path
 does not compile; and if it did, `SINK`'s raw guard is held across the park
 (§9). Leaving it alone was not one of the options, and neither was deleting it
-from here: `kernel_log_file` (`tests/common/volumes.rs:477`), `esp_files`,
-`screen_fatal_halt_composited`'s `/log` half (`tests/toyos.rs:3316`, which reads
+from here: `kernel_log_file` (`tests/common/volumes.rs:485`), `esp_files`,
+`screen_fatal_halt_composited`'s `/log` half (`tests/toyos.rs:3811`, which reads
 the volume off the image and is muted *so that* half tests something) and
 `/bin/console`'s scrollback all read this boot's log file, and §21's rule is that
 every chunk boots and passes `cargo test`.
@@ -1230,8 +1740,8 @@ on the other branch (log §12.0, §12.6) and this section is where it was priced
 
 **One correction stays, because it was true independently of the ordering.** The
 log spec named the test `screen_fatal_composited` in five places and no such test
-exists — the two real names are `screen_fatal_halt` (`tests/toyos.rs:261`) and
-`screen_fatal_halt_composited` (`:267`), and only the second has a `/log` half.
+exists — the two real names are `screen_fatal_halt` (`tests/toyos.rs:334`) and
+`screen_fatal_halt_composited` (`:340`), and only the second has a `/log` half.
 Fixed there.
 
 ---
@@ -1243,7 +1753,7 @@ Transfer or Command Completion Event to the operation that asked for it — **by
 Command TRB address, never by being first** — `dispatch_event` offers every
 arriving event to it, and `advance_outstanding` runs from `poll_if_pending`.
 Teardown and endpoint recovery were converted at X2a/X2b. This is the fourth
-caller and `specs/xhci-port-machine-plan.md` X2c scopes it.
+caller and `specs/plans/xhci-port-machine-plan.md` X2c scopes it.
 
 The work is not the matching. It is that `msc.rs` holds `&mut XhciController`
 across the whole Bulk-Only round trip, so the lock cannot be dropped in the
@@ -1292,9 +1802,10 @@ correct count for the case the paragraph is about is zero.**
    this list did not have; it does nothing for `iod`, which is who parks on
    everything else.
 3. **Bulk-Only Reset Recovery** — **unreachable once the bound is deleted.**
-   `scsi` (`msc.rs:579`) is its only caller and calls it only on `Err(broke)` from
-   `bot`; `framed_phase` (`msc.rs:651`) produces `Broke::Silence` only when
-   `wait_transfer` returns `None`; and `wait_transfer` (`wait/mod.rs:361`) returns
+   `scsi` (`xhci/wait/msc.rs:586`) is its only caller and calls it only on
+   `Err(broke)` from `bot` (`:684`); `framed_phase` (`:658`) produces
+   `Broke::Silence` only when `wait_transfer` returns `None`; and `wait_transfer`
+   (`xhci/wait/mod.rs:340`, its spin at `:363`) returns
    `None` on exactly two events — **the 2 s deadline, or the port going away**.
    So canceller 3's trigger *is* the bound being removed, and canceller 1 is its
    only other trigger.
@@ -1302,8 +1813,8 @@ correct count for the case the paragraph is about is zero.**
 **So a present-but-hung stick parks the flushing thread with nothing able to end
 it.** What that costs is worse than a parked thread, and §22's row had it
 backwards: on pre-log `main` the 2 s bound produces `Scsi::Broken` →
-`write_blocks` `Err` → `Sink::flush` `Refusal` → `log_file.rs:319`'s
-`disable_file_sink()`, so **the sink turns itself off, says why, and serial keeps
+`write_blocks` `Err` → `Sink::flush` `Refusal` → `log_file.rs`'s
+`disable_file_sink()` (pre-log `main`, and the file is gone), so **the sink turns itself off, says why, and serial keeps
 working.** After the change no error is ever produced, so nothing is ever
 disabled. **The chain still exists on the tree C0 opens; it has moved to
 userland** — `SyscallError::Io` → `/bin/logd`'s `LOG_WRITE_BUDGET` → one
@@ -1374,11 +1885,17 @@ Bulk-Only Mass Storage Reset is a class-specific request, not a standard one.
 
 ## 13. The write-back queue, and why `Drop` needs one
 
-`fd::OpenFile::drop` takes the VFS lock at **`fd.rs:46`** — the first draft said
-`fd.rs:644`, which is `fd::fsync`, a different function that this section *keeps*
-synchronous. `Drop` cannot take a `&Parkable`, so with a sleep-locked VFS it
-cannot flush. The root `CLAUDE.md` already carries the weaker form of this rule
-("nothing in `fd` accepts a `&mut Vfs`").
+**`fd.rs` is gone and the `Drop` is not.** The endowment branch replaced the
+descriptor table with the object-handle model, so the impl this section is about
+is now `impl Drop for OpenFileState` (`kernel/src/object/file.rs:27`), which takes
+`crate::vfs::lock()` at `:29` and does the same two operations in the same order
+— flush if modified (`:31`), then unconditional `file_cache::release` /
+`close_file`. **The substance of §13 is unaffected**; every `fd.rs:<line>`
+citation in this section and in §18 is re-pointed. `fsync` is a different
+function that this section *keeps* synchronous, and it is now `object::ops::fsync`
+(`object/ops.rs:654`).
+
+`Drop` cannot take a `&Parkable`, so with a sleep-locked VFS it cannot flush.
 
 **The flush moves out of `Drop`.** A closed file with dirty pages is pushed to a
 write-back queue that `iod` drains with its own `Parkable`. That is exactly the
@@ -1396,51 +1913,50 @@ looked adjacent to the log is only that `log_file::Sink::append` was one of its
 callers. Two things that section establishes belong here, and the second is an
 obligation rather than a note.
 
-**C12's surface has already shrunk by one caller when C0 opens.**
-`Vfs::flush_file` (`vfs.rs:538`) has exactly three callers on pre-log `main`:
-`fd::OpenFile::drop` (`fd.rs:48`), `fd::fsync` (`fd.rs:644`) and
-`log_file.rs:376` — **CONFIRMED** 2026-08-09. The third is **the only one that is
-not reached from a syscall**, and log L6 deletes it, so C12 opens on **two**
-callers and a queue with one class of producer instead of two. §11.4 no longer
-owns anything here, and that is the whole of the interaction between the two
-branches on this point.
+**C12's surface has already shrunk by one caller, and C0 confirms it.**
+`Vfs::flush_file` (`vfs.rs:538`) had exactly three callers on pre-log `main`; the
+third was `log_file.rs:376`, the only one **not** reached from a syscall, and log
+L6 deleted it with the file. On the merged tree it has **two**:
+`OpenFileState::drop` (`kernel/src/object/file.rs:31`) and `object::ops::fsync`
+(`object/ops.rs:668`) — so C12 opens on a queue with one class of producer instead
+of two. §11.4 no longer owns anything here, and that is the whole of the
+interaction between the two branches on this point.
 
-**`SYS_FSYNC` does not carry the device flush on pre-log `main`, and under the
-ruled order log L6 is what fixes it, not C12.** **Verified against this tree,
-2026-08-09:**
+**`SYS_FSYNC` now carries the device flush, and C0's question is answered: log L6
+gave the mount sync to *every* caller.** The struck version of this paragraph
+recorded that `fd::fsync` stopped one level short of what the kernel's own log
+sink did, and asked C0 to record which of two forms L6 took. It took the first,
+and said so in the code: `ops::fsync` (`object/ops.rs:654`) calls `flush_file`
+(`:668`) and then `vfs.sync_for_path(&path)` (`:676`) **under the same
+acquisition, deliberately** — two acquisitions would let this caller's file be
+unmounted between them. `sync_for_path` (`vfs.rs:732`) resolves the mount and
+calls `sync_mount` (`:701`) → `Fat32::sync`
+(`toyos-fat32/src/fs.rs:901`) → **`self.dev.flush()`** (`:908`), SCSI SYNCHRONIZE
+CACHE on a stick.
 
-- `log_file.rs:376` is `vfs.flush_file(…)` **and then** `vfs.sync_mount(MOUNT)`
-  at `:382`, whose own comment is the reason — *"The FAT and the directory entry
-  have reached the device; the device's own write cache has not. A log that
-  survives a wedge has to survive the power being cut with it."* `sync_mount`
-  (`vfs.rs:698`) reaches `Fat32::sync` (`toyos-fat32/src/fs.rs:901`), which writes
-  FSInfo and then calls **`self.dev.flush()`** (`:908`) — the block device's
-  flush, SCSI SYNCHRONIZE CACHE on a stick.
-- `fd::fsync` (`fd.rs:639`), which is what `SYS_FSYNC` dispatches to
-  (`arch/syscall.rs:234`), calls **only** `crate::vfs::lock().flush_file(…)`
-  (`:644`). There is no `sync_mount` and no `dev.flush()` anywhere on that path.
+Its own doc states the reason and the rejected alternative
+(`object/ops.rs:636-653`, `vfs.rs:715-731`): `/bin/logd` publishes
+`LOG_DURABLE_NS` off this call's result and a panicking kernel stops waiting for
+its own report when that word passes the report's timestamp, so an `fsync` that
+stopped at the page cache would make the durability contract a claim about
+nothing. **A second syscall for logd alone was considered and rejected** — it
+needs a number, needs discussion, and would make every *other* `fsync` quietly
+weaker than the one program that noticed. **So §14.2's arithmetic is unaffected:
+no number was taken.** The granularity is the whole mount, because a cache flush
+is per device; every `fsync` is slower for it and more honest.
 
-So `SYS_FSYNC` stops one level short of what the kernel's own log sink does, and
-**"`SYS_FSYNC` parks on a real completion" is not the same promise as
-"`SYS_FSYNC` is durable".** C12 must not conflate them: parking on a write-back
-completion makes the answer *honest about the page cache*, and a caller who asked
-for durability still does not get the device flush. That matters beyond the log —
-`close-cannot-report-io-error` is about the error, this is about the guarantee.
-
-**Who closes it moved with the order.** `/bin/logd`'s durability claim rests on
-`SYS_FSYNC` meaning what it says, and log L6 ships that daemon with nothing after
-it to lean on — so log §12.4 gives L6 the mount sync outright, gated by
-`log_is_durable_after_fsync`, which reds on pre-log behaviour. **C12 therefore
-finds this decided and its job is to not undo it**: whatever it does to parking,
-`SYS_FSYNC` must still reach `dev.flush()`, and that gate is what catches a C12
-that queues the write-back and drops the mount sync on the way. **C0 records
-which form L6 took** — the mount sync for every caller (slower, more honest) or a
-distinct call with the asymmetry written down — because the second would have
-taken a syscall number and that changes §14.2's arithmetic.
+**C12's job is therefore to not undo it.** *"`SYS_FSYNC` parks on a real
+completion"* is still not the same promise as *"`SYS_FSYNC` is durable"*, and
+C12 must not conflate them: parking on a write-back completion makes the answer
+honest about the page cache, and the device flush is a separate step that must
+survive the change. `log_is_durable_after_fsync` is the gate that catches a C12
+which queues the write-back and drops the mount sync on the way.
+`close-cannot-report-io-error` is about the error; this is about the guarantee.
 
 ### 13.1 The flush is not the only thing `Drop` does under that lock
 
-`OpenFile::drop` is two operations, and the first draft moved one:
+`OpenFileState::drop` (`kernel/src/object/file.rs:27`) is two operations, and
+the first draft moved one:
 
 ```rust
 let mut vfs = crate::vfs::lock();
@@ -1455,7 +1971,7 @@ does not get the VFS lock out of `Drop` at all** — C12 is not done until it is
 handled. And the ordering it implies is a data-loss bug: `file_cache::release`
 (`file_cache.rs:123`) calls `drop_file` when the refcount hits zero and the file
 is `evictable`, which is every disk-backed file — bcachefs always
-(`bcachefs_adapter.rs:194`) and FAT32 after its first flush (`vfs.rs:568`, "so its
+(`bcachefs_adapter.rs:194`) and FAT32 after its first flush (`vfs.rs:573`, "so its
 pages were unevictable up to here. They are on disk now"). Today the order is
 *flush, then discard the pages*. With a deferred flush the pages are discarded
 **before** the write-back has run and the only copy is on a disk that does not
@@ -1501,14 +2017,16 @@ idle CPU stops reaching a block device through a filesystem at all.
 (evaluate once, return), `u64::MAX` is a time never reached. **No sentinel branch
 exists**, so there is nothing to collide with.
 
-**This inverts the meaning of `0` inside the kernel, at nine call sites, and the
-failure mode is silent.** `scheduler::block_on`'s contract today is the opposite —
-`scheduler.rs:179`, "`deadline = 0` means no timeout", implemented as
-`(deadline > 0).then(|| Nanos(deadline))`. Every in-kernel caller relies on it:
-`arch/syscall.rs:690`, `:797`, `:799`, `:804`, `:1213`, `:1279`, `:1584`, and
-`scheduler.rs:330` through `process::futex_wait`. A site left passing `0` after
-the change goes from "block forever" to "return immediately" — a busy loop, not a
-compile error, and no test asserts on it.
+**This inverts the meaning of `0` inside the kernel, at every blocking call site,
+and the failure mode is silent.** `scheduler::block_on`'s contract today is the
+opposite — `scheduler.rs:205`, "`deadline = 0` means no timeout" — and every
+in-kernel caller relies on it. The sites are §4.1's park table, which is the
+single enumeration both sections should read from: P1–P9 in `arch/syscall.rs`,
+P10 in `io_uring.rs`, P11–P12 and the three internal ones in `scheduler.rs`, and
+P13–P15 in `kernel/src/log/`. **Fifteen, not nine**, and naming them twice is how
+the first draft's list went stale in two places at once. A site left passing `0`
+after the change goes from "block forever" to "return immediately" — a busy loop,
+not a compile error, and no test asserts on it.
 
 **So `Deadline` must not be a `u64` newtype with a public constructor.** Make the
 absolute form unconstructible from a bare integer: `Deadline::at(Instant)`,
@@ -1517,68 +2035,73 @@ until each has been read, which is the whole point of §3.
 
 Two live sentinel collisions the removal must resolve rather than inherit:
 
-- `io_uring.rs:365` already carries a **third** value: it maps relative `0`
-  (non-blocking) to absolute `1`, and `:419` maps `1` back to `0` (block forever).
-  That line is unreachable only because `:388` returns first. It is exactly the
+- `io_uring.rs:404-405` already carries a **third** value: it maps relative `0`
+  (non-blocking) to absolute `1`, and `:458` maps `1` back to `0` (block forever).
+  That line is unreachable only because `:426` returns first. It is exactly the
   latent trap this section exists to remove and it should be cited as the
   motivating example.
-- **soundd's hack is `.max(1)`, not "sleep a full period".** `userland/soundd/src/main.rs:1003`
-  is `((target - now) as u64).max(1)` with the comment "timeout 0 is the kernel's
-  non-blocking sentinel"; `:996` already picks the next future grid point, so the
-  full-period half was fixed a generation ago. `soundd-past-due-wake-max-1` is the
+- **soundd's hack is `.max(1)`, not "sleep a full period".**
+  `userland/soundd/src/main.rs:1203` is `((target - now) as u64).max(1)` with the
+  comment "timeout 0 is the kernel's non-blocking sentinel" (`:1202`); `:1198`
+  already picks the next future grid point, so the full-period half was fixed a
+  generation ago. `soundd-past-due-wake-max-1` is the
   open entry for what is left, and it notes the `.max(1)` is survivable only
   *because* of `MIN_ONE_SHOT_NS` (§3.1). The deletion is right; the first draft's
   description of what is being deleted is stale.
 
 ### 14.2 Syscall numbers — the allocation that cannot collide
 
-The highest number allocated on `main` today is **98**; 21 numbers in `0..=98` are
-gaps and none is reusable.
+**Settled. The number is 115, it is already reserved in the ABI source by name,
+and neither of this document's two guesses was right.**
 
-**`specs/capability-endowment-spec.md` §3.1 takes 99–112** (fourteen new calls)
-and retires thirteen more (26, 31, 36–39, 65, 68, 70, 76, 85, 87, 96). It lands
-first. Its §9 merge rule is that a number added on `main` while it is open
-**shifts its own block up** rather than being resolved by picking one, so its
-top is not fixed until it merges.
+The history, because the method is worth keeping even though the arithmetic is
+spent. When this was written the highest number on `main` was 98 with 21 unusable
+gaps; `specs/capability-endowment-spec.md` §3.1 was to take 99–112 and retire
+thirteen more (26, 31, 36–39, 65, 68, 70, 76, 85, 87, 96), with a merge rule that
+shifted its own block up if `main` moved under it; and
+`specs/log-architecture-spec.md` was to take one too. Two free numbers, 114 and
+115, and neither spec said which was which. The first draft wrote "expected 113,
+and C0 asserts it rather than assuming it" — a literal one clause away from the
+word "asserts" is what an implementer hard-codes, and 113 would have collided.
+The second draft said *compute it and never write it down here*.
 
-All three numbers re-verified on `origin/main` at 2026-08-09: 78 constants,
-highest **98**, exactly **21** gaps (2, 3, 4, 7, 11, 12, 16, 22, 23, 27, 29, 30,
-32, 33, 34, 46, 47, 48, 69, 71, 84), and their thirteen retirements resolve to
-thirteen distinct names in the tree. **`SYS_NANOSLEEP` is 49 and the endowment
-branch does not touch it** — no double-claim.
+**Both branches have landed and the tree answers it.** The highest number is
+**114** (`SYS_LOG_READ`), and `toyos-abi/src/syscall.rs:223-232` reserves two
+numbers explicitly:
 
-**`specs/log-architecture-spec.md` takes one number too, and under the ruled
-order it takes it first.** Its §3.4 declines to write a literal for exactly the
-reason this section does, and its `SYS_LOG_READ` is on `main` before C0 merges.
-So the two free numbers below the endowment block — 114 and 115 — go log first,
-this branch second, and neither spec says which is which.
+> Number 113 is **reserved, not free**: it is held for `SYS_PORT_REARM` … 115 is
+> likewise held, for `SYS_SLEEP_UNTIL`, which replaces a retired `SYS_NANOSLEEP`.
+> … **Both are recorded here rather than in those specs alone**, because this file
+> is where an agent allocating a number looks and a reservation nobody reads is
+> not a reservation.
 
-**This spec therefore allocates nothing until C0 reads the merged tree**, and
-takes **the first clean number, computed and never written down here**. The first
-draft said "expected 113, and C0 asserts it rather than assuming it", and a
-literal one clause away from the word "asserts" is what an implementer
-hard-codes. `assert_eq!(first_clean, 113)` is wrong in three live cases: `main`
-moves under both branches (**CONFIRMED** 2026-08-09 that it has, from `19c761e`
-to `0e48d2e`) and any landing that adds a number shifts the endowment block up
-(their §9); if they take their own §10.1 option 2 — chunks 0+1 as an earlier PR,
-which their spec calls "the recommendation" — then 99–112 has not landed and the
-first clean number is **99** (§15 row 19); and the log branch has taken one
-before C0 either way. C0 computes it from the merged `toyos-abi` and asserts only
-that it is clean. It needs exactly one:
+**So C0 has nothing to compute; it consumes the existing reservation.** The
+number is written down here *because the ABI writes it down* — a spec that hides
+a number the source states is a second place to get it wrong. C0 asserts only
+that 115 is still free and still carries that comment.
 
-| new | replaces |
-|---|---|
-| `SYS_SLEEP_UNTIL` | `SYS_NANOSLEEP` (49), retired |
+| new | number | replaces |
+|---|---|---|
+| `SYS_SLEEP_UNTIL` | **115**, reserved in `toyos-abi/src/syscall.rs` | `SYS_NANOSLEEP` (49), retired |
 
 Everything else keeps its number with changed semantics: `SYS_IO_URING_ENTER`
 (90) and `SYS_FUTEX_WAIT` (58) take absolute deadlines.
 
-Two consequences of the one number, both already owned by the endowment branch
-and named here so neither is done twice: their chunk 9 sizes the syscall profile
-array from the ABI rather than at `[u32; 64]`
-(`specs/issues/diagnostics/syscall-profile-is-64-bins-wide.md`), which one more
-number does not change; and their `retired_syscalls!` macro takes 49's gravestone
-as one more row.
+**One follow-up this branch deliberately does not do.** That reservation comment
+cites `specs/plans/iouring-blocking-spec.md`, which this document's landing
+deletes, so the citation goes stale the moment this lands. Re-pointing it at
+`specs/completion-architecture-spec.md` is a one-line edit inside
+`toyos-abi/src/`, which `src/pr.rs`'s `abi_lands_alone` treats as a sysroot
+change and would refuse beside a doc-only branch. **It lands as its own tiny PR**,
+the same shape the earlier fix to syscall 113's citation took, and it is C0's
+first act rather than something this branch smuggles.
+
+Two consequences of the one number, both already carried by the endowment branch:
+`ProcessData`'s syscall profile array is sized from the ABI rather than at
+`[u32; 64]` — its own comment records *"It was `[u32; 64]` while the ABI reached
+98"* (`toyos-abi/src/syscall.rs:254`), and the issue that asked for it is closed
+and its file deleted, so this document no longer cites it; and their
+`retired_syscalls!` macro takes 49's gravestone as one more row.
 
 ### 14.3 Semantics
 
@@ -1626,13 +2149,13 @@ of their *code*. Rows 18–22 were added by this review; 2, 3, 4, 9, 10, 12, 16 
 |---|---|---|
 | 1 | **`HandleTable` inside `ProcessData`, "behind the existing lock"** (§1.1) | That lock becomes a `SleepLock` in C8. Their `get::<T>` is lock → clone an owned Arc → unlock, so no table borrow crosses a park; §6's borrow rule *proves* it rather than asserting it. No new lock and no new ordering edge. |
 | 2 | **`Rights::WAIT` — "block on it / io_uring POLL_ADD / SYS_PROCESS_WAIT"** (§1.4) | The seam is taken exactly as offered. **But the check cannot live in `completion::arm`**, as the first draft said: §5.3 makes `arm` take a *borrowed `Subject`*, by which point there is no handle and no `Rights` left to test. **`WAIT` is checked at the syscall boundary that resolves the handle**, and `arm` is reachable only from code that has done so. |
-| 3 | **`Acceptor`/`Connector` and `PortShared`** (§1.2), which carry `acceptors: Arc<KWaitQueue>` and `io_uring_watchers: Lock<Vec<RingId>>` | `kernel/src/object/port.rs` is theirs to create; **C13** replaces those two fields with one watch list, exactly as it does for pipes and devices (the first draft said C3, which is the park site and does not touch `port.rs`). P6 parks there. Their `Acceptor::on_zero_handles` — set `closed`, drop the queue — becomes the canceller that posts `Outcome::Gone` to every parked acceptor, which is what makes their "the bound on failure is a process lifetime and nothing else" true of a *blocked* server too. **"The one file both branches write" is false** and is withdrawn: their chunk 2 also rewrites `io_uring.rs` (which §19 deletes from) and deletes `FdTable` from `fd.rs` (which §9 and §18 both change). Three files, not one. |
-| 4 | **No key at all, rather than a `Koid` key** (§1.1: `Koid` is "an identity for diagnostics and kernel-internal keys, never an authority"; their chunk 2 turns `io_uring::Source` keys into `Koid`s, and §4.1 turns `Source::Listener(ListenerId)` into `Source::Acceptor(Koid)`) | §5.3's `Subject` is a *borrowed reference to the object*, so after C3 there is no key to turn into anything and a destroyed subject is unnameable. Their chunk 2 does the `Koid` rename; C3 removes the residual. Order matters: **C3 must land after their chunk 2**, or it rewrites a `Source` that is about to be rewritten. **Internal contradiction to resolve before C3 is written**: §21 gives C3 the deliverable `Source::Terminated(koid)` while §19 has C3 delete `Source` outright and this row says nothing is left to key. One of the three is wrong; the intent is that nothing survives, so `Source::Terminated(koid)` should go. |
+| 3 | **`Acceptor`/`Connector` and `PortShared`** (§1.2), which carry `acceptors: Arc<KWaitQueue>` and `io_uring_watchers: Lock<Vec<RingId>>` | `kernel/src/object/port.rs` is theirs to create; **C13** replaces those two fields with one watch list, exactly as it does for pipes and devices (the first draft said C3, which is the park site and does not touch `port.rs`). P6 parks there. Their `Acceptor::on_zero_handles` — set `closed`, drop the queue — becomes the canceller that posts `Outcome::Gone` to every parked acceptor, which is what makes their "the bound on failure is a process lifetime and nothing else" true of a *blocked* server too. **"The one file both branches write" is false** and is withdrawn: their chunk 2 also rewrote `io_uring.rs` (which §19 deletes from) and deleted `fd.rs` outright (which §9, §13 and §18 all cited). Three files, not one — **and all three landed**, so C13 opens on `object/port.rs`, `object/ops.rs` and `object/file.rs`. |
+| 4 | ~~**No key at all, rather than a `Koid` key**~~ — **the premise is void; verified 2026-08-15** | The landed `Source` uses neither a `Koid` nor a `ListenerId` for ports: it holds the live object, `Source::Port(Arc<crate::object::port::PortShared>)` (`io_uring.rs:155`), with `PartialEq` by `Arc::ptr_eq`. `grep -n Koid kernel/src/io_uring.rs` returns nothing. So there is no `Koid` rename to follow and no residual key to remove — **C3's job for `Source::Port` is to remove an `Arc`-held reference, not a key**, which §5.3's borrowed `Subject` does by construction. The "internal contradiction to resolve" this row recorded — §21's `Source::Terminated(koid)` against §19's "delete `Source` outright" — dissolves with it: nothing survives, and `Source::Terminated(koid)` is struck. |
 | 5 | **`SYS_LISTEN`/`SYS_CONNECT` retired, `SYS_ACCEPT`(86) takes an `Acceptor` and returns one handle** (§3.2, §3.3) | `kernel/src/listener.rs` is gone before C3 runs, so P6's "listener's completion" is the `Acceptor`'s. `listener::io_uring_watchers` and `wake_poll_waiters` are deleted by them, not by this spec — **removed from §19 so neither branch claims it twice.** |
 | 6 | **`SYS_THREAD_JOIN`(41) is *kept* with its `Tid`** (§3.4, their deviation D5) — `capability-handles-spec.md`'s `SYS_THREAD_JOIN_H` does **not** happen | P8 therefore parks on the `ThreadObject` the `Tid` resolves to inside the caller's own process, not on a handle. `SYS_PROCESS_WAIT`(108) with `Rights::WAIT` is the handle-shaped one, and P7 uses it. `park_lot`, `PARK_BUCKETS` and `wake_task(TaskId)` are still deleted here. |
 | 7 | **`SYS_OPEN_DEVICE`(31) retired; `SYS_DEVICE_CLAIM`(111) mints a claim, and only `/bin/init` holds `Rights::DEVICE`** (§1.2, §3.1) | P3/P4 park on the `DeviceClaim`. `DeviceClaim::on_zero_handles` releasing the class posts `Outcome::Gone(Revoked)` to anyone parked, so their §5.3 crash-release row gains liveness for a blocked reader for free. |
 | 8 | **`SYS_IO_URING_SETUP`(89) returns `{ handle, vaddr }`; the ring owns its `PageAlloc` and the kernel maps it at setup** (§3.3, their chunk 6) | Exactly §5.2's second inbox. **They close `io-uring-abuses-shared-memory`, not this spec** — removed from §19. C11 adopts the ring as an `Inbox` and adds nothing to its allocation. The superseded spec's 32 KiB `RingArena` is dropped by both. |
-| 9 | **`on_zero_handles` runs from a deferred per-CPU queue drained "at syscall exit, `do_schedule` entry and the idle loop"** (their §1.1; the first draft cited §5.2, which is *Backpressure*) | Three things. (a) The third drain site goes, and the reason is not that the idle loop empties — after the log strike it does not (§11.3). `idle_loop` calls `pass(Dispose::None)` on **every** iteration (`driver.rs:690`), so the `do_schedule` drain subsumes the idle one whatever else the loop is doing: **delete the third site rather than keep a body for it**, and the argument no longer depends on a chunk that shrank. (b) C12 adds `FileObject::on_zero_handles → writeback::push`, because `Drop` cannot take a `&Parkable` (§13). Their spec has no hook *table* to add a row to — their §5.3 is a six-row teardown table with no `FileObject` row — so this is an extension, not an entry. C12 lands after their chunk 2. (c) **The general rule, which is new and binds their chunks 1 and 2**: none of the three drain sites has a `Parkable` (`do_schedule` entry provably does not, §6.1), so after C5 **no `on_zero_handles` hook may take a `SleepLock` at all** — the compiler refuses it. `FileObject → writeback::push` is the shape *every* hook needing the VFS must take, not a one-off. |
+| 9 | **`on_zero_handles` runs from a deferred per-CPU queue drained "at syscall exit, `do_schedule` entry and the idle loop"** (their §1.1; the first draft cited §5.2, which is *Backpressure*) | Three things. (a) ~~The third drain site goes~~ — **withdrawn: the landed code keeps all three deliberately and documents why.** `object::drain_zero_handles`'s doc reads *"Called at syscall exit, at the top of every scheduler pass and from the idle loop — the same three sites, and for the same reason, as the wake drains beside them"*, and the idle-loop call (`driver.rs:692`) carries its own rationale: *"`pass` below covers this too; it is here so a CPU that reaches the loop and then halts has run every hook first, rather than leaving one queued behind an interrupt that may be 102 s away."* That is the case this row's argument did not consider — subsumption by `pass` is about a CPU that keeps running, and the idle site is about one that stops. **This branch would have to actively remove an already-justified, already-shipped call**, so it does not: the recommendation is struck and all three sites stay. (b) C12 adds `FileObject::on_zero_handles → writeback::push`, because `Drop` cannot take a `&Parkable` (§13). Their spec has no hook *table* to add a row to — their §5.3 is a six-row teardown table with no `FileObject` row — so this is an extension, not an entry. C12 lands after their chunk 2. (c) **The general rule, which is new and binds their chunks 1 and 2**: none of the three drain sites has a `Parkable` (`do_schedule` entry provably does not, §6.1), so after C5 **no `on_zero_handles` hook may take a `SleepLock` at all** — the compiler refuses it. `FileObject → writeback::push` is the shape *every* hook needing the VFS must take, not a one-off. |
 | 10 | **Their §1.1's closing rule: "The failing shape to check any new type against is `toyos-sched`'s `Registration`: a guard that lives on the victim's own stack and is therefore never dropped when another CPU kills it. No object introduced below places a release obligation on a blocked thread's stack."** | §7 **fixes `Registration` itself** — but by §7.2's rewrite of `handle_retire`'s two reap-in-place arms, not by `Commit::Killed`, which the first draft named and which is the wrong path (`commit()` already dequeues). The victim runs again on its own stack and drops the guard. So their rule stops being a constraint they must design around and becomes a property the kernel has. **They should not relax it until C4 has actually landed and its `toyos-sched` tests are green**: it costs them nothing to keep, and until then it is still true. `retired-thread-leaks-wait-queue-node` is closed by C4, and it is this spec's to close. |
 | 11 | **Their §1.1: an `Arc` cloned before blocking "is stranded on a freed kernel stack … leaks memory, bounded and census-visible"** | Same mechanism as row 10 retires the leak class outright. `capability-handles-spec.md` §13 said the structural fix was "Phase 2 try-once syscalls"; it is not — it is the cancellable park, which keeps one-syscall blocking I/O (§14.3). **Their census baseline assertions should tighten once C4 lands.** |
 | 12 | **`KernelPayload.address_space: Option<PageTables>` → non-`Option`** (`capability-handles-spec.md` §9.4's one surviving retype) | §10: a kernel thread's `ProcessObject` names the **kernel** address space. A kernel thread naming *no* address space would have forced that field to stay an `Option` forever, so the retype is *enabled* by this one. **The endowment spec does not claim it**: `KernelPayload` appears nowhere in it, and its §1.3 lists `AddressSpaceObject` only as a `KObjectRef` variant adopted "with no change of shape" — a different type from `payload.rs:88`'s field. So this row is a contact point with `capability-handles-spec.md`, not with the endowment branch, and nobody currently owns doing it. **C6 does it**, since C6 is what makes it possible. |
@@ -1640,7 +2163,7 @@ of their *code*. Rows 18–22 were added by this review; 2, 3, 4, 9, 10, 12, 16 
 | 14 | **Their gates `kill_while_blocked` and `device_claim_crash_release`** (their chunk 6) | Both are strengthened rather than changed: after C4 the killed client's stack is unwound by returning, so the census returns to baseline for a reason stronger than the handle drain. Do not weaken either to accommodate this spec. |
 | 15 | **The SDK** (§6.5) | Disjoint in *intent*: they change what an argument names, this changes what a timeout means (§14.3 keeps the blocking ABI shape). `toyos/src/services.rs` and `toyos/src/pipe.rs` are deleted by them; `Poller` is replaced by `toyos::ring::Ring` in C11 either way. **Not disjoint in *files*** — see row 18. |
 | 16 | **The `Abi-Inseparable` trailer and the shared sysroot** (their §9, §10.1) | They hold the sysroot claim for their branch's whole life. This branch then claims it in turn — **at C0, not C1** (§21's C0 row is right; the first draft's "C1 onward" here was not), because C0 is where the merge and the re-check happen and the claim must precede the first build. One trailer on one commit is sufficient: `src/pr.rs:319`'s `abi_lands_alone` exempts the whole branch if **any** commit declares it, so §21's single-commit form satisfies the gate. **Their §10.1's own recommendation is to land chunks 0+1 as a separate earlier PR** — see row 19, because "post-endowment" then means two different trees. |
-| 17 | **Root `CLAUDE.md` headroom** (their chunk 9 measures 2,678 bytes spare against 37,322) | Verified 2026-08-09: `src/docs.rs:213` budgets 40,000; `origin/main` is **37,322**, `origin/wt/toyos-endow` is **byte-identical to main** (they have spent nothing yet — their line is planned for chunk 9), and this branch is **37,594**, so this spec's edit spent **272**. Both land comfortably. **Two arbiters, not one**: `src/docs.rs:226`'s `TOTAL_BUDGET` of 80,000 across the five files is separately enforced and currently sits at 74,469. Whoever lands second re-measures both. |
+| 17 | **Root `CLAUDE.md` headroom** (their chunk 9 measured 2,678 bytes spare against 37,322) | **Both budgets are gone with `src/docs.rs`** (deleted by owner ruling in `8d0db10`, "no tests over documentation"), so neither the 40,000 per-file cap nor the 80,000 `TOTAL_BUDGET` is enforced by anything today. The pressure they existed for went with the compaction rather than with the test: `main`'s root `CLAUDE.md` is **13,163** bytes and the five files together are **28,831** — a third of what the struck cap allowed, and **28,824** after this branch's edit. This branch's own edit is **one line**, replacing the bullet that named the two superseded plans. **The row is kept as the record that the arbiter is gone**, so a later agent does not go looking for a budget test that does not exist and conclude the budget was raised. |
 | 18 | **`rust/`, the std fork and the fork estate** (their §6.6, §10.2) — **the row the first draft missed entirely** | Three collisions. **(a) Their chunk 0 is a hard prerequisite for C1, not merely for the merge.** Their §6.6 records that `rust/library/std/Cargo.toml` names `toyos-abi` by a relative path resolving to the **primary** checkout, so a worktree's `x build library` compiles std against *main's* ABI — "for a branch whose whole content is an ABI change it is not an inconvenience but a wall". §14.1 makes this exactly such a branch. **(b) `SYS_SLEEP_UNTIL` and the absolute futex reach the shared tree**: `rust/library/std/src/sys/thread/toyos.rs:87` calls `nanosleep`, `sys/pal/toyos/futex.rs:15` passes a *relative* timeout. Their chunks 2, 5 and 7 hold std edits in the same one shared working tree, and their §10.2 records one uncommitted std patch failing three other worktrees' landings in an hour. **C11's std edits must be sequenced against theirs, not merely merged.** **(c) The 24-byte CQE reaches mio**: `mio/src/sys/toyos/selector.rs` indexes the CQ by `size_of::<IoUringCqe>()` (a recompile absorbs it) but also calls `map_shared`, the line their chunk 6 deletes. Two mio landings and two submodule bumps, sequenced. |
 | 19 | **Their §10.1 option 2 — "land chunk 0 + chunk 1 as their own earlier pull request", which their spec calls "the recommendation"** | If they take it, **"post-endowment" names two different trees** and C0's syscall assertion breaks: after that first PR the block 99–112 has not landed and the first clean number is **99**, not 113. §14.2's fix (assert the *computed* first clean number, never a literal) covers it; the ordering does not. **C0 should actively request their option 2**, because their chunk 0 is row 18(a)'s prerequisite and this branch needs it earliest. |
 | 20 | **`EXPECTED_FAILURES` expires 2026-09-06** (their §8.5, §10.3) | Both entries carry `Stale::OnThisDate("2026-09-06")` (`tests/toyos.rs:730`, `:743`) and the harness **exits 1 by itself** when it arrives. This is a fifteen-chunk branch whose C0 cannot begin until a nine-chunk branch lands, and today is 2026-08-09: **this branch is near-certain to be open past that date and will red on two exemptions it did not cause.** Not this branch's to move — moving it is precisely what the rule forbids. **C0 puts it to the owner** with the two entries' merits, as a question about the entries and not a scheduling favour. |
@@ -1661,7 +2184,7 @@ gate. Four new models beside `ticket_lock.rs` and `tlb_shootdown.rs`:
 |---|---|---|
 | `inbox.rs` | Invariant W (§5.4): producer stores a record then claims; consumer arms, rechecks, parks. Two producers, one consumer, and a producer that runs entirely before the arm | the race window is a handful of instructions on two CPUs; TSO makes the missing edge unobservable |
 | `sleep_lock.rs` | `SleepLock` acquire/release against a parking contender and a concurrent `try_lock`; FIFO among contenders | `Lock::lock`'s spin is unreachable by loom (`lock-spin-unreachable-by-loom`); a parking acquire has no unbounded branch, so this is the **first** contended-acquire model in the tree |
-| `cancel.rs` | kill racing a park racing a post, three ways: cancel before arm, between arm and commit, and after `Blocked` | the interleaving needs a remote CPU acting between two of the victim's instructions |
+| the cancel model — **in `toyos-sched/loom/tests/loom_retire.rs`**, not a new file | kill racing a park racing a post: cancel before arm, between arm and commit, and after `Blocked` | the interleaving needs a remote CPU acting between two of the victim's instructions |
 | `outstanding.rs` | an ISR on CPU A records into `irq_ring`, a drain on CPU B posts, a waiter on CPU C observes | three CPUs, one publication chain; nothing in QEMU orders them |
 
 `kernel-loom` compiles the real `kernel/src/` file a second time against loom's
@@ -1689,9 +2212,18 @@ Two of the four models need re-siting before they are written:
   records, so the acquire/release ordering and the FIFO property are real
   coverage; the wake handshake is not, and the model must say which half it
   proves rather than implying both.
-- **`cancel.rs` is a `toyos-sched` model, not a `kernel-loom` one.** `Commit`, the
+- **The cancel model is a `toyos-sched` model, not a `kernel-loom` one — and it
+  extends an existing file rather than opening a new one.** `Commit`, the
   rendezvous CAS and — after §7.2 — `handle_retire`'s arms all live in
-  `toyos-sched/`, which has its own `loom/` directory. Put it there.
+  `toyos-sched/`, whose `loom/tests/` already holds four models
+  (`loom_mailbox.rs`, `loom_retire.rs`, `loom_sleep.rs`, `loom_ticket.rs`).
+  **`loom_retire.rs` already covers three of the four orderings** — kill vs
+  wake-claim, kill vs park-commit
+  (`a_retire_racing_the_park_commit_always_leaves_someone_to_reap`, `:104`),
+  chase vs migration (`:157`) and adopt-under-kill (`:199`). The genuinely
+  missing case is exactly the one §7.3 names: **retire finding the task already in
+  `parked`.** Extend that file; a fifth would split the estate that already holds
+  the argument.
 
 ### 16.2 The TCG price, and the budget that does not grow
 
@@ -1740,12 +2272,13 @@ changes. Three things do:
 
    | reach | lock | on pre-log `main` |
    |---|---|---|
-   | `dump.rs:532` → `process.rs:669` | `process::PROCESS_TABLE` | `Lock<Option<ProcessTable>>`, already `try_lock` |
+   | `dump.rs` → `process.rs:727` | `process::PROCESS_TABLE` | `Lock<Option<ProcessTable>>`, already `try_lock` |
    | ~~`log!` → `log_ring.rs:314`~~ | ~~`RingGuard`~~ | **gone before C0** — log L3 deletes `log_ring.rs` and the record ring's producer path takes no lock at all (log §2.3, log §7) |
-   | `dump.rs:230` → `panic_console.rs:662` | `SEQ` seqlock + `PAINTING` | deliberately not a `Lock` |
+   | `dump.rs:235` → `panic_console::paint_report` | `SEQ` seqlock + `PAINTING` | deliberately not a `Lock` |
 
-   `process::ProcessData` (`process.rs:346`) is a **different** lock from
-   `process::PROCESS_TABLE` (`process.rs:640`), and thread names come from the
+   `process::ProcessData` (`process.rs:538`, held as `Arc<Lock<ProcessData>>`) is a
+   **different** lock from `process::PROCESS_TABLE` (`process.rs:727`), and
+   thread names come from the
    latter. So **C0 finds two rows, not three**, and after all four conversions
    the one lock that can refuse the dump is still a raw ticket `Lock` with no
    holder, which the dump already asks with `try_lock`. **`SleepLock::holder()`
@@ -1776,10 +2309,11 @@ changes. Three things do:
    nothing else. The halted-machine pager (`page_forever`, reachable only from
    `halt_all_cpus`) is untouched — it must be, because no thread runs there.
 
-The panic path keeps every spin it has (§4.5). `apic.rs:203`'s 500 ms wait for the
-log file to drain before power-off **is not a `Tripwire`** — `apic.rs:194` logs
-"the panel is the only copy" and *returns*, deliberately, because a second panic
-on a machine already going down loses the report (§3.2). It is a `Bound` whose
+The panic path keeps every spin it has (§4.5). `apic.rs:239`'s 500 ms wait for the
+log file to drain before power-off, inside `wait_for_log_file` (`:190`), **is not
+a `Tripwire`** — `apic.rs:236` logs "the panel is the only copy" and *returns*,
+deliberately, because a second panic on a machine already going down loses the
+report (§3.2). It is a `Bound` whose
 expiry is a named refusal. It cannot become a completion either way, because the
 thread that would post it is not going to run again.
 
@@ -1791,40 +2325,43 @@ Gates that must stay green throughout: `blocked_dump`, `screen_blocked_dump`,
 
 ## 18. Migration ledger
 
-Counted with the commands in §4 and re-derived 2026-08-09 at `e6f7769`; two rows
-were wrong and are corrected below.
+**Re-stamped 2026-08-15 at `71a0559`, on the merged tree.** Every row below moved
+— several by a lot, and two in opposite directions — which is the ledger's own
+argument for stating its command rather than its number.
 
-**Every count here, and every line number in §4.1, is measured on pre-endowment,
-pre-log `main`, and C0 re-derives all of them — not only `io-depth-probe` and the
-`--slow-usb` A/B.** The log branch alone removes one spin site
-(`log_ring.rs:328`, §4.4), one convertible `Lock` static (`log_file::SINK`, §9),
-two `Lock` declarations' worth of statics with the file, one `vfs::lock()` site
-(`log_file.rs:376`, §13) and at least two production durations (§3.2) — so no row
-below is a number C1 or C5 may work from. §4.1 calls itself "the refactor's
-inventory" without that hedge, and two of its twelve rows are already stale
-against the endowment plan:
-**P6** (`arch/syscall.rs:1279`) sits inside the `1246-1344` span their §7.1
-deletes, and **P7** (`:1202,1213`) is inside `sys_waitpid`, whose number 26 they
-retire. **`with_fd_owner_data` is a name their chunk 2 may retire outright**, since
-it deletes `FdTable` and makes `fd.rs` dispatch on `KObjectRef` — so C8's "55 call
-sites" is a count of something that may not exist under that name.
+**The hedge the first draft put on two rows applies to all of them, and C0 still
+re-derives.** These are the numbers the plan is written against, not numbers C1 or
+C5 may work from: the tree moves under this branch as it moved under the other
+two. Three of the first draft's caveats are now spent rather than pending — P6's
+`1246-1344` span is deleted and `listener.rs` with it, P7's `sys_waitpid` is
+retired and replaced by `sys_process_wait`, and `with_fd_owner_data` **survived**
+the endowment branch under its own name, in `process.rs`, `io_uring.rs`,
+`object/ops.rs` and `arch/syscall.rs`.
 
-| what | count | disposition |
-|---|---|---|
-| `core::hint::spin_loop();` in `kernel/src/` | 39 | 4 deleted (§4.2), 14 become `Poll` (§4.3), 21 stay and are gated to a **site** allow-list: 13 Class R, 6 Class X, 1 Class L, 1 Class B (§4.4–§4.6) |
-| …of those, under `kernel/src/drivers/` | 23 | |
-| `scheduler::wait_until` callers | 6 | all → `completion::wait` |
-| `scheduler::prepare_wait` call sites | 7 | 3 internal to `scheduler.rs`; all → `completion::arm` |
-| `scheduler::block_on` call sites | 7 | all → `completion::wait` |
-| `io_uring::complete_pending_for_event` call sites | 10 | all → one `post` on a watch list |
-| `.lock()` calls in `kernel/src/` | 244 | 5 statics convert (§9); the sites under them take `&Parkable` |
-| `.try_lock()` calls | 11 | unchanged in meaning; two more appear (`poll_if_pending`, boot's VFS) |
-| `static … Lock<…>` declarations | **52** | `grep -rnE "static [A-Z_0-9]+: *Lock<"` gives 49; add `VOLUMES` (an *array* of two `Lock`s, `fat32_adapter.rs:316`) and the two written `crate::sync::Lock<` (`percpu.rs:294`, `syscall.rs:25`). The first draft said 48. **The number moves with the regex** — three readings of this tree gave 48, 49 and 51 — so the ledger states the command, and only the 5 that convert matter |
-| `vfs::lock()` / `vfs::try_lock()` textual sites | **30** | 29 + 1; the first draft said 33. Split boot from task; 2 doors keep the choke point |
-| `with_fd_owner_data` sites | 55 | take `&Parkable` where they can reach a flush |
-| kernel `.rs` files | 117 | |
+| what | count | command | disposition |
+|---|---|---|---|
+| `core::hint::spin_loop();` in `kernel/src/` | **41** | `rg -n "core::hint::spin_loop\(\);" kernel/src/` | 4 deleted (§4.2), 14 become `Poll` (§4.3), 23 stay and are gated to a **site** allow-list: 15 Class R, 5 Class X, 2 Class L, 1 Class B (§4.4–§4.6) |
+| …of those, under `kernel/src/drivers/` | **22** | the same, scoped to `drivers/` | |
+| `spin_loop` textual lines | **43** | `rg -n 'spin_loop' kernel/src/` | 41 calls + 2 doc-comment mentions; §4.6's gate strips comments |
+| bare `while … {}` loops | **5** | `rg -n 'while .*\{\s*\}\s*$' kernel/src/` | 3 real waits, 2 draining loops the gate must not red on (§4.6) |
+| `scheduler::wait_until` call sites | **7** | `rg -n 'wait_until' kernel/src/` | all in `arch/syscall.rs`; all → `completion::wait` |
+| `scheduler::prepare_wait` call sites | **9** | `rg -n 'prepare_wait' kernel/src/` | 3 internal to `scheduler.rs`; all → `completion::arm` |
+| `scheduler::block_on` call sites | **9** | `rg -n 'block_on' kernel/src/` | 3 internal to `scheduler.rs`; all → `completion::wait` |
+| `io_uring::complete_pending_for_event` call sites | **11** | `rg -n 'complete_pending_for_event' kernel/src/` | 10 hand-paired with a queue wake, 1 the log's batched post (§5.6); all → one `post` on a watch list |
+| `IO_URING_WATCHERS` stores | **8** | `rg -n 'IO_URING_WATCHERS\|io_uring_watchers' kernel/src/` | 6 statics + 2 per-instance fields; §19 |
+| `.lock()` calls in `kernel/src/` | **259** | `rg -n '\.lock\(\)' kernel/src/` | 4 statics convert (§9); the sites under them take `&Parkable` |
+| `.try_lock()` calls | **10** | `rg -n '\.try_lock\(\)' kernel/src/` | unchanged in meaning; two more appear (`poll_if_pending`, boot's VFS) |
+| statics holding a `Lock` | **45** | `rg -n 'static [A-Z_0-9]+: *Lock<' kernel/src/` gives **42** | plus `VOLUMES`, an *array* of two `Lock`s the regex cannot see (`fat32_adapter.rs:316`), plus the two written-out `crate::sync::Lock<` statics (`arch/syscall.rs:83`, `arch/percpu.rs:443`). **The number moves with the regex** — five readings of this tree have given 48, 49, 51, 52 and 45 — so the ledger states the command, and only the 4 that convert matter. Two further `crate::sync::Lock<` occurrences (`object/device.rs:102`, `:233`) are struct **fields**, not statics, and are not counted |
+| `vfs::lock()` / `vfs::try_lock()` textual sites | **29** | `rg -n 'vfs::lock\(\)\|vfs::try_lock\(\)' kernel/src/` | split boot from task; 2 doors keep the choke point |
+| `with_fd_owner_data` sites | **68** | `rg -n 'with_fd_owner_data' kernel/src/` | take `&Parkable` where they can reach a flush |
+| kernel `.rs` files | **136** | `find kernel/src -name '*.rs'` | |
 
-**The 30 VFS sites and the 55 `ProcessData` sites are the blast radius, and it is
+**Two rows moved in opposite directions and that is the interesting part**: 244
+`.lock()` call sites became 259 while the statics under them fell from 49 to 42 by
+the same regex — more call sites over fewer locks. C8's blast radius grew; §9's
+conversion surface did not.
+
+**The 29 VFS sites and the 68 `ProcessData` sites are the blast radius, and it is
 *not* purely mechanical.** The choke point is real and small — `vfs::lock()` and
 `vfs::try_lock()` are the only two doors — but every caller becomes a caller that
 may park, and threading `&Parkable` down to the device stops at a crate boundary:
@@ -1845,15 +2382,37 @@ Userland is untouched until C11, because §14.3 preserves the blocking ABI shape
 **Code deleted, by name.** `sched/driver.rs`: **two** of the four pre-`hlt`
 conditions — `i8042::verdict_due` (`:534`) and `xhci::port_work_pending` (`:564`)
 — and `poll_if_pending` from `drain_irqs`.
-`scheduler.rs`: `wait_until`, `prepare_wait`, `block_on`,
-`wake_task`, `wake_pipe_readers`, `wake_pipe_writers`, `park_lot`, `futex_wake`'s
-generation protocol. `sched/waitqs.rs`: `PARK_BUCKETS`, `park_lot`.
+`scheduler.rs`: `wait_until` (`:249`), `prepare_wait` (`:196`), `block_on`
+(`:207`), `wake_task` (`:321`), `wake_pipe_readers` (`:343`),
+`wake_pipe_writers` (`:355`), `park_lot` (`:265`). `sched/waitqs.rs`:
+`PARK_BUCKETS` (`:36`), `park_lot` (`:52`). **`futex_wake`'s generation protocol
+is struck from this list: it is already gone**, deleted independently of this
+branch in `ba76478`, and `FUTEX_WAKE_GEN` appears nowhere in `kernel/src`.
 `io_uring.rs`: `Source`, `Source::is_ready`, `complete_pending_for_event`,
 `complete_pending_for_source`. `xhci/wait/mod.rs`:
 `wait_transfer`, `wait_command`. `nvme.rs`: `wait_completion`'s spin.
-`virtio.rs`: `submit_and_wait`'s spin. Five per-source `IO_URING_WATCHERS`
-statics (`net.rs`, `keyboard.rs`, `mouse.rs`, `hda.rs`, `virtio_sound.rs`) and
-the sixth inside their `PortShared` (§15 row 3).
+`virtio.rs`: `submit_and_wait`'s spin.
+
+**Eight watcher stores, not six, and the first draft both double-counted one and
+missed another.** Re-enumerated 2026-08-15:
+
+| store | where | kind |
+|---|---|---|
+| `IO_URING_WATCHERS` | `kernel/src/keyboard.rs:17` | static |
+| `IO_URING_WATCHERS` | `kernel/src/mouse.rs:19` | static |
+| `IO_URING_WATCHERS` | `kernel/src/net.rs:41` | static |
+| `IO_URING_WATCHERS` | `kernel/src/drivers/hda.rs:220` | static |
+| `IO_URING_WATCHERS` | `kernel/src/drivers/virtio_sound.rs:270` | static |
+| `IO_URING_WATCHERS` | `kernel/src/log/user.rs:37` | static — **the sixth**, log L4's |
+| `PortShared.io_uring_watchers` | `kernel/src/object/port.rs:74` | per-instance `Lock<Vec<RingId>>` |
+| `Pipe.io_uring_watchers` | `kernel/src/pipe.rs:142` | per-instance `Vec<RingId>` |
+
+`PortShared`'s is **not** a static and is not "the sixth" — `log/user.rs`'s is,
+and §11 names it separately, so the two descriptions collided. And
+**`pipe.rs:142` was named nowhere in this ledger**, which is the one store §5.6's
+*"a ring and a thread are two entries on one watch list"* conversion most
+obviously has to fold: it is the only one already living on the object, which is
+the shape everything else is being moved to.
 
 **Struck from this ledger, 2026-08-09** — `specs/log-architecture-spec.md` §12.1
 takes them and its §8.1 is where they are now listed by name:
@@ -1869,73 +2428,86 @@ the ruled order log L6 lands first, so `flush_log_file_if_affordable`, its four
 names and `log_file::SINK`'s `Lock` are all gone before C0 and none of them can
 return to this ledger.
 
-**One name joins it instead, and it is the log branch's fallback.** The pre-`hlt`
-condition at `driver.rs:523` is *re-pointed* by log L3 rather than deleted — it
-becomes `log::pending()`, because that branch's §2.6a wake is decided inside a
-scheduler pass and the condition covers the gap. **This branch deletes it, in the
-same chunk as the wake conversion (§11), together with `Source::Log` and its
-`IO_URING_WATCHERS` static** — which log L4 adds as a sixth instance of the
-mechanism §19 already deletes five of.
+**~~One name joins it instead, and it is the log branch's fallback.~~ Also void,
+and there is nothing to delete.** The struck version had log L3 re-pointing the
+pre-`hlt` condition into `log::pending()` for this branch to remove. It did not:
+both log conditions were deleted outright, and **no caller of any log pending
+predicate exists anywhere in the tree**. What the log branch did leave is a dead
+function — `log::console::pending()` (`kernel/src/log/console.rs:251`,
+`serial::has_console() && DRAINED.any_pending()`), zero callers repo-wide. **The
+ledger entry is therefore "delete the function, not a condition"**, and the
+C3+C4 deliverable "the `log::pending()` pre-`hlt` condition is deleted with them"
+is struck from §21.
 
-**Not deleted here, because the endowment branch deletes them first**:
-`kernel/src/listener.rs` whole (verified: their §7.1 table and their chunk 3),
-`wake_poll_waiters` (`arch/syscall.rs:1334`, inside the `1246-1344` span they
-delete), and `io_uring`'s `shared_memory` dependency (`io_uring.rs:198`). **One
-item on this list is not backed by their text**: `PendingPoll`'s fd keying. Their
-chunk 2 says only that `io_uring::Source` keys become `Koid`s, and `PendingPoll`
-(`io_uring.rs:185`) carries a **separate** `fd_num: u32` field their spec never
-names. It plausibly becomes a `RawHandle` when `FdTable` dies, but nobody has
-written that down. **C0 asks them, or C3 owns it.**
+`Source::Log` and its `IO_URING_WATCHERS` static (`log/user.rs:37`) **do** join
+the ledger, as the sixth static above. The two genuine log fallbacks — `klogd`'s
+park becoming an `Inbox` park, and `emit`'s relaxed signal becoming the degenerate
+one-waiter post — are unaffected by any of this.
 
-**`specs/issues/` files closed.** Slugs only, deliberately: `src/docs.rs`'s
-`every_named_issue_file_resolves` walks every text file in the tree and reds on
-any `specs/issues/<area>/<slug>.md` path that does not resolve, so a full path
-here would red `cargo test --lib` the moment the file is deleted.
+**Already deleted, by the endowment branch, and confirmed gone 2026-08-15**:
+`kernel/src/listener.rs` whole, and `wake_poll_waiters` — `ls kernel/src/listener.rs`
+is "No such file" and `rg wake_poll_waiters kernel/src/` is empty. `PendingPoll`
+survives (`io_uring.rs:193`) and still carries its own `fd_num: u32` field, which
+no spec ever named; **C3 owns it**, and the question "ask them" is spent because
+they have landed.
 
-**C13 must therefore also de-path the citations elsewhere, and there are more of
-them than this section.** Re-counted 2026-08-09 against the twelve slugs left
-after the log strike: **five** are written as *full paths* in this very document
-— §1 (`disk-wait-pins-a-cpu`), §4.3 (`driver-waits-without-a-deadline`), §5.6
+**`specs/issues/` files closed.** Slugs only, deliberately — but **the gate that
+made this a mechanical requirement no longer exists.** `src/docs.rs` and
+`every_named_issue_file_resolves` were deleted with the doc tests (`8d0db10`,
+owner ruling); the name now occurs only as prose in two spec documents, and
+nothing in `src/` resolves a `specs/issues/<area>/<slug>.md` path. **So a stale
+full-path citation is invisible to `cargo test` today**, which makes the
+convention a discipline rather than a check. The convention stands regardless: a
+slug survives its file moving, a path does not. **Whether to rebuild the check is
+C13's to put to the owner**, alongside `no_spin_outside_the_allow_list`, which
+lands in `src/sourcegate.rs` and is the natural host for it.
+
+**C13 still de-paths the citations, and the reason is now hygiene rather than a
+red.** Five of the twelve slugs are written as full paths in this very document —
+§1 (`disk-wait-pins-a-cpu`), §4.3 (`driver-waits-without-a-deadline`), §5.6
 (`io-uring-source-half-a-wake-pair`), §7.5 (`retired-thread-leaks-wait-queue-node`)
-and §13 (`cache-eviction-wedges-an-idle-cpu`) — and **seven of the twelve** are
-cited by full path from at least one file that is not their own entry: the root
-`CLAUDE.md`, `specs/metal-boot-plan.md`, `specs/metal-hardware-inventory.md` and
-`specs/issues/audio/doom-audio-callback-stalled-on-the-t14.md` among them.
-**Every one is a `cargo test --lib` red at C13 and none is in any chunk's
-budget.** The `specs/issues/README.md` protocol says the durable rule moves into
-the spec that owns the subject; doing that is what removes the citation, so it is
-the same edit.
+and §13 (`cache-eviction-wedges-an-idle-cpu`) — and several are cited by full path
+from files that are not their own entry: the root `CLAUDE.md`,
+`specs/plans/metal-boot-plan.md`, `specs/reference/metal-hardware-inventory.md`
+and `specs/issues/audio/doom-audio-callback-stalled-on-the-t14.md` among them.
+The `specs/issues/README.md` protocol says the durable rule moves into the spec
+that owns the subject; doing that is what removes the citation, so it is the same
+edit. **Nothing fails the build if it is missed**, which is why it needs to be a
+chunk's stated deliverable rather than something the gate catches.
 
-**Three slugs left this ledger with the log strike and their citations went with
-them**: `client-cpu-takes-the-log-flush` (audio) and `log-flush-is-unbounded`
-(boot-media) are `specs/log-architecture-spec.md` L6's, and
-`pre-idle-wedge-says-nothing` (diagnostics) is its L3's — closed there by
-`Drain::Inline` putting every boot record on the wire as it is written, which is
-a stronger claim than "`logd` drains during the boot phases" ever was. Log §12.1
-now lists all three, so the transfer is written down on both sides.
+**Three slugs were said to have left this ledger with the log strike, and all
+three files are still open on `main`.** `client-cpu-takes-the-log-flush` (audio),
+`log-flush-is-unbounded` (boot-media) and `pre-idle-wedge-says-nothing`
+(diagnostics) each still carry `status: open` frontmatter, and each still
+describes the pre-rewrite subsystem — `log_file`, `log_ring`, `owes_wake`,
+`LOG_DEFERRAL_CEILING_NS`, `drain_serial`, `wait_transfer` spins — none of which
+exists in `kernel/src` any more. Neither the log branch nor anything since closed
+or deleted them; `git log` on all three shows their last touch was the specs
+taxonomy reorganisation (`4e690d0`), not a resolution.
 
-**And the order ruling turns their citations into a red on this branch, at C0.**
-The struck version of this paragraph said §1.3's full-path citation of
-`client-cpu-takes-the-log-flush` *"stays live through this branch and goes stale
-at log L8, not at C13"*. **That is backwards under `log → completions`**: L8
-lands first, the file is deleted, and `src/docs.rs`'s
-`every_named_issue_file_resolves` reds on **this document** the moment C0 merges
-`origin/main` — the gate walks every text file in the tree and this spec is one.
-`specs/introspection-plan.md`'s two full-path citations of
-`log-flush-is-unbounded` (`:31`, `:56`) go the same way, and log L8 cannot fix
-either, because `specs/completion-architecture-spec.md` is not in that branch's
-tree (**CONFIRMED** 2026-08-09: it is on `wt/toyos-compl` and not on
-`origin/main`). **C0 de-paths every citation of a slug the log branch closed, in
-the same commit as the merge.** It is a one-line edit that is in nobody's chunk
-budget and it fails the build if it is missed, which is the direction that bound
-has to fail in. Log §12.7 records the same obligation from the other side.
+**So the transfer was written down on one side only, and the obligation is real
+in a different form than this section assigned it.** The entries are stale
+descriptions of deleted code, which is worse than an open issue: an agent reading
+`log-flush-is-unbounded` today goes looking for a file sink that does not exist.
+**C0 puts all three to the owner** — closed by the log rewrite, or re-written
+against the tree that replaced it — rather than assuming the first.
+
+**~~And the order ruling turns their citations into a red on this branch, at
+C0.~~ Void twice over**: the files were never deleted, and the gate that would
+have red on them no longer exists. §1.3's citation of
+`client-cpu-takes-the-log-flush` and `specs/plans/introspection-plan.md`'s two of
+`log-flush-is-unbounded` (`:31`, `:56` — verified unmoved) all still resolve.
+**What survives is the substance rather than the deadline**: those citations point
+at entries describing code that is gone, so they mislead without failing
+anything. That is C0's item above, and it is a judgement to put to the owner, not
+a build error to race.
 
 | slug | area | closed by | note |
 |---|---|---|---|
 | `disk-wait-pins-a-cpu` | audio | C7+C8 | the headline |
 | `cache-eviction-wedges-an-idle-cpu` | boot-media | C13 | the idle CPU no longer reaches a block device; **verify the `rip` first** — that entry says symbolization was never done |
 | `xhci-waits-are-spins` | hardware | C7 | EP0 recovery's `Poll` is the declared residual (§12.3) |
-| `scheduler-pass-blocks-in-xhci` | kernel | C7 | and its second half, `sched-check` never being turned on, is C15's |
+| `scheduler-pass-blocks-in-xhci` | kernel | C7 | **its second half is spent** — `sched-check` *is* turned on, as `sched_check_build` (§20.4); what is left for C15 is the window, not the switch |
 | `hotplug-blocks-a-scheduler-pass` | hardware | C7 | |
 | `driver-waits-without-a-deadline` | kernel | C10 | `CAP.TO` included |
 | `io-uring-source-half-a-wake-pair` | kernel | C3 | one post, no pair to halve |
@@ -1988,8 +2560,11 @@ done
 `--audio-gate 30` at ~17 minutes and that single invocation already runs all four
 gate-A configs, so four arms is ~68 minutes of guest time** plus a rebuild per
 toggle. The first draft stated no number at all. Two worktrees also means two
-guest-slot consumers against `buildlock::guest_slot`'s twelve, which is what makes
-the interleave affordable rather than serial.
+guest-slot consumers against `buildlock::HOST_GUESTS`'s twelve, which is what
+makes the interleave affordable rather than serial — and "two consumers" is
+literal: gate A's thorough tier takes exactly one slot for the whole tier
+(`let _slot = slots.take("gate A, thorough")`, `tests/toyos.rs:12741`), so this
+protocol is two arm processes against twelve slots.
 
 Every run records its host (`host: load <1/5/15min> qemu N toyos-build N`) and
 adjudicates nothing on it — the owner's 2026-08-04 ruling stands: a load-coincident
@@ -2005,26 +2580,43 @@ is to say which measurement becomes the assertion. Add it to
 `tests/audio-baseline.toml` with the run that produced it.
 
 `io-depth-probe` must report **1 from a syscall and 0 from `iod`** (§9.1),
-against a C0 baseline this branch measures rather than inherits. **The **4 from
-the idle loop** is gone before C0** — log L6 removes the only path by which an
-idle CPU reaches a block device — so this branch's target is the syscall arm and
-`iod`'s, and neither §11.4 nor C9 has an intermediate reading to attribute.
+against a C0 baseline this branch measures rather than inherits. **The 4 from the
+idle loop is gone**, confirmed: `log_file.rs` no longer exists, the recorded
+depth-4 trace was `log_file::poll → Sink::flush → vfs::flush_file →
+write_blocks`, and no log condition survives in the pre-`hlt` set. So this
+branch's target is the syscall arm and `iod`'s, and neither §11.4 nor C9 has an
+intermediate reading to attribute.
+
+**One residual keeps the C0 measurement honest.** The probe fires in
+`wait_transfer` for *any* transfer, and `drain_irqs` still calls
+`xhci::poll_if_pending()` (`sched/driver.rs:591`), so a hot-plug enumeration can
+still print an `io-depth: … task None` line from an idle CPU with no block device
+involved — the probe's text says "a disk transfer" for a control transfer too.
+C0 records that arm separately or the baseline reads as a regression it is not.
 **Half of the headline moved to the other branch with the work**: log L6 owns the
 idle-loop half of the `--slow-usb` improvement and records it at its L9; C7+C8
 owns the syscall half. C14 must say which arm it moved, or the two branches will
 both claim the same microseconds.
 
-**And a positive assertion on the log's content, in the same run.** `/log` is a
+**And a positive assertion on the log's content, in the same session.** `/log` is a
 USB volume in every profile, so the *cheapest* way to make the wake number good
 is for the log to stop being written — which is exactly what §12.3's unbounded
 park does to `/bin/logd`. **The headline number and the worst failure mode
 produce the same reading**, and none of §20.3's negative controls separates them.
 So C14 also asserts, host-side on the volume, that this boot's log file holds the
-lines it should. `kernel_log_file` (`tests/common/volumes.rs:477`) is that
-assertion; log L6 has already re-pointed it at `/bin/logd`, and **C14 keeps it
-green mid-run and after shutdown against a userland writer**, which is a stricter
-thing to keep green than the kernel sink was — a `/log` that stops because logd
-parked forever reds it. Without it the headline is unfalsifiable.
+lines it should. `kernel_log_file` (`tests/common/volumes.rs:485`) is that
+assertion, and **it is pre-satisfied**: log L6 re-pointed it, and its own header
+now proves *"a userland process holding `logread` reads a cursor, renders,
+writes, `fsync`s and keeps up"*, asserting mid-run, post-shutdown and rotation.
+C14 inherits it rather than building it, and keeps it green — a `/log` that stops
+because logd parked forever reds it. Without it the headline is unfalsifiable.
+
+**It cannot literally be the same run, and C14 must say so.** `--audio-gate`
+dispatches `AUDIO_TESTS` only and returns (`tests/toyos.rs:12714-12752`), and
+`kernel_log_file` is registered `Tier::Nightly` (`tests/toyos.rs:654`) and
+`Relegated { why: Why::Cost, ci_ms: 43_056 }` (`src/tiers.rs:480`), so it is not
+even in the PR gate. C14 invokes it as a separate command **in the same session,
+on the same tree, recorded beside the A/B**.
 
 ### 20.3 Negative controls — each must red on a tree that has the defect
 
@@ -2032,13 +2624,26 @@ parked forever reds it. Without it the headline is unfalsifiable.
 |---|---|---|
 | ~~`reintroduce-idle-flush`~~ | ~~`log_file::poll()` back on the idle loop~~ — **retired, see below** | — |
 | `sleeplock-spins` | `SleepLock::lock` spins instead of parking | `io-depth-probe`'s depth, and the `--slow-usb` A/B |
-| `park-holding-a-spinlock` | one converted path keeps its raw `Lock` | a named panic — **but say which**: `Parkable::of_current()` at the leaf trips RT1 and names the token; a token threaded from the trap entry reaches `scheduler.rs:43`'s `assert_baseline`. Pin the one the control stages |
+| `park-holding-a-spinlock` | one converted path keeps its raw `Lock` | a named panic — **but say which**: `Parkable::of_current()` at the leaf trips RT1 and names the token; a token threaded from the trap entry reaches `kernel/src/scheduler.rs:44`'s `assert_baseline`, which asserts `preempt::count() == baseline` and has seven call sites. Pin the one the control stages |
 | `drop-a-completion` | one `post` writes the record and does not claim | **not a hang** — see below |
 
 Each carries a comment saying why nothing else can reach it, per the harness's own
-rule. **A feature that replaces only a verdict makes its own gate vacuous.** None
-can join `INERT_ACTUATORS`; each is its own kernel build and three more images in
-the ledger.
+rule. **A feature that replaces only a verdict makes its own gate vacuous.**
+
+**And none of them costs a kernel build, which is the opposite of what the first
+draft said.** `INERT_ACTUATORS` exists nowhere in the tree — the name occurs once,
+as prose in `specs/log-architecture-spec.md` — and the folding it referred to,
+`qemu::fold_inert`, was deleted on 2026-08-10. **Actuators are runtime now**: one
+test kernel (`boot-actuators,test-actuators`) carries all of them and arms
+whichever `\toyos\cmdline` names, validated against `declared_actuators`
+(`tests/common/qemu.rs:1518-1528`). So a behavioural control like
+`sleeplock-spins` or `drop-a-completion` is **a new row in
+`kernel/src/actuator.rs`'s `actuators!` macro** (`:64`) with its
+`specs/device-test-strategy.md` claim comment, costs no new kernel build, and adds
+no row to `TEST_SUITE_KERNEL_BUILDS` (`src/build.rs:791`, four entries). If a
+control genuinely cannot be a runtime branch, it is a fifth entry there **with the
+argument for why** — the bar `fpu-save-nothing` and `sched-check` meet and nothing
+else does.
 
 **`reintroduce-idle-flush` is retired by the order ruling, and the loss is
 named.** The struck version of this paragraph moved it from C9 to C7+C8 and
@@ -2054,55 +2659,117 @@ the ordering, it is small against a compilation blocker, and it is recorded so
 nobody re-derives the feature at C14 and finds nothing to attach it to.**
 
 **`drop-a-completion` cannot have a hang as its verdict.** A hung guest does red,
-but it reds as `STALL`, and the harness prints "the guard expired, so this says
-nothing about the tree" beside it and tells nobody to bisect it — root
-`CLAUDE.md`'s rule is that a timeout is a liveness guard and never a verdict. A
-control whose entire signal is the one class the suite disclaims is not a control.
+and it reds as `STALL` — which *is* red — but the harness prints "the guard
+expired, so this says nothing about the tree" beside it (`tests/toyos.rs:12132`,
+verbatim) and tells nobody to bisect it. The rule is `tests/CLAUDE.md:8`'s, not
+root `CLAUDE.md`'s: *"What a duration still decides prints `STALL` — red, and
+named apart so nobody bisects it."* The objection is not that a STALL passes; it
+is that nobody bisects one. A control whose entire signal is the one class the
+suite names apart is not a control.
 **`blocking_read_stress` therefore asserts a *count* of completed round trips
 inside an `await_guest` bound**, so a dropped completion reds as a number, and the
 control reds on the number.
 
 **`sleeplock-spins` cannot red at C5, where §21 asks it to.** C5 lands `SleepLock`
 with *nothing converted*, so no `SleepLock` is on the disk path, `io-depth-probe`
-reads the same 5 and 4 in both arms and the `--slow-usb` A/B does not move. Either
-the control's gate moves to **C7** (its first real consumer) or C5's gate is
-"the feature exists and its own unit test shows the spin", which is weaker and
-should be labelled as such.
+reads **whatever C0 measured** — unmoved in both arms — and the `--slow-usb` A/B
+does not move. Either the control's gate moves to **C7** (its first real consumer)
+or C5's gate is "the feature exists and its own unit test shows the spin", which
+is weaker and should be labelled as such.
+
+(The first draft said the probe "reads the same 5 and 4 in both arms". Both
+numbers were produced by frames inside `log_file.rs` — 4 from `log_file::poll` on
+the idle loop, 5 from `log_file::flush_final` under `syscall_handler` — and
+neither reading is inherited now that the file is gone. That is precisely why
+§20.2 demands a C0 baseline instead of a quoted pair.)
 
 ### 20.4 New named tests
 
 - `blocking_read_stress` — cross-CPU pipe ping-pong, hard wall-clock bound. The
-  lost-wake canary.
+  lost-wake canary, with §20.3's counting assertion. Nothing to build against yet
+  and nothing stale: the name existed only in the superseded
+  `iouring-blocking-spec.md`, and `await_guest` is a real harness primitive with
+  existing callers (`tests/toyos.rs:3135`, `:4373`, `tests/common/audio.rs:846`,
+  `tests/common/faults.rs:232`).
 - `cancel_while_parked` — kill a thread parked on a disk transfer under
-  `usb-slow-device`; the process exits, the lock is free (`SleepLock::holder()` is
+  `usb-slow-device` (`kernel/src/actuator.rs:187`, which holds every mass-storage
+  bulk completion back 2 ms and is exactly the machine this needs); the process exits, the lock is free (`SleepLock::holder()` is
   `None`), and a second process reads the same file. **It cannot run at C4**, where
   §21 lists it: `SleepLock` does not exist until C5 and there is no park on a disk
   transfer until C7, because `wait_transfer` still spins. C4's gate is the *return
   path* only — kill a thread parked on a pipe and assert it exits through its own
   stack — and this test moves to **C7**.
 - `killed_holder_releases` — kill a thread holding the VFS sleep lock; the machine
-  keeps mounting.
-- `no_spin_outside_the_allow_list` — the §4.6 grep gate, host-side, seconds.
-- `idle_loop_is_the_declared_body` — **struck; it lands with
-  `specs/log-architecture-spec.md` at L6** (its §9.5, §12.1), and under the ruled
-  order it is already in the tree when C0 opens. **This branch amends it twice**:
-  C9 removes `i8042::verdict_due` and `xhci::port_work_pending` from the declared
-  pre-`hlt` list, and the wake conversion (§11) removes `log::pending()`. Each
-  amendment is a diff a reviewer reads, which is the point of a declared-set
-  gate: a condition quietly re-added is invisible to every behavioural test.
-  C9's own behavioural gate is still the two `sched: cpu=` tests (§11.1), which
-  stay live precisely because `log_health` does not move.
-- **`sched-check` is its own chunk, not a line in C14.**
-  `scheduler-pass-blocks-in-xhci` records that invariant P "has never executed
-  against the kernel in any image or any test run", and that the measured window
-  starts after `drain_irqs` — both confirmed (`cpu.rs:1092`, `MAX_PASS_NS` 200 µs
-  at `:703`; `drain_irqs()` precedes `SchedPass::begin` at `driver.rs:316` and
-  `:418`). But **moving the window to start at `drain_irqs` makes invariant P cover
-  `i8042::service`, the dump's `serve_if_owed`, `hold_report`'s 128 probes and every
-  `irq_ring` post** — none of which this refactor touches, all of which must then
-  fit 200 µs on a TCG guest, and `specs/test-cost-audit.md` already classes
-  `sched-check` as perturbing and used by no test. Turning it on will red on things
-  this refactor did not cause. It needs its own baseline before it can be a gate.
+  keeps mounting. **Pick a distinct name**: `killed_holder_releases_the_lock`
+  already exists as a host-side buildlock test (`src/buildlock.rs:951`), and two
+  near-identical names in one failure output is a bisect nobody needs.
+- `no_spin_outside_the_allow_list` — the §4.6 gate, host-side, seconds. **Its
+  host is `src/sourcegate.rs`** (§4.6): `src/docs.rs` was deleted by owner ruling
+  and is not available to any gate this branch writes.
+- `idle_loop_is_the_declared_body` — **un-struck: it was assigned to log L6 and
+  was never built.** The name occurs seven times in the repo and every one is
+  prose — six in `specs/log-architecture-spec.md`, including its own ledger row,
+  and one comment at `kernel/src/sched/driver.rs:556`. There is no such test.
+  **So this branch builds it**, as a `src/sourcegate.rs` declared-set test over
+  the pre-`hlt` disjunction, and **amends it once**: C9 removes
+  `i8042::verdict_due` and `xhci::port_work_pending`. The third amendment the
+  struck version listed — the wake conversion removing `log::pending()` — is
+  dropped, because the log branch left no log condition (§11). The omission is
+  also worth filing against the log branch either way, since its own §12.1 lists
+  the gate as delivered. C9's behavioural gate is still the two `sched: cpu=`
+  tests (`tests/toyos.rs:8974`, `:9478`, counting the line emitted at
+  `kernel/src/scheduler.rs:634`), which stay live precisely because `log_health`
+  does not move.
+- **`exit_wait_storm` — new, and it closes the one uncovered park class.** §4.1
+  collapses P7 (child exit) and P8 (thread exit) onto parks on the
+  `ProcessObject`/`ThreadObject`, and **no gate in §20.3 or §20.4 exercises
+  either**: `blocking_read_stress` is pipes, `cancel_while_parked` and
+  `killed_holder_releases` are disk and VFS. The tree's existing coverage is
+  ordering, not volume — `process_lifecycle` is 295 lines with one arm on the wake
+  (`an_unrelated_wake_does_not_end_the_wait`) and `std_threading` is 41. **N
+  processes each spawning M children that exit while the parent is parked in
+  `SYS_PROCESS_WAIT`, plus N threads joined in a `SYS_THREAD_JOIN` fan-in,
+  asserting a count of collected exit codes inside an `await_guest` bound** — the
+  same shape as `drop-a-completion`'s count, so a lost publish reds as a number
+  and never as a `STALL`. `drop-a-completion` is its negative control, since it
+  reaches the publish path too.
+- **`every_park_declares_its_end` — new, and it is the only form that catches the
+  §12.3 hazard.** §12.3 establishes that `iod` parked on a hung stick stops every
+  write-back in the machine with *"nothing able to end it"*, and §22 marks that
+  row still unresolved with **no second line at all**. Nothing in §20 reds on it:
+  `kernel_log_file` observes `/bin/logd` and not `iod`, and is nightly anyway.
+  **A host-side gate in `src/sourcegate.rs`, sibling to
+  `no_spin_outside_the_allow_list`, over every `completion::wait`/`Parkable`
+  construction site**: each must carry a `Bound`, `Cadence`, `Tripwire` or a named
+  canceller, and a site with none is on an allow-list whose entry states which of
+  §12.3's cancellers ends it. Cheap, no guest. **It has to be static**: a
+  behavioural test cannot distinguish "parked forever" from "slow" without
+  becoming the `STALL` §20.3 already disqualifies as a verdict.
+- **`sched-check` is its own chunk, and the reason has changed.**
+  `scheduler-pass-blocks-in-xhci` records that invariant P *"has never executed
+  against the kernel in any image or any test run"*. **That sentence is stale at
+  its source and so is the audit's**: invariant P has executed, has a baseline,
+  and is already a gate. `sched_check_build` (`tests/toyos.rs:475`, `Tier::Fast`;
+  body at `:8170`) boots `SCHED_CHECK_KERNEL` and runs `sched_stress` under it —
+  green on CI's KVM shards, twelve of twelve, measured 5,879 ms (run
+  31875856466) — and red on the dev host at 1,684,167 ns then 1,749,243 ns,
+  adjudicated 2026-08-15 as cross-arch TCG and scoped to `Instrument::DevHostAlone`
+  (`src/redlist.rs:884-903`,
+  `specs/issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md`).
+  `specs/assessments/test-cost-audit.md:1022`'s *"No test uses it"* is stale with
+  it, and `sched-check` is one of `TEST_SUITE_KERNEL_BUILDS`'s four entries.
+
+  **What survives, and it is the whole of the real point: the window still starts
+  after `drain_irqs`** (`cpu.rs:1092` `check_pass_duration`, `MAX_PASS_NS` 200 µs
+  at `:703`; `drain_irqs()` precedes `SchedPass::begin` at `driver.rs:354`/`:362`
+  and `:461`/`:464`). **Widening it is the change**, and what it would newly cover
+  is `xhci::poll_if_pending` (`driver.rs:591` — the two-second recovery path the
+  companion issue is entirely about, and the largest term the widened window would
+  swallow), `i8042::service` (`:594`), the dump's `serve_if_owed` (`:603`),
+  `hold_report`'s 128 probes (`:606`, `PROBES` at `panic_console/mod.rs:1014`) and
+  every `irq_ring` post (`:608-635`) — none of which this refactor touches, all of
+  which must then fit 200 µs. **C15 takes its own baseline for the widened window
+  before turning it on**, which is a narrower job than the struck version's.
 
 ---
 
@@ -2137,41 +2804,41 @@ Two chunks below are merged pairs and keep both names, so a reference elsewhere 
 
 | # | chunk | delivers | gate |
 |---|---|---|---|
-| C0 | merge `origin/main` (**post-endowment and post-log**); re-check every §15 row against the *merged* tree; re-derive §18's counts, §3.4's duration sweep and §4.6's spin enumeration, none of which survives the log branch unchanged; assert the first clean syscall number (§14.2); **de-path every `specs/issues/` citation the log branch's L8 closed, in the merge commit** (§19); record which form log L6 gave `SYS_FSYNC`'s device flush (§13); claim the sysroot | baseline `io-depth-probe` + `--slow-usb` A/B recorded in this spec | suite green; §15 has no moved row; `cargo test --lib` green, which is what the de-pathing is for |
+| C0 | merge `origin/main` (**post-endowment and post-log**) — **done 2026-08-15 at `71a0559`, and this document is the result**: every §15 row re-checked, §18's counts and §4's enumeration re-stamped, §14.2's number found already reserved at 115, §13's `SYS_FSYNC` question answered (L6 gave the mount sync to every caller). **What C0 still owes**: the `toyos-abi` citation re-point as its own tiny PR (§14.2); putting the three still-open log issue files to the owner (§19); re-running §3.4's duration sweep; and claiming the sysroot | baseline `io-depth-probe` + `--slow-usb` A/B recorded in this spec, with the `poll_if_pending` arm recorded separately (§20.2) | suite green; §15 has no moved row |
 | C1 | the six duration kinds (§3, §3.1, §3.3); `Instant`/`Duration`; `Deadline::{at,never,passed}`; `Parkable` | **every one of the 41 production durations has a kind or a named exception** (§3.4) — not "the kinds exist" | no behaviour change; `MIN_ONE_SHOT_NS` still compiles |
 | C2 | `kernel/src/completion/`: `Record`, `Outcome`, `Inbox`, `Subject`, `arm`, `post`. Wired **behind** the existing waitq — every wake also posts | behaviour-preserving | `kernel-loom/tests/inbox.rs` |
-| **C3+C4 — one chunk, not two** | the one park site (`wait_until`/`prepare_wait`/`block_on` → `completion::wait`, futex folded in, `park_lot`/`PARK_BUCKETS`/`wake_task` deleted) **and** the cancellable kill (§7.2's two `handle_retire` arms, `Commit::Killed` → `dispose_none`, the one-shot cancel). **They cannot be split**: C3 puts an `Armed` on a parked thread's stack while `Commit::Killed` still discards it, so RT5 turns an ordinary kill of a blocked thread — the endowment branch's own `kill_while_blocked` gate — into a kernel panic. **Plus the log branch's three fallbacks (§11)**: `klogd`'s park becomes an `Inbox` park, `emit`'s relaxed signal becomes the degenerate one-waiter post, `Source::Log` folds into the watch list, and the `log::pending()` pre-`hlt` condition is deleted with them | §7, 13 park sites → 1 | `toyos-sched` host tests for the new retire arms; `toyos-sched`'s loom model for cancel; `blocking_read_stress`; grep: one `dispose_block` caller; **`kernel-loom/tests/log_wake.rs` — log §2.5's W3, which the fallback had no subject for and this conversion does** |
+| **C3+C4 — one chunk, not two** | the one park site (`wait_until`/`prepare_wait`/`block_on` → `completion::wait`, futex folded in, `park_lot`/`PARK_BUCKETS`/`wake_task` deleted) **and** the cancellable kill (§7.2's **four** changes — `handle_retire`'s parked arm claim-arbitrated, `SchedPass::pick`'s kill arm, `preempt_if_due`'s interaction with it, and `hand_off`/`adopt` — plus `Commit::Killed` → `dispose_none`, the one-shot cancel and §7.4's choice of teardown park). **They cannot be split**: C3 puts an `Armed` on a parked thread's stack while `Commit::Killed` still discards it, so RT5 turns an ordinary kill of a blocked thread — the endowment branch's own `kill_while_blocked` gate — into a kernel panic. **Plus the log branch's two surviving fallbacks (§11)**: `klogd`'s park becomes an `Inbox` park, and `emit`'s relaxed signal becomes the degenerate one-waiter post; `Source::Log` folds into the watch list carrying §5.3a's edge contract. The third — deleting a `log::pending()` pre-`hlt` condition — is struck: there is none. **Plus §7.2a's amendment to `scheduler-core-spec.md` invariant 7 and the re-derivation of sim I14's bound**, without weakening `old_migrate_kept_the_corpse_i14` | §7, **15 park sites → 1** | `toyos-sched` host tests for the new arms — `cpu.rs` has none today; `toyos-sched`'s loom model for cancel, extending `loom/tests/loom_retire.rs` rather than opening a fifth file; `blocking_read_stress`; `exit_wait_storm`; grep: one `dispose_block` caller; **`kernel-loom/tests/log_wake.rs` — already green, re-verify**, because the log branch shipped W3's model with its code rather than deferring it |
 | C5 | `SleepLock`, `holder()` (§17.1), the `Parkable` threading. Nothing converted | §8 | `kernel-loom/tests/sleep_lock.rs`; the RMW count of §16.2 rule 2 |
-| C6 | kernel threads, **shrunk**: `klogd` and the machinery it runs on are already there (log L3), so C6 spawns `usbd` and `iod` on it, adds their two *recoverable* rows to the panic predicate — `klogd`'s is deliberately not one — and does the `KernelPayload.address_space` retype (§15 row 12). `iod`'s body is C12's | §10 | `blocked_dump` names all three |
+| C6 | kernel threads, **shrunk further than the plan thought**: `klogd`, `sched/kthread.rs`, `driver::spawn`'s `None` fallback and `loader::start::kernel_start` are all on `main` and were written naming this chunk (§10), so C6 spawns `usbd` and `iod` on existing machinery, adds their two *recoverable* rows to the panic predicate — `klogd`'s is deliberately not one — and does the `KernelPayload.address_space` retype (§15 row 12). `iod`'s body is C12's | §10 | `blocked_dump` names all three |
 | **C7+C8 — one chunk, not two** | xHCI async (`wait_transfer`/`wait_command`/`configure`, the per-disk claim, `XHCI` → `SleepLock`, `poll_if_pending` → `usbd` + `try_lock`) **and** `VFS`/`VOLUMES`/`ProcessData` → `SleepLock` with their 30 + 55 call sites and the boot/task split. **§11.4's obligation is discharged and is not in this chunk** — there is no kernel file sink left to re-home. **They cannot be split — see below** | §9, §12 | `toyos-xhci` host tests; `usb_storage_gate`; `killed_holder_releases`; `cancel_while_parked`; `sleeplock-spins` and `park-holding-a-spinlock` red; `io-depth-probe`'s syscall arm falls to 1; **`kernel_log_file` green against `/bin/logd`, which §12.3's choice can silently break**; the syscall half of the `--slow-usb` A/B moves here |
-| C9 | the idle loop's declared end state: `i8042::verdict_due` off the halt check and the i8042 as a polled device on `usbd`; `xhci::port_work_pending` gone with C7's `poll_if_pending`; `log_health` and `reap_poisoned` stay and the chunk says why (§11.1, §11.2). **The log subsystem is not here** — log L1–L6 | §11 | the two `sched: cpu=` tests (`tests/toyos.rs:8229`, `:8722`) stay green **unmodified**, which is what makes the halt-check change checkable |
+| C9 | the idle loop's declared end state: `i8042::verdict_due` off the halt check and the i8042 as a polled device on `usbd`; `xhci::port_work_pending` gone with C7's `poll_if_pending`; `log_health` and `reap_poisoned` stay and the chunk says why (§11.1, §11.2). **The log subsystem is not here** — log L1–L6 | §11 | the two `sched: cpu=` tests (`tests/toyos.rs:8974`, `:9478`) stay green **unmodified**, which is what makes the halt-check change checkable |
 | C10 | `Poll<T>`; NVMe `CAP.TO`; virtio, HDA, IOMMU, RTC settles; the three duplicate `settles` become one | §4.3 | `no_spin_outside_the_allow_list` |
 | C11 | blocking syscalls on the one shape; `SYS_SLEEP_UNTIL`; absolute deadlines; 24-byte CQE; the ring becomes an `Inbox` (its pages are already its own — §15 row 8); `toyos::ring::Ring` replaces `Poller`; soundd's `delta == 0` hack deleted | §14 | full suite; gate A fast tier |
 | C12 | the write-back queue; `FileObject::on_zero_handles`; `SYS_FSYNC` parks; page-cache eviction to `iod`; **§13.1's page pinning and `close_file`** | §13 | `close-cannot-report-io-error`'s reproduction; `disk_backtrace` and `esp_files` still green (§13.2) |
-| C13 | the deletion commit; grep gates; **twelve** `specs/issues/` closures and the full-path citations that go stale with them (§19); CLAUDE.md | §19 | `cargo test --lib` green — `every_named_issue_file_resolves` is the real gate, not "it compiles", which is a tautology |
+| C13 | the deletion commit; the `src/sourcegate.rs` gates; **twelve** `specs/issues/` closures and the full-path citations that go stale with them (§19); CLAUDE.md | §19 | `cargo test --lib` green — **and no longer a real gate on the closures**, since `every_named_issue_file_resolves` was deleted with `src/docs.rs`. C13 puts rebuilding it to the owner (§19) and does the de-pathing as a stated deliverable rather than trusting a check |
 | C14 | measurement: the interleaved four-arm A/B (§20.1, ~68 min of guest time, two worktrees); `io-depth-probe`; the positive log-content assertion (§20.2); assertions recorded in `tests/audio-baseline.toml` | §20 | the numbers go in this spec |
 | C15 | `sched-check`: move invariant P's window to the scheduler entry, take its own baseline, then turn it on in one harness profile | §20.4 | its own baseline first — it will red on work this refactor did not do |
 
 ### 21.1 Why C7 and C8 are one chunk
 
 Trace the disk path, whose lock order the source itself states
-(`fat32_adapter.rs:314`, *"Lock order is VFS → here → `XHCI`"*):
+(`fat32_adapter.rs:308-315`, *"Lock order is VFS → here → `XHCI`"*):
 
 ```
 vfs::lock()                    vfs.rs:29        VFS      [ticket Lock, preempt +1]
-  → Vfs::flush_file
-  → FatVolume::write_at        fat32_adapter.rs:353
+  → Vfs::flush_file            vfs.rs:538
+  → FatVolume::write_at        fat32_adapter.rs:352
       device(role).lock()      fat32_adapter.rs:316  VOLUMES  [ticket Lock, preempt +2]
   → UsbBlockDevice::write_blocks   usb_storage.rs:95
-  → xhci::with_disk            xhci/mod.rs:1871
-      XHCI.lock()              xhci/mod.rs:1777              [preempt +3]
+  → xhci::with_disk            xhci/mod.rs:1869
+      XHCI.lock()              xhci/mod.rs:1870 (static :1775)  [preempt +3]
 ```
 
 At C7 alone, `XHCI` is a `SleepLock` while `VFS` and `VOLUMES` are still ticket
 locks, so `with_disk` must call `XHCI.lock(&p)` — and **both ways of getting the
 token fail**. `Parkable::of_current()` at the leaf runs at baseline +2 and RT1
 refuses it. A token threaded from the syscall entry reaches the park with two
-ticket spinlocks held, and `scheduler.rs:43`'s `assert_baseline` refuses *that* —
+ticket spinlocks held, and `scheduler.rs:44`'s `assert_baseline` refuses *that* —
 which is §9.1's "the conversion is half done" trip, firing exactly as designed.
 The only C7-only escape is `try_lock` with a spin fallback, which is §23
 rejection 4.
@@ -2219,16 +2886,16 @@ obligations on this one.
 | A post races a park | Invariant W: the parker's recheck observes the record | self-wake, retry — structural |
 | A kill races a park | `Cancelled`; the task returns and unwinds by returning | dies at the syscall boundary |
 | A killed task was **already parked** holding a sleep lock | `handle_retire` makes it runnable instead of reaping it (§7.2); it observes the kill at its next `wait` and unwinds | the lock is released by the guard's own `Drop` |
-| A killed task was **ready** with a guard on its stack | not reaped from the run queue; it is picked and observes the kill (§7.2) | as above |
-| A cancelled thread's teardown must take a sleep lock | the cancel is one-shot and already consumed, so teardown parks normally (§7.4) | ordinary acquire |
-| The victim does not reach `Dead` inside the retirer's 1 s | `retire_task`'s `Tripwire` panics — and it now bounds an unwind, not a reap | C4 re-derives the number (§7.3) |
+| A killed task was **ready** with a guard on its stack | **not "left alone"**: `SchedPass::pick` reaps a killed ready task at the head of every pick (`cpu.rs:926`) and `ReadyTask::dispatch` is reachable only past that check, so §7.2 must rewrite that arm too | as above, once §7.2's four changes land |
+| A cancelled thread's teardown must take a sleep lock | **unresolved, and §7.4 says why**: the kill bit is sticky and `WaitTicket::commit` refuses to park a killed task before anything else (`waitq.rs:383`), so a killed thread cannot park at all — including in teardown. One of §7.4's three shapes must be chosen | **owed by C3+C4**, not "ordinary acquire" |
+| The victim does not reach **release** inside the retirer's 1 s | `retire_task`'s `Tripwire` panics. It waits on `handle.released()` and not on the word reaching `Dead` (`scheduler.rs:443`, and its doc says why), so what it now bounds is unwind + teardown + every sleep-lock acquire on the way + the release | C4 re-derives the number against `released()` (§7.3) |
 | A device never answers | the thread parks forever; the CPU is free | Ctrl+Alt+D names the task and the subject; disconnect or kill cancels it |
 | `/bin/logd` parks on a dead stick | with no bound no error is produced, so logd's own give-up policy (log §5.4) never fires and `/log` stops with no line saying why. **The console is unaffected** — `klogd` drains it and has no disk in it (log §4.1), so the T14's total-logging-loss case is gone | **still unresolved until §12.3's choice is made.** Unlike `iod`, logd is killable, so init is a second line; a `Tripwire`/`Budget` is the first. `kernel_log_file` is what reds |
 | `iod` parks on a dead stick | **every** write-back in the machine stops — `SYS_FSYNC`, deferred close flushes, page-cache eviction — and nothing can kill it | **still unresolved until §12.3's choice is made**, and this is the row with no second line at all |
 | The inbox fills | oldest-dropped with a count, and a `Gone(Overflowed)` record so the waiter re-derives | a bounded loss, never a lost wake |
 | `usbd` wedges on a broken controller | `usbd` alone parks; `klogd` and `iod` are unaffected | the dump names it |
 | A CPU takes an event for a transfer nobody is parked on | `Outstanding` matches by TRB address; an unmatched event is dispatched as today | unchanged |
-| Boot's VFS is contended | `try_lock().expect(..)` panics by name | a kernel bug, fail fast |
+| Boot's VFS is contended | `try_lock().expect(..)` panics by name — **once C8 has made boot use `try_lock`, which it does not today** (§6.1) | a kernel bug, fail fast |
 
 Runtime fail-fast, numbered so a review can cite them:
 
@@ -2254,17 +2921,25 @@ Runtime fail-fast, numbered so a review can cite them:
    exactly the namespace the endowment architecture deletes, and a borrowed
    `Subject` costs nothing and cannot name a freed object. **"The objects already
    own watcher lists" is only half true and is withdrawn as a reason**: `Pipe` owns
-   `readers_wq`/`writers_wq` per object (`pipe.rs:153`), but the io_uring watchers
-   are five *global statics* that §19 itself deletes, plus `listener.rs`'s
-   registry. True of the mechanism this spec keeps, false of the one it unifies.
+   `readers_wq`/`writers_wq` per object, and its io_uring watchers too
+   (`pipe.rs:142`) — but **six** of the eight watcher stores are global statics
+   that §19 deletes. True of the mechanism this spec keeps, and true of exactly
+   two of the eight stores it unifies.
    The other three reasons carry it.
 2. **A `RingArena` of 32 KiB slots** (superseded §5.2). `IoUringObject` owning its
    own `PageAlloc` is the endowment spec's answer and it is simpler; two specs
    describing one object is worth more than a slot allocator.
 3. **Two park channels (`Ring` + `Futex`)** (superseded §6.4). The futex's value
    check belongs *before* the arm, exactly like every other readiness check, and
-   the wake-generation protocol exists only because there is no level-readable
-   state today. One channel, one recheck, one proof.
+   the wake-generation protocol existed only because **the futex word** has no
+   level-readable state. **Scoped deliberately**: the first draft wrote "there is
+   no level-readable state today", which implies every subject gains it after the
+   refactor, and one does not (§5.3a). One channel, one recheck, one proof — and
+   **a subject that cannot be asked is handled by the class in §5.3a, not by a
+   second channel.** As written the unscoped sentence was the strongest statement
+   of the premise `Source::Log` falsifies, and a reader who took it literally
+   would build `arm` with no edge path. (The protocol itself is already gone —
+   `ba76478`, §4.1 P11 — so what is rejected here is re-adding it.)
 4. **A `SleepLock` that spins where it cannot park** (`blocking-io-plan.md` B1). A
    primitive whose behaviour depends on invisible context is the sentinel class.
    `Parkable` makes the two worlds separate at compile time instead.
@@ -2363,7 +3038,7 @@ Runtime fail-fast, numbered so a review can cite them:
    the scheduler migration cost seventy defects; this refactor does not reopen it"
    is an argument about `toyos-sched`'s *internals* being untouched — and §7.3 has
    now made even that false, since the retire handshake changes.
-   `specs/metal-track-history.md` records ~70 defects found in code whose own
+   `specs/assessments/metal-track-history.md` records ~70 defects found in code whose own
    suites were green. "Every chunk passes `cargo test`" is a process, not a
    mitigation for one merge commit. **§21.2's C0–C6 / C7–C15 split is the fallback
    and the owner should be asked before C0, not after C13.** The log strike took

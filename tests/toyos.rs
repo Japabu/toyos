@@ -1793,7 +1793,8 @@ impl AudioRun {
 /// A switch and not a test of its own, because it changes no verdict: it makes
 /// the four audio configs measure a machine the host cannot otherwise present,
 /// and what it produces is an A/B against the same command without it in the
-/// same session. `specs/plans/blocking-io-plan.md` is what the numbers are for and
+/// same session. `specs/completion-architecture-spec.md` is what the numbers are
+/// for and
 /// which stage turns one of them into an assertion.
 static SLOW_USB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
