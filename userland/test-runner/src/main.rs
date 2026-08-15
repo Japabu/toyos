@@ -1,9 +1,21 @@
+mod log_gate;
+
 use std::io::{self, BufRead, Write};
 use std::os::toyos::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use toyos::endow::{Endowments, SYSCAP_LABEL};
 use toyos::syscap::SysCap;
+
+/// Tests that run **inside** this process rather than in a binary it spawns.
+///
+/// **Not a shortcut: a spawned binary cannot hold what these need.** This
+/// process passes its whole namespace to every child, and a `SysCap` dup is not
+/// a namespace entry — so a gate whose subject is a right on this program's own
+/// capability has nowhere else to run (`specs/capability-endowment-spec.md`
+/// §6.7a). They answer the same `===TEST_START===`/`===TEST_END===` protocol as
+/// a binary, so the host cannot tell the difference and does not have to.
+const BUILTINS: &[(&str, fn(Option<&SysCap>) -> i32)] = &[("log-gate", log_gate::run)];
 
 fn main() {
     // **The test estate's authority, and the one place least authority is not
@@ -47,12 +59,26 @@ fn main() {
         println!("===TEST_START {name}===");
         let _ = io::stdout().flush();
 
+        if let Some((_, builtin)) = BUILTINS.iter().find(|(n, _)| *n == name) {
+            let code = builtin(cap.as_ref());
+            println!("===TEST_END {name} exit={code}===");
+            let _ = io::stdout().flush();
+            continue;
+        }
+
         // Spawn with piped stdin (so child doesn't consume serial commands)
         // but inherited stdout/stderr (output goes directly to serial).
         let mut command = Command::new(&path);
         command.args(&args).stdin(Stdio::piped());
-        if let Some(cap) = &cap {
-            let dup = cap.duplicate().expect("test-runner: the system capability refused a dup");
+        // **A refused dup is an answer and not a failure.** `duplicate` needs
+        // `DUP` on the capability, which a manifest grants by name — so a cap
+        // without it is one this program holds *for itself*, and the child gets
+        // the namespace and no capability at all. `logread` is exactly such a
+        // cap, as `realtime` is: the estate does not hand either down
+        // (`specs/capability-endowment-spec.md` §6.7a). The `expect` here
+        // assumed every cap was dup-able and took the whole boot down on the
+        // first config that endowed one without `dup`.
+        if let Some(dup) = cap.as_ref().and_then(|cap| cap.duplicate().ok()) {
             command.endow(SYSCAP_LABEL, dup.into_raw().0);
         }
         match command.spawn() {

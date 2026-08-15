@@ -97,6 +97,26 @@ pub mod arch {
     }
 }
 
+/// What the kernel has been told to break, and the models never are.
+///
+/// A shim rather than a `cfg` at the call site, so `commit` is one statement in
+/// every build and the model drives the same line the kernel does.
+pub mod actuator {
+    /// The one `shard.rs` names: the nesting gate's mid-body injection point.
+    /// Loom has no CPU flags and no interrupts, which is exactly why that gate
+    /// exists on a machine instead — so the models drive the loop with nothing
+    /// in it.
+    pub const fn log_nested_emit() -> bool {
+        false
+    }
+}
+
+/// `shard.rs` calls into this from the mid-body point; in the kernel it is
+/// `crate::log::nested`, and here `super` is the crate root.
+pub mod nested {
+    pub fn mid_body() {}
+}
+
 /// The contention and deadlock reports are unreachable in these models — the
 /// spin they fire from is what loom cannot explore — but the arguments are
 /// consumed so the kernel file's bindings are still live code here.

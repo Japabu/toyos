@@ -250,8 +250,18 @@ pub fn read_source(object: &KObjectRef) -> Option<Source> {
             device_registry::DeviceType::VirtioSound => Some(Source::VirtioSound),
             device_registry::DeviceType::Framebuffer => None,
         },
+        // **The `SysCap` is what a log reader parks on, and the rights on the
+        // handle are what decide whether either half means anything.** This
+        // function is handed the object and never the handle, so the source is
+        // named unconditionally; `WAIT` is what the poll path already demands
+        // before it gets here, and `Rights::LOG` is what `SYS_LOG_READ` demands
+        // to answer with a record. A cap holding one without the other can
+        // therefore park on a stream it may not read, or read a stream it may
+        // not park on — and `toyos_manifest`'s `logread` grants both, because
+        // the one program whose whole loop is read-then-park would be trapped
+        // by a name that granted only the first.
+        KObjectRef::SysCap(_) => Some(Source::Log),
         KObjectRef::PipeWrite(_) | KObjectRef::File(_) | KObjectRef::IoUring(_)
-        | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => None,
     }

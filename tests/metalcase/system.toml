@@ -38,5 +38,9 @@ devices = ["nic"]
 receives = ["netd", "launcher"]
 
 # The union its guest binaries need on this machine shape.
+# `logread` is the log gate's own: a spawned test binary does not inherit a
+# `SysCap` dup, so the gate that reads the kernel's records runs inside
+# `test-runner` itself (`specs/log-architecture-spec.md` §3.2, §9.5).
 [programs.test-runner]
 receives = ["compositor", "soundd", "netd"]
+syscap = ["logread"]

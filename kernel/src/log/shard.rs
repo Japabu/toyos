@@ -313,7 +313,18 @@ impl Shard {
         for (word, value) in slot.body.iter().zip(header(record, len)) {
             word.store(value, Ordering::Relaxed);
         }
-        for i in 0..msg_words(len) {
+        let words = msg_words(len);
+        for i in 0..words {
+            // **The nesting gate's injection point, and it is here rather than
+            // anywhere tidier because "mid-body" is the whole claim** (§9.2):
+            // `log-nested-emit` sends this CPU its own IPI from exactly here,
+            // and whether it is delivered before this loop finishes is decided
+            // by §2.3a's bracket and by nothing else. `const fn … { false }` in
+            // a shipping kernel and in `kernel-loom`'s shim, so this folds to
+            // the loop it is written inside.
+            if i * 2 == words && crate::actuator::log_nested_emit() {
+                super::nested::mid_body();
+            }
             let mut bytes = [0u8; 8];
             bytes.copy_from_slice(&record.msg[i * 8..i * 8 + 8]);
             slot.body[HEADER_WORDS + i].store(u64::from_le_bytes(bytes), Ordering::Relaxed);

@@ -391,6 +391,17 @@ extern "C" fn body(_arg: u64) -> ! {
         // longer than `CHUNK_RECORDS` lines.
         drain_inline();
 
+        // **The one context in the machine that has just observed committed
+        // records and may take a lock**, which is why the readiness post is
+        // here and not in `emit` (`specs/log-architecture-spec.md` §3.2). One
+        // post per batch rather than one per record, and none at all while
+        // nothing is watching.
+        //
+        // It is outside `drain_inline` deliberately: that function's other two
+        // callers are a producer mid-`emit` and a panicking machine, and
+        // neither may touch `IO_URINGS`.
+        super::user::post_readiness();
+
         // **Register, then arm, then park — in that order, and the order is the
         // lost wake's other half.** `prepare_wait` moves the word to
         // `Committing`, so a producer that wins the swap from here on takes

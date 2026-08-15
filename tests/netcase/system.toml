@@ -22,8 +22,12 @@ devices = ["nic"]
 # This is also the only config whose test binaries take the launcher path to
 # `Command::spawn` at all: everywhere else test-runner holds no connector and
 # every spawn is direct.
+# `logread` is the log gate's own: a spawned test binary does not inherit a
+# `SysCap` dup, so the gate that reads the kernel's records runs inside
+# `test-runner` itself (`specs/log-architecture-spec.md` §3.2, §9.5).
 [programs.test-runner]
 receives = ["netd", "launcher"]
+syscap = ["logread"]
 
 # What `launcher_refusals` asks init to start. A declared program that serves
 # nothing and provides nothing, so a refused launch of it takes no acceptor

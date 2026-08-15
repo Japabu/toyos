@@ -57,6 +57,16 @@ const SYSCAP_RIGHTS: &[(&str, Rights)] = &[
     // estate is its one holder — one boot runs several binaries that each need
     // the keyboard, and a claim moves.
     ("dup", Rights::DUP),
+    // Read the whole machine's kernel log: every record every CPU wrote, which
+    // is every process's business and no process's right by default.
+    //
+    // **Two bits under one name, because it is one job.** `LOG` is what
+    // `SYS_LOG_READ` answers to, and `WAIT` is what lets the same capability be
+    // named in an io_uring `POLL_ADD` on the log's readiness source. The call
+    // never blocks by design, so a holder that may read and may not park is a
+    // holder that has to spin — a name that looks complete and traps the one
+    // program whose whole loop is read-then-park.
+    ("logread", Rights::LOG.union(Rights::WAIT)),
 ];
 
 /// The whole right set a program's `syscap` list asks for.
@@ -348,6 +358,21 @@ mod tests {
         );
         assert!(syscap_rights(&["transfer".into()]).is_err());
         assert!(syscap_rights(&["root".into()]).is_err());
+    }
+
+    /// **The one name that is two bits**, asserted because the pair is the
+    /// decision and not an accident of how it was written: a log reader that
+    /// may read and may not park has to spin, `SYS_LOG_READ` never blocking by
+    /// design.
+    #[test]
+    fn logread_carries_both_halves_of_reading_a_stream_that_never_blocks() {
+        assert_eq!(
+            syscap_rights(&["logread".into()]).unwrap(),
+            Rights::TRANSFER.union(Rights::LOG).union(Rights::WAIT)
+        );
+        // And it is not the RT band's, nor a device claim's, however it is
+        // spelled.
+        assert!(syscap_rights(&["log".into()]).is_err());
     }
 
     /// A class name reaches init through this file, so a `devices` entry the

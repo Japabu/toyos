@@ -158,6 +158,17 @@ pub enum Source {
     PipeWritable(PipeId),
     VirtioSound,
     Hda,
+    /// The machine's kernel log, named by a `SysCap` that carries
+    /// `Rights::LOG`.
+    ///
+    /// **Edge-triggered, and it is the one source that has to be.** Readiness
+    /// here means "records have moved", never "there is something for you": the
+    /// kernel holds no reader's cursor, so it cannot answer the second at all.
+    /// A reader closes the window itself by reading once more after submitting
+    /// the poll — the same arm-then-rescan `klogd` does on the kernel's side —
+    /// which is why [`Source::is_ready`] answers `false` here and every
+    /// completion comes from `log::user::post_readiness`.
+    Log,
 }
 
 impl PartialEq for Source {
@@ -167,6 +178,7 @@ impl PartialEq for Source {
             | (Self::Mouse, Self::Mouse)
             | (Self::Network, Self::Network)
             | (Self::VirtioSound, Self::VirtioSound)
+            | (Self::Log, Self::Log)
             | (Self::Hda, Self::Hda) => true,
             (Self::Port(a), Self::Port(b)) => Arc::ptr_eq(a, b),
             (Self::PipeReadable(a), Self::PipeReadable(b)) => a == b,
@@ -795,6 +807,12 @@ impl Source {
             Self::Network => crate::net::has_packet(),
             Self::VirtioSound => crate::drivers::virtio_sound::has_pending(),
             Self::Hda => crate::drivers::hda::has_pending(),
+            // Never, and the variant's own doc is the argument: this recheck
+            // asks "is the object ready", and for the log that question is
+            // about a cursor the kernel does not hold. Answering `true` would
+            // complete every poll immediately and turn a parked reader into a
+            // spinning one.
+            Self::Log => false,
         }
     }
 
@@ -808,6 +826,7 @@ impl Source {
             Self::Network => crate::net::add_io_uring_watcher(ring_id),
             Self::VirtioSound => crate::drivers::virtio_sound::add_io_uring_watcher(ring_id),
             Self::Hda => crate::drivers::hda::add_io_uring_watcher(ring_id),
+            Self::Log => crate::log::user::add_io_uring_watcher(ring_id),
             Self::Port(p) => p.add_watcher(ring_id),
         }
     }
@@ -822,6 +841,7 @@ impl Source {
             Self::Network => crate::net::remove_io_uring_watcher(ring_id),
             Self::VirtioSound => crate::drivers::virtio_sound::remove_io_uring_watcher(ring_id),
             Self::Hda => crate::drivers::hda::remove_io_uring_watcher(ring_id),
+            Self::Log => crate::log::user::remove_io_uring_watcher(ring_id),
             Self::Port(p) => p.remove_watcher(ring_id),
         }
     }
@@ -836,6 +856,7 @@ impl Source {
             Self::Network => crate::net::io_uring_watchers(),
             Self::VirtioSound => crate::drivers::virtio_sound::io_uring_watchers(),
             Self::Hda => crate::drivers::hda::io_uring_watchers(),
+            Self::Log => crate::log::user::io_uring_watchers(),
             Self::Port(p) => p.watchers(),
         }
     }

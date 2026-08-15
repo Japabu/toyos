@@ -66,6 +66,22 @@ pub fn eoi() {
     cpu::wrmsr(X2APIC_EOI, 0);
 }
 
+/// Send an IPI to **this** CPU (self shorthand), for the one caller that needs
+/// an interrupt whose delivery time is decided by `IF` alone.
+///
+/// `log-nested-emit` (§9.2) is that caller: it sends this from inside `emit`,
+/// and the whole verdict is *when* it lands — after the publication bracket
+/// with §2.3a's guard, inside the body copy without it. No device interrupt can
+/// serve, because nothing about a device's timing is under a test's control.
+#[cfg(feature = "boot-actuators")]
+pub fn send_self(vector: u8) {
+    if !X2APIC_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    // Destination shorthand = self (0b01 << 18), fixed delivery, level assert.
+    cpu::wrmsr(X2APIC_ICR, 0x0004_4000 | vector as u64);
+}
+
 /// Send an IPI to all CPUs except self (shorthand destination).
 fn ipi_all_excluding_self(vector: u8) {
     // destination shorthand = all-excluding-self (0b11 << 18), fixed delivery

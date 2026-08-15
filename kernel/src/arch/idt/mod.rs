@@ -3,6 +3,8 @@ mod device_irq;
 mod dma_fault;
 mod hda;
 mod i8042;
+#[cfg(feature = "boot-actuators")]
+mod log_nest;
 mod nmi;
 mod timer;
 mod tlb;
@@ -41,6 +43,17 @@ pub const HDA_VECTOR: u8 = Vector::Hda as u8;
 /// The vector the virtio-sound device's MSI-X entry carries, for the same
 /// reason.
 pub const VIRTIO_SOUND_VECTOR: u8 = Vector::VirtioSound as u8;
+
+/// The vector `log-nested-emit` sends itself (§9.2), and the one gate that is
+/// not in the table below.
+///
+/// **It is installed only in a kernel built with `boot-actuators`**, after
+/// `install_gates`, because nothing but that actuator can ever raise it: a
+/// shipping IDT with a gate no interrupt reaches is a gate nothing deletes. It
+/// is `direct` in every sense the table means — its own entry, never
+/// `trap_dispatch` — and it sits one past the last device vector.
+#[cfg(feature = "boot-actuators")]
+pub const LOG_NEST_VECTOR: u8 = 0x27;
 
 // Page fault error code bits
 const PF_PRESENT: u64 = 1 << 0;
@@ -449,6 +462,8 @@ pub fn init() {
     disable_pic();
 
     install_gates(&mut IDT.lock());
+    #[cfg(feature = "boot-actuators")]
+    install_actuator_gates(&mut IDT.lock());
 
     let ptr = IdtPointer {
         limit: (core::mem::size_of::<Idt>() - 1) as u16,
@@ -458,6 +473,15 @@ pub fn init() {
     unsafe {
         cpu::lidt(&ptr as *const IdtPointer as *const u8);
     }
+}
+
+/// The one gate outside the table, and the reason it is outside it: nothing but
+/// an actuator raises [`LOG_NEST_VECTOR`], so a shipping kernel installs no
+/// entry for it and has no handler to install.
+#[cfg(feature = "boot-actuators")]
+fn install_actuator_gates(idt: &mut Idt) {
+    idt.entries[LOG_NEST_VECTOR as usize] =
+        IdtEntry::ring3(Ring3Entry::new(log_nest::log_nest_entry));
 }
 
 /// Take IF=1 on this CPU. Split from `init` so `ioapic::init` can mask every

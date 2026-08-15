@@ -928,11 +928,20 @@ pub fn spawn_init() -> Pid {
         assert!(displaced.is_none(), "an empty table had something at slot {slot}");
     }
     let cap = KObjectRef::SysCap(crate::object::syscap::SysCap::new());
+    // **Every machine-wide authority this system has, because this is the root
+    // of the tree.** Rights only shrink, so a bit absent here is a bit no
+    // manifest can ever name. `LOG` and `WAIT` arrive together and are one
+    // name (`toyos_manifest`'s `logread`): reading every record every CPU wrote,
+    // and parking on the source that says there are more. `SYS_LOG_READ` never
+    // blocks by design, so a holder given the first without the second would
+    // have to spin.
     let rights = Rights::DUP
         .union(Rights::TRANSFER)
         .union(Rights::DEVICE)
         .union(Rights::RT)
-        .union(Rights::MANAGE);
+        .union(Rights::MANAGE)
+        .union(Rights::LOG)
+        .union(Rights::WAIT);
     let cap_handle = handles
         .install(crate::object::HandleEntry::new(cap, rights))
         .expect("spawn_init: an empty table refused the system capability");

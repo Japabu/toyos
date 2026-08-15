@@ -58,6 +58,12 @@ unsafe impl UserSafe for toyos_abi::syscall::IoUringSetup {}
 unsafe impl UserSafe for toyos_abi::input::RawKeyEvent {}
 unsafe impl UserSafe for toyos_abi::input::MouseEvent {}
 
+/// 88 bytes of `u32`, `u32`, `u64`, `u64` and `[u64; 8]` — `#[repr(C)]`, no
+/// padding by its own `const` size assertion, and valid for every bit pattern:
+/// the kernel clamps each number where it uses it rather than trusting it where
+/// it arrives (`log::read::Cursor::from_reader`).
+unsafe impl UserSafe for toyos_abi::log::LogCursor {}
+
 /// Translate a user virtual address to its direct-map address, demand-paging
 /// it in if it is not mapped yet.
 ///

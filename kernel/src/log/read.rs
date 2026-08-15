@@ -127,6 +127,29 @@ impl Cursor {
         self.lost
     }
 
+    /// The walk state a caller's own [`LogCursor`] describes.
+    ///
+    /// **Nothing here is validated and nothing here has to be.** Both fields
+    /// crossed the syscall boundary, and every number in them is clamped where
+    /// it is used rather than where it arrives: [`Cursor::open`] raises a
+    /// position below [`FIRST_SEQ`] or below what a shard still holds, and a
+    /// position *above* `head` simply selects nothing. A `lost` a caller
+    /// invented is a number about that caller's own reading, and the kernel
+    /// decides nothing with it.
+    ///
+    /// [`LogCursor`]: toyos_abi::log::LogCursor
+    pub fn from_reader(cursor: &toyos_abi::log::LogCursor) -> Self {
+        Self { next: cursor.next, lost: cursor.lost }
+    }
+
+    /// Where the walk got to, back into the caller's own cursor.
+    ///
+    /// [`LogCursor`]: toyos_abi::log::LogCursor
+    pub fn into_reader(&self, cursor: &mut toyos_abi::log::LogCursor) {
+        cursor.next = self.next;
+        cursor.lost = self.lost;
+    }
+
     /// Clamp this shard's position to what it can still answer for, counting
     /// the difference as loss, and offer the candidate now sitting there.
     ///
