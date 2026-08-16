@@ -2317,7 +2317,7 @@ gate. Four new models beside `ticket_lock.rs` and `tlb_shootdown.rs`:
 
 | model | what it explores | why the guest suite cannot |
 |---|---|---|
-| `inbox.rs` | Invariant W (§5.4): producer stores a record then claims; consumer arms, rechecks, parks. Two producers, one consumer, and a producer that runs entirely before the arm | the race window is a handful of instructions on two CPUs; TSO makes the missing edge unobservable |
+| `inbox.rs` | Invariant W (§5.4): producer stores a record then claims; consumer arms, rechecks, parks. Two producers, one consumer, and a producer that runs entirely before the arm. **And the producer that takes no lock**: `Inbox::post`'s plain writes are sound only under the subject's leaf lock, so the log's `emit`-side producer uses `Inbox::signal` — one atomic store — and two of them racing must be sound where two `post`s are not | the race window is a handful of instructions on two CPUs; TSO makes the missing edge unobservable |
 | `sleep_lock.rs` | `SleepLock` acquire/release against a parking contender and a concurrent `try_lock`; FIFO among contenders | `Lock::lock`'s spin is unreachable by loom (`lock-spin-unreachable-by-loom`); a parking acquire has no unbounded branch, so this is the **first** contended-acquire model in the tree |
 | the cancel model — **in `toyos-sched/loom/tests/loom_retire.rs`**, not a new file | kill racing a park racing a post: cancel before arm, between arm and commit, and after `Blocked` | the interleaving needs a remote CPU acting between two of the victim's instructions |
 | `outstanding.rs` | an ISR on CPU A records into `irq_ring`, a drain on CPU B posts, a waiter on CPU C observes | three CPUs, one publication chain; nothing in QEMU orders them |
@@ -2325,6 +2325,17 @@ gate. Four new models beside `ticket_lock.rs` and `tlb_shootdown.rs`:
 `kernel-loom` compiles the real `kernel/src/` file a second time against loom's
 atomics, so each model drives the primitive rather than a transliteration. Any new
 primitive that does not compile that way is the wrong shape.
+
+**Each model carries a negative control that stages a mechanism, never a
+verdict** — `wake-fence-off` removes `shard.rs`'s two `SeqCst` fences,
+`inbox-release-off` makes the record's publication relaxed, and
+`inbox-signal-as-post` puts the log's lock-free producer back on `Inbox::post`.
+The last of those is the one C3+C4 owed: the shipped argument for `post`'s plain
+writes was "one poster per *park*", admitted by `shard::signal_after_commit`'s
+swap, and `klogd` starts the next park's epoch while the previous epoch's
+producer is still inside `post`. Under the control loom answers `Causality
+violation: Concurrent write accesses to UnsafeCell`, which is the defect stated
+exactly.
 
 **That mechanism is narrower than three of the four models need, and it constrains
 the file layout.** `kernel-loom/src/lib.rs:63` reaches `kernel/src/sync.rs` and
