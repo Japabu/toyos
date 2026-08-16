@@ -50,7 +50,7 @@ A subdirectory `CLAUDE.md` loads when a file in that subtree is `Read`, and not 
 
 ## Dependencies
 
-Only **Rust** and **QEMU** (for development). The rules: no binary outside those two — a macOS binary is a hard no, and "only for tests" does not soften it; only general and widely used crates — one that does *our* job we write ourselves, and a driver crate never; no Python; a fork is the sanctioned form of every third-party source. Ask of anything new: could this ever run inside ToyOS?
+Only **Rust** and **QEMU** (for development). The rules: no binary outside those two — a macOS binary is a hard no, and "only for tests" does not soften it; only general and widely used crates — one that does *our* job we write ourselves, and a driver crate never; no Python; a fork is the sanctioned form of every third-party source. The north star is **self-hosting**: nothing — build, test, or verification — rests on a host binary. Ask of anything new: could this ever run inside ToyOS?
 
 The bar is not yet the tree. The standing failures are declared rather than removed — Python via `rust/x`, `cc` for every host link, four macOS FAT tools. `NOTICE` names every committed third-party file with its hash, upstream and licence; an image carrying `DOOM1.WAD` may not be sold.
 
