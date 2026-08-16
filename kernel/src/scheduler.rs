@@ -340,9 +340,31 @@ pub fn do_preempt() {
 /// that is what makes it the boundary — so the exit takes nothing with it, and
 /// the timer interrupt bounds how long a Ring 3 loop can put it off.
 ///
+/// **Called at the last exit boundary and from every one of them**, which is
+/// two corrections to the shape this landed with:
+///
+/// * `kernel_exit_to_user_check` called it *once, above* its resched loop. That
+///   loop enables interrupts and gives the CPU away for a whole pass, so a
+///   retire landing inside it reached Ring 3 unobserved. It is now the loop's
+///   own condition, so the check is the last thing before the return.
+/// * The Ring 3 timer stub did not call the epilogue at all — and
+///   `apic::kick_cpu` sends TIMER_VECTOR, so that stub is where a retire's own
+///   IPI lands. A thread killed while running in userland was preempted,
+///   queued in the dying list, picked straight back off it and returned to
+///   Ring 3, once per tick, unbounded. `arch::idt::timer` now runs the same
+///   epilogue every other Ring 3 return runs.
+///
+/// What is left is one instant wide: the kill bit is a remote CPU's plain
+/// atomic and can be raised after this load and before the `iretq`, with IF=0
+/// in between. That thread reaches Ring 3 with the kill pending and comes back
+/// through this boundary on the retire's own `Urgency::Preempt` kick — which
+/// was posted before the bit was set, so it is already on its way.
+/// `scheduler-core-spec.md` invariant 7 states that bound.
+///
 /// One relaxed load per return to userland, which is the whole cost. The
-/// baseline is `BASELINE_IRQ_EXIT`: both entry stubs discharge their own level
-/// before calling the epilogue this runs in.
+/// baseline is `BASELINE_IRQ_EXIT`: every entry stub discharges its own level
+/// before calling the epilogue this runs in, and the Ring 3 timer stub takes
+/// no level at all.
 #[track_caller]
 pub fn exit_if_killed() {
     if !driver::current_kill_pending() {
@@ -475,17 +497,23 @@ pub fn futex_wake(phys_addr: DirectMap, count: usize) -> u64 {
 /// Retire a thread and wait until its record is gone.
 ///
 /// The retire itself is one message (spec §7.6): the sticky kill bit plus
-/// `Msg::Retire` to the CPU the state word names, and whichever CPU ends up
-/// owning the task reaps it — parked, queued, in transit, or at the next safe
-/// point if it is running. Nothing scans anything and nobody spins.
+/// `Msg::Retire` to the CPU the state word names. **Whichever CPU ends up
+/// owning the task then *schedules* it** — `specs/completion-architecture-spec.md`
+/// §7.2 — because this kernel does not unwind and a discarded stack takes every
+/// guard on it. A parked victim is woken into that CPU's dying list, a queued
+/// one is moved into it, a running one is asked for a safe point, and one in
+/// transit is adopted and dispatched. It dies by its own `die`, at the first
+/// safe point its own unwind reaches. Nothing scans anything and nobody spins.
 ///
 /// The *wait* is what the callers need and why this is not fire-and-forget:
 /// process teardown frees memory the dead thread's page tables still map, so
 /// it may not run until that thread's payload — kernel stack and address-space
 /// reference — is dropped. That happens in `Hw::release`, which announces
-/// itself here. Waiting for the state word to read `Dead` would be too weak:
-/// `Dead` is published by the reaping *transition*, one pass before the
-/// release, while the dying CPU still stands on that thread's kernel stack.
+/// itself here. Waiting for the state word to read `Dead` would be too weak,
+/// and the reason survives §7.2 with a different mechanism behind it: `Dead` is
+/// published by the victim's own `dispose_exit`, and the payload it leaves as
+/// that CPU's zombie is freed by the **next** pass, because a pass cannot free
+/// the stack it is standing on.
 ///
 /// The short block deadline is a liveness backstop, not a poll: the wake is a
 /// message like any other, and a lost one must fail loudly rather than hang.
@@ -514,20 +542,49 @@ pub fn retire_task(sched: &ThreadSched) {
     /// is the liveness backstop's step.
     const RECHECK: Cadence = Cadence::every(
         Duration::from_millis(50),
-        "twenty re-polls inside the tripwire, on a thread that is otherwise parked",
+        "a hundred re-polls inside the tripwire, on a thread that is otherwise parked",
     );
-    /// **What this bounds is an IPI, a remote pass and a release** — not a
-    /// reap on this CPU. `retire::post` targets the CPU the state word names
-    /// and kicks it with `Urgency::Preempt`, and this waits for
-    /// `Hw::release` on that CPU.
+    /// **Re-derived at C3+C4, which the struck version of this comment said it
+    /// owed.** What this bounds is no longer "an IPI, one remote pass and a
+    /// release": since `specs/completion-architecture-spec.md` §7.2 the victim
+    /// is *scheduled* rather than reaped, so the wait covers every hop between
+    /// the claim and `Hw::release`. Term by term, from the tree:
     ///
-    /// C4 re-derives it and must: once a killed task runs its own unwind
-    /// (§7.2) what this covers becomes unwind + teardown + every sleep-lock
-    /// acquire on the way + the release, which is a different quantity from
-    /// the one measured here.
+    /// * **2 s — the victim CPU's own pass prologue.** `sched::driver::pass`
+    ///   opens with `drain_irqs()`, which calls `xhci::poll_if_pending()`
+    ///   *before* the mailbox drain, and that call spins on
+    ///   `xhci::USB_TIMEOUT_NS` = 2,000,000,000 ns while holding `XHCI`. This
+    ///   is the term that made the struck 1 s fire on the owner's T14 at 949 s
+    ///   of uptime with doom exiting, and it has nothing to do with §7.2:
+    ///   `specs/issues/kernel/scheduler-pass-blocks-in-xhci.md` is open and
+    ///   says in terms that "`retire_task`'s bound is measuring the USB bus".
+    ///   **A tripwire smaller than one bounded term of its own derivation is
+    ///   not a tripwire**, and that alone is why the number moves.
+    /// * **2 s again — the pass that frees the zombie.** `die` publishes
+    ///   `Dead` and leaves the record as that CPU's zombie; the release is the
+    ///   *next* pass, and that pass opens with the same prologue.
+    /// * **20 ms — two quanta.** One for the victim's CPU to be free to pick
+    ///   the dying task (a running fair task keeps the CPU to its quantum end),
+    ///   one for the pass that releases the zombie to arrive.
+    /// * **The unwind itself**, which is what §7.2 added: `?`-ing
+    ///   `completion::Cancelled` out of every wait the thread was inside,
+    ///   dropping the guards on the way, `process::teardown_resources`, and
+    ///   `ops::close_all` over up to `MAX_HANDLES` = 4,096 handles. On *this*
+    ///   tree that is CPU-bounded work and not a wait — `wait_transfer` still
+    ///   spins and there is no park on a disk transfer until C7 (spec §20.4) —
+    ///   so it is the margin above rather than a term of its own. **C7 changes
+    ///   that and owes this constant another look**: a sleep lock parked on a
+    ///   device puts a third `USB_TIMEOUT_NS` inside the unwind.
+    ///
+    /// 4.02 s of derived terms, and 5 s is the next round number above it.
+    /// Nothing about the RT band is priced here: `scheduler-core-spec.md` §3
+    /// gives real-time work unbounded precedence over the dying list, so a
+    /// machine that spends this tripwire on RT service is a machine whose RT
+    /// workload is the fault, and the RT right is capability-gated.
     const GIVE_UP: Tripwire = Tripwire::absurd(
-        Duration::from_secs(1),
-        "an IPI, one remote pass and a release; past this the wake was lost",
+        Duration::from_secs(5),
+        "two pass prologues on xHCI's own 2 s deadline, two quanta, and an unwind; \
+         past this the wake was lost",
     );
     let give_up = Deadline::at(crate::clock::now() + GIVE_UP.duration());
     let parkable = Parkable::of_current();

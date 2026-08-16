@@ -13,7 +13,7 @@
 //! client, so "never learn" means soundd writing into a ring nobody reads for
 //! the rest of the boot.
 //!
-//! Three arms, each a child killed at a point it cannot come back from:
+//! Four arms, each a child killed at a point it cannot come back from:
 //!
 //! 1. **Blocked reading a pipe.** The parent holds the only write end and must
 //!    see the read side gone.
@@ -21,6 +21,11 @@
 //!    layer up: the parent's write must answer `Gone`.
 //! 3. **Blocked in `accept`.** The child holds the port's only acceptor; the
 //!    parent's next connect through the connector must be `Gone`.
+//! 4. **Not blocked at all** — spinning in Ring 3, with an empty kernel stack
+//!    and no syscall to cancel. The other three ask what a kill *releases*;
+//!    this one asks whether it **ends**, which is `scheduler-core-spec.md`
+//!    invariant 7's "never dispatched into userland again" and the one claim in
+//!    it that no existing test executes.
 //!
 //! **No census assertion anywhere in this file, and that is the point rather
 //! than an omission.** A live-object count is the one instrument that cannot
@@ -39,12 +44,24 @@
 use std::io::{Read, Write};
 use std::os::toyos::process::CommandExt;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use toyos::{endow, namespace, port, AsHandle};
 use toyos_abi::syscall::{self, SyscallError, SERVE_PREFIX, SVC_LABEL};
 
 const SELF_PATH: &str = "/bin/test_rs_kill_while_blocked";
 const SERVICE: &str = "blocked";
+
+/// How long arm 4 waits for a killed Ring 3 spinner to be gone.
+///
+/// **A number rather than a hang, for `specs/completion-architecture-spec.md`
+/// §20.3's reason**: a guest that stops making progress reds as `STALL`, which
+/// the harness prints apart and tells nobody to bisect. Two seconds against a
+/// bound of one interrupt delivery is four orders of magnitude of headroom, and
+/// what it buys is a failure that names itself.
+const ENDS_WITHIN: Duration = Duration::from_secs(2);
 
 fn main() {
     match std::env::args().nth(1).as_deref() {
@@ -57,6 +74,7 @@ fn test() {
     a_pipe_reader_killed_in_the_read();
     a_connection_peer_killed_in_the_read();
     an_acceptor_killed_in_the_accept();
+    a_ring_three_spinner_ends_at_its_next_exit_boundary();
     println!("a killed thread's blocking handle is released, and the peer is told");
 }
 
@@ -169,8 +187,65 @@ fn an_acceptor_killed_in_the_accept() {
     println!("  accept: the port closed and a connect answered Gone");
 }
 
+/// Arm 4. The child is spinning in Ring 3 — no syscall, no handle, nothing to
+/// cancel — when it is killed, and it must be gone.
+///
+/// **This is the arm the other three cannot stand in for.** They kill a thread
+/// that is *inside the kernel*, where a retire reaches it as a park to cancel;
+/// this one kills a thread whose kernel stack is empty, so the only thing that
+/// can end it is the boundary it crosses on its way back into userland. Both
+/// ways that boundary can be missed were live on this branch:
+/// `kernel_exit_to_user_check` read the kill bit once *above* its reschedule
+/// loop, and the Ring 3 timer stub — which is where the retire's own IPI lands,
+/// because `apic::kick_cpu` sends TIMER_VECTOR — did not run that epilogue at
+/// all. With either miss the child here is preempted, queued in the dying list,
+/// picked straight back off it and returned to Ring 3, once per tick, forever.
+///
+/// It is bounded by a wall clock and reported as a number: nothing else could
+/// distinguish "ended late" from "the harness gave up".
+fn a_ring_three_spinner_ends_at_its_next_exit_boundary() {
+    let mut child = parked("spin", None);
+    child.kill().expect("kill the spinning child");
+
+    // The wait is on its own thread so the deadline below is this one's, not
+    // the kernel's — `Child::wait` has nothing to time out on.
+    static REAPED: AtomicBool = AtomicBool::new(false);
+    let started = Instant::now();
+    thread::spawn(move || {
+        let _ = child.wait();
+        REAPED.store(true, Ordering::Release);
+    });
+    while !REAPED.load(Ordering::Acquire) && started.elapsed() < ENDS_WITHIN {
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !REAPED.load(Ordering::Acquire) {
+        println!(
+            "a child killed while spinning in Ring 3 was still running {:?} later — \
+             it is being re-dispatched into userland, so nothing on the return path \
+             reads the kill bit",
+            started.elapsed(),
+        );
+        std::process::exit(1);
+    }
+    println!(
+        "  ring 3: a killed spinner was gone in {:?}, with no syscall to cancel",
+        started.elapsed(),
+    );
+}
+
 fn child(role: &str) -> ! {
     match role {
+        // No syscall after the marker, deliberately: a `sleep` or a `write`
+        // would put a kernel stack under the thread and give the retire a park
+        // to cancel, which is arms 1–3 and not this one. `black_box` is what
+        // stops the loop being optimised into nothing.
+        "spin" => {
+            say("parked in spin");
+            loop {
+                std::hint::black_box(0u64);
+                std::hint::spin_loop();
+            }
+        }
         "pipe-read" => {
             say("parked in pipe-read");
             let mut buf = [0u8; 64];

@@ -6,6 +6,17 @@ use crate::hw::HW;
 // Ring 0 path re-arms the one-shot timer itself: without re-arming, a fire
 // while in Ring 0 would silently disable preemption forever. need_resched
 // gets picked up at the next kernel→user exit.
+//
+// **The Ring 3 path runs `kernel_exit_to_user_check` like every other return
+// to userland, and it was the one vector that did not.** `apic::kick_cpu` sends
+// TIMER_VECTOR, so this stub is where a retire's own IPI lands — and a thread
+// killed while running in Ring 3 was preempted here, put in the dying list,
+// picked straight back off it with a fresh quantum, and returned to userland
+// with the kill pending and nothing on the path that reads it. Once per tick,
+// for as long as the thread cared to loop: `scheduler-core-spec.md`
+// invariant 7's "never dispatched into *userland* again" was false without a
+// bound. `exit_if_killed` lives in that epilogue, which is why the fix is to
+// join it rather than to add a second check here.
 #[unsafe(naked)]
 pub(super) extern "sysv64" fn timer_entry() {
     ring3_naked_asm!(
@@ -31,6 +42,11 @@ pub(super) extern "sysv64" fn timer_entry() {
         "wrmsr",
 
         "call {handler}",
+
+        // IF is 0 here (interrupt gate, and the handler never sti's), which is
+        // the epilogue's entry contract. The user machine state is parked on
+        // this kernel stack across it, exactly as `device_irq` parks it.
+        "call {exit_to_user}",
 
         restore_user_state!(),
 
@@ -61,6 +77,7 @@ pub(super) extern "sysv64" fn timer_entry() {
         "pop rax",
         "iretq",
         handler = sym timer_handler,
+        exit_to_user = sym crate::arch::idt::kernel_exit_to_user_check,
     );
 }
 

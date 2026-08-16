@@ -46,6 +46,31 @@
    survivable at all once a sleep lock can be held across a park. The property
    that replaces it is the one the reap was standing in for: nothing a killed
    task holds outlives it, because the task itself gives it back.
+
+   **"Never dispatched into userland again" is enforced at the last exit
+   boundary, and its residual is one interrupt wide.** Every return to Ring 3 —
+   syscall, exception, device interrupt, TLB shootdown and the timer tick —
+   ends in `kernel_exit_to_user_check`, which reads the kill bit *after* its
+   reschedule loop has settled and immediately before the return, with
+   interrupts off. The bit is set by a remote CPU's plain atomic and can
+   therefore be raised in the instant between that read and the `iretq`; the
+   retire's own `Urgency::Preempt` kick was posted before the bit was set, so
+   that thread takes the interrupt in Ring 3 and comes straight back through
+   the same boundary. **The bound is one interrupt delivery, not one quantum
+   and not one unbounded Ring 3 loop.** Both weaker forms were live on this
+   branch before 2026-08-16: the check ran once *above* the reschedule loop,
+   which gives the CPU away with interrupts on; and the Ring 3 timer stub —
+   which is where `apic::kick_cpu`'s IPI lands — did not run the epilogue at
+   all, so a thread killed in userland was preempted into the dying list,
+   picked straight back off it and returned to Ring 3, once per tick, for as
+   long as it cared to loop.
+
+   **Release completes within the retirer's own tripwire, and that number is
+   derived rather than declared** — `kernel/src/scheduler.rs`'s `GIVE_UP`
+   carries the derivation: two pass prologues on xHCI's 2 s deadline, two
+   quanta, and the unwind. Its dominant term is a filed defect
+   (`specs/issues/kernel/scheduler-pass-blocks-in-xhci.md`) and not a property
+   of this invariant.
 8. **A cross-CPU message is never dropped.** There is no message capacity to
    exhaust and no overflow.
 9. **Userland cannot stall the scheduler.** A wake storm costs the sender its
