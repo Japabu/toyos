@@ -530,13 +530,18 @@ impl RtState {
     /// the lend: the task falls out of the RT band, behind exactly the
     /// normal-priority work the lend existed to jump, and nothing re-grants it.
     ///
-    /// Re-arming cannot compound into an unbounded RT hold, because both ways
-    /// out of `Running` end the lend. A boosted task is RT, so `preempt_if_due`
-    /// only preempts it at its quantum end, and that quantum starts at the same
-    /// dispatch this arms from — so `now >= until` holds there and
-    /// [`RtState::expire`] clears it; a `park` clears it whatever the clock
-    /// says. A second arm therefore needs a *new* lend, and one lend buys at
-    /// most one quantum at the borrowed priority (spec §8.5, invariant I9).
+    /// Re-arming cannot compound into an unbounded RT hold, because **all
+    /// three** ways out of `Running` end the lend. A boosted task is RT, so
+    /// `preempt_if_due` only preempts it at its quantum end, and that quantum
+    /// starts at the same dispatch this arms from — so `now >= until` holds
+    /// there and [`RtState::expire`] clears it; a `park` clears it whatever the
+    /// clock says; and the third, which
+    /// `specs/completion-architecture-spec.md` §7.2 added and this sentence
+    /// once predated, is the dying list — [`ReadyTask::end_lend`] and
+    /// [`RunningTask::end_lend`] are called on every route into it, and their
+    /// docs carry why. A second arm therefore needs a *new* lend, and one lend
+    /// buys at most one quantum at the borrowed priority (spec §8.5, invariant
+    /// I9).
     fn arm(&mut self, now: Nanos) {
         if let Some(until) = self.inherited {
             if now >= until {
@@ -792,8 +797,8 @@ impl<X: SchedPayload> ReadyTask<X> {
     ///
     /// It is also what keeps [`RtState::arm`]'s argument true.
     /// `specs/completion-architecture-spec.md` §7.2 added a third way out of
-    /// `Running` — the dying list — and `arm`'s "both ways out of `Running` end
-    /// the lend" was written when there were two. Without this the re-arm at
+    /// `Running` — the dying list — and `arm`'s enumeration was written when
+    /// there were two. It names all three now. Without this the re-arm at
     /// the next dispatch hands the corpse a fresh window for its whole unwind,
     /// and invariant I9 sees one lend buy more than one quantum. It does: the
     /// sim found it at 12,500,000 ns against a 12,000,000 ns bound as soon as

@@ -202,8 +202,15 @@ pub struct CpuSched<X: SchedPayload> {
     /// Separate from the fair queue rather than ordered inside it, for the
     /// bound: a dying task is not competing for a share of the CPU, it is
     /// releasing resources a retirer is blocked on, so its wait is one pick and
-    /// not the depth of the fair band. That is what keeps invariant I14's
-    /// retire bound a quantum-shaped number instead of a queue-shaped one.
+    /// not the depth of the fair band.
+    ///
+    /// **It jumps that queue and it does not escape its own.** Invariant I14's
+    /// bound is queue-shaped in *this* container, and its own derivation says
+    /// so: the term is `(1 + peers)`, where `peers` is the depth of this list
+    /// on this CPU, and it is workload-shaped exactly as invariant I5's factor
+    /// is. The sentence that used to end here said the opposite — "a
+    /// quantum-shaped number instead of a queue-shaped one" — and it was
+    /// written before that term existed.
     ///
     /// **The argument reaches the fair band and stops there.** "A retirer is
     /// blocked on what this task holds" says nothing about real-time work,
@@ -1979,8 +1986,10 @@ mod tests {
     }
 
     /// A dying task is picked before the fair queue: it is not competing for
-    /// the CPU, it is releasing resources a retirer is blocked on, and that is
-    /// what keeps the retire bound a quantum-shaped number.
+    /// the CPU, it is releasing resources a retirer is blocked on, so its wait
+    /// is one pick and not the depth of the fair band. (It *is* the depth of
+    /// the dying list — invariant I14's `(1 + peers)` term — which is the
+    /// container this jump does not exempt it from.)
     #[test]
     fn a_dying_task_is_picked_before_the_fair_queue() {
         let mut w = World::new(1);
@@ -2156,9 +2165,9 @@ mod tests {
     /// the corpse in the fair band, so `place` → `enqueue` in `handle_adopt`
     /// used to be invisible to the whole suite. A corpse in the fair band is
     /// ordinary work: it queues behind whatever is there, `answer_steal_requests`
-    /// may hand it to another CPU as surplus, and the retirer's bound stops
-    /// being quantum-shaped — which is exactly what the dying list exists to
-    /// prevent.
+    /// may hand it to another CPU as surplus, and the retirer's bound picks up
+    /// the whole depth of the fair band — which is exactly what the dying list
+    /// exists to prevent.
     #[test]
     fn an_adopt_of_a_killed_task_dispatches_it_on_arrival() {
         let mut w = World::new(2);

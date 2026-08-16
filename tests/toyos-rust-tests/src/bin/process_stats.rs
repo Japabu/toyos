@@ -119,9 +119,19 @@ fn live_process() {
 ///
 /// The `held` child blocks reading a pipe its parent holds the write end of, so
 /// its wait is `WaitClass::Pipe` — and `blocked_pipe_ns` is the field that has
-/// to move. It is asserted against `blocked_other_ns` rather than against zero:
-/// "other" is where a park with no class named goes, so a tree that stopped
-/// classifying puts *this* wait there and the two fields swap.
+/// to move, and what is asserted is that it moved at all — **against zero**.
+///
+/// The sentence that used to stand here claimed a stronger discrimination than
+/// the code performs: that the check was made "against `blocked_other_ns`
+/// rather than against zero", so that the two fields swapping would be caught.
+/// `blocked_other_ns` appears in this file only as a format argument, and the
+/// assertion twelve lines below has always read `blocked_pipe_ns > 0`. The gate
+/// does catch what it exists for — a tree that stopped classifying leaves pipe
+/// at zero — and it would not catch one that charged the same wait to both
+/// counters. The stronger form is not obviously sound either, which is why this
+/// is a correction to the sentence rather than to the assertion: the child does
+/// its own blocking during setup, so an ordering between two counters is a
+/// claim about the child's schedule and not about the classification.
 ///
 /// **The park has to be over before the numbers exist**, and the first draft of
 /// this arm read them while the child was still in it. Blocked time is charged
