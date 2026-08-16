@@ -376,6 +376,10 @@ extern "sysv64" fn common_entry() {
 /// spinning on it would hang the CPU silently, so die loudly instead.
 pub(crate) extern "sysv64" fn kernel_exit_to_user_check() {
     flush_ring0_timer_fires_to_trace();
+    // A killed thread returns to Ring 3 exactly once more: never. Its kernel
+    // stack is empty here by definition, so this is where the unwind ends —
+    // `specs/completion-architecture-spec.md` §7.2.
+    crate::scheduler::exit_if_killed();
     while crate::preempt::need_resched() {
         assert!(!crate::scheduler::in_schedule_self(),
             "exit-to-user inside a scheduler pass");

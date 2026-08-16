@@ -238,6 +238,17 @@ extern "sysv64" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, 
     syscall_dispatch(num, a1, a2, a3, a4)
 }
 
+/// What a syscall answers when its wait was cancelled.
+///
+/// **Nothing ever reads it.** The thread has been killed, so the return path
+/// it is on ends at `kernel_exit_to_user_check`, which sees the kill bit and
+/// exits instead of returning to Ring 3 (§7.2). The word exists because the
+/// unwind has to carry *something* through the `u64` every syscall answers in,
+/// and `Interrupted` is what it would mean if anything could read it.
+fn cancelled() -> u64 {
+    SyscallError::Gone.to_u64()
+}
+
 fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     let t0 = crate::clock::nanos_since_boot();
 
@@ -924,18 +935,18 @@ fn sys_write(h: RawHandle, buf: &UserBytes) -> u64 {
             }
             Err(WriteBlock::Pipe(id)) => match pipe::writers_queue(id) {
                 Some(end) => {
-                    // Armed *before* the registration, and re-derived after —
-                    // §5.3a's edge shape, which is what every site here does
-                    // through `wait_until`'s loop already. C3 makes the inbox
-                    // the predicate; until then the queue is still what wakes
-                    // this thread and the record is the shadow.
-                    let _armed = completion::arm(
+                    let parkable = crate::scheduler::Parkable::of_current();
+                    if completion::wait_until(
+                        &parkable,
                         completion::Subject::of(&end.watch),
                         completion::Token::new(0),
-                    );
-                    crate::scheduler::wait_until(&end.queue, Deadline::never(), || {
-                        pipe::has_space(id)
-                    })
+                        Deadline::never(),
+                        || pipe::has_space(id),
+                    )
+                    .is_err()
+                    {
+                        return cancelled();
+                    }
                 }
                 None => return SyscallError::NotFound.to_u64(),
             },
@@ -1108,44 +1119,60 @@ fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
                 return n;
             }
             Err(ReadBlock::Pipe(end, id)) => {
-                let _armed = completion::arm(
+                let parkable = crate::scheduler::Parkable::of_current();
+                if completion::wait_until(
+                    &parkable,
                     completion::Subject::of(&end.watch),
                     completion::Token::new(0),
-                );
-                crate::scheduler::wait_until(&end.queue, Deadline::never(), || pipe::has_data(id))
+                    Deadline::never(),
+                    || pipe::has_data(id),
+                )
+                .is_err()
+                {
+                    return cancelled();
+                }
             }
             Err(ReadBlock::VirtioSound) => {
-                let _armed = completion::arm(
+                let parkable = crate::scheduler::Parkable::of_current();
+                if completion::wait_until(
+                    &parkable,
                     completion::Subject::of(&crate::sched::waitqs::AUDIO_WATCH),
                     completion::Token::new(0),
-                );
-                crate::scheduler::wait_until(
-                    &crate::sched::waitqs::AUDIO,
                     Deadline::never(),
                     crate::drivers::virtio_sound::has_pending,
                 )
+                .is_err()
+                {
+                    return cancelled();
+                }
             }
             Err(ReadBlock::Hda) => {
-                let _armed = completion::arm(
+                let parkable = crate::scheduler::Parkable::of_current();
+                if completion::wait_until(
+                    &parkable,
                     completion::Subject::of(&crate::sched::waitqs::AUDIO_WATCH),
                     completion::Token::new(0),
-                );
-                crate::scheduler::wait_until(
-                    &crate::sched::waitqs::AUDIO,
                     Deadline::never(),
                     crate::drivers::hda::has_pending,
                 )
+                .is_err()
+                {
+                    return cancelled();
+                }
             }
             Err(ReadBlock::Keyboard(deadline)) => {
-                let _armed = completion::arm(
+                let parkable = crate::scheduler::Parkable::of_current();
+                if completion::wait_until(
+                    &parkable,
                     completion::Subject::of(&crate::sched::waitqs::KEYBOARD_WATCH),
                     completion::Token::new(0),
-                );
-                crate::scheduler::wait_until(
-                    &crate::sched::waitqs::KEYBOARD,
                     deadline,
                     crate::keyboard::has_data,
                 )
+                .is_err()
+                {
+                    return cancelled();
+                }
             }
             Err(ReadBlock::Refused(word)) => return word,
             Err(ReadBlock::BadHandle(e)) => return e.refuse(),
@@ -1497,8 +1524,18 @@ fn sys_process_wait(h: RawHandle, flags: u64) -> u64 {
         Err(e) => return e.refuse(),
     };
     if flags & WNOHANG == 0 {
-        let queue = object.waiters();
-        crate::scheduler::wait_until(&queue, Deadline::never(), || object.finished());
+        let parkable = crate::scheduler::Parkable::of_current();
+        if completion::wait_until(
+            &parkable,
+            completion::Subject::of(object.watch()),
+            completion::Token::new(0),
+            Deadline::never(),
+            || object.finished(),
+        )
+        .is_err()
+        {
+            return cancelled();
+        }
     }
     match object.exit_code() {
         // Zero-extended: an exit code is an `i32`, and sign-extending -1 would
@@ -1840,7 +1877,10 @@ fn connect_through(connector: &port::Connector) -> u64 {
         };
     }
     let port = connector.port();
-    crate::sched::waitqs::wake_all(&port.waiters());
+    completion::post(
+        completion::Subject::of(port.watch()),
+        completion::Outcome::Ready,
+    );
     let watchers = port.watchers();
     if !watchers.is_empty() {
         crate::io_uring::complete_pending_for_event(
@@ -1932,10 +1972,18 @@ fn sys_accept(h: RawHandle) -> u64 {
         if acceptor.closed() {
             return SyscallError::Gone.to_u64();
         }
-        let queue = acceptor.waiters();
-        crate::scheduler::wait_until(&queue, Deadline::never(), || {
-            acceptor.has_pending() || acceptor.closed()
-        });
+        let parkable = crate::scheduler::Parkable::of_current();
+        if completion::wait_until(
+            &parkable,
+            completion::Subject::of(acceptor.watch()),
+            completion::Token::new(0),
+            Deadline::never(),
+            || acceptor.has_pending() || acceptor.closed(),
+        )
+        .is_err()
+        {
+            return cancelled();
+        }
     }
 }
 
@@ -2293,22 +2341,42 @@ fn sys_thread_spawn(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> u6
         .map_or(SyscallError::ResourceExhausted.to_u64(), |t| t.raw() as u64)
 }
 
+/// Wait for a thread of this process to die.
+///
+/// **It arms on the thread it names**, which is what replaced the parking lot:
+/// the target's own `TaskHandle` carries the watch, `thread_exit` posts to it,
+/// and the `ThreadSched` held across the park is what keeps that watch alive.
+/// A `wake_task(TaskId)` to the process's main thread — a wake by name, into a
+/// hashed bucket, re-checked by whoever happened to be woken — is gone with it.
 fn sys_thread_join(tid: u64) -> u64 {
     let tid = process::Tid::from_raw(tid as u32);
     let caller = process::current_process();
-    let queue = crate::scheduler::park_lot();
+    // Resolved once. `None` is a thread that never existed or is already
+    // collected, and the predicate below answers both.
+    let target = process::thread_sched(caller, tid);
+    let parkable = crate::scheduler::Parkable::of_current();
     loop {
-        let ticket = crate::scheduler::prepare_wait(queue);
         match process::wait_thread_zombie(tid, caller) {
-            Ok(Some(_)) => {
-                ticket.cancel();
-                return 0;
-            }
-            Ok(None) => crate::scheduler::block_on(ticket, Deadline::never()),
-            Err(()) => {
-                ticket.cancel();
-                return SyscallError::NotFound.to_u64();
-            }
+            Ok(Some(_)) => return 0,
+            Ok(None) => {}
+            Err(()) => return SyscallError::NotFound.to_u64(),
+        }
+        let Some(sched) = target.as_ref() else {
+            // Nothing to arm on and the zombie is not there: the thread is
+            // gone in a way `wait_thread_zombie` will keep answering the same
+            // way, so waiting cannot change it.
+            return SyscallError::NotFound.to_u64();
+        };
+        if completion::wait_until(
+            &parkable,
+            completion::Subject::of(sched.handle.watch()),
+            completion::Token::new(tid.raw() as u64),
+            Deadline::never(),
+            || matches!(process::wait_thread_zombie(tid, caller), Ok(Some(_)) | Err(())),
+        )
+        .is_err()
+        {
+            return cancelled();
         }
     }
 }
@@ -2452,9 +2520,19 @@ fn sys_nanosleep(nanos: u64) -> u64 {
     let deadline = Deadline::at(crate::clock::now() + Duration::from_nanos(nanos));
     // No condition to re-check: the deadline is the wake, and one that has
     // already passed fires at the next scheduler entry.
-    crate::scheduler::block_on(
-        crate::scheduler::prepare_wait(crate::scheduler::park_lot()),
+    // **Armed on nothing but time.** A sleep has no subject — what ends it is
+    // the deadline the caller chose — so it arms on its own thread, where
+    // nothing posts, and the park's own deadline is the whole of the wait.
+    let parkable = crate::scheduler::Parkable::of_current();
+    let Some(handle) = crate::sched::driver::current_handle() else {
+        return 0;
+    };
+    let _ = completion::wait_until(
+        &parkable,
+        completion::Subject::of(handle.watch()),
+        completion::Token::new(0),
         deadline,
+        || false,
     );
     0
 }

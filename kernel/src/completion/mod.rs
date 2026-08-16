@@ -55,8 +55,14 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub use inbox::{Inbox, Outcome, Reason, Record, Token};
 
-use crate::sched::payload::TaskHandle;
+use toyos_sched::hw::Nanos;
+
+use crate::sched::payload::{KShared, TaskHandle};
+use crate::scheduler::Parkable;
 use crate::sync::Lock;
+use crate::time::Deadline;
+
+pub use toyos_sched::waitq::Cancel;
 
 /// The waiters armed on one object.
 ///
@@ -71,9 +77,15 @@ pub struct Watch {
 
 struct Watcher {
     /// The waiter's own inbox, held by `Arc` rather than by reference: a
-    /// killed waiter never drops its `Armed` (§7), and a raw pointer would
-    /// make that a use-after-free instead of a bounded leak.
+    /// raw pointer would make an abandoned arm a use-after-free instead of a
+    /// bounded leak. (Since §7.2 an abandoned arm is itself rare — a killed
+    /// task runs its own unwind and drops it — but the `Arc` is what makes
+    /// "rare" not have to be "never".)
     task: Arc<TaskHandle>,
+    /// The waiter's rendezvous word, for the claim half of the post. Held
+    /// beside the handle because the two are minted at different instants and
+    /// a post needs both: the record, then the claim.
+    shared: Arc<KShared>,
     token: Token,
 }
 
@@ -104,6 +116,7 @@ impl<'a> Subject<'a> {
 pub struct Armed<'a> {
     subject: Subject<'a>,
     task: Arc<TaskHandle>,
+    shared: Arc<KShared>,
     token: Token,
 }
 
@@ -153,6 +166,7 @@ impl Drop for Armed<'_> {
 /// idle CPU.
 pub fn arm(subject: Subject<'_>, token: Token) -> Option<Armed<'_>> {
     let task = crate::sched::driver::current_handle()?;
+    let shared = crate::sched::driver::current_shared()?;
     let inbox = task.inbox();
     assert!(
         !inbox.is_armed(),
@@ -164,10 +178,14 @@ pub fn arm(subject: Subject<'_>, token: Token) -> Option<Armed<'_>> {
     inbox.set_armed(true);
     let watch = subject.0;
     let mut waiters = watch.waiters.lock();
-    waiters.push(Watcher { task: task.clone(), token });
+    waiters.push(Watcher {
+        task: task.clone(),
+        shared: shared.clone(),
+        token,
+    });
     watch.armed.store(waiters.len(), Ordering::Relaxed);
     drop(waiters);
-    Some(Armed { subject, task, token })
+    Some(Armed { subject, task, shared, token })
 }
 
 /// Tell everyone armed on `subject` that something happened.
@@ -176,6 +194,21 @@ pub fn arm(subject: Subject<'_>, token: Token) -> Option<Armed<'_>> {
 /// lock and stores, exactly as the watcher-list walk it sits beside already
 /// does.
 pub fn post(subject: Subject<'_>, outcome: Outcome) {
+    post_with(subject, outcome, None)
+}
+
+/// The same, lending the poster's real-time window to whoever it wakes.
+///
+/// **Priority inheritance survives the conversion**, and it had to be carried
+/// deliberately: the queue wake this replaces took a `WakeCause::boosted`, and
+/// a completion post that dropped it would silently turn an RT writer's signal
+/// into an ordinary one — scheduler-core-spec §3's lend, invariant I9, and the
+/// audio path's whole latency argument.
+pub fn post_boosted(subject: Subject<'_>, outcome: Outcome, until: Nanos) {
+    post_with(subject, outcome, Some(until))
+}
+
+fn post_with(subject: Subject<'_>, outcome: Outcome, boost: Option<Nanos>) {
     let watch = subject.0;
     // The whole cost on a subject nobody waits on. Read before the lock, so a
     // wake that would otherwise be two stores does not become a lock acquire.
@@ -185,10 +218,161 @@ pub fn post(subject: Subject<'_>, outcome: Outcome) {
     let at = crate::clock::now();
     let waiters = watch.waiters.lock();
     for waiter in waiters.iter() {
+        // **Invariant W, in two statements** (§5.4): the record first, under
+        // this subject's leaf lock, and then the claim. A parker that has
+        // published `Committing` is refused its park by the claim; one that
+        // has not yet re-checked finds the record; one already `Blocked` gets
+        // the message. There is no fourth case, which is what
+        // `kernel-loom/tests/inbox.rs` is about.
         waiter.task.inbox().post(Record {
             token: waiter.token,
             outcome,
             at,
         });
+        crate::scheduler::wake_sched(&waiter.shared, boost);
+    }
+}
+
+/// The right to park, and the answer a killed thread gets instead.
+///
+/// A zero-sized type kernel code cannot construct: the only way to hold one is
+/// to have been told, by the one `wait` that reports it, that this thread has
+/// been killed. That is what stops a caller manufacturing a cancel, and RT4 —
+/// the second cancel reported to one thread panics — is what stops one being
+/// swallowed.
+#[derive(Debug)]
+pub struct Cancelled(());
+
+/// Park until a record arrives, the deadline passes, or this thread is
+/// cancelled.
+///
+/// **The one park site in the kernel.** Every blocking syscall reaches the
+/// machine through here, and the whole of its recheck is
+/// [`Inbox::has_record`] — one predicate, with no source named in it, which is
+/// what makes a new wait source unable to re-open the lost-wake window.
+///
+/// The arm is taken by reference and outlives the call, which is §5.3a's edge
+/// contract rather than §5.3's signature: a caller loops, re-deriving its own
+/// predicate between waits, and a post landing in that window must find the
+/// watch still armed. An arm consumed per wait would lose exactly the wake
+/// that arm-before-check exists to catch.
+///
+/// A deadline that passes is an [`Outcome::Gone`] with [`Reason::Expired`] and
+/// not an error: the caller asked for it, and §3's `Deadline` is the kind that
+/// says whose business the expiry is.
+#[track_caller]
+pub fn wait(p: &Parkable, armed: &Armed<'_>, deadline: Deadline) -> Result<Record, Cancelled> {
+    wait_inner(p, armed, deadline, Cancel::Answers)
+}
+
+/// The same, for a wait a kill may not end.
+///
+/// §7.4's third shape. One caller — the retirer waiting for its victim's
+/// release — and its bound is its own tripwire, never the kill: a killed
+/// retirer that took `Cancelled` here could not propagate it (the retire is
+/// half done) and would spin on a commit that refuses to park.
+#[track_caller]
+pub fn wait_uncancellable(p: &Parkable, armed: &Armed<'_>, deadline: Deadline) -> Record {
+    match wait_inner(p, armed, deadline, Cancel::Ignores) {
+        Ok(record) => record,
+        Err(_) => unreachable!("an uncancellable wait never reports a cancel"),
+    }
+}
+
+/// Arm, then park until `ready()` holds, the deadline passes, or this thread is
+/// cancelled.
+///
+/// **The shape every blocking syscall in the kernel now has**, and the direct
+/// replacement for `scheduler::wait_until`. The arm comes first and the
+/// predicate is re-derived after it — §5.3a's edge contract — so a post that
+/// lands in the window between the two is found by the park's own recheck
+/// rather than lost.
+///
+/// A return is not proof of the condition (scheduler-core-spec §2's invariant
+/// 10): the loop is what holds the wait until the predicate is true, and a
+/// deadline that passes returns with it still false, which is what the one
+/// timed caller needs.
+#[track_caller]
+pub fn wait_until(
+    p: &Parkable,
+    subject: Subject<'_>,
+    token: Token,
+    deadline: Deadline,
+    ready: impl Fn() -> bool,
+) -> Result<(), Cancelled> {
+    if ready() {
+        return Ok(());
+    }
+    let Some(armed) = arm(subject, token) else {
+        // No current task: boot, or an idle CPU. Neither can park, and neither
+        // reaches a blocking syscall — this is the `Parkable` argument stated
+        // once more at runtime, for the one caller that could be reached from
+        // a kernel thread before the scheduler exists.
+        return Ok(());
+    };
+    loop {
+        if ready() {
+            return Ok(());
+        }
+        let record = wait(p, &armed, deadline)?;
+        if record.outcome == Outcome::Gone(Reason::Expired) {
+            return Ok(());
+        }
+    }
+}
+
+/// A kernel thread that has said everything it has to say.
+///
+/// **Armed on itself, where nothing posts.** The two log actuator threads park
+/// here rather than exiting, because a thread that exits frees a stack a
+/// producer may still be about to write to; what they must not do is spin,
+/// which is what they would be doing if they competed with the reader for the
+/// rest of the boot. This is what took the last two callers off
+/// `scheduler::park_lot`, which is deleted with them.
+#[cfg(feature = "boot-actuators")]
+#[track_caller]
+pub fn park_forever() -> ! {
+    let parkable = crate::scheduler::Parkable::of_current();
+    let handle = crate::sched::driver::current_handle().expect("a kernel thread is a task");
+    let armed = arm(Subject::of(handle.watch()), Token::new(0)).expect("a task can arm");
+    loop {
+        let _ = wait(&parkable, &armed, Deadline::never());
+    }
+}
+
+#[track_caller]
+fn wait_inner(
+    _p: &Parkable,
+    armed: &Armed<'_>,
+    deadline: Deadline,
+    cancel: Cancel,
+) -> Result<Record, Cancelled> {
+    let task = &armed.task;
+    loop {
+        if let Some(record) = task.inbox().take() {
+            return Ok(record);
+        }
+        if cancel == Cancel::Answers && task.take_cancel(armed.shared.kill_pending()) {
+            return Err(Cancelled(()));
+        }
+        if deadline.reached(crate::clock::now()) {
+            return Ok(Record {
+                token: armed.token,
+                outcome: Outcome::Gone(Reason::Expired),
+                at: crate::clock::now(),
+            });
+        }
+        // Register on this thread's own parking place, re-check, park. The
+        // registration precedes the re-check, which is the whole of §2's
+        // invariant 4; the queue is never woken as a queue, because a post
+        // claims the rendezvous word directly.
+        let ticket = crate::scheduler::prepare_wait(task.park_queue(), cancel);
+        if task.inbox().has_record()
+            || (cancel == Cancel::Answers && armed.shared.kill_pending())
+        {
+            ticket.cancel();
+            continue;
+        }
+        crate::scheduler::block_on(ticket, deadline);
     }
 }

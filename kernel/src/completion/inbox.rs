@@ -96,14 +96,18 @@ impl Token {
 
 /// Why a subject is gone. Never a bare timeout — the reason is the value.
 ///
-/// **One variant, and the rest arrive with their first producer.** §5.1's set
-/// also has the peer's last handle closing, a device claim revoked and a
-/// deadline passing; C2 posts none of those, and a variant nothing constructs
-/// is dead code this tree's build refuses. C3's cancellers bring `Closed` and
-/// `Expired`, C7's device claim brings `Revoked`, and each arrives beside the
-/// code that produces it.
+/// **Three of §5.1's four, each arriving with its first producer.** `Revoked`
+/// — a device claim released out from under a waiter — is C7's, because that
+/// is the chunk with the claim to release; a variant nothing constructs is
+/// dead code this tree's build refuses.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
+    /// The subject ended: the peer's last handle closed, or the object told
+    /// its waiters it will never answer.
+    Closed,
+    /// The caller's own deadline passed. Never a bare timeout — the reason is
+    /// the value, and whose business the expiry is comes from `Deadline`.
+    Expired,
     /// The inbox filled while this waiter was not running. The record it
     /// replaces is lost; the waiter re-derives its own predicate, which is
     /// legal at every park site (§5.5).

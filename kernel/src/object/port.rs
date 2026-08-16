@@ -17,12 +17,9 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use toyos_sched::task::WaitClass;
 
 use crate::io_uring::RingId;
 use crate::pipe::{PipeReader, PipeWriter};
-use crate::sched::payload::KWaitQueue;
-use crate::sched::waitqs::{new_queue, wake_all};
 use crate::sync::Lock;
 
 use super::service::HandleQueue;
@@ -69,8 +66,11 @@ struct PortQueue {
 /// cycle exists.
 pub struct PortShared {
     queue: Lock<PortQueue>,
-    /// Threads blocked in `accept`.
-    acceptors: Arc<KWaitQueue>,
+    /// Threads blocked in `accept`, as a completion subject. On the port rather than on
+    /// either end, for the reason the io_uring watch is: a poll a server
+    /// registered on its `Acceptor` is completed by a client connecting
+    /// through a `Connector`.
+    watch: crate::completion::Watch,
     io_uring_watchers: Lock<Vec<RingId>>,
 }
 
@@ -94,7 +94,7 @@ pub enum PushError {
 pub fn create() -> (Arc<Acceptor>, Arc<Connector>) {
     let shared = Arc::new(PortShared {
         queue: Lock::new(PortQueue { closed: false, pending: VecDeque::new() }),
-        acceptors: new_queue(WaitClass::Ipc),
+        watch: crate::completion::Watch::new(),
         io_uring_watchers: Lock::new(Vec::new()),
     });
     (
@@ -115,10 +115,8 @@ impl PortShared {
         self.queue.lock().closed
     }
 
-    /// The waiter set, cloned out so a blocking site can hold it across its own
-    /// park — the ticket borrows the queue, not the port.
-    pub fn waiters(&self) -> Arc<KWaitQueue> {
-        self.acceptors.clone()
+    pub fn watch(&self) -> &crate::completion::Watch {
+        &self.watch
     }
 
     pub fn watchers(&self) -> Vec<RingId> {
@@ -153,8 +151,8 @@ impl Acceptor {
         self.shared.has_pending()
     }
 
-    pub fn waiters(&self) -> Arc<KWaitQueue> {
-        self.shared.waiters()
+    pub fn watch(&self) -> &crate::completion::Watch {
+        self.shared.watch()
     }
 
     pub fn port(&self) -> Arc<PortShared> {
@@ -211,6 +209,9 @@ impl ZeroHandles for Acceptor {
             connection.inbox.close_now();
         }
         drop(queued);
-        wake_all(&self.shared.acceptors);
+        crate::completion::post(
+            crate::completion::Subject::of(self.shared.watch()),
+            crate::completion::Outcome::Gone(crate::completion::Reason::Closed),
+        );
     }
 }

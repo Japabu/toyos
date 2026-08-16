@@ -29,10 +29,23 @@
    completes or by interrupt immediately after; it does not sleep through it.
 6. **A deadline is armed before its CPU can sleep.** A pass cannot end with a
    pending deadline and an unarmed timer.
-7. **A killed task is never migrated and never dispatched again.** The kill
-   takes effect wherever the task is; release completes within one pass of
-   the CPU holding the task, after at most one message hop per migration in
-   flight, and never waits on a timer.
+7. **A killed task is never migrated, and is dispatched exactly as far as its
+   own unwind.** The kill takes effect wherever the task is: a parked task is
+   made runnable so it can observe the cancel, a ready or running one keeps its
+   stack and dies at the first safe point that can end it — the return to Ring
+   3, or the exit its own unwind reaches. It is never dispatched into
+   *userland* again. Release completes when the unwind does, within one pass of
+   the CPU holding the task plus that unwind, after at most one message hop per
+   migration in flight, and never waits on a timer.
+
+   **Amended 2026-08-16 by `specs/completion-architecture-spec.md` §7.2, and
+   the previous form is quoted because it was load-bearing**: "never dispatched
+   again" was what let a killed task be reaped where it lay. This kernel does
+   not unwind, so the reap discarded every guard on that task's kernel stack —
+   survivable only while the one thing on it was a spinlock guard, and not
+   survivable at all once a sleep lock can be held across a park. The property
+   that replaces it is the one the reap was standing in for: nothing a killed
+   task holds outlives it, because the task itself gives it back.
 8. **A cross-CPU message is never dropped.** There is no message capacity to
    exhaust and no overflow.
 9. **Userland cannot stall the scheduler.** A wake storm costs the sender its
@@ -99,6 +112,6 @@ Wait queues are FIFO: a wake claims the longest-waiting waiter.
 | Wake races a kill | Delivered in order to one owner; the loser is a no-op |
 | Normal wake to a busy CPU | Run at the target's next pass, within one quantum, with no interrupt sent |
 | Real-time wake to a busy CPU | Directed interrupt; pass at interrupt exit |
-| Task killed while in transit between CPUs | The receiving CPU observes the kill and releases the task; no dispatch |
+| Task killed while in transit between CPUs | The receiving CPU adopts it and dispatches it so it can unwind; the retire chase's `Urgency::Preempt` is what makes that prompt, rather than the destination's next voluntary pass |
 | A second concurrent release of one task | Kernel bug; panic |
 | Panic inside a pass | The CPU stops with a single report; re-entry into the panic path is detected and does not recurse |

@@ -854,7 +854,10 @@ pub fn collect_thread_zombie(table: &mut ProcessTable, tid: Tid, parent_pid: Pid
 /// performed here, because both must happen with the table lock given up.
 #[must_use = "a poisoned thread's waiter must be woken"]
 pub enum PoisonWake {
-    /// A child thread died: its own process's `thread_join` is what waits.
+    /// A child thread died. **The pair names the thread that died**, which is
+    /// what a `thread_join` arms on now — it used to name the process's main
+    /// thread, because the wake was by name into a shared parking lot and
+    /// whoever was woken re-checked.
     Joiner(Pid, Tid),
     /// The main thread died, so the process is over. The exit is published on
     /// the object — outside the table lock, like every other publish — and
@@ -874,7 +877,7 @@ pub fn zombify_poisoned(table: &mut ProcessTable, pid: Pid, tid: Tid) -> Option<
         if !matches!(thread.state, ThreadLocation::Zombie(_)) {
             thread.state = ThreadLocation::Zombie(-1);
         }
-        return Some(PoisonWake::Joiner(pid, proc.main_tid));
+        return Some(PoisonWake::Joiner(pid, tid));
     }
     // The same claim every exit and kill takes, for the same reason: exactly
     // one path publishes one exit.
@@ -1341,8 +1344,15 @@ pub fn thread_exit(code: i32) -> ! {
         exit(code);
     }
 
-    let parent_main_tid = release_thread(process_pid, tid, code);
-    scheduler::wake_task(TaskId(process_pid, parent_main_tid));
+    let _parent_main_tid = release_thread(process_pid, tid, code);
+    // Whoever joined this thread armed on it. Posted before the exit pass,
+    // because after it this thread does not run again.
+    if let Some(handle) = crate::sched::driver::current_handle() {
+        crate::completion::post(
+            crate::completion::Subject::of(handle.watch()),
+            crate::completion::Outcome::Gone(crate::completion::Reason::Closed),
+        );
+    }
     scheduler::exit_current(code);
 }
 

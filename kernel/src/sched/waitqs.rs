@@ -30,37 +30,24 @@ use super::payload::{static_queue, KWaitQueue};
 const FUTEX_BUCKETS: usize = 64;
 static FUTEX: [KWaitQueue; FUTEX_BUCKETS] =
     [const { static_queue(WaitClass::Futex) }; FUTEX_BUCKETS];
+static FUTEX_WATCH: [Watch; FUTEX_BUCKETS] = [const { Watch::new() }; FUTEX_BUCKETS];
 
-/// Parking lots for waits that are woken by name rather than by condition:
-/// `waitpid`, `thread_join`, `nanosleep`. See the module note on why these are
-/// never woken as queues.
-const PARK_BUCKETS: usize = 32;
-static PARK: [KWaitQueue; PARK_BUCKETS] = [const { static_queue(WaitClass::Other) }; PARK_BUCKETS];
-
-pub static KEYBOARD: KWaitQueue = static_queue(WaitClass::Io);
-pub static MOUSE: KWaitQueue = static_queue(WaitClass::Io);
-pub static NETWORK: KWaitQueue = static_queue(WaitClass::Io);
-pub static AUDIO: KWaitQueue = static_queue(WaitClass::Io);
-
-/// The completion watch beside each device queue
-/// (`specs/completion-architecture-spec.md` §5.2). One object, two ways of
-/// waiting on it, until C3 deletes the queue half.
+/// The device subjects. **The `KWaitQueue`s that used to stand beside these
+/// are gone**: after §5.6 a reader arms here and parks on its own thread's
+/// queue, so a shared list per device had nothing left in it.
 pub static KEYBOARD_WATCH: Watch = Watch::new();
 pub static MOUSE_WATCH: Watch = Watch::new();
 pub static NETWORK_WATCH: Watch = Watch::new();
 pub static AUDIO_WATCH: Watch = Watch::new();
 
-/// Wake a device queue **and** post to its watch.
+/// Tell a device's waiters that it has something.
 ///
-/// One function rather than a pair at each site, and that is the whole point:
-/// `complete_pending_for_event` has ten hand-paired call sites and
-/// `io-uring-source-half-a-wake-pair` records losing that pairing twice in one
-/// cutover (§5.6). Here the pairing is a call, so half of it cannot be
-/// forgotten.
-pub fn wake_device(queue: &KWaitQueue, watch: &'static Watch) -> usize {
-    let woken = wake_all(queue);
+/// **One call where there was a pair.** `complete_pending_for_event` has ten
+/// hand-paired call sites and `io-uring-source-half-a-wake-pair` records
+/// losing that pairing twice in one cutover (§5.6); the queue half is gone
+/// now, and what is left is the post.
+pub fn wake_device(watch: &'static Watch) {
     completion::post(Subject::of(watch), Outcome::Ready);
-    woken
 }
 
 /// The bucket a futex word parks in, keyed by physical address so the queue is
@@ -69,10 +56,15 @@ pub fn futex(addr: DirectMap) -> &'static KWaitQueue {
     &FUTEX[(addr.phys() >> 2) as usize % FUTEX_BUCKETS]
 }
 
-/// A parking lot for the running thread. Any bucket would do; hashing spreads
-/// the `Registration::finish` scan.
-pub fn park_lot(seed: u64) -> &'static KWaitQueue {
-    &PARK[seed as usize % PARK_BUCKETS]
+/// The completion subject a futex word parks on, keyed the same way.
+///
+/// **`PARK_BUCKETS` and `park_lot` are gone from beside it**
+/// (`specs/completion-architecture-spec.md` §5.6): `waitpid`, `thread_join`
+/// and `nanosleep` stop hashing into a parking lot and arm on the object or on
+/// their own thread, and every thread now parks on a queue of its own
+/// (`TaskHandle::park_queue`).
+pub fn futex_watch(addr: DirectMap) -> &'static Watch {
+    &FUTEX_WATCH[(addr.phys() >> 2) as usize % FUTEX_BUCKETS]
 }
 
 pub fn new_queue(class: WaitClass) -> Arc<KWaitQueue> {
@@ -98,14 +90,4 @@ pub fn wake_all(queue: &KWaitQueue) -> usize {
     })
 }
 
-/// Wake every waiter and lend each an RT window until `until` (spec §8.5).
-pub fn wake_all_boosted(queue: &KWaitQueue, until: toyos_sched::hw::Nanos) -> usize {
-    preempt_off(|p| {
-        queue.wake_all(
-            WakeCause::boosted(WakeReason::Woken, until),
-            cpus(),
-            &HW,
-            p,
-        )
-    })
-}
+

@@ -13,12 +13,12 @@ use toyos_sched::hw::{Machine, Nanos};
 use toyos_sched::task::{WakeCause, WakeReason};
 
 use crate::arch::percpu;
-use crate::completion::{self, Outcome, Subject};
+use crate::completion::{self, Cancel, Outcome, Subject};
 use crate::hw::HW;
 use crate::pipe::PipeId;
 use crate::process::{self, Pid, Tid};
 use crate::sched::driver::{self, cpus, preempt_off, Dispose, NewTask};
-use crate::sched::payload::{KShare, KWaitQueue, KernelLock, ThreadSched};
+use crate::sched::payload::{KShare, KShared, KWaitQueue, KernelLock, ThreadSched};
 use crate::sched::reap_gate::ReapGate;
 use crate::sched::waitqs;
 use crate::sync::Lock;
@@ -242,9 +242,9 @@ pub fn enqueue_new(
 /// C3's `completion::wait` and C5's `SleepLock::lock` are what thread it.
 #[must_use = "a wait ticket must be blocked on or cancelled"]
 #[track_caller]
-pub fn prepare_wait(queue: &KWaitQueue) -> Ticket<'_> {
+pub fn prepare_wait(queue: &KWaitQueue, cancel: Cancel) -> Ticket<'_> {
     let _parkable = Parkable::of_current();
-    Ticket::register(queue)
+    Ticket::register(queue, cancel)
 }
 
 /// Phase 2: park the running thread on the queue it registered with.
@@ -303,27 +303,6 @@ pub fn block_on(ticket: Ticket<'_>, deadline: Deadline) {
 /// and one that lands while it is parked releases it where it lies (§2.7). No
 /// path here can hold a dying thread in a wait.
 #[track_caller]
-pub fn wait_until(queue: &KWaitQueue, deadline: Deadline, ready: impl Fn() -> bool) {
-    loop {
-        let ticket = prepare_wait(queue);
-        if ready() {
-            ticket.cancel();
-            return;
-        }
-        block_on(ticket, deadline);
-        if deadline.reached(crate::clock::now()) {
-            return;
-        }
-    }
-}
-
-/// A parking lot for waits woken by name rather than by condition — waitpid,
-/// thread_join, nanosleep. Never woken as a queue; see `sched::waitqs`.
-pub fn park_lot() -> &'static KWaitQueue {
-    waitqs::park_lot(percpu::current_tid().map_or(0, |t| t.raw() as u64))
-}
-
-#[track_caller]
 pub fn yield_now() {
     assert_baseline(BASELINE_TRAP);
     driver::pass(Dispose::Yield);
@@ -351,6 +330,36 @@ pub fn do_preempt() {
     driver::pass(Dispose::None);
 }
 
+/// A killed thread's last safe point: the return to Ring 3.
+///
+/// **This is what answers §7.2's "what reaps a killed task that never parks
+/// again".** The pick used to reap a killed task before it could be
+/// dispatched; now it dispatches it, so a thread killed while running in
+/// userland would run for ever if nothing stopped it here. What stops it is
+/// the boundary itself: the kernel stack is provably empty at this point —
+/// that is what makes it the boundary — so the exit takes nothing with it, and
+/// the timer interrupt bounds how long a Ring 3 loop can put it off.
+///
+/// One relaxed load per return to userland, which is the whole cost. The
+/// baseline is `BASELINE_IRQ_EXIT`: both entry stubs discharge their own level
+/// before calling the epilogue this runs in.
+#[track_caller]
+pub fn exit_if_killed() {
+    if !driver::current_kill_pending() {
+        return;
+    }
+    assert_baseline(BASELINE_IRQ_EXIT);
+    // **Nothing else, and that is the point.** This is the reap the pick used
+    // to do, moved onto the victim's own stack — not an exit the thread chose.
+    // The retirer owns every book: it marked the thread, it publishes the
+    // process's exit, it frees the mappings, and it is parked on
+    // `released()`, which `Hw::release` answers when this pass drops the
+    // payload. A `mark_thread_zombie` here would be a second teardown racing
+    // that one, with an exit code nobody asked for.
+    driver::pass(Dispose::Exit);
+    unreachable!("exit_if_killed: returned from the exit pass");
+}
+
 #[track_caller]
 pub fn exit_current(code: i32) -> ! {
     assert_baseline(BASELINE_TRAP);
@@ -365,33 +374,24 @@ pub fn exit_current(code: i32) -> ! {
     unreachable!("exit_current: returned from the exit pass");
 }
 
-/// Wake one specific thread — waitpid, thread_join, panic-recovery notify.
-/// The same claim CAS every other wake goes through, without a queue: the
-/// waiter's own `Registration` takes its node out of the parking lot when it
-/// runs again (spec §8.2).
+/// Claim one specific thread's rendezvous word and post its wake.
+///
+/// **The whole of what a completion post does after it has stored its
+/// record**, and the only wake path left that names a task rather than a
+/// queue: `wake_task(TaskId)` — the pid/tid lookup that went with the parking
+/// lot — is deleted with it, because a watcher already holds what it needs.
 ///
 /// No §6.4 baseline assert here or on any other wake path: a wake posts a
 /// message and never switches, and waking from *inside* a lock is the protocol
 /// rather than a violation of it (§8.1's claim-and-post happens under the waitq
 /// leaf lock, and `KernelLock` is documented as a legal mailbox producer for
 /// exactly that reason).
-pub fn wake_task(id: TaskId) {
-    let Some(sched) = process::thread_sched(id.0, id.1) else {
-        return;
+pub fn wake_sched(shared: &Arc<KShared>, boost: Option<Nanos>) {
+    let cause = match boost {
+        Some(until) => WakeCause::boosted(WakeReason::Woken, until),
+        None => WakeCause::new(WakeReason::Woken),
     };
-    wake_sched(&sched);
-}
-
-pub fn wake_sched(sched: &ThreadSched) {
-    preempt_off(|p| {
-        toyos_sched::waitq::wake_direct(
-            &sched.shared,
-            WakeCause::new(WakeReason::Woken),
-            cpus(),
-            &HW,
-            p,
-        )
-    });
+    preempt_off(|p| toyos_sched::waitq::wake_direct(shared, cause, cpus(), &HW, p));
 }
 
 /// Wake pipe readers, lending each an RT window if the writer holds one
@@ -403,16 +403,14 @@ pub fn wake_pipe_readers(pipe_id: PipeId) {
     };
     if driver::current_is_rt() {
         crate::pipe::set_rt_boost_pending(pipe_id);
-        waitqs::wake_all_boosted(&end.queue, boost_window());
+        completion::post_boosted(Subject::of(&end.watch), Outcome::Ready, boost_window());
     } else {
-        waitqs::wake_all(&end.queue);
+        completion::post(Subject::of(&end.watch), Outcome::Ready);
     }
-    completion::post(Subject::of(&end.watch), Outcome::Ready);
 }
 
 pub fn wake_pipe_writers(pipe_id: PipeId) {
     if let Some(end) = crate::pipe::writers_queue(pipe_id) {
-        waitqs::wake_all(&end.queue);
         completion::post(Subject::of(&end.watch), Outcome::Ready);
     }
 }
@@ -444,20 +442,34 @@ pub fn set_current_rt(enable: bool) {
 /// registration — so the read below sees it.
 #[track_caller]
 pub fn futex_wait(phys_addr: DirectMap, expected: u32, deadline: Deadline) -> bool {
-    let queue = waitqs::futex(phys_addr);
-    let ticket = prepare_wait(queue);
-    if unsafe { *phys_addr.as_ptr::<u32>() } != expected {
-        ticket.cancel();
-        return false;
-    }
-    block_on(ticket, deadline);
+    let parkable = Parkable::of_current();
+    // The value check is the predicate, and it runs *after* the arm — which is
+    // the same ordering the registration gave it, and the reason the
+    // wake-generation protocol this used to need is not coming back (§23's
+    // rejection 3).
+    let read = || unsafe { *phys_addr.as_ptr::<u32>() } != expected;
+    let _ = completion::wait_until(
+        &parkable,
+        completion::Subject::of(waitqs::futex_watch(phys_addr)),
+        completion::Token::new(phys_addr.phys()),
+        deadline,
+        read,
+    );
     true
 }
 
 /// Wake up to `count` futex waiters. Buckets are shared, so this can wake a
 /// waiter of a different word — harmless, every waiter re-checks its own.
 pub fn futex_wake(phys_addr: DirectMap, count: usize) -> u64 {
-    waitqs::wake_n(waitqs::futex(phys_addr), count) as u64
+    let woken = waitqs::wake_n(waitqs::futex(phys_addr), count) as u64;
+    // The bucket is shared, so this posts to every waiter on it rather than to
+    // `count` of them — harmless and already true of the queue wake above: a
+    // waiter of a different word re-reads its own and parks again.
+    completion::post(
+        completion::Subject::of(waitqs::futex_watch(phys_addr)),
+        completion::Outcome::Ready,
+    );
+    woken
 }
 
 /// Retire a thread and wait until its record is gone.
@@ -518,6 +530,16 @@ pub fn retire_task(sched: &ThreadSched) {
         "an IPI, one remote pass and a release; past this the wake was lost",
     );
     let give_up = Deadline::at(crate::clock::now() + GIVE_UP.duration());
+    let parkable = Parkable::of_current();
+    // Armed on the victim, which is what `publish_released` posts to. The wait
+    // is uncancellable (§7.4): a killed retirer cannot propagate a cancel with
+    // the retire half done, and what bounds it is the tripwire above.
+    let Some(armed) = completion::arm(
+        completion::Subject::of(sched.handle.watch()),
+        completion::Token::new(sched.shared.key().0),
+    ) else {
+        panic!("retire_task: no current task to park");
+    };
     while !sched.handle.released() {
         if give_up.reached(crate::clock::now()) {
             panic!(
@@ -526,12 +548,11 @@ pub fn retire_task(sched: &ThreadSched) {
                 sched.shared.state()
             );
         }
-        let ticket = prepare_wait(sched.handle.released_wait());
-        if sched.handle.released() {
-            ticket.cancel();
-            return;
-        }
-        block_on(ticket, Deadline::at(crate::clock::now() + RECHECK.duration()));
+        let _record = completion::wait_uncancellable(
+            &parkable,
+            &armed,
+            Deadline::at(crate::clock::now() + RECHECK.duration()),
+        );
     }
 }
 
@@ -612,7 +633,15 @@ pub(crate) fn reap_poisoned() {
     drop(reaped);
     for wake in wakes.into_iter().flatten() {
         match wake {
-            process::PoisonWake::Joiner(pid, tid) => wake_task(TaskId(pid, tid)),
+            // The thread that died is the subject a joiner armed on.
+            process::PoisonWake::Joiner(pid, tid) => {
+                if let Some(sched) = process::thread_sched(pid, tid) {
+                    completion::post(
+                        completion::Subject::of(sched.handle.watch()),
+                        completion::Outcome::Gone(completion::Reason::Closed),
+                    );
+                }
+            }
             // The code a killed process gets: nobody asked for this exit, and
             // the accounting the teardown would have taken was never taken.
             process::PoisonWake::Process(object) => {

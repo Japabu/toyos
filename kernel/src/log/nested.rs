@@ -79,8 +79,7 @@ mod armed {
         crate::log!("lognest done emitted={SHARD_RECORDS}");
 
         loop {
-            let ticket = crate::scheduler::prepare_wait(crate::scheduler::park_lot());
-            crate::scheduler::block_on(ticket, crate::time::Deadline::never());
+            crate::completion::park_forever();
         }
     }
 

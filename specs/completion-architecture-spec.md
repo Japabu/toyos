@@ -1362,6 +1362,18 @@ unchanged" forbids all three of the available fixes.
 3. a **`commit()` that distinguishes cancellable from uncancellable waits**, which
    is the honest shape and the one that changes `toyos-sched`'s public surface.
 
+**Chosen at C3+C4: the third.** `WaitQueue::prepare_wait_uncancellable` mints a
+ticket carrying `Cancel::Ignores`, and `commit()` consults the ticket rather
+than the task — so the same thread may hold both kinds one after the other,
+which is exactly what teardown needs and what the first two shapes could not
+express. The kill bit stays sticky and stays the termination argument; what
+changes is that a wait can say whether the kill is *its* answer.
+
+**One caller today, and it is the one §7.3 predicted**: `retire_task`, waiting
+for its victim's release. A killed retirer cannot propagate a cancel with the
+retire half done, and its bound is its own `Tripwire` rather than the kill.
+C5's `SleepLock` is where teardown's acquires join it.
+
 The existing test `waitq::tests::a_kill_that_lands_before_the_commit_refuses_the_park`
 (`waitq.rs:549-563`) is green and asserts today's behaviour, so whichever is
 chosen amends that test by name. **§5.5's claim that `Commit` is unchanged is
@@ -2921,7 +2933,8 @@ than it was. C15 is independent and last.
 
 **§24's fallback split, if the owner wants one:** C0–C6 as one pull request and
 C7–C15 as a second. The graph permits it at C6 and nothing before C7 changes a
-lock.
+lock. **Taken by owner ruling 2026-08-16**: this pipeline lands as two pull
+requests, split at the C6 boundary.
 
 Across the two branches: C3 must follow the endowment branch's chunk 2 (§15 row
 4) and C12 its chunk 2 as well (row 9). Since the whole of this branch follows
