@@ -107,7 +107,7 @@ time ─────────────────────────
 soundd:  wake ── signal clients ── wait ── consume ── mix ── submit ── sleep
                     │                ▲
                     │                │ fills happen inside soundd's wait,
-client:             └── wake ── fill slots ── block      under the lent band
+client:             └── wake ── fill slots ── block   on soundd's wake grant
 ```
 
 Once per period, in order:
@@ -120,8 +120,11 @@ Once per period, in order:
 4. soundd dithers, quantizes to the device format, and submits.
 
 The signal precedes the read, which gives clients the whole period to fill.
-A signalled client is boosted by pipe priority inheritance for the duration
-of its fill (scheduler spec), so it runs immediately even on one loaded CPU.
+A signalled client fills under soundd's own precedence for the duration of
+its fill (`specs/scheduler-core-spec.md` §3, amended to the wake grant by
+`specs/scheduling-reservations-spec.md` §1.8.1), so it runs immediately even
+on one loaded CPU. Under the grant that time is charged to soundd's budget:
+soundd's reservation prices its clients' fills as well as its own mix.
 
 **Deferral.** soundd may hold a free buffer back for a client that has not
 finished filling, but only while at least five periods of unplayed audio

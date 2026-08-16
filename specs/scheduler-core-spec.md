@@ -184,6 +184,18 @@ A real-time writer signalling a pipe lends its band to the blocked reader
 the reader's first dispatch, and ends at the earlier of the reader's next
 block or one quantum of running time under the lend.
 
+**Amended by `specs/scheduling-reservations-spec.md` §1.8.1, and applied at that
+document's R4; the shipped form above is what the tree still implements.** The
+paragraph's defect is that it lends *precedence* and charges nobody for it,
+which is the one mechanism the reservation model abolishes. Its replacement is
+the **wake grant**: the woken reader runs against the *waker's deadline* for at
+most the waker's remaining budget, and every nanosecond it spends there is
+charged to the waker's budget — so the grant ends at the first of that budget
+being spent, the waker's period boundary, the reader's next block, or the
+reader's death, and the pair spends one budget between them rather than two. The
+quantum of running time above has no counterpart, because a quantum was never
+the quantity being lent.
+
 ## 4. Fairness
 
 The normal band is fair per process: a process's share is charged for every
