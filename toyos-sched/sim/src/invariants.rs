@@ -18,47 +18,117 @@ use toyos_sched::fair::{MAX_VRUNTIME_LAG_NS, QUANTUM_NS};
 use toyos_sched::invariants::{residents, Container};
 use toyos_sched::task::{TaskKey, TaskState};
 
-use crate::vm::{FairEpoch, Vm, IPI_LATENCY_NS, RUN_CHUNK_NS};
+use crate::vm::{FairEpoch, Vm, IPI_LATENCY_NS, RUN_CHUNK_NS, UNWIND_NS};
 
 /// How long a CPU may keep running a normal task while an RT task is ready on
 /// it (invariant I4): the interrupt's own delivery bound, plus the
 /// preempt-off section it may have to wait out, plus the granularity of one
 /// execution step. Measured in the CPU's *own* busy time, so another CPU's
 /// progress cannot inflate it.
+///
+/// **Re-derived against `specs/completion-architecture-spec.md` §7.2, and the
+/// answer is that it does not move.** §7.2 introduced a fourth container — the
+/// dying list — holding tasks that are running, killed, and unwinding. A
+/// container the pick empties *before* `rq` would have added a term to this
+/// bound, and not a small one: nothing preempts a task the next pick hands the
+/// CPU straight back to, so the term would have been the whole unwind, once per
+/// killed task, and the bound would have become a statement about how long a
+/// kernel unwind takes rather than about interrupt delivery. That is the shape
+/// the chunk landed with and it is fixed at its source instead:
+/// `SchedPass::pick` serves `rq` — the only place the RT band lives — whenever
+/// `rq.has_rt()`, and `preempt_if_due` takes a killed running task off the CPU
+/// on exactly the same two conditions as any other. So a dying task is
+/// preempted for RT like the fair-band work it is, every term below is
+/// unchanged, and there is no fifth one.
+///
+/// It is stated here rather than assumed because the sim could not previously
+/// have told the difference: until [`crate::vm::UNWIND_NS`] a killed task's
+/// death cost zero simulated nanoseconds, so `waited` below was measured as 0
+/// however the pick was ordered.
 fn rt_latency_bound(max_kernel_section: u64) -> u64 {
     IPI_LATENCY_NS + max_kernel_section + 2 * RUN_CHUNK_NS
 }
 
-/// How long a retire may take to reach `Hw::release` (invariant I14).
+/// How long a retire may take to reach `Hw::release` (invariant I14), measured
+/// on [`crate::vm::Vm::fair_ns`] rather than on the wall clock — see
+/// [`crate::vm::Killed`] for why the RT band is excluded from it.
 ///
-/// One quantum is what a *running* target is allowed before its next safe
-/// point — spec §7.6's "bounded by the quantum" — and the next three terms
-/// are I4's: the kick's delivery bound, the preempt-off section the target may
-/// be inside, and the granularity of an execution step. Everything else the
-/// protocol does is a message the target consumes at the start of that pass.
+/// **Re-derived hop by hop against `specs/completion-architecture-spec.md`
+/// §7.2, because the shape of the wait changed and not merely its length.**
+/// What the retirer waits for is `Hw::release`, and between the claim and that
+/// call there are five things:
 ///
-/// **The last term is new, and it is what
-/// `specs/completion-architecture-spec.md` §7.2 costs.** A retire no longer
-/// converts anything on arrival: it makes the victim *runnable* and the victim
-/// dies by its own hand, so the bound now covers one more execution step — the
-/// dispatch that starts the unwind and the exit that ends it. In this world
-/// that unwind is one step, because a killed task's next op is its death
-/// (`Vm::exec_op`); in the kernel it is the return path of whatever syscall the
-/// thread was in, which is why `retire_task`'s wall clock is the other half of
-/// this statement and is re-derived beside it.
+/// 1. `IPI_LATENCY_NS` — `retire::post` kicks the CPU the word names with
+///    `Urgency::Preempt`, and this is how long that delivery may take.
+/// 2. `max_kernel_section` — the preempt-off section the target may be inside
+///    when the interrupt lands.
+/// 3. `QUANTUM_NS` — the pass drains the retire and the victim reaches the
+///    dying list, but the pick can only take it once the CPU is free to
+///    switch: a *running* fair task keeps the CPU until its quantum expires
+///    (spec §7.6's "bounded by the quantum"). RT service is not a term here
+///    because it is not on this clock at all — see [`crate::vm::Killed`].
+/// 4. `(1 + peers) × UNWIND_NS` — the unwind itself, plus the unwinds already
+///    queued ahead of it on that CPU.
+/// 5. `QUANTUM_NS` again — **the hop the first version of this bound never
+///    named, and the one the measurements landed on.** `die` publishes `Dead`
+///    and leaves the record as this CPU's *zombie*, because a pass cannot free
+///    the stack it is standing on; the payload is released by the **next** pass
+///    on that CPU (`SchedPass::begin`), and if that CPU dispatched another task
+///    its next pass is that task's quantum expiry. `retire_task`'s own doc
+///    states the same hop from the other side — "`Dead` is published by the
+///    reaping transition, one pass before the release" — and the wait is for
+///    the release, not for the word.
 ///
-/// **Measured rather than assumed**, on 60 seeds of `retire_under_balance`
-/// either side of that change: the worst observed retire went from
-/// 1,000,000 ns to 1,500,000 ns — exactly one `RUN_CHUNK_NS`, which is the
-/// term added here — against a bound of 12,200,000 ns before and 13,200,000 ns
-/// after. The whole gate at 2,000 seeds per scenario is clean at both.
+/// plus `2 × RUN_CHUNK_NS`, invariant I4's granularity term: the model observes
+/// each hop up to one execution chunk late.
+///
+/// **The unwind term is what §7.2 costs.** A retire no longer converts anything
+/// on arrival: it makes the victim *runnable* and the victim dies by its own
+/// hand, on its own stack, through the return path of whatever syscall it was
+/// in. The model charges that at [`crate::vm::UNWIND_NS`].
+///
+/// **The previous form of this paragraph was wrong twice and is replaced rather
+/// than extended**, because both errors are traps:
+///
+/// * It added `RUN_CHUNK_NS` for "one more execution step", and the step it
+///   named cost **zero** simulated nanoseconds — `Vm::exec_op` finished a
+///   killed task without advancing the clock at all. A term was added to the
+///   bound for a quantity the model did not spend.
+/// * It cited a 60-seed measurement (1,000,000 → 1,500,000 ns, "exactly one
+///   `RUN_CHUNK_NS`") that the committed sweep's own seed count does not
+///   support: at 500 seeds the worst observed retire was 2,000,000 ns on both
+///   sides of that change — a delta of zero — and the 500,000 ns delta quoted
+///   was in any case half of the term it was offered as evidence for. Re-run at
+///   500 seeds, the change did add latency in 155 of 500 seeds, by up to
+///   2 × `RUN_CHUNK_NS`; what it did not move was the worst-case statistic,
+///   which is the only one this bound is about.
+///
+/// **`peers` is the other half of the same cost, and the dying list's own field
+/// doc used to deny it.** That doc said a dying task's wait is "one pick and not
+/// the depth of the queue" — true of the *fair* band it jumps, and false of the
+/// dying list itself, which is one CPU's queue of unwinds and runs them one at
+/// a time. Two threads of one process retired together onto one CPU means the
+/// second waits out the first, so the term is `(1 + peers) × UNWIND_NS` where
+/// `peers` is the greatest number of *other* corpses that CPU has held since
+/// this retire was claimed. A workload-shaped term in a derived bound, exactly
+/// as invariant I5's `(runnable threads + 1)` factor is, and for the same
+/// reason: one CPU cannot run two unwinds at once, and pretending otherwise
+/// would price the machine rather than the protocol.
+///
+/// **Measured on the tree that charges the unwind**, 500 seeds of
+/// `retire_under_balance` (`toyos-sched-sim measure retire_under_balance 500`).
+/// The whole gate at 2,000 seeds per scenario is clean.
 ///
 /// Derived, not recorded, and deliberately *not* the kernel's 1 s wall clock:
-/// `retire_task`'s deadline is nearly a hundred times this, so a scenario that
-/// holds this bound says the wall clock had two orders of magnitude of
-/// headroom.
-fn retire_latency_bound(max_kernel_section: u64) -> u64 {
-    QUANTUM_NS + IPI_LATENCY_NS + max_kernel_section + 2 * RUN_CHUNK_NS + RUN_CHUNK_NS
+/// `retire_task`'s tripwire is more than an order of magnitude wider, and
+/// `kernel/src/scheduler.rs` carries the re-derivation of that number against
+/// this mechanism.
+fn retire_latency_bound(max_kernel_section: u64, peers: usize) -> u64 {
+    2 * QUANTUM_NS
+        + IPI_LATENCY_NS
+        + max_kernel_section
+        + 2 * RUN_CHUNK_NS
+        + (1 + peers as u64) * UNWIND_NS
 }
 
 pub fn check_all(vm: &mut Vm<'_>) {
@@ -262,35 +332,91 @@ fn check_retires(vm: &mut Vm<'_>) {
         if vm.killed.contains_key(&key) {
             problems.push(format!(
                 "I14: {key:?} was killed and then migrated to cpu{to} — a task in transit is \
-                 reaped only by the adopt that carries it, and that adopt kicks nobody",
+                 dispatched only by the adopt that carries it, and that adopt kicks nobody, so \
+                 the unwind waits for the destination's next voluntary pass",
             ));
         }
     }
 
-    let bound = retire_latency_bound(vm.max_kernel_section());
-    vm.retire_bound = bound;
-    let mut done = Vec::new();
-    for (&key, &at) in &vm.killed {
-        if vm.live.contains(&key) {
-            let elapsed = vm.clock.since(at);
-            vm.retire_latency = vm.retire_latency.max(elapsed);
-            if elapsed > bound {
-                problems.push(format!(
-                    "I14: {key:?} was retired {elapsed} ns ago and is still {:?} (bound {bound} ns)",
-                    vm.shared[&key].state(),
-                ));
-            }
-        } else {
-            done.push(key);
+    let keys: Vec<TaskKey> = vm.killed.keys().copied().collect();
+    // How many outstanding retires each CPU is holding right now. One CPU runs
+    // one unwind at a time, so this is the queue every one of them is behind.
+    let mut per_cpu: BTreeMap<usize, usize> = BTreeMap::new();
+    for &key in &keys {
+        if !vm.live.contains(&key) {
+            continue;
+        }
+        if let Some(cpu) = owner_of(vm.shared[&key].state()) {
+            *per_cpu.entry(cpu).or_default() += 1;
         }
     }
+
+    let mut done = Vec::new();
+    let mut widest = 0;
+    for key in keys {
+        // Both remembered while the word still names a CPU, so a victim that
+        // has reached `Dead` is still measured against the CPU that ran its
+        // unwind and against the queue it stood in.
+        if let Some(cpu) = owner_of(vm.shared[&key].state()) {
+            let peers = per_cpu.get(&cpu).copied().unwrap_or(1) - 1;
+            let entry = vm.killed.get_mut(&key).expect("came from the map");
+            entry.seen_on = Some(cpu);
+            entry.max_peers = entry.max_peers.max(peers);
+        }
+        let bound = retire_latency_bound(vm.max_kernel_section(), vm.killed[&key].max_peers);
+        widest = widest.max(bound);
+        let elapsed = retire_elapsed(vm, key);
+        vm.retire_latency = vm.retire_latency.max(elapsed);
+        if !vm.live.contains(&key) {
+            done.push(key);
+            continue;
+        }
+        if elapsed > bound {
+            problems.push(format!(
+                "I14: {key:?} was retired {elapsed} ns ago (of its cpu's non-RT time) and is \
+                 still {:?} (bound {bound} ns)",
+                vm.shared[&key].state(),
+            ));
+        }
+    }
+    vm.retire_bound = vm.retire_bound.max(widest);
     for key in done {
-        let at = vm.killed.remove(&key).expect("came from the map");
-        vm.retire_latency = vm.retire_latency.max(vm.clock.since(at));
+        vm.killed.remove(&key).expect("came from the map");
     }
 
     for problem in problems {
         vm.violate(problem);
+    }
+}
+
+/// Which CPU currently owes this retire, if any. `InTransit` owes it to
+/// nobody, which is I14's first half stated as an absence.
+fn owner_of(state: TaskState) -> Option<usize> {
+    match state {
+        TaskState::Running(cpu)
+        | TaskState::Ready(cpu)
+        | TaskState::Committing(cpu, _)
+        | TaskState::Blocked(cpu)
+        | TaskState::WakeQueued(cpu) => Some(cpu.0 as usize),
+        TaskState::InTransit(_) | TaskState::Dead => None,
+    }
+}
+
+/// How long this retire has been outstanding, on the clock [`crate::vm::Killed`]
+/// argues for: elapsed time on the CPU that owns the victim, with that CPU's RT
+/// service taken out.
+///
+/// A victim in no CPU at all — `InTransit`, before any CPU has been seen owning
+/// it — is charged against the wall clock, which is strictly the harsher
+/// reading and the right one for the state whose whole hazard is that no
+/// interrupt is scheduled to end it. A `Dead` one is charged against the CPU
+/// that last owned it, so the number the sweep reports and the number the bound
+/// is read on are the same clock.
+fn retire_elapsed(vm: &Vm<'_>, key: TaskKey) -> u64 {
+    let killed = &vm.killed[&key];
+    match owner_of(vm.shared[&key].state()).or(killed.seen_on) {
+        Some(cpu) => vm.fair_ns[cpu] - killed.fair_at[cpu],
+        None => vm.clock.since(killed.at),
     }
 }
 

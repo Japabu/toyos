@@ -774,10 +774,34 @@ impl<X: SchedPayload> TransitTask<X> {
 }
 
 impl<X: SchedPayload> ReadyTask<X> {
+    /// Entering the dying list: a borrowed RT window ends here, unconditionally
+    /// and exactly as a park ends one.
+    ///
+    /// **Priority inheritance is about the producer's work, and a killed
+    /// consumer will never do it** (spec §8.5): the lend was granted so this
+    /// task would run *the thing the producer is waiting for* promptly, and
+    /// what it will do instead is unwind and die. Spending the window on that
+    /// puts a corpse in the RT band ahead of real real-time work, off a lend
+    /// nobody can benefit from.
+    ///
+    /// It is also what keeps [`RtState::arm`]'s argument true.
+    /// `specs/completion-architecture-spec.md` §7.2 added a third way out of
+    /// `Running` — the dying list — and `arm`'s "both ways out of `Running` end
+    /// the lend" was written when there were two. Without this the re-arm at
+    /// the next dispatch hands the corpse a fresh window for its whole unwind,
+    /// and invariant I9 sees one lend buy more than one quantum. It does: the
+    /// sim found it at 12,500,000 ns against a 12,000,000 ns bound as soon as
+    /// `Vm::UNWIND_NS` made an unwind cost anything.
+    pub(crate) fn end_lend(&mut self) {
+        self.0 .0.rt.release();
+    }
+
     /// Pick. The kill bit is *not* asserted absent here: it is set by a remote
-    /// CPU at any instant, so an assert would be a race, not a check. The
-    /// pass reaps a killed task instead of dispatching it (`CpuSched::pick`),
-    /// which is the same guarantee without the false positive.
+    /// CPU at any instant, so an assert would be a race, not a check — and
+    /// since §7.2 there is nothing to assert, because a killed task **is**
+    /// dispatched: it runs its own unwind on its own stack and dies by its own
+    /// `die`. What decides *when* is `CpuSched::pick`, which takes the dying
+    /// list ahead of the fair band and behind the RT one.
     pub(crate) fn dispatch(self, cpu: CpuId, now: Nanos) -> RunningTask<X> {
         let mut task = self.0;
         task.charge_residency(now, Residency::Ready);
@@ -814,6 +838,14 @@ impl<X: SchedPayload> ReadyTask<X> {
 }
 
 impl<X: SchedPayload> RunningTask<X> {
+    /// A retire found this task running: it will unwind and die on this stack,
+    /// so its borrowed RT window ends now. [`ReadyTask::end_lend`] carries the
+    /// argument; this is the arm where the victim never passes through the
+    /// dying list at all, because nothing takes the CPU away from it.
+    pub(crate) fn end_lend(&mut self) {
+        self.0 .0.rt.release();
+    }
+
     /// Quantum expiry or an explicit yield.
     pub(crate) fn preempt(self, cpu: CpuId, now: Nanos) -> ReadyTask<X> {
         let mut task = self.0;

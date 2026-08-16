@@ -66,6 +66,17 @@ always preempts the normal band. Real-time tasks run FIFO within the band and
 round-robin on the quantum. Entering the real-time band requires the RT right
 (capability endowment spec).
 
+**A killed task unwinding its own stack (invariant 7) is normal-band work and
+takes no exception from this.** It is dispatched ahead of the *fair* queue —
+a retirer is blocked on the resources it is giving back, so it is not competing
+for a share of the CPU — and behind every ready real-time task, which is
+waiting on nothing it holds. It is preempted for real-time work exactly as any
+other normal-band task is, and its unwind is served first-in-first-out against
+the other unwinds on its CPU. **No qualification of the sentence above
+survives**: this is stated because the alternative was tried and is wrong, and
+because "the retirer is blocked" reads like an argument for outranking
+everything until one asks who else is.
+
 A real-time writer signalling a pipe lends its band to the blocked reader
 (priority inheritance). The lend begins at the signal, survives queue time to
 the reader's first dispatch, and ends at the earlier of the reader's next

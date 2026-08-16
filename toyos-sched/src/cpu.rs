@@ -12,7 +12,7 @@
 //! scheduler-related has anywhere to run after the switch resumes.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
@@ -178,7 +178,7 @@ pub struct CpuSched<X: SchedPayload> {
     rq: RunQueue<X>,
     parked: BTreeMap<TaskKey, ParkedEntry<X>>,
     /// Killed tasks that still have a kernel stack to unwind, dispatched
-    /// ahead of the fair queue.
+    /// ahead of the **fair** queue and behind the RT band.
     ///
     /// **This is what replaces every reap-in-place** (spec §7.2 of
     /// `specs/completion-architecture-spec.md`): this kernel does not unwind,
@@ -187,12 +187,27 @@ pub struct CpuSched<X: SchedPayload> {
     /// therefore *scheduled*, observes the cancel at its next park or at its
     /// return to userland, and dies by its own `die`.
     ///
-    /// Separate from the run queue rather than ordered inside it, for the
-    /// bound: a dying task is not competing for the CPU, it is releasing
-    /// resources a retirer is blocked on, so its wait is one pick and not the
-    /// depth of the queue. That is what keeps invariant I14's retire bound a
-    /// quantum-shaped number instead of a queue-shaped one.
-    dying: Vec<ReadyTask<X>>,
+    /// Separate from the fair queue rather than ordered inside it, for the
+    /// bound: a dying task is not competing for a share of the CPU, it is
+    /// releasing resources a retirer is blocked on, so its wait is one pick and
+    /// not the depth of the fair band. That is what keeps invariant I14's
+    /// retire bound a quantum-shaped number instead of a queue-shaped one.
+    ///
+    /// **The argument reaches the fair band and stops there.** "A retirer is
+    /// blocked on what this task holds" says nothing about real-time work,
+    /// which is not waiting on the corpse and whose own bound —
+    /// `scheduler-core-spec.md` §3's "a ready real-time task always preempts
+    /// the normal band", priced by invariant I4 — admits no exception. So
+    /// [`SchedPass::pick`] serves `rq` first *whenever the RT band is
+    /// occupied*, and a dying task is preempted for RT exactly as any other
+    /// fair-band task is.
+    ///
+    /// **A queue and not a stack.** Two concurrent process teardowns put two
+    /// corpses on one CPU; popping the end `keep_dying` pushes to would
+    /// re-select the newest on every pick and the older one would never run —
+    /// so the bound above would be false for k > 1, which is the only k that
+    /// makes it a bound at all.
+    dying: VecDeque<ReadyTask<X>>,
     /// The task that exited on this CPU, freed by the NEXT pass — a pass
     /// cannot free the stack it is running on.
     zombie: Option<DeadTask<X>>,
@@ -232,7 +247,7 @@ impl<X: SchedPayload> CpuSched<X> {
             running: None,
             rq: RunQueue::new(),
             parked: BTreeMap::new(),
-            dying: Vec::new(),
+            dying: VecDeque::new(),
             zombie: None,
             mailbox,
             steal_probe: MailboxNode::new(),
@@ -572,13 +587,17 @@ impl<X: SchedPayload> CpuSched<X> {
         env: Env<'_, H, P>,
     ) {
         let _vruntime = task.share().enter_runnable(env.frontier);
-        self.dying.push(task);
+        self.keep_dying(task);
     }
 
     /// The same, for a task that is *already* counted — one taken out of the
     /// run queue, which never left it.
-    fn keep_dying(&mut self, task: ReadyTask<X>) {
-        self.dying.push(task);
+    ///
+    /// Both routes end a borrowed RT window: [`ReadyTask::end_lend`] carries
+    /// the argument, and this is the one place that has to remember it.
+    fn keep_dying(&mut self, mut task: ReadyTask<X>) {
+        task.end_lend();
+        self.dying.push_back(task);
     }
 
     fn handle_wake<H: Hw<Payload = X>, P: PreemptGuard>(
@@ -656,7 +675,14 @@ impl<X: SchedPayload> CpuSched<X> {
             self.keep_dying(ready);
             return;
         }
-        if self.running.as_ref().is_some_and(|r| r.key() == key) {
+        if let Some(current) = self.running.as_mut().filter(|r| r.key() == key) {
+            // The borrowed window ends here, for the reason
+            // `ReadyTask::end_lend` gives — and this is the arm where a victim
+            // never reaches the dying list at all: nothing takes the CPU away
+            // from a running task whose quantum has not expired, so it unwinds
+            // in place, and a lend left armed would spend the producer's
+            // priority on a corpse.
+            current.end_lend();
             // A running task cannot be yanked out from under its own kernel
             // stack; it dies at its next safe point, bounded by the quantum
             // (spec §7.6). Consuming the message here is only sound because
@@ -958,10 +984,16 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
             self.preempt_if_due();
             self.pick();
             self.answer_steal_requests();
+            // **The dying list counts.** The published load is what spawn
+            // placement and the steal probe read as "how much work is on this
+            // CPU", and a corpse mid-unwind is work: it is dispatched ahead of
+            // the fair band, so a task placed here queues behind it. Counting
+            // `rq` alone made a CPU holding two teardowns look as empty as an
+            // idle one — the same blindness `dying_len` closes in the dump.
             self.env
                 .cpus
                 .get(self.cpu.id)
-                .publish_load(self.cpu.rq.len() as u32);
+                .publish_load((self.cpu.rq.len() + self.cpu.dying.len()) as u32);
             if self.cpu.running.is_some() {
                 return self.switch_to_current();
             }
@@ -994,8 +1026,17 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
             // thread keeps running and unwinds, and its next quantum expiry
             // must not put it where something else can take it — the pick
             // reaped it here in the struck design, mid-unwind, with every
-            // guard still on the stack. It goes back to the dying list, which
-            // the very next pick empties first.
+            // guard still on the stack. It goes to the back of the dying list,
+            // which the next pick empties ahead of the fair band.
+            //
+            // **Ahead of the fair band and not of the RT one**, which is the
+            // half that makes this arm honour rather than undo the decision
+            // that reached it: when what fired this preemption is `rq.has_rt()`
+            // the pick serves that RT task, and this corpse waits with the fair
+            // band it belongs to. Deleting this arm is caught by
+            // `a_killed_task_that_expires_its_quantum_goes_back_to_the_dying_list`
+            // — the fair queue is where the task would land instead, and that
+            // test asserts it never does.
             self.cpu.keep_dying(task);
             return;
         }
@@ -1006,7 +1047,8 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
         self.cpu.rq.insert(vruntime, task);
     }
 
-    /// **The dying list first, and no kill check at all on the fair path.**
+    /// **RT band, then the dying list, then the fair band — and no kill check
+    /// at all on the fair path.**
     ///
     /// §7.2(2): the pick used to reap a killed ready task, which is what made
     /// the earlier drafts' `handle_retire` rewrite a no-op — a task pushed
@@ -1017,19 +1059,34 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
     /// so `ReadyTask::dispatch`'s note about the kill bit not being asserted
     /// away is the whole of what remains true.
     ///
-    /// A dying task jumps the queue and the vruntime frontier does not advance
-    /// for it: it is not spending a share of the CPU, it is finishing.
+    /// A dying task jumps the *fair* queue and the vruntime frontier does not
+    /// advance for it: it is not spending a share of the CPU, it is finishing.
+    ///
+    /// **It does not jump the RT band, and taking `dying` unconditionally is
+    /// what made it.** `rq.pop_next()` is the only place the RT band is served,
+    /// so a pick that emptied `dying` first left a killed normal task holding
+    /// the CPU against a ready real-time task for the whole of its unwind —
+    /// quantum after quantum, because `preempt_if_due` returns it to `dying`
+    /// and this pick handed it straight back with a fresh quantum. That
+    /// contradicts `scheduler-core-spec.md` §3 outright, and the retirer's
+    /// claim on the corpse's resources is no argument for it: the RT task is
+    /// not the retirer and is not waiting on anything the corpse holds. So the
+    /// question asked here is `rq.has_rt()`, and the dying list is served only
+    /// when the answer is no. `a_killed_task_does_not_starve_a_ready_rt_task`
+    /// and its two siblings are the gates.
     fn pick(&mut self) {
         if self.cpu.running.is_some() {
             return;
         }
-        if let Some(task) = self.cpu.dying.pop() {
-            let key = task.key();
-            self.cpu.running = Some(task.dispatch(self.cpu.id, self.now));
-            self.cpu.quantum_end = self.now.after(QUANTUM_NS);
-            self.cpu
-                .trace(self.env, self.now, TraceKind::Schedule { task: key });
-            return;
+        if !self.cpu.rq.has_rt() {
+            if let Some(task) = self.cpu.dying.pop_front() {
+                let key = task.key();
+                self.cpu.running = Some(task.dispatch(self.cpu.id, self.now));
+                self.cpu.quantum_end = self.now.after(QUANTUM_NS);
+                self.cpu
+                    .trace(self.env, self.now, TraceKind::Schedule { task: key });
+                return;
+            }
         }
         // A lapsed borrowed window must not demote the task out of the RT band
         // here: queue time spends none of it, so `ReadyTask::dispatch` re-arms
@@ -1444,6 +1501,27 @@ mod tests {
 
         /// A task in transit to `dst`, which is where every task starts.
         fn spawn(&mut self, dst: CpuId) -> (TaskKey, Arc<TaskShared<Msg<TestPayload>>>) {
+            self.spawn_with(dst, RtState::default())
+        }
+
+        /// The same, permanently in the RT band — the band the dying list must
+        /// not outrank.
+        fn spawn_rt(&mut self, dst: CpuId) -> (TaskKey, Arc<TaskShared<Msg<TestPayload>>>) {
+            self.spawn_with(
+                dst,
+                RtState {
+                    permanent: true,
+                    inherited: None,
+                    lends: 0,
+                },
+            )
+        }
+
+        fn spawn_with(
+            &mut self,
+            dst: CpuId,
+            rt: RtState,
+        ) -> (TaskKey, Arc<TaskShared<Msg<TestPayload>>>) {
             let key = TaskKey(self.next_key);
             self.next_key += 1;
             let share = Arc::new(FairShare::new(TestLock(Mutex::new(
@@ -1454,7 +1532,7 @@ mod tests {
                 share,
                 ctx: (),
                 ext: TestPayload,
-                rt: RtState::default(),
+                rt,
             }
             .build(dst, NOW);
             let shared = task.shared().clone();
@@ -1466,8 +1544,14 @@ mod tests {
         /// Dispatch whatever the pick chooses, so a test can put a task in
         /// `running` without reaching into the CPU.
         fn run_a_pass(&mut self, cpu: CpuId) {
+            self.run_a_pass_at(cpu, NOW);
+        }
+
+        /// The same at a chosen instant, for the tests that have to let a
+        /// quantum expire.
+        fn run_a_pass_at(&mut self, cpu: CpuId, now: Nanos) {
             let (cpus, env) = self.split();
-            let pass = SchedPass::begin(&mut cpus[cpu.0 as usize], env, NOW);
+            let pass = SchedPass::begin(&mut cpus[cpu.0 as usize], env, now);
             let _ = pass.dispose_none().finish();
         }
 
@@ -1756,6 +1840,144 @@ mod tests {
             w.cpus[1].running().map(|t| t.key()),
             Some(key),
             "adopted, placed in the dying list, and picked in the same pass",
+        );
+        w.abandon();
+    }
+
+    /// The control the three RT tests below are read against: an *ordinary*
+    /// fair task loses the CPU to a ready RT task at the next pass.
+    #[test]
+    fn a_live_fair_task_loses_the_cpu_to_a_ready_rt_task() {
+        let mut w = World::new(1);
+        let (fair, _fair_shared) = w.spawn(C0);
+        w.run_a_pass(C0);
+        assert_eq!(w.cpus[0].running().map(|t| t.key()), Some(fair));
+
+        let (rt, _rt_shared) = w.spawn_rt(C0);
+        w.run_a_pass_at(C0, Nanos(NOW.0 + 1));
+
+        assert_eq!(w.cpus[0].running().map(|t| t.key()), Some(rt));
+        w.abandon();
+    }
+
+    /// **A dying task is fair-band work, not a band of its own.** It jumps the
+    /// fair queue because a retirer is blocked on what it holds; it does not
+    /// jump the RT band, because nothing about an unwind makes it more urgent
+    /// than real-time work — and spec §3's "a ready real-time task always
+    /// preempts the normal band" admits no exception for it.
+    ///
+    /// The pass that fires because the RT task is ready must not hand the CPU
+    /// straight back to the corpse: `preempt_if_due` takes it off, and the pick
+    /// then serves `rq` — which is where the RT band lives — before `dying`.
+    #[test]
+    fn a_killed_task_does_not_starve_a_ready_rt_task() {
+        let mut w = World::new(1);
+        let (killed, killed_shared) = w.spawn(C0);
+        w.run_a_pass(C0);
+        assert_eq!(w.cpus[0].running().map(|t| t.key()), Some(killed));
+        killed_shared.mark_kill();
+
+        let (rt, _rt_shared) = w.spawn_rt(C0);
+        assert!(w.cpus[0].rq.has_rt(), "the RT task is ready on cpu0");
+
+        w.run_a_pass_at(C0, Nanos(NOW.0 + 1));
+
+        assert_eq!(
+            w.cpus[0].running().map(|t| t.key()),
+            Some(rt),
+            "the RT task got the CPU on the first pass after it became ready",
+        );
+        assert_eq!(w.cpus[0].dying_len(), 1, "the corpse is queued, not running");
+        assert!(w.released().is_empty(), "and nothing was discarded");
+        w.abandon();
+    }
+
+    /// The same inversion driven by quantum expiry rather than by the RT
+    /// preemption arm — the other of the two reasons `preempt_if_due` fires.
+    #[test]
+    fn a_killed_task_that_expires_its_quantum_yields_to_a_ready_rt_task() {
+        let mut w = World::new(1);
+        let (_killed, killed_shared) = w.spawn(C0);
+        w.run_a_pass(C0);
+        killed_shared.mark_kill();
+        let (rt, _rt_shared) = w.spawn_rt(C0);
+
+        w.run_a_pass_at(C0, Nanos(NOW.0 + QUANTUM_NS + 1));
+
+        assert_eq!(
+            w.cpus[0].running().map(|t| t.key()),
+            Some(rt),
+            "the expiring quantum is not a fresh one for the corpse",
+        );
+        assert_eq!(w.cpus[0].dying_len(), 1);
+        w.abandon();
+    }
+
+    /// And the unwind is deferred, never dropped: once the RT band empties the
+    /// dying task is picked again, still ahead of the fair queue.
+    #[test]
+    fn a_dying_task_resumes_when_the_rt_band_empties() {
+        let mut w = World::new(1);
+        let (killed, killed_shared) = w.spawn(C0);
+        let (_fair, _fair_shared) = w.spawn(C0);
+        w.run_a_pass(C0);
+        assert_eq!(w.cpus[0].running().map(|t| t.key()), Some(killed));
+        killed_shared.mark_kill();
+        let (rt, _rt_shared) = w.spawn_rt(C0);
+        w.run_a_pass_at(C0, Nanos(NOW.0 + 1));
+        assert_eq!(w.cpus[0].running().map(|t| t.key()), Some(rt));
+
+        // The RT task ends. Its own pass's pick is what takes the dying task.
+        {
+            let (cpus, env) = w.split();
+            let pass = SchedPass::begin(&mut cpus[0], env, Nanos(NOW.0 + 2));
+            let _ = pass.dispose_exit().finish();
+        }
+
+        assert_eq!(
+            w.cpus[0].running().map(|t| t.key()),
+            Some(killed),
+            "the unwind resumes, and still ahead of the fair queue",
+        );
+        assert_eq!(w.cpus[0].rq.fair_len(), 1, "the fair task is still waiting");
+        w.abandon();
+    }
+
+    /// **The dying list is a queue and not a stack.** Two concurrent process
+    /// teardowns put two corpses on one CPU; a LIFO would re-select the newest
+    /// on every pick and the older one would never run, which is exactly the
+    /// bound the field's own doc denies.
+    #[test]
+    fn the_dying_list_is_served_oldest_first() {
+        let mut w = World::new(1);
+        let (first, first_shared) = w.spawn(C0);
+        let (second, second_shared) = w.spawn(C0);
+        first_shared.mark_kill();
+        second_shared.mark_kill();
+        {
+            let (cpus, _env) = w.split();
+            let task = cpus[0].rq.remove(first).expect("ready");
+            cpus[0].keep_dying(task);
+            let task = cpus[0].rq.remove(second).expect("ready");
+            cpus[0].keep_dying(task);
+        }
+
+        w.run_a_pass(C0);
+        assert_eq!(
+            w.cpus[0].running().map(|t| t.key()),
+            Some(first),
+            "the one that has been waiting longest unwinds first",
+        );
+
+        {
+            let (cpus, env) = w.split();
+            let pass = SchedPass::begin(&mut cpus[0], env, Nanos(NOW.0 + 1));
+            let _ = pass.dispose_exit().finish();
+        }
+        assert_eq!(
+            w.cpus[0].running().map(|t| t.key()),
+            Some(second),
+            "and the other one follows it, rather than waiting on it forever",
         );
         w.abandon();
     }
