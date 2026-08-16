@@ -235,11 +235,25 @@ pub fn post_boosted(subject: Subject<'_>, outcome: Outcome, until: Nanos) {
 /// wakes means; `usize::MAX` is the broadcast every `pthread_cond_broadcast`
 /// asks for.
 ///
-/// **A waiter whose rendezvous word was already claimed still counts**, and
-/// deliberately: the record reached its inbox before the claim was attempted
-/// (invariant W's order), so whoever won that claim delivers this wake along
-/// with its own. Not counting it would report fewer threads told than were
-/// told, which is the opposite of the error the ABI cares about.
+/// **A waiter whose rendezvous word another claim already took is skipped, and
+/// it does not spend `limit`.** It is not a thread this call woke: it is a
+/// thread already on its way back to its own code, because a waker got there
+/// first or its own deadline did. Counting it is how one thread gets reported
+/// twice — `futex_wake(addr, 1)` twice in a row, against one waiter that has
+/// not been scheduled in between, answering 1 and 1. That is what the old
+/// queue's `wake_one` avoided by *popping* the waiter, and the claim is the
+/// same discriminator without a queue: the word stays `WakeQueued` until the
+/// task runs, so a second claim loses.
+///
+/// The record is stored either way, before the claim is attempted, because
+/// invariant W's order is not conditional. A record delivered to a waiter this
+/// call did not wake costs that waiter one spurious return, which is legal at
+/// every park site (§5.5), and skipping the *store* would be the lost wake the
+/// order exists to prevent.
+///
+/// `futex_wake_counts` is the gate, and it is what found this: the tree that
+/// counted told-but-not-woken waiters answered 1 to a wake of a word whose
+/// waiters were all already gone.
 pub fn post_n(subject: Subject<'_>, outcome: Outcome, token: Token, limit: usize) -> usize {
     let watch = subject.0;
     if limit == 0 || watch.armed.load(Ordering::Relaxed) == 0 {
@@ -247,18 +261,19 @@ pub fn post_n(subject: Subject<'_>, outcome: Outcome, token: Token, limit: usize
     }
     let at = crate::clock::now();
     let waiters = watch.waiters.lock();
-    let mut told = 0;
+    let mut woken = 0;
     for waiter in waiters.iter() {
-        if told == limit {
+        if woken == limit {
             break;
         }
         if waiter.token != token {
             continue;
         }
-        post_to(waiter, outcome, at, None);
-        told += 1;
+        if post_to(waiter, outcome, at, None) {
+            woken += 1;
+        }
     }
-    told
+    woken
 }
 
 fn post_with(subject: Subject<'_>, outcome: Outcome, boost: Option<Nanos>) {
@@ -271,7 +286,7 @@ fn post_with(subject: Subject<'_>, outcome: Outcome, boost: Option<Nanos>) {
     let at = crate::clock::now();
     let waiters = watch.waiters.lock();
     for waiter in waiters.iter() {
-        post_to(waiter, outcome, at, boost);
+        let _ = post_to(waiter, outcome, at, boost);
     }
 }
 
@@ -280,13 +295,21 @@ fn post_with(subject: Subject<'_>, outcome: Outcome, boost: Option<Nanos>) {
 /// `Committing` is refused its park by the claim; one that has not yet
 /// re-checked finds the record; one already `Blocked` gets the message. There
 /// is no fourth case, which is what `kernel-loom/tests/inbox.rs` is about.
-fn post_to(waiter: &Watcher, outcome: Outcome, at: crate::time::Instant, boost: Option<Nanos>) {
+///
+/// `true` means this call won the waiter's claim — see [`post_n`], the one
+/// caller that has to tell that apart from having merely left a record.
+fn post_to(
+    waiter: &Watcher,
+    outcome: Outcome,
+    at: crate::time::Instant,
+    boost: Option<Nanos>,
+) -> bool {
     waiter.task.inbox().post(Record {
         token: waiter.token,
         outcome,
         at,
     });
-    crate::scheduler::wake_sched(&waiter.shared, boost);
+    crate::scheduler::wake_sched(&waiter.shared, boost)
 }
 
 /// The right to park, and the answer a killed thread gets instead.

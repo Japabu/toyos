@@ -386,12 +386,18 @@ pub fn exit_current(code: i32) -> ! {
 /// rather than a violation of it (§8.1's claim-and-post happens under the waitq
 /// leaf lock, and `KernelLock` is documented as a legal mailbox producer for
 /// exactly that reason).
-pub fn wake_sched(shared: &Arc<KShared>, boost: Option<Nanos>) {
+///
+/// `true` means **this** call won the claim, which is the only sense in which
+/// it woke anybody: a task whose word another waker or its own deadline has
+/// already taken is already on its way back to its own code, and a second
+/// caller reporting it as woken counts one thread twice.
+/// [`completion::post_n`] is the one caller that reads the answer.
+pub fn wake_sched(shared: &Arc<KShared>, boost: Option<Nanos>) -> bool {
     let cause = match boost {
         Some(until) => WakeCause::boosted(WakeReason::Woken, until),
         None => WakeCause::new(WakeReason::Woken),
     };
-    preempt_off(|p| toyos_sched::waitq::wake_direct(shared, cause, cpus(), &HW, p));
+    preempt_off(|p| toyos_sched::waitq::wake_direct(shared, cause, cpus(), &HW, p))
 }
 
 /// Wake pipe readers, lending each an RT window if the writer holds one

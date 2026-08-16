@@ -117,11 +117,21 @@ fn live_process() {
 
 /// The blocked-time breakdown is a breakdown.
 ///
-/// The `held` child above blocks reading a pipe its parent holds the write end
-/// of, so its wait is `WaitClass::Pipe` — and `blocked_pipe_ns` is the field
-/// that has to move. It is asserted against `blocked_other_ns` rather than
-/// against zero: "other" is where a park with no class named goes, so a tree
-/// that stopped classifying puts *this* wait there and the two fields swap.
+/// The `held` child blocks reading a pipe its parent holds the write end of, so
+/// its wait is `WaitClass::Pipe` — and `blocked_pipe_ns` is the field that has
+/// to move. It is asserted against `blocked_other_ns` rather than against zero:
+/// "other" is where a park with no class named goes, so a tree that stopped
+/// classifying puts *this* wait there and the two fields swap.
+///
+/// **The park has to be over before the numbers exist**, and the first draft of
+/// this arm read them while the child was still in it. Blocked time is charged
+/// at the transition *out* of `Blocked` (`Task::charge_residency`, from
+/// `BlockedTask::wake`), so a thread that is parked right now has nothing
+/// recorded for the park it is in — unlike `cpu_ns`, where `TaskHandle::cpu_ns`
+/// adds the live slice. So the parent ends the wait, lets the child exit, and
+/// asks the object afterwards, which is what `exited_child` above already
+/// relies on. The gap is filed as
+/// `specs/issues/diagnostics/blocked-time-is-invisible-while-the-park-lasts.md`.
 fn blocked_time_names_what_it_waited_on() {
     let mut child = Command::new(SELF_PATH)
         .arg("held")
@@ -138,10 +148,20 @@ fn blocked_time_names_what_it_waited_on() {
     // and short enough that it is a margin rather than a bound: what is
     // asserted is which counter moved, never how far.
     std::thread::sleep(std::time::Duration::from_millis(200));
-    let s = stats_of(&child).expect("a live process answers");
+    // Ending the park is what charges it. The child's `read` returns and it
+    // exits; its object keeps answering, which is this file's first arm.
+    child
+        .stdin
+        .take()
+        .expect("the held child's stdin")
+        .write_all(b"go\n")
+        .expect("release the held child");
+    child.wait().expect("wait the held child");
+
+    let s = stats_of(&child).expect("an exited child still answers");
     assert!(
         s.blocked_pipe_ns > 0,
-        "a child parked reading a pipe charged {} ns to pipe and {} ns to other — the \
+        "a child that parked reading a pipe charged {} ns to pipe and {} ns to other — the \
          blocked-time breakdown says nothing if every park is unclassified",
         s.blocked_pipe_ns,
         s.blocked_other_ns,
@@ -151,8 +171,6 @@ fn blocked_time_names_what_it_waited_on() {
         s.blocked_pipe_ns, s.blocked_io_ns, s.blocked_futex_ns, s.blocked_ipc_ns,
         s.blocked_other_ns,
     );
-    child.kill().expect("kill the held child");
-    child.wait().expect("wait the held child");
 }
 
 /// Reading does not spend it. This asserted the opposite before the handle:
