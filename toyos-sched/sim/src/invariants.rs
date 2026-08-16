@@ -49,6 +49,16 @@ use crate::vm::{FairEpoch, Vm, IPI_LATENCY_NS, RUN_CHUNK_NS, UNWIND_NS};
 /// `DYING_AGE_NS` away. `DYING_AGE_NS`'s own doc carries the inequality that
 /// makes that a fact — it has to exceed this bound, and 10 ms against 3.7 ms
 /// does.
+///
+/// **Measured, and conservative rather than load-bearing.** On
+/// `scenarios::rt_saturated_retire` seed 0 the aged chunk shows up as exactly
+/// one I4 wait of 1,000,000 ns — `DYING_CHUNK_NS` to the nanosecond, read off
+/// by forcing this bound to zero and collecting the reported `waited`. The
+/// suite would not red without the term, because `2 × RUN_CHUNK_NS` of
+/// observation granularity is already wider than the chunk. It is carried
+/// anyway: what the kernel gives up is a real millisecond of a real RT task's
+/// latency, and a bound that omits a term because the model's own resolution
+/// hides it is a bound that will be wrong the moment either number moves.
 fn rt_latency_bound(max_kernel_section: u64) -> u64 {
     IPI_LATENCY_NS + max_kernel_section + 2 * RUN_CHUNK_NS + DYING_CHUNK_NS
 }
