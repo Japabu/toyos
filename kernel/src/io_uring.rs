@@ -231,20 +231,6 @@ fn take_poll(instance: &mut IoUringInstance, index: usize) -> PendingPoll {
 /// (bounded by number of open fds), but guards against future bugs.
 const MAX_PENDING_POLLS: usize = 1024;
 
-/// This ring's waiters, as the one thing a wake path needs.
-///
-/// **It was a pair, and the second half was dead.** Until this alias shrank it
-/// held an `Arc<KWaitQueue>` beside the `Arc<Watch>` — minted, cloned at five
-/// wake sites and walked on every CQE — with nothing registered on it since
-/// `enter` started parking through `completion::wait_until` on the thread's own
-/// queue. Its doc said it existed "so a site cannot take one and forget the
-/// other", which is a real hazard
-/// (`specs/issues/kernel/io-uring-source-half-a-wake-pair.md` records losing it
-/// twice) and is not this type's to prevent: §5.6's answer is that there is no
-/// pair, and a type minted to enforce one is the pair surviving under a new
-/// name. With one half left the alias is just what a wake needs.
-type Wakeable = Arc<Watch>;
-
 struct IoUringInstance {
     id: RingId,
     shm_phys: DirectMap,
@@ -259,6 +245,18 @@ struct IoUringInstance {
     pending_polls: Vec<PendingPoll>,
     /// Threads armed on this ring's completion queue (spec §8.6), cloned out
     /// of the table because `enter` holds it across its park.
+    ///
+    /// **It was half of a `Wakeable` pair, and the other half was dead.** An
+    /// `Arc<KWaitQueue>` stood beside it — minted at setup, cloned at five wake
+    /// sites and walked on every CQE — with nothing registered on it since
+    /// `enter` started parking through `completion::wait_until` on the calling
+    /// thread's own queue. The pair's own doc said it existed "so a site cannot
+    /// take one and forget the other", which is a real hazard
+    /// (`specs/issues/kernel/io-uring-source-half-a-wake-pair.md` records losing
+    /// it twice) and was not that type's to prevent: §5.6's answer is that there
+    /// is **no pair**, and a type minted to enforce one is the pair surviving
+    /// under a new name. Both the alias and the `wakeable()` accessor are gone
+    /// with it, because a synonym for one field earns nothing.
     watch: Arc<Watch>,
     /// The authoritative CQ tail. The copy in the shared header is a
     /// publication for userspace, which only ever reads it — the kernel must
@@ -269,12 +267,6 @@ struct IoUringInstance {
 }
 
 impl IoUringInstance {
-    /// What a wake path takes out of the table and posts to after the table
-    /// lock is gone.
-    fn wakeable(&self) -> Wakeable {
-        self.watch.clone()
-    }
-
     fn sq_header(&self) -> &IoUringRingHeader {
         unsafe { &*(self.shm_phys.as_mut_ptr::<u8>().add(SQ_RING_OFF as usize) as *const IoUringRingHeader) }
     }
@@ -595,7 +587,7 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
     // Not ready — insert pending poll.
     // The old poll on this handle goes first, so its unregistration cannot
     // undo the registration this one is about to make.
-    let mut woken: Option<Wakeable> = None;
+    let mut woken: Option<Arc<Watch>> = None;
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
     if let Some(instance) = map.get_mut(ring_id) {
@@ -619,7 +611,7 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
             instance.pending_polls.push(new_pp);
         } else {
             instance.post_cqe(user_data, -(SyscallError::ResourceExhausted as i32), 0);
-            let watch = instance.wakeable();
+            let watch = instance.watch.clone();
             drop(guard);
             completion::post(completion::Subject::of(&watch), completion::Outcome::Ready);
             return;
@@ -638,7 +630,7 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
                 if pp.flags.readable() { result_flags |= PollFlags::IN.raw(); }
                 if pp.flags.writable() { result_flags |= PollFlags::OUT.raw(); }
                 instance.post_cqe(pp.user_data, result_flags as i32, 0);
-                woken = Some(instance.wakeable());
+                woken = Some(instance.watch.clone());
             }
         }
     }
@@ -697,7 +689,7 @@ fn post_cqe_locked(ring_id: RingId, user_data: u64, result: i32, flags: u32) {
     let map = guard.as_ref().expect("io_uring not initialized");
     let woken = map.get(ring_id).map(|instance| {
         instance.post_cqe(user_data, result, flags);
-        instance.wakeable()
+        instance.watch.clone()
     });
     drop(guard);
     if let Some(watch) = woken {
@@ -718,7 +710,7 @@ fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPol
 
     // Collect the queues, wake after the table lock is gone: a wake posts
     // mailbox messages and may send a kick IPI, and neither needs IO_URINGS.
-    let mut to_wake: Vec<Wakeable> = Vec::new();
+    let mut to_wake: Vec<Arc<Watch>> = Vec::new();
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
 
@@ -738,7 +730,7 @@ fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPol
             }
         }
 
-        to_wake.push(instance.wakeable());
+        to_wake.push(instance.watch.clone());
     }
     drop(guard);
     for watch in to_wake {
@@ -778,7 +770,7 @@ pub fn remove_fd(sources: &[Option<Source>]) {
     let watches_a_closing_source =
         |pp: &PendingPoll| sources.iter().flatten().any(|s| pp.watches(s));
 
-    let mut to_wake: Vec<Wakeable> = Vec::new();
+    let mut to_wake: Vec<Arc<Watch>> = Vec::new();
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
     for ring_id in affected {
@@ -796,7 +788,7 @@ pub fn remove_fd(sources: &[Option<Source>]) {
                 }
             }
             if cancelled {
-                to_wake.push(instance.wakeable());
+                to_wake.push(instance.watch.clone());
             }
         }
     }
