@@ -147,7 +147,7 @@ impl Drop for Armed<'_> {
         watch.armed.store(waiters.len(), Ordering::Relaxed);
         drop(waiters);
         let inbox = self.task.inbox();
-        inbox.set_armed(false);
+        inbox.disarm();
         while let Some(record) = inbox.take() {
             assert!(
                 record.token == self.token
@@ -184,10 +184,7 @@ pub fn arm(subject: Subject<'_>, token: Token, class: WaitClass) -> Option<Armed
         !inbox.is_armed(),
         "completion::arm: this task is already armed on a subject",
     );
-    // A new wait starts owing nothing. Whatever the last one was told is the
-    // last one's business, and it has already returned.
-    inbox.reset();
-    inbox.set_armed(true);
+    inbox.arm_to(token);
     let watch = subject.0;
     let mut waiters = watch.waiters.lock();
     waiters.push(Watcher {

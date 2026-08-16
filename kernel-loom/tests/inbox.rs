@@ -254,3 +254,84 @@ fn an_overflow_is_reported_once_and_then_cleared() {
         assert!(!inbox.has_record(), "the overflow notice was reported twice");
     });
 }
+
+/// **Two producers with no lock between them.** The log's is the one path in
+/// the kernel that posts to an inbox without taking the subject's leaf lock —
+/// `emit` runs inside `sync.rs`, inside IRQ handlers, inside the scheduler and
+/// inside every syscall's locked region, so it may take none — and
+/// `Inbox::post`'s plain writes have no answer to a second one.
+///
+/// **The argument that was there instead was about the wrong quantity.**
+/// `shard::signal_after_commit`'s swap admits one poster *per park*; `klogd`
+/// re-arms the waiter flag and goes round its loop without parking whenever
+/// there is more to drain, so a second producer wins a fresh epoch's swap while
+/// the first is still inside `post`. Two CPUs writing one
+/// `UnsafeCell<Record>` is undefined behaviour, and x86 TSO hides it from every
+/// guest test in this tree — which is the whole reason this obligation is a
+/// model.
+///
+/// `Inbox::signal` is one atomic store, so the same interleaving is sound and
+/// this model passes. Its teeth are the `inbox-signal-as-post` feature, which
+/// puts the producers back on `post`: loom then answers **`Causality
+/// violation: Concurrent write accesses to UnsafeCell`**, which is the defect
+/// stated exactly.
+#[test]
+fn two_unlocked_producers_are_a_race_and_a_signal_is_not() {
+    loom::model(|| {
+        let inbox = Arc::new(Inbox::new());
+        inbox.arm_to(TOKEN);
+
+        let a = inbox.clone();
+        let ta = loom::thread::spawn(move || produce(&a, 1));
+        let b = inbox.clone();
+        let tb = loom::thread::spawn(move || produce(&b, 2));
+
+        ta.join().unwrap();
+        tb.join().unwrap();
+
+        assert!(
+            inbox.has_record(),
+            "two producers said something happened and the waiter was told nothing",
+        );
+        let got = inbox.take().expect("has_record said there was one");
+        assert!(
+            got.token == TOKEN,
+            "a notice reached the taker carrying a subject it never armed on",
+        );
+    });
+}
+
+/// The producer's half of the model above. Two shapes, one call site: the
+/// shipped `signal`, and the `post` the negative control puts back.
+fn produce(inbox: &Inbox, at: u64) {
+    #[cfg(not(feature = "inbox-signal-as-post"))]
+    {
+        let _ = at;
+        inbox.signal();
+    }
+    #[cfg(feature = "inbox-signal-as-post")]
+    inbox.post(record(at));
+}
+
+/// **A notice that arrives while nothing is armed survives the next arm.**
+///
+/// `arm` used to empty the inbox — "a new wait starts owing nothing" — and for
+/// a producer that takes the subject's leaf lock that is harmless, because the
+/// lock is also what stops a post reaching an inbox whose watcher has been
+/// removed. The log's producer takes no lock and holds a leaked pointer to the
+/// inbox, so it signals whether `klogd` is armed or not; a reset at the arm
+/// discards exactly the notice nobody will send again. Emptying is
+/// `Armed::drop`'s job, where the lock is held.
+#[test]
+fn a_signal_that_landed_before_the_arm_is_not_discarded_by_it() {
+    loom::model(|| {
+        let inbox = Inbox::new();
+        inbox.signal();
+        inbox.arm_to(TOKEN);
+        assert!(
+            inbox.has_record(),
+            "the arm discarded a notice that landed before it, and its producer is a \
+             lock-free path that will not repeat itself",
+        );
+    });
+}

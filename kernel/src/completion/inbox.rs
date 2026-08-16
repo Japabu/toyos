@@ -25,27 +25,40 @@
 //! count is a load and a store rather than an increment. What makes the plain
 //! stores sound is stated as an invariant and asserted at the arm:
 //!
-//! - **One poster at a time.** An inbox is armed on exactly one subject
-//!   (§5.3's `Armed` is consumed by the wait), and every post to that subject
-//!   walks its watch list under the subject's own leaf lock. `arm` refuses a
-//!   second arm by name, so the invariant is checked rather than hoped for.
+//! - **One poster at a time, and the mechanism is the subject's leaf lock.**
+//!   Every post to a subject walks its watch list under that lock, so the
+//!   posters to one inbox are serialized by construction. A producer that
+//!   cannot take a lock therefore cannot use [`Inbox::post`] at all, and has
+//!   [`Inbox::signal`] instead.
 //! - **One taker, ever.** The inbox belongs to one task and only that task
 //!   takes from it.
 //!
-//! The one read-modify-write in the file is the overflow flag's `swap`, on the
-//! taker's side and only when the ring is already empty. It cannot be a load
-//! and a store because both sides write that flag, and a lost overflow is a
-//! lost wake rather than a lost record.
+//! **The struck version of the first bullet named the wrong mechanism, and the
+//! difference was undefined behaviour.** It argued from "an inbox is armed on
+//! exactly one subject (§5.3's `Armed` is consumed by the wait), and `arm`
+//! refuses a second arm by name" — a signature this implementation does not
+//! have (the arm is held by reference across a loop, §5.3a) and, more
+//! importantly, an argument about *subjects* where the invariant is about
+//! *posters*. The log's producer proved the gap: it posts to `klogd`'s inbox
+//! with no lock at all, admitted one-per-*epoch* by `shard::signal_after_commit`'s
+//! swap — and `klogd`'s re-arm-then-continue loop starts a new epoch while the
+//! previous epoch's producer is still inside `post`. Two CPUs writing one
+//! `UnsafeCell<Record>` is not a lost record, it is UB.
+//!
+//! The two read-modify-writes in the file are both flags, both on the *taker's*
+//! side of a word both sides write: the overflow notice and the signal. Neither
+//! can be a load and a store, and a lost one is a lost wake rather than a lost
+//! record.
 
 #[cfg(not(feature = "loom"))]
 use core::cell::UnsafeCell;
 #[cfg(not(feature = "loom"))]
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 #[cfg(feature = "loom")]
 use crate::cell::UnsafeCell;
 #[cfg(feature = "loom")]
-use loom::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::time::Instant;
 
@@ -91,6 +104,12 @@ pub struct Token(u64);
 impl Token {
     pub const fn new(value: u64) -> Self {
         Self(value)
+    }
+
+    /// The opaque value back, for the one place that has to store a token in a
+    /// word: [`Inbox::arm_to`].
+    pub const fn raw(self) -> u64 {
+        self.0
     }
 }
 
@@ -169,15 +188,26 @@ pub struct Inbox {
     /// reports it. A flag rather than a count: what the waiter does about it
     /// is re-derive its predicate, and it does that once.
     overflowed: AtomicBool,
+    /// [`Inbox::signal`]'s whole state: "something happened", from a producer
+    /// that may take no lock. Written by any number of them concurrently and
+    /// cleared by the owner, which is sound because it is one atomic word and
+    /// not a `Record`.
+    signalled: AtomicBool,
     /// Whether an [`Armed`](super::Armed) is live for this inbox. Written only
-    /// by the owner, and the one-poster-at-a-time invariant this file's plain
-    /// stores rest on.
+    /// by the owner.
     armed: AtomicBool,
+    /// The token the live arm named, so [`Inbox::signal`]'s contentless notice
+    /// can be handed to the taker as a record of the subject it is actually
+    /// waiting on. Written only by the owner, at the arm.
+    armed_token: AtomicU64,
 }
 
-// SAFETY: every slot is written by the single poster the arm admits and read by
-// the single owner, and the `tail`/`head` release-acquire pair is what orders
-// the two. The module header states both halves of that invariant.
+// SAFETY: every slot is written under the posting subject's own leaf lock — the
+// walk of its watch list is what serializes the posters to one inbox — and read
+// by the single owner, and the `tail`/`head` release-acquire pair is what orders
+// the two. A producer that cannot take that lock has `signal` instead, which
+// touches no slot at all. The module header states both halves of the invariant
+// and the mechanism each rests on.
 unsafe impl Sync for Inbox {}
 
 impl Inbox {
@@ -188,7 +218,9 @@ impl Inbox {
             tail: AtomicU32::new(0),
             head: AtomicU32::new(0),
             overflowed: AtomicBool::new(false),
+            signalled: AtomicBool::new(false),
             armed: AtomicBool::new(false),
+            armed_token: AtomicU64::new(0),
         }
     }
 
@@ -201,7 +233,9 @@ impl Inbox {
             tail: AtomicU32::new(0),
             head: AtomicU32::new(0),
             overflowed: AtomicBool::new(false),
+            signalled: AtomicBool::new(false),
             armed: AtomicBool::new(false),
+            armed_token: AtomicU64::new(0),
         }
     }
 
@@ -226,12 +260,35 @@ impl Inbox {
         self.tail.store(tail.wrapping_add(1), PUBLISH);
     }
 
+    /// Say that something happened, without saying what — the form a producer
+    /// that may take no lock is allowed to use.
+    ///
+    /// **One atomic store, and that is the whole point.** [`Inbox::post`]'s
+    /// plain writes are sound only because the posters to one subject are
+    /// serialized by that subject's leaf lock; a producer with no lock has no
+    /// such serialization and a second one racing it is undefined behaviour
+    /// rather than a lost record. The machine's log is that producer, by
+    /// necessity: `emit` runs inside `sync.rs`, inside IRQ handlers, inside the
+    /// scheduler and inside every syscall's locked region
+    /// (`specs/completion-architecture-spec.md` §5.3a's first constraint), and
+    /// one read-modify-write per log line measured 350 ms of boot under TCG.
+    ///
+    /// What it costs the reader is exactness: a signal carries no `at` and no
+    /// outcome of its own, which is §5.3a's *edge* contract stated as a type —
+    /// the record means "state may have moved", never "there is something for
+    /// you", and the waiter's own predicate is authoritative. That is what the
+    /// log's reader does anyway.
+    pub fn signal(&self) {
+        self.signalled.store(true, Ordering::Release);
+    }
+
     /// Is there anything for the owner? **The one park-time recheck**, and one
     /// predicate: no match on a channel, no per-source closure, nothing named
     /// in it.
     pub fn has_record(&self) -> bool {
         self.tail.load(OBSERVE) != self.head.load(Ordering::Relaxed)
             || self.overflowed.load(Ordering::Acquire)
+            || self.signalled.load(Ordering::Acquire)
     }
 
     /// Take the oldest record. Owner only.
@@ -239,6 +296,16 @@ impl Inbox {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(OBSERVE);
         if head == tail {
+            // A signal with nothing in the ring is the log's shape: a record
+            // with no content, carrying the token of whatever this inbox is
+            // armed on, because that is the subject whose state may have moved.
+            if self.signalled.swap(false, Ordering::AcqRel) {
+                return Some(Record {
+                    token: Token::new(self.armed_token.load(Ordering::Relaxed)),
+                    outcome: Outcome::Ready,
+                    at: Instant::from_nanos_since_boot(0),
+                });
+            }
             // An overflow with nothing left in the ring is still something the
             // waiter has to hear about, once.
             return self.overflowed.swap(false, Ordering::AcqRel).then(|| Record {
@@ -255,23 +322,33 @@ impl Inbox {
         Some(record)
     }
 
-    /// Empty it, so a new wait starts with nothing owed. The previous wait's
-    /// records belong to that wait.
-    pub fn reset(&self) {
-        while self.has_record() {
-            let _ = self.take();
-        }
-    }
-
     /// Whether an arm is live. Only the owner writes it.
     pub fn is_armed(&self) -> bool {
         self.armed.load(Ordering::Relaxed)
     }
 
+    /// Take the arm, naming the subject it is for.
+    ///
+    /// **It deliberately does not empty the ring**, and the struck version did.
+    /// "A new wait starts owing nothing" is true and is enforced at the other
+    /// end — [`Armed`](super::Armed)'s `Drop` drains, under the same leaf lock
+    /// that stops any further post reaching this inbox — so a reset here can
+    /// only discard something that arrived *between* the two, which for a
+    /// lock-free signaller is a wake nobody will send again. A record that
+    /// outlives its arm costs the next wait one spurious loop, which is legal
+    /// at every park site (§5.5).
+    ///
     /// `pub` rather than `pub(super)` so that `kernel-loom`, where this file's
     /// `super` is a different crate root, still sees a used item. `mod.rs` is
     /// its only caller in the kernel.
-    pub fn set_armed(&self, armed: bool) {
-        self.armed.store(armed, Ordering::Relaxed);
+    pub fn arm_to(&self, token: Token) {
+        self.armed_token.store(token.raw(), Ordering::Relaxed);
+        self.armed.store(true, Ordering::Relaxed);
+    }
+
+    /// Give the arm back. The drain is the caller's, because it is the caller
+    /// that holds the subject's lock while it happens.
+    pub fn disarm(&self) {
+        self.armed.store(false, Ordering::Relaxed);
     }
 }

@@ -139,21 +139,25 @@ pub fn post_wake() {
     // first constraint). `emit` runs inside `sync.rs`, inside IRQ handlers,
     // inside the scheduler and inside every syscall's locked region, so the
     // ordinary `completion::post` — which walks a watch list under the
-    // subject's leaf lock — is not available here. What replaces the list is
-    // the swap in `signal_after_commit`: it admits exactly one poster per
-    // park, so this inbox has one producer and needs no mutual exclusion of
-    // its own. That is §11's "degenerate one-waiter post", and it is why the
-    // claim below may lose without losing the wake.
+    // subject's leaf lock — is not available here.
+    //
+    // **`signal` and not `post`, because there is no one-poster argument to be
+    // had on this path.** The struck version reasoned from the swap in
+    // `shard::signal_after_commit`: "it admits exactly one poster per park, so
+    // this inbox has one producer and needs no mutual exclusion of its own".
+    // Per *park* is not per *post*. `klogd`'s loop re-arms the waiter flag and
+    // goes round without parking whenever `arm_waiter` finds work, so a second
+    // producer can win a fresh epoch's swap while the first is still inside
+    // `Inbox::post` — two CPUs writing one `UnsafeCell<Record>`, which is
+    // undefined behaviour and not a lost record. `Inbox::signal` is one atomic
+    // store and has no such precondition; what it gives up is the record's
+    // content, which this subject is edge-classed and never had to say.
     let inbox = KLOGD_INBOX.load(Ordering::Acquire);
     if !inbox.is_null() {
         // SAFETY: as above — leaked once by `klogd` itself before its first
         // park, never cleared.
         let handle = unsafe { &*inbox };
-        handle.inbox().post(crate::completion::Record {
-            token: crate::completion::Token::new(0),
-            outcome: crate::completion::Outcome::Ready,
-            at: crate::clock::now(),
-        });
+        handle.inbox().signal();
     }
     irq_off(|guard| {
         wake_direct(shared, WakeCause::new(WakeReason::Woken), cpus(), &HW, guard);
@@ -457,9 +461,8 @@ extern "C" fn body(_arg: u64) -> ! {
 
     let parkable = scheduler::Parkable::of_current();
     let handle = crate::sched::driver::current_handle().expect("klogd runs as a task");
-    // The producer writes its record here, without a lock and without a watch
-    // list: one waiter, and the swap in `signal_after_commit` is what admits
-    // exactly one poster per park.
+    // The producer signals here, without a lock and without a watch list —
+    // `post_wake` says why it may not write a record instead.
     KLOGD_INBOX.store(
         alloc::boxed::Box::leak(alloc::boxed::Box::new(handle.clone())) as *const Arc<TaskHandle>
             as *mut _,

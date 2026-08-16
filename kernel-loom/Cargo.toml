@@ -47,6 +47,19 @@ wake-fence-off = []
 #
 # Never on by default, and no kernel build can reach it.
 inbox-release-off = []
+# The negative control for the *lock-free* post. It puts the log's producer
+# back on `Inbox::post` — the shape this branch shipped, whose one-poster
+# argument was per-park rather than per-post — and
+# `two_unlocked_producers_are_a_race_and_a_signal_is_not` must red under it
+# with loom's own words, `Concurrent write accesses to UnsafeCell`:
+#
+#   cargo test --manifest-path kernel-loom/Cargo.toml --features inbox-signal-as-post \
+#     --test inbox
+#
+# It stages the *mechanism* and not a verdict, which is what
+# `specs/completion-architecture-spec.md` §20.3 requires of a control. Never on
+# by default, and no kernel build declares it.
+inbox-signal-as-post = []
 
 [dependencies]
 loom = "0.7"
