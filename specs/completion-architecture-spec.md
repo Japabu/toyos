@@ -1412,12 +1412,19 @@ Consequences the implementer owns:
   unwind".
 
   **The derivation lives at the site and is deliberately not restated here** — in
-  outline, 8 s of four `sched::driver::pass` prologues, each paying xHCI's own
+  outline, 8 s of `sched::driver::pass` prologues, each paying xHCI's own
   `USB_TIMEOUT_NS` of 2 s; 20 ms of two quanta; and 990 ms for the unwind, priced
   **as a stated estimate** at one quantum of the victim's own CPU time,
-  multiplied by the real-time band's derived stretch of 11 and by `1 + peers`
-  with `peers` priced at 8. 9.01 s of terms under a 10 s tripwire, 990 ms of
-  margin.
+  multiplied by the real-time band's deferral factor and by `1 + peers` with
+  `peers` priced at 8. 9.01 s of terms under a 10 s tripwire, 990 ms of margin.
+
+  **Two of those terms are superseded and this section restates neither.** The
+  prologue count of four is an undercount — the measured pass count inside one
+  corpse's chain is twenty — and the deferral factor of 11 is bounded per corpse
+  rather than per CPU, so it is a worst case in neither direction.
+  `specs/scheduling-reservations-spec.md` §8 is where the wait is re-derived
+  against a declared rate instead, and where the prologue term is declined and
+  handed to the pass that owns it.
 
   **What made the real-time factor finite is not this document's to state
   either.** It is bounded deferral: `specs/scheduler-core-spec.md` §3 and
@@ -1435,9 +1442,12 @@ Consequences the implementer owns:
   from one spinning `Rights::RT` thread.
 
   **And one term is filed rather than claimed away.** `peers` is workload-shaped
-  and the tripwire is a constant, so past about nine simultaneous teardowns on
-  one CPU the derivation outgrows its own number:
-  `specs/issues/kernel/retire-tripwire-is-not-queue-shaped.md`, open. The
+  and the tripwire is a constant: with 8.02 s of fixed terms and 110 ms per
+  further corpse, the 990 ms of margin buys nine more of them and the sum first
+  reaches the constant at eighteen concurrent unwinds on one CPU — two
+  quantities this document previously conflated into "about nine".
+  `specs/issues/kernel/retire-tripwire-is-not-queue-shaped.md` is open, and its
+  remedy is chosen by `specs/scheduling-reservations-spec.md` §8. The
   dominant term is a second filed defect —
   `specs/issues/kernel/scheduler-pass-blocks-in-xhci.md`, which says in terms
   that "`retire_task`'s bound is measuring the USB bus" — so closing that issue

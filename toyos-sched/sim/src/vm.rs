@@ -170,13 +170,18 @@ pub struct ProcState {
 pub struct Killed {
     /// The wall-clock instant the retire was claimed at.
     pub at: Nanos,
-    /// The last CPU the victim's word named, so a retire that has completed is
-    /// still measured on the clock of the CPU that ran its unwind.
-    pub seen_on: Option<usize>,
     /// The greatest number of *other* outstanding retires that CPU has held
     /// since this one was claimed. One CPU runs one unwind at a time, so this
     /// is how many are queued ahead of this victim — invariant I14's bound
     /// carries it the way I5's carries the runnable thread count.
+    ///
+    /// **The only field beside the instant, and there used to be a third.** A
+    /// `seen_on` remembered which CPU last owned the victim, and its one reader
+    /// selected whose per-CPU fair clock to measure against. That clock was
+    /// deleted when I14 moved to the wall clock, and the field outlived its
+    /// reader — invisible to the compiler, because a `pub` field of a `pub`
+    /// struct in a lib crate is externally reachable and the dead-code lint
+    /// cannot see that nothing reads it.
     pub max_peers: usize,
 }
 
@@ -1451,7 +1456,6 @@ impl<'q> Vm<'q> {
     fn note_kill(&self) -> Killed {
         Killed {
             at: self.clock,
-            seen_on: None,
             max_peers: 0,
         }
     }

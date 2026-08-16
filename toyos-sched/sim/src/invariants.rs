@@ -93,11 +93,23 @@ fn rt_latency_bound(max_kernel_section: u64) -> u64 {
 /// each hop up to one execution chunk late.
 ///
 /// **`peers` is a workload-shaped term**, exactly as invariant I5's
-/// `(runnable threads + 1)` factor is. Two threads of one process retired
-/// together onto one CPU means the second waits out the first: one CPU cannot
-/// run two unwinds at once, and pretending otherwise would price the machine
-/// rather than the protocol. `peers` is the greatest number of *other* corpses
-/// that CPU has held since this retire was claimed.
+/// `(runnable threads + 1)` factor is. Two corpses on one CPU means the second
+/// waits out the first: one CPU cannot run two unwinds at once, and pretending
+/// otherwise would price the machine rather than the protocol. `peers` is the
+/// greatest number of *other* corpses that CPU has held since this retire was
+/// claimed.
+///
+/// **Where the shape comes from, in the model and in the kernel, and they are
+/// not the same.** This model's `Vm::teardown` posts a retire for every sibling
+/// of a torn-down process in one op with no wait between them, so a batched
+/// single-process teardown is what drives `peers` above zero here. The kernel
+/// cannot produce that: both of its teardown loops call `retire_task` per tid
+/// and it blocks until the victim is released, so one process teardown holds at
+/// most one corpse at a time. What produces `peers > 0` there is *concurrent
+/// independent retirers* — separate killer threads retiring separate victims
+/// that share a CPU — and nothing bounds how many. The model's shape is the
+/// cheaper way to reach the same queue depth, and the bound is about the depth
+/// rather than about who made it.
 fn retire_latency_bound(max_kernel_section: u64, peers: usize) -> u64 {
     2 * QUANTUM_NS
         + IPI_LATENCY_NS
@@ -347,13 +359,15 @@ fn check_retires(vm: &mut Vm<'_>) {
 
     let mut done = Vec::new();
     for key in keys {
-        // Both remembered while the word still names a CPU, so a victim that
-        // has reached `Dead` is still measured against the CPU that ran its
-        // unwind and against the queue it stood in.
+        // Remembered while the word still names a CPU, so a victim that has
+        // reached `Dead` is still measured against the queue it stood in. The
+        // CPU itself is no longer remembered beside it: the second field this
+        // block used to write existed to select *whose* per-CPU fair clock to
+        // read, and I14 has been on the wall clock since that clock was
+        // deleted.
         if let Some(cpu) = owner_of(vm.shared[&key].state()) {
             let peers = per_cpu.get(&cpu).copied().unwrap_or(1) - 1;
             let entry = vm.killed.get_mut(&key).expect("came from the map");
-            entry.seen_on = Some(cpu);
             entry.max_peers = entry.max_peers.max(peers);
         }
         let bound = retire_latency_bound(vm.max_kernel_section(), vm.killed[&key].max_peers);

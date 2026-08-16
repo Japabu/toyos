@@ -93,13 +93,20 @@
 
    **Release completes within the retirer's own tripwire, and both the bound
    and its residual are written down.** `kernel/src/scheduler.rs`'s `GIVE_UP`
-   carries the derivation: four pass prologues on xHCI's 2 s deadline, two
-   quanta, and an unwind a saturated real-time band may stretch elevenfold
-   (§3), times one plus the corpses queued ahead of this one. **The
-   qualification is that the last factor is workload-shaped and the tripwire is
-   a constant** — past about nine simultaneous teardowns on one CPU the
-   derivation outgrows its own number, which is filed as
-   `specs/issues/kernel/retire-tripwire-is-not-queue-shaped.md` and is not
+   carries the derivation: the pass prologues on xHCI's 2 s deadline, two
+   quanta, and an unwind a saturated real-time band defers (§3), times one plus
+   the corpses queued ahead of this one. **Two of those terms are superseded
+   rather than restated here**, and `specs/scheduling-reservations-spec.md` §8
+   is where each is answered: the prologue count named at the site is an
+   undercount — the measured number of passes inside one corpse's chain is
+   twenty, not four, which no constant absorbs — and the real-time factor is a
+   deferral bounded per corpse rather than per CPU, so it is not a worst case
+   in either direction. **The remaining qualification is that the queue factor
+   is workload-shaped and the tripwire is a constant**: with 8.02 s of fixed
+   terms and 110 ms per further corpse the sum first reaches the 10 s constant
+   at eighteen concurrent unwinds on one CPU, and the 990 ms of margin buys nine
+   of them — two quantities that were previously conflated into one. It is filed
+   as `specs/issues/kernel/retire-tripwire-is-not-queue-shaped.md` and is not
    claimed away here. An invariant states a derived bound or it is not an
    invariant; this one states the bound and the edge it does not reach. Its
    dominant term is a second filed defect

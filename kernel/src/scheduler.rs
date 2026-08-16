@@ -582,6 +582,15 @@ pub fn retire_task(sched: &ThreadSched) {
         Duration::from_millis(50),
         "two hundred re-polls inside the tripwire, on a thread that is otherwise parked",
     );
+    /// **Superseded in whole by `specs/scheduling-reservations-spec.md` §8, and
+    /// kept until that design lands because a constant with a broken derivation
+    /// is still the thing this kernel runs.** Two of the terms below are known
+    /// wrong and neither is repairable by moving the number: the prologue count
+    /// is an undercount by a factor the constant cannot absorb, and the
+    /// real-time factor prices a deferral that is bounded per corpse rather than
+    /// per CPU. Each says so where it is stated, rather than being re-derived
+    /// into a form that fails the same way again.
+    ///
     /// **Re-derived twice at C3+C4, and the second time because the first was
     /// below its own sum.** What this bounds is no longer "an IPI, one remote
     /// pass and a release": since `specs/completion-architecture-spec.md` §7.2
@@ -599,15 +608,24 @@ pub fn retire_task(sched: &ThreadSched) {
     ///   `specs/issues/kernel/scheduler-pass-blocks-in-xhci.md` is open and says
     ///   in terms that "`retire_task`'s bound is measuring the USB bus".
     ///
-    ///   **Four, and the struck derivation priced two.** The chain is: the pass
-    ///   the retire's `Urgency::Preempt` kick buys, which drains `Msg::Retire`;
-    ///   the pass that dispatches the corpse once the CPU is free of whatever
-    ///   was running; the corpse's *own* exit pass, which is
-    ///   `exit_if_killed`'s `driver::pass(Dispose::Exit)` and is a separate
-    ///   `pass()` call paying the same prologue; and the pass that frees the
-    ///   zombie. Three of those are unavoidable for a victim already in the
-    ///   kernel; the fourth is what a parked or queued victim adds, and a
-    ///   tripwire covers the worst case or it is not one.
+    ///   **Four named passes, and the count is an undercount rather than a
+    ///   bound — superseded, not re-derived.** The named chain is: the pass the
+    ///   retire's `Urgency::Preempt` kick buys, which drains `Msg::Retire`; the
+    ///   pass that dispatches the corpse once the CPU is free of whatever was
+    ///   running; the corpse's *own* exit pass, which is `exit_if_killed`'s
+    ///   `driver::pass(Dispose::Exit)` and is a separate `pass()` call paying
+    ///   the same prologue; and the pass that frees the zombie. But every chunk
+    ///   boundary inside the unwind is itself a `pass()` call paying the same
+    ///   prologue, and an instrumented count of one 10 ms unwind under this
+    ///   crate's own driving loop found **twenty** — so under the premise this
+    ///   bullet states, one corpse alone prices at 40 s and nine at 360 s, both
+    ///   far above the constant. The other horn is no better: `poll_if_pending`
+    ///   early-returns unless an xHCI interrupt is pending or port work is due,
+    ///   and only `try_lock`s, so "every pass pays the prologue unconditionally"
+    ///   is false as written and the term that dominates this number rests on
+    ///   it. Neither horn is fixed by a larger constant, which is why
+    ///   `specs/scheduling-reservations-spec.md` §8 declines to price this term
+    ///   at all and names the pass, not the wait, as what has to change.
     /// * **20 ms — two quanta.** One for the victim's CPU to be free to pick
     ///   the dying task (a running fair task keeps the CPU to its quantum end),
     ///   one for the pass that releases the zombie to arrive.
@@ -622,28 +640,47 @@ pub fn retire_task(sched: &ThreadSched) {
     ///   budget (`toyos_sched::cpu::MAX_PASS_NS`) of 200 µs, is priced here at
     ///   one quantum — 10 ms of the victim's own CPU time.
     ///
-    ///   The real-time band multiplies it by 11 and no more.
+    ///   The real-time band multiplies it by 11 — a factor whose derivation is
+    ///   a `k = 1` argument, and **superseded rather than re-derived**.
     ///   `toyos_sched::cpu::DYING_AGE_NS` makes that band's precedence over the
-    ///   dying list a *bounded* deferral: an aged corpse takes one
-    ///   `DYING_CHUNK_NS` per `DYING_AGE_NS + DYING_CHUNK_NS`, so 10 ms of
-    ///   unwind costs 110 ms of wall clock when the band never empties.
-    ///   `an_unwind_under_saturated_rt_is_stretched_by_the_age_ratio` is what
-    ///   keeps that factor and this number from drifting apart. **The struck
-    ///   derivation priced this term at nothing** — "a machine that spends this
-    ///   tripwire on RT service is a machine whose RT workload is the fault" —
-    ///   and that was not a derivation, it was the reason the tripwire was
-    ///   reachable from one spinning `Rights::RT` thread.
+    ///   dying list a deferral bounded *per corpse*: an aged corpse takes one
+    ///   `DYING_CHUNK_NS` per `DYING_AGE_NS + DYING_CHUNK_NS`, so one 10 ms
+    ///   unwind costs 110 ms of wall clock when the band never empties. What
+    ///   that argument does not carry is the CPU: k aged corpses take k
+    ///   consecutive chunks, and a band that briefly empties dispatches a corpse
+    ///   with no grant and restamps it, throwing the accumulated age away. The
+    ///   factor is therefore not a worst case in either direction.
+    ///   `specs/scheduling-reservations-spec.md` §8 replaces it with a rate —
+    ///   the dying server's own reservation — which reaches the same 110 ms and
+    ///   reaches it for every k. **The struck derivation priced this term at
+    ///   nothing** — "a machine that spends this tripwire on RT service is a
+    ///   machine whose RT workload is the fault" — and that was not a
+    ///   derivation, it was the reason the tripwire was reachable from one
+    ///   spinning `Rights::RT` thread.
     ///
     ///   Times `1 + peers`, because one CPU runs one unwind at a time and this
-    ///   victim waits out the corpses queued ahead of it. Priced at `peers = 8`:
-    ///   one process's threads torn down together onto one CPU. **Past that the
-    ///   term outgrows the constant**, and that is filed rather than papered
-    ///   over — `specs/issues/kernel/retire-tripwire-is-not-queue-shaped.md`.
+    ///   victim waits out the corpses queued ahead of it. Priced at `peers = 8`.
+    ///   **The provenance that number used to carry was impossible in this
+    ///   kernel and is corrected here**: "one process's threads torn down
+    ///   together onto one CPU" cannot happen, because `kill_process` and the
+    ///   exit path both loop over a process's tids calling `retire_task`, which
+    ///   blocks until the victim has been released — so one teardown holds at
+    ///   most one corpse at a time. The producer of `peers > 0` is *concurrent
+    ///   independent retirers*: separate killer threads retiring separate
+    ///   victims that happen to share a CPU. Nothing bounds how many, which is
+    ///   the whole of the filed defect
+    ///   `specs/issues/kernel/retire-tripwire-is-not-queue-shaped.md`, and 8 is
+    ///   a chosen number rather than a measured or derived one.
     ///
     /// 9.01 s of derived terms, and 10 s is the next round number above it —
-    /// 990 ms of margin, which is one whole unwind's worth. The dominant term
-    /// remains a filed defect and not a property of this wait: close the xHCI
-    /// issue and 8 s of this number goes with it.
+    /// 990 ms of margin, which is one whole unwind's worth. **The margin buys
+    /// nine further corpses at 110 ms each, and that is not the same quantity as
+    /// the crossing point**: with 8.02 s of fixed terms the sum is
+    /// 8.02 s + 0.110 s × N, which reaches the priced 9.01 s at N = 9 and first
+    /// reaches the constant at N = 18. The two readings were conflated wherever
+    /// this figure was repeated. The dominant term remains a filed defect and
+    /// not a property of this wait: close the xHCI issue and 8 s of this number
+    /// goes with it.
     ///
     /// **C7 owes this constant another look**: a sleep lock parked on a device
     /// puts a fifth `USB_TIMEOUT_NS` inside the unwind.

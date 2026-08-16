@@ -190,7 +190,8 @@ pub struct CpuSched<X: SchedPayload> {
     rq: RunQueue<X>,
     parked: BTreeMap<TaskKey, ParkedEntry<X>>,
     /// Killed tasks that still have a kernel stack to unwind, dispatched
-    /// ahead of the **fair** queue and behind the RT band.
+    /// ahead of the **fair** queue, and behind the RT band only until the head
+    /// of this list has aged ([`DYING_AGE_NS`]).
     ///
     /// **This is what replaces every reap-in-place** (spec §7.2 of
     /// `specs/completion-architecture-spec.md`): this kernel does not unwind,
@@ -212,14 +213,26 @@ pub struct CpuSched<X: SchedPayload> {
     /// quantum-shaped number instead of a queue-shaped one" — and it was
     /// written before that term existed.
     ///
-    /// **The argument reaches the fair band and stops there.** "A retirer is
+    /// **The argument reaches the fair band and stops there, and what happens
+    /// past it is a bounded deferral rather than an absolute.** "A retirer is
     /// blocked on what this task holds" says nothing about real-time work,
-    /// which is not waiting on the corpse and whose own bound —
-    /// `scheduler-core-spec.md` §3's "a ready real-time task always preempts
-    /// the normal band", priced by invariant I4 — admits no exception. So
-    /// [`SchedPass::pick`] serves `rq` first *whenever the RT band is
-    /// occupied*, and a dying task is preempted for RT exactly as any other
-    /// fair-band task is.
+    /// which is not waiting on the corpse. So [`SchedPass::pick`] serves `rq`
+    /// first *unless the head of this list has aged* ([`DYING_AGE_NS`]), and
+    /// [`SchedPass::preempt_if_due`]'s RT arm does not fire against an aged
+    /// corpse inside its [`DYING_CHUNK_NS`] grant — the two halves of one rule,
+    /// which is why neither may be read as "exactly like any other fair-band
+    /// task". The sentence that used to end here said exactly that, and said
+    /// the pick serves `rq` first whenever the RT band is occupied; both were
+    /// written before the grant existed and both were false the moment it did.
+    ///
+    /// **Superseded in design by `specs/scheduling-reservations-spec.md`**,
+    /// which deletes the age, the chunk and the grant together: the deferral
+    /// above is bounded per *corpse* and not per CPU, so k corpses take k
+    /// consecutive grants, and a real-time band that briefly empties throws the
+    /// accumulated age away on every dispatch. What replaces it is a per-CPU
+    /// dying server holding an ordinary reservation, whose guarantee does not
+    /// depend on how many corpses are behind it or on how the other band's
+    /// occupancy happens to fall.
     ///
     /// **A queue and not a stack.** Two concurrent process teardowns put two
     /// corpses on one CPU; popping the end `keep_dying` pushes to would
@@ -2229,14 +2242,23 @@ mod tests {
     }
 
     /// **A dying task is fair-band work, not a band of its own.** It jumps the
-    /// fair queue because a retirer is blocked on what it holds; it does not
-    /// jump the RT band, because nothing about an unwind makes it more urgent
-    /// than real-time work — and spec §3's "a ready real-time task always
-    /// preempts the normal band" admits no exception for it.
+    /// fair queue because a retirer is blocked on what it holds; a corpse that
+    /// has *not* aged does not jump the RT band, because nothing about an
+    /// unwind makes it more urgent than real-time work.
     ///
     /// The pass that fires because the RT task is ready must not hand the CPU
     /// straight back to the corpse: `preempt_if_due` takes it off, and the pick
     /// then serves `rq` — which is where the RT band lives — before `dying`.
+    ///
+    /// **This stages the un-aged case and only that case**, which is the
+    /// direction it was written for: the corpse here is killed and preempted
+    /// inside one pass, so it has stood in the list for far less than
+    /// [`DYING_AGE_NS`] and `pick`'s aging test is false.
+    /// `a_corpse_is_not_starved_for_ever_by_a_spinning_rt_task` is the other
+    /// direction and stages the aged one. Neither absolute holds, and a doc
+    /// here that stated one — "spec §3's 'a ready real-time task always
+    /// preempts the normal band' admits no exception for it" — was carrying an
+    /// absolute this crate's own gates already disprove.
     #[test]
     fn a_killed_task_does_not_starve_a_ready_rt_task() {
         let mut w = World::new(1);

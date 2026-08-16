@@ -67,9 +67,17 @@ const VICTIM_LABEL: &str = "victim";
 ///
 /// **A number rather than a hang, for `specs/completion-architecture-spec.md`
 /// §20.3's reason**: a guest that stops making progress reds as `STALL`, which
-/// the harness prints apart and tells nobody to bisect. Two seconds against a
-/// bound of one interrupt delivery and a teardown is four orders of magnitude
-/// of headroom, and what it buys is a failure that names itself.
+/// the harness prints apart and tells nobody to bisect. What it buys is a
+/// failure that names itself.
+///
+/// **Priced against the quantity it actually bounds**, which is not one
+/// interrupt delivery: what this constant covers is the whole of
+/// [go byte → boundary → teardown], and the only measurement of that window is
+/// this arm's own recorded green run, 4.972884 ms. Two seconds against it is
+/// 402×. The sentence that used to stand here said "four orders of magnitude of
+/// headroom", which would be true of the interrupt delivery alone — precisely
+/// the part this arm cannot observe from outside the kill, and the part the
+/// window's several scheduler dispatches sit on top of.
 ///
 /// **It has to be smaller than `scheduler::retire_task`'s own tripwire, and
 /// that ordering is the whole of the arm's ability to report.** The process
