@@ -207,7 +207,8 @@ pub enum BlockEnd {
     /// A wake claimed the registration first: the task kept the CPU and its
     /// wait is satisfied.
     Woken,
-    /// A retire landed inside the window; the task exited instead of parking.
+    /// A retire landed inside the window; the commit refused the park and the
+    /// task kept the CPU to unwind on.
     Killed,
 }
 
@@ -992,10 +993,16 @@ impl<'q> Vm<'q> {
                         (pass.dispose_none().finish(), None, BlockEnd::Woken)
                     }
                     // A retire landed while the task was deciding to park.
-                    // Parking is a safe point (spec §6.3, §7.6): the commit
-                    // withdrew the registration, and this pass buries it.
+                    // **The task keeps its stack and unwinds**, which is
+                    // `specs/completion-architecture-spec.md` §7.2 and is what
+                    // the kernel's `pass_block` does: this driver buried it
+                    // here until the model could charge an unwind, and burying
+                    // it was the one disposition the amended design does not
+                    // have. The commit withdrew the registration and put the
+                    // word back at `Running`; the next `exec_op` finds the kill
+                    // bit and spends `UNWIND_NS` before its own `die`.
                     Commit::Killed => {
-                        (pass.dispose_exit().finish(), None, BlockEnd::Killed)
+                        (pass.dispose_none().finish(), None, BlockEnd::Killed)
                     }
                 },
             }
@@ -1293,9 +1300,10 @@ impl<'q> Vm<'q> {
         };
         match end {
             BlockEnd::Parked => {}
-            // The task is dead. `reap_released` takes its program and its
-            // bookkeeping; there is no registration to finish, because the
-            // commit withdrew it.
+            // The task is dying and still running. Its script does not
+            // advance — the next `exec_op` finds the kill bit and unwinds —
+            // and there is no registration to finish, because the commit
+            // withdrew it.
             BlockEnd::Killed => {}
             // Phase 2 declined to park: the waker that claimed the ticket left
             // a token behind, and the script moves on.
