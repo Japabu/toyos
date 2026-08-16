@@ -36,8 +36,8 @@ use crate::payload::{
     MockAddressSpace, SimCtx, SimPayload, SimPreempt, SimShareLock, SimWaitList, StdLock,
 };
 use crate::workload::{
-    BlockShape, ChargeShape, MigrateShape, Op, ParkShape, Protocol, Scenario, Script, ShareShape,
-    WindowShape,
+    AgeShape, BlockShape, ChargeShape, MigrateShape, Op, ParkShape, Protocol, Scenario, Script,
+    ShareShape, WindowShape,
 };
 
 /// How finely a `Run(ns)` op is chopped. Small enough that a 10 ms quantum
@@ -140,29 +140,36 @@ pub struct ProcState {
     pub torn_down: bool,
 }
 
-/// When a retire was claimed, in both of the clocks invariant I14 needs.
+/// When a retire was claimed, on the one clock invariant I14 is allowed to
+/// read.
 ///
-/// **The wall clock is not the one the bound is read on, and since
-/// `specs/completion-architecture-spec.md` §7.2 it cannot be.** A killed task
-/// is normal-band work now: it unwinds on its own stack, and
-/// `scheduler-core-spec.md` §3 says a ready real-time task always preempts the
-/// normal band — so the interval between the retire and the release contains
-/// however much RT service the victim's CPU owed, which nothing in this model
-/// or in that law bounds. Charging it to the retire would make I14 a
-/// measurement of the RT workload.
+/// **The wall clock, and the previous form of this doc argued for the
+/// opposite.** It said a killed task is normal-band work, that
+/// `scheduler-core-spec.md` §3 gives a ready real-time task unqualified
+/// precedence over the normal band, and that the retire-to-release interval
+/// therefore contains an unbounded quantity — so I14 should be read on a clock
+/// with the RT band's service subtracted out.
 ///
-/// So the latency is read on [`Vm::fair_ns`] — elapsed time on the victim's own
-/// CPU with the RT band unoccupied — and the wall clock is kept for the
-/// migration half, which is a statement about an instant rather than a
-/// duration. **This is the arrangement `check_fairness` already uses one
-/// invariant over**: I5 stops measuring service while the RT band is occupied,
-/// "because the RT band exists to be unfair and invariant I4 is what bounds
-/// it". I14 now says the same thing about promptness.
+/// Every step of that was true and the conclusion was a blindfold. The kernel
+/// does not wait on that clock: `scheduler::retire_task` blocks behind a
+/// **wall-clock** tripwire and panics when it expires. A model measuring the
+/// same wait on a clock the kernel cannot read is a model that cannot see the
+/// panic — and the unbounded quantity the paragraph named is exactly the defect
+/// that panic was reachable through, declared as a modelling convenience one
+/// file away from the invariant that would have caught it.
+///
+/// So the quantity is bounded at its source instead: `CpuSched::pick`'s
+/// [`toyos_sched::cpu::DYING_AGE_NS`] makes the RT band's precedence over a
+/// corpse a bounded deferral, and I14 is read on the clock the kernel's own
+/// guard reads. The RT service the victim's CPU owed is *in* the number, which
+/// is the only way the number means anything.
+///
+/// (I5 still stops measuring service while the RT band is occupied. That
+/// exclusion is about *fairness*, which the RT band exists to be unfair to;
+/// this one was about *promptness*, which nothing exempts it from.)
 pub struct Killed {
     /// The wall-clock instant the retire was claimed at.
     pub at: Nanos,
-    /// Every CPU's [`Vm::fair_ns`] at that instant.
-    pub fair_at: Vec<u64>,
     /// The last CPU the victim's word named, so a retire that has completed is
     /// still measured on the clock of the CPU that ran its unwind.
     pub seen_on: Option<usize>,
@@ -271,10 +278,6 @@ pub struct Vm<'q> {
     pub transit: Vec<Option<ReadyTask<SimPayload>>>,
     pub clock: Nanos,
     pub busy_ns: Vec<u64>,
-    /// Per CPU: elapsed time during which that CPU was **not** serving the RT
-    /// band. Invariant I14's latency half is measured on this clock rather than
-    /// on the wall clock — see [`Killed`].
-    pub fair_ns: Vec<u64>,
     /// When each CPU's pending IPI must be taken.
     pub ipi_due: Vec<Option<Nanos>>,
     /// When each CPU last acquired an unserved `need_resched`. A CPU that
@@ -282,7 +285,8 @@ pub struct Vm<'q> {
     /// once; letting the explorer defer it while the clock ran would measure
     /// the explorer's freedom rather than the protocol's latency.
     pub resched_at: Vec<Option<Nanos>>,
-    /// When each CPU last acquired an unfinished unwind on its loaded task.
+    /// When each CPU last acquired — or last discharged and re-acquired — an
+    /// unfinished unwind on its loaded task.
     ///
     /// The same device as [`Vm::resched_at`], for the same reason and with the
     /// same grace: a CPU running a killed task is spending [`UNWIND_NS`] of its
@@ -291,7 +295,24 @@ pub struct Vm<'q> {
     /// deferral the explorer could hold the unwinding CPU still while another
     /// ran for milliseconds — and invariant I14 would be measuring the
     /// explorer's freedom rather than the protocol's latency.
+    ///
+    /// **"The same grace" is a per-chunk grace, and saying so cost a rewrite of
+    /// how this is stamped.** `resched_at` clears when the CPU takes the pass it
+    /// owed; this used to be stamped on the false→true transition only and
+    /// cleared when the CPU stopped running *any* killed task — so one stamp
+    /// covered a whole teardown window, several corpses long, and
+    /// [`Vm::enabled`]'s gate held every other CPU still for all of it.
+    /// [`Vm::unwind_gate_ns`] is the instrument that says it does not any more.
     pub unwind_at: Vec<Option<Nanos>>,
+    /// The longest any one [`Vm::unwind_at`] stamp stood before an execution
+    /// step on that CPU discharged it.
+    ///
+    /// One chunk of grace plus the chunk the discharging step itself spends is
+    /// the whole of what the gate may cost, so this cannot exceed
+    /// `2 × RUN_CHUNK_NS` — which is what
+    /// `the_unwind_gate_lasts_one_chunk_and_not_one_unwind` asserts, and what
+    /// the false→true-only stamp measured at 17 chunks.
+    pub unwind_gate_ns: u64,
     /// Busy-time stamp at which an RT task became ready while this CPU ran a
     /// normal one (invariant I4).
     pub rt_pending_since: Vec<Option<u64>>,
@@ -457,6 +478,7 @@ impl<'q> Vm<'q> {
             let mut cpu = CpuSched::new(CpuId(i as u32), rx, SimCtx::default());
             cpu.set_park_keeps_lapsed_lend(scenario.park == ParkShape::KeepLapsedLend);
             cpu.set_migrate_keeps_the_corpse(scenario.migrate == MigrateShape::KeepTheCorpse);
+            cpu.set_rt_outranks_every_corpse(scenario.age == AgeShape::RtOutranksEveryCorpse);
             cpu.set_fair_order(scenario.order);
             cpus.push(cpu);
         }
@@ -501,10 +523,10 @@ impl<'q> Vm<'q> {
             transit: (0..n).map(|_| None).collect(),
             clock: Nanos::ZERO,
             busy_ns: vec![0; n],
-            fair_ns: vec![0; n],
             ipi_due: vec![None; n],
             resched_at: vec![None; n],
             unwind_at: vec![None; n],
+            unwind_gate_ns: 0,
             rt_pending_since: vec![None; n],
             boosted_run: BTreeMap::new(),
             service_ns: vec![0; process_count],
@@ -672,9 +694,27 @@ impl<'q> Vm<'q> {
         // *other* CPU's execution step is enabled until it takes one. See
         // [`Vm::unwind_at`] — without it invariant I14 measures how long the
         // explorer felt like ignoring a CPU.
-        let unwind_owed = (0..self.scenario.cpus).find(|&cpu| {
-            self.unwind_at[cpu].is_some_and(|at| at.after(RUN_CHUNK_NS) <= self.clock)
-        });
+        //
+        // **The *oldest* debt, not the lowest-numbered one.** `find` named the
+        // first owed CPU and denied the step to every other — including the
+        // other CPUs that owed one, so a second unwinding CPU waited behind the
+        // first for as long as the first kept taking steps, each of which
+        // restarts its own grace. That is this device's own failure wearing the
+        // device's mask, and it is unbounded in the *other* CPU's unwind:
+        // measured at 7,500,000 ns of stamp-to-discharge on
+        // `retire_under_balance` before this line, against a doc promising one
+        // chunk. Ordering the debts makes the wait a derived quantity instead —
+        // one chunk of grace, the chunk that carries the clock past it, and the
+        // chunk that discharges it. [`Vm::unwind_gate_ns`] is the instrument and
+        // `the_unwind_gate_lasts_one_chunk_and_not_one_unwind` is the gate.
+        let unwind_owed = (0..self.scenario.cpus)
+            .filter_map(|cpu| {
+                self.unwind_at[cpu]
+                    .filter(|at| at.after(RUN_CHUNK_NS) <= self.clock)
+                    .map(|at| (at, cpu))
+            })
+            .min()
+            .map(|(_, cpu)| cpu);
 
         for cpu in 0..self.scenario.cpus {
             if pending_ipi[cpu] > 0 {
@@ -770,6 +810,14 @@ impl<'q> Vm<'q> {
 
     pub fn execute(&mut self, step: Step, choices: &mut ChoiceStream) {
         self.steps += 1;
+        // Which CPU just *took* its execution step, sampled before the step
+        // runs it: this is what discharges an unwind gate and restarts the
+        // grace, and it has to be read off the step rather than off the state
+        // the step leaves behind.
+        let executed = match step {
+            Step::Exec(cpu) => Some(cpu),
+            _ => None,
+        };
         self.execute_inner(step, choices);
         let owed = self.hw.with(|s| s.need_resched.clone());
         for cpu in 0..self.scenario.cpus {
@@ -781,12 +829,37 @@ impl<'q> Vm<'q> {
             let unwinding = self.cpus[cpu]
                 .running()
                 .is_some_and(|task| self.shared[&task.key()].kill_pending());
-            match (unwinding, self.unwind_at[cpu]) {
-                (true, None) => self.unwind_at[cpu] = Some(self.clock),
-                (false, _) => self.unwind_at[cpu] = None,
-                (true, Some(_)) => {}
+            // **Restamped on every execution step this CPU takes, which is what
+            // makes the grace one chunk and not one whole unwind.** The
+            // false→true transition alone left the stamp standing for the CPU's
+            // *entire* teardown window — across several consecutive corpses —
+            // so `Vm::enabled`'s gate stayed closed the whole time and no other
+            // CPU could take an `Exec`. That narrowed the explorer's
+            // interleaving space over exactly the window this chunk is about,
+            // and it shifted I14's recorded measurement: 15,653 stamps
+            // suppressed 10,845 other-CPU `Exec` opportunities over
+            // `retire_under_balance` seeds 0..500, with the longest single span
+            // 17,000,000 ns — 17 chunks, against a doc promising one.
+            match (unwinding, self.unwind_at[cpu], executed == Some(cpu)) {
+                (true, None, _) => self.unwind_at[cpu] = Some(self.clock),
+                (true, Some(since), true) => {
+                    self.note_unwind_gate(since);
+                    self.unwind_at[cpu] = Some(self.clock);
+                }
+                (true, Some(_), false) => {}
+                (false, Some(since), _) => {
+                    self.note_unwind_gate(since);
+                    self.unwind_at[cpu] = None;
+                }
+                (false, None, _) => {}
             }
         }
+    }
+
+    /// Record how long one unwind stamp stood before an execution step (or the
+    /// end of the unwind) discharged it — [`Vm::unwind_gate_ns`].
+    fn note_unwind_gate(&mut self, since: Nanos) {
+        self.unwind_gate_ns = self.unwind_gate_ns.max(self.clock.since(since));
     }
 
     fn execute_inner(&mut self, step: Step, choices: &mut ChoiceStream) {
@@ -835,16 +908,6 @@ impl<'q> Vm<'q> {
             ChargeShape::Double { process } => self.scenario.process_index(process),
         };
         for cpu in 0..self.scenario.cpus {
-            // Charged whether or not a task is loaded, and *not* charged while
-            // an RT task is: invariant I14's latency half is measured on this
-            // clock, and `scheduler-core-spec.md` §3 gives the RT band
-            // precedence over the whole normal band — which since §7.2 includes
-            // a dying task. An idle CPU is denying the retire nothing, so its
-            // time counts; a CPU serving RT is doing what the law tells it to,
-            // so its time does not.
-            if !self.cpus[cpu].running().is_some_and(|t| t.rt().is_rt()) {
-                self.fair_ns[cpu] += delta;
-            }
             let Some(task) = self.cpus[cpu].running() else {
                 continue;
             };
@@ -1384,11 +1447,10 @@ impl<'q> Vm<'q> {
         self.run_pass(cpu, Dispose::Exit);
     }
 
-    /// Stamp a retire in both of invariant I14's clocks — see [`Killed`].
+    /// Stamp a retire on invariant I14's clock — see [`Killed`].
     fn note_kill(&self) -> Killed {
         Killed {
             at: self.clock,
-            fair_at: self.fair_ns.clone(),
             seen_on: None,
             max_peers: 0,
         }

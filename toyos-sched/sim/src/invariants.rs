@@ -18,119 +18,101 @@ use toyos_sched::fair::{MAX_VRUNTIME_LAG_NS, QUANTUM_NS};
 use toyos_sched::invariants::{residents, Container};
 use toyos_sched::task::{TaskKey, TaskState};
 
+use toyos_sched::cpu::{DYING_AGE_NS, DYING_CHUNK_NS};
+
 use crate::vm::{FairEpoch, Vm, IPI_LATENCY_NS, RUN_CHUNK_NS, UNWIND_NS};
 
 /// How long a CPU may keep running a normal task while an RT task is ready on
-/// it (invariant I4): the interrupt's own delivery bound, plus the
-/// preempt-off section it may have to wait out, plus the granularity of one
-/// execution step. Measured in the CPU's *own* busy time, so another CPU's
-/// progress cannot inflate it.
+/// it (invariant I4): the interrupt's own delivery bound, plus the preempt-off
+/// section it may have to wait out, plus the granularity of one execution step,
+/// **plus one aged corpse's chunk**. Measured in the CPU's *own* busy time, so
+/// another CPU's progress cannot inflate it.
 ///
-/// **Re-derived against `specs/completion-architecture-spec.md` §7.2, and the
-/// answer is that it does not move.** §7.2 introduced a fourth container — the
-/// dying list — holding tasks that are running, killed, and unwinding. A
-/// container the pick empties *before* `rq` would have added a term to this
-/// bound, and not a small one: nothing preempts a task the next pick hands the
-/// CPU straight back to, so the term would have been the whole unwind, once per
-/// killed task, and the bound would have become a statement about how long a
-/// kernel unwind takes rather than about interrupt delivery. That is the shape
-/// the chunk landed with and it is fixed at its source instead:
-/// `SchedPass::pick` serves `rq` — the only place the RT band lives — whenever
-/// `rq.has_rt()`, and `preempt_if_due` takes a killed running task off the CPU
-/// on exactly the same two conditions as any other. So a dying task is
-/// preempted for RT like the fair-band work it is, every term below is
-/// unchanged, and there is no fifth one.
+/// **The fourth term is what bounded deferral costs, and it is priced here
+/// rather than declared away.** `specs/completion-architecture-spec.md` §7.2
+/// introduced the dying list; the first attempt served it *before* `rq` and the
+/// term would have been the whole unwind, once per killed task, turning this
+/// bound into a statement about how long a kernel teardown takes. The second
+/// attempt served it strictly *after* `rq` and had no term at all — at the price
+/// of a corpse that never runs under a saturated RT band, which is
+/// `scheduler::retire_task`'s tripwire and a kernel panic from a legal
+/// `Rights::RT` workload.
 ///
-/// It is stated here rather than assumed because the sim could not previously
-/// have told the difference: until [`crate::vm::UNWIND_NS`] a killed task's
-/// death cost zero simulated nanoseconds, so `waited` below was measured as 0
-/// however the pick was ordered.
+/// What ships is neither absolute. `CpuSched::pick` takes the dying list ahead
+/// of the RT band only once its head has waited
+/// [`toyos_sched::cpu::DYING_AGE_NS`], and dispatches it for exactly
+/// [`toyos_sched::cpu::DYING_CHUNK_NS`] with `CpuSched::aged_grant` holding the
+/// preemption off for that long and no longer. So a ready RT task gives up one
+/// chunk, and gives it up **at most once per age window**: the window this
+/// bound measures closes the instant the RT task runs, and the corpse's stamp
+/// restarts when it is preempted back, so the next aged chunk is a full
+/// `DYING_AGE_NS` away. `DYING_AGE_NS`'s own doc carries the inequality that
+/// makes that a fact — it has to exceed this bound, and 10 ms against 3.7 ms
+/// does.
 fn rt_latency_bound(max_kernel_section: u64) -> u64 {
-    IPI_LATENCY_NS + max_kernel_section + 2 * RUN_CHUNK_NS
+    IPI_LATENCY_NS + max_kernel_section + 2 * RUN_CHUNK_NS + DYING_CHUNK_NS
 }
 
 /// How long a retire may take to reach `Hw::release` (invariant I14), measured
-/// on [`crate::vm::Vm::fair_ns`] rather than on the wall clock — see
-/// [`crate::vm::Killed`] for why the RT band is excluded from it.
+/// on the **wall clock** — the one `scheduler::retire_task`'s own tripwire
+/// reads, and see [`crate::vm::Killed`] for why there is no second clock any
+/// more.
 ///
-/// **Re-derived hop by hop against `specs/completion-architecture-spec.md`
-/// §7.2, because the shape of the wait changed and not merely its length.**
-/// What the retirer waits for is `Hw::release`, and between the claim and that
-/// call there are five things:
+/// Hop by hop, from the claim to the call:
 ///
 /// 1. `IPI_LATENCY_NS` — `retire::post` kicks the CPU the word names with
 ///    `Urgency::Preempt`, and this is how long that delivery may take.
 /// 2. `max_kernel_section` — the preempt-off section the target may be inside
 ///    when the interrupt lands.
 /// 3. `QUANTUM_NS` — the pass drains the retire and the victim reaches the
-///    dying list, but the pick can only take it once the CPU is free to
-///    switch: a *running* fair task keeps the CPU until its quantum expires
-///    (spec §7.6's "bounded by the quantum"). RT service is not a term here
-///    because it is not on this clock at all — see [`crate::vm::Killed`].
-/// 4. `(1 + peers) × UNWIND_NS` — the unwind itself, plus the unwinds already
-///    queued ahead of it on that CPU.
-/// 5. `QUANTUM_NS` again — **the hop the first version of this bound never
-///    named, and the one the measurements landed on.** `die` publishes `Dead`
-///    and leaves the record as this CPU's *zombie*, because a pass cannot free
-///    the stack it is standing on; the payload is released by the **next** pass
-///    on that CPU (`SchedPass::begin`), and if that CPU dispatched another task
-///    its next pass is that task's quantum expiry. `retire_task`'s own doc
-///    states the same hop from the other side — "`Dead` is published by the
-///    reaping transition, one pass before the release" — and the wait is for
-///    the release, not for the word.
+///    dying list, but the pick can only take it once the CPU is free to switch:
+///    a *running* fair task keeps the CPU until its quantum expires (spec
+///    §7.6's "bounded by the quantum").
+/// 4. **`(1 + peers) × UNWIND_NS × STRETCH`** — the unwind itself, the unwinds
+///    already queued ahead of it on that CPU, and the real-time band's bounded
+///    share of the same CPU. See [`rt_deferral_stretch`].
+/// 5. `QUANTUM_NS` again — `die` publishes `Dead` and leaves the record as this
+///    CPU's *zombie*, because a pass cannot free the stack it is standing on;
+///    the payload is released by the **next** pass on that CPU
+///    (`SchedPass::begin`), and if that CPU dispatched another task its next
+///    pass is that task's quantum expiry. `retire_task`'s own doc states the
+///    same hop from the other side, and the wait is for the release, not for
+///    the word.
 ///
 /// plus `2 × RUN_CHUNK_NS`, invariant I4's granularity term: the model observes
 /// each hop up to one execution chunk late.
 ///
-/// **The unwind term is what §7.2 costs.** A retire no longer converts anything
-/// on arrival: it makes the victim *runnable* and the victim dies by its own
-/// hand, on its own stack, through the return path of whatever syscall it was
-/// in. The model charges that at [`crate::vm::UNWIND_NS`].
-///
-/// **The previous form of this paragraph was wrong twice and is replaced rather
-/// than extended**, because both errors are traps:
-///
-/// * It added `RUN_CHUNK_NS` for "one more execution step", and the step it
-///   named cost **zero** simulated nanoseconds — `Vm::exec_op` finished a
-///   killed task without advancing the clock at all. A term was added to the
-///   bound for a quantity the model did not spend.
-/// * It cited a 60-seed measurement (1,000,000 → 1,500,000 ns, "exactly one
-///   `RUN_CHUNK_NS`") that the committed sweep's own seed count does not
-///   support: at 500 seeds the worst observed retire was 2,000,000 ns on both
-///   sides of that change — a delta of zero — and the 500,000 ns delta quoted
-///   was in any case half of the term it was offered as evidence for. Re-run at
-///   500 seeds, the change did add latency in 155 of 500 seeds, by up to
-///   2 × `RUN_CHUNK_NS`; what it did not move was the worst-case statistic,
-///   which is the only one this bound is about.
-///
-/// **`peers` is the other half of the same cost, and the dying list's own field
-/// doc used to deny it.** That doc said a dying task's wait is "one pick and not
-/// the depth of the queue" — true of the *fair* band it jumps, and false of the
-/// dying list itself, which is one CPU's queue of unwinds and runs them one at
-/// a time. Two threads of one process retired together onto one CPU means the
-/// second waits out the first, so the term is `(1 + peers) × UNWIND_NS` where
-/// `peers` is the greatest number of *other* corpses that CPU has held since
-/// this retire was claimed. A workload-shaped term in a derived bound, exactly
-/// as invariant I5's `(runnable threads + 1)` factor is, and for the same
-/// reason: one CPU cannot run two unwinds at once, and pretending otherwise
-/// would price the machine rather than the protocol.
-///
-/// **Measured on the tree that charges the unwind**, over
-/// `sim/tests/scenarios.rs`'s `a_retire_completes_inside_its_derived_bound`:
-/// the worst retire is **17,000,000 ns against its own 26,200,000 ns bound**
-/// (that victim had no peer queued ahead of it, so its bound is the one-unwind
-/// form). The whole gate at 2,000 seeds per scenario is clean.
-///
-/// Derived, not recorded, and deliberately *not* the kernel's 1 s wall clock:
-/// `retire_task`'s tripwire is more than an order of magnitude wider, and
-/// `kernel/src/scheduler.rs` carries the re-derivation of that number against
-/// this mechanism.
+/// **`peers` is a workload-shaped term**, exactly as invariant I5's
+/// `(runnable threads + 1)` factor is. Two threads of one process retired
+/// together onto one CPU means the second waits out the first: one CPU cannot
+/// run two unwinds at once, and pretending otherwise would price the machine
+/// rather than the protocol. `peers` is the greatest number of *other* corpses
+/// that CPU has held since this retire was claimed.
 fn retire_latency_bound(max_kernel_section: u64, peers: usize) -> u64 {
     2 * QUANTUM_NS
         + IPI_LATENCY_NS
         + max_kernel_section
         + 2 * RUN_CHUNK_NS
-        + (1 + peers as u64) * UNWIND_NS
+        + (1 + peers as u64) * UNWIND_NS * rt_deferral_stretch()
+}
+
+/// By how much a saturated real-time band stretches an unwind's wall-clock
+/// length, which is the factor term 4 of [`retire_latency_bound`] carries.
+///
+/// `CpuSched::pick` delivers an aged corpse one
+/// [`toyos_sched::cpu::DYING_CHUNK_NS`] per
+/// `DYING_AGE_NS + DYING_CHUNK_NS`, so `UNWIND_NS` of the victim's own CPU time
+/// takes that multiple of wall clock to spend when the RT band never empties.
+/// It is charged unconditionally because a bound is a worst case, and it is a
+/// *finite* factor rather than the unbounded term the previous form of this
+/// derivation declined to price at all.
+///
+/// The same factor is a term of `scheduler::retire_task`'s `GIVE_UP`
+/// derivation, and `toyos_sched`'s own
+/// `an_unwind_under_saturated_rt_is_stretched_by_the_age_ratio` is what stops
+/// the two drifting apart.
+fn rt_deferral_stretch() -> u64 {
+    (DYING_AGE_NS + DYING_CHUNK_NS) / DYING_CHUNK_NS
 }
 
 pub fn check_all(vm: &mut Vm<'_>) {
@@ -378,8 +360,8 @@ fn check_retires(vm: &mut Vm<'_>) {
         }
         if elapsed > bound {
             problems.push(format!(
-                "I14: {key:?} was retired {elapsed} ns ago (of its cpu's non-RT time) and is \
-                 still {:?} (bound {bound} ns)",
+                "I14: {key:?} was retired {elapsed} ns ago and is still {:?} \
+                 (bound {bound} ns, on the wall clock `retire_task` reads)",
                 vm.shared[&key].state(),
             ));
         }
@@ -406,22 +388,13 @@ fn owner_of(state: TaskState) -> Option<usize> {
     }
 }
 
-/// How long this retire has been outstanding, on the clock [`crate::vm::Killed`]
-/// argues for: elapsed time on the CPU that owns the victim, with that CPU's RT
-/// service taken out.
+/// How long this retire has been outstanding, on the clock
+/// `scheduler::retire_task`'s own tripwire reads: the wall clock, every CPU's
+/// and no CPU's, with nothing subtracted from it.
 ///
-/// A victim in no CPU at all — `InTransit`, before any CPU has been seen owning
-/// it — is charged against the wall clock, which is strictly the harsher
-/// reading and the right one for the state whose whole hazard is that no
-/// interrupt is scheduled to end it. A `Dead` one is charged against the CPU
-/// that last owned it, so the number the sweep reports and the number the bound
-/// is read on are the same clock.
+/// [`crate::vm::Killed`] carries why there is no second clock any more.
 fn retire_elapsed(vm: &Vm<'_>, key: TaskKey) -> u64 {
-    let killed = &vm.killed[&key];
-    match owner_of(vm.shared[&key].state()).or(killed.seen_on) {
-        Some(cpu) => vm.fair_ns[cpu] - killed.fair_at[cpu],
-        None => vm.clock.since(killed.at),
-    }
+    vm.clock.since(vm.killed[&key].at)
 }
 
 /// I3 / invariant T: the armed deadline is never later than the earliest

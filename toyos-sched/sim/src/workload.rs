@@ -178,6 +178,21 @@ pub enum MigrateShape {
     KeepTheCorpse,
 }
 
+/// How the pick weighs a ready real-time task against a corpse waiting to
+/// unwind — `scheduler-core-spec.md` §3.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AgeShape {
+    /// What ships: the RT band goes first until the head of the dying list has
+    /// waited `DYING_AGE_NS`, and then that corpse takes one `DYING_CHUNK_NS`
+    /// ahead of it. Bounded in both directions.
+    BoundedDeferral,
+    /// The shape this branch shipped between the two fixes: `pick` asks only
+    /// `rq.has_rt()`, so a permanently-RT thread that never parks holds the
+    /// dying list closed for ever and `scheduler::retire_task`'s tripwire
+    /// panics the kernel. See `scenarios::old_rt_starved_the_corpse`.
+    RtOutranksEveryCorpse,
+}
+
 /// What a fair share is a share *of* — spec §9.1's "all threads of one process
 /// share a vruntime".
 ///
@@ -238,6 +253,7 @@ pub struct Scenario {
     pub window: WindowShape,
     pub park: ParkShape,
     pub migrate: MigrateShape,
+    pub age: AgeShape,
     pub share: ShareShape,
     pub charge: ChargeShape,
     /// How the fair band picks between two ready threads of one share. A
@@ -314,6 +330,11 @@ impl Scenario {
 
     pub fn with_migrate(mut self, migrate: MigrateShape) -> Self {
         self.migrate = migrate;
+        self
+    }
+
+    pub fn with_age(mut self, age: AgeShape) -> Self {
+        self.age = age;
         self
     }
 
