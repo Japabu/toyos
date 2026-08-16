@@ -1,9 +1,18 @@
 //! The retire protocol — spec §7.6: a sticky kill bit plus a message chase.
 //!
-//! Termination argument: the kill bit is already set when the message is
-//! posted, so whichever CPU ends up owning the task converts it to a dead task
-//! on arrival, and the chase is bounded by the number of in-flight hops (≤1 in
-//! practice). Nothing scans; the home CPU in the state word is the proof.
+//! **Termination argument, restated for `specs/completion-architecture-spec.md`
+//! §7.2.** The kill bit is already set when the message is posted, so whichever
+//! CPU ends up owning the task *schedules* it — into that CPU's dying list, or
+//! by asking a running victim for a safe point — and it dies by its own `die`
+//! at the first safe point its own unwind reaches. The chase is bounded by the
+//! number of in-flight hops (≤1 in practice). Nothing scans; the home CPU in
+//! the state word is the proof.
+//!
+//! The struck form said the owning CPU "converts it to a dead task on arrival",
+//! and that conversion is exactly what §7.2 deleted: this kernel does not
+//! unwind, so discarding the task value discarded every guard on its kernel
+//! stack. The chase's bound is unchanged — what changed is what the last hop
+//! does.
 
 use crate::cpu::CpuHandles;
 use crate::hw::{CpuId, Kicker};
@@ -32,7 +41,8 @@ pub fn begin<M>(shared: &Arc<TaskShared<M>>) -> RetireTicket<'_, M> {
 
 impl<M: SchedMsg> RetireTicket<'_, M> {
     /// Post `Msg::Retire` to wherever the task currently lives. `None` means
-    /// the task is already dead — the message would have nothing to reap.
+    /// the task is already dead — there is nobody left to ask for a safe
+    /// point, and no stack left to unwind.
     pub fn post(
         self,
         cpus: &CpuHandles<M>,
@@ -83,7 +93,8 @@ fn post_retire<M: SchedMsg>(
 }
 
 /// Which CPU must handle the task's death. For a task in transit that is the
-/// destination — the adopting CPU sees the kill bit and reaps on arrival.
+/// destination — the adopting CPU sees the kill bit and dispatches it into its
+/// own dying list on arrival.
 fn home_of(state: TaskState) -> Option<CpuId> {
     match state {
         TaskState::Running(cpu)

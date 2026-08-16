@@ -449,9 +449,12 @@ impl<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> WaitTicket<'q, M, L> {
     /// task "dies at its next safe point" has to be kept *here* and cannot be
     /// kept later: `handle_retire` already consumed the retire message and
     /// answered it with `need_resched` because the task was still running.
-    /// Park it anyway and nothing is left to reap it — a parked task is never
-    /// picked, the retirer waits on a word that never reaches `Dead`, and the
-    /// address space the payload holds is never released.
+    /// Park it anyway and nothing brings the task back — a parked task is
+    /// woken by a wake and there is no second retire to send one, the retirer
+    /// waits on a release that never comes, and the address space the payload
+    /// holds is never freed. The refusal is what keeps the task *running*, on
+    /// its own stack, which since
+    /// `specs/completion-architecture-spec.md` §7.2 is where its death happens.
     ///
     /// The kill check comes first because it subsumes the wake: a task about
     /// to die has no use for a wake, and `cancel_commit` puts the word back to

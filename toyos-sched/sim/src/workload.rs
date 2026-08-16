@@ -166,12 +166,15 @@ pub enum ParkShape {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MigrateShape {
     /// Spec §7.6's promptness carried into the balance path: a killed task is
-    /// reaped by the CPU that holds it, and never handed on.
+    /// kept by the CPU that holds it and dispatched there, never handed on.
+    /// The variant keeps the name it was minted with, and the name is now the
+    /// *old* mechanism — §7.2 replaced the reap with a dispatch and the
+    /// promptness argument is unchanged by that.
     ReapTheCorpse,
     /// The balance path before it read the kill bit: a killed ready task is
-    /// migrated like any other, and its reap then rides an `Urgency::Normal`
-    /// adopt to a CPU that owes it nothing sooner than its next voluntary pass.
-    /// See `scenarios::old_migrate_kept_the_corpse`.
+    /// migrated like any other, and its unwind then waits on an
+    /// `Urgency::Normal` adopt reaching a CPU that owes it nothing sooner than
+    /// its next voluntary pass. See `scenarios::old_migrate_kept_the_corpse`.
     KeepTheCorpse,
 }
 

@@ -206,11 +206,11 @@ pub fn retire_under_balance() -> Scenario {
 ///
 /// It **must fail** invariant I14. `answer_steal_requests` pops from the back
 /// of the fair band and migrates without reading the kill bit, so a task the
-/// victim CPU would have reaped at its own next `pick` becomes an
+/// victim CPU would have dispatched at its own next `pick` becomes an
 /// `Urgency::Normal` adopt aimed at a CPU that owes it nothing until its next
 /// voluntary pass. Every other state a killed task can be in has an interrupt
-/// behind its reap; `InTransit` has none, and this is the code that put tasks
-/// there on purpose.
+/// behind the pass that handles it; `InTransit` has none, and this is the code
+/// that put tasks there on purpose.
 pub fn old_migrate_kept_the_corpse() -> Scenario {
     let mut scenario = retire_under_balance().with_migrate(MigrateShape::KeepTheCorpse);
     scenario.name = "old_migrate_kept_the_corpse";

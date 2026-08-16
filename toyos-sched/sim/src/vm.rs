@@ -1267,8 +1267,8 @@ impl<'q> Vm<'q> {
     /// There is no kill check here. A `Retire` that lands between the two
     /// halves is honoured by `WaitTicket::commit`, in the core, where both
     /// this driver and the kernel's get it — which is where it belongs, since
-    /// a driver that forgot it would leave the task parked with nothing left
-    /// to reap it.
+    /// a driver that forgot it would park a task that nothing will wake and
+    /// whose unwind therefore never starts.
     fn block_pass(&mut self, cpu: usize, choices: &mut ChoiceStream) {
         let Blocking {
             key,
