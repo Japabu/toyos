@@ -120,7 +120,7 @@ system.toml        What to build and boot
 
 ## Planned work
 
-- `specs/scheduler-core-spec.md` — the ownership-typed scheduler core; nine negative gates prove the harnesses have teeth, never weaken one to make a change pass.
+- `specs/scheduler-core-spec.md` + `specs/scheduling-reservations-spec.md` — the ownership-typed scheduler core, and the reservation model that replaces its band ordering; the sim's negative gates prove the harnesses have teeth, never weaken one to make a change pass.
 - `specs/iommu-spec.md` + `specs/plans/iommu-plan.md` + `specs/plans/userspace-drivers-spec.md` — the IOMMU and the userspace drivers it makes safe.
 - `specs/plans/hda-driver-plan.md` — HDA on the T14; the line is who writes an address: soundd never holds a physical address.
 - `specs/completion-architecture-spec.md` — kill every wait: one completion primitive, one park site, a CPU never waits for a device, and a kill is answered by `Cancelled` rather than by discarding the stack.
