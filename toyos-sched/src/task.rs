@@ -749,25 +749,23 @@ impl<X: SchedPayload> TaskBuilder<X> {
 }
 
 impl<X: SchedPayload> TransitTask<X> {
-    /// Arrival at the destination CPU. A task killed while in flight is
-    /// converted here — which is exactly why the retire chase terminates
-    /// (spec §7.6): whoever ends up owning the task reaps it.
-    pub(crate) fn adopt(self, cpu: CpuId, now: Nanos) -> Result<ReadyTask<X>, DeadTask<X>> {
+    /// Arrival at the destination CPU.
+    ///
+    /// **A task killed in flight is adopted like any other**, where it used to
+    /// be converted straight to a corpse. The retire chase still terminates,
+    /// and its argument is sharper for the change: whoever ends up owning the
+    /// task *dispatches* it, and it dies by its own `die` once its kernel
+    /// stack has unwound. Discarding the value here discarded that stack —
+    /// `specs/completion-architecture-spec.md` §7.1's arm 6.
+    pub(crate) fn adopt(self, cpu: CpuId, now: Nanos) -> ReadyTask<X> {
         let mut task = self.0;
         task.0.since = now;
-        if task.0.shared.kill_pending() {
-            assert!(
-                task.0.shared.transition(TaskState::InTransit(cpu), TaskState::Dead),
-                "adopt of a task that is not in transit to this CPU",
-            );
-            return Err(DeadTask(task));
-        }
         assert!(
             task.0.shared.transition(TaskState::InTransit(cpu), TaskState::Ready(cpu)),
             "adopt of a task that is not in transit to this CPU: {:?}",
             task.0.shared.state(),
         );
-        Ok(ReadyTask(task))
+        ReadyTask(task)
     }
 
     pub(crate) fn adopt_node(&self) -> &MailboxNode<Msg<X>> {
@@ -807,18 +805,6 @@ impl<X: SchedPayload> ReadyTask<X> {
             task.0.shared.state(),
         );
         TransitTask(task)
-    }
-
-    /// The kill bit was observed at pick or a `Retire` message arrived.
-    pub(crate) fn reap(self, cpu: CpuId, now: Nanos) -> DeadTask<X> {
-        let mut task = self.0;
-        task.charge_residency(now, Residency::Ready);
-        assert!(
-            task.0.shared.transition(TaskState::Ready(cpu), TaskState::Dead),
-            "reap of a task that is not ready on this CPU: {:?}",
-            task.0.shared.state(),
-        );
-        DeadTask(task)
     }
 
     pub(crate) fn is_rt(&self) -> bool {
@@ -883,6 +869,13 @@ impl<X: SchedPayload> RunningTask<X> {
     }
 
     /// Exit, or a kill honoured at a safe point.
+    ///
+    /// **The only death there is**, since
+    /// `specs/completion-architecture-spec.md` §7.2: `ReadyTask::reap` and
+    /// `BlockedTask::reap` are gone with the arms that called them, so a task
+    /// can only become a corpse on the CPU it is running on, by its own hand,
+    /// with its kernel stack already unwound. Everything a reap-in-place used
+    /// to discard is now released by the ordinary return path.
     pub(crate) fn die(self, cpu: CpuId, now: Nanos) -> DeadTask<X> {
         let mut task = self.0;
         task.charge_residency(now, Residency::Running);
@@ -944,18 +937,6 @@ impl<X: SchedPayload> BlockedTask<X> {
         ReadyTask(task)
     }
 
-    /// `Msg::Retire` found the task parked.
-    pub(crate) fn reap(self, cpu: CpuId, class: WaitClass, now: Nanos) -> DeadTask<X> {
-        let mut task = self.0;
-        task.charge_residency(now, Residency::Blocked(class));
-        let from = task.0.shared.state();
-        assert!(
-            matches!(from, TaskState::Blocked(c) | TaskState::WakeQueued(c) if c == cpu),
-            "reap of a task that is not parked on this CPU: {from:?}",
-        );
-        assert!(task.0.shared.transition(from, TaskState::Dead));
-        DeadTask(task)
-    }
 }
 
 impl<X: SchedPayload> DeadTask<X> {

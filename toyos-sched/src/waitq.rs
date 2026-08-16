@@ -121,6 +121,33 @@ impl<M: SchedMsg, L: LeafLock<WaitList<M>>> WaitQueue<M, L> {
     /// cancelled or committed.
     #[must_use = "a wait ticket must be committed or cancelled"]
     pub fn prepare_wait<'q>(&'q self, cur: &CurrentTask<'_, M>) -> WaitTicket<'q, M, L> {
+        self.register(cur, Cancel::Answers)
+    }
+
+    /// Phase 1 for a wait that a kill may **not** end.
+    ///
+    /// `specs/completion-architecture-spec.md` §7.4's third shape, which it
+    /// calls the honest one: a `commit()` that distinguishes cancellable from
+    /// uncancellable waits. The other two — a kill bit cleared for the window,
+    /// or a park variant that ignores it — either open a hole in the
+    /// termination argument or hide the distinction from the type system.
+    ///
+    /// It exists because §7.2 makes `Commit::Killed` a *disposition* rather
+    /// than an exit: a killed task keeps running and unwinds. A site that
+    /// cannot propagate a cancel — the retirer waiting for its victim's
+    /// release is the one — would otherwise get `Killed` back from every
+    /// acquire and spin, which is exactly the `sleeplock-spins` negative gate
+    /// staged by the production path. Such a site is bounded by its own
+    /// tripwire and by the event it waits for, never by the kill.
+    #[must_use = "a wait ticket must be committed or cancelled"]
+    pub fn prepare_wait_uncancellable<'q>(
+        &'q self,
+        cur: &CurrentTask<'_, M>,
+    ) -> WaitTicket<'q, M, L> {
+        self.register(cur, Cancel::Ignores)
+    }
+
+    fn register<'q>(&'q self, cur: &CurrentTask<'_, M>, cancel: Cancel) -> WaitTicket<'q, M, L> {
         assert!(
             cur.shared.set_waiting(),
             "a task waits on at most one queue",
@@ -132,6 +159,7 @@ impl<M: SchedMsg, L: LeafLock<WaitList<M>>> WaitQueue<M, L> {
             shared: cur.shared.clone(),
             cpu: cur.cpu,
             generation,
+            cancel,
             armed: true,
             _not_send: PhantomData,
         }
@@ -261,10 +289,28 @@ pub struct WaitTicket<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> {
     shared: Arc<TaskShared<M>>,
     cpu: CpuId,
     generation: Gen,
+    cancel: Cancel,
     /// Disarmed by `cancel`/`commit`; still armed at drop means a
     /// registration was abandoned.
     armed: bool,
     _not_send: PhantomData<*mut ()>,
+}
+
+/// Whether a kill ends this wait.
+///
+/// A property of the *wait* and not of the task, which is what
+/// `specs/completion-architecture-spec.md` §7.4 settles: the same thread may
+/// hold both kinds, one after the other — a cancellable park on the way in and
+/// an uncancellable one on the way out, in the teardown its own cancel sent it
+/// to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Cancel {
+    /// The ordinary park. A kill refuses the commit, the caller is told, and
+    /// it unwinds.
+    Answers,
+    /// The park a kill may not end. The caller cannot propagate a cancel and
+    /// is bounded by something else.
+    Ignores,
 }
 
 /// The result of cancelling a registration.
@@ -380,7 +426,7 @@ impl<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> WaitTicket<'q, M, L> {
     /// `Running(cpu)` either way, which is what the exit disposition needs.
     pub fn commit(mut self) -> Commit<'q, M, L> {
         self.armed = false;
-        if self.shared.kill_pending() {
+        if self.cancel == Cancel::Answers && self.shared.kill_pending() {
             self.queue.dequeue(&self.shared);
             let _ = self.shared.cancel_commit(self.cpu, self.generation);
             return Commit::Killed;

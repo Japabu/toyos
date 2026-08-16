@@ -32,16 +32,33 @@ fn rt_latency_bound(max_kernel_section: u64) -> u64 {
 /// How long a retire may take to reach `Hw::release` (invariant I14).
 ///
 /// One quantum is what a *running* target is allowed before its next safe
-/// point — spec §7.6's "bounded by the quantum" — and the other three terms
+/// point — spec §7.6's "bounded by the quantum" — and the next three terms
 /// are I4's: the kick's delivery bound, the preempt-off section the target may
 /// be inside, and the granularity of an execution step. Everything else the
 /// protocol does is a message the target consumes at the start of that pass.
 ///
+/// **The last term is new, and it is what
+/// `specs/completion-architecture-spec.md` §7.2 costs.** A retire no longer
+/// converts anything on arrival: it makes the victim *runnable* and the victim
+/// dies by its own hand, so the bound now covers one more execution step — the
+/// dispatch that starts the unwind and the exit that ends it. In this world
+/// that unwind is one step, because a killed task's next op is its death
+/// (`Vm::exec_op`); in the kernel it is the return path of whatever syscall the
+/// thread was in, which is why `retire_task`'s wall clock is the other half of
+/// this statement and is re-derived beside it.
+///
+/// **Measured rather than assumed**, on 60 seeds of `retire_under_balance`
+/// either side of that change: the worst observed retire went from
+/// 1,000,000 ns to 1,500,000 ns — exactly one `RUN_CHUNK_NS`, which is the
+/// term added here — against a bound of 12,200,000 ns before and 13,200,000 ns
+/// after. The whole gate at 2,000 seeds per scenario is clean at both.
+///
 /// Derived, not recorded, and deliberately *not* the kernel's 1 s wall clock:
-/// `retire_task`'s deadline is a hundred times this, so a scenario that holds
-/// this bound says the wall clock had two orders of magnitude of headroom.
+/// `retire_task`'s deadline is nearly a hundred times this, so a scenario that
+/// holds this bound says the wall clock had two orders of magnitude of
+/// headroom.
 fn retire_latency_bound(max_kernel_section: u64) -> u64 {
-    QUANTUM_NS + IPI_LATENCY_NS + max_kernel_section + 2 * RUN_CHUNK_NS
+    QUANTUM_NS + IPI_LATENCY_NS + max_kernel_section + 2 * RUN_CHUNK_NS + RUN_CHUNK_NS
 }
 
 pub fn check_all(vm: &mut Vm<'_>) {
@@ -73,7 +90,10 @@ fn runnable_now(vm: &Vm<'_>) -> (Vec<u32>, Vec<u32>, BTreeSet<TaskKey>) {
     let mut threads = BTreeSet::new();
     for cpu in 0..cpus {
         for (key, container) in residents(&vm.cpus[cpu]) {
-            if !matches!(container, Container::Running | Container::Ready) {
+            if !matches!(
+                container,
+                Container::Running | Container::Ready | Container::Dying
+            ) {
                 continue;
             }
             threads.insert(key);
@@ -92,7 +112,10 @@ fn runnable_per_process(vm: &Vm<'_>) -> Vec<u32> {
     let mut counted = vec![0u32; vm.procs.len()];
     for cpu in 0..vm.scenario.cpus {
         for (key, container) in residents(&vm.cpus[cpu]) {
-            if !matches!(container, Container::Running | Container::Ready) {
+            if !matches!(
+                container,
+                Container::Running | Container::Ready | Container::Dying
+            ) {
                 continue;
             }
             if let Some(process) = vm.process_of(key) {
@@ -125,6 +148,7 @@ fn check_single_ownership(vm: &mut Vm<'_>) {
             let agrees = match (container, state) {
                 (Container::Running, TaskState::Running(c))
                 | (Container::Ready, TaskState::Ready(c))
+                | (Container::Dying, TaskState::Ready(c))
                 | (Container::Parked, TaskState::Blocked(c))
                 | (Container::Parked, TaskState::WakeQueued(c)) => c.0 as usize == cpu,
                 // A task that has registered on a wait queue and not yet parked
@@ -203,12 +227,19 @@ fn check_sleeping_cpus(vm: &mut Vm<'_>) {
 ///
 /// Two halves of one property, because the protocol's promptness rests on two
 /// different things. **A killed task is never migrated**: `InTransit` is the
-/// one state whose reap is not backed by an interrupt — the destination's
+/// one state whose handling is not backed by an interrupt — the destination's
 /// adopt carries `Urgency::Normal`, which by design sends no IPI to a busy CPU
-/// — so a CPU that hands on a task it knows is dead trades a reap it could do
-/// in this pass for a wait on another CPU's next voluntary one. **And a retire
-/// completes within [`retire_latency_bound`]**, which is the statement the
-/// kernel's `retire_task` makes with a wall clock and a panic.
+/// — so a CPU that hands on a task it knows is dead trades an unwind it could
+/// start in this pass for a wait on another CPU's next voluntary one. **And a
+/// retire completes within [`retire_latency_bound`]**, which is the statement
+/// the kernel's `retire_task` makes with a wall clock and a panic.
+///
+/// **Both halves survive `specs/completion-architecture-spec.md` §7.2 and only
+/// one of them changed.** That section makes a killed task *run* rather than
+/// be reaped where it lies, so the first half's justification is now about
+/// where the unwind can start rather than where the reap can happen — the
+/// sentence above is written in those terms and the check is the same check.
+/// The second half gained one term and is re-derived at its own definition.
 ///
 /// The first half is what `scenarios::old_migrate_kept_the_corpse` proves has
 /// teeth; the second is a bound in the shape of I4's, and it is what a future

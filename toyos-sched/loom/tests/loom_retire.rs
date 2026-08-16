@@ -228,3 +228,79 @@ fn an_adopting_cpu_always_observes_the_kill_bit() {
         assert!(!task.retire_node().in_flight());
     });
 }
+
+/// **The fifth race, and the one `specs/completion-architecture-spec.md` §7.3
+/// names as missing: a retire that finds its victim already parked.**
+///
+/// §7.2 rewrites that arm from a reap-in-place into a claim-arbitrated wake,
+/// and the arbitration is the whole of what can go wrong. The retirer and a
+/// remote waker reach for the same rendezvous word; exactly one of them may win
+/// it, and whichever loses must leave the task somewhere the other one's
+/// message will find it. The defect this excludes is the one §7.2(c) describes
+/// in terms: remove-then-convert, where the retirer takes the entry out of
+/// `parked` and then loses the claim, so the in-flight `Msg::Wake` lands on a
+/// `handle_wake` whose `parked.remove` returns `None` — and the task is in no
+/// container at all, never runnable, never reaped, until the retirer's own
+/// tripwire panics the machine.
+///
+/// Modelled at the claim rather than at the container, because the container
+/// is `CpuSched`'s and `CpuSched` is `!Sync`: one CPU owns it and no
+/// interleaving can reach it. What two CPUs really race for is this word.
+#[test]
+fn a_retire_and_a_wake_never_both_claim_a_parked_task() {
+    model(|| {
+        let (world, mut rx) = world();
+        let task = Arc::new(TaskShared::<Msg>::new(TaskKey(1), TaskState::Blocked(CPU0)));
+
+        // The waker: an ordinary post through the same claim CAS every wake
+        // goes through.
+        let waker = {
+            let world = world.clone();
+            let task = task.clone();
+            loom::thread::spawn(move || {
+                wake_direct(
+                    &task,
+                    WakeCause::new(WakeReason::Woken),
+                    &world.cpus,
+                    &world.kicks,
+                    &RemoteGuard,
+                )
+            })
+        };
+
+        // The retirer: the kill bit, the message, and then — on the CPU that
+        // owns the task — the claim `handle_retire` now makes.
+        retire::begin(&task).post(&world.cpus, &world.kicks, &RemoteGuard);
+        let retire_claimed = matches!(task.claim_wake(), toyos_sched_loom::task::Claim::Parked(_));
+
+        let wake_claimed = waker.join().unwrap();
+        let msgs = drain(&mut rx[0], &world.preempt);
+
+        assert!(
+            !(retire_claimed && wake_claimed),
+            "two claims on one parked task: the wake and the retire would both place it",
+        );
+        assert!(
+            retire_claimed || wake_claimed,
+            "neither claimed a task that was parked the whole time: it is in no container",
+        );
+        assert!(
+            msgs.contains(&Msg::Retire(TaskKey(1))),
+            "the retire message is delivered whichever way the claim went",
+        );
+        if wake_claimed {
+            // The retirer left the entry alone, which is what makes the
+            // in-flight wake able to find it. `handle_wake` places it, and the
+            // kill bit — already set above — is what sends it to the dying
+            // list rather than the fair queue.
+            assert!(
+                msgs.contains(&Msg::Wake(TaskKey(1), WakeReason::Woken)),
+                "the wake it lost to must be the message that places the task",
+            );
+            assert_eq!(task.state(), TaskState::WakeQueued(CPU0));
+        } else {
+            assert_eq!(task.state(), TaskState::WakeQueued(CPU0));
+        }
+        assert!(task.kill_pending(), "the kill bit is sticky either way");
+    });
+}
