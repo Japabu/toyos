@@ -1669,15 +1669,25 @@ const NULL_SINK_CLIENTS: usize = 2;
 /// the line never arriving rather than arriving wrong.
 ///
 /// The wait is [`await_guest`]'s: it ends when the removals are there, or when
-/// the guest goes quiet, and never on a span of host wall clock. It costs
-/// nothing on the runs that already had both lines — the predicate is checked
-/// before anything is drained — and its expiry is not a verdict, which is why
-/// the error is dropped: what fails this test is still the count, in
-/// `check_departures`'s own words.
+/// the guest stops making progress, and never on a span of host wall clock. It
+/// costs nothing on a run that already had both lines — the predicate is checked
+/// before anything is drained, which was true of 6 of 6 measured runs on the dev
+/// host — and its expiry is not a verdict, which is why the error is dropped:
+/// what fails this test is still the count, in `check_departures`'s own words.
+///
+/// [`audio::SOUNDD_GONE`] ends it too, for the same reason `await_null_sink`
+/// reads that line: soundd exiting is a removal that is never coming, and the
+/// test should say so in its own sentence rather than wait out the guard. The
+/// guard is the whole of [`qemu::GUEST_WEDGED`] here and not the quiet bound —
+/// this boot's kernel prints on a 10 s cadence, so the machine is never silent
+/// for the 15 s that would end the wait early (measured: an unreachable
+/// predicate takes 302 s). That price is paid only by a run where soundd is
+/// alive and has genuinely stopped reporting departures, which is the defect
+/// this test exists for.
 fn settle_null_sink_client_exits(qemu: &mut QemuInstance, result: &mut TestResult) {
     let mut serial = std::mem::take(&mut result.serial);
     let _ = await_guest(qemu, &mut serial, "soundd to report both clients leaving", |seen| {
-        audio::departures(seen).len() >= NULL_SINK_CLIENTS
+        audio::departures(seen).len() >= NULL_SINK_CLIENTS || seen.contains(audio::SOUNDD_GONE)
     });
     result.serial = serial;
 }

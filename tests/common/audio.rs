@@ -828,7 +828,10 @@ fn silent_runs(mono: &[i32], min_len: usize) -> Vec<SilentRun> {
 pub const NULL_SINK: &str = "soundd: no audio device, presenting a null sink";
 
 /// The kernel's word for the other outcome: soundd is not there any more.
-const SOUNDD_GONE: &str = "exit: soundd";
+///
+/// Read by every wait on something soundd owes, so that a dead mixer ends the
+/// wait with the caller's own sentence instead of a guard expiring.
+pub const SOUNDD_GONE: &str = "exit: soundd";
 
 /// Wait until soundd has said which sink it took, bounded by the guest.
 ///
