@@ -4,6 +4,8 @@ use super::{cpu, gdt};
 use crate::drivers::acpi;
 use crate::mm::paging::{CachePolicy, Occupancy};
 use crate::user_ptr::{SyscallContext, UserBytes, UserBytesMut};
+use toyos_sched::task::WaitClass;
+
 use crate::completion;
 use crate::object::{ops, port, KObjectRef};
 use crate::time::{Cadence, Deadline, Duration};
@@ -940,6 +942,7 @@ fn sys_write(h: RawHandle, buf: &UserBytes) -> u64 {
                         &parkable,
                         completion::Subject::of(&end.watch),
                         completion::Token::new(0),
+                        WaitClass::Pipe,
                         Deadline::never(),
                         || pipe::has_space(id),
                     )
@@ -1124,6 +1127,7 @@ fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
                     &parkable,
                     completion::Subject::of(&end.watch),
                     completion::Token::new(0),
+                    WaitClass::Pipe,
                     Deadline::never(),
                     || pipe::has_data(id),
                 )
@@ -1138,6 +1142,7 @@ fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
                     &parkable,
                     completion::Subject::of(&crate::sched::waitqs::AUDIO_WATCH),
                     completion::Token::new(0),
+                    WaitClass::Io,
                     Deadline::never(),
                     crate::drivers::virtio_sound::has_pending,
                 )
@@ -1152,6 +1157,7 @@ fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
                     &parkable,
                     completion::Subject::of(&crate::sched::waitqs::AUDIO_WATCH),
                     completion::Token::new(0),
+                    WaitClass::Io,
                     Deadline::never(),
                     crate::drivers::hda::has_pending,
                 )
@@ -1166,6 +1172,7 @@ fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
                     &parkable,
                     completion::Subject::of(&crate::sched::waitqs::KEYBOARD_WATCH),
                     completion::Token::new(0),
+                    WaitClass::Io,
                     deadline,
                     crate::keyboard::has_data,
                 )
@@ -1529,6 +1536,7 @@ fn sys_process_wait(h: RawHandle, flags: u64) -> u64 {
             &parkable,
             completion::Subject::of(object.watch()),
             completion::Token::new(0),
+            WaitClass::Other,
             Deadline::never(),
             || object.finished(),
         )
@@ -1977,6 +1985,7 @@ fn sys_accept(h: RawHandle) -> u64 {
             &parkable,
             completion::Subject::of(acceptor.watch()),
             completion::Token::new(0),
+            WaitClass::Ipc,
             Deadline::never(),
             || acceptor.has_pending() || acceptor.closed(),
         )
@@ -2371,6 +2380,7 @@ fn sys_thread_join(tid: u64) -> u64 {
             &parkable,
             completion::Subject::of(sched.handle.watch()),
             completion::Token::new(tid.raw() as u64),
+            WaitClass::Other,
             Deadline::never(),
             || matches!(process::wait_thread_zombie(tid, caller), Ok(Some(_)) | Err(())),
         )
@@ -2531,6 +2541,7 @@ fn sys_nanosleep(nanos: u64) -> u64 {
         &parkable,
         completion::Subject::of(handle.watch()),
         completion::Token::new(0),
+        WaitClass::Other,
         deadline,
         || false,
     );

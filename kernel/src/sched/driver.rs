@@ -34,7 +34,7 @@ use toyos_sched::fair::Frontier;
 use toyos_sched::hw::{CpuId, Hw, Kicker, Machine, Nanos};
 use toyos_sched::mailbox::{mailbox, Kick, PreemptGuard, Urgency};
 use toyos_sched::msg::Msg;
-use toyos_sched::task::{RtState, TaskBuilder, TaskKey};
+use toyos_sched::task::{RtState, TaskBuilder, TaskKey, WaitClass};
 use toyos_sched::waitq::{Cancel, Cancelled, Commit, CurrentTask};
 
 use crate::arch::percpu;
@@ -412,14 +412,15 @@ impl<'q> Ticket<'q> {
     /// preemption between reading the task and registering it would leave
     /// `CurrentTask` naming a CPU the thread no longer runs on, and
     /// `begin_commit` asserts on exactly that.
-    pub fn register(queue: &'q KWaitQueue, cancel: Cancel) -> Self {
+    pub fn register(queue: &'q KWaitQueue, cancel: Cancel, class: WaitClass) -> Self {
         crate::preempt::disable();
         let shared = current_shared().expect("prepare_wait: no running thread");
         let current = CurrentTask::new(&shared, current_cpu());
-        Self(match cancel {
-            Cancel::Answers => queue.prepare_wait(&current),
-            Cancel::Ignores => queue.prepare_wait_uncancellable(&current),
-        })
+        // **The class is the wait's and not the queue's**, because the queue is
+        // this thread's own parking place and has no subject —
+        // `WaitQueue::prepare_wait_as` carries the argument, and the blocked-time
+        // breakdown in `ProcessStats` is what it buys.
+        Self(queue.prepare_wait_as(&current, cancel, class))
     }
 
     /// The condition became true after registering: withdraw, and take the
@@ -764,6 +765,29 @@ pub fn ready_len() -> usize {
 
 pub fn parked_len() -> usize {
     try_with_cpu(|cpu| cpu.parked().count()).unwrap_or(0)
+}
+
+/// Killed threads on this CPU that are unwinding or waiting to.
+///
+/// **The dump's fourth container, and it had no caller at all.**
+/// `CpuSched::dying_len`'s own doc says it exists "for a dump that has to say
+/// where every task is", and until this one nothing asked: a dying task's state
+/// word reads `Ready`, so the process-table census counted it, the CPU half
+/// could not see it, and `unheld = claimed − scheduled` reported a task nothing
+/// would ever run — on a healthy machine, for up to a quantum, on every thread
+/// teardown. That verdict is the whole reason the dump exists.
+pub fn dying_len() -> usize {
+    try_with_cpu(|cpu| cpu.dying_len()).unwrap_or(0)
+}
+
+/// Every dying thread on this CPU, in the order the pick will take them.
+pub fn for_each_dying(mut f: impl FnMut(TaskId)) -> bool {
+    try_with_cpu(|cpu| {
+        for task in cpu.dying() {
+            f(task.ext().id);
+        }
+    })
+    .is_some()
 }
 
 /// The thread this CPU has loaded, if any.

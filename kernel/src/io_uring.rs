@@ -25,8 +25,6 @@ use crate::id_map::{IdKey, IdMap};
 use crate::pipe::{self, PipeId};
 use crate::process::{self, Pid};
 use crate::scheduler;
-use crate::sched::payload::KWaitQueue;
-use crate::sched::waitqs::{new_queue, wake_all};
 use crate::sync::Lock;
 use crate::completion::{self, Watch};
 use crate::time::{Deadline, Duration};
@@ -233,9 +231,19 @@ fn take_poll(instance: &mut IoUringInstance, index: usize) -> PendingPoll {
 /// (bounded by number of open fds), but guards against future bugs.
 const MAX_PENDING_POLLS: usize = 1024;
 
-/// A ring's two waiter sets, taken together so a site cannot take one and
-/// forget the other.
-type Wakeable = (Arc<KWaitQueue>, Arc<Watch>);
+/// This ring's waiters, as the one thing a wake path needs.
+///
+/// **It was a pair, and the second half was dead.** Until this alias shrank it
+/// held an `Arc<KWaitQueue>` beside the `Arc<Watch>` — minted, cloned at five
+/// wake sites and walked on every CQE — with nothing registered on it since
+/// `enter` started parking through `completion::wait_until` on the thread's own
+/// queue. Its doc said it existed "so a site cannot take one and forget the
+/// other", which is a real hazard
+/// (`specs/issues/kernel/io-uring-source-half-a-wake-pair.md` records losing it
+/// twice) and is not this type's to prevent: §5.6's answer is that there is no
+/// pair, and a type minted to enforce one is the pair surviving under a new
+/// name. With one half left the alias is just what a wake needs.
+type Wakeable = Arc<Watch>;
 
 struct IoUringInstance {
     id: RingId,
@@ -249,10 +257,8 @@ struct IoUringInstance {
     sq_size: u32,
     cq_size: u32,
     pending_polls: Vec<PendingPoll>,
-    /// Threads waiting on this ring's completion queue (spec §8.6).
-    waiters: Arc<KWaitQueue>,
-    /// The same waiters as a completion subject, cloned out of the table the
-    /// same way and for the same reason: `enter` holds it across its park.
+    /// Threads armed on this ring's completion queue (spec §8.6), cloned out
+    /// of the table because `enter` holds it across its park.
     watch: Arc<Watch>,
     /// The authoritative CQ tail. The copy in the shared header is a
     /// publication for userspace, which only ever reads it — the kernel must
@@ -263,12 +269,10 @@ struct IoUringInstance {
 }
 
 impl IoUringInstance {
-    /// The queue and the watch together: every wake of a ring posts to both
-    /// until C11 makes the CQ itself the inbox, and cloning them in one place
-    /// is what stops a site taking one and forgetting the other — §5.6's
-    /// half-a-wake-pair, which this tree has lost twice.
+    /// What a wake path takes out of the table and posts to after the table
+    /// lock is gone.
     fn wakeable(&self) -> Wakeable {
-        (self.waiters.clone(), self.watch.clone())
+        self.watch.clone()
     }
 
     fn sq_header(&self) -> &IoUringRingHeader {
@@ -388,7 +392,6 @@ pub fn create(depth: u32) -> Result<(RingRef, u64), SyscallError> {
             sq_size,
             cq_size,
             pending_polls: Vec::new(),
-            waiters: new_queue(WaitClass::Io),
             watch: Arc::new(Watch::new()),
             cq_tail: core::cell::Cell::new(0),
             owner_pid: pid,
@@ -475,6 +478,7 @@ pub fn enter(
             &parkable,
             completion::Subject::of(&queue),
             completion::Token::new(ring_id.0 as u64),
+            WaitClass::Io,
             deadline,
             || cq_count(ring_id).map_or(true, |n| n >= min_complete),
         )
@@ -615,10 +619,9 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
             instance.pending_polls.push(new_pp);
         } else {
             instance.post_cqe(user_data, -(SyscallError::ResourceExhausted as i32), 0);
-            let queue = instance.wakeable();
+            let watch = instance.wakeable();
             drop(guard);
-            wake_all(&queue.0);
-            completion::post(completion::Subject::of(&queue.1), completion::Outcome::Ready);
+            completion::post(completion::Subject::of(&watch), completion::Outcome::Ready);
             return;
         }
 
@@ -640,9 +643,8 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
         }
     }
     drop(guard);
-    if let Some(queue) = woken {
-        wake_all(&queue.0);
-        completion::post(completion::Subject::of(&queue.1), completion::Outcome::Ready);
+    if let Some(watch) = woken {
+        completion::post(completion::Subject::of(&watch), completion::Outcome::Ready);
     }
 }
 
@@ -698,9 +700,8 @@ fn post_cqe_locked(ring_id: RingId, user_data: u64, result: i32, flags: u32) {
         instance.wakeable()
     });
     drop(guard);
-    if let Some(queue) = woken {
-        wake_all(&queue.0);
-        completion::post(completion::Subject::of(&queue.1), completion::Outcome::Ready);
+    if let Some(watch) = woken {
+        completion::post(completion::Subject::of(&watch), completion::Outcome::Ready);
     }
 }
 
@@ -740,9 +741,8 @@ fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPol
         to_wake.push(instance.wakeable());
     }
     drop(guard);
-    for queue in to_wake {
-        wake_all(&queue.0);
-        completion::post(completion::Subject::of(&queue.1), completion::Outcome::Ready);
+    for watch in to_wake {
+        completion::post(completion::Subject::of(&watch), completion::Outcome::Ready);
     }
 }
 
@@ -801,9 +801,8 @@ pub fn remove_fd(sources: &[Option<Source>]) {
         }
     }
     drop(guard);
-    for queue in to_wake {
-        wake_all(&queue.0);
-        completion::post(completion::Subject::of(&queue.1), completion::Outcome::Ready);
+    for watch in to_wake {
+        completion::post(completion::Subject::of(&watch), completion::Outcome::Ready);
     }
 }
 

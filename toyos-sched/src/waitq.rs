@@ -121,7 +121,30 @@ impl<M: SchedMsg, L: LeafLock<WaitList<M>>> WaitQueue<M, L> {
     /// cancelled or committed.
     #[must_use = "a wait ticket must be committed or cancelled"]
     pub fn prepare_wait<'q>(&'q self, cur: &CurrentTask<'_, M>) -> WaitTicket<'q, M, L> {
-        self.register(cur, Cancel::Answers)
+        self.register(cur, Cancel::Answers, self.class)
+    }
+
+    /// Phase 1, saying both things a *wait* decides for itself rather than
+    /// inheriting from the queue it registers on: whether a kill ends it, and
+    /// what its blocked time is attributed to.
+    ///
+    /// **The class stopped being the queue's the moment there was one queue per
+    /// thread.** `specs/completion-architecture-spec.md` §5.2 makes every park
+    /// happen on `TaskHandle::park_queue` — a list of one, a parking place with
+    /// no subject — so a class read off that queue is the same word for every
+    /// wait in the machine, and `ProcessStats`'s `blocked_io_ns`,
+    /// `blocked_futex_ns`, `blocked_pipe_ns` and `blocked_ipc_ns` were
+    /// permanently zero while the dump's per-thread column read "other" for
+    /// everyone. What a waiter is waiting for is a property of the subject it
+    /// armed on, so it is named at the wait.
+    #[must_use = "a wait ticket must be committed or cancelled"]
+    pub fn prepare_wait_as<'q>(
+        &'q self,
+        cur: &CurrentTask<'_, M>,
+        cancel: Cancel,
+        class: WaitClass,
+    ) -> WaitTicket<'q, M, L> {
+        self.register(cur, cancel, class)
     }
 
     /// Phase 1 for a wait that a kill may **not** end.
@@ -144,10 +167,15 @@ impl<M: SchedMsg, L: LeafLock<WaitList<M>>> WaitQueue<M, L> {
         &'q self,
         cur: &CurrentTask<'_, M>,
     ) -> WaitTicket<'q, M, L> {
-        self.register(cur, Cancel::Ignores)
+        self.register(cur, Cancel::Ignores, self.class)
     }
 
-    fn register<'q>(&'q self, cur: &CurrentTask<'_, M>, cancel: Cancel) -> WaitTicket<'q, M, L> {
+    fn register<'q>(
+        &'q self,
+        cur: &CurrentTask<'_, M>,
+        cancel: Cancel,
+        class: WaitClass,
+    ) -> WaitTicket<'q, M, L> {
         assert!(
             cur.shared.set_waiting(),
             "a task waits on at most one queue",
@@ -160,6 +188,7 @@ impl<M: SchedMsg, L: LeafLock<WaitList<M>>> WaitQueue<M, L> {
             cpu: cur.cpu,
             generation,
             cancel,
+            class,
             armed: true,
             _not_send: PhantomData,
         }
@@ -290,6 +319,9 @@ pub struct WaitTicket<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> {
     cpu: CpuId,
     generation: Gen,
     cancel: Cancel,
+    /// What this *wait* is, for the blocked-time attribution — not what the
+    /// queue is. See [`WaitQueue::prepare_wait_as`].
+    class: WaitClass,
     /// Disarmed by `cancel`/`commit`; still armed at drop means a
     /// registration was abandoned.
     armed: bool,
@@ -436,7 +468,7 @@ impl<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> WaitTicket<'q, M, L> {
                 CommittedTicket {
                     shared: self.shared.clone(),
                     cpu: self.cpu,
-                    class: self.queue.class(),
+                    class: self.class,
                 },
                 Registration {
                     queue: self.queue,

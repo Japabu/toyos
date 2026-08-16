@@ -1,35 +1,28 @@
-//! Where the kernel's wait queues live — spec §8.6.
+//! Where the kernel's wait *subjects* live — spec §8.6.
 //!
-//! Every waitable object owns its queue. Objects with a lifetime own an
-//! `Arc<KWaitQueue>` (pipe ends, listeners, io_uring rings); objects that are
-//! singletons own a `static` (the devices); and the two sets with no object at
-//! all — futex words and the by-name wakes of join/waitpid/sleep — are hashed
-//! into fixed bucket arrays, because a bucket is a *place to park*, not a set
-//! whose membership means anything.
+//! **There is no wait queue in this file any more, and that is the whole of
+//! what `specs/completion-architecture-spec.md` §5.6 asked for.** Every waitable
+//! object owns a [`Watch`] and a waiter arms on it; the park itself is on the
+//! waiter's own thread queue (`TaskHandle::park_queue`), which is the one list
+//! left in the kernel and has exactly one member. Objects with a lifetime own
+//! an `Arc<Watch>` (pipe ends, listeners, io_uring rings), singleton devices own
+//! a `static`, and futex words — which have no object at all — hash into a fixed
+//! bucket array, because a bucket is a *place to arm*, not a set whose
+//! membership means anything.
 //!
-//! The two bucket arrays differ in one important way. A futex bucket is woken
-//! with `wake_one`/`wake_all`, so sharing a bucket costs a spurious wake and
-//! nothing else (every blocking site loops). A park bucket is **never** woken
-//! as a queue: `wake_direct` claims the task's own rendezvous word and the
-//! queue node is cleaned up by the waiter's own `Registration`. Waking a park
-//! bucket would satisfy a wake with an unrelated sleeper, so nothing does.
-
-use alloc::sync::Arc;
-
-use toyos_sched::task::{WaitClass, WakeCause, WakeReason};
+//! **A shared bucket is not a shared wake.** A watcher carries the token it
+//! armed with, and a futex waiter's token is its word's physical address, so
+//! `completion::post_n` walks the bucket and names the word. Sharing a bucket
+//! therefore costs a list walk and not a spurious wake — which is what makes
+//! `SYS_FUTEX_WAKE`'s count and its return value mean anything.
 
 use crate::completion::{self, Outcome, Subject, Watch};
-use crate::hw::HW;
 use crate::DirectMap;
 
-use super::driver::{cpus, preempt_off};
-use super::payload::{static_queue, KWaitQueue};
-
 /// Enough that two live futex words rarely share one, small enough to sit in
-/// `.bss`. A collision costs a spurious wake; all waiters re-check their word.
+/// `.bss`. A collision costs a longer walk and nothing else: the walk matches
+/// on the waiter's token, which is the word.
 const FUTEX_BUCKETS: usize = 64;
-static FUTEX: [KWaitQueue; FUTEX_BUCKETS] =
-    [const { static_queue(WaitClass::Futex) }; FUTEX_BUCKETS];
 static FUTEX_WATCH: [Watch; FUTEX_BUCKETS] = [const { Watch::new() }; FUTEX_BUCKETS];
 
 /// The device subjects. **The `KWaitQueue`s that used to stand beside these
@@ -50,44 +43,17 @@ pub fn wake_device(watch: &'static Watch) {
     completion::post(Subject::of(watch), Outcome::Ready);
 }
 
-/// The bucket a futex word parks in, keyed by physical address so the queue is
-/// shared across every process that maps it.
-pub fn futex(addr: DirectMap) -> &'static KWaitQueue {
-    &FUTEX[(addr.phys() >> 2) as usize % FUTEX_BUCKETS]
-}
-
-/// The completion subject a futex word parks on, keyed the same way.
+/// The completion subject a futex word arms on, keyed by physical address so
+/// the subject is shared across every process that maps the word.
 ///
-/// **`PARK_BUCKETS` and `park_lot` are gone from beside it**
-/// (`specs/completion-architecture-spec.md` §5.6): `waitpid`, `thread_join`
-/// and `nanosleep` stop hashing into a parking lot and arm on the object or on
-/// their own thread, and every thread now parks on a queue of its own
-/// (`TaskHandle::park_queue`).
+/// **`FUTEX`, `PARK_BUCKETS` and `park_lot` are all gone from beside it**
+/// (`specs/completion-architecture-spec.md` §5.6): `waitpid`, `thread_join` and
+/// `nanosleep` stop hashing into a parking lot and arm on the object or on
+/// their own thread, every thread parks on a queue of its own
+/// (`TaskHandle::park_queue`), and the futex's own 64-way queue array outlived
+/// its last registrant by one chunk — `wake_n` counted an empty list and
+/// `futex_wake` therefore returned 0 for every call in the machine.
 pub fn futex_watch(addr: DirectMap) -> &'static Watch {
     &FUTEX_WATCH[(addr.phys() >> 2) as usize % FUTEX_BUCKETS]
 }
-
-pub fn new_queue(class: WaitClass) -> Arc<KWaitQueue> {
-    Arc::new(static_queue(class))
-}
-
-pub fn wake_n(queue: &KWaitQueue, count: usize) -> usize {
-    preempt_off(|p| {
-        let mut woken = 0;
-        while woken < count {
-            if queue.wake_one(WakeCause::new(WakeReason::Woken), cpus(), &HW, p) == 0 {
-                break;
-            }
-            woken += 1;
-        }
-        woken
-    })
-}
-
-pub fn wake_all(queue: &KWaitQueue) -> usize {
-    preempt_off(|p| {
-        queue.wake_all(WakeCause::new(WakeReason::Woken), cpus(), &HW, p)
-    })
-}
-
 

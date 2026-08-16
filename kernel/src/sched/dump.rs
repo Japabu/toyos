@@ -118,6 +118,11 @@ mod tally {
 
     pub static PARKED: AtomicU32 = AtomicU32::new(0);
     pub static READY: AtomicU32 = AtomicU32::new(0);
+    /// Killed threads unwinding, or waiting on a CPU to unwind. **A container
+    /// of its own**, because their state words read `Ready` and the census
+    /// counts them as such, so a verdict built without this one reports them as
+    /// held by nobody.
+    pub static DYING: AtomicU32 = AtomicU32::new(0);
     pub static RUNNING: AtomicU32 = AtomicU32::new(0);
     pub static NO_DEADLINE: AtomicU32 = AtomicU32::new(0);
     pub static PENDING: AtomicU32 = AtomicU32::new(0);
@@ -125,9 +130,10 @@ mod tally {
     pub static ABSURD: AtomicU32 = AtomicU32::new(0);
     pub static UNPRINTED: AtomicU32 = AtomicU32::new(0);
 
-    pub const ALL: [&AtomicU32; 8] = [
+    pub const ALL: [&AtomicU32; 9] = [
         &PARKED,
         &READY,
+        &DYING,
         &RUNNING,
         &NO_DEADLINE,
         &PENDING,
@@ -461,6 +467,22 @@ fn report_this_cpu() {
     let ready = driver::ready_len() as u32;
     tally::READY.fetch_add(ready, Ordering::Relaxed);
 
+    // **The dying list, which no reader of this dump could see.** A killed
+    // thread's word says `Ready(cpu)`, so the census below counts it — while
+    // `ready_len()` counts only `rq` and `for_each_parked` walks only `parked`,
+    // which made every teardown in flight an `unheld` false positive. The whole
+    // point of the verdict is to tell "a task nothing will ever run" from a
+    // busy machine, and this is a task that runs *next*.
+    let mut dying = 0u32;
+    let read_dying = driver::for_each_dying(|id| {
+        dying += 1;
+        tally::DYING.fetch_add(1, Ordering::Relaxed);
+        log!("  cpu{cpu} pid={} tid={} unwinding (killed)", id.0.raw(), id.1.raw());
+    });
+    if !read_dying {
+        log!("  cpu{cpu} !! a pass owns its scheduler state; nothing read from it");
+    }
+
     let mut ordinary = 0u32;
     let read = driver::for_each_parked(|task| {
         tally::PARKED.fetch_add(1, Ordering::Relaxed);
@@ -582,9 +604,11 @@ fn summary(cpus: usize, silent: u32, c: Census) {
         );
     }
     log!(
-        "== sched: {answered}/{cpus} cpu(s) answered — {} running, {} queued, {} parked",
+        "== sched: {answered}/{cpus} cpu(s) answered — {} running, {} queued, {} unwinding, \
+         {} parked",
         tally::RUNNING.load(Ordering::Relaxed),
         tally::READY.load(Ordering::Relaxed),
+        tally::DYING.load(Ordering::Relaxed),
         tally::PARKED.load(Ordering::Relaxed),
     );
     log!(
@@ -605,8 +629,13 @@ fn summary(cpus: usize, silent: u32, c: Census) {
     let overdue = tally::OVERDUE.load(Ordering::Relaxed);
     let absurd = tally::ABSURD.load(Ordering::Relaxed);
     if c.read {
+        // `DYING` is in the sum for the same reason `READY` is: the census
+        // counted those threads under `ready`, and a container the CPU half
+        // cannot see is exactly what `unheld` is meant to name — so leaving it
+        // out reports a healthy teardown as a lost task.
         let scheduled = tally::PARKED.load(Ordering::Relaxed)
             + tally::READY.load(Ordering::Relaxed)
+            + tally::DYING.load(Ordering::Relaxed)
             + tally::RUNNING.load(Ordering::Relaxed);
         let claimed = c.running + c.ready + c.blocked;
         log!(

@@ -10,7 +10,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use hashbrown::HashMap;
 use toyos_sched::fair::{ShareState, QUANTUM_NS};
 use toyos_sched::hw::{Machine, Nanos};
-use toyos_sched::task::{WakeCause, WakeReason};
+use toyos_sched::task::{WaitClass, WakeCause, WakeReason};
 
 use crate::arch::percpu;
 use crate::completion::{self, Cancel, Outcome, Subject};
@@ -242,9 +242,9 @@ pub fn enqueue_new(
 /// C3's `completion::wait` and C5's `SleepLock::lock` are what thread it.
 #[must_use = "a wait ticket must be blocked on or cancelled"]
 #[track_caller]
-pub fn prepare_wait(queue: &KWaitQueue, cancel: Cancel) -> Ticket<'_> {
+pub fn prepare_wait(queue: &KWaitQueue, cancel: Cancel, class: WaitClass) -> Ticket<'_> {
     let _parkable = Parkable::of_current();
-    Ticket::register(queue, cancel)
+    Ticket::register(queue, cancel, class)
 }
 
 /// Phase 2: park the running thread on the queue it registered with.
@@ -474,24 +474,37 @@ pub fn futex_wait(phys_addr: DirectMap, expected: u32, deadline: Deadline) -> bo
         &parkable,
         completion::Subject::of(waitqs::futex_watch(phys_addr)),
         completion::Token::new(phys_addr.phys()),
+        WaitClass::Futex,
         deadline,
         read,
     );
     true
 }
 
-/// Wake up to `count` futex waiters. Buckets are shared, so this can wake a
-/// waiter of a different word — harmless, every waiter re-checks its own.
+/// Wake up to `count` waiters on this futex word, and answer how many.
+///
+/// **Both halves are the ABI's** (`toyos-abi/src/syscall.rs`'s `futex_wake`:
+/// "wake up to `count` threads waiting on `addr`, returns number of threads
+/// woken"), and the completion cutover briefly honoured neither: the count
+/// went to a bucket queue nothing registered on any more — so the return was
+/// provably always 0 — and the actual wake was an uncounted `post` that told
+/// *every* waiter on the shared bucket, turning `pthread_cond_signal` into a
+/// broadcast.
+///
+/// [`completion::post_n`] is the whole of the fix, and the token is why it
+/// needs no second channel (§23's rejection 3 forbids one): the waiter arms
+/// with its word's physical address, so the walk names the word and not the
+/// 64-way bucket it hashes into. A waiter of a different word is not woken and
+/// does not count against `count` — which is stronger than the queue this
+/// replaces, where a shared bucket could spend a single wake on the wrong
+/// waiter and leave the intended one parked.
 pub fn futex_wake(phys_addr: DirectMap, count: usize) -> u64 {
-    let woken = waitqs::wake_n(waitqs::futex(phys_addr), count) as u64;
-    // The bucket is shared, so this posts to every waiter on it rather than to
-    // `count` of them — harmless and already true of the queue wake above: a
-    // waiter of a different word re-reads its own and parks again.
-    completion::post(
+    completion::post_n(
         completion::Subject::of(waitqs::futex_watch(phys_addr)),
         completion::Outcome::Ready,
-    );
-    woken
+        completion::Token::new(phys_addr.phys()),
+        count,
+    ) as u64
 }
 
 /// Retire a thread and wait until its record is gone.
@@ -594,6 +607,7 @@ pub fn retire_task(sched: &ThreadSched) {
     let Some(armed) = completion::arm(
         completion::Subject::of(sched.handle.watch()),
         completion::Token::new(sched.shared.key().0),
+        WaitClass::Other,
     ) else {
         panic!("retire_task: no current task to park");
     };
@@ -804,10 +818,18 @@ pub fn log_health() {
         next_health.store(now + SNAPSHOT_INTERVAL.nanos(), Ordering::Relaxed);
         let ready = driver::ready_len() + usize::from(percpu::current_tid().is_some());
         let parked = driver::parked_len();
+        // **`dying` is on the line because this line is the whole account.** On
+        // the machine with no serial port an occasional occupancy line in
+        // `kernel.log` is the only thing that says where the scheduler's tasks
+        // are, and a container it does not name is one nobody can ask about
+        // — `sched::dump` needs a keystroke, which that machine has nowhere to
+        // send.
+        let dying = driver::dying_len();
         crate::log!(
-            "sched: cpu={} ready={} parked={} current={:?}",
+            "sched: cpu={} ready={} dying={} parked={} current={:?}",
             cpu,
             ready,
+            dying,
             parked,
             percpu::current_tid()
         );

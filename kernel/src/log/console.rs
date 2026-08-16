@@ -25,7 +25,7 @@ use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use alloc::sync::Arc;
 
 use toyos_abi::log::LogRecord;
-use toyos_sched::task::{WakeCause, WakeReason};
+use toyos_sched::task::{WaitClass, WakeCause, WakeReason};
 use toyos_sched::waitq::wake_direct;
 
 use crate::drivers::serial::{self, BackendGuard};
@@ -502,6 +502,7 @@ extern "C" fn body(_arg: u64) -> ! {
         let Some(armed) = completion::arm(
             completion::Subject::of(handle.watch()),
             completion::Token::new(0),
+            WaitClass::Other,
         ) else {
             continue;
         };

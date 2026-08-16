@@ -57,6 +57,8 @@ pub use inbox::{Inbox, Outcome, Reason, Record, Token};
 
 use toyos_sched::hw::Nanos;
 
+use toyos_sched::task::WaitClass;
+
 use crate::sched::payload::{KShared, TaskHandle};
 use crate::scheduler::Parkable;
 use crate::sync::Lock;
@@ -118,6 +120,11 @@ pub struct Armed<'a> {
     task: Arc<TaskHandle>,
     shared: Arc<KShared>,
     token: Token,
+    /// What this wait is, for the blocked-time breakdown. Decided here rather
+    /// than at the park, because the park is on this thread's own queue and
+    /// that queue has no subject to read a class off — see
+    /// `toyos_sched::waitq::WaitQueue::prepare_wait_as`.
+    class: WaitClass,
 }
 
 impl Drop for Armed<'_> {
@@ -162,9 +169,14 @@ impl Drop for Armed<'_> {
 /// fires immediately, arrives with C3's park conversion and the readiness
 /// question that goes with it.
 ///
+/// `class` is what this wait's blocked time is attributed to. It belongs to the
+/// arm because it is a property of the *subject*: a thread parked on a pipe end
+/// is blocked on a pipe however it got there, and the queue it physically parks
+/// on is its own and says nothing.
+///
 /// `None` when there is no current task: boot has none, and neither has an
 /// idle CPU.
-pub fn arm(subject: Subject<'_>, token: Token) -> Option<Armed<'_>> {
+pub fn arm(subject: Subject<'_>, token: Token, class: WaitClass) -> Option<Armed<'_>> {
     let task = crate::sched::driver::current_handle()?;
     let shared = crate::sched::driver::current_shared()?;
     let inbox = task.inbox();
@@ -185,7 +197,7 @@ pub fn arm(subject: Subject<'_>, token: Token) -> Option<Armed<'_>> {
     });
     watch.armed.store(waiters.len(), Ordering::Relaxed);
     drop(waiters);
-    Some(Armed { subject, task, shared, token })
+    Some(Armed { subject, task, shared, token, class })
 }
 
 /// Tell everyone armed on `subject` that something happened.
@@ -208,6 +220,47 @@ pub fn post_boosted(subject: Subject<'_>, outcome: Outcome, until: Nanos) {
     post_with(subject, outcome, Some(until))
 }
 
+/// Tell at most `limit` of the waiters armed on `subject` **for this token**
+/// that something happened, and answer how many were told.
+///
+/// **The counted form, and the token is what makes counting mean anything.**
+/// `SYS_FUTEX_WAKE`'s ABI is "wake up to `count` threads waiting on `addr`,
+/// return the number woken", and a subject whose waiters are a *hash bucket*
+/// cannot honour either half: the bucket holds waiters of every word that
+/// hashes into it, so a count-limited walk over the bucket would spend the
+/// caller's single wake on a thread waiting for a different word and leave the
+/// intended one parked. A shared queue's spurious wake is harmless because
+/// every waiter re-checks; a shared queue's *stolen* wake is not.
+///
+/// The token closes it without a second channel, which §23's rejection 3
+/// forbids: a futex waiter arms with its word's physical address as its token,
+/// so this walk names the word rather than the bucket. A waiter of another word
+/// in the same bucket is skipped and does not count against `limit`.
+///
+/// A `limit` of zero tells nobody, which is what a caller asking for zero
+/// wakes means; `usize::MAX` is the broadcast every `pthread_cond_broadcast`
+/// asks for.
+pub fn post_n(subject: Subject<'_>, outcome: Outcome, token: Token, limit: usize) -> usize {
+    let watch = subject.0;
+    if limit == 0 || watch.armed.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    let at = crate::clock::now();
+    let waiters = watch.waiters.lock();
+    let mut told = 0;
+    for waiter in waiters.iter() {
+        if told == limit {
+            break;
+        }
+        if waiter.token != token {
+            continue;
+        }
+        post_to(waiter, outcome, at, None);
+        told += 1;
+    }
+    told
+}
+
 fn post_with(subject: Subject<'_>, outcome: Outcome, boost: Option<Nanos>) {
     let watch = subject.0;
     // The whole cost on a subject nobody waits on. Read before the lock, so a
@@ -218,19 +271,22 @@ fn post_with(subject: Subject<'_>, outcome: Outcome, boost: Option<Nanos>) {
     let at = crate::clock::now();
     let waiters = watch.waiters.lock();
     for waiter in waiters.iter() {
-        // **Invariant W, in two statements** (§5.4): the record first, under
-        // this subject's leaf lock, and then the claim. A parker that has
-        // published `Committing` is refused its park by the claim; one that
-        // has not yet re-checked finds the record; one already `Blocked` gets
-        // the message. There is no fourth case, which is what
-        // `kernel-loom/tests/inbox.rs` is about.
-        waiter.task.inbox().post(Record {
-            token: waiter.token,
-            outcome,
-            at,
-        });
-        crate::scheduler::wake_sched(&waiter.shared, boost);
+        post_to(waiter, outcome, at, boost);
     }
+}
+
+/// **Invariant W, in two statements** (§5.4): the record first, under this
+/// subject's leaf lock, and then the claim. A parker that has published
+/// `Committing` is refused its park by the claim; one that has not yet
+/// re-checked finds the record; one already `Blocked` gets the message. There
+/// is no fourth case, which is what `kernel-loom/tests/inbox.rs` is about.
+fn post_to(waiter: &Watcher, outcome: Outcome, at: crate::time::Instant, boost: Option<Nanos>) {
+    waiter.task.inbox().post(Record {
+        token: waiter.token,
+        outcome,
+        at,
+    });
+    crate::scheduler::wake_sched(&waiter.shared, boost);
 }
 
 /// The right to park, and the answer a killed thread gets instead.
@@ -297,13 +353,14 @@ pub fn wait_until(
     p: &Parkable,
     subject: Subject<'_>,
     token: Token,
+    class: WaitClass,
     deadline: Deadline,
     ready: impl Fn() -> bool,
 ) -> Result<(), Cancelled> {
     if ready() {
         return Ok(());
     }
-    let Some(armed) = arm(subject, token) else {
+    let Some(armed) = arm(subject, token, class) else {
         // No current task: boot, or an idle CPU. Neither can park, and neither
         // reaches a blocking syscall — this is the `Parkable` argument stated
         // once more at runtime, for the one caller that could be reached from
@@ -334,7 +391,8 @@ pub fn wait_until(
 pub fn park_forever() -> ! {
     let parkable = crate::scheduler::Parkable::of_current();
     let handle = crate::sched::driver::current_handle().expect("a kernel thread is a task");
-    let armed = arm(Subject::of(handle.watch()), Token::new(0)).expect("a task can arm");
+    let armed =
+        arm(Subject::of(handle.watch()), Token::new(0), WaitClass::Other).expect("a task can arm");
     loop {
         let _ = wait(&parkable, &armed, Deadline::never());
     }
@@ -366,7 +424,7 @@ fn wait_inner(
         // registration precedes the re-check, which is the whole of §2's
         // invariant 4; the queue is never woken as a queue, because a post
         // claims the rendezvous word directly.
-        let ticket = crate::scheduler::prepare_wait(task.park_queue(), cancel);
+        let ticket = crate::scheduler::prepare_wait(task.park_queue(), cancel, armed.class);
         if task.inbox().has_record()
             || (cancel == Cancel::Answers && armed.shared.kill_pending())
         {
