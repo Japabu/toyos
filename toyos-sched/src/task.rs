@@ -694,6 +694,29 @@ macro_rules! linear_state {
                 self.0.rt()
             }
 
+            /// Whether this task competes **in the real-time band** right now,
+            /// which is not the same question as [`RtState::is_rt`].
+            ///
+            /// A killed task unwinding its own stack is normal-band work —
+            /// `scheduler-core-spec.md` §3 — and that is a statement about what
+            /// it is *doing*, not about a right it holds. `RtState::release`
+            /// ends an inherited lend and deliberately leaves the permanent
+            /// flag alone, so a thread that called `SYS_RT_ENTER` and was then
+            /// killed still answers `is_rt()`. Asking `is_rt()` where the band
+            /// is meant let that corpse hold its CPU for a full quantum against
+            /// a ready real-time sibling, and made `SchedPass::pick` and
+            /// `SchedPass::preempt_if_due` disagree about one task: the pick
+            /// gates the dying list on `rq.has_rt()` whatever the corpse is,
+            /// while the preemption exempted it.
+            ///
+            /// It is not a right revoked, either: the thread is dying, its
+            /// unwind is not real-time work, and the bounded deferral
+            /// ([`crate::cpu::DYING_AGE_NS`]) is what keeps that from starving
+            /// it. `a_killed_rt_thread_unwinds_in_the_normal_band` is the gate.
+            pub fn serves_rt_band(&self) -> bool {
+                self.0.rt().is_rt() && !self.0.shared().kill_pending()
+            }
+
             pub fn ext(&self) -> &X {
                 self.0.ext()
             }

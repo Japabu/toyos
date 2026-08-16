@@ -133,6 +133,16 @@ it is not competing for a share of the CPU — and behind every ready real-time
 task, which is waiting on nothing it holds. Its unwind is served
 first-in-first-out against the other unwinds on its CPU.
 
+**"Normal-band work" is about what the task is doing, not about a right it
+holds.** `RtState::release` ends an inherited lend and leaves the *permanent*
+flag alone, so a thread that entered the real-time band and was then killed
+still answers `is_rt()`. That is correct — nothing revokes the right — but it is
+not the question the pick and the preemption ask, and asking it let such a
+corpse keep its CPU for a whole quantum against a ready real-time sibling while
+the pick was gating its dying list on `rq.has_rt()` regardless: two halves of
+this rule disagreeing about one task. `RunningTask::serves_rt_band` is the one
+question both halves ask now, and the answer for a dying task is no.
+
 **The qualification, which is derived and not a hedge**: once the head of a
 CPU's dying list has waited `toyos_sched::cpu::DYING_AGE_NS` = one quantum, the
 next pick dispatches it ahead of the real-time band for one `DYING_CHUNK_NS` =

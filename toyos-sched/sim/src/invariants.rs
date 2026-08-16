@@ -438,10 +438,15 @@ fn check_rt_latency(vm: &mut Vm<'_>) {
     let bound = rt_latency_bound(vm.max_kernel_section());
     let mut problems = Vec::new();
     for cpu in 0..vm.scenario.cpus {
+        // `serves_rt_band` and not `is_rt`, for the reason that method's own doc
+        // gives: a killed thread that holds the RT right is unwinding, not doing
+        // real-time work, so a real-time sibling waiting behind it **is** being
+        // starved and this check has to see it. Reading `is_rt` here made the
+        // model agree with the defect rather than with the law.
         let starving = vm.cpus[cpu].rq().has_rt()
             && vm.cpus[cpu]
                 .running()
-                .is_some_and(|task| !task.rt().is_rt());
+                .is_some_and(|task| !task.serves_rt_band());
         match (starving, vm.rt_pending_since[cpu]) {
             (true, None) => vm.rt_pending_since[cpu] = Some(vm.busy_ns[cpu]),
             (true, Some(since)) => {

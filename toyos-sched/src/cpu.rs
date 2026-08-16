@@ -1143,7 +1143,14 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
         // The RT arm does not fire against an aged corpse inside its granted
         // chunk — that grant is the whole of the bounded deferral, and the
         // quantum arm above is what ends it.
-        let rt_due = self.cpu.rq.has_rt() && !current.is_rt() && !self.cpu.aged_grant;
+        //
+        // **`serves_rt_band` and not `is_rt`**, which is what makes this arm and
+        // `pick` agree about one task. A killed thread that had called
+        // `SYS_RT_ENTER` still answers `is_rt()`, because `RtState::release`
+        // ends a lend and leaves the permanent flag alone — so this arm exempted
+        // it while the pick gated its dying list on `rq.has_rt()` regardless,
+        // and it held the CPU for a full quantum against a ready RT sibling.
+        let rt_due = self.cpu.rq.has_rt() && !current.serves_rt_band() && !self.cpu.aged_grant;
         let due = self.now >= self.cpu.quantum_end || rt_due;
         if !due {
             return;
@@ -2528,6 +2535,51 @@ mod tests {
             "the grant ends on its own boundary and not a nanosecond later",
         );
         assert_eq!(w.cpus[0].dying_len(), 1, "the corpse is queued again");
+        w.abandon();
+    }
+
+    /// **A killed thread that holds the RT right unwinds in the normal band**,
+    /// and until `serves_rt_band` existed it did not.
+    ///
+    /// `RtState::release` ends an inherited lend and deliberately leaves the
+    /// *permanent* flag alone, so a thread that called `SYS_RT_ENTER` and was
+    /// then killed still answers `is_rt()`. `preempt_if_due` asked exactly that
+    /// and therefore exempted the corpse, while `pick` gated its dying list on
+    /// `rq.has_rt()` whatever it was — two halves of one rule disagreeing about
+    /// one task. The corpse held its CPU for a full quantum against a ready
+    /// real-time sibling; `soundd` holds the right and a killed `soundd` thread
+    /// is exactly this.
+    ///
+    /// The control is `a_live_fair_task_loses_the_cpu_to_a_ready_rt_task` and
+    /// its three siblings above: this asserts the same thing of the one task
+    /// that used to be the exception.
+    #[test]
+    fn a_killed_rt_thread_unwinds_in_the_normal_band() {
+        let mut w = World::new(1);
+        let (killed, killed_shared) = w.spawn_rt(C0);
+        w.run_a_pass(C0);
+        assert_eq!(w.cpus[0].running().map(|t| t.key()), Some(killed));
+        assert!(
+            w.cpus[0].running().expect("running").is_rt(),
+            "it holds the RT right, and being killed does not take it back",
+        );
+        killed_shared.mark_kill();
+
+        let (rt, _rt_shared) = w.spawn_rt(C0);
+        w.run_a_pass_at(C0, Nanos(NOW.0 + 1));
+
+        assert_eq!(
+            w.cpus[0].running().map(|t| t.key()),
+            Some(rt),
+            "the corpse is unwinding, not doing real-time work, so the sibling \
+             that is doing real-time work gets the CPU at the next pass",
+        );
+        assert_eq!(w.cpus[0].dying_len(), 1, "and the corpse waits its age out");
+        assert!(
+            w.cpus[0].dying[0].task.is_rt(),
+            "with its right intact — this is about the band it competes in, not \
+             about revoking anything",
+        );
         w.abandon();
     }
 
