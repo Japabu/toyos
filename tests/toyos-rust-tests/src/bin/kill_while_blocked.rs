@@ -25,7 +25,9 @@
 //!    and no syscall to cancel. The other three ask what a kill *releases*;
 //!    this one asks whether it **ends**, which is `scheduler-core-spec.md`
 //!    invariant 7's "never dispatched into userland again" and the one claim in
-//!    it that no existing test executes.
+//!    it that no existing test executes. It is the one arm that does not issue
+//!    its own kill: a `kill` that does not end its target does not return
+//!    either, so the killer is a process of its own and this one only watches.
 //!
 //! **No census assertion anywhere in this file, and that is the point rather
 //! than an omission.** A live-object count is the one instrument that cannot
@@ -42,25 +44,41 @@
 //! anywhere, which is the case that is *not* under test.
 
 use std::io::{Read, Write};
-use std::os::toyos::process::CommandExt;
+use std::os::toyos::process::{ChildExt, CommandExt};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use toyos::process::Process;
 use toyos::{endow, namespace, port, AsHandle};
 use toyos_abi::syscall::{self, SyscallError, SERVE_PREFIX, SVC_LABEL};
+use toyos_abi::RawHandle;
 
 const SELF_PATH: &str = "/bin/test_rs_kill_while_blocked";
 const SERVICE: &str = "blocked";
 
-/// How long arm 4 waits for a killed Ring 3 spinner to be gone.
+/// The label arm 4's killer finds the spinner under. A local name in one
+/// process's own table, and it names nothing anywhere else.
+const VICTIM_LABEL: &str = "victim";
+
+/// How long arm 4 gives a killed Ring 3 spinner to reach its last exit
+/// boundary, watched from outside the kill.
 ///
 /// **A number rather than a hang, for `specs/completion-architecture-spec.md`
 /// §20.3's reason**: a guest that stops making progress reds as `STALL`, which
 /// the harness prints apart and tells nobody to bisect. Two seconds against a
-/// bound of one interrupt delivery is four orders of magnitude of headroom, and
-/// what it buys is a failure that names itself.
+/// bound of one interrupt delivery and a teardown is four orders of magnitude
+/// of headroom, and what it buys is a failure that names itself.
+///
+/// **It has to be smaller than `scheduler::retire_task`'s own tripwire, and
+/// that ordering is the whole of the arm's ability to report.** The process
+/// doing the killing is parked inside that tripwire for as long as the victim
+/// stays in userland, and when it blows the kernel panics and takes the machine
+/// with it — so an arm that had not spoken by then never speaks. Nothing here
+/// reads that constant or restates its value: what this one needs is only to be
+/// first, and a bound derived from device timeouts and scheduler quanta is not
+/// going to come in under two seconds.
 const ENDS_WITHIN: Duration = Duration::from_secs(2);
 
 fn main() {
@@ -81,7 +99,8 @@ fn test() {
 /// Spawn a child in `role` and wait for it to say it has parked.
 ///
 /// The child's stdin is a pipe this process holds the write end of, which is
-/// what arms 1 and 2 measure afterwards.
+/// what arms 1 and 2 measure afterwards and what releases arm 4's killer at a
+/// moment this process picks.
 fn parked(role: &str, extra: Option<(String, u32)>) -> std::process::Child {
     let mut command = Command::new(SELF_PATH);
     command.arg(role).stdin(Stdio::piped()).stdout(Stdio::piped());
@@ -201,35 +220,83 @@ fn an_acceptor_killed_in_the_accept() {
 /// all. With either miss the child here is preempted, queued in the dying list,
 /// picked straight back off it and returned to Ring 3, once per tick, forever.
 ///
-/// It is bounded by a wall clock and reported as a number: nothing else could
-/// distinguish "ended late" from "the harness gave up".
+/// **Three processes, because the killer cannot report.** `Process::kill` is
+/// `scheduler::retire_task`, which parks until the victim's record is released
+/// and panics the kernel at its own tripwire when it never is. On exactly the
+/// tree this arm exists to catch, then, the call does not come back: an arm
+/// that killed and then timed its own `kill` would be *inside* the panic it is
+/// meant to name, and the version of this arm that did so could only ever have
+/// reported on a tree that was already fixed. So the kill is a child of its
+/// own, and the deadline below is held by a process with nothing of the kernel
+/// under it.
+///
+/// **What it watches is the victim's own stdout.** That pipe's write end is in
+/// the victim's handle table and in no other, so the read end this process
+/// holds reaches EOF when — and only when — the victim's handles are drained.
+/// That is `kill_process`'s phase 3, which runs after `retire_task` has seen
+/// the victim released, which the victim publishes from its own pass out of
+/// `exit_if_killed` — the last exit boundary itself. EOF is downstream of the
+/// boundary by a teardown and by nothing that can wait, and it is unreachable
+/// without it.
+///
+/// **The clock starts before the kill and not after it**, which is the second
+/// half of what was wrong here: the previous shape took its `Instant` once
+/// `kill()` had already returned, and a returned `kill` has already published
+/// the exit — so what it timed was the reap of a zombie and never the boundary.
+/// What this one bounds is the whole of [go byte → boundary → teardown], so the
+/// number is an upper bound on the boundary rather than a measurement of it.
 fn a_ring_three_spinner_ends_at_its_next_exit_boundary() {
-    let mut child = parked("spin", None);
-    child.kill().expect("kill the spinning child");
+    let mut victim = parked("spin", None);
+    // Taken out of the `Child` because the observation is the pipe and not the
+    // process: `parked` has already read the marker line off it, so the next
+    // thing that can ever arrive on it is the end of the victim.
+    let mut spun = victim.stdout.take().expect("the spinner's stdout");
 
-    // The wait is on its own thread so the deadline below is this one's, not
-    // the kernel's — `Child::wait` has nothing to time out on.
-    static REAPED: AtomicBool = AtomicBool::new(false);
+    // A duplicate, because `endow` moves what it is handed: this process keeps
+    // its own handle so that dropping the `Child` stays its business.
+    let for_killer =
+        syscall::dup(RawHandle(victim.as_raw_handle())).expect("a second handle to the spinner");
+    let mut killer = parked("kill", Some((VICTIM_LABEL.to_string(), for_killer.0)));
+    let mut go = killer.stdin.take().expect("the killer's stdin");
+
+    /// Nanoseconds from the go byte to EOF, and `u64::MAX` until there is one.
+    /// Stored by the reader so the answer is the instant it saw rather than the
+    /// poll that noticed.
+    static GONE_AFTER_NS: AtomicU64 = AtomicU64::new(u64::MAX);
     let started = Instant::now();
     thread::spawn(move || {
-        let _ = child.wait();
-        REAPED.store(true, Ordering::Release);
+        let mut byte = [0u8; 1];
+        while spun.read(&mut byte).expect("read the spinner's stdout") != 0 {}
+        GONE_AFTER_NS.store(started.elapsed().as_nanos() as u64, Ordering::Release);
     });
-    while !REAPED.load(Ordering::Acquire) && started.elapsed() < ENDS_WITHIN {
-        thread::sleep(Duration::from_millis(10));
+    go.write_all(b"g").expect("release the killer");
+
+    while GONE_AFTER_NS.load(Ordering::Acquire) == u64::MAX && started.elapsed() < ENDS_WITHIN {
+        thread::sleep(Duration::from_millis(1));
     }
-    if !REAPED.load(Ordering::Acquire) {
+    let gone = GONE_AFTER_NS.load(Ordering::Acquire);
+    if gone == u64::MAX {
         println!(
-            "a child killed while spinning in Ring 3 was still running {:?} later — \
-             it is being re-dispatched into userland, so nothing on the return path \
-             reads the kill bit",
+            "a child killed while spinning in Ring 3 still held its handles {:?} later — \
+             it is being re-dispatched into userland, so nothing on the return path reads \
+             the kill bit, and the process that killed it is parked in retire_task with \
+             nothing it can say",
             started.elapsed(),
         );
         std::process::exit(1);
     }
+    // Bounded by the line above and not a second deadline: EOF is phase 3, and
+    // phases 4 and 5 behind it are straight-line kernel code with no wait in
+    // them, so a killer that produced the EOF has already returned from its
+    // `kill`. What this adds is the killer's own verdict on that call.
+    assert!(
+        killer.wait().expect("wait for the killer").success(),
+        "the spinner ended, but the process that killed it did not agree",
+    );
     println!(
-        "  ring 3: a killed spinner was gone in {:?}, with no syscall to cancel",
-        started.elapsed(),
+        "  ring 3: a killed spinner reached its last exit boundary in {:?}, with no syscall \
+         to cancel",
+        Duration::from_nanos(gone),
     );
 }
 
@@ -245,6 +312,21 @@ fn child(role: &str) -> ! {
                 std::hint::black_box(0u64);
                 std::hint::spin_loop();
             }
+        }
+        // Arm 4's killer. It is a process rather than a thread because
+        // `Process::kill` does not return on the tree that arm is about — it
+        // is `retire_task`, which parks until the victim's record is released
+        // and panics the kernel at its own tripwire when it never is. Nothing
+        // the observer does is behind this call.
+        "kill" => {
+            let victim: Process = endow::Endowments::get()
+                .take(VICTIM_LABEL)
+                .expect("the parent endowed a handle to the spinner");
+            say("parked in kill");
+            let mut go = [0u8; 1];
+            std::io::stdin().read_exact(&mut go).expect("wait for the parent's go");
+            victim.kill().expect("kill the spinning child");
+            std::process::exit(0);
         }
         "pipe-read" => {
             say("parked in pipe-read");
