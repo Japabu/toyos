@@ -1498,25 +1498,43 @@ pub fn usb_transport_break(
     // injected, and without the second the log says only that something went
     // wrong — which is the line the T14 produced, and the reason the cause of
     // that break cannot be read out of its log today.
-    const BROKE: &str = "usb-storage: transport broke on SCSI 0x2a: no answer in the data phase";
-    let staged = log.matches(BROKE).count();
-    if staged != 1 {
+    const BROKE: &str = "transport broke on SCSI 0x2a: no answer in the data phase";
+    let staged: Vec<&str> = log.lines().filter(|l| l.contains(BROKE)).collect();
+    if staged.len() != 1 {
         return Err(format!(
-            "the staged break happened {staged} times, want the one the injection arms per \
-             boot; did it run?\n{log}"
+            "the staged break happened {} times, want the one the injection arms per \
+             boot; did it run?\n{log}",
+            staged.len()
         ));
     }
+    // **And every count below is about that one device.** The actuator abandons
+    // the first WRITE(10) of the boot, so the line above names the disk under
+    // test; this profile carries a second one — the stick the machine booted
+    // from — whose own transport can break in the same boot for reasons that
+    // have nothing to do with the injection. `log.matches("transport broke")`
+    // summed both, and on CI run 31684437719 the boot stick's clean
+    // status-phase recovery at 2.616 s (one break, one retry, `SCSI 0x35`,
+    // slot 1) pushed the total from the injected disk's real 2 to 3 and reddened
+    // the run (`specs/issues/hardware/usb-transport-break-counts-the-boot-sticks-recovery.md`).
+    let under_test = broke_on(staged[0])?;
+
     // And the driver got over it. Two attempts are explained by the fault — the
     // fault itself, and the recovery the device's late answer to the abandoned
     // transfer can undo — so a third that also breaks is the transport failing
     // to come back rather than this test's doing.
-    let breaks = log.matches("transport broke").count();
+    let mine = format!("usb-storage: {under_test} transport broke");
+    let breaks = log.matches(mine.as_str()).count();
     if breaks > 2 {
+        let all: Vec<&str> = log.lines().filter(|l| l.contains("transport broke")).collect();
         return Err(format!(
-            "the transport broke {breaks} times off one abandoned transfer, which can undo one \
-             recovery and no more\n{log}"
+            "{under_test}'s transport broke {breaks} times off one abandoned transfer, which \
+             can undo one recovery and no more; every break this boot: {all:?}\n{log}"
         ));
     }
+    // Left counting every device on the machine on purpose, and it is not the
+    // shape above: a break the driver recovers from belongs to the disk it
+    // happened on, but a transport that never comes back takes the boot with it
+    // whichever disk it was.
     if let Some(gave_up) = log.lines().find(|l| l.contains("times running; the transport is not")) {
         return Err(format!("{gave_up:?}\n{log}"));
     }
@@ -1524,11 +1542,14 @@ pub fn usb_transport_break(
     // The endpoint state the recovery had to be chosen for, read out of the
     // controller's own output device context. `Halted` here would mean the
     // injection staged the other shape and everything below proves nothing.
-    if !log.contains("is Running, recovering") {
-        let states: Vec<&str> = log.lines().filter(|l| l.contains(", recovering")).collect();
+    // Scoped to the disk under test for the same reason the count is: another
+    // device's endpoint being found Running says nothing about this one's.
+    let recovered = format!("xHCI: {under_test} endpoint");
+    let states: Vec<&str> = log.lines().filter(|l| l.contains(", recovering")).collect();
+    if !states.iter().any(|l| l.contains(recovered.as_str()) && l.contains("is Running,")) {
         return Err(format!(
-            "no endpoint was found Running after the break, so this is not the non-halt \
-             shape: {states:?}\n{log}"
+            "no endpoint of {under_test} was found Running after the break, so this is not the \
+             non-halt shape: {states:?}\n{log}"
         ));
     }
 
@@ -1568,11 +1589,31 @@ pub fn usb_transport_break(
     let _ = std::fs::remove_file(&image);
 
     eprintln!(
-        "  [usb] a bulk transfer abandoned mid-flight: the endpoint was found Running and \
-         stopped rather than reset, the transport came back in {breaks} break(s), and every \
-         block the guest was told to write verified host-side"
+        "  [usb] a bulk transfer abandoned mid-flight on {under_test}: the endpoint was found \
+         Running and stopped rather than reset, that device's transport came back in {breaks} \
+         break(s) of the {} this boot, and every block the guest was told to write verified \
+         host-side",
+        log.matches("transport broke").count()
     );
     Ok(())
+}
+
+/// Which device a `usb-storage: <bdf> slot <n> transport broke …` line is about.
+///
+/// **Refused rather than widened if the line stops naming one.** A count of
+/// broken transports is evidence about a disk, and a machine that boots off USB
+/// always has at least two: the answer to "how many times did *this* disk's
+/// transport break" is not recoverable from a line that does not say which disk
+/// it was, and matching every disk's line instead is how this test came to red
+/// on a boot stick's own clean recovery.
+fn broke_on(line: &str) -> Result<&str, String> {
+    line.split_once("usb-storage: ")
+        .and_then(|(_, rest)| rest.split_once(" transport broke"))
+        .map(|(who, _)| who)
+        .ok_or_else(|| {
+            format!("{line:?} does not name the device whose transport broke, so nothing can \
+                    count that device's breaks apart from another's")
+        })
 }
 
 /// A SuperSpeed port is not reset into existence, and the driver knows which
@@ -1951,17 +1992,33 @@ fn hid_break_boot(
     // cannot name the code its mouse died of, because the driver discarded it.
     let named: Vec<&str> = log.lines().filter(|l| l.contains(ENDPOINT)).collect();
     let want = format!("{ENDPOINT} completed with code 6 (Stall Error); failure 1 of 8");
-    let staged = log.matches(want.as_str()).count();
-    if staged != 2 {
+    let staged: Vec<&&str> = named.iter().filter(|l| l.contains(want.as_str())).collect();
+    if staged.len() != 2 {
         return Err(format!(
-            "{staged} endpoint(s) reported a broken completion, want the mouse and the \
-             keyboard: {named:?}\n{log}"
+            "{} endpoint(s) reported a broken completion, want the mouse and the \
+             keyboard: {named:?}\n{log}",
+            staged.len()
         ));
     }
-    for kind in ["xHCI: USB pointer on slot", "xHCI: USB keyboard on slot"] {
-        if !named.iter().any(|l| l.contains(kind)) {
-            return Err(format!("no {kind:?} line among {named:?}\n{log}"));
+    // Which two devices those were, by the controller they are on and the slot
+    // they hold on it — and both halves are needed. **A slot id is one
+    // controller's numbering and this machine has two**: the boot disk is slot 1
+    // on `00:02.0` and the mouse plugged in below is slot 1 on `00:03.0`.
+    let mut broken: Vec<(&str, &str)> = Vec::new();
+    for line in &staged {
+        broken.push(hid_broke_on(line)?);
+    }
+    for kind in ["pointer", "keyboard"] {
+        if !broken.iter().any(|(k, _)| *k == kind) {
+            return Err(format!("no {kind:?} among the broken completions {broken:?}\n{log}"));
         }
+    }
+    if broken[0].1 == broken[1].1 {
+        return Err(format!(
+            "both broken completions are on {}, so this boot broke one device twice rather \
+             than the mouse and the keyboard once each\n{log}",
+            broken[0].1
+        ));
     }
 
     // The endpoint state the recovery had to be chosen for, read out of the
@@ -1969,11 +2026,26 @@ fn hid_break_boot(
     // the endpoint really is Running — `Halted` here would mean the injection
     // staged a shape this boot cannot produce and everything above proves
     // something else.
-    let running = log.matches("endpoint 3 is Running, recovering").count();
-    if running != 2 {
+    //
+    // **Once for each of the two devices the injection struck, and no longer a
+    // count over the whole boot.** `endpoint 3` is the first IN endpoint of
+    // *every* USB device — the boot disk's bulk IN as much as a HID interrupt
+    // endpoint — so one transport recovery on the boot disk anywhere in the boot
+    // used to red this test with a failure about HID: three CI runs did exactly
+    // that, e.g. `31405969578` shard 10, where the disk's own
+    // `slot 1 endpoint 3` and `slot 1 endpoint 4` at 2.639 s were counted beside
+    // the mouse's and the keyboard's
+    // (`specs/issues/hardware/xhci-hid-break-counts-any-endpoint-3.md`).
+    let mut recovered: Vec<(&str, usize)> = Vec::new();
+    for (_, who) in &broken {
+        let running = format!("xHCI: {who} endpoint 3 is Running, recovering");
+        recovered.push((who, log.matches(running.as_str()).count()));
+    }
+    if recovered.iter().any(|(_, n)| *n != 1) {
         let states: Vec<&str> = log.lines().filter(|l| l.contains(", recovering")).collect();
         return Err(format!(
-            "{running} endpoint(s) were found Running after the break, want 2: {states:?}\n{log}"
+            "the two devices the injection struck were found Running {recovered:?} time(s), \
+             want once each; every recovery this boot: {states:?}\n{log}"
         ));
     }
 
@@ -1993,12 +2065,31 @@ fn hid_break_boot(
     serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
 
     eprintln!(
-        "  [xhci] a HID interrupt endpoint broken at {which}: both devices named the code, were \
-         found Running and restarted, and {word:?} plus a {:?} pointer delta crossed them \
-         afterwards",
+        "  [xhci] a HID interrupt endpoint broken at {which}: {broken:?} named the code, were \
+         each found Running once and restarted (of {} recoveries in the boot), and {word:?} \
+         plus a {:?} pointer delta crossed them afterwards",
+        log.matches("is Running, recovering").count(),
         (DX * scale_x, DY * scale_y)
     );
     Ok(())
+}
+
+/// Which device an `xHCI: USB <kind> on <bdf> slot <n>: interrupt endpoint …`
+/// line is about, as the kind and the device.
+///
+/// **Refused rather than widened if the line stops naming one.** Recovery lines
+/// carry `<bdf> slot <n>` and nothing else that identifies a device, so a test
+/// that cannot read this pair off the completion has no way to tell its own
+/// device's recovery from another device's — and the only alternative to
+/// refusing is the count over every device that reddened this test three times.
+fn hid_broke_on(line: &str) -> Result<(&str, &str), String> {
+    line.split_once("xHCI: USB ")
+        .and_then(|(_, rest)| rest.split_once(": interrupt endpoint"))
+        .and_then(|(who, _)| who.split_once(" on "))
+        .ok_or_else(|| {
+            format!("{line:?} does not name the device and the controller its endpoint broke \
+                    on, so nothing can tell that device's recovery from another's")
+        })
 }
 
 /// Devices plugged in **after** the machine has booted.
