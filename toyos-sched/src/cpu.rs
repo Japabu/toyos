@@ -1197,3 +1197,334 @@ impl<M: SchedMsg> CpuHandles<M> {
         self.handles.is_empty()
     }
 }
+
+/// The arms this file has that nothing else covers.
+///
+/// **`cpu.rs` had no test module at all before
+/// `specs/completion-architecture-spec.md` §7.3 asked for one**, and every arm
+/// exercised below — the retire's three, the pick's, the balance path's and
+/// the adopt's — was reachable only through the simulator, which explores
+/// *scenarios* rather than stating what a single arm does. The scheduler
+/// migration cost seventy defects in code whose own suites were green
+/// (`specs/assessments/metal-track-history.md`); these are the statements a
+/// reader can check one at a time.
+///
+/// The harness is deliberately the smallest thing that can hold a `CpuSched`:
+/// a payload with no address space, an `Hw` that records rather than acts, and
+/// one CPU unless a test needs two.
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use crate::fair::{FairShare, ShareState};
+    use crate::hw::{Kicker, Machine};
+    use crate::mailbox::{mailbox, NoPreempt};
+    use crate::sync::LeafLock;
+    use crate::task::{RtState, TaskAccounting, TaskBuilder};
+    use crate::waitq::{WaitList, WaitQueue};
+    use std::sync::Mutex;
+
+    struct TestLock<T>(Mutex<T>);
+
+    impl<T: Send> LeafLock<T> for TestLock<T> {
+        fn with<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+            f(&mut self.0.lock().expect("a test never poisons a lock"))
+        }
+    }
+
+    struct TestPayload;
+
+    impl SchedPayload for TestPayload {
+        type Ctx = ();
+        type ShareLock = TestLock<ShareState>;
+    }
+
+    #[derive(Default)]
+    struct HwState {
+        released: Vec<TaskKey>,
+        need_resched: Vec<CpuId>,
+        kicks: Vec<CpuId>,
+        switches: Vec<Option<TaskKey>>,
+    }
+
+    #[derive(Default)]
+    struct TestHw(Mutex<HwState>);
+
+    impl TestHw {
+        fn state(&self) -> std::sync::MutexGuard<'_, HwState> {
+            self.0.lock().expect("a test never poisons a lock")
+        }
+    }
+
+    impl Kicker for TestHw {
+        fn kick(&self, target: CpuId) {
+            self.state().kicks.push(target);
+        }
+    }
+
+    impl Machine for TestHw {
+        type IrqGuard = ();
+        fn now(&self) -> Nanos {
+            Nanos::ZERO
+        }
+        fn set_timer(&self, _deadline: Nanos) {}
+        fn stop_timer(&self) {}
+        fn irq_guard(&self) {}
+        fn halt(&self) {}
+        fn need_resched(&self, cpu: CpuId) {
+            self.state().need_resched.push(cpu);
+        }
+        fn trace(&self, _ev: TraceEvent) {}
+    }
+
+    impl Hw for TestHw {
+        type Payload = TestPayload;
+        #[allow(unsafe_code)] // the declaration is unsafe; this body reads keys only
+        unsafe fn switch(&self, token: RunToken<TestPayload>) {
+            self.state().switches.push(token.incoming());
+        }
+        fn release(&self, key: TaskKey, _payload: TestPayload, _acct: TaskAccounting) {
+            self.state().released.push(key);
+        }
+    }
+
+    const C0: CpuId = CpuId(0);
+    const C1: CpuId = CpuId(1);
+    const NOW: Nanos = Nanos(1_000);
+
+    /// One CPU's worth of world, plus the handles both CPUs need.
+    struct World {
+        cpus: Vec<CpuSched<TestPayload>>,
+        handles: CpuHandles<Msg<TestPayload>>,
+        hw: TestHw,
+        frontier: Frontier,
+        preempt: NoPreempt,
+        next_key: u64,
+    }
+
+    impl World {
+        fn new(count: usize) -> Self {
+            let mut cpus = Vec::new();
+            let mut handles = Vec::new();
+            for i in 0..count {
+                let (tx, rx) = mailbox();
+                cpus.push(CpuSched::new(CpuId(i as u32), rx, ()));
+                handles.push(CpuHandle::new(CpuId(i as u32), tx));
+            }
+            Self {
+                cpus,
+                handles: CpuHandles::new(handles),
+                hw: TestHw::default(),
+                frontier: Frontier::new(),
+                preempt: NoPreempt,
+                next_key: 1,
+            }
+        }
+
+        /// The CPUs and the environment as two disjoint borrows. One call
+        /// rather than two accessors because `Env` borrows every field the
+        /// CPUs do not, and the compiler only sees that inside one body.
+        fn split(
+            &mut self,
+        ) -> (
+            &mut Vec<CpuSched<TestPayload>>,
+            Env<'_, TestHw, NoPreempt>,
+        ) {
+            (
+                &mut self.cpus,
+                Env {
+                    hw: &self.hw,
+                    cpus: &self.handles,
+                    frontier: &self.frontier,
+                    preempt: &self.preempt,
+                    steal: false,
+                },
+            )
+        }
+
+        /// A task in transit to `dst`, which is where every task starts.
+        fn spawn(&mut self, dst: CpuId) -> (TaskKey, Arc<TaskShared<Msg<TestPayload>>>) {
+            let key = TaskKey(self.next_key);
+            self.next_key += 1;
+            let share = Arc::new(FairShare::new(TestLock(Mutex::new(
+                ShareState::NonRunnable { lag: 0 },
+            ))));
+            let task = TaskBuilder {
+                key,
+                share,
+                ctx: (),
+                ext: TestPayload,
+                rt: RtState::default(),
+            }
+            .build(dst, NOW);
+            let shared = task.shared().clone();
+            let (cpus, env) = self.split();
+            cpus[dst.0 as usize].handle_adopt(task, env, NOW);
+            (key, shared)
+        }
+
+        /// Dispatch whatever the pick chooses, so a test can put a task in
+        /// `running` without reaching into the CPU.
+        fn run_a_pass(&mut self, cpu: CpuId) {
+            let (cpus, env) = self.split();
+            let pass = SchedPass::begin(&mut cpus[cpu.0 as usize], env, NOW);
+            let _ = pass.dispose_none().finish();
+        }
+
+        fn park_running(&mut self, cpu: CpuId, queue: &WaitQueue<Msg<TestPayload>, TestLock<WaitList<Msg<TestPayload>>>>) {
+            let (cpus, env) = self.split();
+            let sched = &mut cpus[cpu.0 as usize];
+            let current = CurrentTask::new(
+                sched.running().expect("a running task to park").shared(),
+                cpu,
+            );
+            let ticket = queue.prepare_wait(&current);
+            let (committed, registration) = match ticket.commit() {
+                crate::waitq::Commit::Parked(c, r) => (c, r),
+                _ => panic!("the commit refused an uncontended park"),
+            };
+            let pass = SchedPass::begin(sched, env, NOW);
+            let _ = pass.dispose_block(committed, None).finish();
+            core::mem::forget(registration);
+        }
+
+        fn released(&self) -> Vec<TaskKey> {
+            self.hw.state().released.clone()
+        }
+
+        /// End a test that deliberately leaves a task alive.
+        ///
+        /// `Task`'s drop bomb — "the only legal death is `DeadTask::finalize`"
+        /// — is a scheduler invariant and not a cleanup path, so a world with
+        /// a live task in it may not be dropped. Forgetting it is what a
+        /// running machine does with a task that is still running.
+        fn abandon(self) {
+            core::mem::forget(self);
+        }
+    }
+
+    fn queue() -> WaitQueue<Msg<TestPayload>, TestLock<WaitList<Msg<TestPayload>>>> {
+        WaitQueue::new(WaitClass::Other, TestLock(Mutex::new(WaitList::new())))
+    }
+
+    /// A task reaches `running` through the ordinary route: adopt, pass, pick.
+    #[test]
+    fn a_spawned_task_is_adopted_and_dispatched() {
+        let mut w = World::new(1);
+        let (key, shared) = w.spawn(C0);
+        assert_eq!(shared.state(), TaskState::Ready(C0), "adopt makes it ready");
+        w.run_a_pass(C0);
+        assert_eq!(shared.state(), TaskState::Running(C0));
+        assert_eq!(w.cpus[0].running().map(|t| t.key()), Some(key));
+        w.abandon();
+    }
+
+    /// **The arm §7.1 calls the one that matters.** A thread parked on a disk
+    /// transfer is in `parked`; today the retire reaps it where it lies, and
+    /// its kernel stack — every guard on it — goes with it.
+    #[test]
+    fn a_retire_reaps_a_parked_task_where_it_lies() {
+        let mut w = World::new(1);
+        let q = queue();
+        let (key, shared) = w.spawn(C0);
+        w.run_a_pass(C0);
+        w.park_running(C0, &q);
+        assert_eq!(shared.state(), TaskState::Blocked(C0));
+
+        crate::retire::begin(&shared).post(&w.handles, &w.hw, &NoPreempt);
+        w.run_a_pass(C0);
+
+        assert_eq!(shared.state(), TaskState::Dead);
+        assert_eq!(w.released(), std::vec![key], "reaped in place, stack and all");
+    }
+
+    /// The same hazard one step later: woken by a release, sitting in the run
+    /// queue with the previous guard still on its stack, killed before it is
+    /// picked.
+    #[test]
+    fn a_retire_reaps_a_ready_task() {
+        let mut w = World::new(1);
+        let (key, shared) = w.spawn(C0);
+        assert_eq!(shared.state(), TaskState::Ready(C0));
+
+        crate::retire::begin(&shared).post(&w.handles, &w.hw, &NoPreempt);
+        w.run_a_pass(C0);
+
+        assert_eq!(shared.state(), TaskState::Dead);
+        assert_eq!(w.released(), std::vec![key]);
+    }
+
+    /// The one arm that already does what §7.2 wants of all of them: a running
+    /// task cannot be yanked out from under its own kernel stack, so it is
+    /// asked to take a safe point instead.
+    #[test]
+    fn a_retire_of_the_running_task_asks_for_a_safe_point() {
+        let mut w = World::new(1);
+        let (_key, shared) = w.spawn(C0);
+        w.run_a_pass(C0);
+        assert_eq!(shared.state(), TaskState::Running(C0));
+
+        crate::retire::begin(&shared).post(&w.handles, &w.hw, &NoPreempt);
+        w.run_a_pass(C0);
+
+        assert_eq!(shared.state(), TaskState::Running(C0), "it keeps its stack");
+        assert!(w.released().is_empty(), "nothing was released");
+        assert_eq!(w.hw.state().need_resched, std::vec![C0]);
+        w.abandon();
+    }
+
+    /// **The crate's general answer to a killed ready task**, and why §7.2's
+    /// earlier drafts were a no-op: whatever the retire does, the very next
+    /// pick reaps a killed task before it can be dispatched.
+    #[test]
+    fn the_pick_reaps_a_killed_ready_task() {
+        let mut w = World::new(1);
+        let (key, shared) = w.spawn(C0);
+        shared.mark_kill();
+
+        w.run_a_pass(C0);
+
+        assert_eq!(shared.state(), TaskState::Dead);
+        assert_eq!(w.released(), std::vec![key]);
+        assert!(w.cpus[0].running().is_none(), "a killed task is never dispatched");
+    }
+
+    /// The balance path reads the kill bit and keeps the corpse rather than
+    /// handing it to a CPU whose adopt kicks nobody. This is the property the
+    /// sim's I14 and `old_migrate_kept_the_corpse_i14.trace` stand on.
+    #[test]
+    fn the_balance_path_reaps_a_killed_task_rather_than_migrating_it() {
+        let mut w = World::new(2);
+        let (key, shared) = w.spawn(C0);
+        shared.mark_kill();
+
+        let (cpus, env) = w.split();
+        let task = cpus[0].rq.remove(key).expect("ready on cpu0");
+        task.share().leave_runnable(env.frontier);
+        cpus[0].hand_off(task, C1, env, NOW);
+
+        assert_eq!(shared.state(), TaskState::Dead);
+        assert_eq!(w.released(), std::vec![key], "reaped here, not migrated");
+    }
+
+    /// A kill that lands after the adopt was posted: the destination converts
+    /// it on arrival, which is what makes the retire chase terminate.
+    #[test]
+    fn an_adopt_of_a_killed_task_reaps_it_on_arrival() {
+        let mut w = World::new(2);
+        let (key, shared) = w.spawn(C0);
+
+        let (cpus, env) = w.split();
+        let task = cpus[0].rq.remove(key).expect("ready on cpu0");
+        task.share().leave_runnable(env.frontier);
+        cpus[0].hand_off(task, C1, env, NOW);
+        assert_eq!(shared.state(), TaskState::InTransit(C1));
+
+        shared.mark_kill();
+        w.run_a_pass(C1);
+
+        assert_eq!(shared.state(), TaskState::Dead);
+        assert_eq!(w.released(), std::vec![key]);
+    }
+}
