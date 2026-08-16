@@ -82,11 +82,24 @@ impl FileHeader {
         if read::u16_at(data, 54).ok_or(Error::TooSmall)? as usize != PROGRAM_HEADER_SIZE {
             return Err(Error::BadProgramHeaderSize);
         }
+        let phoff = read::u64_at(data, 32).ok_or(Error::TooSmall)?;
+        // The header occupies exactly the first `FILE_HEADER_SIZE` bytes, so a
+        // table a linker wrote never starts inside them. Left unchecked this
+        // is not caught here: `phoff` is small, so `program_headers` finds it
+        // inside the buffer, and the "table" it reads back is the file
+        // header's own bytes reinterpreted as `ProgramHeader`s. None of their
+        // bit patterns lands on a known `p_type`, so the file is refused
+        // anyway — as `NoLoadSegments`, true of the resulting (garbage) table
+        // but silent about what is actually wrong: an `e_phoff` no linker
+        // would write.
+        if phoff < FILE_HEADER_SIZE as u64 {
+            return Err(Error::ProgramHeadersInsideFileHeader);
+        }
 
         Ok(FileHeader {
             machine: Machine::X86_64,
             entry: read::u64_at(data, 24).ok_or(Error::TooSmall)?,
-            phoff: read::u64_at(data, 32).ok_or(Error::TooSmall)?,
+            phoff,
             phnum,
             shoff: read::u64_at(data, 40).ok_or(Error::TooSmall)?,
             shnum: read::u16_at(data, 60).ok_or(Error::TooSmall)?,
