@@ -20,6 +20,17 @@ struct TestDef {
     qemu_name: String,
     timeout: Duration,
     check: fn(&TestResult) -> bool,
+    /// What the test's window is still owed when the guest's exit closed it.
+    ///
+    /// A capture ends at `===TEST_END===`, which is the test process exiting —
+    /// and a daemon reporting *on* that exit writes its line afterwards. So a
+    /// check that counts such lines is counting over a window its own subject
+    /// closes, and the last one loses the race
+    /// (`null_sink_client_exits`, PR #85 and PR #94). This runs between the
+    /// test and its check, with the guest still up, and waits on the guest's
+    /// own liveness — never on a span of host time. [`no_settle`] is the
+    /// default and costs nothing.
+    settle: fn(&mut QemuInstance, &mut TestResult),
 }
 
 /// Whether a test may run while other guests are up.
@@ -1580,15 +1591,20 @@ fn check_audio_idle_suspend(result: &TestResult) -> bool {
 /// The exit code already says both `/bin/tone` runs finished cleanly — that is
 /// the test's own assertion — so this window is exactly the case soundd used to
 /// misreport: `client N died` for a process that exited `code=0`, because the
-/// mix loop's signal pipe broke before the control thread read the peer. The
-/// race is scheduling and this test does not try to win it; what it asserts is
-/// that neither outcome of the race is worded as a death, and that both
-/// removals name a departure soundd actually established (§7).
+/// mix loop's signal pipe broke before the control thread read the peer. What
+/// it asserts is that neither outcome of that race is worded as a death, and
+/// that both removals name a departure soundd actually established (§7).
+///
+/// **The count is per removal and stays exact**, because the vocabulary is
+/// asserted per removal: a capture where no client ever left would satisfy
+/// every check above it vacuously, and a range would let the second removal go
+/// missing again. What used to make that count a race was the window and not
+/// the number — see [`settle_null_sink_client_exits`], which is what closes it.
 fn check_null_sink_client_exits(result: &TestResult) -> bool {
     if !check_rust_result(result) {
         return false;
     }
-    let problems = audio::check_departures(&result.serial, 2);
+    let problems = audio::check_departures(&result.serial, NULL_SINK_CLIENTS);
     if !problems.is_empty() {
         eprintln!(
             "FAIL rs::null_sink_client_exits: {}\nserial:\n{}",
@@ -1637,6 +1653,58 @@ fn check_fault_gates(result: &TestResult) -> bool {
         ok = false;
     }
     ok & check_symbols_were_read("fault_gates", &result.serial)
+}
+
+/// The clients `test_rs_null_sink_client_exits` runs in series, and so the
+/// number of removals soundd owes. One constant, because the wait below and the
+/// count above have to be the same number or the wait is for something else.
+const NULL_SINK_CLIENTS: usize = 2;
+
+/// Wait for soundd to report the second client leaving, on the guest's liveness.
+///
+/// **The last removal arrives after the process whose exit produced it**, and
+/// that process exiting is what ends the capture: round 1's line makes it in
+/// because a whole second round follows it, and round 2's has nothing behind it
+/// but `===TEST_END===`. Counting two removals over that window is an assertion
+/// about scheduling, and it went red on CI twice on documentation-only branches
+/// — `soundd reported 1 client removals, expected 2` — with the capture showing
+/// the line never arriving rather than arriving wrong.
+///
+/// The wait is [`await_guest`]'s: it ends when the removals are there, or when
+/// the guest stops making progress, and never on a span of host wall clock. It
+/// costs nothing on a run that already had both lines — the predicate is checked
+/// before anything is drained, which was true of 6 of 6 measured runs on the dev
+/// host — and its expiry is not a verdict, which is why the error is dropped:
+/// what fails this test is still the count, in `check_departures`'s own words.
+///
+/// [`audio::SOUNDD_GONE`] ends it too, for the same reason `await_null_sink`
+/// reads that line: soundd exiting is a removal that is never coming, and the
+/// test should say so in its own sentence rather than wait out the guard. The
+/// guard is the whole of [`qemu::GUEST_WEDGED`] here and not the quiet bound —
+/// this boot's kernel prints on a 10 s cadence, so the machine is never silent
+/// for the 15 s that would end the wait early (measured: an unreachable
+/// predicate takes 302 s). That price is paid only by a run where soundd is
+/// alive and has genuinely stopped reporting departures, which is the defect
+/// this test exists for.
+fn settle_null_sink_client_exits(qemu: &mut QemuInstance, result: &mut TestResult) {
+    let mut serial = std::mem::take(&mut result.serial);
+    let _ = await_guest(qemu, &mut serial, "soundd to report both clients leaving", |seen| {
+        audio::departures(seen).len() >= NULL_SINK_CLIENTS || seen.contains(audio::SOUNDD_GONE)
+    });
+    result.serial = serial;
+}
+
+/// Nothing to wait for: the test's own window carries everything its check
+/// reads. Every name but one.
+fn no_settle(_: &mut QemuInstance, _: &mut TestResult) {}
+
+/// Select the between-the-test-and-its-check wait by name, as [`check_for`]
+/// selects the check.
+fn settle_for(name: &str) -> fn(&mut QemuInstance, &mut TestResult) {
+    match name {
+        "null_sink_client_exits" => settle_null_sink_client_exits,
+        _ => no_settle,
+    }
 }
 
 /// Select check function by test name convention.
@@ -4166,6 +4234,13 @@ type Grouped = Option<Boot>;
 const METAL_SIM_DESKTOP: &str = "metal-sim desktop";
 const I8042_TRACE: &str = "i8042 trace";
 
+/// The line `tests/toyos-rust-tests/src/bin/i8042_keyboard.rs` prints once it
+/// holds the keyboard fd, and the line every injection into that binary is
+/// timed off. Eight callers wait for it, and one — `i8042_undecoded_bytes` —
+/// also reads its capture *from* it: it is the boundary between what the
+/// machine did on its own and what this test staged.
+const I8042_READY: &str = "===I8042_READY===";
+
 impl Boot {
     /// Drain for `dur` into the group's console, and hand back the whole of it.
     fn drain(&mut self, dur: Duration) -> &str {
@@ -4836,7 +4911,7 @@ fn i8042_keyboard(boot: &mut Boot) -> Result<(), String> {
     let result = qemu.run_test_hooked(
         "test_rs_i8042_keyboard",
         Duration::from_secs(20),
-        "===I8042_READY===",
+        I8042_READY,
         |socket| {
             for key in ["h", "e", "l", "l", "o"] {
                 qemu::qmp_send_keys(socket, &[(key, true), (key, false)]);
@@ -6185,7 +6260,7 @@ fn i8042_no_spurious_wake(boot: &mut Boot) -> Result<(), String> {
     let result = qemu.run_test_hooked(
         "test_rs_i8042_keyboard",
         Duration::from_secs(20),
-        "===I8042_READY===",
+        I8042_READY,
         |socket| {
             for _ in 0..2 {
                 qemu::qmp_send_keys(socket, &[("pause", true), ("pause", false)]);
@@ -8834,7 +8909,7 @@ fn run_machine_test(
             let result = qemu.run_test_hooked(
                 "test_rs_i8042_keyboard",
                 Duration::from_secs(30),
-                "===I8042_READY===",
+                I8042_READY,
                 |socket| {
                     qemu::qmp_send_keys(socket, &[("a", true), ("a", false)]);
                     thread::sleep(Duration::from_millis(3000));
@@ -8941,7 +9016,7 @@ fn run_machine_test(
             let result = qemu.run_test_hooked(
                 "test_rs_i8042_keyboard",
                 Duration::from_secs(20),
-                "===I8042_READY===",
+                I8042_READY,
                 |socket| {
                     qemu::qmp_send_keys(socket, &[("a", true), ("a", false)]);
                     thread::sleep(Duration::from_millis(100));
@@ -9170,7 +9245,7 @@ fn run_machine_test(
             let result = qemu.run_test_hooked(
                 "test_rs_i8042_keyboard",
                 Duration::from_secs(20),
-                "===I8042_READY===",
+                I8042_READY,
                 |socket| {
                     for key in ["h", "e", "l", "l", "o"] {
                         qemu::qmp_send_keys(socket, &[(key, true), (key, false)]);
@@ -9240,7 +9315,7 @@ fn run_machine_test(
             let result = qemu.run_test_hooked(
                 "test_rs_i8042_keyboard",
                 Duration::from_secs(20),
-                "===I8042_READY===",
+                I8042_READY,
                 |socket| {
                     for key in ["h", "e", "l", "l", "o"] {
                         qemu::qmp_send_keys(socket, &[(key, true), (key, false)]);
@@ -9300,7 +9375,7 @@ fn run_machine_test(
             let result = qemu.run_test_hooked(
                 "test_rs_i8042_keyboard",
                 Duration::from_secs(20),
-                "===I8042_READY===",
+                I8042_READY,
                 |socket| {
                     qemu::qmp_send_keys(socket, &[("pause", true), ("pause", false)]);
                     thread::sleep(Duration::from_millis(200));
@@ -9312,12 +9387,19 @@ fn run_machine_test(
             if let Some(err) = &result.error {
                 return Err(format!("{err}\n{}", result.stdout));
             }
-            let Some(mute) = result.serial.lines().find(|l| l.contains("nothing decoded")) else {
-                return Err(format!(
-                    "bytes arrived and decoded to nothing and the driver never said so:\n{}",
-                    result.serial
-                ));
-            };
+            // **Both lines are read from the injection onwards**, and that is
+            // not tidiness: this driver reports on its own bring-up too, and a
+            // `nothing decoded` line from before the Pause was pressed is not a
+            // report about the Pause. Reading the first one in the whole capture
+            // is what made this test red on a line naming no byte, on the dev
+            // host and on CI
+            // (`specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`).
+            // The marker is the boundary the test knows, because the marker is
+            // what the injection was timed off.
+            let capture = serial::Serial::named("i8042 capture", result.serial.clone());
+            let mute = capture.must_say_after(I8042_READY, "nothing decoded").map_err(|why| {
+                format!("bytes arrived and decoded to nothing and the driver never said so: {why}")
+            })?;
             // The datum, not the count. `0xE1` is Pause's prefix and the first
             // byte of the sequence whichever way the drain batched it; a line
             // that reports only "N bytes, 0 keys" is the one this test exists
@@ -9328,13 +9410,12 @@ fn run_machine_test(
             // And the picture corrects itself. A one-shot report would freeze
             // the panel on the half-arrived sequence and never say the
             // keyboard works after all — which on the T14 is a reflash.
-            let Some(alive) = result.serial.lines().find(|l| l.contains("the pin asserts")) else {
-                return Err(format!(
+            let alive = capture.must_say_after(I8042_READY, "the pin asserts").map_err(|why| {
+                format!(
                     "a letter was typed after the undecoded bytes and the driver never \
-                     revised its verdict:\n{}",
-                    result.serial
-                ));
-            };
+                     revised its verdict: {why}"
+                )
+            })?;
             let keys = alive
                 .split_whitespace()
                 .collect::<Vec<_>>()
@@ -9451,7 +9532,7 @@ fn run_machine_test(
             let result = qemu.run_test_hooked(
                 "test_rs_i8042_keyboard",
                 Duration::from_secs(30),
-                "===I8042_READY===",
+                I8042_READY,
                 |socket| {
                     qemu::qmp_send_keys(socket, &[("a", true), ("a", false)]);
                 },
@@ -10660,6 +10741,7 @@ fn build_test_registry(
         tests.push(TestDef {
             qemu_name: format!("test_rs_{name}"),
             check: check_for(&name),
+            settle: settle_for(&name),
             timeout,
             name,
         });
@@ -10670,6 +10752,7 @@ fn build_test_registry(
             qemu_name: format!("test_c_{name}"),
             timeout: Duration::from_secs(10),
             check: check_c_result,
+            settle: no_settle,
             name: name.clone(),
         });
     }
@@ -12062,6 +12145,9 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
                         qemu = boot();
                         result = qemu.run_test(&test.qemu_name, test.timeout);
                     }
+                    // Between the test and its check, with the guest still up:
+                    // see [`TestDef::settle`].
+                    (test.settle)(&mut qemu, &mut result);
                     let reason = (!(test.check)(&result)).then(|| {
                         result
                             .error

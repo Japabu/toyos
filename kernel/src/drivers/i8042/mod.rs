@@ -136,6 +136,21 @@ static AUX_GSI: AtomicU32 = AtomicU32::new(u32::MAX);
 static IRQS: AtomicU32 = AtomicU32::new(0);
 static RX_BYTES: AtomicU32 = AtomicU32::new(0);
 
+/// Interrupts the ISR found **nothing behind**: OBF clear on the first sample,
+/// so the burst read no byte at all.
+///
+/// `init` sends commands to the controller and *polls* for the answers, and the
+/// pin is armed before the last of those reads — so a byte can be taken by the
+/// polling reader before the ISR that same byte raised gets to run. What
+/// arrives then is an edge with an empty output buffer, and the counters are
+/// honest about it while the conclusion drawn from them was not: nothing was
+/// undecodable, the byte was simply somebody else's.
+///
+/// It is subtracted from [`IRQS`] wherever the question is "did anything arrive
+/// to decode", never where the question is "has the pin ever asserted" — an
+/// empty interrupt is evidence of the second and of nothing else.
+static EMPTY_IRQS: AtomicU32 = AtomicU32::new(0);
+
 /// When the pin first asserted. Set in the handler beside `IRQS`, which is the
 /// only place the two can be made to agree — the health line says "first seen"
 /// and there is now more than one line, so reading the clock where the line is
@@ -202,6 +217,12 @@ const HEALTH_DONE: u8 = 4;
 /// reading `1 bytes, 0 keys` on a keyboard that is in fact working must not be
 /// the last word.
 const HEALTH_MUTE_SAID: u8 = 5;
+/// The pin has asserted and **no interrupt has carried a byte** ([`EMPTY_IRQS`]
+/// accounts for all of them). A state of its own rather than a variant of
+/// [`HEALTH_MUTE_SAID`], because the mute verdict is still owed: the first byte
+/// that does arrive and decodes to nothing has to be reported, and a state that
+/// had already said "nothing decoded" would swallow it.
+const HEALTH_EMPTY_SAID: u8 = 6;
 
 static HEALTH: AtomicU8 = AtomicU8::new(HEALTH_OFF);
 static ARMED_NS: AtomicU64 = AtomicU64::new(0);
@@ -370,9 +391,27 @@ fn first_irq_ms() -> u64 {
 /// Say once whether the armed pin has ever asserted. Runs in thread context
 /// from `service`, on whichever CPU took the pass; the compare-exchange is what
 /// keeps two CPUs from both reporting.
+///
+/// **"Nothing decoded" is a claim about bytes, so it is only made when bytes
+/// have arrived and been accounted for.** Two producers used to make it about
+/// something else, and both printed a line naming no byte at all — which is the
+/// one shape `Unexplained` exists to replace, and which
+/// `i8042_undecoded_bytes` reads as a report about its own injection:
+///
+/// - An interrupt with no byte behind it ([`EMPTY_IRQS`]). Counted apart and
+///   said in its own words below; the mute verdict stays owed.
+/// - A byte still in the ring. `service` drains before it reports, but the pin
+///   is live between the two, so an interrupt landing in that gap is counted
+///   here with its byte undecoded. One `has_bytes` load defers the report to
+///   the pass that has the byte, which is where the report was always meant to
+///   be made.
 fn report_health(state: u8) {
     let irqs = IRQS.load(Ordering::Relaxed);
-    if irqs > 0 {
+    let carried = irqs.saturating_sub(EMPTY_IRQS.load(Ordering::Relaxed));
+    if carried > 0 || RX_BYTES.load(Ordering::Relaxed) > 0 {
+        if has_bytes() {
+            return;
+        }
         let keys = KBD_EVENTS.load(Ordering::Relaxed);
         let motion = AUX_EVENTS.load(Ordering::Relaxed);
         // Two lines at most, and the second only when the picture changes from
@@ -408,6 +447,24 @@ fn report_health(state: u8) {
         // Whichever of the two it was, the counters are now on the record and
         // the repeat can start measuring from here.
         arm_repeat();
+        return;
+    }
+    // The pin asserts and nothing has come over it. Said in its own words
+    // because neither of the two above is true: "nothing decoded" would be a
+    // verdict on bytes that never arrived, and "the pin has never asserted"
+    // below is false — this is the third thing a controller can do, and on a
+    // machine whose only channel is the panel it is the difference between an
+    // init that took its own answers and a keyboard nobody has touched.
+    if irqs > 0 {
+        if state != HEALTH_EMPTY_SAID && claim_health(state, HEALTH_EMPTY_SAID) {
+            log!(
+                "i8042: {} interrupts and no byte behind any of them — the output buffer was empty when the ISR read it, first seen at {}ms",
+                irqs,
+                first_irq_ms()
+            );
+            to_screen();
+            arm_repeat();
+        }
         return;
     }
     if state == HEALTH_QUIET_DUE && claim_health(HEALTH_QUIET_DUE, HEALTH_QUIET_SAID) {
@@ -447,8 +504,12 @@ fn report_counters() {
         return;
     }
     REPORTED_IRQS.store(irqs, Ordering::Relaxed);
+    // `empty` rides with the fault counters because that is the only place it
+    // can still be read once traffic starts: the line above it fires only while
+    // *every* interrupt was empty, and the common case is one at bring-up
+    // followed by a keyboard that works.
     log!(
-        "i8042: {} interrupts, {} bytes, {} keys, {} motion, {} undecoded, {} discarded, {} overruns, {} dropped, {} lost edges — last byte at {}ms",
+        "i8042: {} interrupts, {} bytes, {} keys, {} motion, {} undecoded, {} discarded, {} overruns, {} dropped, {} lost edges, {} empty — last byte at {}ms",
         irqs,
         RX_BYTES.load(Ordering::Relaxed),
         KBD_EVENTS.load(Ordering::Relaxed),
@@ -458,6 +519,7 @@ fn report_counters() {
         OVERRUNS.load(Ordering::Relaxed),
         DROPPED_TOTAL.load(Ordering::Relaxed),
         LOST_EDGES.load(Ordering::Relaxed),
+        EMPTY_IRQS.load(Ordering::Relaxed),
         LAST_IRQ_NS.load(Ordering::Relaxed) / 1_000_000
     );
 }
@@ -643,6 +705,12 @@ pub extern "sysv64" fn handler() {
     if n == ISR_BURST && buffer_full(inb(STATUS)) {
         // It cannot mask the line itself — that needs the I/O APIC lock.
         QUARANTINE.store(true, Ordering::Relaxed);
+    }
+    if n == 0 {
+        // An edge with an empty output buffer. One relaxed add, in the one
+        // place that can tell it from an interrupt that delivered something:
+        // see [`EMPTY_IRQS`].
+        EMPTY_IRQS.fetch_add(1, Ordering::Relaxed);
     }
     if n > 0 {
         crate::irq_ring::isr_publish(IrqSource::I8042, timestamp);

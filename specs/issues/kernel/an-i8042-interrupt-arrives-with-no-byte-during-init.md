@@ -97,3 +97,64 @@ this entry was opened; it now answers the row that cites it —
 
 Neither is the log branch's to fix, and the entry says so rather than the branch
 carrying a red it did not cause the shape of.
+
+## 2026-08-16: the first CI sighting, and it is a *third* producer
+
+PR #94 (`wt/toyos-schedfuture`, five documentation files), `ci` run
+`31944633004`, job `95158684534` (`guest (2)`). Every row above is dev-host TCG;
+this is KVM with one guest on the machine:
+
+```
+FAIL i8042_undecoded_bytes: the line names no byte: [kernel 2.494 cpu1] i8042: 1 interrupts and 4 bytes, nothing decoded — first seen at 2494ms
+```
+
+`ALONE i8042_undecoded_bytes: GREEN, and it was alone both times — nothing the
+harness controls differed, so it failed once and passed once. That is a rate and
+not a classification.` The green re-run's own lines, from the same job:
+
+```
+[kernel 2.816 cpu0] i8042: 2 interrupts and 6 bytes, nothing decoded — no event from [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5], first seen at 2816ms
+[kernel 3.017 cpu0] i8042: the pin asserts — 4 interrupts, 8 bytes, 2 keys, 0 motion, no event from [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5], first seen at 2816ms
+```
+
+**Four bytes, not zero, and the stamp is the injection's own.** This is not the
+bring-up line the heading names: Pause is six bytes, the red run reported after
+the first interrupt had delivered four of them, and `Partial` holds a run until
+the byte that *ends* it — so `UNEXPLAINED_N` was still zero and `Unexplained`
+rendered nothing. The counters are honest and the conclusion is not: the
+sequence had not finished arriving.
+
+So the mute line has three producers that name no byte, and only two of them are
+this entry's. The third is its own defect in its own file —
+`specs/issues/kernel/the-i8042-mute-verdict-cannot-revise-a-line-it-said-too-early.md`
+— because the fix differs in kind: no rule about *when* the report is triggered
+reaches it, the driver has to be able to revise a verdict it has already said.
+
+## What landed, 2026-08-16
+
+Both halves this entry sanctions, and neither reaches that third producer:
+
+- **The driver** (`kernel/src/drivers/i8042/mod.rs`). `EMPTY_IRQS` counts the
+  interrupts the ISR found nothing behind, and "nothing decoded" is claimed only
+  when something arrived to decode. The empty case gets its own sentence (`N
+  interrupts and no byte behind any of them`), leaves the mute verdict owed, and
+  rides the periodic counter line as `{} empty` for the ordinary case of one at
+  bring-up followed by a keyboard that works. A second producer of the same
+  false report went with it: `service` drains before it reports but the pin is
+  live between the two, so a `has_bytes` load defers the report to the pass that
+  holds the byte.
+- **The gate** (`tests/toyos.rs`, `tests/common/serial.rs`). `must_say_after`
+  reads the first line of a shape *after* a marker, and `i8042_undecoded_bytes`
+  anchors both of its lines on `===I8042_READY===` — the marker its injection is
+  timed off, and the only boundary the test knows without a host clock.
+  `serial_vocabulary` gates the matcher against a constructed capture carrying
+  this entry's own stranger line, in both directions: the whole-capture scan
+  reads the stranger, the anchored one does not, and a capture with only the
+  stranger in it has no answer at all.
+
+**What is still open here is the race itself.** Its remaining consequence is not
+this test: `i8042_health`'s quiet boot waits for `the pin has never asserted` as
+its ready marker, and an empty interrupt during bring-up makes that line untrue
+and so unsaid — the boot then fails on its marker rather than on a verdict.
+Closing that is the other half of the driver's two options above — `init` masks
+the GSI while it polls — and nothing has measured how often it bites.
