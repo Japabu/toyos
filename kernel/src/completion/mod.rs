@@ -234,6 +234,12 @@ pub fn post_boosted(subject: Subject<'_>, outcome: Outcome, until: Nanos) {
 /// A `limit` of zero tells nobody, which is what a caller asking for zero
 /// wakes means; `usize::MAX` is the broadcast every `pthread_cond_broadcast`
 /// asks for.
+///
+/// **A waiter whose rendezvous word was already claimed still counts**, and
+/// deliberately: the record reached its inbox before the claim was attempted
+/// (invariant W's order), so whoever won that claim delivers this wake along
+/// with its own. Not counting it would report fewer threads told than were
+/// told, which is the opposite of the error the ABI cares about.
 pub fn post_n(subject: Subject<'_>, outcome: Outcome, token: Token, limit: usize) -> usize {
     let watch = subject.0;
     if limit == 0 || watch.armed.load(Ordering::Relaxed) == 0 {
