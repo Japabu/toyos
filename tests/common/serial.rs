@@ -107,6 +107,49 @@ impl Serial {
         Err(format!("{needle:?} never reached the {}:{note}\n{}", self.source, self.text))
     }
 
+    /// The guest said this **after** it said `marker`.
+    ///
+    /// A whole-capture scan answers with the earliest line of that shape,
+    /// whoever wrote it and whenever — and for a test that *stages* the event it
+    /// is looking for, the earliest line is the wrong one whenever anything else
+    /// on the machine can produce the same shape. `i8042_undecoded_bytes`
+    /// injects an undecodable key once the guest prints `===I8042_READY===` and
+    /// then read the first `nothing decoded` line in its capture as the answer;
+    /// the driver's own bring-up produces one before that marker, and on a
+    /// laptop a real spurious interrupt can too
+    /// (`specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`).
+    ///
+    /// The marker is what the injection was timed off, so it is the boundary the
+    /// test actually knows — no host clock is involved, and a stranger line
+    /// before it can no longer be read as the test's own. A missing marker is a
+    /// failure rather than a fallback to the whole capture: the anchor going
+    /// missing is exactly when the loose scan would look like it worked.
+    pub fn must_say_after(&self, marker: &str, needle: &str) -> Result<&str, String> {
+        let Some(at) = self.text.find(marker) else {
+            return Err(format!(
+                "{marker:?} — the line {needle:?} would have to follow — never reached the {}:\n{}",
+                self.source, self.text
+            ));
+        };
+        // From the end of the marker's own line, so a marker and a needle that
+        // share one line (the console splices them when a writer left no
+        // newline) is not read as the needle arriving first.
+        let after = self.text[at..].find('\n').map_or(self.text.len(), |n| at + n + 1);
+        if let Some(line) = self.text[after..].lines().find(|l| l.contains(needle)) {
+            return Ok(line);
+        }
+        let earlier = match self.text[..after].lines().find(|l| l.contains(needle)) {
+            Some(l) => format!(
+                "\nnote: one arrived *before* {marker:?} and is not this test's — first: {l:?}"
+            ),
+            None => String::new(),
+        };
+        Err(format!(
+            "{needle:?} never reached the {} after {marker:?}:{earlier}\n{}",
+            self.source, self.text
+        ))
+    }
+
     /// The guest did not say this — and the channel was working, so the
     /// absence means something.
     pub fn must_not_say(&self, needle: &str) -> Result<(), String> {
@@ -180,6 +223,36 @@ pub fn self_check() -> Result<(), String> {
         return Err(format!("must_say returned {line:?}, not the whole line"));
     }
 
+    // `must_say_after`, against the capture that made it exist: a stranger line
+    // of the right shape before the marker, and the test's own after it. The
+    // first case is the defect and is asserted in both directions — the plain
+    // scan reads the stranger, which is what `i8042_undecoded_bytes` did.
+    const READY: &str = "===I8042_READY===";
+    let stranger = "[kernel 0.418 cpu1] i8042: 1 interrupts and 0 bytes, nothing decoded — first \
+                    seen at 418ms";
+    let mine = "[kernel 2.816 cpu0] i8042: 2 interrupts and 6 bytes, nothing decoded — no event \
+                from [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5], first seen at 2816ms";
+    let staged = Serial::named("test capture", format!("{stranger}\n{READY}\n{mine}\n"));
+    if staged.must_say("nothing decoded")? != stranger {
+        return Err(String::from("the whole-capture scan stopped reading the earliest line"));
+    }
+    if staged.must_say_after(READY, "nothing decoded")? != mine {
+        return Err(format!("must_say_after read a line from before {READY:?}"));
+    }
+    // And with only the stranger in the capture there is no answer at all,
+    // rather than the stranger: a test that staged nothing must not pass on
+    // somebody else's line.
+    let only_stranger = Serial::named("test capture", format!("{stranger}\n{READY}\n"));
+    let err = only_stranger.must_say_after(READY, "nothing decoded").unwrap_err();
+    if !err.contains("before") {
+        return Err(format!("a stranger-only capture failed without naming why: {err}"));
+    }
+    // A missing anchor is a failure, not a fallback to the whole capture.
+    let no_marker = Serial::named("test capture", format!("{stranger}\n"));
+    if no_marker.must_say_after(READY, "nothing decoded").is_ok() {
+        return Err(String::from("must_say_after answered from a capture with no marker in it"));
+    }
+
     // Interleaving is detected and named, and a clean capture reports none.
     let split = Serial::named("test capture", "[kernel 0.001 cpu0] a\nBoot: comp[kernel 0.002 cpu0] lete\n");
     if split.interleaved().is_none() {
@@ -194,6 +267,10 @@ pub fn self_check() -> Result<(), String> {
         return Err(format!("a split needle failed without naming the cause: {err}"));
     }
 
-    eprintln!("  [serial] {} vocabulary cases, both directions", cases.len());
+    eprintln!(
+        "  [serial] {} vocabulary cases, both directions, plus the anchored scan against a \
+         stranger line",
+        cases.len()
+    );
     Ok(())
 }
