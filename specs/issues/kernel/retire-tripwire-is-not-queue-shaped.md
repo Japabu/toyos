@@ -65,14 +65,19 @@ Three shapes have been considered and none is this chunk's to choose:
    dead thread's page tables still map. `specs/completion-architecture-spec.md`
    §7.4 is where that would be revisited.
 
-**Remedy 2 is the one chosen**, by `specs/scheduling-reservations-spec.md` §8,
-and that design answers the objection recorded against it: the scaling factor is
-no longer a magnitude with a private derivation attached but a declared
-reservation — the per-CPU dying server's guaranteed rate — so the retirer's
-deadline is a caller's own arithmetic over a spec-cited rate and a depth it
-reads. What `kernel/src/time.rs` genuinely lacks is a *panicking* kind that takes
-a citation rather than an absurdity, which that spec records as the one change it
-needs there. This file closes when that lands, and not before.
+**Remedy 2 was chosen and then withdrawn.** The 2026-08-16 five-lens review of
+`specs/scheduling-reservations-spec.md` proved the arm-time depth read is the
+same defect again: the snapshot is taken before the victim reaches the queue, so
+k concurrent retirers all read a depth of zero and the k-th victim legally
+outlives a deadline whose expiry §10 made a panic — and the read itself is one
+scheduler-core invariant 2 forbids. §8 as revised replaces the deadline
+principle entirely: the victim's own CPU asserts that the dying server delivers
+its reservation each period its queue is non-empty and that a served head corpse
+advances a progress marker, while the retirer keeps only a fixed-hop tripwire —
+no depth is read, no wall-clock deadline is computed, and `kernel/src/time.rs`
+needs no new kind after all. None of the three remedies above is the shape that
+landed; §8 owns the design now. This file closes at R7, when §8's assertions are
+implemented and gated, and not before.
 
 Until then the constant is honest about what it does not cover, which is the
 whole of what this file records.
