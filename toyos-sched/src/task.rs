@@ -157,8 +157,11 @@ const GEN_BITS: u32 = 32;
 const GEN_MASK: u64 = (1 << GEN_BITS) - 1;
 
 /// Sticky: set by the retirer before it posts, never cleared. Any CPU that
-/// adopts the task converts it to a dead task on arrival, which is what makes
-/// the retire chase terminate (spec §7.6).
+/// adopts the task *dispatches* it on arrival — into its own dying list — and
+/// the task dies by its own `die` at the first safe point its unwind reaches,
+/// which is what makes the retire chase terminate (spec §7.6, and
+/// `specs/completion-architecture-spec.md` §7.2 for why it is a dispatch and no
+/// longer a conversion).
 const KILL: u64 = 1 << 62;
 /// Sticky: exactly one retirer may post the retire node (spec §7.6).
 const RETIRE_QUEUED: u64 = 1 << 63;
@@ -225,7 +228,10 @@ fn legal(from: TaskState, to: TaskState) -> bool {
         // Dispositions of the running task; the home CPU never changes here.
         (Running(a), Ready(b)) | (Running(a), Committing(b, _)) => a == b,
         (Running(_), Dead) => true,
-        // Pick, migrate, reap.
+        // Pick and migrate. `Ready → Dead` is not a reap any more: since
+        // `specs/completion-architecture-spec.md` §7.2 nothing converts a ready
+        // task to a dead one, and the edge survives for the *panic* path, where
+        // `schedule_no_return` buries a context that cannot be resumed.
         (Ready(a), Running(b)) => a == b,
         (Ready(_), InTransit(_)) | (Ready(_), Dead) => true,
         // The two-phase wait handshake.
