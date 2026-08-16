@@ -257,6 +257,11 @@ pub const STALLED: &str = "STALLED:";
 /// silence here is a machine that has stopped rather than a machine that is
 /// thinking. It is not a verdict about any of them: no assertion in this suite
 /// is satisfied by the guest merely talking.
+///
+/// The other side of that coin: on a shared boot the kernel itself is one of
+/// the periodic speakers, on a 10 s cadence, so a wait whose predicate never
+/// comes true is never ended by this bound — the guest keeps talking, and the
+/// wait runs the whole of [`GUEST_WEDGED`].
 pub const GUEST_QUIET: Duration = Duration::from_secs(15);
 
 /// The other end of the same guard: a guest can be stuck and chatty.
@@ -272,6 +277,12 @@ pub const GUEST_QUIET: Duration = Duration::from_secs(15);
 /// that is stuck *and* chatty, which is a state the width does not produce;
 /// scaling it would only make that state cost an hour at width 12. The longest
 /// guest action any caller waits on is eight seconds of audio.
+///
+/// It is also the real ceiling of any failing wait on a shared boot, because
+/// the kernel's own 10 s cadence keeps the quiet clock above reset: a settle
+/// predicate that could never come true was measured ending here at 302 s,
+/// not at 15 (PR #96's verification). Price a new waiting check against this
+/// number, not the one above.
 pub const GUEST_WEDGED: Duration = Duration::from_secs(300);
 
 pub fn guest_liveness() -> Liveness {
