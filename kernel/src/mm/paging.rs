@@ -393,6 +393,25 @@ impl AddressSpace {
     }
 
     /// Unmap one 2MB page and free its physical memory.
+    ///
+    /// **A wait armed on a word in this frame ends here**, because there is
+    /// nothing left for it to be woken by. A futex waiter's completion token is
+    /// its word's *physical* address — that is what makes a futex in shared
+    /// memory work across processes — and nothing pins the frame behind it, so
+    /// the moment the entry below goes and the page reaches the PMM that token
+    /// names whatever is mapped there next. `revoke_futex_range` is the
+    /// deletion of that hazard rather than bookkeeping against it: the waiter is
+    /// told `Gone(Closed)` and taken off the bucket, so no later `futex_wake`
+    /// can find it. See `sched::waitqs::revoke_futex_range`.
+    ///
+    /// It runs on every present entry rather than only on the frames this
+    /// address space owns. A shared-memory page is unmapped here too and its
+    /// frame outlives the unmap, so a waiter in *another* process is ended
+    /// where it did not have to be — a spurious futex return, which every park
+    /// site is allowed (`specs/completion-architecture-spec.md` §5.5) and every
+    /// futex loop in userland already re-checks. The converse mistake is not
+    /// survivable, and telling the two apart would put the ownership question
+    /// on a path whose only wrong answer is a use-after-free.
     pub fn unmap(&mut self, vaddr: UserAddr) {
         let va = vaddr.raw();
         assert!(
@@ -408,6 +427,11 @@ impl AddressSpace {
                 if pde & PAGE_PRESENT != 0 {
                     pd.clear_pde(pd_idx, va);
                     let phys = pde & ADDR_MASK_2M;
+                    // Before the page can reach the PMM, and after the entry is
+                    // gone: a waiter that translated this word already is on
+                    // the bucket for this walk to find, and one arriving after
+                    // it has nothing to translate.
+                    crate::sched::waitqs::revoke_futex_range(phys, PAGE_2M);
                     // Remove the page from our owned list — Drop frees it.
                     // No-op for shared memory pages (not in this map).
                     self.pages.remove(&phys);

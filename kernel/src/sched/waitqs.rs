@@ -57,3 +57,34 @@ pub fn futex_watch(addr: DirectMap) -> &'static Watch {
     &FUTEX_WATCH[(addr.phys() >> 2) as usize % FUTEX_BUCKETS]
 }
 
+/// End every futex wait whose word lies in `[phys, phys + len)`, because that
+/// physical memory is being taken away from whoever was waiting on it.
+///
+/// **Called with the frame still owned**, from `AddressSpace::unmap` and under
+/// the address-space lock, which is what makes it a fence rather than a race:
+/// the page-table entry is already cleared, so a waiter that translated the
+/// word before this ran is on the list to be found, and one that translates
+/// after it finds nothing to arm on. There is no window in between for a
+/// waiter to arm on a frame this call has already walked past.
+///
+/// **Every bucket, not the one the base hashes to.** A 2 MiB frame holds 2^19
+/// words and the hash is `(phys >> 2) % 64`, so its words are spread across all
+/// 64 buckets by construction — the same arithmetic that makes two words 256
+/// bytes apart share one. A bucket nobody is armed on costs one relaxed load.
+///
+/// Without it a futex token outlives its frame: the token is a raw physical
+/// address, nothing pins the frame, and the PMM hands the freshly freed one
+/// straight back out — `pmm::alloc_contiguous`, which every `mmap` goes
+/// through, scans the bitmap from index 0, and `pmm::free_page` lowers
+/// `alloc_page`'s hint to whatever it just freed. So the next process to map
+/// that frame and call `futex_wake` at the same offset wins the stale waiter's
+/// claim, is counted a wake it did not make, and leaves the real waiter parked
+/// for good. `futex_wake_counts`'s sweeper is that process, and on the tree
+/// without this it took three of four.
+pub fn revoke_futex_range(phys: u64, len: u64) -> usize {
+    FUTEX_WATCH
+        .iter()
+        .map(|watch| completion::revoke_range(Subject::of(watch), phys, len))
+        .sum()
+}
+

@@ -453,14 +453,48 @@ pub fn set_current_rt(enable: bool) {
 /// that runs after the registration either claims the ticket or finds the
 /// waiter parked, and one that ran before it stored the new value before the
 /// registration — so the read below sees it.
+///
+/// **The word is named twice**, by the user address the caller passed and by
+/// the physical address it translated to, because the token is the physical one
+/// and nothing pins the frame behind it. `AddressSpace::unmap` ends every wait
+/// armed on a frame it is giving back (`waitqs::revoke_futex_range`), and the
+/// re-translation below is the other half of that fence — see the predicate.
 #[track_caller]
-pub fn futex_wait(phys_addr: DirectMap, expected: u32, deadline: Deadline) -> bool {
+pub fn futex_wait(
+    addr: crate::UserAddr,
+    phys_addr: DirectMap,
+    expected: u32,
+    deadline: Deadline,
+) -> bool {
     let parkable = Parkable::of_current();
     // The value check is the predicate, and it runs *after* the arm — which is
     // the same ordering the registration gave it, and the reason the
     // wake-generation protocol this used to need is not coming back (§23's
     // rejection 3).
-    let read = || unsafe { *phys_addr.as_ptr::<u32>() } != expected;
+    //
+    // **The translation is re-derived rather than trusted, and that is what
+    // closes the window between the caller's translation and this arm.** An
+    // `munmap` on a sibling CPU takes the address-space lock, clears the entry
+    // and only then walks the futex buckets, so a translation that still names
+    // the same frame was taken before that clear — and the revoke that follows
+    // it is therefore guaranteed to find this arm. A translation that answers
+    // anything else means the unmap already went past, this arm is one no post
+    // will ever reach, and the load below would be through a frame the PMM has
+    // reissued. It costs a per-CPU lookup, one leaf lock and a three-level walk
+    // per *wake check* — a path that has already paid a park and a context
+    // switch, and one an uncontended futex never enters at all.
+    let read = || {
+        let Some(pt) = current_address_space() else {
+            return true;
+        };
+        let same_frame =
+            pt.lock().translate(addr).is_some_and(|now| now.phys() == phys_addr.phys());
+        if !same_frame {
+            return true;
+        }
+        let word = unsafe { *phys_addr.as_ptr::<u32>() };
+        word != expected
+    };
     let _ = completion::wait_until(
         &parkable,
         completion::Subject::of(waitqs::futex_watch(phys_addr)),

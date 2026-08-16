@@ -242,8 +242,16 @@ pub fn post_boosted(subject: Subject<'_>, outcome: Outcome, until: Nanos) {
 /// twice — `futex_wake(addr, 1)` twice in a row, against one waiter that has
 /// not been scheduled in between, answering 1 and 1. That is what the old
 /// queue's `wake_one` avoided by *popping* the waiter, and the claim is the
-/// same discriminator without a queue: the word stays `WakeQueued` until the
-/// task runs, so a second claim loses.
+/// same discriminator without a queue — but what discriminates is the
+/// *catch-all*, not any one state. `TaskShared::claim_wake`
+/// (`toyos_sched::task`) takes `Blocked` and `Committing` and answers
+/// `Claim::Lost` for everything else. The first claim leaves the word
+/// `WakeQueued(cpu)`; `TaskShared::finish_wake` moves it to `Ready(cpu)` when
+/// that CPU drains its mailbox, which is before the task is dispatched and can
+/// be a quantum before; and the word reads `Running(cpu)` once it is. All three
+/// fall to that catch-all arm, so the second claim loses wherever in the span
+/// between the first claim and the waiter's return it arrives — not merely
+/// while the word still says `WakeQueued`.
 ///
 /// The record is stored either way, before the claim is attempted, because
 /// invariant W's order is not conditional. A record delivered to a waiter this
@@ -274,6 +282,55 @@ pub fn post_n(subject: Subject<'_>, outcome: Outcome, token: Token, limit: usize
         }
     }
     woken
+}
+
+/// End every wait armed on `subject` whose token lies in `[from, from + len)`,
+/// take those watchers off the list, and answer how many there were.
+///
+/// **The teardown form, and it is the only post that also *disarms*.** A token
+/// is opaque here, so what a range means is the caller's: the one caller names
+/// physical addresses, because a futex waiter's token is its word's physical
+/// address and a frame going back to the PMM is a range of them.
+///
+/// **Why a post alone would not do.** A `Ready` record leaves the waiter armed
+/// and its predicate authoritative — which for a futex is a load through the
+/// word's *physical* address, and the frame it names is about to be handed to
+/// somebody else. Worse, the watcher would stay on the bucket with a token that
+/// now names another process's memory, so the next [`post_n`] for that address
+/// would spend its caller's wake on it and count it. Taking the node off the
+/// list under the same leaf lock a post walks it under is what makes "a revoked
+/// watcher cannot be claimed later" a property of the structure rather than of
+/// a flag somebody has to check.
+///
+/// [`Reason::Closed`] is the outcome, and it is the existing vocabulary rather
+/// than a new one: "the object told its waiters it will never answer" is
+/// exactly what an unmapped word has said. [`wait_until`] returns on it without
+/// re-deriving the predicate, which is the half that keeps the freed frame
+/// undereferenced.
+pub fn revoke_range(subject: Subject<'_>, from: u64, len: u64) -> usize {
+    let watch = subject.0;
+    if watch.armed.load(Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    let at = crate::clock::now();
+    let mut waiters = watch.waiters.lock();
+    let mut ended = 0;
+    let mut at_index = 0;
+    while at_index < waiters.len() {
+        let token = waiters[at_index].token.raw();
+        if token < from || token - from >= len {
+            at_index += 1;
+            continue;
+        }
+        // Off the list first, then told: after the `swap_remove` no post can
+        // reach this watcher, and the record it is leaving with is the last
+        // one its inbox will see for this arm.
+        let waiter = waiters.swap_remove(at_index);
+        post_to(&waiter, Outcome::Gone(Reason::Closed), at, None);
+        ended += 1;
+    }
+    watch.armed.store(waiters.len(), Ordering::Relaxed);
+    ended
 }
 
 fn post_with(subject: Subject<'_>, outcome: Outcome, boost: Option<Nanos>) {
@@ -371,6 +428,15 @@ pub fn wait_uncancellable(p: &Parkable, armed: &Armed<'_>, deadline: Deadline) -
 /// 10): the loop is what holds the wait until the predicate is true, and a
 /// deadline that passes returns with it still false, which is what the one
 /// timed caller needs.
+///
+/// **Two outcomes end the loop without the predicate, and the second is a
+/// safety property rather than an economy.** A deadline is the caller's own,
+/// and [`Reason::Closed`] is a subject that has said it will never answer:
+/// re-deriving a predicate against a subject that is gone is at best a park
+/// nothing can end, and for the one caller [`revoke_range`] serves it is a load
+/// through a physical address whose frame has already gone back to the PMM.
+/// [`Reason::Overflowed`] is deliberately not one of the two — it means
+/// "re-derive", which is what looping does.
 #[track_caller]
 pub fn wait_until(
     p: &Parkable,
@@ -395,7 +461,7 @@ pub fn wait_until(
             return Ok(());
         }
         let record = wait(p, &armed, deadline)?;
-        if record.outcome == Outcome::Gone(Reason::Expired) {
+        if let Outcome::Gone(Reason::Expired | Reason::Closed) = record.outcome {
             return Ok(());
         }
     }

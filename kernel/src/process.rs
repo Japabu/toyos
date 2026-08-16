@@ -1412,6 +1412,12 @@ pub fn thread_sched(pid: Pid, tid: Tid) -> Option<ThreadSched> {
 /// alignment is not the caller's manners: a word four bytes below a 2 MiB
 /// boundary would have its tail read out of the next *physical* page, which
 /// belongs to somebody else.
+///
+/// For the same reason the answer is not a *lease*: nothing here pins the
+/// frame, and a sibling's `munmap` can hand it back to the PMM while the wait
+/// is still parked on it. What makes that safe is at the two ends —
+/// `AddressSpace::unmap` ends the waits it orphans, and `scheduler::futex_wait`
+/// re-derives this translation on every check rather than trusting it.
 fn futex_word(addr: UserAddr) -> Option<crate::mm::DirectMap> {
     if addr.raw() % 4 != 0 {
         return None;
@@ -1444,7 +1450,7 @@ pub fn futex_wait(addr: UserAddr, expected: u32, timeout_ns: u64) -> u64 {
         return toyos_abi::syscall::SyscallError::BadAddress.to_u64();
     };
 
-    if scheduler::futex_wait(phys_addr, expected, deadline) {
+    if scheduler::futex_wait(addr, phys_addr, expected, deadline) {
         0 // blocked and woken
     } else {
         0 // value mismatch, returned immediately
