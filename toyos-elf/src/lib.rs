@@ -98,6 +98,10 @@ pub enum Error {
     NoProgramHeaders,
     /// `e_phentsize` is not 56, the only size an ELF64 program header has.
     BadProgramHeaderSize,
+    /// `e_phoff` is less than [`header::FILE_HEADER_SIZE`]: the program
+    /// header table would begin inside the file header itself, which no
+    /// linker emits.
+    ProgramHeadersInsideFileHeader,
     /// The program header table lies outside the buffer that was read, or
     /// `e_phoff` plus its length overflows.
     ProgramHeadersOutsideBuffer,
@@ -139,6 +143,7 @@ impl Error {
             Error::WrongMachine => "ELF: not x86_64",
             Error::NoProgramHeaders => "ELF: no program headers",
             Error::BadProgramHeaderSize => "ELF: e_phentsize is not 56",
+            Error::ProgramHeadersInsideFileHeader => "ELF: e_phoff points inside the file header",
             Error::ProgramHeadersOutsideBuffer => "ELF: program headers outside the header buffer",
             Error::TooManyLoadSegments => "ELF: more PT_LOAD segments than the loader will map",
             Error::NoLoadSegments => "ELF: no loadable segments",

@@ -70,6 +70,27 @@ fn no_program_headers_is_refused() {
     assert_eq!(refused(Elf::new(0x1000).phnum(0).build()), Error::NoProgramHeaders);
 }
 
+/// A real file's program header table starts at or after `e_phoff ==
+/// FILE_HEADER_SIZE` (64): the header occupies exactly the bytes before it.
+/// An `e_phoff` inside that range is not a buffer-bounds question — every
+/// case here is well inside a one-page file — so it must be refused by its
+/// own name rather than fall through to `program_headers` reading header
+/// bytes back as a (garbage) program header table and failing later as
+/// `NoLoadSegments`.
+#[test]
+fn a_program_header_offset_inside_the_file_header_is_refused_by_name() {
+    for phoff in [0u64, 1, 32, 63] {
+        assert_eq!(
+            refused(Elf::honest(0x1000).phoff(phoff).phnum(1).build()),
+            Error::ProgramHeadersInsideFileHeader,
+            "e_phoff {phoff:#x}",
+        );
+    }
+    // 64 itself is the boundary and is not refused by this check; an honest
+    // file's real table starts there.
+    assert_eq!(accepted(Elf::honest(0x1000).build()).segments().len(), 1);
+}
+
 /// `e_phoff + e_phnum * 56` is `usize` arithmetic on a `u64` a file chose. The
 /// shape this replaces computed it unchecked and then sliced with it: with
 /// overflow checks on that is a kernel panic, and with them off the slice's own
