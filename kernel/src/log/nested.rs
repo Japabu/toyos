@@ -80,7 +80,7 @@ mod armed {
 
         loop {
             let ticket = crate::scheduler::prepare_wait(crate::scheduler::park_lot());
-            crate::scheduler::block_on(ticket, 0);
+            crate::scheduler::block_on(ticket, crate::time::Deadline::never());
         }
     }
 

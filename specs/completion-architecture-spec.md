@@ -181,8 +181,10 @@ document.
 A bare `u64` of nanoseconds is not a thing. **Every duration in the kernel is one
 of a closed set of kinds, each a distinct type, and the constructor of each
 demands what justifies it.** The first draft had four; the sweep in §3.4 found two
-more the kernel already needs (`Floor`, §3.1; `Budget`, §3.3). Six is the current
-count and C1 owns making it total.
+more the kernel already needs (`Floor`, §3.1; `Budget`, §3.3). Six was the count
+this section was written with, **and C1's own sweep made it seven — `Delay`,
+§3.5.** `kernel/src/time.rs` is where all of them live, and its module header is
+the taxonomy's home now that the types exist.
 
 | kind | what it is | where the number comes from | expiry means |
 |---|---|---|---|
@@ -343,6 +345,63 @@ may be re-done, and what makes that rate affordable". And **spin *counts* are no
 durations** — `serial.rs:237`'s `PANIC_LOCK_SPIN_LIMIT`, `serial.rs:534`'s
 `THRE_SPIN_LIMIT`, `sync.rs`'s 50M/500M — even where a doc comment prices them in
 seconds. RT7 must not reach them.
+
+### 3.5 C1's sweep, re-run — and the seventh kind it found
+
+Re-run on `wt/toyos-p2impl` at `c41b831`, by
+`rg -no '\b[A-Z][A-Z_0-9]*_(NS|NANOS|MS|US|SECS)\b' kernel/src/` for the named
+ones and `rg -n '[0-9]_000(_000)*' kernel/src/` for the inline ones, then
+reading every site. **43 production durations**, not 41 and not fewer: the two
+this section predicted would leave did leave with `log_file.rs`, and the sweep
+found more than that in inline literals and in constants whose names carry no
+unit — the four `panic_console` holds, `screen_claimed_by_userland`'s bare 2 s,
+`smp.rs`'s AP-start 100 ms, both calibration windows, and
+`sys_read`'s console re-poll.
+
+**Thirty-nine of the 43 now carry their kind in the type.** The four that do not
+are named exceptions with the chunk that owes each:
+
+| exception | why it is still a `u64` |
+|---|---|
+| `USB_TIMEOUT_NS` (`xhci/mod.rs:319`) | §12.3's open decision is C7's: a `Tripwire` on the transfer, or a `Budget` at the filesystem layer. Typing it at C1 would be taking that decision |
+| `hda.rs`'s and `hda_probe.rs`'s `SETTLE_NS` | a `Bound` whose citation does not exist yet. Their own doc says "the specification's own numbers are microseconds", and §3.2 gives C10 the job of deciding each settle site and saying which. Inventing a section number here is what §3.4 forbids |
+| `PORT_DEBOUNCE_NS` | it is `toyos_xhci::portmachine::DEBOUNCE_NS`, a constant in a pure host-tested crate. RT7 reaches `kernel/src/` |
+
+Not counted, and each is a class rather than an item: **ten actuator durations**
+(`SLOW_TRANSFER_NS`, `SLOW_CONNECT_NS`, `ARM_WINDOW_NANOS`, `ARM_AT_NS`,
+`DEAF_NS`, `ACK_BUDGET_NS`, `PROBE_DELAY_NS`, `heartbeat`'s `PERIOD_NS`,
+`DIAG_TICK_NS`, and the i8042 fast-health arm), which §3.3 already treats as
+outside the four; **seven instants** held in statics (`FIRST_IRQ_NS`,
+`LAST_IRQ_NS`, `ARMED_NS`, `NEXT_REPORT_NS`, `LOG_DURABLE_NS`, `CPU_TIME_NS`,
+`LAST_DUMP_NANOS`) — a kind classifies the *interval* somebody chose, not a
+timestamp the machine remembers; and the spin counts §3.4 already excluded.
+
+**The seventh kind is `Delay`: a duration the caller *spends*.** Six could not
+hold `CODEC_DETECT_NS` (25 frames at 48 kHz between releasing `CRST` and
+believing `STATESTS`), the two D3hot recoveries, the SDM's two INIT/SIPI delays,
+or either calibration window. Nothing is waited *for* across any of them and
+nothing expires: the elapsing **is** the success path, so there is no error, no
+panic and no degraded answer. Forcing them into `Bound` would have made "expiry
+means the device broke" false of a third of the `Bound`s in the tree. Two
+constructors, `from_spec` for a settle a specification mandates and `to_measure`
+for a window something is counted across. This is §3.1's and §3.3's method
+applied once more, and it is the last one the sweep needed.
+
+**Two classifications came out one square from this document, both recorded at
+the site.** `apic.rs`'s `LOG_FILE_DRAIN` is a `Budget` and not §3.2's `Bound`:
+that reclassification away from `Tripwire` is right, but `Bound`'s two
+constructors both demand a register or a specification section and this number
+is policy priced against a measured panel paint — while "the panel is the only
+copy" is a degraded answer exactly. And `smp.rs`'s AP-start 100 ms is a `Budget`
+and not the `Tripwire` §3.3 offered as the alternative to finding a source: its
+expiry already names the AP as absent and boots one CPU short, so making it a
+panic is a behaviour change, which C1's own gate forbids. The number still has
+no source, which is what §3.3 was right about.
+
+**`Bound::from_register` does not exist yet**, and that is the tree's dead-code
+rule rather than an omission: `nvme.rs:429` reads `cap` and never takes `TO` out
+of it, so C10 is the first chunk with a register to cite and writes the
+constructor beside its first caller.
 
 ---
 

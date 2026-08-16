@@ -470,7 +470,7 @@ extern "C" fn body(_arg: u64) -> ! {
         // missing one is what W3's two fences exist to make impossible, and a
         // timeout here would hide exactly that.
         PARKS.fetch_add(1, Ordering::Relaxed);
-        scheduler::block_on(ticket, 0);
+        scheduler::block_on(ticket, crate::time::Deadline::never());
     }
 }
 

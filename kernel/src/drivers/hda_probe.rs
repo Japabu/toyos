@@ -42,6 +42,7 @@ use crate::drivers::pci::PciDevice;
 use crate::mm::paging::CachePolicy;
 use crate::mm::Mmio;
 use crate::log;
+use crate::time::{Delay, Duration};
 
 /// Class `0403`. Every function that answers it is probed, and `prog_if` is
 /// not part of the selection: the T14's reports `0x80`, QEMU's reports `0x00`,
@@ -60,7 +61,12 @@ const CAP_POWER_MANAGEMENT: u8 = 0x01;
 /// requires before the first register access after leaving D3hot.
 const PM_CONTROL_STATUS: u64 = 0x04;
 const PM_STATE_MASK: u16 = 0x3;
-const PM_D3HOT_RECOVERY_NS: u64 = 10_000_000;
+/// As `hda.rs`'s: a [`Delay`] the PCI Power Management specification mandates
+/// out of D3hot, and not a bound on anything.
+const PM_D3HOT_RECOVERY: Delay = Delay::from_spec(
+    Duration::from_millis(10),
+    "PCI Power Management: the mandated D3hot-to-D0 recovery time",
+);
 
 /// The controller's register window, from the Intel High Definition Audio
 /// specification's register chapter. Only the reset, capability and immediate-
@@ -98,7 +104,10 @@ const SETTLE_NS: u64 = 100_000_000;
 /// `STATESTS`: 25 frames at 48 kHz. Rounded up to a millisecond, and read
 /// twice a millisecond apart, because a codec that appears late reads as no
 /// codec at all — and "no codec" is the answer that ends this plan.
-const CODEC_DETECT_NS: u64 = 1_000_000;
+const CODEC_DETECT: Delay = Delay::from_spec(
+    Duration::from_millis(1),
+    "HD Audio: 25 frames at 48kHz between releasing CRST and believing STATESTS",
+);
 
 pub fn run(rsdp_addr: u64, devices: &[PciDevice]) {
     log!("hda: === H0 probe: specs/plans/hda-driver-plan.md §6 ===");
@@ -534,7 +543,7 @@ fn codecs(hda: &PciDevice, bar: &Bar) {
     }
 
     let first = regs.read_u16(STATESTS);
-    spin_until_ns(CODEC_DETECT_NS);
+    spin_until_ns(CODEC_DETECT.nanos());
     let statests = regs.read_u16(STATESTS);
     log!("hda: statests={statests:#06x} (first read {first:#06x})");
 
@@ -598,7 +607,7 @@ fn power_up(pci: &PciDevice) {
         return;
     }
     cap.write_u16(PM_CONTROL_STATUS, pmcsr & !PM_STATE_MASK);
-    spin_until_ns(PM_D3HOT_RECOVERY_NS);
+    spin_until_ns(PM_D3HOT_RECOVERY.nanos());
     log!("hda: power state D{state} -> D{}", cap.read_u16(PM_CONTROL_STATUS) & PM_STATE_MASK);
 }
 
@@ -619,7 +628,7 @@ fn reset(regs: Mmio) -> bool {
         log!("hda: controller never left reset (GCTL={:#010x}) — refused", regs.read_u32(GCTL));
         return false;
     }
-    spin_until_ns(CODEC_DETECT_NS);
+    spin_until_ns(CODEC_DETECT.nanos());
     true
 }
 

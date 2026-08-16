@@ -147,6 +147,6 @@ extern "C" fn body(thread: u64) -> ! {
     // rest of the boot.
     loop {
         let ticket = crate::scheduler::prepare_wait(crate::scheduler::park_lot());
-        crate::scheduler::block_on(ticket, 0);
+        crate::scheduler::block_on(ticket, crate::time::Deadline::never());
     }
 }

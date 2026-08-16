@@ -50,6 +50,7 @@ mod iommu;
 mod preempt;
 mod irq_ring;
 mod trace;
+mod time;
 mod clock;
 mod rtc;
 

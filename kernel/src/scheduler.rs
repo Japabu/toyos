@@ -21,6 +21,7 @@ use crate::sched::payload::{KShare, KWaitQueue, KernelLock, ThreadSched};
 use crate::sched::reap_gate::ReapGate;
 use crate::sched::waitqs;
 use crate::sync::Lock;
+use crate::time::{Cadence, Deadline, Duration, Tripwire};
 use crate::DirectMap;
 
 pub use crate::sched::driver::{
@@ -93,6 +94,48 @@ fn blocking_baseline() -> u32 {
         0
     } else {
         BASELINE_TRAP
+    }
+}
+
+/// The right to give the CPU back.
+///
+/// `specs/completion-architecture-spec.md` §6. Made once per trap entry and
+/// once per kernel-thread body; [`Parkable::of_current`] asserts the context's
+/// baseline preempt depth, so a caller holding a spinlock cannot make one. Not
+/// `Copy`, not `Clone`, and never stored in a struct: it is threaded down the
+/// call chain by reference, and that is the whole mechanism.
+///
+/// **What the token delivers is a compile-time property about the *context*,
+/// and nothing about which locks are held.** A function with no `Parkable` in
+/// scope cannot park, cannot take a sleep lock, and cannot call anything that
+/// does — transitively, through the whole call graph. That is why
+/// `sched::dump`, `panic_console`, every ISR and every `Drop` impl are
+/// structurally unable to block: none of them can make one.
+///
+/// **It is not a borrow rule.** §6.2 records the first draft's proposal — a
+/// `&mut Parkable` for `wait` so that a live sleep guard would make a park a
+/// compile error — and why it is wrong: three of this design's own sections
+/// require a sleep lock to be *held* across a park, which is the entire point
+/// of giving the CPU back during a device round trip. What still catches a
+/// *spinlock* held across a park is the runtime assertion here and at the park
+/// (RT1, §6.3), because `Lock::lock` takes no token and must not.
+///
+/// The first consumers are C3's `completion::wait` and C5's `SleepLock::lock`.
+/// C1 builds the token and puts it where the assertion already was, so the
+/// failure names the entry rather than the park.
+pub struct Parkable(());
+
+impl Parkable {
+    /// Assert that this context may park, and mint the proof.
+    ///
+    /// There is no `Parkable::boot()` and no spin fallback: a primitive that
+    /// silently degrades to a spin depending on invisible context is the
+    /// sentinel class the root `CLAUDE.md` forbids. Boot has no token because
+    /// boot has no current task, and code that runs there takes `try_lock`.
+    #[track_caller]
+    pub fn of_current() -> Parkable {
+        assert_baseline(blocking_baseline());
+        Parkable(())
     }
 }
 
@@ -191,10 +234,15 @@ pub fn enqueue_new(
 /// The ticket holds preemption off until it is consumed; the re-check may take
 /// whatever locks it needs, and the deferred request is served by the block or
 /// by the cancel. See [`Ticket`].
+///
+/// The baseline assertion is [`Parkable::of_current`]'s, which is RT1: the
+/// token is minted where the decision to park is made, so a trip names that
+/// site. The proof is dropped again here because nothing below takes one yet —
+/// C3's `completion::wait` and C5's `SleepLock::lock` are what thread it.
 #[must_use = "a wait ticket must be blocked on or cancelled"]
 #[track_caller]
 pub fn prepare_wait(queue: &KWaitQueue) -> Ticket<'_> {
-    assert_baseline(blocking_baseline());
+    let _parkable = Parkable::of_current();
     Ticket::register(queue)
 }
 
@@ -202,14 +250,22 @@ pub fn prepare_wait(queue: &KWaitQueue) -> Ticket<'_> {
 ///
 /// Taking the ticket by value is the whole point: a park that reaches the
 /// machine without a registration behind it is the lost-wake window, and there
-/// is no other way to construct one. `deadline = 0` means no timeout.
+/// is no other way to construct one.
+///
+/// **The deadline is a [`Deadline`] and no longer a `u64` whose zero means
+/// "forever".** That convention was invisible at a call site and inverted by
+/// `specs/completion-architecture-spec.md` §14.1's absolute form, where zero is
+/// simply the past; a site left passing `0` through that change becomes a busy
+/// loop rather than a compile error. [`Deadline::never`] is the one that does
+/// not arm a timer, and every other value arms one — including
+/// [`Deadline::passed`], which fires at the next pass.
 #[track_caller]
-pub fn block_on(ticket: Ticket<'_>, deadline: u64) {
+pub fn block_on(ticket: Ticket<'_>, deadline: Deadline) {
     // One level above the calling context's baseline: the ticket has held the
     // registration window's own level since `prepare_wait`, and `pass_block`
     // inherits it.
     assert_baseline(blocking_baseline() + 1);
-    driver::pass_block(ticket, (deadline > 0).then(|| Nanos(deadline)));
+    driver::pass_block(ticket, (!deadline.is_never()).then(|| Nanos(deadline.nanos())));
 }
 
 /// Register, re-check, park — for a site whose condition is exactly `ready` —
@@ -246,7 +302,7 @@ pub fn block_on(ticket: Ticket<'_>, deadline: u64) {
 /// and one that lands while it is parked releases it where it lies (§2.7). No
 /// path here can hold a dying thread in a wait.
 #[track_caller]
-pub fn wait_until(queue: &KWaitQueue, deadline: u64, ready: impl Fn() -> bool) {
+pub fn wait_until(queue: &KWaitQueue, deadline: Deadline, ready: impl Fn() -> bool) {
     loop {
         let ticket = prepare_wait(queue);
         if ready() {
@@ -254,7 +310,7 @@ pub fn wait_until(queue: &KWaitQueue, deadline: u64, ready: impl Fn() -> bool) {
             return;
         }
         block_on(ticket, deadline);
-        if deadline != 0 && crate::hw::now_ns() >= deadline {
+        if deadline.reached(crate::clock::now()) {
             return;
         }
     }
@@ -384,7 +440,7 @@ pub fn set_current_rt(enable: bool) {
 /// waiter parked, and one that ran before it stored the new value before the
 /// registration — so the read below sees it.
 #[track_caller]
-pub fn futex_wait(phys_addr: DirectMap, expected: u32, deadline: u64) -> bool {
+pub fn futex_wait(phys_addr: DirectMap, expected: u32, deadline: Deadline) -> bool {
     let queue = waitqs::futex(phys_addr);
     let ticket = prepare_wait(queue);
     if unsafe { *phys_addr.as_ptr::<u32>() } != expected {
@@ -438,12 +494,32 @@ pub fn retire_task(sched: &ThreadSched) {
     preempt_off(|p| {
         toyos_sched::retire::begin(&sched.shared).post(cpus(), &HW, p);
     });
-    const RECHECK_NS: u64 = 50_000_000;
-    let give_up = crate::hw::now_ns() + 1_000_000_000;
+    /// How often the retirer looks again while it waits. A re-poll rate and
+    /// not a bound: what actually ends this wait is the release wake, and this
+    /// is the liveness backstop's step.
+    const RECHECK: Cadence = Cadence::every(
+        Duration::from_millis(50),
+        "twenty re-polls inside the tripwire, on a thread that is otherwise parked",
+    );
+    /// **What this bounds is an IPI, a remote pass and a release** — not a
+    /// reap on this CPU. `retire::post` targets the CPU the state word names
+    /// and kicks it with `Urgency::Preempt`, and this waits for
+    /// `Hw::release` on that CPU.
+    ///
+    /// C4 re-derives it and must: once a killed task runs its own unwind
+    /// (§7.2) what this covers becomes unwind + teardown + every sleep-lock
+    /// acquire on the way + the release, which is a different quantity from
+    /// the one measured here.
+    const GIVE_UP: Tripwire = Tripwire::absurd(
+        Duration::from_secs(1),
+        "an IPI, one remote pass and a release; past this the wake was lost",
+    );
+    let give_up = Deadline::at(crate::clock::now() + GIVE_UP.duration());
     while !sched.handle.released() {
-        if crate::hw::now_ns() > give_up {
+        if give_up.reached(crate::clock::now()) {
             panic!(
-                "retire_task: task not released after 1s: {:?}",
+                "retire_task: task not released after {}: {:?}",
+                GIVE_UP.duration(),
                 sched.shared.state()
             );
         }
@@ -452,7 +528,7 @@ pub fn retire_task(sched: &ThreadSched) {
             ticket.cancel();
             return;
         }
-        block_on(ticket, crate::hw::now_ns() + RECHECK_NS);
+        block_on(ticket, Deadline::at(crate::clock::now() + RECHECK.duration()));
     }
 }
 
@@ -594,7 +670,16 @@ pub fn flush_current_stats(acct: &mut process::ProcessAccounting) {
 /// of occupancy, taken from the idle loop, by a machine whose only channel may
 /// be a log file on the stick it booted from. The occupancy of the run queues
 /// and the occupancy of the page pools are read together or not at all.
-const SNAPSHOT_INTERVAL_NS: u64 = 10_000_000_000;
+///
+/// A [`Cadence`] under §3.4's widened definition — "how often a thing may be
+/// re-done, and what makes that rate affordable" — and *not* a deadline. It
+/// rate-limits an opportunistic check on a CPU that is already awake;
+/// converting it into something a CPU is woken for would add a wake to a
+/// machine with nothing to run, which is an audio change.
+const SNAPSHOT_INTERVAL: Cadence = Cadence::every(
+    Duration::from_secs(10),
+    "one clock read and one relaxed compare per idle trip, on a CPU already awake",
+);
 
 /// When each CPU may next print its own line. Per CPU rather than global: which
 /// CPUs reach idle is most of what the line says, and one global deadline would
@@ -602,7 +687,7 @@ const SNAPSHOT_INTERVAL_NS: u64 = 10_000_000_000;
 static NEXT_HEALTH: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
 /// A snapshot of this CPU's run queues, at most once per
-/// [`SNAPSHOT_INTERVAL_NS`], plus the machine's page pools on the same cadence.
+/// [`SNAPSHOT_INTERVAL`], plus the machine's page pools on the same cadence.
 ///
 /// Called from the idle loop on every trip, and the cadence is a wall clock
 /// because a trip is not a unit of time. It used to be one line per 1000 trips
@@ -627,7 +712,7 @@ pub fn log_health() {
     let cpu = percpu::cpu_id();
     let Some(next_health) = NEXT_HEALTH.get(cpu as usize) else { return };
     if now >= next_health.load(Ordering::Relaxed) {
-        next_health.store(now + SNAPSHOT_INTERVAL_NS, Ordering::Relaxed);
+        next_health.store(now + SNAPSHOT_INTERVAL.nanos(), Ordering::Relaxed);
         let ready = driver::ready_len() + usize::from(percpu::current_tid().is_some());
         let parked = driver::parked_len();
         crate::log!(
@@ -642,12 +727,12 @@ pub fn log_health() {
     static NEXT_PMM_DUMP: AtomicU64 = AtomicU64::new(0);
     let next = NEXT_PMM_DUMP.load(Ordering::Relaxed);
     if next == 0 {
-        NEXT_PMM_DUMP.store(now + SNAPSHOT_INTERVAL_NS, Ordering::Relaxed);
+        NEXT_PMM_DUMP.store(now + SNAPSHOT_INTERVAL.nanos(), Ordering::Relaxed);
     } else if now >= next
         && NEXT_PMM_DUMP
             .compare_exchange(
                 next,
-                now + SNAPSHOT_INTERVAL_NS,
+                now + SNAPSHOT_INTERVAL.nanos(),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             )

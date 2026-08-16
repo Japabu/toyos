@@ -49,6 +49,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::{apic, percpu, smp};
 use crate::sched::payload::{SCHED_BLOCKED, SCHED_READY, SCHED_RUNNING};
+use crate::time::{Budget, Duration, Floor};
 
 use super::driver;
 use super::MAX_CPUS;
@@ -56,13 +57,23 @@ use super::MAX_CPUS;
 /// A deadline further out than this is not a wait, it is arithmetic that got
 /// away: no kernel site parks for an hour, and a `saturating_add` that
 /// overflowed lands at `u64::MAX` nanoseconds, which is 584 years.
-const ABSURD_HORIZON_NS: u64 = 3_600_000_000_000;
+///
+/// A [`Floor`] rather than any of the waiting kinds: nothing waits for it and
+/// nothing expires. It is a predicate *on* another duration, which is the one
+/// thing that kind is for.
+const ABSURD_HORIZON: Floor = Floor::policy(
+    Duration::from_secs(3_600),
+    "no kernel site parks for an hour, and an overflowed saturating_add lands 584 years out",
+);
 
 /// How long the asking CPU waits for its siblings before naming the silent
 /// ones. It spends this with preemption off, which is what any bounded wait in
 /// `drain_irqs` costs; a quarter second is far past a scheduler pass and far
 /// short of anything a person notices after pressing a key.
-const ANSWER_BUDGET_NS: u64 = 250_000_000;
+const ANSWER_BUDGET: Budget = Budget::of(
+    Duration::from_millis(250),
+    "the silent CPUs are named and their part of the report is missing",
+);
 
 /// Ordinary parked lines one CPU may print. A line the verdict depends on —
 /// overdue, absurd — is never counted against this, so truncation cannot hide
@@ -77,13 +88,19 @@ const CENSUS_LINES: u32 = 16;
 /// giving up on the first refusal costs the owner the half of the report that
 /// names a thread no CPU has. Whoever holds it in the case this facility is
 /// for is not going to finish, which is what the ceiling is for.
-const TABLE_BUDGET_NS: u64 = 20_000_000;
+const TABLE_BUDGET: Budget = Budget::of(
+    Duration::from_millis(20),
+    "the summary says the census is missing rather than naming the threads no CPU has",
+);
 
 /// How long a silent CPU gets to answer the NMI. Two orders of magnitude below
 /// the kick's budget because an NMI needs nothing of the target but the
 /// interrupt itself: no pass, no lock, no scheduler state. A CPU that has not
 /// answered in a millisecond is not going to.
-const NMI_BUDGET_NS: u64 = 1_000_000;
+const NMI_BUDGET: Budget = Budget::of(
+    Duration::from_millis(1),
+    "the CPU is reported silent with no instruction pointer beside it",
+);
 
 static IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static OWES: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
@@ -140,7 +157,7 @@ impl Verdict {
         match deadline {
             None => Self::Event,
             Some(at) if at <= now => Self::Overdue,
-            Some(at) if at - now > ABSURD_HORIZON_NS => Self::Absurd,
+            Some(at) if at - now > ABSURD_HORIZON.nanos() => Self::Absurd,
             Some(_) => Self::Pending,
         }
     }
@@ -209,7 +226,7 @@ pub fn request() {
     // A pass reached by preemption cannot be holding a `Lock` — taking one
     // raises the preempt count — so spinning here cannot be blocking a sibling
     // on a lock this CPU's interrupted context owns.
-    let deadline = crate::clock::nanos_since_boot().saturating_add(ANSWER_BUDGET_NS);
+    let deadline = crate::clock::nanos_since_boot().saturating_add(ANSWER_BUDGET.nanos());
     let mut silent = 0;
     loop {
         if (0..cpus).all(|cpu| !OWES[cpu].load(Ordering::Acquire)) {
@@ -267,7 +284,7 @@ fn probe_silent(asked: &[bool; MAX_CPUS], cpus: usize) {
         }
     }
 
-    let deadline = crate::clock::nanos_since_boot().saturating_add(NMI_BUDGET_NS);
+    let deadline = crate::clock::nanos_since_boot().saturating_add(NMI_BUDGET.nanos());
     while (0..cpus).any(|cpu| asked[cpu] && NMI_OWES[cpu].load(Ordering::Acquire)) {
         if crate::clock::nanos_since_boot() >= deadline {
             break;
@@ -301,14 +318,14 @@ fn probe_silent(asked: &[bool; MAX_CPUS], cpus: usize) {
 /// and the NMI really is what reaches it.
 ///
 /// Bounded and self-healing on purpose. The window is longer than
-/// [`ANSWER_BUDGET_NS`] so the CPU is named silent, and short enough that it
+/// [`ANSWER_BUDGET`] so the CPU is named silent, and short enough that it
 /// rejoins and the guest shuts down cleanly — which is itself part of the
 /// assertion, since a CPU the NMI merely interrupted must come back.
 #[cfg(feature = "boot-actuators")]
 pub(super) fn deaf_window() {
     /// Late enough that the machine is up and every CPU has joined.
     const ARM_AT_NS: u64 = 3_000_000_000;
-    /// Comfortably past [`ANSWER_BUDGET_NS`], so "silent" is not a race — and
+    /// Comfortably past [`ANSWER_BUDGET`], so "silent" is not a race — and
     /// bounded, so the CPU rejoins and the guest still shuts down.
     const DEAF_NS: u64 = 400_000_000;
     /// How long cpu0 waits for the victim to reach its idle loop and go deaf.
@@ -498,7 +515,7 @@ struct Census {
 fn census() -> Census {
     let mut c = Census::default();
     let mut printed = 0u32;
-    let deadline = crate::clock::nanos_since_boot().saturating_add(TABLE_BUDGET_NS);
+    let deadline = crate::clock::nanos_since_boot().saturating_add(TABLE_BUDGET.nanos());
     c.read = walk_threads(deadline, |thread| {
         c.threads += 1;
         if thread.zombie.is_some() {

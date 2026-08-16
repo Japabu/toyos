@@ -8,7 +8,7 @@ use wait::msc;
 /// The driver's whole surface to the rest of the kernel. Everything that waits
 /// lives under [`wait`] — see its own documentation for why that is a module
 /// boundary and not a type.
-pub use wait::boot::{init, PORT_POLL_NS, PORT_SETTLE_CEILING_NS};
+pub use wait::boot::{init, PORT_POLL, PORT_SETTLE_CEILING};
 pub use wait::msc::{storage_flush, storage_read, storage_write};
 
 use alloc::vec::Vec;

@@ -22,6 +22,7 @@ use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::{Acquire, R
 
 use crate::mm::paging::CachePolicy;
 use crate::arch::cpu;
+use crate::time::{Delay, Duration, Instant};
 
 // HPET register offsets
 const HPET_CAP: u64 = 0x000;
@@ -43,7 +44,11 @@ pub fn init(hpet_base: u64) {
     hpet.write_u64(HPET_CFG, cfg | 1);
 
     // Calibrate TSC: measure TSC ticks over ~50ms of HPET time
-    let calibration_ns: u64 = 50_000_000; // 50ms
+    const CALIBRATION: Delay = Delay::to_measure(
+        Duration::from_millis(50),
+        "TSC ticks counted against the HPET; longer is a better ratio and boot time is what it costs",
+    );
+    let calibration_ns = CALIBRATION.nanos();
     let calibration_hpet_ticks = calibration_ns * 1_000_000 / hpet_period_fs;
 
     let hpet_start = hpet.read_u64(HPET_COUNTER);
@@ -99,6 +104,16 @@ pub fn nanos_since_boot() -> u64 {
     let delta = cpu::rdtsc().saturating_sub(TSC_BOOT.load(Relaxed));
     let period_fs = TSC_PERIOD_FS.load(Relaxed);
     ((delta as u128 * period_fs as u128) / 1_000_000) as u64
+}
+
+/// The same reading as an [`Instant`], which is the type arithmetic on it is
+/// allowed in.
+///
+/// **The one bridge between the machine's clock and `crate::time`.** That
+/// module names nothing outside `core` so `kernel-loom` can compile it beside
+/// the completion core; the hardware read lives here, where it already did.
+pub fn now() -> Instant {
+    Instant::from_nanos_since_boot(nanos_since_boot())
 }
 
 /// A [`cpu::rdtsc`] value `nanos` in the future, for a wait whose loop may not

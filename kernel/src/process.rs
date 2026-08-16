@@ -10,6 +10,7 @@ use crate::object::{ops, HandleTable};
 use crate::sync::Lock;
 use crate::symbols::SymbolTable;
 use crate::sched::payload::ThreadSched;
+use crate::time::{Deadline, Duration};
 use crate::{elf, pipe, scheduler};
 use crate::{DirectMap, UserAddr};
 use crate::loader::{
@@ -1418,10 +1419,14 @@ fn futex_word(addr: UserAddr) -> Option<crate::mm::DirectMap> {
 /// `pub fn` in another file, which a third caller would not have known to
 /// repeat.
 pub fn futex_wait(addr: UserAddr, expected: u32, timeout_ns: u64) -> u64 {
+    // The ABI's relative `u64::MAX` means "no timeout" and every other value is
+    // a relative span, turned absolute exactly once, here. C11 makes the ABI
+    // itself absolute; until then this is where the two meanings meet, and the
+    // [`Deadline`] is what stops the sentinel travelling any further in.
     let deadline = if timeout_ns != u64::MAX {
-        crate::clock::nanos_since_boot().saturating_add(timeout_ns)
+        Deadline::at(crate::clock::now() + Duration::from_nanos(timeout_ns))
     } else {
-        0
+        Deadline::never()
     };
 
     // Physical, so a futex in shared memory works across processes.

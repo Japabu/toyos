@@ -5,6 +5,7 @@ use crate::drivers::acpi;
 use crate::mm::paging::{CachePolicy, Occupancy};
 use crate::user_ptr::{SyscallContext, UserBytes, UserBytesMut};
 use crate::object::{ops, port, KObjectRef};
+use crate::time::{Cadence, Deadline, Duration};
 use crate::{device, log, pipe, process, vfs};
 use crate::{DirectMap, UserAddr};
 
@@ -921,7 +922,7 @@ fn sys_write(h: RawHandle, buf: &UserBytes) -> u64 {
                 return n;
             }
             Err(WriteBlock::Pipe(id)) => match pipe::writers_queue(id) {
-                Some(q) => crate::scheduler::wait_until(&q, 0, || pipe::has_space(id)),
+                Some(q) => crate::scheduler::wait_until(&q, Deadline::never(), || pipe::has_space(id)),
                 None => return SyscallError::NotFound.to_u64(),
             },
             Err(WriteBlock::Refused(word)) => return word,
@@ -947,7 +948,9 @@ enum ReadBlock {
     Pipe(alloc::sync::Arc<crate::sched::payload::KWaitQueue>, pipe::PipeId),
     VirtioSound,
     Hda,
-    Keyboard(u64),
+    /// A console read re-polls, because nothing posts a serial key; a claimed
+    /// keyboard is woken by its own IRQ and waits with [`Deadline::never`].
+    Keyboard(Deadline),
     /// Nothing to wait for: the answer is this word.
     Refused(u64),
     /// Carried out of the process's lock rather than answered inside it:
@@ -1021,7 +1024,7 @@ fn sys_device_reg(handle: RawHandle, offset: u64, width: u64, value: Option<u64>
 /// and what their holders already build around.
 fn read_block_device(claim: &crate::object::device::DeviceClaim) -> ReadBlock {
     match claim.class() {
-        device::DeviceType::Keyboard => ReadBlock::Keyboard(0),
+        device::DeviceType::Keyboard => ReadBlock::Keyboard(Deadline::never()),
         device::DeviceType::VirtioSound if claim.info_read() => ReadBlock::VirtioSound,
         device::DeviceType::HdaAudio if claim.info_read() => ReadBlock::Hda,
         _ => ReadBlock::Refused(SyscallError::NotFound.to_u64()),
@@ -1032,7 +1035,20 @@ fn read_block(object: &KObjectRef) -> ReadBlock {
     match object {
         KObjectRef::Device(_) => unreachable!("a device claim blocks via `read_block_device`"),
         KObjectRef::Console(_) => {
-            ReadBlock::Keyboard(crate::clock::nanos_since_boot() + 10_000_000)
+            /// **The only reason a serial-console read ever returns.**
+            /// The park is on `waitqs::KEYBOARD`, whose only waker is the
+            /// i8042/USB keyboard — a *different* device from the one this
+            /// read is about. The 16550's IER is written to zero and
+            /// `virtio_console` has no handler at all, so nothing posts a
+            /// serial key and what ends this wait is the re-poll and nothing
+            /// else. `specs/completion-architecture-spec.md` §3.2 keeps the
+            /// number and reclassifies it: it is the [`Cadence`] of a poll on
+            /// `serial::has_data`, which C10 makes explicit.
+            const CONSOLE_REPOLL: Cadence = Cadence::every(
+                Duration::from_millis(10),
+                "nothing posts a serial-console key, so this rate is the whole of the wake",
+            );
+            ReadBlock::Keyboard(Deadline::at(crate::clock::now() + CONSOLE_REPOLL.duration()))
         }
         _ => match ops::pipe_id_read(object).and_then(|id| {
             pipe::readers_queue(id).map(|q| ReadBlock::Pipe(q, id))
@@ -1078,16 +1094,16 @@ fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
                 return n;
             }
             Err(ReadBlock::Pipe(queue, id)) => {
-                crate::scheduler::wait_until(&queue, 0, || pipe::has_data(id))
+                crate::scheduler::wait_until(&queue, Deadline::never(), || pipe::has_data(id))
             }
             Err(ReadBlock::VirtioSound) => crate::scheduler::wait_until(
                 &crate::sched::waitqs::AUDIO,
-                0,
+                Deadline::never(),
                 crate::drivers::virtio_sound::has_pending,
             ),
             Err(ReadBlock::Hda) => crate::scheduler::wait_until(
                 &crate::sched::waitqs::AUDIO,
-                0,
+                Deadline::never(),
                 crate::drivers::hda::has_pending,
             ),
             Err(ReadBlock::Keyboard(deadline)) => crate::scheduler::wait_until(
@@ -1446,7 +1462,7 @@ fn sys_process_wait(h: RawHandle, flags: u64) -> u64 {
     };
     if flags & WNOHANG == 0 {
         let queue = object.waiters();
-        crate::scheduler::wait_until(&queue, 0, || object.finished());
+        crate::scheduler::wait_until(&queue, Deadline::never(), || object.finished());
     }
     match object.exit_code() {
         // Zero-extended: an exit code is an `i32`, and sign-extending -1 would
@@ -1881,7 +1897,7 @@ fn sys_accept(h: RawHandle) -> u64 {
             return SyscallError::Gone.to_u64();
         }
         let queue = acceptor.waiters();
-        crate::scheduler::wait_until(&queue, 0, || {
+        crate::scheduler::wait_until(&queue, Deadline::never(), || {
             acceptor.has_pending() || acceptor.closed()
         });
     }
@@ -2252,7 +2268,7 @@ fn sys_thread_join(tid: u64) -> u64 {
                 ticket.cancel();
                 return 0;
             }
-            Ok(None) => crate::scheduler::block_on(ticket, 0),
+            Ok(None) => crate::scheduler::block_on(ticket, Deadline::never()),
             Err(()) => {
                 ticket.cancel();
                 return SyscallError::NotFound.to_u64();
@@ -2394,7 +2410,10 @@ fn sys_sysinfo(out: &mut UserBytesMut) -> u64 {
 }
 
 fn sys_nanosleep(nanos: u64) -> u64 {
-    let deadline = crate::clock::nanos_since_boot().saturating_add(nanos);
+    // The caller's own arithmetic, which is exactly what a `Deadline` is: the
+    // ABI still carries a relative span, and this is the one place it becomes
+    // an instant.
+    let deadline = Deadline::at(crate::clock::now() + Duration::from_nanos(nanos));
     // No condition to re-check: the deadline is the wake, and one that has
     // already passed fires at the next scheduler entry.
     crate::scheduler::block_on(

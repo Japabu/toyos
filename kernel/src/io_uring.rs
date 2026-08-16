@@ -28,6 +28,7 @@ use crate::scheduler;
 use crate::sched::payload::KWaitQueue;
 use crate::sched::waitqs::{new_queue, wake_all};
 use crate::sync::Lock;
+use crate::time::{Deadline, Duration};
 use crate::DirectMap;
 
 use toyos_abi::io_uring::{
@@ -400,12 +401,21 @@ pub fn enter(
     min_complete: u32,
     timeout_nanos: u64,
 ) -> Result<u32, SyscallError> {
-    let deadline = if timeout_nanos == 0 {
-        1 // sentinel for non-blocking
+    // **Three readings of one word, and this is where they stop.** The relative
+    // `timeout_nanos` still arrives from userland with `0` meaning non-blocking
+    // and `u64::MAX` meaning forever — that is the ABI until C11 — but inside
+    // the kernel each becomes a named `Deadline`: `passed()` is evaluate-once,
+    // `never()` arms no timer, and anything else is an instant. What this
+    // replaces mapped relative `0` onto absolute `1` and `1` back onto `0`,
+    // which is `specs/completion-architecture-spec.md` §14.1's motivating
+    // example for why the absolute form may not be a bare `u64`.
+    let non_blocking = timeout_nanos == 0;
+    let deadline = if non_blocking {
+        Deadline::passed()
     } else if timeout_nanos == u64::MAX {
-        0 // block forever
+        Deadline::never()
     } else {
-        crate::clock::nanos_since_boot().saturating_add(timeout_nanos)
+        Deadline::at(crate::clock::now() + Duration::from_nanos(timeout_nanos))
     };
 
     if to_submit > 0 {
@@ -422,7 +432,7 @@ pub fn enter(
             return Ok(count);
         }
 
-        if deadline == 1 {
+        if non_blocking {
             return Ok(count);
         }
 
@@ -434,7 +444,7 @@ pub fn enter(
             return Ok(count);
         }
 
-        if deadline > 0 && crate::clock::nanos_since_boot() >= deadline {
+        if deadline.reached(crate::clock::now()) {
             return Ok(count);
         }
 
@@ -454,7 +464,7 @@ pub fn enter(
             ticket.cancel();
             continue;
         }
-        scheduler::block_on(ticket, if deadline == 1 { 0 } else { deadline });
+        scheduler::block_on(ticket, deadline);
     }
 }
 
