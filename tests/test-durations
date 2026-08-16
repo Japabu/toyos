@@ -167,7 +167,7 @@ foreign_disk_untouched 4624
 fpu_isolation 11075
 fs_large_file 104
 fs_truncate_persist 22
-futex_wake_counts 18446744073709551615
+futex_wake_counts 613
 handle_basic 16
 handle_kill_policy 300
 handle_transfer 50
