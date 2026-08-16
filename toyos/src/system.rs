@@ -25,10 +25,6 @@ pub fn sysinfo(buf: &mut [u8]) -> usize {
     syscall::sysinfo(buf)
 }
 
-pub fn cpu_count() -> u32 {
-    syscall::cpu_count()
-}
-
 pub fn shutdown() -> ! {
     syscall::shutdown()
 }
