@@ -380,13 +380,13 @@ impl<X: SchedPayload> CpuSched<X> {
         self.park_keeps_lapsed_lend = keep;
     }
 
-    /// Hand a killed ready task to another CPU instead of reaping it where it
-    /// is — the balance path before [`CpuSched::hand_off`] checked the kill
-    /// bit. It puts the task in `InTransit`, whose reap rides an
-    /// `Urgency::Normal` adopt and therefore waits for the destination's next
-    /// voluntary pass; the retirer's own bound is wall clock. Invariant I14
-    /// must catch it; `scenarios::old_migrate_kept_the_corpse` is the gate that
-    /// proves it does.
+    /// Hand a killed ready task to another CPU instead of keeping it — the
+    /// balance path before [`CpuSched::hand_off`] checked the kill bit. It puts
+    /// the task in `InTransit`, whose handling rides an `Urgency::Normal` adopt
+    /// and therefore waits for the destination's next voluntary pass; the
+    /// retirer's own bound is wall clock. Invariant I14 must catch it;
+    /// `scenarios::old_migrate_kept_the_corpse` is the gate that proves it
+    /// does.
     pub fn set_migrate_keeps_the_corpse(&mut self, keep: bool) {
         self.migrate_keeps_the_corpse = keep;
     }
@@ -445,8 +445,10 @@ impl<X: SchedPayload> CpuSched<X> {
         env.hw.release(key, payload, acct);
     }
 
-    /// Every death goes through here — including the reap paths, not just the
-    /// exit path (invariant I11).
+    /// Every death goes through here (invariant I11) — and since
+    /// `specs/completion-architecture-spec.md` §7.2 there is only one kind: a
+    /// task's own `die`, on the stack it unwound. The reap paths this sentence
+    /// used to have to name are gone.
     ///
     /// A task whose context is the one this CPU is *currently executing on*
     /// cannot be handed back yet: in the kernel that record owns the kernel
@@ -481,14 +483,18 @@ impl<X: SchedPayload> CpuSched<X> {
     /// already settled the share refcount: a task taken out of this queue must
     /// leave it, a task that never entered must not.
     ///
-    /// A killed task is reaped here instead. `InTransit` is the one state whose
-    /// reap is not backed by an interrupt: the retire that carries
+    /// **A killed task is kept here instead**, and dispatched on this CPU —
+    /// see [`CpuSched::begin_dying`]. `InTransit` is the one state whose
+    /// handling is not backed by an interrupt: the retire that carries
     /// `Urgency::Preempt` is consumed and dropped by a destination that gets it
     /// ahead of the adopt (`handle_retire`'s home-is-me arm), and the adopt
-    /// behind it is `Urgency::Normal`, which by design kicks nobody. Reading the
-    /// kill bit here is what stops a CPU putting a task it knows is dead into
-    /// that state; what remains is a kill that lands *after* the adopt was
-    /// posted, and that case always has a `Msg::Retire` aimed at the same CPU.
+    /// behind it is `Urgency::Normal`, which by design kicks nobody. So handing
+    /// a corpse on trades an unwind that could start in this pass for a wait on
+    /// another CPU's next voluntary one. Reading the kill bit here is what stops
+    /// a CPU putting a task it knows is dead into that state; what remains is a
+    /// kill that lands *after* the adopt was posted, and that case always has a
+    /// `Msg::Retire` aimed at the same CPU — whose adopter dispatches it, which
+    /// is what makes the chase terminate.
     fn hand_off<H: Hw<Payload = X>, P: PreemptGuard>(
         &mut self,
         task: ReadyTask<X>,
@@ -608,10 +614,11 @@ impl<X: SchedPayload> CpuSched<X> {
         now: Nanos,
     ) {
         let Some(entry) = self.parked.remove(&key) else {
-            // Not parked here any more: a `Retire` reaped it, or its deadline
-            // fired first and this wake lost the arbitration CAS. Keys are
-            // never reused, so a stale wake is provably about a task that is
-            // no longer waiting — a benign no-op (spec §7.6).
+            // Not parked here any more: a `Retire` already woke it into the
+            // dying list, or its deadline fired first and this wake lost the
+            // arbitration CAS. Keys are never reused, so a stale wake is
+            // provably about a task that is no longer waiting — a benign no-op
+            // (spec §7.6).
             return;
         };
         let task = entry.task.wake(self.id, cause, entry.class, now);
@@ -684,21 +691,35 @@ impl<X: SchedPayload> CpuSched<X> {
             // priority on a corpse.
             current.end_lend();
             // A running task cannot be yanked out from under its own kernel
-            // stack; it dies at its next safe point, bounded by the quantum
-            // (spec §7.6). Consuming the message here is only sound because
-            // the sticky kill bit outlives it and *every* safe point honours
-            // it: the pick reaps a killed ready task, and `WaitTicket::commit`
-            // refuses to park a killed one. Without that second arm a task that
-            // parked through this window would never be picked again, so
-            // nothing would ever reap it.
+            // stack; it dies at its next safe point (spec §7.6). Consuming the
+            // message here is only sound because the sticky kill bit outlives
+            // it and *every* safe point honours it, and
+            // `specs/completion-architecture-spec.md` §7.2 changed which points
+            // those are. **The pick no longer reaps anything** — the argument
+            // this comment used to make. What ends the task instead:
+            //
+            // * `completion::wait` answers `Cancelled` and the caller `?`s it
+            //   out, dropping every guard on the way, so the unwind reaches the
+            //   thread's own exit;
+            // * `WaitTicket::commit` still refuses to park a killed task, which
+            //   is what keeps it *running* rather than parked where no wake is
+            //   coming;
+            // * and `kernel::scheduler::exit_if_killed` at the return to Ring 3
+            //   is the backstop for a thread that never parks again, with an
+            //   empty kernel stack by construction.
+            //
+            // The quantum is not the bound any more and saying so would be the
+            // same error: what bounds this is the unwind, and
+            // `sim::invariants::retire_latency_bound` derives it hop by hop.
             env.hw.need_resched(self.id);
             return;
         }
         // Somewhere else. Re-post the *same* node — legal precisely because
         // this consumer just unlinked it — unless the word names this CPU,
         // which means an `Adopt` is on its way here: re-posting would spin
-        // against the producer, and the sticky kill bit already guarantees
-        // the adopter reaps it on arrival.
+        // against the producer, and the sticky kill bit already guarantees the
+        // adopter *dispatches* it on arrival, into its own dying list, where it
+        // unwinds and dies by its own `die`.
         match shared.state() {
             TaskState::Dead => {}
             state if home_of(state) == Some(self.id) => {}
@@ -1368,6 +1389,16 @@ impl<M: SchedMsg> CpuHandles<M> {
 /// The harness is deliberately the smallest thing that can hold a `CpuSched`:
 /// a payload with no address space, an `Hw` that records rather than acts, and
 /// one CPU unless a test needs two.
+///
+/// **A world holding one task cannot state where a disposition put it.** The
+/// pick launders every container back into `running`, so "it ended up running"
+/// is what a fair-queue route, a dying-list route and a no-op all produce, and
+/// three of the four gates in this module were vacuous for exactly that reason
+/// until they were made to red under a mutation. A *second* occupant — a task
+/// already in the dying list, or an RT task already in the band — is what makes
+/// the answer observable, because the pick then takes that one and leaves the
+/// one under test where the disposition put it. Every test below that asserts a
+/// container says which second occupant it needs and why.
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -1576,6 +1607,37 @@ mod tests {
             self.hw.state().released.clone()
         }
 
+        /// Push the `Msg::Wake` for a task whose claim has **already** been
+        /// won — `waitq::deliver_wake`'s second half, split from its first.
+        ///
+        /// A waker is two steps: the claim CAS, then the push. They are not one
+        /// instruction and nothing makes them one, so a message posted by
+        /// anybody else can land in between — and for a retire, landing in
+        /// between is the whole of §7.2(c). The mailbox is FIFO, so a test that
+        /// posts the wake first can never observe that order; this is how it
+        /// gets to.
+        fn post_claimed_wake(
+            &self,
+            cpu: CpuId,
+            shared: &Arc<TaskShared<Msg<TestPayload>>>,
+            reason: WakeReason,
+        ) {
+            let cause = WakeCause::new(reason);
+            let slot = shared
+                .wake_node()
+                .claim()
+                .expect("the wake claim admits one poster: node must be free");
+            if self.handles.get(cpu).post(
+                slot,
+                Msg::wake(shared.key(), cause),
+                cause.urgency(),
+                &NoPreempt,
+            ) == Kick::Send
+            {
+                self.hw.kick(cpu);
+            }
+        }
+
         /// End a test that deliberately leaves a task alive.
         ///
         /// `Task`'s drop bomb — "the only legal death is `DeadTask::finalize`"
@@ -1633,6 +1695,21 @@ mod tests {
     /// first owns a `Msg::Wake` in flight to this same CPU, so the retire
     /// leaves the entry alone. Removing it here would leave the task in no
     /// container at all — never runnable, never reaped — which is §7.2(c).
+    ///
+    /// **The order has to be driven by hand, and this test did not use to be
+    /// able to reach the arm it is named for.** Posting the wake and then the
+    /// retire cannot: the mailbox is FIFO, so the wake is drained first,
+    /// `parked` is empty by the time `handle_retire` runs, and the whole
+    /// `parked.contains_key` branch is skipped — with `Claim::Lost =>
+    /// panic!()` staged in it, this test passed. What reaches the arm is the
+    /// window a waker really has ([`World::post_claimed_wake`]): the claim CAS
+    /// has been won and the push has not happened yet, so the retire is the
+    /// first message this CPU sees.
+    ///
+    /// The first block below is what has the teeth. It reds under
+    /// remove-then-convert (the defect §7.2(c) names) and under a retirer that
+    /// claims and ignores the answer: both take the entry out of `parked`, and
+    /// there is nothing there for the wake to find.
     #[test]
     fn a_retire_that_loses_the_claim_leaves_the_wake_in_flight() {
         let mut w = World::new(1);
@@ -1641,15 +1718,24 @@ mod tests {
         w.run_a_pass(C0);
         w.park_running(C0, &q);
 
-        // A waker wins the claim first; its message is queued to cpu0.
-        assert!(crate::waitq::wake_direct(
-            &shared,
-            WakeCause::new(WakeReason::Woken),
-            &w.handles,
-            &w.hw,
-            &NoPreempt,
-        ));
+        // A waker wins the claim; its message has not been pushed yet.
+        assert_eq!(shared.claim_wake(), Claim::Parked(C0), "the waker owns it");
         crate::retire::begin(&shared).post(&w.handles, &w.hw, &NoPreempt);
+        {
+            let (cpus, env) = w.split();
+            cpus[0].drain(env, NOW);
+        }
+
+        assert!(
+            w.cpus[0].parked_task(key).is_some(),
+            "the retire lost the claim: the entry stays for the wake to find",
+        );
+        assert_eq!(w.cpus[0].dying_len(), 0, "the retire placed nothing itself");
+        assert!(w.cpus[0].rq.is_empty(), "and queued nothing either");
+
+        // Now the wake it lost to lands, and *it* places the task — in the
+        // dying list, because the kill bit is already set.
+        w.post_claimed_wake(C0, &shared, WakeReason::Woken);
         {
             let (cpus, env) = w.split();
             cpus[0].drain(env, NOW);
@@ -1658,6 +1744,7 @@ mod tests {
         assert!(w.released().is_empty());
         assert_eq!(w.cpus[0].dying.len(), 1, "the in-flight wake placed it");
         assert_eq!(w.cpus[0].dying[0].key(), key);
+        assert_eq!(shared.state(), TaskState::Ready(C0));
         w.abandon();
     }
 
@@ -1772,12 +1859,30 @@ mod tests {
 
     /// §7.2(3): a killed task that expires its quantum mid-unwind must not
     /// land anywhere the pick can treat it as ordinary work.
+    ///
+    /// **The second corpse is what makes this test a statement about where the
+    /// first one landed.** With one task on the CPU the pick empties whichever
+    /// container `preempt_if_due` put it in and hands it straight back, so
+    /// "it is running again" and "the fair queue is empty" read the same
+    /// whether the kill arm is there or not — deleting that arm left this test
+    /// passing. A corpse already queued ahead of it is what the pick takes
+    /// instead, and where the expiring one went stays observable.
     #[test]
     fn a_killed_task_that_expires_its_quantum_goes_back_to_the_dying_list() {
         let mut w = World::new(1);
-        let (key, shared) = w.spawn(C0);
+        let (expiring, expiring_shared) = w.spawn(C0);
         w.run_a_pass(C0);
-        shared.mark_kill();
+        assert_eq!(w.cpus[0].running().map(|t| t.key()), Some(expiring));
+        expiring_shared.mark_kill();
+
+        // A second teardown, already waiting its turn on this CPU.
+        let (queued, queued_shared) = w.spawn(C0);
+        queued_shared.mark_kill();
+        {
+            let (cpus, _env) = w.split();
+            let task = cpus[0].rq.remove(queued).expect("ready");
+            cpus[0].keep_dying(task);
+        }
 
         {
             let (cpus, env) = w.split();
@@ -1788,10 +1893,63 @@ mod tests {
         assert!(w.released().is_empty());
         assert_eq!(
             w.cpus[0].running().map(|t| t.key()),
-            Some(key),
-            "picked straight back off the dying list",
+            Some(queued),
+            "the corpse that has been waiting longest unwinds next",
         );
-        assert!(w.cpus[0].rq.is_empty(), "and never through the fair queue");
+        assert_eq!(
+            w.cpus[0].dying_len(),
+            1,
+            "and the one whose quantum expired went back to the dying list",
+        );
+        assert_eq!(w.cpus[0].dying[0].key(), expiring);
+        assert!(w.cpus[0].rq.is_empty(), "never through the fair queue");
+        w.abandon();
+    }
+
+    /// The same statement at the *voluntary* disposition. A killed task that
+    /// yields is on its way out too, so it goes back to the dying list and
+    /// never into the fair band.
+    ///
+    /// Read against its involuntary twin above, and gated the same way: with a
+    /// single task on the CPU the pick launders the difference, and deleting
+    /// `dispose_yield`'s kill arm left the whole suite green. The corpse queued
+    /// ahead of it is what keeps the answer visible.
+    #[test]
+    fn a_killed_task_that_yields_goes_back_to_the_dying_list() {
+        let mut w = World::new(1);
+        let (yielder, yielder_shared) = w.spawn(C0);
+        let (queued, queued_shared) = w.spawn(C0);
+        yielder_shared.mark_kill();
+        queued_shared.mark_kill();
+        {
+            let (cpus, _env) = w.split();
+            for key in [yielder, queued] {
+                let task = cpus[0].rq.remove(key).expect("ready");
+                cpus[0].keep_dying(task);
+            }
+        }
+        w.run_a_pass(C0);
+        assert_eq!(w.cpus[0].running().map(|t| t.key()), Some(yielder));
+
+        {
+            let (cpus, env) = w.split();
+            let pass = SchedPass::begin(&mut cpus[0], env, Nanos(NOW.0 + 1));
+            let _ = pass.dispose_yield().finish();
+        }
+
+        assert!(w.released().is_empty());
+        assert_eq!(
+            w.cpus[0].running().map(|t| t.key()),
+            Some(queued),
+            "the yield hands the CPU to the corpse that was waiting",
+        );
+        assert_eq!(
+            w.cpus[0].dying_len(),
+            1,
+            "and the yielder went back to the dying list",
+        );
+        assert_eq!(w.cpus[0].dying[0].key(), yielder);
+        assert!(w.cpus[0].rq.is_empty(), "never into the fair queue");
         w.abandon();
     }
 
@@ -1819,27 +1977,51 @@ mod tests {
     }
 
     /// A kill that lands after the adopt was posted: the destination adopts it
-    /// like any other task and dispatches it, which is what makes the retire
-    /// chase terminate — for a sharper reason than the reap it replaces.
+    /// like any other task and routes it by its kill bit, which is what makes
+    /// the retire chase terminate — for a sharper reason than the reap it
+    /// replaces.
+    ///
+    /// **The routing is asserted before the pick runs, and that is the half
+    /// with teeth.** "It ends up running" is equally true of an adopt that put
+    /// the corpse in the fair band, so `place` → `enqueue` in `handle_adopt`
+    /// used to be invisible to the whole suite. A corpse in the fair band is
+    /// ordinary work: it queues behind whatever is there, `answer_steal_requests`
+    /// may hand it to another CPU as surplus, and the retirer's bound stops
+    /// being quantum-shaped — which is exactly what the dying list exists to
+    /// prevent.
     #[test]
     fn an_adopt_of_a_killed_task_dispatches_it_on_arrival() {
         let mut w = World::new(2);
         let (key, shared) = w.spawn(C0);
 
-        let (cpus, env) = w.split();
-        let task = cpus[0].rq.remove(key).expect("ready on cpu0");
-        task.share().leave_runnable(env.frontier);
-        cpus[0].hand_off(task, C1, env, NOW);
+        {
+            let (cpus, env) = w.split();
+            let task = cpus[0].rq.remove(key).expect("ready on cpu0");
+            task.share().leave_runnable(env.frontier);
+            cpus[0].hand_off(task, C1, env, NOW);
+        }
         assert_eq!(shared.state(), TaskState::InTransit(C1));
 
         shared.mark_kill();
+        {
+            let (cpus, env) = w.split();
+            cpus[1].drain(env, NOW);
+        }
+
+        assert_eq!(w.cpus[1].dying_len(), 1, "the arriving corpse is placed to unwind");
+        assert_eq!(w.cpus[1].dying[0].key(), key);
+        assert!(
+            w.cpus[1].rq.is_empty(),
+            "and never into the fair band, where it would be ordinary work",
+        );
+
         w.run_a_pass(C1);
 
         assert!(w.released().is_empty(), "nothing was discarded in flight");
         assert_eq!(
             w.cpus[1].running().map(|t| t.key()),
             Some(key),
-            "adopted, placed in the dying list, and picked in the same pass",
+            "and the next pick takes it ahead of the fair band",
         );
         w.abandon();
     }

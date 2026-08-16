@@ -1,20 +1,27 @@
 //! Loom: the retire protocol (spec §7.6, §12).
 //!
-//! Four races: the kill bit against a concurrent wake claim, the kill bit
+//! Six races: the kill bit against a concurrent wake claim, the kill bit
 //! against a waiter's own park commit, the retire-node re-post chase against a
-//! migration, and adoption under a kill. What replaced `KILLED[16]`,
+//! migration, adoption under a kill, the two claims on one parked task, and —
+//! last, and the only one that runs a whole `CpuSched` — what
+//! `handle_retire` *does* with the answer it gets. What replaced `KILLED[16]`,
 //! `WAKE_TRANSITS` and the 1 s timeout scan is a sticky bit plus a message, so
 //! the cases worth checking are exactly the orderings of that bit and that
 //! node.
 
 use loom::sync::Arc;
-use toyos_sched_loom::cpu::{CpuHandle, CpuHandles};
-use toyos_sched_loom::mailbox::{mailbox, MailboxConsumer};
+use toyos_sched_loom::cpu::{CpuHandle, CpuHandles, CpuSched, Env, RunToken, SchedPass};
+use toyos_sched_loom::fair::{FairShare, Frontier, ShareState};
+use toyos_sched_loom::hw::{CpuId, Hw, Kicker, Machine, Nanos, TraceEvent};
+use toyos_sched_loom::mailbox::{mailbox, MailboxConsumer, Urgency};
 use toyos_sched_loom::model::{
-    model, wait_list, Kicks, LoomLock, Msg, PreemptModel, RemoteGuard, CPU0, CPU1,
+    model, wait_list, IrqGuard, Kicks, LoomLock, Msg, PreemptModel, RemoteGuard, CPU0, CPU1,
 };
 use toyos_sched_loom::retire;
-use toyos_sched_loom::task::{TaskKey, TaskShared, TaskState, WaitClass, WakeCause, WakeReason};
+use toyos_sched_loom::task::{
+    RtState, SchedPayload, TaskAccounting, TaskBuilder, TaskKey, TaskShared, TaskState, WaitClass,
+    WakeCause, WakeReason,
+};
 use toyos_sched_loom::waitq::{wake_direct, Commit, CurrentTask, WaitList, WaitQueue};
 
 struct World {
@@ -302,5 +309,225 @@ fn a_retire_and_a_wake_never_both_claim_a_parked_task() {
             assert_eq!(task.state(), TaskState::WakeQueued(CPU0));
         }
         assert!(task.kill_pending(), "the kill bit is sticky either way");
+    });
+}
+
+// The sixth model runs a whole `CpuSched`, so it needs the three things a pass
+// is built against: a payload, a hardware surface, and the shared half of a CPU.
+
+/// The smallest payload a `CpuSched` can be built over: no address space, no
+/// saved context, and loom's mutex as the per-process share cell.
+struct Payload;
+
+impl SchedPayload for Payload {
+    type Ctx = ();
+    type ShareLock = LoomLock<ShareState>;
+}
+
+/// The full message set (`crate::msg::Msg`), as opposed to the reduced [`Msg`]
+/// the primitive models use: a pass consumes `Adopt` and `Retire` too.
+type TaskMsg = toyos_sched_loom::msg::Msg<Payload>;
+
+/// An `Hw` that records nothing. Every question this model asks is about which
+/// of `CpuSched`'s own containers the task is in, and `CpuSched` answers those
+/// itself; a recorder would only add state loom has to explore.
+struct Silent;
+
+impl Kicker for Silent {
+    fn kick(&self, _target: CpuId) {}
+}
+
+impl Machine for Silent {
+    type IrqGuard = ();
+    fn now(&self) -> Nanos {
+        NOW
+    }
+    fn set_timer(&self, _deadline: Nanos) {}
+    fn stop_timer(&self) {}
+    fn irq_guard(&self) {}
+    fn halt(&self) {}
+    fn need_resched(&self, _cpu: CpuId) {}
+    fn trace(&self, _ev: TraceEvent) {}
+}
+
+impl Hw for Silent {
+    type Payload = Payload;
+    #[allow(unsafe_code)] // the declaration is unsafe; this body does nothing
+    unsafe fn switch(&self, _token: RunToken<Payload>) {}
+    fn release(&self, _key: TaskKey, _payload: Payload, _acct: TaskAccounting) {}
+}
+
+/// Everything a pass touches that is **not** the `CpuSched`. The waker thread
+/// gets a handle to this and to nothing else, which is the whole of §6.1: a
+/// remote CPU may post and ring, and there is no second way in.
+struct Owner {
+    cpus: CpuHandles<TaskMsg>,
+    hw: Silent,
+    frontier: Frontier,
+}
+
+/// The instant every pass in the model runs at. Constant on purpose: a quantum
+/// that never expires keeps `preempt_if_due` out of the interleavings, which
+/// have nothing to do with it.
+const NOW: Nanos = Nanos(1_000);
+/// The task the retire and the wake race for.
+const KEY: TaskKey = TaskKey(1);
+/// The task that keeps the CPU busy — see the model's own note on why an idle
+/// CPU cannot be modelled here.
+const OTHER: TaskKey = TaskKey(2);
+
+/// **The sixth model, and the first that executes a line of `CpuSched`.**
+///
+/// The model above races the two claims and stops at the CAS — it calls
+/// `TaskShared::claim_wake` where `handle_retire` calls it. That states the
+/// arbitration is exclusive and says nothing about what the retirer *does* with
+/// the answer, and the gap was measurable: a `panic!()` at the top of
+/// `handle_retire` left all thirteen models green, so no model reached the arm
+/// §7.2(c) is about.
+///
+/// This one drives it. The setup is an ordinary life: adopt, dispatch, park.
+/// Then a remote waker and a retirer reach for the same parked task, and the
+/// CPU that owns it runs the passes that consume whatever arrives. `CpuSched`
+/// is `!Sync` and stays on its own thread, exactly as a CPU's scheduler state
+/// does; what crosses is the message.
+///
+/// The property is §7.2(c) itself: **whichever way the claim goes, the task
+/// ends up in the dying list.** If the retirer wins, its own wake places it
+/// there; if it loses, the waker's `Msg::Wake` is in flight to this same CPU
+/// and `handle_wake` places it — but only if the retirer left the entry in
+/// `parked`. Remove-then-convert reds this model: the entry is gone, the wake
+/// lands on a `parked.remove` that returns `None`, and the task is in no
+/// container at all.
+///
+/// **The CPU is deliberately never idle.** `OTHER` runs throughout, and it is
+/// not scenery: an idle `SchedPass` ends in `try_sleep`, whose `Err(())` retry
+/// re-drains and decides again, and a producer that loom leaves suspended
+/// mid-push holds `is_empty()` false for as long as loom cares to leave it
+/// there — so the loop is unbounded in the model and 2 instructions on the
+/// machine (N3 bounds the torn-push window; `loom_mailbox.rs` is where *that*
+/// is checked). Modelling this arm therefore means modelling a busy CPU, which
+/// is also the case the arm exists for.
+#[test]
+fn the_retire_arm_never_loses_a_parked_task_to_a_racing_wake() {
+    model(|| {
+        let (tx, rx) = mailbox::<TaskMsg>();
+        let owner = Arc::new(Owner {
+            cpus: CpuHandles::new(vec![CpuHandle::new(CPU0, tx)]),
+            hw: Silent,
+            frontier: Frontier::new(),
+        });
+        let mut cpu = CpuSched::<Payload>::new(CPU0, rx, ());
+        // A pass runs from the IRQ-exit path, which cannot be preempted, so
+        // `IrqGuard` is its guard (N3). The waker is a *remote* CPU and carries
+        // its own — the exclusion that would matter here is between a pass and
+        // a preempt-disabled section on this same CPU, and there is no such
+        // section in this model.
+        let guard = IrqGuard;
+        let env = Env {
+            hw: &owner.hw,
+            cpus: &owner.cpus,
+            frontier: &owner.frontier,
+            preempt: &guard,
+            steal: false,
+        };
+        let pass = |cpu: &mut CpuSched<Payload>| {
+            let _ = SchedPass::begin(cpu, env, NOW).dispose_none().finish();
+        };
+        // Spawn placement is a message, never a reach into the queue (§9.4).
+        let spawn = |key: TaskKey| {
+            let share = Arc::new(FairShare::new(LoomLock::new(ShareState::NonRunnable {
+                lag: 0,
+            })));
+            let task = TaskBuilder {
+                key,
+                share,
+                ctx: (),
+                ext: Payload,
+                rt: RtState::default(),
+            }
+            .build(CPU0, NOW);
+            let shared = task.shared().clone();
+            let _ = owner.cpus.get(CPU0).post_owned(
+                TaskMsg::Adopt { task },
+                TaskMsg::adopt_node,
+                Urgency::Normal,
+                &guard,
+            );
+            shared
+        };
+
+        let shared = spawn(KEY);
+        pass(&mut cpu);
+        assert_eq!(cpu.running().map(|t| t.key()), Some(KEY), "adopted and picked");
+
+        // It blocks on something — the state §7.1 calls the arm that matters —
+        // and the pick hands the CPU to `OTHER`, adopted in the same pass.
+        let other = spawn(OTHER);
+        let queue: WaitQueue<TaskMsg, LoomLock<WaitList<TaskMsg>>> =
+            WaitQueue::new(WaitClass::Pipe, wait_list());
+        let ticket = {
+            let current = cpu.current_task().expect("the task is running");
+            queue.prepare_wait(&current)
+        };
+        let (committed, registration) = match ticket.commit() {
+            Commit::Parked(committed, registration) => (committed, registration),
+            _ => unreachable!("nothing has touched this task yet"),
+        };
+        let _ = SchedPass::begin(&mut cpu, env, NOW)
+            .dispose_block(committed, None)
+            .finish();
+        assert_eq!(shared.state(), TaskState::Blocked(CPU0));
+        assert_eq!(cpu.running().map(|t| t.key()), Some(OTHER), "the CPU has work");
+
+        // The race: a waker on another CPU, and this CPU's own retirer.
+        let waker = {
+            let owner = owner.clone();
+            let shared = shared.clone();
+            loom::thread::spawn(move || {
+                wake_direct(
+                    &shared,
+                    WakeCause::new(WakeReason::Woken),
+                    &owner.cpus,
+                    &owner.hw,
+                    &RemoteGuard,
+                )
+            })
+        };
+        retire::begin(&shared).post(&owner.cpus, &owner.hw, &RemoteGuard);
+
+        // The pass that consumes the retire. This is the arm under test.
+        pass(&mut cpu);
+        let woke = waker.join().unwrap();
+        // And the one that consumes a wake posted after that drain. Joining
+        // first is what makes the second pass conclusive: every message either
+        // side will ever post has been posted by now.
+        pass(&mut cpu);
+
+        assert!(
+            cpu.dying().any(|t| t.key() == KEY),
+            "the task is in no container: the retire {} the claim and nothing placed it",
+            if woke { "lost" } else { "won" },
+        );
+        assert!(
+            cpu.parked().next().is_none(),
+            "a retire that lost the claim leaves the entry for the wake to find, \
+             and the wake takes it out of `parked`",
+        );
+        assert!(
+            !cpu.rq().keys().any(|key| key == KEY),
+            "a killed task is placed in the dying list, never in the fair band",
+        );
+        assert!(shared.kill_pending(), "the kill bit is sticky either way");
+
+        // Wind both tasks down by the only death there is, so the model leaves
+        // nothing alive: `OTHER` exits, the pick takes the corpse off the dying
+        // list, it dies by its own `die`, and a last pass frees the zombie.
+        registration.finish();
+        let _ = SchedPass::begin(&mut cpu, env, NOW).dispose_exit().finish();
+        assert_eq!(other.state(), TaskState::Dead);
+        assert_eq!(cpu.running().map(|t| t.key()), Some(KEY), "the unwind runs");
+        let _ = SchedPass::begin(&mut cpu, env, NOW).dispose_exit().finish();
+        pass(&mut cpu);
+        assert_eq!(shared.state(), TaskState::Dead);
     });
 }
