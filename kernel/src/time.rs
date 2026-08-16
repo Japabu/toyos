@@ -274,6 +274,14 @@ impl fmt::Display for Cadence {
 ///
 /// The constructor's argument is *how long is absurd*, not where the number
 /// came from — a tripwire that could be cited would be a [`Bound`].
+///
+/// **A tripwire smaller than one bounded term of what it covers is not a
+/// tripwire**, and the failure mode is a kernel that panics on a healthy
+/// machine. "Absurd" is a claim about the whole path: every [`Bound`] a slow
+/// but working machine may spend on the way has to fit inside it, and the
+/// largest of those is usually a device's. `scheduler::retire_task`'s `GIVE_UP`
+/// is the worked example — 1 s against a path containing two of xHCI's own 2 s
+/// deadlines, and it fired on the owner's T14 at 949 s of uptime.
 #[derive(Clone, Copy)]
 pub struct Tripwire {
     limit: Duration,
