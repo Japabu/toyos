@@ -130,7 +130,7 @@ audio_tone (smp=8) 11144
 audio_tone_load (smp=1) 40524
 audio_tone_load (smp=8) 11121
 blocked_dump 3376
-blocking_read_stress 18446744073709551615
+blocking_read_stress 53
 boot_partition_identity 5203
 boot_volume_metadata_error 4811
 c_capture_ignores_daemon_lines 5346
@@ -157,7 +157,7 @@ dump_nmi_probe 24625
 empty_dir_stat 11
 endowment_denied 45
 esp_filesystem 6685
-exit_wait_storm 18446744073709551615
+exit_wait_storm 197
 expected_failure_entries 0
 expected_failure_exit_status 0
 expected_failure_verdicts 0
