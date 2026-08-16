@@ -1073,8 +1073,8 @@ document — it is closed by the measurement §4.2 requires.
 ### 6.1 One new invariant
 
 > **I15 — a runnable entity is never underserved.** For every entity, over every
-> period in which it was continuously runnable, the CPU time it received is at
-> least its budget.
+> one of *its own periods* in which it was continuously runnable, the CPU time
+> it received is at least its budget, measured on the wall clock.
 
 That is §1.9's sentence, word for word, which is the point: the law and the
 instrument are one predicate and neither can drift from the other by a rewrite.
