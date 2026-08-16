@@ -793,31 +793,62 @@ the superseded spec's §13.2 had to plan for.
 ### 5.3 Arming
 
 ```rust
-/// Proof that a record will arrive on `inbox` for `token`. `!Copy`,
-/// `#[must_use]`; `Drop` disarms. A park with nothing armed is untypeable.
+/// Proof that a record will arrive on the armed inbox for `token`. `!Copy`,
+/// `#[must_use]`; `Drop` disarms and drains. A park with nothing armed is
+/// untypeable.
 #[must_use]
 pub struct Armed<'a> { .. }
 
-/// Arm a watch.
+/// Arm a watch for the running task.
 ///
-/// For a **level** subject (§5.3a) it closes the arm-time TOCTOU inside
-/// itself: check readiness, insert the node under the subject's leaf lock,
-/// re-check, and fire immediately if it became ready — exactly what
-/// `process_poll_add` does today (`io_uring.rs:540`, its recheck at
-/// `:601-616`), now in one place instead of per source.
+/// **Edge-only, for every subject.** The record a post leaves means "state may
+/// have moved", never "there is something for you"; the waiter's own predicate
+/// stays authoritative and is re-derived after this returns, which is what
+/// `wait_until`'s loop does at every call site. §5.3a's level form — where
+/// `arm` asks the subject and fires immediately — is not implemented for any
+/// subject, and the per-source arm-time recheck it was meant to replace still
+/// stands where it always was (`io_uring::process_poll_add`).
 ///
-/// For an **edge** subject it asks nothing and never fires immediately,
-/// because there is no state to ask about; the waiter's own predicate is
-/// authoritative and is re-derived after this returns. Writing the level
-/// contract as if it were total is what would make a reader implement `arm`
-/// for the log and get a watch that can never fire at arm time while the doc
-/// claims it closes the window.
-pub fn arm<'a>(inbox: &'a Inbox, subject: &Subject, token: Token) -> Armed<'a>;
+/// `class` is what this wait's blocked time is attributed to. It belongs here
+/// because it is a property of the *subject*: since §5.2 every thread parks on
+/// a queue of its own, so a class read off the queue is the same word for
+/// every wait in the machine.
+///
+/// `None` when there is no current task: boot has none, and neither has an
+/// idle CPU.
+pub fn arm<'a>(subject: Subject<'a>, token: Token, class: WaitClass) -> Option<Armed<'a>>;
 
-/// Park until a record is readable. Returns the first record, or `Cancelled`
-/// (§7). Callers loop and re-derive: a spurious return is legal.
-pub fn wait(p: &mut Parkable, armed: Armed<'_>) -> Result<Record, Cancelled>;
+/// Park until a record arrives, the deadline passes, or this thread is
+/// cancelled (§7). Callers loop and re-derive: a spurious return is legal.
+pub fn wait(p: &Parkable, armed: &Armed<'_>, deadline: Deadline)
+    -> Result<Record, Cancelled>;
 ```
+
+**Five divergences from the block above as C3+C4 landed it, and they are
+amendments rather than drift.** The struck version named a by-value `Armed`, a
+`&mut Parkable`, an infallible `arm`, no deadline and no class. Each is
+answered:
+
+- **`&Armed` and not `Armed`.** §5.3a's edge contract needs the arm to *outlive*
+  the wait: a caller loops, re-deriving its own predicate between waits, and a
+  post landing in that window must find the watch still armed. An arm consumed
+  per wait would lose exactly the wake arm-before-check exists to catch.
+- **`&Parkable` and not `&mut`.** §6.2 already settles this and gives three of
+  this document's own sections as the reason; the block above simply had not
+  caught up.
+- **`Option<Armed>` and not `Armed`.** Boot and an idle CPU have no current
+  task, so there is nothing to arm *for*. A panicking `arm` would make the one
+  caller reachable from a kernel thread before the scheduler exists panic.
+- **A `Deadline` on `wait`.** §14.1's absolute form; the timed callers
+  (`sys_read`'s console, `nanosleep`, `io_uring::enter`) need it and a park with
+  no deadline argument would have to smuggle one.
+- **A `WaitClass` on `arm`.** The fifth, and the one nobody wrote down: without
+  it every park in the machine is `WaitClass::Other`, because the queue a thread
+  parks on is its own.
+
+**§6 and §6.2 already said `&Parkable`** — "`completion::wait` and
+`SleepLock::lock` both take `&Parkable`" — so the struck block was an internal
+contradiction of this document rather than a claim about the tree.
 
 `Subject` is a borrowed reference to the object being waited on — a pipe end, a
 listener, a device claim, a process object, an outstanding driver operation, or
@@ -901,19 +932,30 @@ doc comment says *"Edge-triggered, and it is the one source that has to be."*
 
 ### 5.4 The one park/recheck site, and its proof
 
-`kernel/src/sched/driver.rs`'s `pass_block` park arm, in full:
+`kernel/src/completion/mod.rs`'s `wait_inner`, in full:
 
 ```rust
-Commit::Parked(committed, registration) => {
-    // The ONE recheck in the kernel. One predicate. No match on a channel,
-    // no per-source closure, nothing named in it.
-    if inbox.has_record() {
-        (pass.dispose_none().finish(), Some(registration))
-    } else {
-        (pass.dispose_block(committed, deadline).finish(), Some(registration))
-    }
+// Register on this thread's own parking place, re-check, park. The
+// registration precedes the re-check, which is the whole of §2's invariant 4.
+let ticket = crate::scheduler::prepare_wait(task.park_queue(), cancel, armed.class);
+if task.inbox().has_record() || (cancel == Cancel::Answers && armed.shared.kill_pending()) {
+    ticket.cancel();
+    continue;
 }
+crate::scheduler::block_on(ticket, deadline);
 ```
+
+**It is not in `pass_block`, and the struck version of this section put it
+there.** The code it quoted — a `Commit::Parked` arm branching on
+`inbox.has_record()` — structurally cannot exist: `pass_block` runs inside the
+scheduler driver, where no inbox is in scope and none can be, because the
+driver knows tasks and tickets and nothing about what they wait for. The
+recheck sits one layer up, between `prepare_wait` and `block_on`, and the
+invariant below is preserved exactly: the registration still publishes
+`Committing` before the predicate is read, and `commit()` inside the blocking
+pass still refuses the park if a claim landed in between. The cancel arm is
+what the struck `dispose_none` branch was standing in for, and it is the
+stronger form — it withdraws the registration rather than leaving one behind.
 
 **Invariant W.** A poster executes C1 `store the record` (under the subject's leaf
 lock) then C2 `claim the waiter` (the rendezvous-word CAS `toyos-sched` already
@@ -929,7 +971,20 @@ performs). A parker executes P1 `prepare_wait` (publishing `Committing`) then P2
 The proof is **source-agnostic**: it names pipes, disks, child exits and deadlines
 not at all, because they are all "a record in an inbox". A new wait source cannot
 re-open the window, because it has no way to add a second predicate — there is one
-`dispose_block` caller and a grep gate says so.
+`wait_inner`, every blocking site in the kernel goes through it, and `dispose_block`
+still has exactly one caller (`sched::driver::pass_block`) below it.
+
+**C1's lock is part of the proof and one producer cannot take it.** The log's
+`emit` runs inside `sync.rs`, inside IRQ handlers, inside the scheduler and
+inside every syscall's locked region, so it may take no lock at all — which is
+§5.3a's first constraint. That producer uses `Inbox::signal` rather than
+`Inbox::post`: one atomic store, no slot, and therefore no requirement that the
+posters to that inbox be serialized. What it gives up is the record's content,
+which an edge-classed subject never had to say. `Inbox::post`'s plain writes
+keep their precondition, and it is the subject's leaf lock rather than anything
+about the arm — the struck reasoning was "one poster *per park*", and `klogd`
+starts a new park's epoch while the previous one's producer is still inside
+`post`.
 
 ### 5.5 What does **not** change
 
@@ -1140,6 +1195,14 @@ it load-bearing for termination:
 
 So the run-queue arm is not a smaller change than the parked one. Touching either
 without the other deletes the termination argument for row 3 as well.
+
+**The quotation above is of the code as it was, and the tree no longer reads
+that way.** All six rows landed; `pick` reaps nothing, and the comment that
+declared it load-bearing has been rewritten to name what replaces it —
+`scheduler::exit_if_killed` at the return to Ring 3, and the victim's own `die`
+at the exit its unwind reaches. Quoted here in its old form deliberately,
+because it is the thing this section exists to strike; a reader following the
+line numbers will find the amended text and not this one.
 
 ### 7.2 What must change
 

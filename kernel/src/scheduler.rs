@@ -269,39 +269,17 @@ pub fn block_on(ticket: Ticket<'_>, deadline: Deadline) {
     driver::pass_block(ticket, (!deadline.is_never()).then(|| Nanos(deadline.nanos())));
 }
 
-/// Register, re-check, park — for a site whose condition is exactly `ready` —
-/// and **hold the wait until that condition is true**.
+/// Give the CPU up voluntarily, keeping the claim on it: the pass decides
+/// whether anything else deserves the quantum.
 ///
-/// A return from a park is not evidence that this queue is what woke the
-/// thread. A task is woken *by name* as well as by queue: every child thread's
-/// exit posts `wake_task` to its process's main thread (`process::thread_exit`),
-/// panic recovery wakes a joiner, a futex bucket is shared by every word that
-/// hashes into it, and a deadline fires on the task's own CPU. Checking once
-/// and returning made every caller's answer depend on which of those arrived
-/// first — `sys_process_wait` read an exit code that had not been published
-/// yet and killed the kernel from a plain `Child::wait()`. So the predicate is
-/// re-checked after every wake and the thread re-parks until it holds, which
-/// is what `sched::waitqs` already documents every blocking site as doing and
-/// what spec §2's invariant 10 requires of one. A site that parks with
-/// `prepare_wait`/`block_on` directly owns that loop itself — `sys_nanosleep`
-/// is the one that does not
-/// (`specs/issues/kernel/nanosleep-ends-early-when-a-sibling-thread-exits.md`).
-///
-/// Looping does not weaken spec §2's no-lost-wake invariant, because each trip
-/// is the whole two-phase handshake again: the re-registration happens *before*
-/// the re-check, so a wake landing in between claims the new ticket and the
-/// commit refuses to park.
-///
-/// `deadline` still bounds the wait. It is absolute, so a re-park carries the
-/// same one and the wait ends no later than it was going to; an expiry returns
-/// with the condition false, which is what the one timed caller
-/// (`sys_read`'s console) needs — it re-derives its answer from the object
-/// rather than from this return, inside a loop of its own.
-///
-/// A killed task never comes back round: a retire that lands while it is
-/// deciding to park turns the block into an exit (`Commit::Killed`, spec §6.3),
-/// and one that lands while it is parked releases it where it lies (§2.7). No
-/// path here can hold a dying thread in a wait.
+/// **The thirty-three lines that used to stand here were the deleted
+/// `scheduler::wait_until`'s, and the commit that deleted the function left its
+/// doc behind on the next item.** They described a register/re-check/park loop
+/// this function has never had, named `wake_task` — deleted as code in the same
+/// commit — and said a retire mid-park "turns the block into an exit", which
+/// `pass_block`'s `Commit::Killed` arm inverted to `dispose_none` nineteen lines
+/// away. The loop they describe is real and lives in `completion::wait_until`,
+/// where the argument belongs; it is not restated here.
 #[track_caller]
 pub fn yield_now() {
     assert_baseline(BASELINE_TRAP);

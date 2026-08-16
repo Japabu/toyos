@@ -7,22 +7,19 @@
 //! wait source cannot re-open the lost-wake window because it has no way to add
 //! a second predicate.
 //!
-//! **What C2 lands, and what it deliberately does not.** The core is wired
-//! *behind* the existing wait queues: a park still registers a
-//! `toyos_sched` ticket and is still woken by a queue wake, and what is new is
-//! that the waiter also arms an inbox on the subject and every wake of that
-//! subject also posts a record. Nothing parks on the inbox alone yet — C3 is
-//! the chunk that makes [`Inbox::has_record`] the park predicate and deletes
-//! the queue half — so this chunk is behaviour-preserving by construction, and
-//! what it buys is that the post path, the record's publication and the arm's
-//! bookkeeping are all live and under test before anything depends on them.
+//! **What C3 landed, and the header said the opposite of it until now.** C2
+//! wired the core *behind* the existing wait queues — a park still registered a
+//! `toyos_sched` ticket, was still woken by a queue wake, and nothing parked on
+//! the inbox alone. C3 is the chunk that made [`Inbox::has_record`] the park
+//! predicate and deleted the queue half, and it landed: [`wait_inner`] rechecks
+//! `has_record()` and nothing else, a park registers on the *thread's own*
+//! queue, and no queue in the kernel is woken as a queue any more.
 //!
-//! **Which subjects exist here.** The four device queues
-//! (`waitqs::{KEYBOARD, MOUSE, NETWORK, AUDIO}`) and both ends of a pipe: five
-//! park sites — a pipe read, a pipe write, a console read, and the two audio
-//! period reads — against the sites that wake them. C3 adds the rest with the
-//! park conversion that needs them: the port acceptor, the process and thread
-//! objects, the io_uring ring, the futex bucket and the CPU's deadline list.
+//! **Which subjects exist here.** All of them. The four device watches
+//! (`waitqs::{KEYBOARD, MOUSE, NETWORK, AUDIO}`), both ends of a pipe, the port
+//! acceptor, the process and thread objects, the io_uring ring, the futex
+//! bucket, and a thread's own watch for the waits whose end is a deadline. The
+//! header listed five park sites and said C3 would add the rest; C3 did.
 //!
 //! **No registry, and no id.** A [`Subject`] is a borrowed reference to the
 //! object being waited on, so a destroyed subject cannot be named and §5.1's
@@ -39,13 +36,13 @@
 //! costs one `Arc` clone and one `Lock` acquire; a disarm the same. Nothing on
 //! the wake path gained a read-modify-write it did not have.
 //!
-//! **The hazard this chunk inherits and does not fix.** A task killed while
-//! parked never drops its [`Armed`], because this kernel does not unwind — so
-//! its node stays on the watch list and the `Arc<TaskHandle>` behind it leaks,
-//! bounded and census-visible. That is the endowment spec's §1.1 leak class and
-//! §7's subject; C3+C4 closes it by making a killed task run its own unwind.
-//! It is memory, never unsoundness: the watch holds an `Arc`, so nothing here
-//! can point at a freed inbox.
+//! **The hazard C2 inherited is closed, by §7.2 and in this chunk.** A task
+//! killed while parked used to be reaped where it lay and so never dropped its
+//! [`Armed`]: its node stayed on the watch list and the `Arc<TaskHandle>` behind
+//! it leaked, bounded and census-visible — the endowment spec's §1.1 leak class.
+//! A killed task now runs its own unwind and drops the arm on the way out. The
+//! `Arc` stays anyway, because it is what makes "rare" not have to be "never":
+//! a leak is memory, where a raw pointer would be a use-after-free.
 
 pub mod inbox;
 
