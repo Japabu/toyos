@@ -34,9 +34,9 @@
    made runnable so it can observe the cancel, a ready or running one keeps its
    stack and dies at the first safe point that can end it — the return to Ring
    3, or the exit its own unwind reaches. It is never dispatched into
-   *userland* again. Release completes when the unwind does, within one pass of
-   the CPU holding the task plus that unwind, after at most one message hop per
-   migration in flight, and never waits on a timer.
+   *userland* again. Release completes when the unwind does, after at most one
+   message hop per migration in flight, and within a bound this invariant
+   states rather than assumes.
 
    **Amended 2026-08-16 by `specs/completion-architecture-spec.md` §7.2, and
    the previous form is quoted because it was load-bearing**: "never dispatched
@@ -47,30 +47,65 @@
    that replaces it is the one the reap was standing in for: nothing a killed
    task holds outlives it, because the task itself gives it back.
 
-   **"Never dispatched into userland again" is enforced at the last exit
-   boundary, and its residual is one interrupt wide.** Every return to Ring 3 —
-   syscall, exception, device interrupt, TLB shootdown and the timer tick —
-   ends in `kernel_exit_to_user_check`, which reads the kill bit *after* its
-   reschedule loop has settled and immediately before the return, with
-   interrupts off. The bit is set by a remote CPU's plain atomic and can
-   therefore be raised in the instant between that read and the `iretq`; the
-   retire's own `Urgency::Preempt` kick was posted before the bit was set, so
-   that thread takes the interrupt in Ring 3 and comes straight back through
-   the same boundary. **The bound is one interrupt delivery, not one quantum
-   and not one unbounded Ring 3 loop.** Both weaker forms were live on this
-   branch before 2026-08-16: the check ran once *above* the reschedule loop,
-   which gives the CPU away with interrupts on; and the Ring 3 timer stub —
-   which is where `apic::kick_cpu`'s IPI lands — did not run the epilogue at
-   all, so a thread killed in userland was preempted into the dying list,
-   picked straight back off it and returned to Ring 3, once per tick, for as
-   long as it cared to loop.
+   **Amended again the same day, and this half is a correction rather than a
+   replacement.** The release clause used to end "within one pass of the CPU
+   holding the task plus that unwind ... and never waits on a timer". Both
+   halves were false when they were written. Release needs at least two passes
+   after `Dead` is published, because a pass cannot free the stack it is
+   standing on; and a queued victim waits out the running task's quantum before
+   it is dispatched at all, which is a wait on the programmed hardware timer
+   that expiry is. The bound below is what the sentence should have said.
 
-   **Release completes within the retirer's own tripwire, and that number is
-   derived rather than declared** — `kernel/src/scheduler.rs`'s `GIVE_UP`
-   carries the derivation: two pass prologues on xHCI's 2 s deadline, two
-   quanta, and the unwind. Its dominant term is a filed defect
+   **"Never dispatched into userland again" is enforced at the last exit
+   boundary, and its residual is one interrupt wide.** Every return to Ring 3
+   that can carry a task — syscall, exception, device interrupt, TLB shootdown,
+   the timer tick and the thread-start trampoline — ends in
+   `kernel_exit_to_user_check`, which reads the kill bit *after* its reschedule
+   loop has settled and immediately before the return, with interrupts off. The
+   bit is set by a remote CPU's plain atomic and can therefore be raised in the
+   instant between that read and the `iretq`; the retire sets the bit first,
+   with a locked read-modify-write in `claim_retire`, and only then posts the
+   message and issues its `Urgency::Preempt` kick — so that kick cannot be
+   consumed by a target that has not yet seen the bit, the thread takes the
+   interrupt in Ring 3, and it comes straight back through the same boundary.
+   **The bound is one interrupt delivery, not one quantum and not one unbounded
+   Ring 3 loop**, and it rests on that order: a kick issued *before* the bit
+   could be consumed in Ring 0 with the bit still invisible, and the victim
+   would then run in Ring 3 until an unrelated tick.
+   `toyos-sched/src/retire.rs`'s module header states the same order from the
+   other side.
+
+   **The one exception is vector 2**, and the enumeration says so rather than
+   saying "every". The NMI stub is a `Ring0Entry`: no preempt-count bump and no
+   exit-to-user check, and it `iretq`s straight back to whatever ring it
+   interrupted, by its own module header's decision. An NMI taken in Ring 3
+   therefore returns to Ring 3 without the check. It is diagnostic-only, it is
+   raised by a debug-dump path, and it does not consume the retire's pending
+   kick — so the residual above is unchanged by it. What would not be true is
+   the word "every".
+
+   Both weaker forms of this bound were live on this branch before 2026-08-16:
+   the check ran once *above* the reschedule loop, which gives the CPU away with
+   interrupts on; and the Ring 3 timer stub — which is where `apic::kick_cpu`'s
+   IPI lands — did not run the epilogue at all, so a thread killed in userland
+   was preempted into the dying list, picked straight back off it and returned
+   to Ring 3, once per tick, for as long as it cared to loop.
+
+   **Release completes within the retirer's own tripwire, and both the bound
+   and its residual are written down.** `kernel/src/scheduler.rs`'s `GIVE_UP`
+   carries the derivation: four pass prologues on xHCI's 2 s deadline, two
+   quanta, and an unwind a saturated real-time band may stretch elevenfold
+   (§3), times one plus the corpses queued ahead of this one. **The
+   qualification is that the last factor is workload-shaped and the tripwire is
+   a constant** — past about nine simultaneous teardowns on one CPU the
+   derivation outgrows its own number, which is filed as
+   `specs/issues/kernel/retire-tripwire-is-not-queue-shaped.md` and is not
+   claimed away here. An invariant states a derived bound or it is not an
+   invariant; this one states the bound and the edge it does not reach. Its
+   dominant term is a second filed defect
    (`specs/issues/kernel/scheduler-pass-blocks-in-xhci.md`) and not a property
    of this invariant.
+
 8. **A cross-CPU message is never dropped.** There is no message capacity to
    exhaust and no overflow.
 9. **Userland cannot stall the scheduler.** A wake storm costs the sender its
@@ -91,16 +126,41 @@ always preempts the normal band. Real-time tasks run FIFO within the band and
 round-robin on the quantum. Entering the real-time band requires the RT right
 (capability endowment spec).
 
-**A killed task unwinding its own stack (invariant 7) is normal-band work and
-takes no exception from this.** It is dispatched ahead of the *fair* queue —
-a retirer is blocked on the resources it is giving back, so it is not competing
-for a share of the CPU — and behind every ready real-time task, which is
-waiting on nothing it holds. It is preempted for real-time work exactly as any
-other normal-band task is, and its unwind is served first-in-first-out against
-the other unwinds on its CPU. **No qualification of the sentence above
-survives**: this is stated because the alternative was tried and is wrong, and
-because "the retirer is blocked" reads like an argument for outranking
-everything until one asks who else is.
+**A killed task unwinding its own stack (invariant 7) is normal-band work, and
+the real-time band's precedence over it is bounded.** It is dispatched ahead of
+the *fair* queue — a retirer is blocked on the resources it is giving back, so
+it is not competing for a share of the CPU — and behind every ready real-time
+task, which is waiting on nothing it holds. Its unwind is served
+first-in-first-out against the other unwinds on its CPU.
+
+**The qualification, which is derived and not a hedge**: once the head of a
+CPU's dying list has waited `toyos_sched::cpu::DYING_AGE_NS` = one quantum, the
+next pick dispatches it ahead of the real-time band for one `DYING_CHUNK_NS` =
+1 ms, and the band resumes. The stamp restarts, so the next such chunk is a full
+age window away. A real-time task therefore gives up at most 1 ms per 10 ms to a
+corpse, which is the whole of what invariant I4's bound grows by; and an unwind
+under a real-time band that never empties is delivered at one chunk per
+11 ms, which is the factor `retire_task`'s tripwire carries.
+
+**Both absolutes were tried and both are wrong**, which is why the sentence
+above has exactly one qualification and not none:
+
+- The dying list served *before* the real-time band starves a ready real-time
+  task for the whole of an unwind, quantum after quantum, because the
+  preemption returns the corpse to the list and the next pick hands it straight
+  back. That contradicts the paragraph above it.
+- The dying list served strictly *after* the band starves the corpse for ever
+  under one thread that holds the RT right and never parks. No sibling CPU can
+  rescue it — a killed task is never migrated (invariant 7), and a steal answers
+  from the fair band only — so `Hw::release` is never called and the retirer's
+  tripwire panics the kernel. `Rights::RT` is capability-gated and `SYS_RT_ENTER`
+  has no revocation, so that is a kernel panic reachable from a legal workload,
+  which is the one thing this kernel does not do.
+
+`toyos-sched`'s `a_killed_task_does_not_starve_a_ready_rt_task` and
+`a_corpse_is_not_starved_for_ever_by_a_spinning_rt_task` are the two gates, one
+per direction, and the simulator carries the same pair as invariant I4 and the
+negative gate `old_rt_starved_the_corpse`.
 
 A real-time writer signalling a pipe lends its band to the blocked reader
 (priority inheritance). The lend begins at the signal, survives queue time to

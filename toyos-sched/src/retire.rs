@@ -142,6 +142,19 @@ mod tests {
         }
     }
 
+    /// A [`Kicker`] that samples the victim's kill bit at the instant the IPI
+    /// is issued, which is the only place that ordering can be observed.
+    struct SamplingKicks {
+        task: Arc<TaskShared<Msg>>,
+        seen: Mutex<Vec<bool>>,
+    }
+
+    impl Kicker for SamplingKicks {
+        fn kick(&self, _target: CpuId) {
+            self.seen.lock().unwrap().push(self.task.kill_pending());
+        }
+    }
+
     const C0: CpuId = CpuId(0);
     const C1: CpuId = CpuId(1);
 
@@ -200,6 +213,52 @@ mod tests {
         assert_eq!(chase(&t, &cpus, &kicks, &NoPreempt), Some(C1));
         assert_eq!(rx[1].pop(&NoPreempt), Some(Msg::Retire(TaskKey(1))));
         assert_eq!(&*kicks.0.lock().unwrap(), &[C0, C1]);
+    }
+
+    /// **The kill bit is set before the kick, and invariant 7's residual bound
+    /// is the wrong way round without it.**
+    ///
+    /// `scheduler-core-spec.md` invariant 7 bounds a killed thread's remaining
+    /// time in Ring 3 at one interrupt delivery: the exit boundary reads the
+    /// bit with IF=0 immediately before the `iretq`, so a bit raised in that
+    /// instant is missed — and what brings the thread back is this
+    /// `Urgency::Preempt` kick. That argument holds only because the kick
+    /// *follows* the bit. Issued first, the IPI could be consumed by a target
+    /// still in Ring 0 with the bit invisible, leaving nothing in flight when
+    /// the bit appears and the victim in Ring 3 until an unrelated tick.
+    ///
+    /// The spec and two code comments stated the order backwards while the code
+    /// had it right, which is a proof of the bound's negation offered as a proof
+    /// of the bound. This is the assertion that stops it being restated.
+    ///
+    /// **A host test and not a loom model**, deliberately: this is program
+    /// order inside one thread — `claim_retire`'s locked read-modify-write, then
+    /// `post`, then `kick` — and not a memory-ordering question between two.
+    /// Loom would explore schedules that cannot reorder it and assert nothing
+    /// this does not.
+    #[test]
+    fn the_kill_bit_is_set_before_the_kick_and_before_the_chase_kick() {
+        let (cpus, mut rx) = world();
+        let t = task(1, TaskState::Ready(C1));
+        let kicks = SamplingKicks {
+            task: t.clone(),
+            seen: Mutex::new(Vec::new()),
+        };
+
+        assert_eq!(begin(&t).post(&cpus, &kicks, &NoPreempt), Some(C1));
+        assert_eq!(rx[1].pop(&NoPreempt), Some(Msg::Retire(TaskKey(1))));
+
+        // And the chase, which is the second site that kicks.
+        assert!(t.transition(TaskState::Ready(C1), TaskState::InTransit(C0)));
+        assert_eq!(chase(&t, &cpus, &kicks, &NoPreempt), Some(C0));
+        assert_eq!(rx[0].pop(&NoPreempt), Some(Msg::Retire(TaskKey(1))));
+
+        assert_eq!(
+            &*kicks.seen.lock().unwrap(),
+            &[true, true],
+            "an IPI left before the kill bit was visible: invariant 7's residual \
+             is a quantum, not an interrupt",
+        );
     }
 
     #[test]

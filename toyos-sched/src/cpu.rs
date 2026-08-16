@@ -2564,11 +2564,6 @@ mod tests {
         }
         w.run_a_pass(C2);
 
-        assert_eq!(w.handles.get(C1).load(), 3, "cpu1 is holding three corpses");
-        assert_eq!(w.handles.get(C1).surplus(), 0, "and can give away none of it");
-        assert_eq!(w.handles.get(C2).load(), 2);
-        assert_eq!(w.handles.get(C2).surplus(), 2, "cpu2 has two to give");
-
         // cpu0 is idle, and its pass posts the one probe it gets.
         w.run_a_pass(C0);
         // The victim answers from surplus at its next pass, and the answer is an
@@ -2591,6 +2586,13 @@ mod tests {
             3,
             "while cpu1's corpses stayed exactly where they were",
         );
+
+        // Read last, so the assertion that fails on a tree publishing one
+        // number for both readers is the *behaviour* above and not this.
+        assert_eq!(w.handles.get(C1).load(), 3, "cpu1 is holding three corpses");
+        assert_eq!(w.handles.get(C1).surplus(), 0, "and can give away none of it");
+        assert_eq!(w.handles.get(C2).load(), 1, "cpu2 gave one of its two away");
+        assert_eq!(w.handles.get(C2).surplus(), 1);
         w.abandon();
     }
 }
