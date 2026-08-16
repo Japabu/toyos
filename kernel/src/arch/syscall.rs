@@ -4,6 +4,7 @@ use super::{cpu, gdt};
 use crate::drivers::acpi;
 use crate::mm::paging::{CachePolicy, Occupancy};
 use crate::user_ptr::{SyscallContext, UserBytes, UserBytesMut};
+use crate::completion;
 use crate::object::{ops, port, KObjectRef};
 use crate::time::{Cadence, Deadline, Duration};
 use crate::{device, log, pipe, process, vfs};
@@ -922,7 +923,20 @@ fn sys_write(h: RawHandle, buf: &UserBytes) -> u64 {
                 return n;
             }
             Err(WriteBlock::Pipe(id)) => match pipe::writers_queue(id) {
-                Some(q) => crate::scheduler::wait_until(&q, Deadline::never(), || pipe::has_space(id)),
+                Some(end) => {
+                    // Armed *before* the registration, and re-derived after —
+                    // §5.3a's edge shape, which is what every site here does
+                    // through `wait_until`'s loop already. C3 makes the inbox
+                    // the predicate; until then the queue is still what wakes
+                    // this thread and the record is the shadow.
+                    let _armed = completion::arm(
+                        completion::Subject::of(&end.watch),
+                        completion::Token::new(0),
+                    );
+                    crate::scheduler::wait_until(&end.queue, Deadline::never(), || {
+                        pipe::has_space(id)
+                    })
+                }
                 None => return SyscallError::NotFound.to_u64(),
             },
             Err(WriteBlock::Refused(word)) => return word,
@@ -945,7 +959,7 @@ enum WriteBlock {
 /// carries what its own re-check needs — the queue is registered on *before*
 /// the condition is re-read, which is what closes the check-then-block window.
 enum ReadBlock {
-    Pipe(alloc::sync::Arc<crate::sched::payload::KWaitQueue>, pipe::PipeId),
+    Pipe(pipe::PipeEnd, pipe::PipeId),
     VirtioSound,
     Hda,
     /// A console read re-polls, because nothing posts a serial key; a claimed
@@ -1051,7 +1065,7 @@ fn read_block(object: &KObjectRef) -> ReadBlock {
             ReadBlock::Keyboard(Deadline::at(crate::clock::now() + CONSOLE_REPOLL.duration()))
         }
         _ => match ops::pipe_id_read(object).and_then(|id| {
-            pipe::readers_queue(id).map(|q| ReadBlock::Pipe(q, id))
+            pipe::readers_queue(id).map(|end| ReadBlock::Pipe(end, id))
         }) {
             Some(block) => block,
             None => ReadBlock::Refused(SyscallError::NotFound.to_u64()),
@@ -1093,24 +1107,46 @@ fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
                 if let Some(id) = pipe_id { process::wake_pipe_writers(id); }
                 return n;
             }
-            Err(ReadBlock::Pipe(queue, id)) => {
-                crate::scheduler::wait_until(&queue, Deadline::never(), || pipe::has_data(id))
+            Err(ReadBlock::Pipe(end, id)) => {
+                let _armed = completion::arm(
+                    completion::Subject::of(&end.watch),
+                    completion::Token::new(0),
+                );
+                crate::scheduler::wait_until(&end.queue, Deadline::never(), || pipe::has_data(id))
             }
-            Err(ReadBlock::VirtioSound) => crate::scheduler::wait_until(
-                &crate::sched::waitqs::AUDIO,
-                Deadline::never(),
-                crate::drivers::virtio_sound::has_pending,
-            ),
-            Err(ReadBlock::Hda) => crate::scheduler::wait_until(
-                &crate::sched::waitqs::AUDIO,
-                Deadline::never(),
-                crate::drivers::hda::has_pending,
-            ),
-            Err(ReadBlock::Keyboard(deadline)) => crate::scheduler::wait_until(
-                &crate::sched::waitqs::KEYBOARD,
-                deadline,
-                crate::keyboard::has_data,
-            ),
+            Err(ReadBlock::VirtioSound) => {
+                let _armed = completion::arm(
+                    completion::Subject::of(&crate::sched::waitqs::AUDIO_WATCH),
+                    completion::Token::new(0),
+                );
+                crate::scheduler::wait_until(
+                    &crate::sched::waitqs::AUDIO,
+                    Deadline::never(),
+                    crate::drivers::virtio_sound::has_pending,
+                )
+            }
+            Err(ReadBlock::Hda) => {
+                let _armed = completion::arm(
+                    completion::Subject::of(&crate::sched::waitqs::AUDIO_WATCH),
+                    completion::Token::new(0),
+                );
+                crate::scheduler::wait_until(
+                    &crate::sched::waitqs::AUDIO,
+                    Deadline::never(),
+                    crate::drivers::hda::has_pending,
+                )
+            }
+            Err(ReadBlock::Keyboard(deadline)) => {
+                let _armed = completion::arm(
+                    completion::Subject::of(&crate::sched::waitqs::KEYBOARD_WATCH),
+                    completion::Token::new(0),
+                );
+                crate::scheduler::wait_until(
+                    &crate::sched::waitqs::KEYBOARD,
+                    deadline,
+                    crate::keyboard::has_data,
+                )
+            }
             Err(ReadBlock::Refused(word)) => return word,
             Err(ReadBlock::BadHandle(e)) => return e.refuse(),
         }

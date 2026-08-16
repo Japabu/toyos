@@ -64,7 +64,10 @@ pub fn remove_io_uring_watcher(id: RingId) {
 
 /// Wake every thread blocked on keyboard input.
 pub fn wake_waiters() {
-    crate::sched::waitqs::wake_all(&crate::sched::waitqs::KEYBOARD);
+    crate::sched::waitqs::wake_device(
+        &crate::sched::waitqs::KEYBOARD,
+        &crate::sched::waitqs::KEYBOARD_WATCH,
+    );
 }
 
 pub fn io_uring_watchers() -> Vec<RingId> {

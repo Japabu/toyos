@@ -620,7 +620,10 @@ fn drain_irqs() {
         // One wait queue for both backends: an over-wake costs a recheck, and a
         // second queue would have to be chosen by whichever driver bound —
         // which is a fact the parking side does not have.
-        crate::sched::waitqs::wake_all(&crate::sched::waitqs::AUDIO);
+        crate::sched::waitqs::wake_device(
+            &crate::sched::waitqs::AUDIO,
+            &crate::sched::waitqs::AUDIO_WATCH,
+        );
         for (watchers, source) in [
             (
                 crate::drivers::virtio_sound::io_uring_watchers(),
@@ -705,6 +708,12 @@ extern "C" fn idle_loop() -> ! {
 /// its own block without borrowing the `CpuSched`.
 pub fn current_shared() -> Option<Arc<KShared>> {
     try_with_cpu(|cpu| cpu.running().map(|t| t.shared().clone())).flatten()
+}
+
+/// The running task's cross-CPU face, which is where its completion inbox
+/// lives. `None` on a CPU with no task: boot, and the idle loop.
+pub fn current_handle() -> Option<Arc<crate::sched::payload::TaskHandle>> {
+    try_with_cpu(|cpu| cpu.running().map(|t| t.ext().handle.clone())).flatten()
 }
 
 pub fn current_cpu() -> CpuId {

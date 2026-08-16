@@ -19,6 +19,12 @@ loom = []
 # with either fence removed behaves identically, which is the whole reason the
 # obligation is a model. `specs/log-architecture-spec.md` §2.5's W3.
 wake-fence-off = []
+# The same arrangement for the completion core: `kernel-loom` turns it on to
+# make `completion::inbox`'s record publication relaxed, and
+# `kernel-loom/tests/inbox.rs` must red when it does. On x86 a build with the
+# release removed behaves identically, which is the whole reason the obligation
+# is a model. `specs/completion-architecture-spec.md` §16.1.
+inbox-release-off = []
 # **Every actuator, and which one is armed comes from the boot parameter.**
 # `kernel/src/actuator.rs` declares all 47 with the claim each rests on; this
 # name is the whole of what a build decides about them. A kernel without it has

@@ -78,6 +78,12 @@ impl Instant {
         Self(nanos)
     }
 
+    /// Back to the domain every existing `u64` call site speaks. Named rather
+    /// than a field so the direction is deliberate: an `Instant` that becomes
+    /// a `u64` has left the type system that separates it from a duration.
+    pub const fn nanos_since_boot(self) -> u64 {
+        self.0
+    }
 }
 
 impl Add<Duration> for Instant {

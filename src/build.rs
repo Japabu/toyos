@@ -1634,6 +1634,11 @@ mod tests {
                 "boot-actuators",
                 "debug-wait",
                 "fpu-save-nothing",
+                // `wake-fence-off`'s twin, for the completion core: turned on
+                // only by `kernel-loom`, to make the inbox's record
+                // publication relaxed and prove `inbox` reds without the
+                // release.
+                "inbox-release-off",
                 "loom",
                 "sched-check",
                 "test-actuators",

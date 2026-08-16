@@ -19,6 +19,7 @@ use toyos_sched::sync::LeafLock;
 use toyos_sched::task::{SchedPayload, TaskAccounting, TaskShared, WaitClass};
 use toyos_sched::waitq::{WaitList, WaitQueue, WaitTicket};
 
+use crate::completion::Inbox;
 use crate::mm::paging::Cr3;
 use crate::process::{OwnedAlloc, PageTables, ProcessAccounting, TaskId};
 use crate::sync::Lock;
@@ -119,6 +120,17 @@ pub struct TaskHandle {
     /// queue costs the same as a slot and makes the wait the ordinary
     /// register/re-check/park shape instead of a bespoke handshake.
     released_wait: KWaitQueue,
+    /// This thread's completions
+    /// (`specs/completion-architecture-spec.md` §5.2's first of the two
+    /// inboxes).
+    ///
+    /// **Here rather than in a thread table, and the reason is the same one
+    /// this struct exists for**: it is the cross-CPU-readable face of a task,
+    /// already `Arc`'d, already released with the task, and already what a
+    /// remote CPU may hold. A poster lends itself a clone of that `Arc` when
+    /// the waiter arms, so a post reaches the inbox without asking the process
+    /// table anything — which a park on a hot path could not afford.
+    inbox: Inbox,
 }
 
 impl TaskHandle {
@@ -129,6 +141,7 @@ impl TaskHandle {
             acct: Lock::new(TaskAccounting::default()),
             released: AtomicBool::new(false),
             released_wait: static_queue(WaitClass::Other),
+            inbox: Inbox::new(),
         }
     }
 
@@ -160,6 +173,10 @@ impl TaskHandle {
 
     pub fn released_wait(&self) -> &KWaitQueue {
         &self.released_wait
+    }
+
+    pub fn inbox(&self) -> &Inbox {
+        &self.inbox
     }
 
     pub fn cpu_ns(&self) -> u64 {

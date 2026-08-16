@@ -54,6 +54,7 @@ mod time;
 mod clock;
 mod rtc;
 
+mod completion;
 mod object;
 mod io_uring;
 mod pipe;

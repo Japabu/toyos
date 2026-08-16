@@ -18,6 +18,7 @@ use alloc::sync::Arc;
 
 use toyos_sched::task::{WaitClass, WakeCause, WakeReason};
 
+use crate::completion::{self, Outcome, Subject, Watch};
 use crate::hw::HW;
 use crate::DirectMap;
 
@@ -40,6 +41,27 @@ pub static KEYBOARD: KWaitQueue = static_queue(WaitClass::Io);
 pub static MOUSE: KWaitQueue = static_queue(WaitClass::Io);
 pub static NETWORK: KWaitQueue = static_queue(WaitClass::Io);
 pub static AUDIO: KWaitQueue = static_queue(WaitClass::Io);
+
+/// The completion watch beside each device queue
+/// (`specs/completion-architecture-spec.md` §5.2). One object, two ways of
+/// waiting on it, until C3 deletes the queue half.
+pub static KEYBOARD_WATCH: Watch = Watch::new();
+pub static MOUSE_WATCH: Watch = Watch::new();
+pub static NETWORK_WATCH: Watch = Watch::new();
+pub static AUDIO_WATCH: Watch = Watch::new();
+
+/// Wake a device queue **and** post to its watch.
+///
+/// One function rather than a pair at each site, and that is the whole point:
+/// `complete_pending_for_event` has ten hand-paired call sites and
+/// `io-uring-source-half-a-wake-pair` records losing that pairing twice in one
+/// cutover (§5.6). Here the pairing is a call, so half of it cannot be
+/// forgotten.
+pub fn wake_device(queue: &KWaitQueue, watch: &'static Watch) -> usize {
+    let woken = wake_all(queue);
+    completion::post(Subject::of(watch), Outcome::Ready);
+    woken
+}
 
 /// The bucket a futex word parks in, keyed by physical address so the queue is
 /// shared across every process that maps it.

@@ -13,6 +13,7 @@ use toyos_sched::hw::{Machine, Nanos};
 use toyos_sched::task::{WakeCause, WakeReason};
 
 use crate::arch::percpu;
+use crate::completion::{self, Outcome, Subject};
 use crate::hw::HW;
 use crate::pipe::PipeId;
 use crate::process::{self, Pid, Tid};
@@ -397,20 +398,22 @@ pub fn wake_sched(sched: &ThreadSched) {
 /// (spec §8.5). The pipe is also marked, so a reader that was runnable rather
 /// than blocked at write time takes the window at its own consume point.
 pub fn wake_pipe_readers(pipe_id: PipeId) {
-    let Some(queue) = crate::pipe::readers_queue(pipe_id) else {
+    let Some(end) = crate::pipe::readers_queue(pipe_id) else {
         return;
     };
     if driver::current_is_rt() {
         crate::pipe::set_rt_boost_pending(pipe_id);
-        waitqs::wake_all_boosted(&queue, boost_window());
+        waitqs::wake_all_boosted(&end.queue, boost_window());
     } else {
-        waitqs::wake_all(&queue);
+        waitqs::wake_all(&end.queue);
     }
+    completion::post(Subject::of(&end.watch), Outcome::Ready);
 }
 
 pub fn wake_pipe_writers(pipe_id: PipeId) {
-    if let Some(queue) = crate::pipe::writers_queue(pipe_id) {
-        waitqs::wake_all(&queue);
+    if let Some(end) = crate::pipe::writers_queue(pipe_id) {
+        waitqs::wake_all(&end.queue);
+        completion::post(Subject::of(&end.watch), Outcome::Ready);
     }
 }
 

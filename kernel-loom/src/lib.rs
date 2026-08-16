@@ -145,3 +145,17 @@ pub mod log_registry;
 
 #[path = "../../kernel/src/sched/reap_gate.rs"]
 pub mod reap_gate;
+
+/// The duration kinds and the two time types. It names nothing outside `core`,
+/// which is what lets a record carry an `Instant` into a model at all — and it
+/// is compiled here so that constraint is checked rather than remembered.
+#[path = "../../kernel/src/time.rs"]
+pub mod time;
+
+/// The completion core's record and inbox. It reaches `crate::time` and
+/// `crate::cell` and nothing else, which is the layout requirement
+/// `specs/completion-architecture-spec.md` §16.1 puts on C2: a file that named
+/// a pipe end or a device claim could not be compiled here at all, and the
+/// ordering would stop being checked by anything.
+#[path = "../../kernel/src/completion/inbox.rs"]
+pub mod inbox;

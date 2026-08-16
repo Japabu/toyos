@@ -39,6 +39,14 @@ loom = []
 # Never on by default and never reachable from a kernel build, which declares
 # the same name only so `cfg` checking knows it.
 wake-fence-off = []
+# The negative control for the inbox's publication edge. It makes the `tail`
+# store and load relaxed, and `inbox.rs` must red under it:
+#
+#   cargo test --manifest-path kernel-loom/Cargo.toml --features inbox-release-off \
+#     --test inbox
+#
+# Never on by default, and no kernel build can reach it.
+inbox-release-off = []
 
 [dependencies]
 loom = "0.7"
