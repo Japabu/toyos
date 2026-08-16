@@ -336,8 +336,15 @@ pub fn do_preempt() {
 /// atomic and can be raised after this load and before the `iretq`, with IF=0
 /// in between. That thread reaches Ring 3 with the kill pending and comes back
 /// through this boundary on the retire's own `Urgency::Preempt` kick — which
-/// was posted before the bit was set, so it is already on its way.
-/// `scheduler-core-spec.md` invariant 7 states that bound.
+/// **follows** the bit rather than preceding it. `retire::begin` sets KILL with
+/// a locked read-modify-write in `claim_retire`, and `RetireTicket::post` is
+/// what pushes the message and issues the kick, so the kick cannot be consumed
+/// by a CPU that has not yet seen the bit. The reverse order is what would
+/// break the bound, not what establishes it: an IPI taken in Ring 0 ahead of a
+/// bit nobody can see leaves no interrupt in flight once the bit appears, and
+/// the victim sits in Ring 3 until an unrelated tick.
+/// `scheduler-core-spec.md` invariant 7 states that bound, and
+/// `toyos-sched/src/retire.rs`'s module header states the same order.
 ///
 /// One relaxed load per return to userland, which is the whole cost. The
 /// baseline is `BASELINE_IRQ_EXIT`: every entry stub discharges its own level
@@ -539,49 +546,77 @@ pub fn retire_task(sched: &ThreadSched) {
     /// is the liveness backstop's step.
     const RECHECK: Cadence = Cadence::every(
         Duration::from_millis(50),
-        "a hundred re-polls inside the tripwire, on a thread that is otherwise parked",
+        "two hundred re-polls inside the tripwire, on a thread that is otherwise parked",
     );
-    /// **Re-derived at C3+C4, which the struck version of this comment said it
-    /// owed.** What this bounds is no longer "an IPI, one remote pass and a
-    /// release": since `specs/completion-architecture-spec.md` §7.2 the victim
-    /// is *scheduled* rather than reaped, so the wait covers every hop between
-    /// the claim and `Hw::release`. Term by term, from the tree:
+    /// **Re-derived twice at C3+C4, and the second time because the first was
+    /// below its own sum.** What this bounds is no longer "an IPI, one remote
+    /// pass and a release": since `specs/completion-architecture-spec.md` §7.2
+    /// the victim is *scheduled* rather than reaped, so the wait covers every
+    /// hop between the claim and `Hw::release`. Term by term, from the tree:
     ///
-    /// * **2 s — the victim CPU's own pass prologue.** `sched::driver::pass`
-    ///   opens with `drain_irqs()`, which calls `xhci::poll_if_pending()`
-    ///   *before* the mailbox drain, and that call spins on
-    ///   `xhci::USB_TIMEOUT_NS` = 2,000,000,000 ns while holding `XHCI`. This
-    ///   is the term that made the struck 1 s fire on the owner's T14 at 949 s
-    ///   of uptime with doom exiting, and it has nothing to do with §7.2:
-    ///   `specs/issues/kernel/scheduler-pass-blocks-in-xhci.md` is open and
-    ///   says in terms that "`retire_task`'s bound is measuring the USB bus".
-    ///   **A tripwire smaller than one bounded term of its own derivation is
-    ///   not a tripwire**, and that alone is why the number moves.
-    /// * **2 s again — the pass that frees the zombie.** `die` publishes
-    ///   `Dead` and leaves the record as that CPU's zombie; the release is the
-    ///   *next* pass, and that pass opens with the same prologue.
+    /// * **8 s — four pass prologues at 2 s each.** `sched::driver::pass` opens
+    ///   with `drain_irqs()`, which calls `xhci::poll_if_pending()` *before* the
+    ///   mailbox drain; below that poll sits `msc::bind`, a disk arriving after
+    ///   boot, and `wait/mod.rs` names it "the one door, and the only blocking
+    ///   thing a scheduler pass can still reach" — on `xhci::USB_TIMEOUT_NS` =
+    ///   2,000,000,000 ns while holding `XHCI`. This is the term that made the
+    ///   struck 1 s fire on the owner's T14 at 949 s of uptime with doom
+    ///   exiting, and it has nothing to do with §7.2:
+    ///   `specs/issues/kernel/scheduler-pass-blocks-in-xhci.md` is open and says
+    ///   in terms that "`retire_task`'s bound is measuring the USB bus".
+    ///
+    ///   **Four, and the struck derivation priced two.** The chain is: the pass
+    ///   the retire's `Urgency::Preempt` kick buys, which drains `Msg::Retire`;
+    ///   the pass that dispatches the corpse once the CPU is free of whatever
+    ///   was running; the corpse's *own* exit pass, which is
+    ///   `exit_if_killed`'s `driver::pass(Dispose::Exit)` and is a separate
+    ///   `pass()` call paying the same prologue; and the pass that frees the
+    ///   zombie. Three of those are unavoidable for a victim already in the
+    ///   kernel; the fourth is what a parked or queued victim adds, and a
+    ///   tripwire covers the worst case or it is not one.
     /// * **20 ms — two quanta.** One for the victim's CPU to be free to pick
     ///   the dying task (a running fair task keeps the CPU to its quantum end),
     ///   one for the pass that releases the zombie to arrive.
-    /// * **The unwind itself**, which is what §7.2 added: `?`-ing
-    ///   `completion::Cancelled` out of every wait the thread was inside,
-    ///   dropping the guards on the way, `process::teardown_resources`, and
-    ///   `ops::close_all` over up to `MAX_HANDLES` = 4,096 handles. On *this*
-    ///   tree that is CPU-bounded work and not a wait — `wait_transfer` still
-    ///   spins and there is no park on a disk transfer until C7 (spec §20.4) —
-    ///   so it is the margin above rather than a term of its own. **C7 changes
-    ///   that and owes this constant another look**: a sleep lock parked on a
-    ///   device puts a third `USB_TIMEOUT_NS` inside the unwind.
+    /// * **990 ms — the unwind, stretched by a saturated real-time band.** The
+    ///   unwind itself is what §7.2 added: `?`-ing `completion::Cancelled` out
+    ///   of every wait the thread was inside, dropping the guards on the way,
+    ///   `process::teardown_resources`, and `ops::close_all` over up to
+    ///   `MAX_HANDLES` = 4,096 handles. On *this* tree that is CPU-bounded work
+    ///   and not a wait — `wait_transfer` still spins and there is no park on a
+    ///   disk transfer until C7 (spec §20.4). **Its length is an estimate and
+    ///   says so**: 4,096 closes plus a teardown, against a scheduler pass
+    ///   budget (`toyos_sched::cpu::MAX_PASS_NS`) of 200 µs, is priced here at
+    ///   one quantum — 10 ms of the victim's own CPU time.
     ///
-    /// 4.02 s of derived terms, and 5 s is the next round number above it.
-    /// Nothing about the RT band is priced here: `scheduler-core-spec.md` §3
-    /// gives real-time work unbounded precedence over the dying list, so a
-    /// machine that spends this tripwire on RT service is a machine whose RT
-    /// workload is the fault, and the RT right is capability-gated.
+    ///   The real-time band multiplies it by 11 and no more.
+    ///   `toyos_sched::cpu::DYING_AGE_NS` makes that band's precedence over the
+    ///   dying list a *bounded* deferral: an aged corpse takes one
+    ///   `DYING_CHUNK_NS` per `DYING_AGE_NS + DYING_CHUNK_NS`, so 10 ms of
+    ///   unwind costs 110 ms of wall clock when the band never empties.
+    ///   `an_unwind_under_saturated_rt_is_stretched_by_the_age_ratio` is what
+    ///   keeps that factor and this number from drifting apart. **The struck
+    ///   derivation priced this term at nothing** — "a machine that spends this
+    ///   tripwire on RT service is a machine whose RT workload is the fault" —
+    ///   and that was not a derivation, it was the reason the tripwire was
+    ///   reachable from one spinning `Rights::RT` thread.
+    ///
+    ///   Times `1 + peers`, because one CPU runs one unwind at a time and this
+    ///   victim waits out the corpses queued ahead of it. Priced at `peers = 8`:
+    ///   one process's threads torn down together onto one CPU. **Past that the
+    ///   term outgrows the constant**, and that is filed rather than papered
+    ///   over — `specs/issues/kernel/retire-tripwire-is-not-queue-shaped.md`.
+    ///
+    /// 9.01 s of derived terms, and 10 s is the next round number above it —
+    /// 990 ms of margin, which is one whole unwind's worth. The dominant term
+    /// remains a filed defect and not a property of this wait: close the xHCI
+    /// issue and 8 s of this number goes with it.
+    ///
+    /// **C7 owes this constant another look**: a sleep lock parked on a device
+    /// puts a fifth `USB_TIMEOUT_NS` inside the unwind.
     const GIVE_UP: Tripwire = Tripwire::absurd(
-        Duration::from_secs(5),
-        "two pass prologues on xHCI's own 2 s deadline, two quanta, and an unwind; \
-         past this the wake was lost",
+        Duration::from_secs(10),
+        "four pass prologues on xHCI's own 2 s deadline, two quanta, and an unwind \
+         the real-time band may stretch elevenfold; past this the wake was lost",
     );
     let give_up = Deadline::at(crate::clock::now() + GIVE_UP.duration());
     let parkable = Parkable::of_current();
