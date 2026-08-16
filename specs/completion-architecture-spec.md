@@ -2313,32 +2313,88 @@ of their *code*. Rows 18–22 were added by this review; 2, 3, 4, 9, 10, 12, 16 
 
 x86's TSO gives every load acquire and every store release semantics, so a missing
 acquire edge is invisible on the only architecture ToyOS boots. Loom is the only
-gate. Four new models beside `ticket_lock.rs` and `tlb_shootdown.rs`:
+gate.
 
-| model | what it explores | why the guest suite cannot |
-|---|---|---|
-| `inbox.rs` | Invariant W (§5.4): producer stores a record then claims; consumer arms, rechecks, parks. Two producers, one consumer, and a producer that runs entirely before the arm. **And the producer that takes no lock**: `Inbox::post`'s plain writes are sound only under the subject's leaf lock, so the log's `emit`-side producer uses `Inbox::signal` — one atomic store — and two of them racing must be sound where two `post`s are not | the race window is a handful of instructions on two CPUs; TSO makes the missing edge unobservable |
-| `sleep_lock.rs` | `SleepLock` acquire/release against a parking contender and a concurrent `try_lock`; FIFO among contenders | `Lock::lock`'s spin is unreachable by loom (`lock-spin-unreachable-by-loom`); a parking acquire has no unbounded branch, so this is the **first** contended-acquire model in the tree |
-| the cancel model — **in `toyos-sched/loom/tests/loom_retire.rs`**, not a new file | kill racing a park racing a post: cancel before arm, between arm and commit, and after `Blocked` | the interleaving needs a remote CPU acting between two of the victim's instructions |
-| `outstanding.rs` | an ISR on CPU A records into `irq_ring`, a drain on CPU B posts, a waiter on CPU C observes | three CPUs, one publication chain; nothing in QEMU orders them |
+**What `kernel-loom/tests/` holds today, counted rather than remembered: seven
+models** — `ticket_lock.rs`, `tlb_shootdown.rs`, `reap_gate.rs`,
+`log_record.rs`, `log_publish.rs`, `log_wake.rs` and `inbox.rs`, 27 `#[test]`s
+and 27 `loom::model` calls between them — beside two files that are not models
+at all. `log_body_words.rs` and `log_zeroed_init.rs` are
+`cfg(not(feature = "loom"))` host-fast regressions with zero `loom::model`
+calls, run by the `--no-default-features` invocation
+`.github/workflows/host-tests.yml` names second, and neither carries a control
+because neither explores a schedule.
+
+Four models were planned for this section. The status column is what became of
+them, and **`sleep_lock.rs` and `outstanding.rs` do not exist as files** — they
+wait on the primitives C5 and C11 create:
+
+| model | status | what it explores | why the guest suite cannot |
+|---|---|---|---|
+| `inbox.rs` | **landed** | Invariant W (§5.4): producer stores a record then claims; consumer arms, rechecks, parks. Two producers, one consumer, and a producer that runs entirely before the arm. **And the producer that takes no lock**: `Inbox::post`'s plain writes are sound only under the subject's leaf lock, so the log's `emit`-side producer uses `Inbox::signal` — one atomic store — and two of them racing must be sound where two `post`s are not | the race window is a handful of instructions on two CPUs; TSO makes the missing edge unobservable |
+| `sleep_lock.rs` | **not written; waits on C5** | `SleepLock` acquire/release against a parking contender and a concurrent `try_lock`; FIFO among contenders | `Lock::lock`'s spin is unreachable by loom (`lock-spin-unreachable-by-loom`); a parking acquire has no unbounded branch, so this is the **first** contended-acquire model in the tree |
+| the cancel model — **in `toyos-sched/loom/tests/loom_retire.rs`**, not a new file | **landed**: that file holds `a_retire_racing_the_park_commit_always_leaves_someone_to_reap` and `a_retire_and_a_wake_never_both_claim_a_parked_task` | kill racing a park racing a post: cancel before arm, between arm and commit, and after `Blocked` | the interleaving needs a remote CPU acting between two of the victim's instructions |
+| `outstanding.rs` | **not written; waits on C11** | an ISR on CPU A records into `irq_ring`, a drain on CPU B posts, a waiter on CPU C observes | three CPUs, one publication chain; nothing in QEMU orders them |
 
 `kernel-loom` compiles the real `kernel/src/` file a second time against loom's
 atomics, so each model drives the primitive rather than a transliteration. Any new
 primitive that does not compile that way is the wrong shape.
 
-**Each model carries a negative control that stages a mechanism, never a
-verdict** — `wake-fence-off` removes `shard.rs`'s two `SeqCst` fences,
-`inbox-release-off` makes the record's publication relaxed, and
-`inbox-signal-as-post` puts the log's lock-free producer back on `Inbox::post`.
-The last of those is the one C3+C4 owed: the shipped argument for `post`'s plain
-writes was "one poster per *park*", admitted by `shard::signal_after_commit`'s
-swap, and `klogd` starts the next park's epoch while the previous epoch's
-producer is still inside `post`. Under the control loom answers `Causality
-violation: Concurrent write accesses to UnsafeCell`, which is the defect stated
-exactly.
+**All seven models in `kernel-loom/tests/` carry a negative control that stages
+a mechanism, never a verdict.** Until 2026-08-16 three of them did and this
+sentence claimed all seven: `ticket_lock`, `tlb_shootdown`, `reap_gate`,
+`log_record` and `log_publish` had none. All five were in the tree before the
+paragraph that spoke for them — `git log --diff-filter=A` dates them 2026-08-06,
+08-07, 08-15, 08-11 and 08-14 against the paragraph's own 08-16 — so the claim
+was false the day it was written, and it is repaired by adding the five controls
+rather than by narrowing the sentence. Each control is one cargo feature that
+weakens one edge, run as
 
-**That mechanism is narrower than three of the four models need, and it constrains
-the file layout.** `kernel-loom/src/lib.rs:63` reaches `kernel/src/sync.rs` and
+```text
+cargo test --manifest-path kernel-loom/Cargo.toml --features <control> --test <model>
+```
+
+and each was read **both ways round on 2026-08-16** — green with the feature
+off, red with it on:
+
+| control | what it weakens | the model that must red, and how it says so |
+|---|---|---|
+| `lock-acquire-off` | `sync.rs`'s two loads of `now` — the ones that decide ownership — go `Relaxed` | `ticket_lock`, loom's own `Causality violation: Concurrent write accesses to UnsafeCell` |
+| `shootdown-serve-relaxed` | `shootdown.rs`'s `serve` reads what it owes `Relaxed`, so the flush stops postdating the initiator's page-table write | `tlb_shootdown`: *cpu 1 acknowledged the shootdown while still holding a translation for the page the initiator is about to free* |
+| `reap-raise-relaxed` | `sched/reap_gate.rs`'s `raise` store goes `Relaxed` | `reap_gate`: *a claimed gate handed the reaper an empty poison slot* |
+| `log-commit-release-off` | `log/shard.rs`'s publishing store goes `Relaxed` — obligation W1 | `log_record`: *torn: at_ns is another record's*, and a key from a generation the slot no longer holds |
+| `shard-publish-relaxed` | `log/registry.rs`'s pointer store and load go `Relaxed` — obligation W5 | `log_publish`, loom's own `Causality violation: Concurrent load and mut accesses` |
+| `wake-fence-off` | `log/shard.rs`'s two `SeqCst` fences removed — obligation W3 | `log_wake`: *the producer posted nothing and the reader decided to park* |
+| `inbox-release-off` | `completion/inbox.rs`'s record publication and observation go `Relaxed` | `inbox`, loom's own `Causality violation: Concurrent write accesses to UnsafeCell` |
+| `inbox-signal-as-post` | the log's lock-free producer goes back on `Inbox::post` | `inbox`, at `two_unlocked_producers_are_a_race_and_a_signal_is_not`, same words |
+
+Every one of the eight is declared in `kernel-loom/Cargo.toml` with its own
+command beside it, and none is ever on by default. Seven have their `cfg` site
+in kernel source, so `kernel/Cargo.toml` declares those seven names too —
+purely so `cfg` checking knows them, never enabled there, and each therefore
+has to appear in `src/build.rs`'s
+`the_kernel_declares_only_the_builds_that_earned_one`, which is the list that
+says what a kernel feature costs. None of them costs a kernel build: no kernel
+`cargo test` invocation names one. `inbox-signal-as-post` is the exception in
+the other direction — its `cfg` site is in `kernel-loom/tests/inbox.rs` itself,
+because what it swaps is which producer the model drives, so no kernel
+declaration exists or is wanted.
+
+**CI runs one of the eight.** `.github/workflows/host-tests.yml`'s
+*kernel-loom wake fences have teeth* step demands `log_wake`'s FAILED line by
+name under `wake-fence-off`; the other seven are read at the landing that adds
+or changes them, which is what the dated verification above is.
+
+`inbox-signal-as-post` is the one C3+C4 owed: the shipped argument for `post`'s
+plain writes was "one poster per *park*", admitted by
+`shard::signal_after_commit`'s swap, and `klogd` starts the next park's epoch
+while the previous epoch's producer is still inside `post`. Under the control
+loom answers `Causality violation: Concurrent write accesses to UnsafeCell`,
+which is the defect stated exactly.
+
+**That mechanism — compiling the real `kernel/src/` file a second time against
+loom's atomics — is narrower than three of the four models need, and it constrains
+the file layout.** `kernel-loom/src/lib.rs:128` reaches `kernel/src/sync.rs` and
 `kernel/src/shootdown.rs` by `#[path]`, and it works only because those two files
 name almost nothing outside themselves — four shimmed items in total
 (`cell::UnsafeCell`, `preempt::{disable,enable}`, `arch::tlb::poll`, `log!`), and
@@ -2365,11 +2421,12 @@ Two of the four models need re-siting before they are written:
   (`loom_mailbox.rs`, `loom_retire.rs`, `loom_sleep.rs`, `loom_ticket.rs`).
   **`loom_retire.rs` already covers three of the four orderings** — kill vs
   wake-claim, kill vs park-commit
-  (`a_retire_racing_the_park_commit_always_leaves_someone_to_reap`, `:104`),
-  chase vs migration (`:157`) and adopt-under-kill (`:199`). The genuinely
-  missing case is exactly the one §7.3 names: **retire finding the task already in
-  `parked`.** Extend that file; a fifth would split the estate that already holds
-  the argument.
+  (`a_retire_racing_the_park_commit_always_leaves_someone_to_reap`, `:111`),
+  chase vs migration (`the_retire_chase_reuses_one_node_under_a_racing_migration`,
+  `:164`) and adopt-under-kill (`an_adopting_cpu_always_observes_the_kill_bit`,
+  `:206`). The genuinely missing case is exactly the one §7.3 names: **retire
+  finding the task already in `parked`.** Extend that file; a fifth would split
+  the estate that already holds the argument.
 
 ### 16.2 The TCG price, and the budget that does not grow
 

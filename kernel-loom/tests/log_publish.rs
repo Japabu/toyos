@@ -7,6 +7,18 @@
 //! asked for. On x86 every store is a release and this cannot happen. **ARM64
 //! is planned.**
 //!
+//! The negative case is a cargo feature rather than a comment:
+//!
+//! ```text
+//! cargo test --manifest-path kernel-loom/Cargo.toml --features shard-publish-relaxed \
+//!   --test log_publish
+//! ```
+//!
+//! makes both sides of the pointer's publication relaxed and this file must red
+//! — loom answers `Causality violation: Concurrent load and mut accesses`,
+//! which is the reader reaching the shard's own words while the publisher is
+//! still building them. Verified 2026-08-16, both ways round.
+//!
 //! `specs/log-architecture-spec.md` §2.2.
 
 #![cfg(feature = "loom")]

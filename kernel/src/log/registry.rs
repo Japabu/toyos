@@ -18,6 +18,27 @@ use loom::sync::atomic::{AtomicPtr, Ordering};
 
 use toyos_abi::log::MAX_LOG_SHARDS;
 
+/// The store that makes a shard reachable, and what it carries.
+///
+/// What the pair orders is the zeroing and the initial `head`, not the pointer:
+/// an AP's shard is `alloc_zeroed` memory the BSP builds before storing the
+/// pointer, and a reader that saw the pointer without this would read whatever
+/// the heap held under a slot's sequence number.
+///
+/// **A cargo feature rather than a comment, because a model that has never
+/// failed proves nothing.** `kernel-loom`'s `shard-publish-relaxed` makes both
+/// sides `Relaxed` and `kernel-loom/tests/log_publish.rs` must red under it. No
+/// kernel build can turn the name on: the kernel declares it only so `cfg`
+/// checking knows it.
+#[cfg(not(feature = "shard-publish-relaxed"))]
+const PUBLISH: Ordering = Ordering::Release;
+#[cfg(feature = "shard-publish-relaxed")]
+const PUBLISH: Ordering = Ordering::Relaxed;
+#[cfg(not(feature = "shard-publish-relaxed"))]
+const OBSERVE: Ordering = Ordering::Acquire;
+#[cfg(feature = "shard-publish-relaxed")]
+const OBSERVE: Ordering = Ordering::Relaxed;
+
 /// One path in both builds: in the kernel `super` is `crate::log`, and in
 /// `kernel-loom` it is the crate root, which re-exports `log_shard` under this
 /// name for exactly that reason. A `cfg` here instead would have to be the
@@ -61,7 +82,7 @@ pub unsafe fn publish(slots: &[AtomicPtr<Shard>], cpu: u32, shard: *mut Shard) {
         .checked_sub(1)
         .and_then(|ap| slots.get(ap))
         .unwrap_or_else(|| panic!("log: cpu{cpu} has no shard slot in an ABI of {MAX_LOG_SHARDS}"));
-    slot.store(shard, Ordering::Release);
+    slot.store(shard, PUBLISH);
 }
 
 /// The shard `cpu` published, if it has one.
@@ -69,7 +90,7 @@ pub unsafe fn publish(slots: &[AtomicPtr<Shard>], cpu: u32, shard: *mut Shard) {
 /// `Acquire` against [`publish`]'s `Release`: what the pair orders is the
 /// zeroing and the initial `head`, not the pointer.
 pub fn published(slots: &[AtomicPtr<Shard>], ap: usize) -> Option<&'static Shard> {
-    let ptr = slots.get(ap)?.load(Ordering::Acquire);
+    let ptr = slots.get(ap)?.load(OBSERVE);
     // SAFETY: `publish`'s contract is a live shard that is never freed, and the
     // pointer is only ever written once.
     (!ptr.is_null()).then(|| unsafe { &*ptr })

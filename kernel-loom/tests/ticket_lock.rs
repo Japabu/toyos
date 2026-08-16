@@ -4,6 +4,20 @@
 //! publishes through is `now`. Whichever operation reads `now` is therefore the
 //! one that has to carry the acquire — an acquire on `ticket` synchronizes with
 //! nothing, because nothing ever releases to `ticket`.
+//!
+//! On x86 every load is an acquire, so a build with that edge relaxed behaves
+//! identically to this one and no guest test can fail here. The negative case is
+//! a cargo feature rather than a comment:
+//!
+//! ```text
+//! cargo test --manifest-path kernel-loom/Cargo.toml --features lock-acquire-off \
+//!   --test ticket_lock
+//! ```
+//!
+//! makes `sync.rs`'s two loads of `now` relaxed and this file must red — loom
+//! answers `Causality violation: Concurrent write accesses to UnsafeCell`, which
+//! is a lock handing out data it did not synchronize, stated exactly. Verified
+//! 2026-08-16, both ways round.
 
 use kernel_loom::sync::Lock;
 use loom::sync::Arc;

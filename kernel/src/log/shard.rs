@@ -73,6 +73,25 @@ const MSG_WORDS: usize = 1;
 /// publishes with.
 const BODY_WORDS: usize = HEADER_WORDS + MSG_WORDS;
 
+/// The store that publishes a record, and what it carries.
+///
+/// It is the last store [`Shard::commit`] makes, and the release is what puts
+/// every body word ahead of it for a reader whose `slot.seq.load(Acquire)`
+/// answers `seq` — obligation W1 of `specs/log-architecture-spec.md` §2.5.
+///
+/// **A cargo feature rather than a comment, because a model that has never
+/// failed proves nothing.** `kernel-loom`'s `log-commit-release-off` makes it
+/// `Relaxed` and `kernel-loom/tests/log_record.rs` must red under it: a reader
+/// then observes the sequence number with a stale or half-written body behind
+/// it, twice over — the re-check reads the same relaxed word and accepts the
+/// mixture. On x86 every store is a release and this cannot happen, which is
+/// the whole reason W1 is a model. No kernel build can turn the name on: the
+/// kernel declares it only so `cfg` checking knows it.
+#[cfg(not(feature = "log-commit-release-off"))]
+const PUBLISH: Ordering = Ordering::Release;
+#[cfg(feature = "log-commit-release-off")]
+const PUBLISH: Ordering = Ordering::Relaxed;
+
 /// The message bound this file enforces, which is the ABI's in the kernel build
 /// and the model's own under loom.
 const MSG_BYTES: usize = MSG_WORDS * 8;
@@ -331,7 +350,7 @@ impl Shard {
         }
 
         // The store that publishes, and it is the last one.
-        slot.seq.store(seq, Ordering::Release);
+        slot.seq.store(seq, PUBLISH);
     }
 
     /// The timestamp of record `seq`, under exactly [`Shard::read`]'s validity

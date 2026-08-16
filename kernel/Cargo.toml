@@ -25,6 +25,25 @@ wake-fence-off = []
 # release removed behaves identically, which is the whole reason the obligation
 # is a model. `specs/completion-architecture-spec.md` §16.1.
 inbox-release-off = []
+# The same arrangement, five more times, one per loom model that had no control
+# until 2026-08-16. Each is declared here and never enabled here; `kernel-loom`
+# turns exactly one on at a time and the named model must red. None costs a
+# kernel build — no kernel `cargo test` invocation names any of them, for
+# `loom`'s reason. `specs/completion-architecture-spec.md` §16.1 enumerates
+# which model each one reds, and `kernel-loom/Cargo.toml` carries the command.
+#
+# `src/sync.rs`'s two loads of `now` go `Relaxed`, and `ticket_lock` reds.
+lock-acquire-off = []
+# `src/sched/reap_gate.rs`'s `raise` store goes `Relaxed`, and `reap_gate` reds.
+reap-raise-relaxed = []
+# `src/shootdown.rs`'s `serve` reads what it owes `Relaxed`, and
+# `tlb_shootdown` reds.
+shootdown-serve-relaxed = []
+# `src/log/shard.rs`'s publishing store goes `Relaxed`, and `log_record` reds.
+log-commit-release-off = []
+# `src/log/registry.rs`'s pointer store and load go `Relaxed`, and `log_publish`
+# reds.
+shard-publish-relaxed = []
 # **Every actuator, and which one is armed comes from the boot parameter.**
 # `kernel/src/actuator.rs` declares all 47 with the claim each rests on; this
 # name is the whole of what a build decides about them. A kernel without it has

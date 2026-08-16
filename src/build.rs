@@ -1639,8 +1639,22 @@ mod tests {
                 // publication relaxed and prove `inbox` reds without the
                 // release.
                 "inbox-release-off",
+                // The five below join `inbox-release-off` and `wake-fence-off`
+                // as loom negative controls, and between them cost **no kernel
+                // build**: no `cargo test` invocation in `src/` or `tests/`
+                // names one, and only `kernel-loom` turns them on. They are
+                // declared here so `cfg` checking knows the names. §16.1 of
+                // `specs/completion-architecture-spec.md` pairs each with the
+                // model it must red, and the reason they exist is that five of
+                // the seven loom models carried no control at all while that
+                // section claimed every model did.
+                "lock-acquire-off",
+                "log-commit-release-off",
                 "loom",
+                "reap-raise-relaxed",
                 "sched-check",
+                "shard-publish-relaxed",
+                "shootdown-serve-relaxed",
                 "test-actuators",
                 // Costs no kernel build at all, for `loom`'s reason: declared
                 // so `cfg` checking knows the name, and turned on only by
