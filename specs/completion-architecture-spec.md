@@ -237,18 +237,29 @@ first is why this kind has to exist:
   What survived the strike as a *finding* dies with them: `MAX_BLOCKED_NANOS`
   existed only because `log_file::poll` `try_lock`s the VFS, and neither the poll
   nor the constant reaches this branch.
-- `retire_task`'s `RECHECK_NS` (50 ms, `scheduler.rs:441`) — **covered, but it is
-  a widening and not a deletion, and the first draft's wording will make an
-  implementer delete both halves.** The poster already exists
-  (`sched/payload.rs:155` `publish_released` → `waitqs::wake_all`), so parking is
-  sound. But the 1 s panic at `scheduler.rs:445` is evaluated *only at the top of
-  the `while` loop*, which is re-entered only because the 50 ms deadline returns
-  `block_on`. Park with no deadline and the `Tripwire` never fires: a lost wake
-  parks forever. **The park must carry `Tripwire(1 s)` itself** — one deadline
-  instead of twenty re-polls, expiry a panic instead of a retry. §7.3 then
-  re-derives that 1 s, because it now bounds an unwind — **and §7.3's correction
-  is that the loop does not wait on the state word at all**, so the re-derivation
-  is against `handle.released()`.
+- `retire_task`'s 50 ms re-poll — **covered, but it is a widening and not a
+  deletion, and the first draft's wording will make an implementer delete both
+  halves.** The poster already exists — `sched/payload.rs:184`'s
+  `publish_released`, whose wake is a `completion::post` on the victim's own
+  watch (`:189`), and not the `waitqs::wake_all` this bullet first named — so
+  parking is sound. But the panic is evaluated *only at the top of the `while`
+  loop*, and in the case that matters, a lost wake, nothing but the 50 ms
+  deadline re-enters that loop. Park with no deadline and the `Tripwire` never
+  fires: a lost wake parks forever.
+
+  **What this bullet then prescribed — "the park must carry `Tripwire(1 s)`
+  itself", one deadline instead of twenty re-polls — is struck, because C3+C4
+  built the other shape and the other shape is right.** Both halves survive with
+  one job each: `RECHECK` is a `Cadence` of 50 ms (`scheduler.rs:581`, the
+  duration at `:582`) and its own doc says what it is — *"a re-poll rate and not
+  a bound"*, the liveness backstop's step — while `GIVE_UP` is the bound and is
+  read at the loop top (`:667-674`). One deadline would have fused them, and a
+  slow unwind would then end the wait exactly as a lost message does; it is the
+  lost message this kernel has to fail loudly on, and it is the unwind whose
+  length nobody can promise. **The number is not 1 s either**: §7.3's
+  re-derivation makes it 10 s (`:650-654`), and §7.3's correction that the loop
+  does not wait on the state word at all stands — it waits on
+  `handle.released()`.
 - The 10 ms behind a serial-console read — **NOT COVERED. It is the only reason a
   serial-console read ever returns**, and the replacement named in §4.1 P5 and
   §11 is about a different device. On the merged tree it is
@@ -447,7 +458,7 @@ deleted.
 | P9 | `arch/syscall.rs:2361,2362` (`sys_nanosleep`, `:2357`) | an instant | caller's | park on a deadline completion |
 | P10 | `io_uring.rs:449,458` | a CQE | caller's | the ring **is** an inbox (§5.2) |
 | P11 | `scheduler.rs:389,394` (`futex_wait`, `:387`) | a futex word | caller's | park on the bucket's completion |
-| P12 | `scheduler.rs:450,455` (`retire_task`, `:422`) | a task's release | **50 ms re-poll + 1 s panic** | park on the release completion **carrying `Tripwire(1 s)` as its own deadline** — the panic is only reachable through the re-poll today, so deleting both parks forever (§3.2). §7.3 re-derives the 1 s: it now bounds an unwind |
+| P12 | `scheduler.rs:450,455` (`retire_task`, `:422`) | a task's release | **50 ms re-poll + 1 s panic** | **landed at C3+C4, and not in the shape this row prescribed** — the two columns to the left are the `71a0559` snapshot and the citations here are current. `retire_task` (`scheduler.rs:559`) arms on the victim's watch and parks in `completion::wait_uncancellable` (`scheduler.rs:675`); the 50 ms re-poll survives as `RECHECK`, a `Cadence` (`scheduler.rs:581`), and the bound is `GIVE_UP`, a `Tripwire` of **10 s** (`scheduler.rs:650`) evaluated at the loop top (`:668`). "Carrying `Tripwire(1 s)` as its own deadline" is struck on both counts, the deadline and the number (§3.2, §7.3) |
 | P13 | `log/console.rs:461,478` | a committed log record | none | `klogd`'s park becomes an `Inbox` park (§11) — **and `discard_pending()` at `:441` stays in front of the arm**, because a console-less machine must arm too (§5.3a) |
 | P14 | `log/storm.rs:149,150` | nothing, ever | none | a log actuator thread that parks forever rather than exit; it parks on `park_lot()`, so the conversion must carry it or `park_lot` survives |
 | P15 | `log/nested.rs:81,82` | nothing, ever | none | as P14 |
@@ -470,12 +481,19 @@ plain register-then-read-then-park and `futex_wake` (`:400`) is one line
 delegating to `waitqs::wake_n`. The row is now only the fold onto the bucket's
 completion.
 
-**P5's and P12's numbers are exactly what they were**, which is worth saying
-because everything around them moved: the 10 ms is
-`ReadBlock::Keyboard(nanos_since_boot() + 10_000_000)` (`:1042`) consumed at
-`:1100` on `waitqs::KEYBOARD`, and P12's are `const RECHECK_NS: u64 =
-50_000_000` (`scheduler.rs:441`) with `give_up = now + 1_000_000_000` (`:442`)
-and the panic at `:445`.
+**P5's and P12's numbers were exactly what they were at the re-run**, which was
+worth saying because everything around them moved — and one of the two has since
+stopped being true, which is worth saying louder. P5's 10 ms survived C1 and C3
+with its value intact and its kind attached: `CONSOLE_REPOLL`, a `Cadence`
+(`arch/syscall.rs:1075`, the duration at `:1076`), consumed at `:1079` and parked
+at `:1169` on `waitqs::KEYBOARD_WATCH` (`sched/waitqs.rs:31`) with
+`keyboard::has_data` as the readiness — so §3.2's finding is intact too, because
+that is still the wrong device for a serial console and the `Cadence`'s own text
+now says the rate *is* the whole of the wake. **P12's number is not what it
+was.** The `RECHECK_NS`/`give_up` pair this paragraph recorded at `71a0559`
+(50 ms and 1 s) is now `RECHECK` at 50 ms (`scheduler.rs:581`) and `GIVE_UP` at
+**10 s** (`:650`) — re-derived twice at C3+C4, the second time because the first
+sum was below its own terms. §7.3 carries the discharge.
 
 ### 4.2 Class D — a CPU waits for a device on a thread's behalf. Four spins deleted.
 
@@ -1244,7 +1262,7 @@ if let Some(entry) = self.parked.remove(&key) {
   `Claim::Lost`, the in-flight `Msg::Wake` lands on `handle_wake` whose
   `parked.remove` now returns `None` and no-ops (`cpu.rs:528-534`), and the task
   ends up in **no container at all**: never runnable, never reaped, and
-  `retire_task` panics at 1 s. The correct shape is
+  `retire_task` panics when its tripwire expires. The correct shape is
   `parked.get_mut` → `claim_wake` → `Claim::Parked ⇒ wake + place`,
   `Claim::Lost ⇒ leave it, the Wake is in flight`.
 - **(d) "ready: leave it alone" is a strict no-op, and it also deletes an
@@ -1293,9 +1311,19 @@ both still exact:**
   (`driver.rs:38`). The new type needs a different name — `completion::Cancelled`
   in its own module, referred to qualified.
 
-### 7.2a It contradicts the scheduler's own law, and that must be amended in writing
+### 7.2a It contradicts the scheduler's own law, and that must be amended in writing — **discharged by the C3+C4 amendment**
 
-`specs/scheduler-core-spec.md:32` states as **invariant 7**:
+**Amended 2026-08-16 at `beb4dde`, and this section is kept because the
+contradiction is the evidence that forced the amendment.**
+`specs/scheduler-core-spec.md`'s invariant 7 (`:32`) now says a killed task "is
+dispatched exactly as far as its own unwind"; its release clause states a derived
+bound in place of "one pass … and never waits on a timer"; and the failure
+table's transit row (`:211`) has the receiving CPU adopt the task and dispatch it
+so it can unwind. **That spec is the normative statement of all three, and this
+document does not restate them.**
+
+The struck form, quoted because it was load-bearing — "never dispatched again" is
+what let a killed task be reaped where it lay:
 
 > **A killed task is never migrated and never dispatched again.** The kill takes
 > effect wherever the task is; release completes within one pass of the CPU
@@ -1303,73 +1331,134 @@ both still exact:**
 > never waits on a timer.
 
 §7.2 requires a killed task to be **dispatched again, on its own stack**, and
-requires release to wait for an unwind that may itself park on a device. The same
-spec's failure table (`:102`) says "Task killed while in transit between CPUs |
-The receiving CPU observes the kill and releases the task; **no dispatch**".
+requires release to wait for an unwind that may itself park on a device; the
+failure table's transit row said in as many words "**no dispatch**". Neither
+sentence survived this design, and the branch may not land a tree that
+contradicts its own law — which is why the amendment was part of the chunk and
+not a follow-up.
 
-**Neither sentence survives this design, and the branch may not land a tree that
-contradicts its own law.** C3+C4 amends `scheduler-core-spec.md` invariant 7 and
-its release-promptness clause explicitly, in the same chunk, with the amended
-form saying what replaces "never dispatched": a killed task is dispatched exactly
-as far as its own unwind, and release completes when the unwind does. The failure
-table's transit row is amended with it.
+**And the sim's I14 is where that amendment gets teeth or loses them.** It did
+not lose them. `check_retires` (`toyos-sched/sim/src/invariants.rs:311`, its
+statement of both halves at `:290-310`) still checks that **a killed task is
+never migrated** — re-argued in terms of where the unwind may *start* rather than
+where the reap may happen, which is the same check — and `retire_latency_bound`
+(`:101-107`) gained exactly the terms the old sum could not survive: a second
+`QUANTUM_NS`, because a pass cannot free the stack it is standing on, and
+`(1 + peers) × UNWIND_NS × rt_deferral_stretch()` (`:124`), which is the
+real-time band's bounded share of the same CPU. It is read on the **wall
+clock** — the one `retire_task`'s own tripwire reads — and `Killed`'s doc
+(`toyos-sched/sim/src/vm.rs:143-169`) records why the intermediate form that
+subtracted RT service out was struck: a model measuring the wait on a clock the
+kernel cannot read is a model that cannot see the panic, and the unbounded
+quantity that form named was the defect the panic was reachable through. The
+corpus trace
+`toyos-sched/sim/corpus/old_migrate_kept_the_corpse_i14.trace` and its scenario
+(`toyos-sched/sim/src/scenarios.rs:215`) are untouched, and
+`old_rt_starved_the_corpse` (`:286`) joined them as a tenth negative gate, for
+the other direction. Root `CLAUDE.md`'s rule held: the bound grew and the
+controls did not shrink.
 
-**And the sim's I14 is where that amendment gets teeth or loses them.**
-`toyos-sched/sim/src/invariants.rs:202-215` hard-codes today's model in two
-halves — "**A killed task is never migrated**", and "a retire completes within
-`retire_latency_bound`", which is `QUANTUM_NS + IPI_LATENCY_NS +
-max_kernel_section + 2 * RUN_CHUNK_NS` (`:43-45`). That bound cannot survive a
-retire that waits for a full kernel unwind and a teardown. The corpus trace
-`toyos-sched/sim/corpus/old_migrate_kept_the_corpse_i14.trace` is the negative
-gate that proves I14 has teeth, and root `CLAUDE.md` forbids weakening a negative
-gate to make a change pass. **C3+C4 owes a written re-derivation of I14's bound
-and of what "never dispatched" now means, with the negative control still
-red.**
+### 7.3 This is a change to `toyos-sched`'s retire handshake, and §5.5 said it was not — the bound it owed is **discharged by the C4 re-derivation**
 
-### 7.3 This is a change to `toyos-sched`'s retire handshake, and §5.5 said it was not
+**Discharged 2026-08-16 — `beb4dde` wrote it down, `48d2a4f` landed the code.
+The bound is `kernel/src/scheduler.rs`'s `GIVE_UP` (`:650`), it is a `Tripwire`
+of 10 s, and it is derived term by term against `released()` at the site.** This
+section is kept because the question is what that derivation had to answer, and
+because a discharged obligation that is simply deleted is one the next reader
+re-opens — §11.4's rule, applied a second time. The second bullet records the
+answer beside the question it was written as.
 
 §5.5's "the one change inside `toyos-sched` is §7's, and it is a change to
 `Commit::Killed`'s *disposition*, not to the handshake" is **false**, and the
 correction is not cosmetic. Rewriting the two reaping arms changes the retire
-protocol's own termination argument (`retire.rs`'s module note: "whichever CPU
-ends up owning the task converts it to a dead task on arrival"), because a retire
-no longer converts anything on arrival — it schedules the victim and waits.
+protocol's own termination argument: `retire.rs`'s module note used to read
+"whichever CPU ends up owning the task converts it to a dead task on arrival",
+and that header now carries the sentence as **struck**, with the reason
+(`toyos-sched/src/retire.rs:11-15`) — a retire no longer converts anything on
+arrival, it schedules the victim and waits.
 
 Consequences the implementer owns:
 
 - **`toyos-sched` needs its own host tests for the new arms**, alongside
-  `retire.rs`'s five existing ones (`retire.rs:150,163,176,194,204`), and the
-  cancel loom model (§16.1) must cover retire-of-a-parked-task, not only
-  kill-racing-a-commit. **`cpu.rs` has no `#[cfg(test)]` module at all**, so
-  `handle_retire`'s and `pick`'s arms have *zero* host coverage today: this is
-  not an addition to existing coverage, it is the first coverage those arms will
-  ever have. `cargo test -p toyos-sched --lib` is 41 passing tests and none of
-  them is in `cpu.rs`.
+  `retire.rs`'s own (`retire.rs:175,189,201,240,265,275`), and the cancel loom
+  model (§16.1) must cover retire-of-a-parked-task, not only kill-racing-a-commit.
+  **`cpu.rs` had no `#[cfg(test)]` module at all** when this was written, so
+  `handle_retire`'s and `pick`'s arms had *zero* host coverage: not an addition
+  to existing coverage but the first those arms would ever have. **Both halves
+  are answered.** `cpu.rs` has a test module (`:1575`), and the two directions of
+  the dispatch rule §7.2a amended are gated there by name —
+  `a_killed_task_does_not_starve_a_ready_rt_task` and
+  `a_corpse_is_not_starved_for_ever_by_a_spinning_rt_task`. The loom half is
+  `the_retire_arm_never_loses_a_parked_task_to_a_racing_wake`
+  (`toyos-sched/loom/tests/loom_retire.rs:411`), which is the one model in that
+  file that drives a whole `CpuSched`, beside
+  `a_retire_and_a_wake_never_both_claim_a_parked_task` (`:257`) — and it extended
+  `loom_retire.rs` rather than opening a fifth file, as C3+C4's gate column asks.
 - **The retirer's bound now covers an unwind, not a reap — and it is not the
-  state word it waits on.** `retire_task` is `kernel/src/scheduler.rs:422`, and
-  it loops on `sched.handle.released()` (`:443`), not on the word reaching
-  `Dead`. Its own doc (`:404-420`) rejects the word reading in terms: *"Waiting
-  for the state word to read `Dead` would be too weak: `Dead` is published by the
-  reaping transition, one pass before the release, while the dying CPU still
-  stands on that thread's kernel stack."* The 1 s panic is at `:445`, with
-  `give_up` computed at `:442` and tested at `:444`. **This makes §7.3's own
-  warning stronger than it stated**: the bound covers unwind +
-  `teardown_resources` + `close_all` + every sleep-lock acquire on the way + the
-  release, not merely "the length of a kernel unwind". **C4 must re-derive it
-  against `released()` and say what the new number is measured against**, or the
-  first busy kill panics the machine.
+  state word it waits on. Re-derived against `released()`, and the number is
+  10 s.** `retire_task` is `kernel/src/scheduler.rs:559` and it loops on
+  `sched.handle.released()` (`:667`), not on the word reaching `Dead`. Its own
+  doc (`:535-557`) rejects the word reading in terms: *"Waiting for the state
+  word to read `Dead` would be too weak … `Dead` is published by the victim's own
+  `dispose_exit`, and the payload it leaves as that CPU's zombie is freed by the
+  **next** pass, because a pass cannot free the stack it is standing on."* — and
+  this document previously quoted that doc's *pre-§7.2* wording, "published by
+  the reaping transition, one pass before the release", which named the mechanism
+  §7.2 deleted. The hop is the same hop; only what performs it moved. `GIVE_UP`
+  is at `:650-654`, computed into `give_up` at `:655`, tested at `:668` and
+  panicking at `:669`. The warning this bullet made is intact and is what the
+  number had to price: unwind + `teardown_resources` + `close_all` + every
+  sleep-lock acquire on the way + the release, not merely "the length of a kernel
+  unwind".
+
+  **The derivation lives at the site and is deliberately not restated here** — in
+  outline, 8 s of four `sched::driver::pass` prologues, each paying xHCI's own
+  `USB_TIMEOUT_NS` of 2 s; 20 ms of two quanta; and 990 ms for the unwind, priced
+  **as a stated estimate** at one quantum of the victim's own CPU time,
+  multiplied by the real-time band's derived stretch of 11 and by `1 + peers`
+  with `peers` priced at 8. 9.01 s of terms under a 10 s tripwire, 990 ms of
+  margin.
+
+  **What made the real-time factor finite is not this document's to state
+  either.** It is bounded deferral: `specs/scheduler-core-spec.md` §3 and
+  invariant 7 both carry it — `toyos_sched::cpu::DYING_AGE_NS` = one quantum and
+  `DYING_CHUNK_NS` = 1 ms, so a corpse the band has deferred for one age window
+  is dispatched ahead of it for one chunk, and 11 is the ratio that follows.
+  That spec is where a reader goes for the rule; this one only spends the factor.
+
+  **The struck numbers were 1 s and then 5 s, and they failed differently.** The
+  1 s fired on the owner's T14 because it priced no xHCI pass prologue at all —
+  it was measuring the USB bus. The 5 s priced two prologues where the chain has
+  four, and priced real-time precedence at nothing, on the grounds that a machine
+  spending this tripwire on RT service is a machine whose RT workload is the
+  fault; that was not a derivation, it was the reason the tripwire was reachable
+  from one spinning `Rights::RT` thread.
+
+  **And one term is filed rather than claimed away.** `peers` is workload-shaped
+  and the tripwire is a constant, so past about nine simultaneous teardowns on
+  one CPU the derivation outgrows its own number:
+  `specs/issues/kernel/retire-tripwire-is-not-queue-shaped.md`, open. The
+  dominant term is a second filed defect —
+  `specs/issues/kernel/scheduler-pass-blocks-in-xhci.md`, which says in terms
+  that "`retire_task`'s bound is measuring the USB bus" — so closing that issue
+  takes 8 s of this number with it. **C7 owes the constant another look**: a
+  sleep lock parked on a device puts a fifth `USB_TIMEOUT_NS` inside the unwind.
 - **The reap that satisfies today's bound is not on the retirer's CPU.**
-  `retire::post` → `post_retire` targets `home_of(shared.state())`
-  (`toyos-sched/src/retire.rs:87-97`) and kicks it with `Urgency::Preempt`
-  (`:79`); the retirer then parks until the *victim's* CPU has run a pass and
-  `Hw::release` has fired. "Effectively instant" is already an IPI plus a remote
-  pass plus a release — which is exactly what `retire_latency_bound` prices. The
-  argument that the new bound is a large multiple of the old still stands; the
-  baseline is not zero and this document should not say it is.
-- `dispose_exit` at a park is deleted; the only remaining disposition that exits
-  is the one a thread chooses (`driver.rs:370`), which is the sole other caller.
-  Confirmed by grep: exactly two `dispose_exit` call sites in the whole kernel
-  (`driver.rs:370`, `:482`) and two `dispose_none` (`:368`, `:477`).
+  `retire::post` → `post_retire` (`toyos-sched/src/retire.rs:74`) targets
+  `home_of(shared.state())` (`:80`, the function at `:98`) and kicks it with
+  `Urgency::Preempt` (`:89`); the retirer then parks until the *victim's* CPU has
+  run a pass and `Hw::release` has fired (`kernel/src/hw.rs:217`, which is the
+  one caller of `sched/payload.rs:184`'s `publish_released`). "Effectively
+  instant" is already an IPI plus a remote pass plus a release — which is exactly
+  what `retire_latency_bound` prices. The argument that the new bound is a large
+  multiple of the old still stands; the baseline is not zero and this document
+  should not say it is.
+- `dispose_exit` at a park is deleted, **and the prediction held**: the only
+  remaining disposition that exits is the one a thread chooses
+  (`sched/driver.rs:370`). Confirmed by grep — **one** `dispose_exit` call site
+  in the whole kernel where there were two, and three `dispose_none`
+  (`driver.rs:368`, `:484`, `:492`), the last being `Commit::Killed`'s inverted
+  arm.
 
 ### 7.4 `Cancelled` must be consumed, not sticky — or teardown panics
 
@@ -3090,9 +3179,9 @@ obligations on this one.
 | A post races a park | Invariant W: the parker's recheck observes the record | self-wake, retry — structural |
 | A kill races a park | `Cancelled`; the task returns and unwinds by returning | dies at the syscall boundary |
 | A killed task was **already parked** holding a sleep lock | `handle_retire` makes it runnable instead of reaping it (§7.2); it observes the kill at its next `wait` and unwinds | the lock is released by the guard's own `Drop` |
-| A killed task was **ready** with a guard on its stack | **not "left alone"**: `SchedPass::pick` reaps a killed ready task at the head of every pick (`cpu.rs:926`) and `ReadyTask::dispatch` is reachable only past that check, so §7.2 must rewrite that arm too | as above, once §7.2's four changes land |
-| A cancelled thread's teardown must take a sleep lock | **unresolved, and §7.4 says why**: the kill bit is sticky and `WaitTicket::commit` refuses to park a killed task before anything else (`waitq.rs:383`), so a killed thread cannot park at all — including in teardown. One of §7.4's three shapes must be chosen | **owed by C3+C4**, not "ordinary acquire" |
-| The victim does not reach **release** inside the retirer's 1 s | `retire_task`'s `Tripwire` panics. It waits on `handle.released()` and not on the word reaching `Dead` (`scheduler.rs:443`, and its doc says why), so what it now bounds is unwind + teardown + every sleep-lock acquire on the way + the release | C4 re-derives the number against `released()` (§7.3) |
+| A killed task was **ready** with a guard on its stack | **not "left alone", and no longer reaped either**: `handle_retire` moves it out of the fair queue into that CPU's dying list (`cpu.rs:731-736`) and `SchedPass::pick` dispatches it from there (`cpu.rs:1228`) — ahead of the fair queue always, ahead of the real-time band once it has aged. The reap at the head of every pick that this row was written against is gone | as above; §7.2's four changes landed at C3+C4 |
+| A cancelled thread's teardown must take a sleep lock | **resolved at C3+C4, by §7.4's third shape.** The kill bit stays sticky and `WaitTicket::commit` still refuses to park a killed task on an ordinary ticket, so the *ticket* says whether the kill is its answer: `WaitQueue::prepare_wait_uncancellable` (`waitq.rs:166`) mints one carrying `Cancel::Ignores` (`:170`, the variant at `:345`) and `commit()` consults it rather than the task | one caller today — `completion::wait_uncancellable` (`kernel/src/completion/mod.rs:411`), for `retire_task`'s own wait. C5's `SleepLock` is where teardown's acquires join it (§7.4) |
+| The victim does not reach **release** inside the retirer's tripwire | `retire_task`'s `Tripwire` panics. It waits on `handle.released()` and not on the word reaching `Dead` (`scheduler.rs:667`, and its doc says why), so what it bounds is unwind + teardown + every sleep-lock acquire on the way + the release | **discharged**: `GIVE_UP` is **10 s**, derived against `released()` at `scheduler.rs:650`. The 1 s this row used to name priced no xHCI pass prologue at all, and the 5 s that replaced it priced two where the chain has four (§7.3); the residual `peers` term is filed, not claimed away |
 | A device never answers | the thread parks forever; the CPU is free | Ctrl+Alt+D names the task and the subject; disconnect or kill cancels it |
 | `/bin/logd` parks on a dead stick | with no bound no error is produced, so logd's own give-up policy (log §5.4) never fires and `/log` stops with no line saying why. **The console is unaffected** — `klogd` drains it and has no disk in it (log §4.1), so the T14's total-logging-loss case is gone | **still unresolved until §12.3's choice is made.** Unlike `iod`, logd is killable, so init is a second line; a `Tripwire`/`Budget` is the first. `kernel_log_file` is what reds |
 | `iod` parks on a dead stick | **every** write-back in the machine stops — `SYS_FSYNC`, deferred close flushes, page-cache eviction — and nothing can kill it | **still unresolved until §12.3's choice is made**, and this is the row with no second line at all |
