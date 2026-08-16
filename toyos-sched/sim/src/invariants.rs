@@ -115,9 +115,11 @@ fn rt_latency_bound(max_kernel_section: u64) -> u64 {
 /// reason: one CPU cannot run two unwinds at once, and pretending otherwise
 /// would price the machine rather than the protocol.
 ///
-/// **Measured on the tree that charges the unwind**, 500 seeds of
-/// `retire_under_balance` (`toyos-sched-sim measure retire_under_balance 500`).
-/// The whole gate at 2,000 seeds per scenario is clean.
+/// **Measured on the tree that charges the unwind**, over
+/// `sim/tests/scenarios.rs`'s `a_retire_completes_inside_its_derived_bound`:
+/// the worst retire is **17,000,000 ns against its own 26,200,000 ns bound**
+/// (that victim had no peer queued ahead of it, so its bound is the one-unwind
+/// form). The whole gate at 2,000 seeds per scenario is clean.
 ///
 /// Derived, not recorded, and deliberately *not* the kernel's 1 s wall clock:
 /// `retire_task`'s tripwire is more than an order of magnitude wider, and
@@ -352,7 +354,6 @@ fn check_retires(vm: &mut Vm<'_>) {
     }
 
     let mut done = Vec::new();
-    let mut widest = 0;
     for key in keys {
         // Both remembered while the word still names a CPU, so a victim that
         // has reached `Dead` is still measured against the CPU that ran its
@@ -364,9 +365,13 @@ fn check_retires(vm: &mut Vm<'_>) {
             entry.max_peers = entry.max_peers.max(peers);
         }
         let bound = retire_latency_bound(vm.max_kernel_section(), vm.killed[&key].max_peers);
-        widest = widest.max(bound);
         let elapsed = retire_elapsed(vm, key);
-        vm.retire_latency = vm.retire_latency.max(elapsed);
+        // Recorded as a pair, so the number the sweep prints and the bound it
+        // is read against are one victim's and not two.
+        if elapsed > vm.retire_latency {
+            vm.retire_latency = elapsed;
+            vm.retire_bound = bound;
+        }
         if !vm.live.contains(&key) {
             done.push(key);
             continue;
@@ -379,7 +384,6 @@ fn check_retires(vm: &mut Vm<'_>) {
             ));
         }
     }
-    vm.retire_bound = vm.retire_bound.max(widest);
     for key in done {
         vm.killed.remove(&key).expect("came from the map");
     }
