@@ -16,8 +16,8 @@
 //! (`i8042_quarantine`) straddling it run to run for the classification's own
 //! reason — and four for [`Why::RidesTheBootOf`], riding
 //! `metal_sim_compositor`'s shared boot. Between them they account for
-//! 1,755.2 s of the 2,102.5 s the committed profile still prices (the two
-//! labels below its `UNMEASURED_MS` markers are the rest of it), and none is
+//! 1,755.2 s of the 2,096.5 s the committed profile still prices across 315
+//! labels (its other two carry `UNMEASURED_MS` markers), and none is
 //! gated per pull request. `guards` on every row says what stopped being gated,
 //! because a run that quietly does less is the whole failure mode here —
 //! `specs/assessments/test-cost-audit.md` §7 is the long form.

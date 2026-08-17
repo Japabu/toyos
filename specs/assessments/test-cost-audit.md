@@ -2030,8 +2030,9 @@ the runs' own profile:
 | `swiss_german_layout` | 11,079 ms | 3,877 ms | **−7,202** |
 | **total** | 96,779 ms | 18,108 ms | **−78,671** |
 
-Against the committed CI profile's 2,150.4 s of measured test time, the two
-spans that are pure host wall clock — `xhci_msi_only`'s 30 s and
+Against the committed CI profile, which prices 2,096.5 s across the 315 labels
+that are not the two `UNMEASURED_MS` markers below, the two spans that are pure
+host wall clock — `xhci_msi_only`'s 30 s and
 `swiss_german_layout`'s 8 s — come off a KVM shard at exactly the same size,
 because a fallback deadline is a number of seconds and not a quantity of guest
 work. The other two are drains bounded by the same kind of number and behave the
