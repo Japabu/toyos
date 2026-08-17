@@ -59,6 +59,16 @@ and it is a real finding about the scheduler. The row is scoped to
 `Instrument::DevHostAlone` precisely so that a CI red under this name cannot be
 silenced by it.
 
+**That has now happened, so read the two sentences above as spent.** Invariant P
+fired on a KVM shard at 200569 ns — run 31946183485, job 95162423932,
+`guest (8)`, 2026-08-16 — and
+`specs/issues/kernel/the-check-build-guest-stopped-answering-on-kvm-twice.md`
+carries it. Nothing in *this* file's reasoning about the dev host is disturbed:
+1.68 ms in `driver::idle_loop` before userland and 200569 ns in `timer_handler`
+during `sched_stress` are three orders of magnitude and two call sites apart. What
+is disturbed is the sentence "a scheduler pass that fits 200 µs natively"; on the
+one native measurement there is, it did not.
+
 The related gap in the measured *window* — that the budget cannot see the xHCI
 prologue at all — is `specs/issues/kernel/scheduler-pass-blocks-in-xhci.md` and
 is untouched by this. That issue named two halves wanting fixing together, "the
