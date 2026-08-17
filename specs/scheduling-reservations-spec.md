@@ -1857,10 +1857,15 @@ design that dissolved it.
   (`audio-subsystem-spec.md` §2). The relative phase is therefore arbitrary, and
   §4.1 derives the wake-to-mix bound at phase zero and states what the other
   phases cost — a latency of up to one pipeline slot, absorbed, with throughput
-  untouched. **Whether a second phase origin should exist for device-driven
-  reservations is a design question for the owner**, not one this document
-  settles: a per-client grid anchor is a new mechanism, and inventing one to
-  rescue a derivation is how each of the three superseded attempts began.
+  untouched. **Settled 2026-08-17: one anchor, and a measurement decides whether
+  a second is ever owed.** A per-client grid anchor is a new mechanism, and
+  inventing one to rescue a derivation is how each of the three superseded
+  attempts began; what it would buy back is at most one slot of latency on a
+  pipeline that carries eight, with no throughput and no dropout at stake. R8
+  measures wake-to-submit on the four gate-A configurations, where an effect this
+  size is visible if it is real — so this is answered by that measurement or it
+  is not answered at all, and until then the phase origin stays where §1.6 puts
+  it.
 
 - **Real-time wake placement moves a thread across CPUs.**
   `scheduler-core-spec.md` §5's placement rule moves a woken real-time task to a
