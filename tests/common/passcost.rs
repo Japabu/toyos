@@ -24,9 +24,9 @@
 //! workload that boots this kernel is `sched_check_build`'s, and a whole boot
 //! plus `sched_stress` takes about 150 passes per CPU — a quantum is 10 ms, so
 //! nearly every pass is a block or a wake rather than a tick. Measured on the
-//! dev host, 2026-08-17: 168, 149, 152, 152, 142, 139, 134 and 129 over eight
-//! CPU-runs. A 90th percentile over 150 samples has fifteen above it; a 99th has
-//! one and a half, which is its own largest sample wearing a percentile's name.
+//! dev host, 2026-08-17, eighteen CPU-runs: 121 to 346, median around 148. A
+//! 90th percentile over 150 samples has fifteen above it; a 99th has one and a
+//! half, which is its own largest sample wearing a percentile's name.
 //!
 //! **The pair that says this works is on the dev host and not in a fixture.**
 //! Alone on a quiet machine the guest reports `p50 < 16384 ns, p90 < 131072 ns,
@@ -41,8 +41,12 @@ use toyos_sched::cpu::{PassCostReport, MAX_PASS_NS};
 /// Samples a report must carry before its quantiles mean anything: a 90th
 /// percentile over this many has ten above it.
 ///
-/// The measured runs above clear it by half. A report below it is refused
-/// rather than judged — a percentile computed from forty samples is a sample.
+/// **The margin is 21 %, and it is stated rather than assumed.** Eighteen
+/// CPU-runs on the dev host, 2026-08-17, ranged from 121 to 346 passes with a
+/// median around 148; 121 is the closest any of them came to this floor. If a
+/// run ever falls below it the gate reds *saying so* — a report that cannot
+/// answer must not answer, and a percentile computed from forty samples is a
+/// sample.
 pub const MIN_SAMPLES: u64 = 100;
 
 /// The last report each CPU published in `capture`, ordered by CPU.
