@@ -124,6 +124,7 @@ abuse_shared_grant 27
 abuse_spawn_argv 16
 abuse_tls_alloc 45
 allocator_stress 673
+alone_line_reports_the_alone_run 0
 audio_idle_suspend 1011
 audio_tone (smp=1) 10790
 audio_tone (smp=8) 11144

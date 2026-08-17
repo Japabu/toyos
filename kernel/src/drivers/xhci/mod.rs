@@ -215,6 +215,34 @@ impl core::fmt::Display for Answer {
     }
 }
 
+/// Which device a line is about: the controller, and the slot on it.
+///
+/// **A slot id is the controller's own numbering, and a machine has more than
+/// one controller.** `Profile::MetalHotplug` boots the disk as slot 1 on
+/// `00:02.0` and hot-plugs the mouse as slot 1 on `00:03.0`, so a line saying
+/// `slot 1` names two different devices and nothing reading the log can tell
+/// which. That is not hypothetical: a harness assertion counting endpoint
+/// recoveries counted the boot disk's as a mouse's on three CI runs
+/// (`specs/issues/hardware/xhci-hid-break-counts-any-endpoint-3.md`), and the
+/// same shape counted the boot stick's transport recovery as the disk under
+/// test's (`…/usb-transport-break-counts-the-boot-sticks-recovery.md`).
+///
+/// So every line the recovery path writes carries this, and `pci` on
+/// [`XhciController`] is the field that makes it available.
+#[derive(Clone, Copy)]
+struct Slot {
+    bus: u8,
+    dev: u8,
+    func: u8,
+    id: u8,
+}
+
+impl core::fmt::Display for Slot {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:02x}:{:02x}.{} slot {}", self.bus, self.dev, self.func, self.id)
+    }
+}
+
 /// Why a slot was given back, which is what decides what goes with it.
 enum AfterSlot {
     /// A port's device has left the bus. Its pool blocks belong to the next
@@ -286,8 +314,8 @@ fn enqueue_control(
 /// The line for an endpoint no sequence of commands takes back to Running.
 /// Two callers — the recovery that waits and the one that is stepped — and the
 /// same endpoint whichever asked.
-fn log_unrecoverable(slot_id: u8, dci: u8, state: EndpointState) {
-    log!("xHCI: slot {slot_id} endpoint {dci} is {state}; nothing short of Configure Endpoint \
+fn log_unrecoverable(slot: Slot, dci: u8, state: EndpointState) {
+    log!("xHCI: {slot} endpoint {dci} is {state}; nothing short of Configure Endpoint \
          takes an endpoint out of that, and this driver does not re-configure a bound device");
 }
 
@@ -916,6 +944,13 @@ impl XhciController {
         self.pool.slice()
     }
 
+    /// This controller's `slot_id`, as a [`Slot`] a log line can name a device
+    /// by. Never construct one of these from a bare slot id: the controller is
+    /// half the identity.
+    fn slot(&self, id: u8) -> Slot {
+        Slot { bus: self.pci.bus, dev: self.pci.dev, func: self.pci.func, id }
+    }
+
     /// Every read of a port register in this driver, so that what the connect
     /// settle sees and what `init_device` acts on cannot disagree.
     fn read_portsc(&self, port_idx: u8) -> Portsc {
@@ -1206,9 +1241,10 @@ impl XhciController {
         // that died still died with the old one. Read and not cleared —
         // acknowledging it is `service_port`'s job, and clearing it here would
         // steal the evidence that runs the teardown.
+        let slot = self.slot(slot_id);
         let portsc = self.read_portsc(port_idx);
         if !portsc.connected() || portsc.connect_changed() {
-            log!("xHCI: USB {kind} on slot {slot_id}: interrupt endpoint {ep_addr:#04x} \
+            log!("xHCI: USB {kind} on {slot}: interrupt endpoint {ep_addr:#04x} \
                  completed with {} as its port went away; leaving it to the disconnect",
                 Completion(code));
             return;
@@ -1217,7 +1253,7 @@ impl XhciController {
         let dev = &mut self.devices[at];
         dev.failures += 1;
         let failures = dev.failures;
-        log!("xHCI: USB {kind} on slot {slot_id}: interrupt endpoint {ep_addr:#04x} (dci {dci}) \
+        log!("xHCI: USB {kind} on {slot}: interrupt endpoint {ep_addr:#04x} (dci {dci}) \
              completed with {}; failure {failures} of {MAX_HID_FAILURES}",
             Completion(code));
 
@@ -1226,11 +1262,11 @@ impl XhciController {
             return;
         }
         let state = self.endpoint_state(block, dci);
-        log!("xHCI: slot {slot_id} endpoint {dci} is {state}, recovering");
+        log!("xHCI: {slot} endpoint {dci} is {state}, recovering");
         match Recovery::begin(state) {
             Ok((seq, act)) => self.step_recovery(slot_id, seq, act),
             Err(NeedsConfigure(state)) => {
-                log_unrecoverable(slot_id, dci, state);
+                log_unrecoverable(slot, dci, state);
                 self.let_go(at, format_args!("endpoint {ep_addr:#04x} could not be restarted"));
             }
         }
@@ -1245,12 +1281,13 @@ impl XhciController {
         let Some(at) = self.devices.iter().position(|d| d.slot_id == slot_id) else {
             return;
         };
+        let slot = self.slot(slot_id);
         let dev = &mut self.devices[at];
         let (dci, ep_addr, ring_at) = (dev.int_ep_dci, dev.ep_addr, dev.block + DEV_INT_RING);
         match act {
             Act::Running => {
                 dev.requeue(&self.db_base);
-                log!("xHCI: slot {slot_id} endpoint {dci} is delivering again");
+                log!("xHCI: {slot} endpoint {dci} is delivering again");
             }
             Act::Command(cmd) => {
                 // Copied out and written back rather than borrowed across the
@@ -1292,7 +1329,7 @@ impl XhciController {
             self.step_recovery(slot_id, seq, act);
             return;
         }
-        log!("xHCI: slot {slot_id}: {issued} failed: {}", Answer(outcome));
+        log!("xHCI: {}: {issued} failed: {}", self.slot(slot_id), Answer(outcome));
         if let Some(at) = self.devices.iter().position(|d| d.slot_id == slot_id) {
             self.let_go(at, format_args!("its interrupt endpoint could not be restarted"));
         }
@@ -1314,7 +1351,7 @@ impl XhciController {
             return;
         }
         self.outstanding.cancel();
-        log!("xHCI: slot {slot_id}'s endpoint recovery is abandoned; its port has gone");
+        log!("xHCI: {}'s endpoint recovery is abandoned; its port has gone", self.slot(slot_id));
     }
 
     /// Everything a HID device the driver has given up on leaves behind.
@@ -1332,8 +1369,8 @@ impl XhciController {
     /// here, and `parse_config` gives that device one function.
     fn let_go(&mut self, at: usize, why: core::fmt::Arguments) {
         let mut dev = self.devices.remove(at);
-        log!("xHCI: USB {} on slot {} is being let go — {why}. Unplug it and plug it in again.",
-            dev.kind(), dev.slot_id);
+        log!("xHCI: USB {} on {} is being let go — {why}. Unplug it and plug it in again.",
+            dev.kind(), self.slot(dev.slot_id));
         dev.unbind();
         if let Some(slot) = self.ports[dev.port_idx as usize].take_slot() {
             self.submit_disable_slot(slot.get(), AfterSlot::LetGo);

@@ -708,8 +708,10 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("suspend_detector", Sched::Parallel, Tier::Fast),
     ("suspend_invalidates_a_verdict", Sched::Parallel, Tier::Fast),
     // Same again: whether a red that is a blown liveness guard still reads as
-    // one by the time it reaches the summary.
+    // one by the time it reaches the summary, and whether the `ALONE:` line
+    // under a red is about the run it claims to be about.
     ("stall_is_not_a_verdict", Sched::Parallel, Tier::Fast),
+    ("alone_line_reports_the_alone_run", Sched::Parallel, Tier::Fast),
     // Same: the expected-failure declaration asking whether it still refuses the
     // things it exists to refuse.
     ("expected_failure_verdicts", Sched::Parallel, Tier::Fast),
@@ -8058,6 +8060,7 @@ fn run_machine_test(
         "suspend_detector" => common::clock::self_check(),
         "suspend_invalidates_a_verdict" => suspend_invalidates_a_verdict(),
         "stall_is_not_a_verdict" => stall_is_not_a_verdict(),
+        "alone_line_reports_the_alone_run" => alone_line_reports_the_alone_run(),
         "expected_failure_verdicts" => expected_failure_verdicts(),
         "expected_failure_exit_status" => expected_failure_exit_status(),
         "expected_failure_entries" => expected_failure_entries(),
@@ -10949,6 +10952,160 @@ impl Outcome {
     }
 }
 
+/// The one line of a failure that names it.
+///
+/// A red's `reason` is the assertion's sentence with the whole capture pasted
+/// after it, and the capture differs between any two boots — so the first line
+/// is what "the same failure" can be asked about, and it is what the summary
+/// already prints.
+fn headline(reason: Option<&str>) -> String {
+    reason.unwrap_or("check failed").lines().next().unwrap_or("check failed").to_string()
+}
+
+/// What the isolated re-run of one red is allowed to say about it.
+///
+/// **A red-again arm quotes the alone run's own failure**, and says so when it
+/// is not the failure the wide run found. `red again — the defect is real` used
+/// to be the whole line, and the `failures:` summary beside it always carries
+/// the *wide* run's message: on PR #22's run `31424496450` the wide run failed
+/// `xhci_hid_break`'s endpoint count and the alone re-run failed its pointer
+/// delivery three minutes later, and the job said `red again` over the wide
+/// run's sentence — so an adjudicator read one assertion's evidence for
+/// another's. Two different assertions in one job is not a weaker finding than
+/// one twice; it is a different and larger one, and the line now says which it
+/// was (`specs/issues/hardware/xhci-hid-break-counts-any-endpoint-3.md`).
+///
+/// The green arms are untouched. They are a classification the whole redlist is
+/// written against, and nothing about them was wrong.
+///
+/// Pure, and every input a parameter, so [`alone_line_reports_the_alone_run`]
+/// can stage the divergence rather than wait for CI to produce one.
+fn alone_line(name: &str, wide: &str, shared_the_host: bool, alone: Option<&Outcome>) -> String {
+    let Some(outcome) = alone else {
+        return format!("  ALONE {name}: the lone run reported nothing about it");
+    };
+    match outcome.verdict() {
+        // **Two different findings, and which one it is depends on whether the
+        // first run shared the host** — the parallel phase's width, never the
+        // run's, because the serial tail is one guest at any width. Beside other
+        // guests, a green retry says this one was not, which is a classification
+        // defect.
+        Verdict::Pass(_) | Verdict::Stale(_) if shared_the_host => format!(
+            "  ALONE {name}: GREEN — it fails only beside other guests, so its \
+             Sched::Parallel is wrong. The run stays red on the classification."
+        ),
+        // Alone both times, nothing differed that the harness controls: it
+        // failed once and passed once, which is a *rate* and says nothing about
+        // `Sched`. CI runs one lane per machine, so every one of its retries is
+        // the second kind.
+        Verdict::Pass(_) | Verdict::Stale(_) => format!(
+            "  ALONE {name}: GREEN, and it was alone both times — nothing the harness \
+             controls differed, so it failed once and passed once. That is a rate and \
+             not a classification."
+        ),
+        Verdict::Fail(_) | Verdict::Expected(_) => {
+            let said = headline(outcome.reason.as_deref());
+            if said == wide {
+                format!("  ALONE {name}: red again, the same failure both times — the defect \
+                         is real. {said}")
+            } else {
+                format!(
+                    "  ALONE {name}: red again on a DIFFERENT failure — it failed twice, on two \
+                     assertions, so this is not one defect reproduced and the divergence is \
+                     itself the finding.\n      wide:  {wide}\n      alone: {said}"
+                )
+            }
+        }
+        Verdict::Invalid => format!("  ALONE {name}: the host was suspended during the retry too"),
+    }
+}
+
+/// Whether the `ALONE:` line still reports the run it is a line about.
+///
+/// The staged pair is the one that was mis-reported: a wide failure and an
+/// alone failure that are not the same sentence. A gate rather than a comment
+/// because the defect is invisible from inside a green run — every arm prints
+/// *a* plausible line, and only the quoted text says which run it came from.
+fn alone_line_reports_the_alone_run() -> Result<(), String> {
+    const WIDE: &str = "3 endpoint(s) were found Running after the break, want 2";
+    const OTHER: &str = "input never came back: no pointer event moved by (2560, -1920)";
+    let red = |reason: &str| Outcome {
+        name: "a_test".to_string(),
+        reason: Some(format!("{reason}\n[kernel 2.639 cpu0] a whole capture nobody diffs")),
+        elapsed: Duration::from_secs(9),
+        suspended: Duration::ZERO,
+    };
+    let green = Outcome {
+        name: "a_test".to_string(),
+        reason: None,
+        elapsed: Duration::from_secs(9),
+        suspended: Duration::ZERO,
+    };
+
+    // The two greens, byte for byte what they have always been: the redlist and
+    // every issue file quote these, and a reworded classification would silently
+    // invalidate the record rather than add to it.
+    let wide_green = alone_line("a_test", WIDE, true, Some(&green));
+    if !wide_green.contains(
+        "GREEN — it fails only beside other guests, so its Sched::Parallel is wrong. \
+         The run stays red on the classification.",
+    ) {
+        return Err(format!("the shared-host green arm has changed wording:\n{wide_green}"));
+    }
+    let lone_green = alone_line("a_test", WIDE, false, Some(&green));
+    if !lone_green.contains(
+        "GREEN, and it was alone both times — nothing the harness controls differed, so it \
+         failed once and passed once. That is a rate and not a classification.",
+    ) {
+        return Err(format!("the alone-both-times green arm has changed wording:\n{lone_green}"));
+    }
+    for line in [&wide_green, &lone_green] {
+        if line.contains(WIDE) {
+            return Err(format!("a green quotes the wide run's failure:\n{line}"));
+        }
+    }
+
+    // Red again on the same assertion: still "the defect is real", now with the
+    // sentence the *alone* run produced under it.
+    let same = alone_line("a_test", WIDE, false, Some(&red(WIDE)));
+    if !same.contains("red again, the same failure both times") || !same.contains(WIDE) {
+        return Err(format!("a reproduced failure does not say so, or does not quote it:\n{same}"));
+    }
+    if same.contains("[kernel 2.639") {
+        return Err(format!("the line pasted the whole capture into the summary:\n{same}"));
+    }
+
+    // And the case the old line could not tell apart from it.
+    let diverged = alone_line("a_test", WIDE, false, Some(&red(OTHER)));
+    if !diverged.contains("DIFFERENT failure") {
+        return Err(format!("two different failures read as one reproduced:\n{diverged}"));
+    }
+    for both in [WIDE, OTHER] {
+        if !diverged.contains(both) {
+            return Err(format!("the divergent line drops {both:?}:\n{diverged}"));
+        }
+    }
+    if diverged.find(WIDE) > diverged.find(OTHER) {
+        return Err(format!("the divergent line reads alone-then-wide:\n{diverged}"));
+    }
+
+    // The host stopping during the retry is neither, and a retry that never
+    // reported is not a verdict about anything.
+    let suspended = Outcome {
+        suspended: common::clock::SUSPENDED_AT_LEAST,
+        ..red(OTHER)
+    };
+    let asleep = alone_line("a_test", WIDE, false, Some(&suspended));
+    if !asleep.contains("the host was suspended during the retry too") {
+        return Err(format!("a suspended retry reads as a verdict:\n{asleep}"));
+    }
+    let missing = alone_line("a_test", WIDE, false, None);
+    if !missing.contains("the lone run reported nothing about it") {
+        return Err(format!("a retry that reported nothing reads as a verdict:\n{missing}"));
+    }
+    Ok(())
+}
+
 /// A blown guard stays red, and stops reading as an answer.
 ///
 /// Both halves, because each fails the other's way round. An implementation
@@ -11164,10 +11321,7 @@ impl Tally {
 
     fn record(&mut self, outcome: Outcome) {
         let verdict = outcome.verdict_against(self.expected);
-        let summary = || {
-            let reason = outcome.reason.as_deref().unwrap_or("check failed");
-            reason.lines().next().unwrap_or("check failed").to_string()
-        };
+        let summary = || headline(outcome.reason.as_deref());
         match verdict {
             Verdict::Pass(None) => self.passed += 1,
             Verdict::Pass(Some(entry)) => {
@@ -13038,18 +13192,21 @@ fn main() {
     eprintln!("\nrunning {total} tests\n");
 
     let mut timed: Vec<(String, Duration)> = Vec::new();
-    // Every red, with whether it had the host to itself when it happened. Reds
-    // only: a test the host slept through has no verdict to confirm, and
-    // re-running it would put a second guess beside the first — and an expected
-    // failure has already been answered by its entry, which names the task
-    // rather than asking which of the retry's two answers it was.
-    let mut reds: Vec<(String, bool)> = Vec::new();
+    // Every red, with whether it had the host to itself when it happened and
+    // *what it said* — the third field, because the re-run below has to be able
+    // to answer whether the two runs failed the same way, and by the time it
+    // runs this outcome has been moved into the tally. Reds only: a test the
+    // host slept through has no verdict to confirm, and re-running it would put
+    // a second guess beside the first — and an expected failure has already been
+    // answered by its entry, which names the task rather than asking which of
+    // the retry's two answers it was.
+    let mut reds: Vec<(String, bool, String)> = Vec::new();
     let mut collect = |outcomes: &[Outcome], shared_the_host: bool| {
         reds.extend(
             outcomes
                 .iter()
                 .filter(|o| matches!(o.verdict(), Verdict::Fail(_)))
-                .map(|o| (o.name.clone(), shared_the_host)),
+                .map(|o| (o.name.clone(), shared_the_host, headline(o.reason.as_deref()))),
         );
     };
     if !parallel.is_empty() {
@@ -13081,39 +13238,14 @@ fn main() {
 
     if !reds.is_empty() {
         eprintln!("  --- re-running {} failure(s) alone ---", reds.len());
-        for (name, shared_the_host) in &reds {
+        for (name, shared_the_host, wide) in &reds {
             let Some(task) = retry_task(name, &tests_to_run) else {
                 eprintln!("  ALONE {name}: no way to run it by itself; verdict stands");
                 continue;
             };
             let outcomes = run_phase(vec![task], 1, &bins, &slots);
-            match outcomes.iter().find(|o| &o.name == name).map(Outcome::verdict) {
-                // **Two different findings, and which one it is depends on
-                // whether the first run shared the host** — the parallel
-                // phase's width, never the run's, because the serial tail is
-                // one guest at any width. Beside other guests, a green retry
-                // says this one was not, which is a classification defect.
-                // Alone both times, nothing differed that the harness controls:
-                // it failed once and passed once, which is a *rate* and says
-                // nothing about `Sched`. CI runs one lane per machine, so every
-                // one of its retries is the second kind.
-                Some(Verdict::Pass(_) | Verdict::Stale(_)) if *shared_the_host => eprintln!(
-                    "  ALONE {name}: GREEN — it fails only beside other guests, so its \
-                     Sched::Parallel is wrong. The run stays red on the classification."
-                ),
-                Some(Verdict::Pass(_) | Verdict::Stale(_)) => eprintln!(
-                    "  ALONE {name}: GREEN, and it was alone both times — nothing the harness \
-                     controls differed, so it failed once and passed once. That is a rate and \
-                     not a classification."
-                ),
-                Some(Verdict::Fail(_) | Verdict::Expected(_)) => {
-                    eprintln!("  ALONE {name}: red again — the defect is real.")
-                }
-                Some(Verdict::Invalid) => {
-                    eprintln!("  ALONE {name}: the host was suspended during the retry too")
-                }
-                None => eprintln!("  ALONE {name}: the lone run reported nothing about it"),
-            }
+            let alone = outcomes.iter().find(|o| &o.name == name);
+            eprintln!("{}", alone_line(name, wide, *shared_the_host, alone));
         }
     }
 

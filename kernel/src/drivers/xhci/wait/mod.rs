@@ -204,12 +204,13 @@ impl XhciController {
     /// command [`Recovery`] owes, up to the point where the sequence would
     /// speak to the device.
     fn quiesce_endpoint(&mut self, ep: &mut Restart<'_>) -> Owed {
+        let slot = self.slot(ep.slot_id);
         let state = self.endpoint_state(ep.ctx_block, ep.dci);
-        log!("xHCI: slot {} endpoint {} is {state}, recovering", ep.slot_id, ep.dci);
+        log!("xHCI: {slot} endpoint {} is {state}, recovering", ep.dci);
         let (mut seq, mut act) = match Recovery::begin(state) {
             Ok(begun) => begun,
             Err(NeedsConfigure(state)) => {
-                log_unrecoverable(ep.slot_id, ep.dci, state);
+                log_unrecoverable(slot, ep.dci, state);
                 return Owed::Failed;
             }
         };
@@ -238,8 +239,8 @@ impl XhciController {
         let cleared =
             self.control_transfer(slot_id, ep0_ring, 0x02, 0x01, 0, ep_addr as u16, None, 0);
         if !cleared.done() {
-            log!("xHCI: slot {slot_id} would not clear the halt on endpoint {ep_addr:#04x}: \
-                 {cleared}");
+            log!("xHCI: {} would not clear the halt on endpoint {ep_addr:#04x}: {cleared}",
+                self.slot(slot_id));
             return false;
         }
         true
