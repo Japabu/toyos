@@ -158,3 +158,75 @@ its ready marker, and an empty interrupt during bring-up makes that line untrue
 and so unsaid — the boot then fails on its marker rather than on a verdict.
 Closing that is the other half of the driver's two options above — `init` masks
 the GSI while it polls — and nothing has measured how often it bites.
+
+## 2026-08-17: the driver half did not hold, and why
+
+The retirement above was withdrawn the next day (#107). The driver half claimed
+the report says `nothing decoded` only when something arrived to decode. **It did
+not, and the counters said so without a boot**: the ISR added to `IRQS` on entry
+and to `EMPTY_IRQS` only after the drain came back empty, with the whole
+port-drain loop between them, while `report_health` computed
+`carried = IRQS - EMPTY_IRQS` and printed whenever `carried > 0`. A reader
+landing inside that window read `carried = 1` for an interrupt that carried
+nothing. Counting an empty interrupt *apart* fixes nothing if the two counts are
+still read at different instants.
+
+Independently observed while that was being written: 2 of 6 full suites on
+2026-08-17, `1 interrupts and 0 bytes … first seen at 449ms`, on a tree carrying
+the fix.
+
+**The lesson is about the shape of the claim, not this driver.** "Counted apart"
+is a statement about a settled pair; the report is made against an unsettled one.
+A fix that adds a second counter has to say at which instants the two agree, and
+that one never did.
+
+## What actually fixed it, 2026-08-17
+
+`kernel/src/drivers/i8042/tally.rs`: the pair is **one `u64` the ISR writes once,
+after the burst** — low half the interrupts that put a byte in the ring, high
+half those that found none — and `Counts` can only be built by `Tally::read`,
+which is one load. There is no subtraction left to be wrong and no instant at
+which the halves disagree about the same interrupt. Narrowing the window was
+never available as a fix, because the report is a statement about a completed
+observation and the ISR had not finished making it.
+
+Moving the write to the end of the ISR closed a second producer of the identical
+line, and it had nothing to do with the empty case: `IRQS` moved on the way *in*,
+so a reader between the pin asserting and the first `push_isr` held a count of
+arrived bytes with no byte anywhere. That is what `1 interrupts and 0 bytes …
+first seen at 418ms` on `cpu1` actually was — the reporting CPU is an AP, and
+`i8042::init` runs on the BSP before `smp::boot_aps`, so no reader can be inside
+the bring-up ISR at all. The empty interrupt is the *occasion* named by this
+entry's heading; the entry-time increment is what let any first interrupt print
+the line.
+
+A third went with them, at the other end of the same byte's life: `RX_BYTES` was
+added up after the drain loop, so a byte popped from the ring and still in front
+of a decoder was in neither `has_bytes()` nor `RX_BYTES` for the length of its
+own decode. `pop` counts it before releasing the slot, so the mute verdict's
+`has_bytes` guard means what it says. All three are the same statement — *the
+report never claims a verdict about bytes that did not arrive* — so they landed
+together rather than as three entries.
+
+Between them, `N interrupts and 0 bytes, nothing decoded` is unprintable:
+`carried > 0` means bytes reached the ring, and a byte that reached the ring is
+in it or in `RX_BYTES` at every instant. The one exception names itself, a ring
+overflow, which `drain` logs on its own line.
+
+**The gate is `kernel-loom/tests/i8042_tally.rs`, and it was measured in both
+directions rather than argued.** With the two counters put back in `tally.rs`
+both properties red — `Counts { carried: 1, empty: 0 }` for an interrupt that
+carried nothing, and a count of an arrived byte with the byte unpublished — and
+with the word restored all three models pass. A third model asserts the
+transliterated old shape really *is* read torn, collected across loom's
+executions, so the day loom stops exploring that window the file reds instead of
+passing vacuously. The test half — anchoring on `===I8042_READY===` — was left
+exactly as it landed; nothing found it wrong.
+
+What that does **not** reach, and neither does anything here: the mute verdict
+said too early about a sequence still arriving
+(`specs/issues/kernel/the-i8042-mute-verdict-cannot-revise-a-line-it-said-too-early.md`),
+which is the CI row under this test's name and a line with a non-zero byte count.
+The `i8042_health` marker above is also untouched — an empty bring-up interrupt
+still happens and still makes `the pin has never asserted` untrue — which is why
+this entry stays open.
