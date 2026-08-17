@@ -45,6 +45,13 @@ use window::Translator;
 
 const EVENT_SIZE: usize = std::mem::size_of::<RawKeyEvent>();
 
+/// The host's end-of-run marker for `layout`: the HID usage for the End key.
+/// The same sentinel and the same reason as `i8042_keyboard.rs` — nothing
+/// `swiss_german_layout` injects presses End, so its release is unambiguous,
+/// and without one the mode below spends its whole fallback deadline on a
+/// keyboard that has nothing left to say.
+const SENTINEL: u8 = 0x4D;
+
 const TOKEN_KEYBOARD: u64 = 1;
 const TOKEN_LISTEN: u64 = 2;
 const TOKEN_CLIENT: u64 = 3;
@@ -154,12 +161,22 @@ fn layout(mut surface: Surface, connector: &Connector) {
     surface.drain_notices();
     println!("===SWISS_READY===");
 
+    // A liveness ceiling, not the measurement: the host's sequence ends on
+    // [`SENTINEL`]'s release, so the normal path leaves as soon as the last
+    // transition it typed has been reported, and only a run that lost the
+    // sentinel pays this. It used to be the whole run — eight seconds of an
+    // idle keyboard on every green `swiss_german_layout`, against half a second
+    // of injection.
     let deadline = Instant::now() + Duration::from_secs(8);
     let mut seen = 0;
-    while Instant::now() < deadline {
+    let mut ended = false;
+    while !ended && Instant::now() < deadline {
         surface.drain_keyboard(|key, text| {
             println!("kev usage=0x{:02x} mods=0x{:02x} tr={:?}", key.keycode, key.modifiers, text);
             seen += 1;
+            if key.keycode == SENTINEL && !key.pressed() {
+                ended = true;
+            }
         });
         std::thread::sleep(Duration::from_millis(5));
     }

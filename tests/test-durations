@@ -279,7 +279,7 @@ std_unwind_so 34
 suite_split 2
 suspend_detector 20
 suspend_invalidates_a_verdict 0
-swiss_german_layout 12645
+swiss_german_layout 18446744073709551615
 syscall_cost 84
 tlb_shootdown_waits 98
 toybox_cp_volume 18735
@@ -307,7 +307,7 @@ xhci_full_speed_device 4795
 xhci_hid_break 61704
 xhci_hotplug 7711
 xhci_many_devices 5421
-xhci_msi_only 35223
+xhci_msi_only 18446744073709551615
 xhci_no_interrupt 4560
 xhci_portsc_rw1c 6386
 xhci_second_controller 4985
