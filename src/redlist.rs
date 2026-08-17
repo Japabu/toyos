@@ -1329,7 +1329,7 @@ pub const KNOWN_RED: &[Red] = &[
                anchoring on `===I8042_READY===` — holds is a separate question and is not decided \
                here. \
                \n\n**The withdrawal above went on to say the torn read `prints this row's line \
-               exactly`, and that clause was wrong** (corrected 2026-08-17, PR #112). The torn \
+               exactly`, and that clause was wrong** (corrected 2026-08-17, PR #114). The torn \
                read is real and is fixed, but it is not what produced this line, and the boot \
                order says so: the reporting CPU is `cpu1`, an AP, and `i8042::init` runs on the \
                BSP *before* `smp::boot_aps` — so at the bring-up interrupt this row always named \
@@ -1404,7 +1404,7 @@ pub const KNOWN_RED: &[Red] = &[
                not. **Retired with the row above on 2026-08-16 and withdrawn with it on \
                2026-08-17** — a rate cannot be retired by a fix that does not reach its cause. \
                The withdrawal named the torn read as that cause and **that attribution was wrong** \
-               (corrected 2026-08-17, PR #112): this is a rate of the entry-time increment, not of \
+               (corrected 2026-08-17, PR #114): this is a rate of the entry-time increment, not of \
                the subtraction, for the reason the row above sets out — no AP exists to read \
                anything at the bring-up interrupt. The withdrawal was still right to be made, \
                which is the durable half of it",

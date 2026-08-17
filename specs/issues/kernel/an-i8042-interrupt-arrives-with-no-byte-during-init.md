@@ -178,7 +178,7 @@ the fix.
 ### The withdrawal named the wrong producer, and this is the correction
 
 The withdrawal went on to say the torn read "prints this row's line exactly".
-**That clause is wrong**, corrected 2026-08-17 (PR #112) by the author of the
+**That clause is wrong**, corrected 2026-08-17 (PR #114) by the author of the
 repair rather than by its author.
 
 The torn read was real and is fixed. But it is not what printed
