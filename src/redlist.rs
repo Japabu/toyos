@@ -895,10 +895,16 @@ pub const KNOWN_RED: &[Red] = &[
         evidence: "`cargo test -- sched_check_build` on this branch, two boots (parallel phase \
                    then ALONE re-run); green on KVM the same day — twelve of twelve guest shards, \
                    run 31875856466, where it measured 5,879 ms — **and a KVM shard has since \
-                   STALLed it**: run 31890991692, guest 8, STALL and then ALONE GREEN, so the \
-                   unqualified reading above is one session and not the accelerator's property. A \
-                   STALL is a duration and not a verdict, which is why it qualifies this sentence \
-                   rather than opening a row",
+                   STALLed it twice, independently**: run 31890991692, guest 8, STALL and then \
+                   ALONE GREEN; then PR #95 run 31946183485, job 95162423932 (`guest (8)`), \
+                   STALLED at 382s of a 388s guard — the guest silent for the last 383s of it — \
+                   then ALONE: GREEN again, `durations` (job 95163708113) red only as the \
+                   stall's own arithmetic: 387502 ms against the 10000 ms Fast line. Two \
+                   sessions, a day apart, not one, so the unqualified reading above no longer \
+                   holds as written — whether the shape is real or the guard's is \
+                   specs/issues/kernel/the-check-build-guest-stopped-answering-on-kvm-twice.md's \
+                   question, not this row's. A STALL is a duration and not a verdict, which is \
+                   why it qualifies this sentence rather than opening a row",
         source: "specs/issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
         measured: "2026-08-15",
     },
