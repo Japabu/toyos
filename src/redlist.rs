@@ -1559,6 +1559,27 @@ pub const KNOWN_RED: &[Red] = &[
         measured: "2026-08-15",
     },
     Red {
+        test: "boot_partition_identity",
+        instrument: Instrument::Ci,
+        finding: Finding::fires(1, 2),
+        standing: Standing::Stands,
+        what: "the same panic again, byte for byte — `sshd: cannot bind 0.0.0.0:22: netd error` \
+               at `sshd/src/main.rs:359`, three lines after `sshd: starting...` and with \
+               `init: started test-runner` interleaved into the backtrace. **This is what turns \
+               the row above from a sighting into a rate**: two CI observations, two days and \
+               two trees apart, one guest per machine both times. The harness adjudicated it \
+               itself — `ALONE: GREEN, and it was alone both times — nothing the harness \
+               controls differed, so it failed once and passed once. That is a rate and not a \
+               classification`. Shard 1's other 173 names passed",
+        evidence: "run 32044008591, job 95428160739 (`guest (1)`), PR #116 on \
+                   `wt/toyos-invariantp` — a diff of documentation and `src/redlist.rs` strings \
+                   with no code in it at all, which is what says the race is not the branch's. \
+                   The denominator is the two CI runs this branch dispatched: #113's twelve \
+                   shards were green under this name and #116's shard 1 was not",
+        source: "specs/issues/build/sshd-panics-when-netd-exits-before-it-binds.md",
+        measured: "2026-08-17",
+    },
+    Red {
         test: "usb_boot_stick_pulled",
         instrument: Instrument::Ci,
         finding: Finding::Seen,

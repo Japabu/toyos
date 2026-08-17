@@ -94,6 +94,30 @@ boot each way is not a proof, but it is the pair the write-up's shortlist
 predicts: the losing path is mid-handshake against a netd that is still there,
 not a netd that has already gone.
 
+**A second CI sighting, two days and two trees later, makes it a rate.** Run
+`32044008591`, job `95428160739` (`guest (1)`), PR #116 on
+`wt/toyos-invariantp`, 2026-08-17 — the same panic at the same line, and the
+victim is `boot_partition_identity` for the third time:
+
+```
+[kernel 0.559 cpu0] spawn: /bin/sshd pid=6 …
+init: started sshd
+sshd: starting...
+thread 'main' (1) panicked at sshd/src/main.rs:359:23:
+sshd: cannot bind 0.0.0.0:22: netd error
+init: started test-runner
+stack backtrace:
+```
+
+The branch it fired on is a diff of documentation and `src/redlist.rs` strings
+with no code in it, so nothing about the image was that branch's. The harness
+answered `ALONE: GREEN, and it was alone both times` again, and shard 1's other
+173 names passed. What this adds to the shortlist above is one detail: **`init`
+had not finished starting its children** — `init: started test-runner` is
+interleaved into sshd's backtrace, so the losing bind happens while init is
+still walking its list, which is where the ordering shape in "what the fix is
+not" would bite.
+
 ## What the fix is not
 
 Widening the guard to accept any error is wrong in the direction that matters:
