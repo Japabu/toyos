@@ -132,6 +132,22 @@ changes.
   `longest_first`'s own profile, so it is dispatched early and runs beside
   everything. Still `Sched::Parallel`.
 
+- **`handle_kill_policy`** — added 2026-08-17, **1 of 6** full `cargo test` runs
+  in one session on `wt/toyos-suitecut`, whose whole delta is four test timeouts,
+  with a second worktree's suite on the host throughout. `16 more killed
+  processes left more live objects behind: [("Process", 6, 7)]`, `ALONE …
+  GREEN`, and green on all twelve KVM shards of the same tree (run
+  `32023797195`). **Its mechanism is `fd_lifetime`'s and not the terminal
+  race's**: both are shared-boot binaries whose verdict is a *machine-wide*
+  census either side of a kill — free bytes there, live objects by type here —
+  taken on a guest where a hundred and fifty other tests are also starting and
+  reaping processes. One extra `Process` between two samples is another test's
+  reap that had not landed yet, and nothing in that boot arranges for it not to
+  be. Still `Sched::Parallel`.
+- **`wall_clock_file`** — added 2026-08-17, same session, **1 of 6**,
+  `ALONE … GREEN`, green on all twelve shards of the same tree. Not
+  investigated further.
+
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits
 twelve guests across every worktree. It recurred on 2026-08-07: **eight

@@ -16,8 +16,8 @@
 //! (`i8042_quarantine`) straddling it run to run for the classification's own
 //! reason — and four for [`Why::RidesTheBootOf`], riding
 //! `metal_sim_compositor`'s shared boot. Between them they account for
-//! 1,755.2 s of the 2,096.5 s the committed profile still prices across 315
-//! labels (its other two carry `UNMEASURED_MS` markers), and none is
+//! 1,755.2 s of the 2,135.0 s the committed profile prices across 317 labels,
+//! and none is
 //! gated per pull request. `guards` on every row says what stopped being gated,
 //! because a run that quietly does less is the whole failure mode here —
 //! `specs/assessments/test-cost-audit.md` §7 is the long form.
@@ -29,9 +29,10 @@
 //! by that door on 2026-08-17**: `xhci_msi_only` (35,223 ms) and
 //! `swiss_german_layout` (12,645 ms) were each a guest binary waiting out a
 //! fixed fallback deadline nobody had sent the sentinel for, 30 s and 8 s of
-//! host wall clock with no assertion behind either. They are registered Fast
-//! against an `UNMEASURED_MS` marker until the shards price them;
-//! `specs/assessments/test-cost-audit.md` §5.10 is the measurement.
+//! host wall clock with no assertion behind either. Both are `Tier::Fast`
+//! again, on run 32023797195's twelve shards rather than on the dev host:
+//! **5,857 ms and 5,441 ms**. `specs/assessments/test-cost-audit.md` §5.10 is
+//! the measurement.
 //!
 //! **CI is the instrument for a per-PR policy.** The effective profile starts
 //! with the last full twelve-shard run and replaces every name measured by the

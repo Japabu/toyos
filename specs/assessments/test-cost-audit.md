@@ -2030,13 +2030,20 @@ the runs' own profile:
 | `swiss_german_layout` | 11,079 ms | 3,877 ms | **−7,202** |
 | **total** | 96,779 ms | 18,108 ms | **−78,671** |
 
-Against the committed CI profile, which prices 2,096.5 s across the 315 labels
-that are not the two `UNMEASURED_MS` markers below, the two spans that are pure
-host wall clock — `xhci_msi_only`'s 30 s and
-`swiss_german_layout`'s 8 s — come off a KVM shard at exactly the same size,
+**And the two that were re-tiered were measured on the deciding instrument**,
 because a fallback deadline is a number of seconds and not a quantity of guest
-work. The other two are drains bounded by the same kind of number and behave the
-same way.
+work, so it comes off a KVM shard at exactly the size it comes off TCG. Run
+`32023797195`, twelve shards, all green:
+
+| test | committed CI before | measured after | delta |
+|---|---:|---:|---:|
+| `xhci_msi_only` | 35,223 ms | **5,857 ms** | −29,366 |
+| `swiss_german_layout` | 12,645 ms | **5,441 ms** | −7,204 |
+
+Both are `Tier::Fast` again on that evidence. The committed profile prices
+2,135.0 s across 317 labels after the merge that took those two numbers.
+`idle_stack_guard` and `dump_nmi_probe` are drains bounded by the same kind of
+number and will behave the same way; no fast-tier shard can measure either.
 
 **Suite wall clock is not the right figure here and is reported anyway, with its
 caveat.** The two full nightly runs came in at 2,150.2 s and 512.9 s, and almost
@@ -2084,9 +2091,11 @@ one frozen guest measures the freeze. The per-test table above is the claim.
 ### 5.10.3 The tier consequence, and what was deliberately left
 
 `xhci_msi_only` and `swiss_german_layout` return to `Tier::Fast` — the first two
-names to make the trip §7 left the door open for. Both go back carrying
+names to make the trip §7 left the door open for. Both went back carrying
 `tiers::UNMEASURED_MS` rather than a guessed number, which is §7.2's bootstrap
-and costs the two CI cycles `tests/CLAUDE.md` prices.
+and cost the two CI cycles `tests/CLAUDE.md` prices: the first push red
+`durations` by design and measured them at 5,857 ms and 5,441 ms, and the second
+replaced the markers with the profile that run wrote.
 
 `idle_stack_guard` and `dump_nmi_probe` stay Nightly and their `ci_ms` stays the
 last CI measurement. A fast-tier shard never re-measures a withheld label, so
