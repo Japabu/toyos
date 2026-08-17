@@ -876,6 +876,38 @@ pub const KNOWN_RED: &[Red] = &[
         measured: "2026-08-10",
     },
     // ---------------------------------------------------------------------
+    // Invariant P on KVM. The dev-host row below predicted this case and said
+    // what it would mean: "if invariant P ever fires on a KVM shard, this file
+    // does not cover it". It has. The two rows are the same assert on two
+    // accelerators and they are not one measurement — the magnitudes differ by
+    // three orders and so do the call sites.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "sched_check_build",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`invariant P: a scheduler pass took 200569 ns, budget 200000 ns` — the assert \
+               firing on native x86-64 under KVM, in `timer_handler` -> `driver::pass` -> \
+               `SchedPass::finish` while `test_rs_sched_stress` pid=7 was in syscall 8, at 1.449 s \
+               of guest uptime. `schedule_no_return: panicked inside a pass, cannot rejoin` halts \
+               every CPU 1 ms later, which is the whole of the 383 s of silence the run then \
+               reported as `STALLED:`. **The red is the panic and the stall is its shadow**: \
+               `run_test_paced` ends early on `KERNEL PANIC` only, which the CPU-exception path \
+               prints and a Rust `panic!` does not, so the wait ran its full 382 s ceiling on a \
+               machine that had been halted since second two and the summary said the run \
+               `established nothing about this tree`",
+        evidence: "PR #95 (`wt/toyos-harness2`), run 31946183485, job 95162423932 (\"guest (8)\"), \
+                   sha 4ec5d01, on an Azure 4-core EPYC 7763 with `/dev/kvm` — so KVM nested in a \
+                   hypervisor guest. One firing, not a rate: the earlier STALL under this name \
+                   (run 31890991692, job 95027203184, guest 8, 2026-08-15) printed an empty \
+                   `serial:` because `in_test` never became true, so its lines went to \
+                   `TestResult::before` and the caller drops that — its cause is unrecorded and is \
+                   not counted here",
+        source: "specs/issues/kernel/the-check-build-guest-stopped-answering-on-kvm-twice.md",
+        measured: "2026-08-16",
+    },
+    // ---------------------------------------------------------------------
     // The dev host. Everything below is TCG on arm64, so none of it is evidence
     // about which vendor executes an instruction — and all of it is about a
     // machine CI has no way to construct.
@@ -888,17 +920,17 @@ pub const KNOWN_RED: &[Red] = &[
         what: "`invariant P: a scheduler pass took 1684167 ns, budget 200000 ns`, panicking in \
                `driver::idle_loop` before userland — then 1749243 ns on cpu1 in the isolated \
                re-run. The dev host emulates x86-64 instruction by instruction while the guest \
-               TSC advances with host wall clock, so a pass that fits 200 µs natively cannot fit \
-               it here. Ruled out rather than assumed: removing `check_cpu` from inside the \
+               TSC advances with host wall clock, and eight to nine times the budget is what that \
+               costs. Ruled out rather than assumed: removing `check_cpu` from inside the \
                measured window left 1705987 ns, and `pass` samples its clock after `drain_irqs`, \
                so the xHCI prologue is outside the window entirely",
         evidence: "`cargo test -- sched_check_build` on this branch, two boots (parallel phase \
                    then ALONE re-run); green on KVM the same day — twelve of twelve guest shards, \
-                   run 31875856466, where it measured 5,879 ms — **and a KVM shard has since \
-                   STALLed it**: run 31890991692, guest 8, STALL and then ALONE GREEN, so the \
-                   unqualified reading above is one session and not the accelerator's property. A \
-                   STALL is a duration and not a verdict, which is why it qualifies this sentence \
-                   rather than opening a row",
+                   run 31875856466, where it measured 5,879 ms. **What this row may no longer be \
+                   read as saying is that the budget fits natively**: the same assert has since \
+                   fired on a KVM shard at 200569 ns, which is the `Instrument::Ci` row above. \
+                   The TCG explanation of *this* magnitude stands; the implied claim about the \
+                   other accelerator does not",
         source: "specs/issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
         measured: "2026-08-15",
     },
@@ -1259,21 +1291,27 @@ pub const KNOWN_RED: &[Red] = &[
         test: "i8042_undecoded_bytes",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(3, 14),
-        standing: Standing::Retired(
-            "both halves the write-up sanctions landed 2026-08-16: the driver claims `nothing \
-             decoded` only when something arrived to decode (an interrupt the ISR found no byte \
-             behind is counted apart and said in its own words), and the test reads its lines from \
-             `===I8042_READY===` — the marker its injection is timed off — so a bring-up line \
-             cannot be read as the Pause's. **Not cover for the CI row under this name**, which is \
-             a different producer",
-        ),
+        standing: Standing::Stands,
         what: "`the line names no byte: [kernel 0.418 cpu1] i8042: 1 interrupts and 0 bytes, \
                nothing decoded — first seen at 418ms`. The test takes the *first* `nothing \
                decoded` line in the capture and assumes it is the one its injection produced, and \
                an interrupt whose byte the driver's own polling init already consumed produces an \
                earlier one. **The isolated re-run answered differently on the two arms** — `red \
                again` on one occurrence and `ALONE: GREEN` on the other — which is itself evidence \
-               that the timing and not the arm decides it",
+               that the timing and not the arm decides it. \
+               \n\n**Retired 2026-08-16, and the retirement is withdrawn 2026-08-17: the driver \
+               half does not hold.** It claimed the driver says `nothing decoded` only when \
+               something arrived to decode. It does not, because the two counters that decide are \
+               read torn: the ISR adds to `IRQS` on entry (`i8042/mod.rs:663`) and to `EMPTY_IRQS` \
+               only after draining and finding nothing (`:693`), with the port-drain loop between \
+               them, while `report_health` computes `carried = IRQS - EMPTY_IRQS` (`:390`) and \
+               prints whenever `carried > 0`. A reader landing inside that window sees \
+               `carried = 1` for an interrupt that carried nothing, and prints this row's line \
+               exactly. The window is the bring-up polling init this row always named. Observed \
+               again 2 of 6 full suites on 2026-08-17 (`1 interrupts and 0 bytes … first seen at \
+               449ms`, PR #106's author, on a tree containing the fix). Whether the test half — \
+               anchoring on `===I8042_READY===` — holds is a separate question and is not decided \
+               here",
         evidence: "fourteen full `cargo test` suites in one session on `wt/toyos-logd`: 2 of the 9 \
                    with the window bounded and 1 of the 5 without; `main` (4d8c2e9) 0 of 7 and \
                    this branch 0 of 5 before the byte ring went, both recorded in the source below",
@@ -1320,18 +1358,16 @@ pub const KNOWN_RED: &[Red] = &[
         test: "i8042_undecoded_bytes",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(6, 10),
-        standing: Standing::Retired(
-            "the same two halves as the fourteen-suite row, 2026-08-16. The rate this row measures \
-             is the bring-up line's, and the gate can no longer read one: what it reads now begins \
-             at the marker its injection is timed off",
-        ),
+        standing: Standing::Stands,
         what: "the same line, and **the rate tracks host load** — 6 of 10 with the suites run back \
                to back and the load average never below 6.4, against the 3 of 14 above with the \
                host allowed to settle between them, on one tree in one session. The harness's \
                isolated re-run answered `ALONE: GREEN` on these, which is the class name for \
                exactly that. A bring-up race whose window is the driver's own polling init is what \
                a rate that moves with the host looks like; a defect in what this branch changed is \
-               not",
+               not. **Retired with the row above on 2026-08-16 and withdrawn with it on \
+               2026-08-17** — the torn read that row records is what this rate is a rate of, and a \
+               rate cannot be retired by a fix that does not reach its cause",
         evidence: "ten consecutive full `cargo test` suites on `wt/toyos-logd`'s tip, loads \
                    6.4-9.7, immediately after the fourteen above",
         source: "specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md",
