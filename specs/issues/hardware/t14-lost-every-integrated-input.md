@@ -32,7 +32,7 @@ clean packets and requires the driver to name none of them; reverting the split
 reds it with the T14's own line shape.
 
 **What remains open is the actual question, and the log cannot answer it.**
-`IRQS` counts in the ISR before any decoding, so 6 interrupts is hardware truth
+The tally counts in the ISR before any decoding, so 6 interrupts is hardware truth
 — but it is truth *as of 6.609 s*, which is when the driver stopped speaking.
 `HEALTH_DONE` was terminal. For the remaining 54 s the log cannot separate:
 

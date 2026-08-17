@@ -1337,7 +1337,24 @@ pub const KNOWN_RED: &[Red] = &[
         test: "i8042_undecoded_bytes",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(3, 14),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the counters are one word, 2026-08-17 — and this retirement is a measurement where \
+             the one it replaces was an argument. `kernel/src/drivers/i8042/tally.rs` is a single \
+             `u64` the ISR writes **once, after the burst**, low half the interrupts that put a \
+             byte in the ring and high half those that found none, and `Counts` can only be built \
+             by one load: there is no subtraction left to be wrong and no instant at which the \
+             halves disagree. Moving that write to the end also ends the producer this row's own \
+             line actually had — `IRQS` moved on the way *in*, so a reader between the pin and the \
+             first `push_isr` held a count of arrived bytes with no byte anywhere — and `RX_BYTES` \
+             is now counted in `pop` rather than after the drain, so a byte in mid-decode is on \
+             one side of the report's `has_bytes` guard rather than neither. Between them `N \
+             interrupts and 0 bytes, nothing decoded` is unprintable. **Measured in both \
+             directions**: `kernel-loom/tests/i8042_tally.rs` reds with the two counters put back \
+             (`Counts { carried: 1, empty: 0 }` for an interrupt that carried nothing) and passes \
+             with the word, and a third model asserts the old shape really is read torn so the \
+             file cannot pass vacuously. **Nine full `cargo test` suites, 9 green.** Not cover for \
+             the CI row under this name, which is a different producer and still stands",
+        ),
         what: "`the line names no byte: [kernel 0.418 cpu1] i8042: 1 interrupts and 0 bytes, \
                nothing decoded — first seen at 418ms`. The test takes the *first* `nothing \
                decoded` line in the capture and assumes it is the one its injection produced, and \
@@ -1404,7 +1421,14 @@ pub const KNOWN_RED: &[Red] = &[
         test: "i8042_undecoded_bytes",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(6, 10),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the same one word as the row above, 2026-08-17, and this rate is the one the nine \
+             green suites were run against: back to back with no gap, on a host another \
+             worktree's suite was taking guest slots from, and **two of the nine collapsed \
+             machine-wide** — 160 and 172 reds on `Broken pipe` and `QEMU disconnected` — with \
+             this name passing inside both. That is the load this row says the rate tracks, at \
+             more of it than the row was measured under, with nothing to track",
+        ),
         what: "the same line, and **the rate tracks host load** — 6 of 10 with the suites run back \
                to back and the load average never below 6.4, against the 3 of 14 above with the \
                host allowed to settle between them, on one tree in one session. The harness's \
@@ -1602,6 +1626,26 @@ pub const KNOWN_RED: &[Red] = &[
                    from [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5]`",
         source: "specs/issues/kernel/the-i8042-mute-verdict-cannot-revise-a-line-it-said-too-early.md",
         measured: "2026-08-16",
+    },
+    Red {
+        test: "screen_console_shell",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`no \\`i8042:\\` line above the prompt: \\`/boot/toyos/kernel.log\\` never reached the \
+               scrollback` — **and the panel it printed disproves that sentence**: every line on \
+               it is stamped `0.000` and comes from the first screenful of the boot, so the seed \
+               reached the console and the view was at its *head*. The assertion wants the end of \
+               the seed and `screendump_while` stops at the first frame carrying the prompt, so \
+               nothing orders the seed's paint against it. `ALONE: GREEN, and it was alone both \
+               times — a rate and not a classification`. **Not about the diff it was found on**, \
+               which is the i8042 interrupt tally: that change writes no boot line and removes \
+               none, so the set of `i8042:` lines this test looks for is identical either side of \
+               it",
+        evidence: "PR #111 run 32040411208, job 95418635461 (`guest (3)`); the isolated re-run in \
+                   the same job was green",
+        source: "specs/issues/diagnostics/console-scrollback-can-sit-at-the-head-of-the-seeded-log.md",
+        measured: "2026-08-17",
     },
 ];
 
