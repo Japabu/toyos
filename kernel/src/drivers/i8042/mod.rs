@@ -291,34 +291,14 @@ static REPORTED_IRQS: AtomicU32 = AtomicU32::new(0);
 ///
 /// Written only from `drain`, which holds `PS2` and is the one place that knows
 /// both the byte and whether anything came of it.
-/// The report holds eight, and `hda-probe` reports 24 of them: the owner
-/// presses Mute, Volume Down and Volume Up on a diagnostic boot and reads off
-/// what the EC sent, because H8 adds `toyos-ps2` entries for exactly those
-/// three and nothing in this repository knows whether they reach the i8042 at
-/// all. Three keys are twelve bytes of make and break under set 1, so the whole
-/// answer would not fit in one shipped-length report — and H0 is the boot that
-/// is meant to answer everything.
-///
-/// The array is the longer one in every build and the *bound* is what moves, so
-/// a boot with nothing armed reports exactly the eight the shipping kernel
-/// does. Only the bound moves: the list, the run-blaming and the line are the
-/// shipped ones, exactly as `test-small-caches` moves a ceiling and nothing else.
-const UNEXPLAINED_CAP: usize = 24;
-
-fn unexplained_len() -> usize {
-    if crate::actuator::hda_probe() {
-        UNEXPLAINED_CAP
-    } else {
-        8
-    }
-}
-static UNEXPLAINED: [AtomicU16; UNEXPLAINED_CAP] = [const { AtomicU16::new(0) }; UNEXPLAINED_CAP];
+const UNEXPLAINED_LEN: usize = 8;
+static UNEXPLAINED: [AtomicU16; UNEXPLAINED_LEN] = [const { AtomicU16::new(0) }; UNEXPLAINED_LEN];
 static UNEXPLAINED_N: AtomicU32 = AtomicU32::new(0);
 const UNEXPLAINED_AUX: u16 = 1 << 8;
 
 fn record_unexplained(byte: u8, aux: bool) {
     let n = UNEXPLAINED_N.fetch_add(1, Ordering::Relaxed) as usize;
-    if let Some(slot) = UNEXPLAINED.get(n).filter(|_| n < unexplained_len()) {
+    if let Some(slot) = UNEXPLAINED.get(n) {
         slot.store(u16::from(byte) | if aux { UNEXPLAINED_AUX } else { 0 }, Ordering::Relaxed);
     }
 }
@@ -335,7 +315,7 @@ impl core::fmt::Display for Unexplained {
             return Ok(());
         }
         write!(f, " no event from [")?;
-        for (i, slot) in UNEXPLAINED.iter().take(seen.min(unexplained_len())).enumerate() {
+        for (i, slot) in UNEXPLAINED.iter().take(seen).enumerate() {
             let value = slot.load(Ordering::Relaxed);
             if i > 0 {
                 write!(f, ", ")?;
@@ -345,8 +325,8 @@ impl core::fmt::Display for Unexplained {
             }
             write!(f, "{:#04x}", value as u8)?;
         }
-        if seen > unexplained_len() {
-            write!(f, ", +{}", seen - unexplained_len())?;
+        if seen > UNEXPLAINED_LEN {
+            write!(f, ", +{}", seen - UNEXPLAINED_LEN)?;
         }
         write!(f, "],")
     }
@@ -736,17 +716,17 @@ pub extern "sysv64" fn handler() {
 /// at most two bytes, in a stream that has already lost one — never in the
 /// healthy case this exists for.
 struct Partial {
-    bytes: [u8; UNEXPLAINED_CAP],
+    bytes: [u8; UNEXPLAINED_LEN],
     len: usize,
 }
 
 impl Partial {
     const fn new() -> Self {
-        Self { bytes: [0; UNEXPLAINED_CAP], len: 0 }
+        Self { bytes: [0; UNEXPLAINED_LEN], len: 0 }
     }
 
     fn push(&mut self, byte: u8) {
-        if self.len < unexplained_len() {
+        if self.len < UNEXPLAINED_LEN {
             self.bytes[self.len] = byte;
             self.len += 1;
         }

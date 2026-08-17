@@ -465,7 +465,13 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // never got to send is a stall it names, and never a key the driver lost.
     ("xhci_second_controller", Sched::Parallel, Tier::Fast),
     ("xhci_two_controllers", Sched::Parallel, Tier::Fast),
-    ("xhci_msi_only", Sched::Parallel, Tier::Nightly),
+    // **Returned 2026-08-17**, on the same `input_events_run` the two names
+    // above it run: it had `xhci_second_controller`'s sequence written out again
+    // on fixed sleeps, and nothing sent the right-button release
+    // `test_rs_input_events` exits on — so 30 s of its 35.2 s CI price was a
+    // client waiting out a fallback deadline with every assertion already
+    // satisfied. Carrying `UNMEASURED_MS` until the shards price it.
+    ("xhci_msi_only", Sched::Parallel, Tier::Fast),
     ("xhci_no_interrupt", Sched::Parallel, Tier::Fast),
     ("nvme_large_device", Sched::Parallel, Tier::Fast),
     ("nvme_wide_sector", Sched::Parallel, Tier::Fast),
@@ -555,7 +561,14 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // against a marker with a twenty-second ceiling, so a slower guest is a
     // slower test and not a different verdict — which is the same argument
     // `i8042_kbd_echo` has run on at width 4 since the phase landed.
-    ("swiss_german_layout", Sched::Parallel, Tier::Nightly),
+    //
+    // **Returned 2026-08-17.** Eight of its 12.6 s CI price were
+    // `test_rs_locale_gate layout` holding an idle keyboard open until a fixed
+    // deadline expired, against half a second of injection; it exits on the End
+    // key's release now, which is `i8042_keyboard`'s own sentinel and the fix
+    // §7.5 made for that whole family. Carrying `UNMEASURED_MS` until the shards
+    // price it.
+    ("swiss_german_layout", Sched::Parallel, Tier::Fast),
     ("locale_detect", Sched::Parallel, Tier::Fast),
     ("locale_detect_unrecognized", Sched::Parallel, Tier::Fast),
     // The wizard on the two surfaces the machine actually has, rather than on
@@ -689,9 +702,6 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("heap_ceiling_recovery", Sched::Parallel, Tier::Fast),
     ("iommu_context_absent", Sched::Parallel, Tier::Fast),
     ("iommu_empty_domain", Sched::Parallel, Tier::Fast),
-    // Two boots, one kernel build each: the probe's own, and the plain kernel
-    // on the same machine to show it stays out of an ordinary boot.
-    ("hda_probe", Sched::Parallel, Tier::Fast),
     // H4: soundd driving an Intel HDA controller itself, read back off the
     // device. Serial — its verdict is a wav capture, and one taken while eleven
     // other guests contend for the host measures the host.
@@ -5053,6 +5063,14 @@ fn swiss_german_layout(qemu: &mut QemuInstance) -> Result<(), String> {
             tap(&plain("q"));
             // And the key the wizard asks about.
             tap(&plain("grave_accent"));
+            // The sentinel `test_rs_locale_gate layout` exits on — the same End
+            // key and the same reason as [`send_i8042_sentinel`], sent through
+            // the connection this hook already holds because a `-qmp …,server`
+            // socket serves one connection at a time. Nothing above presses
+            // End, so its release is unambiguous; without it every green run
+            // waited out the binary's whole 8 s fallback against half a second
+            // of typing.
+            tap(&plain("end"));
         },
     );
     if let Some(err) = &result.error {
@@ -7248,7 +7266,6 @@ fn run_machine_test(
         "iommu_context_absent" => common::iommu::iommu_context_absent(test_config, c_bins, rust_bins),
         "iommu_empty_domain" => common::iommu::iommu_empty_domain(test_config, c_bins, rust_bins),
         // Body in `tests/common/hda.rs`, same reason.
-        "hda_probe" => common::hda::hda_probe(test_config, c_bins, rust_bins),
         "hda_tone" => common::hda::hda_tone(test_config, c_bins, rust_bins),
         "hda_client_stall" => common::hda::hda_client_stall(test_config, c_bins, rust_bins),
         "hda_two_live_refused" => {
@@ -7770,30 +7787,22 @@ fn run_machine_test(
             };
             const DX: i32 = 40;
             const DY: i32 = -30;
-            let result = qemu.run_test_hooked(
-                "test_rs_input_events",
-                Duration::from_secs(30),
-                "===INPUT_READY===",
-                |socket| {
-                    let mut input = qemu::QmpInput::open(socket);
-                    // Off the origin first: the accumulated position clamps at
-                    // 0, so a move up or left from there is invisible.
-                    input.mouse(100, 100, None);
-                    thread::sleep(Duration::from_millis(100));
-                    input.mouse(DX, DY, None);
-                    thread::sleep(Duration::from_millis(100));
-                    input.mouse(0, 0, Some(("left", true)));
-                    thread::sleep(Duration::from_millis(50));
-                    input.mouse(0, 0, Some(("left", false)));
-                    thread::sleep(Duration::from_millis(100));
-                    for key in ["h", "e", "l", "l", "o"] {
-                        input.keys(&[(key, true), (key, false)]);
-                        thread::sleep(Duration::from_millis(20));
-                    }
-                },
-            );
+            // Off the origin first: the accumulated position clamps at 0, so a
+            // move up or left from there is invisible.
+            //
+            // **`input_events_run`, which is `xhci_second_controller`'s own
+            // sequence and was written out again here on fixed sleeps.** Two
+            // things came of the copy and both were defects: nothing paced the
+            // injection, so a key the host sent while the guest was behind was
+            // indistinguishable from one this controller lost — the exact
+            // reading `xhci_second_controller` moved off (§5.5.2) — and nothing
+            // sent the right-button release `test_rs_input_events` ends on, so
+            // every green run waited out the client's whole 30 s fallback
+            // deadline. `input_events_end`'s own doc says every caller owes it
+            // one; this was the caller that did not.
+            let (result, sent) = input_events_run(&mut qemu, (100, 100), (DX, DY));
             if let Some(err) = &result.error {
-                return Err(format!("{err}\n{}", result.stdout));
+                return Err(format!("{err} after {sent} of the sequence\n{}", result.stdout));
             }
 
             let keys = parse_key_events(&result.stdout);

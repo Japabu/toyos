@@ -517,16 +517,6 @@ actuators! {
     /// passthrough, which would fault identically for the first.
     iommu_empty_domain = "iommu-empty-domain";
 
-    /// Stage H0 of `specs/plans/hda-driver-plan.md`: take every class-0403 function
-    /// out of reset once, at the end of the peripheral phase, and report what is
-    /// behind it. Nothing else can reach those questions — a codec is not on the
-    /// PCI bus, and the capability that would let a userland process touch one is
-    /// `specs/plans/userspace-drivers-spec.md` stage 4, unbuilt, and whether it should
-    /// ever be given this device is exactly what H0 asks. No shipped path takes
-    /// an audio controller out of reset, and the whole actuator is deleted at H9.
-    /// See `kernel/src/drivers/hda_probe.rs`.
-    hda_probe = "hda-probe";
-
     /// Run the HDA register allow-list over every arm of it at bind time, and
     /// report each verdict by name. Nothing else can be the caller: the check is
     /// gated on holding the device claim, soundd takes that claim for the life of

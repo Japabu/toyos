@@ -2005,6 +2005,126 @@ third build in every run, which is the trade §3.6 is about. The *image* — the
 diag config, no test binaries, nothing that can claim the framebuffer — is still
 the flashed one.
 
+## 5.10 Wave 10: four fixed spans nobody was waiting for, 2026-08-17
+
+§7 relegated fifty-four names and said the reason to reach for #188 is that one
+of them becomes fast enough to come back. This is that, and what it found is
+smaller and duller than the audit expected: **four tests spent 78.7 s of every
+full run waiting out a host-clock span with every assertion in them already
+satisfied.** Nothing here is a new mechanism. Three of the four are the shapes
+§5.5.1 and §5.4.2 already named — a guest binary running to a fallback deadline
+nobody sent the sentinel for, and a drain paid in full because the guest neither
+exits nor halts — applied to the four call sites the earlier sweeps missed.
+
+### 5.10.1 The measurement
+
+Dev host, cross-arch TCG, twelve wide, `cargo test -- --nightly` before and
+after on the same tree in one session (318 labels both). Per-test durations from
+the runs' own profile:
+
+| test | before | after | delta |
+|---|---:|---:|---:|
+| `xhci_msi_only` | 34,773 ms | 5,188 ms | **−29,585** |
+| `idle_stack_guard` | 28,523 ms | 3,384 ms | **−25,139** |
+| `dump_nmi_probe` | 22,404 ms | 5,659 ms | **−16,745** |
+| `swiss_german_layout` | 11,079 ms | 3,877 ms | **−7,202** |
+| **total** | 96,779 ms | 18,108 ms | **−78,671** |
+
+**And the two that were re-tiered were measured on the deciding instrument**,
+because a fallback deadline is a number of seconds and not a quantity of guest
+work, so it comes off a KVM shard at exactly the size it comes off TCG. Run
+`32023797195`, twelve shards, all green:
+
+| test | committed CI before | measured after | delta |
+|---|---:|---:|---:|
+| `xhci_msi_only` | 35,223 ms | **5,857 ms** | −29,366 |
+| `swiss_german_layout` | 12,645 ms | **5,441 ms** | −7,204 |
+
+Both are `Tier::Fast` again on that evidence. The committed profile prices
+2,135.0 s across 317 labels after the merge that took those two numbers.
+`idle_stack_guard` and `dump_nmi_probe` are drains bounded by the same kind of
+number and will behave the same way; no fast-tier shard can measure either.
+
+**Suite wall clock is not the right figure here and is reported anyway, with its
+caveat.** The two full nightly runs came in at 2,150.2 s and 512.9 s, and almost
+none of that gap is this change: the before run carried `desktop_window_child`'s
+#156 freeze at 1,069 s and two blown liveness guards
+(`netd_connection_caps` 1,947 s, `console_locale_detect` 306 s), and the after
+run carried the same freeze at 359 s and one guard. A phase whose wall clock is
+one frozen guest measures the freeze. The per-test table above is the claim.
+
+### 5.10.2 What each one was
+
+- **`xhci_msi_only` — 30 s.** It carried `xhci_second_controller`'s injection
+  sequence written out a second time on fixed sleeps, and never sent the
+  right-button release `test_rs_input_events` exits on, so the client ran to its
+  30 s ceiling with `hello` and the pointer delta long since delivered.
+  `input_events_end`'s own doc already said every caller owes it one. It calls
+  `input_events_run` now — the same helper the two names above it in
+  `MACHINE_TESTS` use — which is **strictly stronger** as well as shorter: every
+  packet is paced against the guest's own report of the one before it, so a key
+  the host sent while the guest was behind is no longer indistinguishable from a
+  key this controller lost, which is the reading §5.5.2 moved
+  `xhci_second_controller` off.
+- **`swiss_german_layout` — 8 s.** `test_rs_locale_gate layout` collected key
+  events until a fixed deadline expired; the host's whole sequence is ~0.5 s of
+  taps. It exits on the End key's release now — `i8042_keyboard.rs`'s own
+  sentinel, and the fix §7.5 made for that entire family, applied to the one
+  binary the family's sweep did not reach. The 8 s stays as the fallback for a
+  lost sentinel.
+- **`idle_stack_guard` — 20 s.** `double_fault_stack`'s shape exactly, and §5.4.2
+  said to look for it elsewhere: the fault is fatal, `halt_all_cpus` stops every
+  CPU without QEMU exiting, and a plain `drain_serial` therefore waits out its
+  whole ceiling for a machine that will never speak again. It drains until the
+  page walk's `PTE:` line, which is the last thing any assertion reads.
+  **The three spaces in `PTE:   0x` are load-bearing** — `PDPTE:` one level up
+  contains `PTE:` as a substring, and the obvious predicate ended the drain two
+  lines early and red a green machine with `the crash report's page walk does not
+  show a split leaf`. Measured, on this change's first run.
+- **`dump_nmi_probe` — 16 s.** An NMI interrupts a CPU rather than killing it, so
+  the guest here neither exits nor halts either. It drains until both the dump's
+  own end line and the victim's `rejoined after`, and requires both rather than
+  either because their order is a fact about how long the report takes: the dump
+  is requested while the victim is deaf and the victim announces its return when
+  its 400 ms window closes.
+
+### 5.10.3 The tier consequence, and what was deliberately left
+
+`xhci_msi_only` and `swiss_german_layout` return to `Tier::Fast` — the first two
+names to make the trip §7 left the door open for. Both went back carrying
+`tiers::UNMEASURED_MS` rather than a guessed number, which is §7.2's bootstrap
+and cost the two CI cycles `tests/CLAUDE.md` prices: the first push red
+`durations` by design and measured them at 5,857 ms and 5,441 ms, and the second
+replaced the markers with the profile that run wrote.
+
+`idle_stack_guard` and `dump_nmi_probe` stay Nightly and their `ci_ms` stays the
+last CI measurement. A fast-tier shard never re-measures a withheld label, so
+neither price can move until a nightly run takes it; guessing at what a KVM
+runner will make of them would put a dev-host TCG number where §7.2 says only a
+CI number belongs. `dump_nmi_probe` is the likelier of the two to come back.
+
+**What was measured and left alone**, because the span *is* the verdict:
+
+- `usb_flush_optional`'s twelve 500 ms probes look like pacing and are not:
+  `/bin/logd`'s give-up is a five-second budget, so the six seconds of probing
+  is what makes the give-up reachable at all, and the test's `gave_up == 1` rests
+  on it.
+- `usb_boot_stick_pulled`'s ninety-two 120 ms probes are the liveness rate the
+  gate reports (`answered >= ANSWERED` of forty after the pull). Waiting for each
+  answer would make the count forty by construction.
+- `metal_sim_pointer_churn`'s twenty-four 400 ms settles pace a race
+  reproduction — the owner's plug/pull cadence, whose fourth cycle is where his
+  desktop froze. Content-waiting each phase would change what the test
+  reproduces, which is not a cost question.
+- `i8042_health_cadence`, `screen_diag_boot`, `screen_blocked_dump`,
+  `screen_pager_keys`' final watch and `i8042_quarantine`'s fallback are each a
+  staged window that the assertion is *about*; all five are already
+  `Why::TimerAnchored` for that reason.
+- `xhci_deaf_registers`, `wall_clock_refusals`, `toybox_cp_volume` and
+  `iommu_discovery` are the next four by price and none has a host-clock span in
+  it: they are two, five, one and four boots respectively doing real guest work,
+  at or near the ~3.7 s per-boot floor §1.3 measured.
+
 ---
 
 ## 7. The nightly tier: what the fast path stopped gating, 2026-08-11
