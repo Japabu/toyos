@@ -1581,6 +1581,26 @@ pub const KNOWN_RED: &[Red] = &[
         source: "specs/issues/kernel/the-i8042-mute-verdict-cannot-revise-a-line-it-said-too-early.md",
         measured: "2026-08-16",
     },
+    Red {
+        test: "screen_console_shell",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`no \\`i8042:\\` line above the prompt: \\`/boot/toyos/kernel.log\\` never reached the \
+               scrollback` — **and the panel it printed disproves that sentence**: every line on \
+               it is stamped `0.000` and comes from the first screenful of the boot, so the seed \
+               reached the console and the view was at its *head*. The assertion wants the end of \
+               the seed and `screendump_while` stops at the first frame carrying the prompt, so \
+               nothing orders the seed's paint against it. `ALONE: GREEN, and it was alone both \
+               times — a rate and not a classification`. **Not about the diff it was found on**, \
+               which is the i8042 interrupt tally: that change writes no boot line and removes \
+               none, so the set of `i8042:` lines this test looks for is identical either side of \
+               it",
+        evidence: "PR #111 run 32040411208, job 95418635461 (`guest (3)`); the isolated re-run in \
+                   the same job was green",
+        source: "specs/issues/diagnostics/console-scrollback-can-sit-at-the-head-of-the-seeded-log.md",
+        measured: "2026-08-17",
+    },
 ];
 
 // ---------------------------------------------------------------------------
