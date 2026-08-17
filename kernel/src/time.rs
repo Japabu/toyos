@@ -37,6 +37,19 @@
 //! every constructor takes the justification as a `&'static str` beside the
 //! number. A number nobody can cite is a [`Tripwire`] or it does not exist.
 //!
+//! **What a panic may be about, and it is the rule the two panicking kinds cost
+//! the most to learn.** A panic asserts what its own site observes, and nothing
+//! a workload scales. A latency, a rate of progress, a time-to-complete: each of
+//! those is device time and workload time added together, so each is *measured*,
+//! reported, and gated in the harness — where a number can be read and argued
+//! with — and none of them is asserted here. Three successive scheduler designs
+//! were lost to the other reading, and every one of them was locally plausible:
+//! the constant looked generous, the composition that outgrew it was one level
+//! down, and the kernel died naming its own bound instead of the workload that
+//! had exceeded it. The question to ask of a number before it becomes a
+//! [`Tripwire`] is whether it gets larger when the machine gets busier. If it
+//! does, it is not one.
+//!
 //! **What is not a duration**, stated because the sweep had to decide it twice:
 //! a spin *count* is not one — `serial.rs`'s `PANIC_LOCK_SPIN_LIMIT` and
 //! `THRE_SPIN_LIMIT`, `sync.rs`'s 50M/500M — even where a doc comment prices it
