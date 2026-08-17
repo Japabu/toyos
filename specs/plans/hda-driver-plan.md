@@ -433,12 +433,14 @@ and no syscalls" survives intact — which was the condition the owner set on it
 CORB/RIRB a verb is a 32-bit store into a ring soundd may map writable — a codec
 verb has no bus-mastering and cannot name memory — plus **one** `CORBWP` bump.
 N verbs queued before the bump are one syscall. The immediate-command path costs
-four register writes per verb (`kernel/src/drivers/hda_probe.rs:648-663`) and is
-H0's, kept for a controller whose CORB is not up yet.
+four register writes per verb — measured off H0's immediate-command routine,
+`kernel/src/drivers/hda_probe.rs:648-663` before its deletion — and is kept for
+a controller whose CORB is not up yet.
 
-**At bring-up, once.** Replaying `hda_probe.rs`'s own conditional verb structure
-against the committed T14 fixture gives **215 verbs** for the probe's full dump
-and **115** for a driver-minimal enumeration that reads only the fields
+**At bring-up, once.** Replaying H0's own conditional verb structure (deleted
+with `hda_probe.rs`) against the committed T14 fixture gives **215 verbs** for
+the probe's full dump and **115** for a driver-minimal enumeration that reads
+only the fields
 `toyos-hda::graph::Codec` carries; QEMU's two codecs give 52 and 32. Path
 configuration is 14 verbs (17 if amps are written per channel). Batched behind
 one `CORBWP` bump per dependency level that is tens of syscalls, once, at claim
@@ -935,7 +937,7 @@ throughout.
 
 | Stage | Content | Size (est.) | Gate |
 |---|---|---|---|
-| **H0** | **Feasibility, on metal. No driver.** A kernel diagnostic behind a boot parameter, armed only in the diagnostic image, deleted at H9. It carries the comment `specs/device-test-strategy.md` requires of an actuator, and the reason nothing else can reach it is exact: **there is no way for a userland process to touch a codec before the capability of §4 exists, and the questions it answers are the ones that decide whether that capability will ever be given this device.** Two halves on one boot. **(a) Handoff**, for `00:1f.3`: its DMAR device scope, whether its isolation scope is a singleton given four sibling functions (§7 risk 1), whether it carries an RMRR, whether it offers MSI or MSI-X and how many vectors, BAR0's size/width/prefetchability and whether a 2 MiB relocation target exists, and the unit's `ECAP.SC` (§4.4 item 4). **(b) Codec**, using the immediate-command registers so it needs no DMA and no capability: release `GCTL.CRST`, read `GCAP`/`VMIN`/`VMAJ` and `STATESTS`, and for every codec present dump vendor and device id, every function group, every widget's capabilities and every pin's configuration default. Plus: log every i8042 scancode sequence that decodes to no key, and press the three volume keys. | ~120 + ~250 lines kernel | The log carries a named line per item, read off the panel and off `/log/kernel.log`. **If the isolation scope or an RMRR refuses the device, or `STATESTS` reads zero, this track stops here and is re-decided.** |
+| **H0** | **DONE, and deleted.** Feasibility, on metal. No driver. A kernel diagnostic behind a boot parameter, armed only in the diagnostic image. ~~deleted at H9~~ — **deleted now, decoupled from H9**: its four questions are answered (§6.4, §6.5) and its job ends once the driver it staged (H1–H4) exists to answer them itself; H9 is persistence alone and remains blocked on it (§6.2). It carried the comment `specs/device-test-strategy.md` requires of an actuator, and the reason nothing else could reach it was exact: **there was no way for a userland process to touch a codec before the capability of §4 exists, and the questions it answered are the ones that decided whether that capability would ever be given this device.** Two halves on one boot. **(a) Handoff**, for `00:1f.3`: its DMAR device scope, whether its isolation scope is a singleton given four sibling functions (§7 risk 1), whether it carries an RMRR, whether it offers MSI or MSI-X and how many vectors, BAR0's size/width/prefetchability and whether a 2 MiB relocation target exists, and the unit's `ECAP.SC` (§4.4 item 4). **(b) Codec**, using the immediate-command registers so it needed no DMA and no capability: release `GCTL.CRST`, read `GCAP`/`VMIN`/`VMAJ` and `STATESTS`, and for every codec present dump vendor and device id, every function group, every widget's capabilities and every pin's configuration default. Plus: log every i8042 scancode sequence that decodes to no key, and press the three volume keys. | ~120 + ~250 lines kernel | The log carried a named line per item, read off the panel and off `/log/kernel.log`. **If the isolation scope or an RMRR refuses the device, or `STATESTS` reads zero, this track stops here and is re-decided.** |
 | **H1** | **DONE — `toyos-hda`, the host-tested core.** Verb encode/decode, the graph model, `find_output_path`, `SDnFMT` encoding, BDL construction. No I/O. | ~1,500 lines Rust | `cargo test` in-crate, against three fixtures including **H0's dump of the T14's own codec**. §5.2's state-space attacks, each with teeth: deleting the cycle check must red the cyclic fixture, and deleting the speaker-pin preference must red the two-codec one. |
 | **H2** | **The stub's capability.** Rewritten under §4.1's decision: I3 and I4 are **not** in it and `userspace-drivers-spec.md` stage 3 is not either (§4.2). What lands is the four syscalls of §4.4 item 1 plus `SYS_DEVICE_REG_WRITE` (item 1b), `CachePolicy::Uncacheable`, a `writable` field on `SharedRegion`, and the claim-time 2 MiB-neighbour refusal of §4.1.4. **Proposes that the capability be staged against a second `intel-hda` rather than a second `virtio-net-pci`** (§4.2). | ~600 lines kernel (est.) | The refusals, each by name: a write off the allow-list, a write of an address register, a claim whose BAR shares its page. Teeth: deleting the allow-list check must red the first two. |
 | **H3** | **DONE, and §6.7 is what it actually built.** soundd drives virtio-sound from userland through the same stub HDA got: descriptor tables kernel-only, avail rings and every buffer in the region the driver maps. Deleted: `audio.rs`, `SYS_AUDIO_SUBMIT`, `SYS_AUDIO_POLL`, `DEVICE_AUDIO`, `AudioInfo`. **Not** deleted, and §6.7 says why each: `virtio_sound.rs` (it is the stub now), `AudioCompletionRecord`, vector `0x23`. Closes `userspace-drivers-spec.md` stage 7. | ~1,000 lines Rust moved, 285 lines of kernel deleted | **Gate A's thorough tier, `cargo test --test toyos-build -- --audio-gate 30`, same-session A/B against the pre-stage tree.** Same rule as a scheduler-migration transition and for the same reason. ~~This is the stage that can revert the direction, and it is deliberately before HDA exists.~~ **Spent** — H4 landed first (§6.7). |
@@ -944,7 +946,7 @@ throughout.
 | **H6** | **Jack detection and output routing.** Polled pin sense on soundd's existing 2 s cadence; route between the speaker and headphone pins; ramp master gain to zero across the switch so it does not click. | ~300 lines Rust | Metal: headphones in, sound follows within one poll interval, and back out again. Harness if QEMU's codec models pin sense; if it does not, the switch logic is host-tested in `toyos-hda` and the *transition* is asserted in QEMU by driving it from a test hook. |
 | **H7** | **Master volume and mute.** A gain on soundd's mix bus, §4.4 item 6's three messages, the existing ramp machinery, and `toybox audio` to read and set it. | ~400 lines Rust | **Harness, with real teeth**: a guest test sets master to 0.5 and the wav capture's amplitude halves; sets mute and the capture goes silent; neither transition fires the click detector. |
 | **H8** | **The volume keys.** Three `SET1_E0` entries in `toyos-ps2` — Keyboard/Keypad-page Mute, Volume Up and Volume Down usages, against what H0 observed the EC actually sends — and the surface owners consuming those three usages instead of forwarding them (§6.1). | ~150 lines Rust | Harness: QMP injects the scancodes and a guest test asserts soundd's master state moved and the capture followed. Metal: the owner presses F1/F2/F3. |
-| **H9** | **Persistence, and H0's probe deleted.** Master volume and mute survive a reboot. **Blocked** — §6.2. | ~200 lines Rust | Reboot in the harness and read the value back; on metal, only once there is a volume to write to. |
+| **H9** | **Persistence.** Master volume and mute survive a reboot. **Blocked** — §6.2. ~~and H0's probe deleted~~ — H0's diagnostic was deleted ahead of and independent of this stage; see the H0 row. | ~200 lines Rust | Reboot in the harness and read the value back; on metal, only once there is a volume to write to. |
 | **H10** | **The end condition.** `userspace-drivers-spec.md` §7.5's checks pass for audio; CLAUDE.md's architecture and `metal-hardware-inventory.md`'s undriven list updated; `specs/issues/` entries closed. | — | Those commands |
 
 H0 and H1 are independent of everything else and of each other, and H0 is a
@@ -984,7 +986,7 @@ and adopt-by-witness — which is gated on the owner's review of its §4. H9 wai
 on that, and until then master volume resets to its default on every boot on the
 T14. In the harness it persists, because the harness has a disk.
 
-### 6.3 H0 is built. How to run it, and how to read what comes back
+### 6.3 H0 was built, ran, and is now deleted
 
 **Read the (b) block first, and read it before estimating anything in §6.** The
 owner has decided the T14 gets real sound out of its internal speakers. That
@@ -993,34 +995,43 @@ plan is the answer to that decision or whether the answer is a project of a
 different order, and no schedule for H1–H10 means anything until one real boot
 has answered it.
 
-**Built**, behind the kernel feature `hda-probe`
-(`kernel/src/drivers/hda_probe.rs`, ~640 lines). It runs last in the peripheral
-phase, over **every** class-0403 function the PCI walk returned rather than the
-first, does no DMA at all — the verbs go through the immediate-command
-registers — and bounds every wait. Deleted at H9 with the feature.
+**Was built**, behind the runtime actuator `hda-probe`
+(`kernel/src/drivers/hda_probe.rs`, ~640 lines — deleted, along with the
+actuator and its harness arm, once the questions below were answered). It ran
+last in the peripheral phase, over **every** class-0403 function the PCI walk
+returned rather than the first, did no DMA at all — the verbs went through the
+immediate-command registers — and bounded every wait.
 
-The harness arm is `cargo test -- hda_probe` on `Profile::MetalHda`, a machine
-built so one boot runs both arms of each question below (§5.1 lists what that
-does and does not certify). It also boots the same machine with a plain kernel
-and requires no `hda:` line at all, which is the only assertion that binds
-"nothing in the ordinary boot path takes that controller out of reset".
+The harness arm was `cargo test -- hda_probe` on `Profile::MetalHda`, a machine
+built so one boot ran both arms of each question below (§5.1 lists what that
+did and did not certify). It also booted the same machine with a plain kernel
+and required no `hda:` line at all, which was the only assertion that bound
+"nothing in the ordinary boot path takes that controller out of reset". Both
+the machine profile and the test are gone with the actuator; §6.4 and §6.5 are
+what they found, kept because the findings outlive the diagnostic that made
+them.
 
-#### Running it on the T14
+#### How H0 was run on the T14
+
+Kept as a historical record of a procedure that no longer runs — `hda-probe`
+carries no meaning once neither the actuator nor the module exists.
 
 ```
 cargo run -- --diag-boot --kernel-param hda-probe --build-only
 ```
 
-→ `target/bootable-diag.img`. **`--kernel-param` is orthogonal to the boot
-mode on purpose.** Attaching a feature list to `Boot::Diag` was the other way to
-reach this image, and it would have made the diagnostic kernel permanently a
-different build from the shipping one — which is the guarantee that mode exists
-to make — and left a line in `src/build.rs` to take out again at H9. Here the
-probe is a word on one command line and there is nothing to clean up. An
-undeclared feature name is refused by name against `kernel/Cargo.toml` before
-any lock, so when H9 deletes `hda-probe` this command stops working loudly
-rather than quietly producing an image with no probe in it, which would look
-identical and answer nothing.
+→ `target/bootable-diag.img`, while this still ran. **`--kernel-param` is
+orthogonal to the boot mode on purpose.** Attaching a feature list to
+`Boot::Diag` was the other way to reach this image, and it would have made the
+diagnostic kernel permanently a different build from the shipping one — which
+is the guarantee that mode exists to make — and would have left a line in
+`src/build.rs` to take out again at deletion. The probe was a word on one
+command line and there was nothing to clean up there. `src/build.rs`'s
+`kernel_cmdline` checks every `--kernel-param` name against
+`kernel/src/actuator.rs`'s declared list, before any lock, so with `hda-probe`
+gone from that list this command now fails loudly by name at build time rather
+than quietly producing an image with no probe in it, which would have looked
+identical and answered nothing.
 
 **Build it from a committed tree** (CLAUDE.md): `cargo` builds the working tree,
 and a checkout usually holds somebody's uncommitted work.
@@ -1159,8 +1170,9 @@ first-match warning with it.
 #### The volume keys
 
 No new mechanism: the i8042 driver already names every byte run that decoded to
-nothing, and under `hda-probe` its list holds 24 bytes instead of 8 so three
-keys' make and break fit in one boot. Read the `i8042:` lines:
+nothing, and for this boot its list was widened from 8 to 24 so three keys'
+make and break fit in one report — reverted with the actuator now that H0 is
+answered. Read the `i8042:` lines:
 
 - `no event from [0xe0, 0x20, …]` — the keys reach the i8042 and decode to
   nothing, and those bytes are exactly what H8's three `toyos-ps2` entries are
@@ -1381,9 +1393,9 @@ reader must not take §6.3's answer table for a record of what the machine said:
 | **`2m-page-neighbours`** | **H2, and it is the only one the stub genuinely turns on** (§4.1.4). A nonzero count is a claim-time refusal on the T14 and makes `userspace-drivers-spec.md` stage 3 a prerequisite for that machine. |
 | `ECAP.SC` | defence in depth only (§4.4 item 4) |
 
-**And one question H0 could not have answered, because the probe never asks it.**
-`size_bar0` reads exactly one BAR (`kernel/src/drivers/hda_probe.rs:448-453`),
-and the only loop over BAR indices skips the HDA function itself
+**And one question H0 could not have answered, because the probe never asked it.**
+`size_bar0` read exactly one BAR (`kernel/src/drivers/hda_probe.rs:448-453`,
+before its deletion), and the only loop over BAR indices skipped the HDA function itself
 (`:382-384`). Nothing else in the boot path prints a BAR for `00:1f.3`. So
 **whether `00:1f.3` exposes a second BAR — the Audio DSP window Intel parts of
 this generation carry — is unanswered here**, and no amount of re-reading the
