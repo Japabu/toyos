@@ -891,12 +891,17 @@ pub const KNOWN_RED: &[Red] = &[
              clock advances while the hypervisor has its vCPU, so the quantity carried a term \
              the kernel neither observes nor controls; `toyos-sched` now records the \
              distribution and `tests/common/passcost.rs` gates it at `MAX_PASS_NS` on the 90th \
-             percentile. **What retires this row is the same 91-run record that produced it**: \
-             invariant P asserted *every* pass under 200 000 ns and was green on 89 of those \
-             91 runs, so in each of the 89 the 90th percentile was under the budget too, and \
-             one crossing cannot move the 90th percentile of ~150 samples in the other two. \
-             The gate is green wherever the assert was, and green on the two runs the assert \
-             killed the machine on",
+             percentile. **What retires this row is the panic, which cannot happen again.** \
+             The same 91-run record says the replacement would have been green across it: \
+             invariant P asserted *every* pass under 200 000 ns and was green on 89 of the 91, \
+             which is *zero* crossings in each, so their 90th percentiles were far under the \
+             budget. **That is a rate over the period those runs sampled and not a bound**, \
+             and the other two settle nothing about counts — the machine halted at the first \
+             crossing and could never have shown a second. What is still open about the \
+             fraction is \
+             `specs/issues/kernel/the-p90-pass-cost-gate-rests-on-an-observed-steal-rate.md`, \
+             and a red under the new gate is a fresh measurement rather than this one \
+             returning",
         ),
         what: "`invariant P: a scheduler pass took 200569 ns, budget 200000 ns` — the assert \
                firing on native x86-64 under KVM, in `timer_handler` -> `driver::pass` -> \
@@ -967,7 +972,15 @@ pub const KNOWN_RED: &[Red] = &[
                p90 < 262144 ns, max 1745977 ns, 14 over` and it reds. **Note the maxima on the \
                green side**: 1974235 ns and 2543303 ns in the serial tail of the run that ended \
                263 of 263 green — nine and twelve times the budget, refused by nothing, where \
-               the assert this replaced would have halted the machine on any one of them",
+               the assert this replaced would have halted the machine on any one of them. \
+               **Reading a red under this name in one line: look at the median in the same \
+               failure text.** Every red measured carried `p50 < 131072 ns` against `p50 < \
+               16384` or `< 32768 ns` on every green, because contention moves the whole \
+               distribution; a p90 red whose *median* sits with the green baseline is the shape \
+               host load has not been observed to produce, and is the one to bisect. That is a \
+               heuristic with its evidence attached and not a discriminator — the verdict still \
+               needs the isolated re-run red **and** a same-session A/B against `main` green, \
+               which is the standing law for the `ALONE: GREEN` class",
         evidence: "`cargo test` on `wt/toyos-invariantp`, 2026-08-17, ten CPU-runs over three \
                    sessions. Every one of the six reds was taken beside other guests: four \
                    under another agent's suite on the shared host (`fastest boot 2330 ms \
@@ -976,7 +989,11 @@ pub const KNOWN_RED: &[Red] = &[
                    at 1.02x and the serial tail at 1.05x. `sched_check_build` is `Sched::Serial` \
                    since the same day, on this measurement, which removes the second half of \
                    this row's own cause. Not evidence about KVM in either direction — the dev \
-                   host boots no KVM guest",
+                   host boots no KVM guest. **This row is also the counter-evidence to the \
+                   gate's own warrant**: 14 of 134 and 19 of 140 passes over budget is 10–13 %, \
+                   which is correlated inflation with mass in it rather than the handful of \
+                   samples the gate's argument assumes a busy machine produces \
+                   (`specs/issues/kernel/the-p90-pass-cost-gate-rests-on-an-observed-steal-rate.md`)",
         source: "specs/issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
         measured: "2026-08-17",
     },

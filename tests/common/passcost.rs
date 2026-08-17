@@ -20,6 +20,33 @@
 //! printed and never gated, and a rare long pass is reported rather than
 //! caught. That last sentence is the honest limit of this instrument.
 //!
+//! **And the quantile's own warrant is a rate, not a bound — the same
+//! confession, one level up.** The sentence above says a host "touches the
+//! handful of passes it lands in", and that is an *observation* about this
+//! infrastructure over a sampled period, not a property of hypervisors. A host
+//! under load does not deschedule a vCPU once: it deschedules repeatedly, and
+//! the passes it delays are not independent draws. Nothing available here
+//! bounds how much of one run steal can reach, so nothing here can promise the
+//! 90th percentile is out of its range.
+//!
+//! Two pieces of evidence, and they point opposite ways. **For the gate**:
+//! invariant P asserted every pass under budget and was green in 89 of 91 KVM
+//! runs, which is *zero* crossings in each of the 89 — about 27 000 passes with
+//! no sample over 200 000 ns at all, so the 90th percentile was far under it.
+//! **Against the gate**: the other two runs are censored exactly where the
+//! count lives, because the machine halted at the first crossing and could
+//! never have shown a second; and the correlated shape is not hypothetical —
+//! this file's own dev-host measurements reached 14 and 19 passes over budget
+//! out of ~140, which is 10–13 % and reds a 90th percentile outright. That was
+//! emulator contention rather than hypervisor steal, but it is the same class
+//! and this gate cannot tell the two apart.
+//!
+//! So **a p90 red on a busy CI day is a thing this gate can produce for reasons
+//! the kernel did not cause**, it is adjudicated in `src/redlist.rs` like any
+//! other composed-quantity red, and
+//! `specs/issues/kernel/the-p90-pass-cost-gate-rests-on-an-observed-steal-rate.md`
+//! names the two instruments that would replace the rate with a measurement.
+//!
 //! **And the sample is small, which is what decides which quantile.** The only
 //! workload that boots this kernel is `sched_check_build`'s, and a whole boot
 //! plus `sched_stress` takes about 150 passes per CPU — a quantum is 10 ms, so

@@ -197,6 +197,16 @@ guest time, and `tests/common/passcost.rs` reads and judges it.
   pass is a block or a wake and not a tick. A 90th percentile over 150 samples
   has fifteen above it; a 99th has one and a half.
 
+**And the fraction is where this file's reasoning is weakest, which is its own
+open entry.** "Nine in ten" rests on the claim that a busy host reaches a handful
+of passes rather than a tenth of them — an *observed rate* on this
+infrastructure, not a bound, and one the two red runs above cannot support
+because the machine halted at the first crossing and could never have shown a
+second. The counts are censored where the magnitudes were.
+`specs/issues/kernel/the-p90-pass-cost-gate-rests-on-an-observed-steal-rate.md`
+carries that, with the measurement that makes it concrete rather than
+speculative and the two instruments that would settle it.
+
 **Why the gate is green where the assert was, on the same evidence that opened
 this file.** Invariant P asserted every pass under 200 000 ns and was green on 89
 of these 91 KVM runs. In each of those 89, every sample was under the budget, so
