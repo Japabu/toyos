@@ -147,6 +147,13 @@ changes.
 - **`wall_clock_file`** — added 2026-08-17, same session, **1 of 6**,
   `ALONE … GREEN`, green on all twelve shards of the same tree. Not
   investigated further.
+- **`log_poll_outlives_a_close`** — added 2026-08-17, **1 of 3** full
+  `cargo test` runs on `wt/toyos-panicstall`, whose whole delta is the harness's
+  panic vocabulary, with a second worktree's suite holding guest slots
+  throughout — `toyos-i8042fix` names this very test in that run's
+  `[host-slots]` lines. `the close probe exited Some(1)`, `ALONE … GREEN`, and
+  `cargo run -- --known-red log_poll_outlives_a_close` answers `NOT ON THE
+  LIST`, so this is its first recorded sighting. Not investigated.
 
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits

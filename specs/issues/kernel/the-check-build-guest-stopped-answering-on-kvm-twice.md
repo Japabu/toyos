@@ -70,6 +70,9 @@ times budget.
 
 ## Why the harness called a panic a stall
 
+*As it was on 2026-08-16. It is not that any more — see item 2 of what is owed —
+and the paragraphs below are kept as the record of what produced this verdict.*
+
 `tests/common/qemu.rs` holds two waits with two different vocabularies for a
 fatal line, and only one of them is complete.
 
@@ -163,14 +166,16 @@ name lives, not one chance in twelve twice.
 1. **`toyos-sched`** — the pass-cost distribution above, in `feature = "check"`.
    It is the only thing that turns this from a rate into a cause. **Done**, and
    what it turned into is below.
-2. **`tests/common/qemu.rs`** — `run_test_paced` should recognise the same fatal
-   lines `wait_for_ready` already does, and every caller that reports
-   `result.error` should report `before` with it. **Proposed, not done here**:
-   it is the guard machinery every test in the suite runs through, the naive
-   patch is not safe, and it is filed with its own owner at
-   `specs/issues/build/a-kernel-rust-panic-during-a-test-reads-as-a-stall.md`.
-   Nothing in this file waits on that; the verdict above is already decided
-   without it.
+2. **`tests/common/qemu.rs`** — half done. `run_test_paced`, `wait_for_ready`
+   and `await_guest` now read one vocabulary in `tests/common/serial.rs`, so a
+   kernel panic during a test ends the run at the silence bound and the verdict
+   names the panic instead of the guard; a *staged* one was measured at 18 s
+   against 171 s of ceiling. The half still owed is the other one —
+   every caller that reports `result.error` should report `before` and `started`
+   with it, which is what would have made the first sighting readable:
+   `specs/issues/build/a-failure-message-drops-the-lines-before-the-test-started.md`.
+   Nothing in this file waits on either; the verdict above is already decided
+   without them.
 
 ## What the measurement became, and what is claimed now
 
