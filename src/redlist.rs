@@ -1323,12 +1323,24 @@ pub const KNOWN_RED: &[Red] = &[
                only after draining and finding nothing (`:693`), with the port-drain loop between \
                them, while `report_health` computes `carried = IRQS - EMPTY_IRQS` (`:390`) and \
                prints whenever `carried > 0`. A reader landing inside that window sees \
-               `carried = 1` for an interrupt that carried nothing, and prints this row's line \
-               exactly. The window is the bring-up polling init this row always named. Observed \
+               `carried = 1` for an interrupt that carried nothing. Observed \
                again 2 of 6 full suites on 2026-08-17 (`1 interrupts and 0 bytes … first seen at \
                449ms`, PR #106's author, on a tree containing the fix). Whether the test half — \
                anchoring on `===I8042_READY===` — holds is a separate question and is not decided \
-               here",
+               here. \
+               \n\n**The withdrawal above went on to say the torn read `prints this row's line \
+               exactly`, and that clause was wrong** (corrected 2026-08-17, PR #112). The torn \
+               read is real and is fixed, but it is not what produced this line, and the boot \
+               order says so: the reporting CPU is `cpu1`, an AP, and `i8042::init` runs on the \
+               BSP *before* `smp::boot_aps` — so at the bring-up interrupt this row always named \
+               there is no second CPU in existence to land inside the ISR's window. What did \
+               produce it is a different window in the same handler: `IRQS` was incremented on \
+               **entry**, ahead of the first `push_isr`, so a reader between the pin asserting and \
+               the first byte reaching the ring held a count of arrived bytes with no byte \
+               anywhere — `carried = 1`, `RX_BYTES = 0`, `has_bytes()` false, which is this line. \
+               Both windows close the same way and did, in PR #111. **The withdrawal itself \
+               stands**: retiring on reasoning alone was wrong whichever mechanism the reasoning \
+               named, and that is the half worth keeping",
         evidence: "fourteen full `cargo test` suites in one session on `wt/toyos-logd`: 2 of the 9 \
                    with the window bounded and 1 of the 5 without; `main` (4d8c2e9) 0 of 7 and \
                    this branch 0 of 5 before the byte ring went, both recorded in the source below",
@@ -1390,8 +1402,12 @@ pub const KNOWN_RED: &[Red] = &[
                exactly that. A bring-up race whose window is the driver's own polling init is what \
                a rate that moves with the host looks like; a defect in what this branch changed is \
                not. **Retired with the row above on 2026-08-16 and withdrawn with it on \
-               2026-08-17** — the torn read that row records is what this rate is a rate of, and a \
-               rate cannot be retired by a fix that does not reach its cause",
+               2026-08-17** — a rate cannot be retired by a fix that does not reach its cause. \
+               The withdrawal named the torn read as that cause and **that attribution was wrong** \
+               (corrected 2026-08-17, PR #112): this is a rate of the entry-time increment, not of \
+               the subtraction, for the reason the row above sets out — no AP exists to read \
+               anything at the bring-up interrupt. The withdrawal was still right to be made, \
+               which is the durable half of it",
         evidence: "ten consecutive full `cargo test` suites on `wt/toyos-logd`'s tip, loads \
                    6.4-9.7, immediately after the fourteen above",
         source: "specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md",

@@ -175,10 +175,36 @@ Independently observed while that was being written: 2 of 6 full suites on
 2026-08-17, `1 interrupts and 0 bytes … first seen at 449ms`, on a tree carrying
 the fix.
 
-**The lesson is about the shape of the claim, not this driver.** "Counted apart"
-is a statement about a settled pair; the report is made against an unsettled one.
-A fix that adds a second counter has to say at which instants the two agree, and
-that one never did.
+### The withdrawal named the wrong producer, and this is the correction
+
+The withdrawal went on to say the torn read "prints this row's line exactly".
+**That clause is wrong**, corrected 2026-08-17 (PR #112) by the author of the
+repair rather than by its author.
+
+The torn read was real and is fixed. But it is not what printed
+`[kernel 0.418 cpu1] i8042: 1 interrupts and 0 bytes, nothing decoded`, and the
+boot order is what settles it: the reporting CPU is **`cpu1`, an AP**, while
+`i8042::init` runs on the BSP *before* `smp::boot_aps` — so at the bring-up
+interrupt this entry is named for, there is no second CPU in existence to land
+inside the ISR's window. A reader has to exist before it can read anything torn.
+
+What did print it is a different window in the same handler, and the section
+below has it: `IRQS` was incremented on **entry**, ahead of the first
+`push_isr`, so a reader between the pin asserting and the first byte reaching the
+ring held a count of arrived bytes with no byte anywhere.
+
+**The withdrawal itself stands, and that is the half that matters.** Retiring on
+reasoning alone was wrong whichever mechanism the reasoning named — and the
+correction is an instance of the same failure one level up: a torn read was
+proved to exist and then asserted to be *the* producer of an observed line
+without checking that a reader could have been there. Proving a race exists and
+proving it is the one that fired are two claims, and the second needs its own
+evidence.
+
+**The lesson about the fix is about the shape of the claim, not this driver.**
+"Counted apart" is a statement about a settled pair; the report is made against
+an unsettled one. A fix that adds a second counter has to say at which instants
+the two agree, and that one never did.
 
 ## What actually fixed it, 2026-08-17
 

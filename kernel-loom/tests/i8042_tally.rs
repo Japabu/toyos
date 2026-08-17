@@ -4,16 +4,23 @@
 //! about *bytes* — and it decides whether to print it from how many interrupts
 //! carried one. That was two counters the ISR wrote at either end of its
 //! port-drain burst, subtracted by a reader on another CPU, and a reader landing
-//! between the two writes blamed an interrupt that had carried nothing. It fired
-//! about one full suite in three under load
-//! (`specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`).
+//! between the two writes blamed an interrupt that had carried nothing.
 //!
-//! **A rate is why this is a model and not a test.** The window is a handful of
-//! instructions on one CPU; no guest boot can be made to land in it on demand,
-//! and a green suite says nothing about whether it can still be landed in. What
-//! the property actually is — *at no instant may a reader see an empty interrupt
-//! counted as one that carried* — is a claim about every interleaving, which is
-//! what loom enumerates.
+//! **That torn read is not what produced the rate the write-up records.**
+//! `i8042_undecoded_bytes` at about one full suite in three under load came from
+//! the same handler counting on the way *in*, ahead of any byte reaching the
+//! ring, which needs no subtraction at all; the boot-order argument is in
+//! `specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`.
+//! One word closes both. The distinction is written here because blaming a
+//! proved race for an observed line, without checking that a reader could have
+//! been there, is the mistake this file exists downstream of.
+//!
+//! **A rate is why this is a model and not a test.** Either window is a handful
+//! of instructions on one CPU; no guest boot can be made to land in one on
+//! demand, and a green suite says nothing about whether it can still be landed
+//! in. What the property actually is — *at no instant may a reader see an empty
+//! interrupt counted as one that carried* — is a claim about every
+//! interleaving, which is what loom enumerates.
 //!
 //! Three directions, and the third is the one that makes the first two mean
 //! anything:
