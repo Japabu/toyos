@@ -917,23 +917,28 @@ fn assert_actuators_match_features(root: &Path, features: &str, kernel: &[u8]) {
     );
 }
 
-/// The scheduler core's `feature = "check"` asserts, by their own panic text,
-/// and the two kernels that must disagree about carrying them.
+/// The scheduler core's `feature = "check"` instruments, by their own text, and
+/// the two kernels that must disagree about carrying them.
 ///
-/// Every one of these is a `#[cfg(feature = "check")]` site in `toyos-sched`:
-/// invariant P is `cpu::check_pass_duration`'s budget, and the other two are
-/// `invariants::check_cpu` — invariant T's armed-timer bound and the
-/// container-versus-state-word agreement. Their format strings are the only
-/// part of the check build with a literal the linker keeps, which is what makes
-/// the artifact answerable at all.
-const SCHED_CHECK_ASSERTS: [&str; 3] = [
-    "invariant P: a scheduler pass took",
+/// Every one of these is a `#[cfg(feature = "check")]` site in `toyos-sched`.
+/// Two are asserts from `invariants::check_cpu` — invariant T's armed-timer
+/// bound and the container-versus-state-word agreement. The third is the
+/// pass-cost report (`cpu::PassCostReport::PREFIX`), which is a *measurement*
+/// and not an assert: a pass's elapsed time includes any interval a hypervisor
+/// took the CPU away, so it is recorded and gated in the harness rather than
+/// panicked over. Their format strings are the only part of the check build
+/// with a literal the linker keeps, which is what makes the artifact answerable
+/// at all — and the report's literal is kept out of the shipping kernel by
+/// nothing but dead-code elimination, which the `want == false` direction below
+/// is what checks.
+const SCHED_CHECK_LITERALS: [&str; 3] = [
+    "sched-check pass-costs cpu=",
     "invariant T: cpu",
     "disagrees with its state word",
 ];
 
-/// Refuse to write an image whose scheduler asserts do not match the feature
-/// set that decides whether they exist.
+/// Refuse to write an image whose scheduler instruments do not match the
+/// feature set that decides whether they exist.
 ///
 /// [`assert_actuators_match_features`]'s shape and its reason: the property is
 /// about the artifact, so the artifact is what is asked, and a convention
@@ -943,10 +948,10 @@ const SCHED_CHECK_ASSERTS: [&str; 3] = [
 /// works at all.
 ///
 /// This is the half of the check-build gate that a booted guest cannot supply.
-/// A guest proves the asserts did not *fire*; a kernel with the feature quietly
-/// dropped proves that too, and rather more easily. Measured on the two binaries
-/// this build produces: 0 of 3 in the shipping kernel, 3 of 3 in the
-/// `sched-check` one.
+/// A guest proves the asserts did not *fire* and the report was published; a
+/// kernel with the feature quietly dropped proves the first of those too, and
+/// rather more easily. Measured on the two binaries this build produces: 0 of 3
+/// in the shipping kernel, 3 of 3 in the `sched-check` one.
 fn assert_sched_check_matches_features(features: &str, kernel: &[u8]) {
     let want = match features {
         "" => false,
@@ -957,17 +962,17 @@ fn assert_sched_check_matches_features(features: &str, kernel: &[u8]) {
         let needle = needle.as_bytes();
         kernel.windows(needle.len()).any(|w| w == needle)
     };
-    let wrong: Vec<&&str> = SCHED_CHECK_ASSERTS.iter().filter(|a| named(a) != want).collect();
+    let wrong: Vec<&&str> = SCHED_CHECK_LITERALS.iter().filter(|a| named(a) != want).collect();
     assert!(
         wrong.is_empty(),
-        "the {} kernel {} {} of the {} scheduler check asserts: {wrong:?}.\n\
+        "the {} kernel {} {} of the {} scheduler check instruments: {wrong:?}.\n\
          `sched-check` forwards to `toyos-sched/check`, so a build that carries the feature \
-         and not the asserts is a check build in name only — which is what a green \
+         and not the instruments is a check build in name only — which is what a green \
          `sched_check_build` would then be certifying.",
         if want { "sched-check" } else { "shipping" },
         if want { "is missing" } else { "names" },
         wrong.len(),
-        SCHED_CHECK_ASSERTS.len(),
+        SCHED_CHECK_LITERALS.len(),
     );
 }
 

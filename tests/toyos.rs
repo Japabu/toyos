@@ -484,12 +484,23 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // `desktop_window_child` carries, not a reclassification.
     ("fpu_isolation", Sched::Parallel, Tier::Nightly),
     // The fourth declared kernel build, booted so that the scheduler core's
-    // `feature = "check"` asserts are compiled and executed by a CI run at all.
-    // Parallel: every verdict is an exit code, a stdout line or a clean serial,
-    // and the one number in it — invariant P's 200 µs — is a bound the *guest*
-    // measures against its own TSC inside a single scheduler pass, which no
-    // amount of host load lengthens. A pass is preempt-off by construction.
-    ("sched_check_build", Sched::Parallel, Tier::Fast),
+    // `feature = "check"` instruments are compiled and executed by a CI run at
+    // all. One of its verdicts is a *quantile* of the guest's published
+    // pass-cost distribution, which is wall clock across a scheduler pass.
+    //
+    // **Serial, and it used to say `Parallel` for a reason that was wrong.**
+    // The old note read "a bound the guest measures against its own TSC inside
+    // a single scheduler pass, which no amount of host load lengthens. A pass
+    // is preempt-off by construction." Preempt-off stops the *guest's*
+    // scheduler and stops nothing above it: the guest's TSC advances while the
+    // host has the vCPU, which is why invariant P panicked on a KVM shard at
+    // 200569 ns and why it is a measurement now. Measured here, 2026-08-17, one
+    // suite: alone on a quiet host (1.02x the reference boot) cpu0 reports
+    // `168 passes, p50 < 16384 ns, p90 < 131072 ns` and passes; in the same
+    // run's 12-wide phase, `134 passes, p50 < 131072 ns, p90 < 262144 ns` and
+    // it reds. Host contention moves this guest's median by a factor of eight,
+    // which is the definition of a test that must have the machine to itself.
+    ("sched_check_build", Sched::Serial, Tier::Fast),
     ("short_sleep_livelock", Sched::Parallel, Tier::Fast),
     // The kernel thread and the row that says what its panic means. Two
     // boots, both headless: the second one halts on purpose — and the pair
@@ -8065,7 +8076,15 @@ fn run_machine_test(
         }
         // No guest: the instrument itself, in both directions. `screen_decoder`
         // is the same idea for the framebuffer decoder.
-        "serial_vocabulary" => serial::self_check(),
+        //
+        // Three of them under one name, because they are one subject: what a
+        // console line says died, what a wait does about it, and the fact that
+        // only one place in the harness is allowed to answer either.
+        "serial_vocabulary" => {
+            serial::self_check()?;
+            qemu::ceiling_self_check()?;
+            one_vocabulary()
+        }
         "suspend_detector" => common::clock::self_check(),
         "suspend_invalidates_a_verdict" => suspend_invalidates_a_verdict(),
         "stall_is_not_a_verdict" => stall_is_not_a_verdict(),
@@ -8258,25 +8277,36 @@ fn run_machine_test(
             Ok(())
         }
         "sched_check_build" => {
-            // The scheduler core's own asserts, run on a real machine — spec
-            // §10.2's on-target counterpart to everything the simulator does.
+            // The scheduler core's own instruments, run on a real machine —
+            // spec §10.2's on-target counterpart to everything the simulator
+            // does.
             //
             // `kernel/Cargo.toml` has forwarded `sched-check =
             // ["toyos-sched/check"]` since the check build was written, and
             // until this test nothing in `src/` or `tests/` ever asked for it.
-            // So `cpu::MAX_PASS_NS`, invariant P and `invariants::check_cpu`
-            // were compiled by no CI run at all: a quantum never armed, a task
-            // whose container disagreed with its state word, and a pass that
-            // blew its 200 µs budget were each caught by nothing on hardware,
-            // however green the simulator was.
+            // So `cpu::MAX_PASS_NS`, the pass-cost measurement and
+            // `invariants::check_cpu` were compiled by no CI run at all: a
+            // quantum never armed, a task whose container disagreed with its
+            // state word, and a distribution of passes with mass over the
+            // budget were each caught by nothing on hardware, however green the
+            // simulator was.
             //
-            // **What the simulator cannot say.** Two of the three asserts are
-            // about state, and the sim checks those globally and better. The
-            // third is about *cost*, and the sim's clock does not advance inside
-            // a step — `scenarios::overlong_pass` exercises it against a
-            // modelled pass cost, which proves the assert compiles and fires,
-            // not that a real pass on real silicon fits in 200 µs. Only a booted
-            // kernel reads a TSC.
+            // **What the simulator cannot say.** Two of the three instruments
+            // are asserts about state, and the sim checks those globally and
+            // better. The third is a measurement of *cost*, and the sim's clock
+            // does not advance inside a step — `scenarios::overlong_pass` feeds
+            // the recorder a modelled pass cost, which proves the recorder
+            // compiles and counts, not what a real pass on real silicon costs.
+            // Only a booted kernel reads a TSC.
+            //
+            // **And the cost half is gated here rather than in the kernel.**
+            // What a pass measures is wall clock across the pass, and a guest's
+            // wall clock runs while the host has taken its vCPU away — so the
+            // quantity includes a term the host's scheduler sets. The check
+            // build publishes the distribution and `common::passcost` judges it;
+            // `passcost`'s own two-directions self-check runs first, because a
+            // gate that must stay green under host descheduling has to be shown
+            // doing so on a case no booted machine can stage.
             //
             // **The workload is `sched_stress`** because the asserts are dense
             // on exactly what it does: it spawns burners that drive vruntime,
@@ -8293,6 +8323,7 @@ fn run_machine_test(
             // 0 of 3 assert texts in the shipping kernel, 3 of 3 in this one.
             // This half is the other one: on a machine that really carries them,
             // honest work does not trip them.
+            common::passcost::self_check()?;
             let mut qemu = QemuInstance::boot_with_options(
                 test_config,
                 c_bins,
@@ -8326,6 +8357,29 @@ fn run_machine_test(
             serial::Serial::named("test serial", result.serial.as_str()).must_be_clean()?;
             for line in result.stdout.lines() {
                 eprintln!("  [sched-check] {}", line.trim());
+            }
+            // The whole boot, in the three pieces a capture comes in: the ready
+            // marker, the hole after it, and the test window. The counters are
+            // cumulative since boot, so the last line each CPU published is the
+            // whole of that CPU's run.
+            let mut capture = serial::Serial::boot(&qemu);
+            capture.push(&result.before);
+            capture.push(&result.serial);
+            let reports = common::passcost::reports(capture.text());
+            if reports.is_empty() {
+                return Err(format!(
+                    "the check build published no pass-cost report at all, so nothing above \
+                     gated what a pass costs — every pass on this boot went unmeasured or \
+                     unspoken. `{}` is the prefix that never appeared:\n{}",
+                    toyos_sched::cpu::PassCostReport::PREFIX,
+                    capture.text(),
+                ));
+            }
+            for report in &reports {
+                eprintln!("  [sched-check] {}", common::passcost::describe(report));
+            }
+            for report in &reports {
+                common::passcost::verdict(report)?;
             }
             Ok(())
         }
@@ -11852,6 +11906,80 @@ fn expected_failure_exit_status() -> Result<(), String> {
     if before_review.exit_code() != 0 {
         return Err("an entry whose review date has not arrived reds anyway".to_string());
     }
+    Ok(())
+}
+
+/// A wait that hands a death spelling to a scan of its own, asked of the
+/// harness's source.
+///
+/// **The one place the vocabulary lives is the whole of the fix, so this is
+/// what keeps it the one place.** `tests/common/qemu.rs` holds three waits on a
+/// guest and they used to disagree: the boot half ended on three spellings, the
+/// test half on one and `await_guest` on none at all — so a Rust `panic!` in the
+/// kernel matched nothing while a test was running, the machine halted every
+/// CPU, and the guard expired onto a verdict saying the guest had stopped
+/// answering. All three ask `serial::died` now, which is the only thing in the
+/// harness that knows the words and the only thing that knows the prefix decides
+/// whose death they report.
+/// `specs/issues/build/every-recorded-stall-predates-the-panic-discriminator.md`
+/// is what the years before it are worth.
+///
+/// The way that comes back is the obvious patch: one more spelling handed
+/// straight to a `contains` beside the call. It would match a *program's* panic
+/// as readily as the kernel's and take the run down with a guest binary that
+/// was expected to die — so the shape is refused by name rather than left to a
+/// reviewer. Comment lines go first: this file argues about these words at
+/// length, and prose is not a second answer.
+fn hand_rolled_deaths(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        for word in serial::spellings() {
+            // The shape is the spelling as somebody's first argument —
+            // `contains`, `starts_with`, `find`, any of them. A spelling
+            // *inside* a longer staged line is how this file's own gates build
+            // their inputs, and those are not scans.
+            if line.contains(&format!("(\"{word}")) {
+                found.push(format!("{}:{}: {}", n + 1, word, line.trim()));
+            }
+        }
+    }
+    found
+}
+
+/// [`hand_rolled_deaths`] over the file that has to stay clean, with its own
+/// bad input beside it so a check that stopped finding anything says so.
+fn one_vocabulary() -> Result<(), String> {
+    const FILE: &str = "tests/common/qemu.rs";
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(FILE);
+    let text = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let found = hand_rolled_deaths(&text);
+    if !found.is_empty() {
+        return Err(format!(
+            "{FILE} scans for a death spelling itself, and `serial::died` is where that is \
+             decided for every wait at once — a second answer here is what let a kernel panic \
+             read as a stall, and it matches a program's own panic besides:\n  {}",
+            found.join("\n  ")
+        ));
+    }
+    // The negative control. Every line of it is a shape this must name, and the
+    // last two are shapes it must not: prose, and a staged capture built out of
+    // the same words.
+    let staged = "\
+        } else if line.contains(\"KERNEL PANIC\") {\n\
+        if line.starts_with(\"SEGFAULT\") {\n\
+        // ends on `PANIC:` and nothing else, which is the defect\n\
+        const KERNEL: &str = \"[kernel 1.450 cpu3] PANIC: panicked at reserve.rs:812:9:\";\n";
+    let named = hand_rolled_deaths(staged);
+    if named.len() != 2 {
+        return Err(format!(
+            "the check names {} of the two hand-rolled scans staged for it: {named:?}",
+            named.len()
+        ));
+    }
+    eprintln!("  [vocabulary] {FILE} asks `serial::died` and nothing else");
     Ok(())
 }
 
