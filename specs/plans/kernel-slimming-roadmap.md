@@ -7,18 +7,32 @@
 
 ## Move 1 — the userland loader (pipeline 5)
 
-The largest untrusted-input parser left in Ring 0 is program loading past the
-minimum: relocations, symbol resolution, TLS layout, and the dlopen family all
-operate on attacker-supplied bytes in privileged code, and the class has
-already produced real defects (`sys_dlopen`'s `init_out` kernel-address write;
-dlopen's missing dedup). No production kernel dynamic-links userland.
+Program loading past the minimum — relocations, symbol resolution, TLS layout
+and the dlopen family — operates on attacker-supplied bytes in privileged code.
+It is not the largest such parser in Ring 0, as this paragraph claimed until it
+was measured: filesystem and USB are both larger, and program loading is third.
+What it is instead is the only large one whose input an unprivileged process
+writes byte by byte, and the one holding the most privileged `unsafe`. No
+production kernel dynamic-links userland.
 
 The end state: the kernel maps the `PT_LOAD`s of a static-PIE image and jumps;
 everything else runs in a Ring 3 loader inside the target's own address space,
 holding only the file handles it was endowed, where a crafted binary can only
-corrupt itself. `SYS_DLOPEN`, `SYS_DLSYM` and `SYS_DLCLOSE` retire (numbers
-never reused). Spec first, house style; the crafted-ELF corpus becomes the
-negative gate against a kernel that no longer parses most of it.
+corrupt itself. Five syscalls retire, not the three this paragraph first named
+(numbers never reused). Spec first, house style; the crafted-ELF corpus becomes
+the negative gate against a kernel that no longer parses most of it.
+
+**Sized and decided by `specs/assessments/2026-08-17-move1-loader-scoping.md`,
+which is the arbiter for every number above.** The move is worth doing on
+evidence the paragraph above did not have: nine dated commits over eleven days
+fixed userland-reachable kernel defects in this code, six of them machine-wide
+panics; seven of the loader's twelve bounds are over quantities a workload sets
+and two have no bound at all; and two of those ceilings are *already* exceeded
+by artifacts this tree builds. **It has a deadline.** Nothing shipped is
+dynamically linked today, so the move is pure deletion — the day `hosted-rustc`
+turns on, a very large shared object is dlopened into a kernel whose cache never
+evicts, and every one of those bounds becomes load-bearing at once. Do it after
+the completion architecture lands and before that day.
 
 Independent of the completion architecture; may run as soon as a slot frees.
 
@@ -36,6 +50,13 @@ covers early boot; what mounts `/boot` and `/home`, and with what authority,
 is the spec's first question).
 
 ## Move 3 — symbol machinery onto the pure crate (small, independent)
+
+**Partly overtaken: verify what is left before planning this.** Wave A of the
+2026-08-15 consolidation audit moved the symbol machinery onto `toyos-elf` and
+retired the bootloader's second decoder, so the premise below — that
+`kernel/src/symbols.rs` and a sibling hold their own symtab walks — was false as
+of 2026-08-17. What remains of this move is the `rustc-demangle` question in the
+paragraph after it, which stands untouched.
 
 ELF parsing is already `toyos-elf/` (pure, `forbid(unsafe_code)`, crafted +
 real corpus). But `kernel/src/symbols.rs`'s panic-time resolver re-implements
