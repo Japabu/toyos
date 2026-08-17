@@ -14,8 +14,6 @@ pub mod virtio_sound;
 pub mod gop;
 pub mod hda;
 pub mod panic_console;
-#[cfg(feature = "boot-actuators")]
-pub mod hda_probe;
 
 use alloc::vec::Vec;
 use crate::mm::pmm::PhysPage;

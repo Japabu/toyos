@@ -119,7 +119,24 @@ pub fn idle_stack_guard(
 
     writeln!(qemu.stdin_mut(), "run test_rs_test_panic_child 9").expect("write to QEMU stdin");
     qemu.flush_stdin();
-    let log = qemu.drain_serial(Duration::from_secs(20));
+    // Until the page walk, not for twenty seconds — `double_fault_stack`'s
+    // shape and for its reason: this fault is fatal, so `halt_all_cpus` stops
+    // every CPU without QEMU exiting and a plain drain has nothing left to
+    // disconnect it. `debug_page_walk` is the last thing any assertion below
+    // reads (PDPTE, then the PDE carrying `PS=`, then this line), and it runs
+    // early in the crash report, so what follows on the wire — registers,
+    // backtrace, stack — is diagnostic that nothing here asks for. A boot where
+    // the guard is *not* there prints no page walk at all, which is the
+    // `debug syscall returned` arm below: it pays the whole ceiling and then
+    // reds, which is the right way round.
+    //
+    // **The three spaces are load-bearing.** `PDPTE:` one level up contains
+    // `PTE:` as a substring, so the obvious predicate ends the drain two lines
+    // early and reds a green machine with `the crash report's page walk does
+    // not show a split leaf` — measured, on this change's first run.
+    // `mm::paging::debug_page_walk` writes `PTE:   {:#018x}`, which is the
+    // spelling the assertion below reads too.
+    let log = qemu.drain_until(Duration::from_secs(20), |line| line.contains("PTE:   0x"));
 
     // The premise: which address the kernel went for. Without it every
     // assertion below could be satisfied by a fault somewhere else.
@@ -337,7 +354,22 @@ pub fn dump_nmi_probe(
     // once per idle-loop iteration, and on a settled guest the next thing that
     // wakes it is the 10 s health tick. Add 400 ms of deafness and the dump's
     // 250 ms kick budget, and 20 s is the first round number that clears it.
-    let log = qemu.drain_serial(Duration::from_secs(20));
+    //
+    // **A ceiling now rather than the run.** The guest neither exits nor halts
+    // here — an NMI interrupts a CPU, it does not kill it — so a plain drain
+    // paid the whole twenty seconds on every green run, against a guest that
+    // was done in about a third of it. Both markers, and neither implies the
+    // other's order: the dump is requested while the victim is deaf and the
+    // victim announces its own return when the 400 ms window closes, so which
+    // of the two lands last is a fact about how long the report takes rather
+    // than about the machine.
+    let dumped = std::cell::Cell::new(false);
+    let rejoined = std::cell::Cell::new(false);
+    let log = qemu.drain_until(Duration::from_secs(20), |line| {
+        dumped.set(dumped.get() || line.contains("=== end of dump ==="));
+        rejoined.set(rejoined.get() || line.contains("rejoined after"));
+        dumped.get() && rejoined.get()
+    });
 
     if !log.contains("=== blocked-task dump:") {
         return Err(format!("the dump never ran — is `dump-deaf-cpu` on?\n{log}"));

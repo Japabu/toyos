@@ -122,10 +122,10 @@ pub fn tsc_deadline(nanos: u64) -> u64 {
 /// it was waiting on.
 ///
 /// **The one bounded wait a driver spins in, and it reads the TSC rather than
-/// the nanosecond clock.** This body was written three times — `drivers/hda.rs`,
-/// `drivers/hda_probe.rs` and `drivers/xhci/wait/mod.rs`, byte-identical apart
-/// from which constant each named — and all three read [`nanos_since_boot`] per
-/// iteration, whose 128-bit divide is an out-of-line `compiler_builtins` call.
+/// the nanosecond clock.** This body was written twice — `drivers/hda.rs` and
+/// `drivers/xhci/wait/mod.rs`, byte-identical apart from which constant each
+/// named — and both read [`nanos_since_boot`] per iteration, whose 128-bit
+/// divide is an out-of-line `compiler_builtins` call.
 /// [`tsc_deadline`] and a 64-bit compare inline, which is why
 /// `src/redlist.rs`'s `dump_nmi_probe` red was retired on this form: a spin
 /// that calls out of itself is a spin an instruction-pointer sample attributes

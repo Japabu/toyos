@@ -35,6 +35,36 @@ referenced, and a plan references its spec, never the reverse. No
 self-reference and no slogans. The testing documents are the one exception
 for naming instruments and tests: there, the instruments are the subject.
 
+## Before a spec exists
+
+A proposed permanent concept earns its document by surviving three questions,
+answered in writing before the document is started. The answers are a
+paragraph each; this is minutes of work, and it is cheaper than every
+instrument that would otherwise be built to verify a concept that should not
+exist.
+
+**Necessity.** Delete the proposed concept. Which required property can no
+longer be guaranteed by the concepts that already exist? Name the workload
+that demonstrates the loss, and state the property without using the proposed
+concept's own vocabulary. No workload, no concept. Where the honest answer is
+that an existing concept must grow a second job, the answer is to merge and
+not to add.
+
+**Scaling.** For every quantity in every bound the proposal states: who sets
+it — the kernel, the hardware, or the workload? A guarantee that omits a term
+the workload sets is refused rather than repaired, and a constant derived from
+an assumed rate is a guarantee of that kind.
+
+**Authority.** Does the mechanism assert what its own site observes, or does
+it predict what another site will do later? A prediction becomes measurement,
+accounting, or policy. It does not become an invariant.
+
+An architecture document — one that states permanent concepts rather than one
+subsystem's semantics — carries the surviving answers: one sentence per
+concept, and a ledger of concepts, mechanisms, invariants and gates before the
+design and after it. That is the one justification a document here may carry,
+and it is carried because a later reader needs it to delete the concept again.
+
 ## Checking a spec against the tree it describes
 
 A spec is read before its subsystem is touched, so a false claim propagates
