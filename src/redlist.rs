@@ -1291,21 +1291,27 @@ pub const KNOWN_RED: &[Red] = &[
         test: "i8042_undecoded_bytes",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(3, 14),
-        standing: Standing::Retired(
-            "both halves the write-up sanctions landed 2026-08-16: the driver claims `nothing \
-             decoded` only when something arrived to decode (an interrupt the ISR found no byte \
-             behind is counted apart and said in its own words), and the test reads its lines from \
-             `===I8042_READY===` — the marker its injection is timed off — so a bring-up line \
-             cannot be read as the Pause's. **Not cover for the CI row under this name**, which is \
-             a different producer",
-        ),
+        standing: Standing::Stands,
         what: "`the line names no byte: [kernel 0.418 cpu1] i8042: 1 interrupts and 0 bytes, \
                nothing decoded — first seen at 418ms`. The test takes the *first* `nothing \
                decoded` line in the capture and assumes it is the one its injection produced, and \
                an interrupt whose byte the driver's own polling init already consumed produces an \
                earlier one. **The isolated re-run answered differently on the two arms** — `red \
                again` on one occurrence and `ALONE: GREEN` on the other — which is itself evidence \
-               that the timing and not the arm decides it",
+               that the timing and not the arm decides it. \
+               \n\n**Retired 2026-08-16, and the retirement is withdrawn 2026-08-17: the driver \
+               half does not hold.** It claimed the driver says `nothing decoded` only when \
+               something arrived to decode. It does not, because the two counters that decide are \
+               read torn: the ISR adds to `IRQS` on entry (`i8042/mod.rs:663`) and to `EMPTY_IRQS` \
+               only after draining and finding nothing (`:693`), with the port-drain loop between \
+               them, while `report_health` computes `carried = IRQS - EMPTY_IRQS` (`:390`) and \
+               prints whenever `carried > 0`. A reader landing inside that window sees \
+               `carried = 1` for an interrupt that carried nothing, and prints this row's line \
+               exactly. The window is the bring-up polling init this row always named. Observed \
+               again 2 of 6 full suites on 2026-08-17 (`1 interrupts and 0 bytes … first seen at \
+               449ms`, PR #106's author, on a tree containing the fix). Whether the test half — \
+               anchoring on `===I8042_READY===` — holds is a separate question and is not decided \
+               here",
         evidence: "fourteen full `cargo test` suites in one session on `wt/toyos-logd`: 2 of the 9 \
                    with the window bounded and 1 of the 5 without; `main` (4d8c2e9) 0 of 7 and \
                    this branch 0 of 5 before the byte ring went, both recorded in the source below",
@@ -1352,18 +1358,16 @@ pub const KNOWN_RED: &[Red] = &[
         test: "i8042_undecoded_bytes",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(6, 10),
-        standing: Standing::Retired(
-            "the same two halves as the fourteen-suite row, 2026-08-16. The rate this row measures \
-             is the bring-up line's, and the gate can no longer read one: what it reads now begins \
-             at the marker its injection is timed off",
-        ),
+        standing: Standing::Stands,
         what: "the same line, and **the rate tracks host load** — 6 of 10 with the suites run back \
                to back and the load average never below 6.4, against the 3 of 14 above with the \
                host allowed to settle between them, on one tree in one session. The harness's \
                isolated re-run answered `ALONE: GREEN` on these, which is the class name for \
                exactly that. A bring-up race whose window is the driver's own polling init is what \
                a rate that moves with the host looks like; a defect in what this branch changed is \
-               not",
+               not. **Retired with the row above on 2026-08-16 and withdrawn with it on \
+               2026-08-17** — the torn read that row records is what this rate is a rate of, and a \
+               rate cannot be retired by a fix that does not reach its cause",
         evidence: "ten consecutive full `cargo test` suites on `wt/toyos-logd`'s tip, loads \
                    6.4-9.7, immediately after the fourteen above",
         source: "specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md",
