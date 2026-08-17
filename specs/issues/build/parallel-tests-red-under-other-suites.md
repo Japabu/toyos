@@ -144,6 +144,25 @@ changes.
   reaping processes. One extra `Process` between two samples is another test's
   reap that had not landed yet, and nothing in that boot arranges for it not to
   be. Still `Sched::Parallel`.
+
+  **It has since fired on CI, byte-identical, which is what this bullet said it
+  had not done.** Run `32047352064`, job `95438242676` (`guest (2)`),
+  `wt/toyos-invariantp` at its merge of `origin/main`, 2026-08-17: the same
+  `[("Process", 6, 7)]`, the same `ALONE … GREEN`, shard 2's other twelve names
+  passing. The sentence above recording it "green on all twelve KVM shards"
+  stays true of the tree it was taken on and is no longer true of the name.
+
+  **That cuts against half of this bullet's explanation and leaves the other
+  half standing.** A CI shard is one guest per machine with `--jobs 1`, so
+  "another worktree's suite on the host" cannot be what did it there. What
+  survives, and is the half that was always the load-bearing one, is the
+  *shared boot*: the census is machine-wide and a shard runs its whole tier
+  through one guest, so a co-resident test's unreaped `Process` perturbs it
+  whatever else the host is doing. **Consistent with that mechanism, not
+  established as it** — nothing in the capture identifies which process the
+  extra object belonged to, and the assertion prints a type and a count rather
+  than an owner. Making it print the owner is the cheap next step if this
+  recurs, and it is what would turn a consistent story into a measured one.
 - **`wall_clock_file`** — added 2026-08-17, same session, **1 of 6**,
   `ALONE … GREEN`, green on all twelve shards of the same tree. Not
   investigated further.

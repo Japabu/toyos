@@ -1561,22 +1561,59 @@ pub const KNOWN_RED: &[Red] = &[
     Red {
         test: "boot_partition_identity",
         instrument: Instrument::Ci,
-        finding: Finding::fires(1, 2),
+        finding: Finding::fires(1, 4),
         standing: Standing::Stands,
-        what: "the same panic again, byte for byte — `sshd: cannot bind 0.0.0.0:22: netd error` \
-               at `sshd/src/main.rs:359`, three lines after `sshd: starting...` and with \
-               `init: started test-runner` interleaved into the backtrace. **This is what turns \
-               the row above from a sighting into a rate**: two CI observations, two days and \
-               two trees apart, one guest per machine both times. The harness adjudicated it \
-               itself — `ALONE: GREEN, and it was alone both times — nothing the harness \
-               controls differed, so it failed once and passed once. That is a rate and not a \
-               classification`. Shard 1's other 173 names passed",
+        what: "**the same signature, and the producer is not established** — `sshd: cannot bind \
+               0.0.0.0:22: netd error` at `sshd/src/main.rs:359:23`, the identical bytes to the \
+               row above. That is as far as the message goes and this row goes no further: the \
+               write-up's own finding is that the std fork flattens every `io::Error` kind to \
+               the string `netd error`, so four candidate paths print this line and no capture \
+               of it can say which one ran. **What matches beyond the message is the timing \
+               shape**, which is the part worth recording: `spawn: /bin/sshd pid=6` at 0.559 s \
+               and `exit: netd pid=5 code=0` at 0.566 s, so the bind went into a teardown \
+               already in progress — the same direction as the earlier CI capture, where the \
+               gap was 23 ms, and the opposite of the clean-exit arm in the same write-up, \
+               where sshd started after netd was gone. `ALONE: GREEN, and it was alone both \
+               times — nothing the harness controls differed, so it failed once and passed \
+               once. That is a rate and not a classification`. Shard 1's other 173 names passed",
         evidence: "run 32044008591, job 95428160739 (`guest (1)`), PR #116 on \
                    `wt/toyos-invariantp` — a diff of documentation and `src/redlist.rs` strings \
                    with no code in it at all, which is what says the race is not the branch's. \
-                   The denominator is the two CI runs this branch dispatched: #113's twelve \
-                   shards were green under this name and #116's shard 1 was not",
+                   The denominator is this branch's four CI runs that reached a verdict — \
+                   32043101865, 32044008591, 32044756253 and 32047352064 — of which only the \
+                   second was red under this name; a fifth (32044676027) was cancelled and says \
+                   nothing",
         source: "specs/issues/build/sshd-panics-when-netd-exits-before-it-binds.md",
+        measured: "2026-08-17",
+    },
+    Red {
+        test: "handle_kill_policy",
+        instrument: Instrument::Ci,
+        finding: Finding::fires(1, 4),
+        standing: Standing::Stands,
+        what: "`16 more killed processes left more live objects behind: [(\"Process\", 6, 7)]` — \
+               `the_kills_release_what_they_held`'s machine-wide live-object census, one \
+               `Process` higher on the second sample than the first. `ALONE: GREEN, and it was \
+               alone both times — nothing the harness controls differed, so it failed once and \
+               passed once. That is a rate and not a classification`; shard 2's other twelve \
+               names passed. **The first CI sighting of a signature recorded so far only on the \
+               dev host**, where the write-up added it the same day at 1 of 6 and recorded it \
+               green on all twelve KVM shards of that tree. That bears on its explanation \
+               rather than its severity: the dev-host bullet leans partly on other *suites* \
+               sharing the machine, and a CI shard is one guest per machine with `--jobs 1`, so \
+               what survives here is the other half of it — a machine-wide census taken on a \
+               shared boot, perturbed by a co-resident test's reap that had not landed yet. \
+               **Consistent with that mechanism, not established as it**: nothing in this \
+               capture identifies which process the extra `Process` object belonged to",
+        evidence: "run 32047352064, job 95438242676 (`guest (2)`), `wt/toyos-invariantp` at its \
+                   merge of `origin/main`, so the tree carries main's own commits as well as \
+                   this branch's. **Not this branch's code, and that is checkable rather than \
+                   asserted**: the only kernel code this branch adds is behind `sched-check` \
+                   (forwarding to `toyos-sched/check`), `handle_kill_policy` boots no such \
+                   kernel, and `src/build.rs`'s artifact gate measures 0 of 3 check-build \
+                   literals in the shipping image on every build. Same denominator as the row \
+                   above: this branch's four CI runs that reached a verdict, red in one",
+        source: "specs/issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-17",
     },
     Red {

@@ -94,29 +94,51 @@ boot each way is not a proof, but it is the pair the write-up's shortlist
 predicts: the losing path is mid-handshake against a netd that is still there,
 not a netd that has already gone.
 
-**A second CI sighting, two days and two trees later, makes it a rate.** Run
-`32044008591`, job `95428160739` (`guest (1)`), PR #116 on
-`wt/toyos-invariantp`, 2026-08-17 — the same panic at the same line, and the
-victim is `boot_partition_identity` for the third time:
+**A second CI sighting, two days and two trees later.** Run `32044008591`, job
+`95428160739` (`guest (1)`), PR #116 on `wt/toyos-invariantp`, 2026-08-17 — the
+same line at the same site, and the victim is `boot_partition_identity` for the
+third time:
 
 ```
+[kernel 0.529 cpu0] spawn: /bin/netd pid=5 …
+netd: no NIC on this machine, exiting
 [kernel 0.559 cpu0] spawn: /bin/sshd pid=6 …
 init: started sshd
 sshd: starting...
 thread 'main' (1) panicked at sshd/src/main.rs:359:23:
 sshd: cannot bind 0.0.0.0:22: netd error
 init: started test-runner
-stack backtrace:
+[kernel 0.566 cpu0] exit: netd pid=5 code=0 cpu=16ms
+[kernel 0.690 cpu1] exit: sshd pid=6 code=101 cpu=111ms
 ```
 
+**The message is identical and that settles nothing about the producer**, which
+is this file's own central finding: four candidate paths print `netd error`
+because the std fork flattens every kind to that string, and this capture
+distinguishes them no better than the last one did. It is recorded as *same
+signature, producer unidentified*, and `src/redlist.rs`'s row says so in those
+words.
+
+**What it does add is a third point in the timing series, and it points the same
+way.** sshd spawned at 0.559 s and netd exited at 0.566 s — a **7 ms** gap, so
+the bind again went into a teardown that was in progress rather than finished.
+The 2026-08-15 CI panic had 23 ms in the same direction; the clean-exit arm in
+that same job had sshd start 5 ms *after* netd was gone. Three boots is not a
+proof, but the sign has not yet come out the other way: **every observed panic
+has sshd binding before netd's exit line, and every observed clean exit has it
+binding after.** That is the shortlist's prediction holding for a third boot,
+and it is still a correlation over three.
+
+One reading deliberately *not* taken from this capture: `init: started
+test-runner` sits between the panic message and the backtrace, and that is a
+property of the console splitter rather than of time — several processes write
+to one console and the harness's own caveat is that their lines interleave. It
+carries nothing about the race, and init is in any case still walking its child
+list whenever sshd starts, since sshd is not the last entry in it.
+
 The branch it fired on is a diff of documentation and `src/redlist.rs` strings
-with no code in it, so nothing about the image was that branch's. The harness
-answered `ALONE: GREEN, and it was alone both times` again, and shard 1's other
-173 names passed. What this adds to the shortlist above is one detail: **`init`
-had not finished starting its children** — `init: started test-runner` is
-interleaved into sshd's backtrace, so the losing bind happens while init is
-still walking its list, which is where the ordering shape in "what the fix is
-not" would bite.
+with no code in it. The harness answered `ALONE: GREEN, and it was alone both
+times` again, and shard 1's other 173 names passed.
 
 ## What the fix is not
 
