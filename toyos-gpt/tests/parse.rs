@@ -55,6 +55,13 @@ struct Builder {
     entries: Vec<Entry>,
     hybrid_mbr: bool,
     no_mbr_signature: bool,
+    /// Write a second, independent copy of the header and the array at the
+    /// top of the device — LBA `lba_count - 1` and just below it — the way a
+    /// real disk carries one. `false` by default and unchanged by it: every
+    /// test above this field was written against a disk with no backup at
+    /// all, and adding one silently would let a fallback this crate does not
+    /// yet have paper over a primary this suite meant to break.
+    backup: bool,
 }
 
 impl Default for Builder {
@@ -83,6 +90,7 @@ impl Default for Builder {
             ],
             hybrid_mbr: false,
             no_mbr_signature: false,
+            backup: false,
         }
     }
 }
@@ -142,6 +150,49 @@ impl Builder {
         let crc = crc32(&h[..size]);
         h[16..20].copy_from_slice(&crc.to_le_bytes());
         disk[lba..lba * 2].copy_from_slice(&h);
+
+        if self.backup {
+            // The backup array sits directly below the backup header, at the
+            // top of the device — the mirror of the primary's layout, where
+            // the array follows the header. Same entries, same CRC: this
+            // builds an honest mirror, not an independent second table, because the
+            // point of `backup` is a torn front recovering from an intact
+            // back, not two disks disagreeing.
+            let array_lbas = (self.entry_count as u64 * self.entry_bytes as u64).div_ceil(lba as u64);
+            let backup_header_lba = self.lba_count - 1;
+            let backup_array_lba = backup_header_lba - array_lbas;
+            let backup_array_at = (backup_array_lba as usize).saturating_mul(lba);
+            for (i, e) in self.entries.iter().enumerate() {
+                let at = backup_array_at + i * self.entry_bytes as usize;
+                if at + 128 > disk.len() {
+                    break;
+                }
+                disk[at..at + 16].copy_from_slice(&e.type_guid.0);
+                disk[at + 16..at + 32].copy_from_slice(&e.unique.0);
+                disk[at + 32..at + 40].copy_from_slice(&e.first.to_le_bytes());
+                disk[at + 40..at + 48].copy_from_slice(&e.last.to_le_bytes());
+            }
+            let backup_array_crc = crc32(&disk[backup_array_at..backup_array_at + array_bytes]);
+
+            let mut hb = vec![0u8; lba];
+            hb[..8].copy_from_slice(b"EFI PART");
+            hb[8..12].copy_from_slice(&self.revision.to_le_bytes());
+            hb[12..16].copy_from_slice(&self.header_bytes.to_le_bytes());
+            hb[20..24].copy_from_slice(&self.reserved.to_le_bytes());
+            hb[24..32].copy_from_slice(&backup_header_lba.to_le_bytes());
+            hb[32..40].copy_from_slice(&1u64.to_le_bytes()); // AlternateLBA: the primary, at LBA 1.
+            hb[40..48].copy_from_slice(&self.first_usable.to_le_bytes());
+            hb[48..56].copy_from_slice(&self.last_usable.to_le_bytes());
+            hb[56..72].copy_from_slice(&guid(0x5D).0);
+            hb[72..80].copy_from_slice(&backup_array_lba.to_le_bytes());
+            hb[80..84].copy_from_slice(&self.entry_count.to_le_bytes());
+            hb[84..88].copy_from_slice(&self.entry_bytes.to_le_bytes());
+            hb[88..92].copy_from_slice(&backup_array_crc.to_le_bytes());
+            let hb_crc = crc32(&hb[..size]);
+            hb[16..20].copy_from_slice(&hb_crc.to_le_bytes());
+            let backup_header_at = backup_header_lba as usize * lba;
+            disk[backup_header_at..backup_header_at + lba].copy_from_slice(&hb);
+        }
 
         Image { lba_bytes: self.lba_bytes, lba_count: self.lba_count, bytes: disk, fail_at: None }
     }
@@ -440,6 +491,43 @@ fn an_overlapping_neighbour_is_refused() {
     b.entries[0] = Entry::new(TYPE_OTHER, guid(0xA1), 40, 250);
     let mut img = b.build();
     assert_eq!(img.locate(guid(0xC3)), Err(GptError::PartitionOverlap { index: 0 }));
+}
+
+/// UEFI puts the second copy at the end of the device precisely so a torn
+/// write to the front is recoverable. A primary whose signature is gone
+/// never became a checked table, so `locate` must retry the backup rather
+/// than refuse a disk that is otherwise fine.
+#[test]
+fn a_damaged_primary_falls_back_to_a_good_backup() {
+    let mut img = Builder { backup: true, ..Default::default() }.build();
+    *img.at(1, 0) = b'X';
+    let found = img.locate(guid(0xC3)).expect("the backup carries this GUID");
+    assert_eq!(found.partition.index, 2);
+    assert_eq!(found.partition.first_lba, 200);
+    assert_eq!(found.partition.last_lba, 299);
+    assert_eq!(found.used_entries, 4);
+    assert_eq!(found.disk_guid, guid(0x5D));
+}
+
+/// Both copies gone must be a named refusal, not a panic and not a made-up
+/// answer. The fallback's own failure is discarded in favour of the
+/// primary's, so the caller learns why the primary — the copy that matters —
+/// was unreadable.
+#[test]
+fn both_copies_damaged_is_refused_by_name() {
+    let mut img = Builder { backup: true, ..Default::default() }.build();
+    *img.at(1, 0) = b'X';
+    *img.at(DISK_LBAS - 1, 0) = b'X';
+    assert_eq!(img.locate(guid(0xC3)), Err(GptError::NoHeader));
+}
+
+/// A primary that parsed cleanly and simply does not contain the target is
+/// never compared against the backup — a CRC-verified table is trusted
+/// alone, so a `NotFound` is not in the set of errors this falls back on.
+#[test]
+fn a_valid_primary_that_lacks_the_guid_is_not_retried_against_the_backup() {
+    let mut img = Builder { backup: true, ..Default::default() }.build();
+    assert_eq!(img.locate(guid(0xEE)), Err(GptError::NotFound { used_entries: 4 }));
 }
 
 #[test]
