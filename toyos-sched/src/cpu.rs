@@ -25,6 +25,8 @@ use crate::mailbox::{
 use crate::msg::Msg;
 use crate::queue::RunQueue;
 use crate::sync::{Arc, AtomicU32, Ordering};
+#[cfg(feature = "check")]
+use crate::sync::AtomicU64;
 use crate::task::{
     BlockedTask, Claim, DeadTask, ReadyTask, RunningTask, SchedPayload, TaskKey, TaskShared,
     TaskState, TransitTask, WaitClass, WakeCause, WakeReason,
@@ -684,9 +686,10 @@ fn home_of(state: TaskState) -> Option<CpuId> {
     }
 }
 
-/// How long one scheduler pass may take on the machine it runs on (spec
-/// §10.2, §14's preempt-off risk). Asserted only in `feature = "check"`
-/// builds, which is what the kernel's `sched-check` feature turns on.
+/// How long one scheduler pass is modelled to take on the machine it runs on
+/// (spec §10.2, §14's preempt-off risk). **Measured by a `feature = "check"`
+/// build and gated in the harness against the measurement; asserted by
+/// nothing.**
 ///
 /// The number is the simulator's own modelling error made explicit. The sim
 /// charges a pass **zero** time — every step it takes is either a workload op
@@ -698,9 +701,222 @@ fn home_of(state: TaskState) -> Option<CpuId> {
 /// pass that is doing scheduling rather than work.
 ///
 /// It is a *policy* number, like `MAX_USER_STR` and `MAX_FDS`: nothing in the
-/// design forces 200 µs. If it ever fires on honest work, the honest response
-/// is to find out which pass grew and why — not to raise it.
+/// design forces 200 µs. If a measurement crosses it on honest work, the honest
+/// response is to find out which pass grew and why — not to raise it.
+///
+/// **Why no panic stands over it.** The only clock either world can read across
+/// a pass is wall clock — `rdtsc` in the kernel — and a guest's wall clock
+/// advances while its vCPU is descheduled by the host. `elapsed` is therefore
+/// the pass plus any interval the hypervisor took the CPU away, and the second
+/// term is set by the host's scheduler, which this CPU neither observes nor
+/// controls and no constant bounds. A panic may only assert what its own site
+/// observes and what no workload scales, so the cost of a pass is recorded as a
+/// distribution ([`PassCosts`]) and judged where composed quantities are judged:
+/// in the harness and the simulator.
 pub const MAX_PASS_NS: u64 = 200_000;
+
+/// Power-of-two buckets a pass-cost histogram keeps. The top one saturates at
+/// 2^30 ns ≈ 1.07 s, which is longer than any pass a machine survives.
+#[cfg(feature = "check")]
+pub const PASS_COST_BUCKETS: usize = 32;
+
+/// Bucket 0 is exactly zero; bucket `b > 0` covers `[2^(b-1), 2^b)` ns.
+#[cfg(feature = "check")]
+pub fn pass_cost_bucket(ns: u64) -> usize {
+    ((u64::BITS - ns.leading_zeros()) as usize).min(PASS_COST_BUCKETS - 1)
+}
+
+/// The exclusive upper bound of bucket `b`, and `u64::MAX` for the saturating
+/// top one. A quantile is reported as one of these: "this fraction of passes
+/// cost *less than* this many nanoseconds" is the strongest true statement a
+/// histogram supports, and it is the statement the harness gates.
+#[cfg(feature = "check")]
+pub fn pass_cost_bucket_end(bucket: usize) -> u64 {
+    if bucket >= PASS_COST_BUCKETS - 1 {
+        u64::MAX
+    } else {
+        1u64 << bucket
+    }
+}
+
+/// One CPU's pass-cost distribution, as a value: the wire form between the
+/// kernel that measures and the harness that judges.
+///
+/// `over` is exact and the histogram is not, which is deliberate — it is the
+/// direct successor of the quantity the removed assert panicked over, and
+/// rounding it to a power of two would lose the one number a reader compares
+/// against [`MAX_PASS_NS`] by eye.
+#[cfg(feature = "check")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PassCostReport {
+    pub cpu: CpuId,
+    /// Passes measured since boot.
+    pub count: u64,
+    /// The longest single pass measured. **Includes any interval the host took
+    /// the CPU away**, so it is printed and never gated on.
+    pub max_ns: u64,
+    /// Passes measured at more than [`MAX_PASS_NS`].
+    pub over: u64,
+    pub buckets: [u64; PASS_COST_BUCKETS],
+}
+
+#[cfg(feature = "check")]
+impl PassCostReport {
+    pub fn empty(cpu: CpuId) -> Self {
+        Self {
+            cpu,
+            count: 0,
+            max_ns: 0,
+            over: 0,
+            buckets: [0; PASS_COST_BUCKETS],
+        }
+    }
+
+    /// The smallest bucket end below which `num/den` of all passes fall.
+    ///
+    /// Zero samples answer 0: a caller that gates on this must check
+    /// [`Self::count`] first, and the harness does.
+    pub fn quantile_upper_ns(&self, num: u64, den: u64) -> u64 {
+        assert!(den > 0 && num <= den, "a quantile is num/den with num <= den");
+        if self.count == 0 {
+            return 0;
+        }
+        // Ceiling, so `num/den` is reached rather than approached: at
+        // 999/1000 of 1000 samples the answer covers all 1000, not 999.
+        let want = (self.count as u128 * num as u128).div_ceil(den as u128);
+        let mut seen: u128 = 0;
+        for (bucket, &n) in self.buckets.iter().enumerate() {
+            seen += n as u128;
+            if seen >= want {
+                return pass_cost_bucket_end(bucket);
+            }
+        }
+        u64::MAX
+    }
+}
+
+/// The wire form. Parsed back by [`PassCostReport::parse`], and the two are
+/// held together by a round-trip test rather than by care.
+#[cfg(feature = "check")]
+impl core::fmt::Display for PassCostReport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "sched-check pass-costs cpu={} n={} max={} over={} b=",
+            self.cpu.0, self.count, self.max_ns, self.over,
+        )?;
+        let mut first = true;
+        for (bucket, &n) in self.buckets.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            if !first {
+                write!(f, ",")?;
+            }
+            first = false;
+            write!(f, "{bucket}:{n}")?;
+        }
+        if first {
+            write!(f, "-")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "check")]
+impl PassCostReport {
+    /// The prefix a capture is searched for. One contiguous literal, because
+    /// the build's artifact gate looks for exactly these bytes in the kernel
+    /// image to prove the check build carries the instrument at all.
+    pub const PREFIX: &'static str = "sched-check pass-costs cpu=";
+
+    /// Read one report out of a console line. `None` for a line that is not
+    /// one, or one whose fields do not parse — a malformed report is not a
+    /// zeroed report, and a caller that treats it as one gates on nothing.
+    pub fn parse(line: &str) -> Option<Self> {
+        let body = &line[line.find(Self::PREFIX)? + Self::PREFIX.len()..];
+        let mut fields = body.split_whitespace();
+        let cpu: u32 = fields.next()?.parse().ok()?;
+        let mut report = Self::empty(CpuId(cpu));
+        report.count = fields.next()?.strip_prefix("n=")?.parse().ok()?;
+        report.max_ns = fields.next()?.strip_prefix("max=")?.parse().ok()?;
+        report.over = fields.next()?.strip_prefix("over=")?.parse().ok()?;
+        let hist = fields.next()?.strip_prefix("b=")?;
+        if hist != "-" {
+            for pair in hist.split(',') {
+                let (bucket, n) = pair.split_once(':')?;
+                let bucket: usize = bucket.parse().ok()?;
+                let n: u64 = n.parse().ok()?;
+                *report.buckets.get_mut(bucket)? = n;
+            }
+        }
+        // A histogram that does not add up to `n` is a truncated line or a
+        // changed format, and either way the numbers below it mean nothing.
+        (report.buckets.iter().sum::<u64>() == report.count).then_some(report)
+    }
+}
+
+/// One CPU's live pass-cost recorder, written only by that CPU and read by
+/// anyone (spec §10.2). Exists only in a `feature = "check"` build.
+///
+/// Plain relaxed load/store rather than read-modify-write: the writer is the
+/// owning CPU inside its own pass, so there is no contention to lose to, and an
+/// uncontended `lock xadd` on the pass path is the operation that costs most
+/// under emulation.
+#[cfg(feature = "check")]
+pub struct PassCosts {
+    count: AtomicU64,
+    max_ns: AtomicU64,
+    over: AtomicU64,
+    buckets: [AtomicU64; PASS_COST_BUCKETS],
+}
+
+#[cfg(feature = "check")]
+impl PassCosts {
+    fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            max_ns: AtomicU64::new(0),
+            over: AtomicU64::new(0),
+            buckets: [const { AtomicU64::new(0) }; PASS_COST_BUCKETS],
+        }
+    }
+
+    fn bump(cell: &AtomicU64) {
+        cell.store(cell.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+    }
+
+    fn record(&self, ns: u64) {
+        Self::bump(&self.count);
+        Self::bump(&self.buckets[pass_cost_bucket(ns)]);
+        if ns > self.max_ns.load(Ordering::Relaxed) {
+            self.max_ns.store(ns, Ordering::Relaxed);
+        }
+        if ns > MAX_PASS_NS {
+            Self::bump(&self.over);
+        }
+    }
+
+    /// Passes measured so far — the driver's cadence reads this and nothing
+    /// else, so a report costs one load on the pass path between reports.
+    pub fn count(&self) -> u64 {
+        self.count.load(Ordering::Relaxed)
+    }
+
+    pub fn report(&self, cpu: CpuId) -> PassCostReport {
+        let mut report = PassCostReport::empty(cpu);
+        report.max_ns = self.max_ns.load(Ordering::Relaxed);
+        report.over = self.over.load(Ordering::Relaxed);
+        for (bucket, cell) in self.buckets.iter().enumerate() {
+            report.buckets[bucket] = cell.load(Ordering::Relaxed);
+        }
+        // Last, and from the buckets rather than the counter: a remote reader
+        // can land between the two writes, and a report whose histogram is one
+        // short of its `n` fails `parse`'s sum check downstream for no reason.
+        report.count = report.buckets.iter().sum();
+        report
+    }
+}
 
 /// Pass type-states: a pass must be disposed exactly once, and disposal is
 /// the only route to [`SchedPass::finish`].
@@ -863,12 +1079,16 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
         // measures the pass and nothing else. `now` is threaded as a value
         // everywhere else in the core precisely so a decision cannot depend on
         // when it is read; this reads the clock again, which is why it exists
-        // only in a check build and feeds an assert rather than a decision.
+        // only in a check build and feeds a histogram rather than a decision.
+        //
+        // The handle is taken out here for the same reason `hw` is: by the time
+        // the measurement lands, `finish_inner` has consumed the pass and with
+        // it every borrow of the `CpuSched`.
         #[cfg(feature = "check")]
-        let (hw, entered) = (self.env.hw, self.now);
+        let (hw, handle, entered) = (self.env.hw, self.env.cpus.get(self.cpu.id), self.now);
         let action = self.finish_inner();
         #[cfg(feature = "check")]
-        check_pass_duration(hw, entered);
+        handle.pass_costs().record(hw.now().since(entered));
         action
     }
 
@@ -1080,25 +1300,6 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
     }
 }
 
-/// The on-target counterpart to the simulator's invariants (spec §10.2): the
-/// sim asserts what a pass *does*, this asserts what a pass *costs*.
-///
-/// Everything else in `feature = "check"` is a statement about state the core
-/// owns and can therefore be checked in either world. This one cannot: the
-/// simulator's clock does not advance inside a step, so on the sim side it is
-/// exercised by a modelled pass cost (`scenarios::overlong_pass`) and on the
-/// kernel side by the real TSC.
-#[cfg(feature = "check")]
-fn check_pass_duration<H: Hw>(hw: &H, entered: Nanos) {
-    let elapsed = hw.now().since(entered);
-    assert!(
-        elapsed <= MAX_PASS_NS,
-        "invariant P: a scheduler pass took {elapsed} ns, budget {MAX_PASS_NS} ns — \
-         the simulator charges a pass nothing, so invariant I4's RT wake-latency \
-         bound is optimistic by at least that much",
-    );
-}
-
 /// The globally shared, `Sync` face of a CPU, and the whole remote surface:
 /// post a message, ring the doorbell, read the published load (spec §6.1).
 pub struct CpuHandle<M> {
@@ -1107,6 +1308,20 @@ pub struct CpuHandle<M> {
     doorbell: Doorbell,
     /// Ready-count heuristic, published for spawn placement only.
     load: AtomicU32,
+    /// The on-target counterpart to the simulator's invariants (spec §10.2):
+    /// the sim asserts what a pass *does*, this measures what a pass *costs*.
+    ///
+    /// Everything else in `feature = "check"` is a statement about state the
+    /// core owns, which is checkable in either world. Cost is not: the
+    /// simulator's clock does not advance inside a step, so on the sim side the
+    /// recorder is fed a modelled pass cost (`scenarios::overlong_pass`) and on
+    /// the kernel side the real TSC.
+    ///
+    /// It lives on the handle rather than in the `CpuSched` because the
+    /// measurement lands *after* the pass has consumed every borrow of that,
+    /// and because a report has to be readable from outside a pass.
+    #[cfg(feature = "check")]
+    pass_costs: PassCosts,
 }
 
 impl<M: SchedMsg> CpuHandle<M> {
@@ -1116,11 +1331,18 @@ impl<M: SchedMsg> CpuHandle<M> {
             post,
             doorbell: Doorbell::new(),
             load: AtomicU32::new(0),
+            #[cfg(feature = "check")]
+            pass_costs: PassCosts::new(),
         }
     }
 
     pub fn id(&self) -> CpuId {
         self.id
+    }
+
+    #[cfg(feature = "check")]
+    pub fn pass_costs(&self) -> &PassCosts {
+        &self.pass_costs
     }
 
     pub fn doorbell(&self) -> &Doorbell {
@@ -1195,5 +1417,113 @@ impl<M: SchedMsg> CpuHandles<M> {
 
     pub fn is_empty(&self) -> bool {
         self.handles.is_empty()
+    }
+}
+
+#[cfg(all(test, feature = "check"))]
+mod tests {
+    use super::*;
+    use alloc::format;
+
+    /// The two halves of the wire form are one format, and this is what says
+    /// so: a `Display` that gains a field and a `parse` that does not is a
+    /// harness reading zeros out of a live machine and calling it green.
+    #[test]
+    fn a_report_survives_the_wire() {
+        let mut report = PassCostReport::empty(CpuId(3));
+        report.buckets[pass_cost_bucket(4_000)] = 900;
+        report.buckets[pass_cost_bucket(1_684_167)] = 1;
+        report.count = 901;
+        report.max_ns = 1_684_167;
+        report.over = 1;
+        let line = format!("[kernel 1.234 cpu3] {report}");
+        assert_eq!(PassCostReport::parse(&line), Some(report));
+    }
+
+    /// An empty histogram still round-trips, because a CPU that has taken no
+    /// pass is a state the harness must be able to read rather than one it
+    /// mistakes for a truncated line.
+    #[test]
+    fn an_empty_report_survives_the_wire() {
+        let report = PassCostReport::empty(CpuId(0));
+        assert_eq!(PassCostReport::parse(&format!("{report}")), Some(report));
+    }
+
+    /// A line whose histogram does not add up to its `n` is refused. The
+    /// console splices lines under load, and a half-read report parsed as a
+    /// whole one gates on a distribution that never existed.
+    #[test]
+    fn a_truncated_report_is_refused() {
+        let mut report = PassCostReport::empty(CpuId(1));
+        report.buckets[10] = 5;
+        report.count = 900;
+        assert_eq!(PassCostReport::parse(&format!("{report}")), None);
+        assert_eq!(PassCostReport::parse("[kernel 1.0 cpu0] xhci: reset"), None);
+        assert_eq!(
+            PassCostReport::parse("sched-check pass-costs cpu=0 n=1 max=2 over=0"),
+            None,
+        );
+    }
+
+    /// Bucket `b` holds `[2^(b-1), 2^b)`, and the quantile reads back the
+    /// bucket's *end*. Both directions of the boundary, because an off-by-one
+    /// here is a gate that is one power of two too kind.
+    #[test]
+    fn a_bucket_is_a_power_of_two_wide() {
+        assert_eq!(pass_cost_bucket(0), 0);
+        assert_eq!(pass_cost_bucket(1), 1);
+        assert_eq!(pass_cost_bucket(2), 2);
+        assert_eq!(pass_cost_bucket(3), 2);
+        assert_eq!(pass_cost_bucket(4), 3);
+        assert_eq!(pass_cost_bucket(MAX_PASS_NS), 18);
+        assert_eq!(pass_cost_bucket_end(18), 262_144);
+        assert_eq!(pass_cost_bucket_end(17), 131_072);
+        assert_eq!(pass_cost_bucket(u64::MAX), PASS_COST_BUCKETS - 1);
+        assert_eq!(pass_cost_bucket_end(PASS_COST_BUCKETS - 1), u64::MAX);
+    }
+
+    /// The quantile is the whole of what the harness gates, so it is asked the
+    /// question the harness asks: a bulk of cheap passes with one enormous
+    /// sample must answer *cheap*, and a bulk of expensive ones must not.
+    #[test]
+    fn a_quantile_follows_the_mass_and_not_the_tail() {
+        let mut sparse = PassCostReport::empty(CpuId(0));
+        sparse.buckets[12] = 99_999; // < 4096 ns
+        sparse.buckets[21] = 1; // ~2 ms, one host-stolen pass
+        sparse.count = 100_000;
+        sparse.max_ns = 1_900_000;
+        sparse.over = 1;
+        assert_eq!(sparse.quantile_upper_ns(99, 100), 4_096);
+        assert_eq!(sparse.quantile_upper_ns(999, 1_000), 4_096);
+        assert_eq!(sparse.quantile_upper_ns(1, 1), pass_cost_bucket_end(21));
+
+        let mut heavy = PassCostReport::empty(CpuId(0));
+        heavy.buckets[12] = 90_000;
+        heavy.buckets[18] = 10_000; // a tenth of every pass over 131 µs
+        heavy.count = 100_000;
+        assert_eq!(heavy.quantile_upper_ns(99, 100), 262_144);
+        assert_eq!(heavy.quantile_upper_ns(9, 10), 4_096);
+
+        assert_eq!(PassCostReport::empty(CpuId(0)).quantile_upper_ns(1, 2), 0);
+    }
+
+    /// The recorder and the report agree, including the exact `over` count the
+    /// histogram cannot express.
+    #[test]
+    fn the_recorder_counts_what_it_was_given() {
+        let costs = PassCosts::new();
+        for ns in [0, 1, 4_000, MAX_PASS_NS, MAX_PASS_NS + 1, 1_684_167] {
+            costs.record(ns);
+        }
+        let report = costs.report(CpuId(2));
+        assert_eq!(report.cpu, CpuId(2));
+        assert_eq!(report.count, 6);
+        assert_eq!(report.max_ns, 1_684_167);
+        assert_eq!(report.over, 2);
+        // Both budget samples land in bucket 18, `[131072, 262144)`, which is
+        // exactly why `over` is counted separately: the histogram cannot tell
+        // 200 000 from 200 001 and the assert this replaced could.
+        assert_eq!(report.buckets[pass_cost_bucket(MAX_PASS_NS)], 2);
+        assert_eq!(report.buckets.iter().sum::<u64>(), 6);
     }
 }

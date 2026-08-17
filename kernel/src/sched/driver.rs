@@ -105,6 +105,57 @@ static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
 struct CpuTime(AtomicU64);
 static CPU_TIME_NS: [CpuTime; MAX_CPUS] = [const { CpuTime(AtomicU64::new(0)) }; MAX_CPUS];
 
+/// Nanoseconds between two pass-cost reports from one CPU.
+///
+/// The counters are cumulative since boot, so the *last* line a capture holds
+/// is the whole run and the ones before it cost only their own record — which
+/// makes this number a resolution rather than a sample size: the last report is
+/// at most this long before the end.
+///
+/// **A wall-clock cadence and not a per-`n`-passes one, because the second is a
+/// feedback loop.** A report is a log record, a record wakes `klogd`, and a
+/// wake is a pass — so "every N passes" makes the report rate drive the pass
+/// rate it is reporting on. Measured on the dev host, 2026-08-17: at one report
+/// per 64 passes cpu0 finished a boot plus `sched_stress` at 1,408 passes, and
+/// at one per 256 it never reached 256 at all. This clock is the guest's own
+/// and nothing the reports do moves it.
+#[cfg(feature = "sched-check")]
+const PASS_COST_REPORT_EVERY_NS: u64 = 200_000_000;
+
+/// When each CPU last reported, in nanoseconds since boot. Read and written by
+/// the owning CPU alone.
+#[cfg(feature = "sched-check")]
+static PASS_COST_REPORTED: [CpuTime; MAX_CPUS] = [const { CpuTime(AtomicU64::new(0)) }; MAX_CPUS];
+
+/// Publish this CPU's pass-cost distribution, at most once every
+/// [`PASS_COST_REPORT_EVERY_NS`].
+///
+/// **Outside the pass and inside the preempt-off region**, which is the only
+/// window that works: the measurement lands after `finish_inner` has consumed
+/// every borrow of the `CpuSched`, and `log::emit` may take no lock and does
+/// not — it fills a stack record and publishes it under one trap-state bracket
+/// (`log/mod.rs`), which is why it is already called from IRQ handlers and from
+/// inside the scheduler.
+///
+/// `now` is the pass's own sample rather than a fresh clock read: this is a
+/// cadence and not a measurement, and one read per pass is what the check build
+/// already pays.
+///
+/// A check build only. On the pass path between two reports this costs one
+/// relaxed load and one comparison, and everything about it — the histogram,
+/// the clock read that feeds it, the record — exists only where `sched-check`
+/// does.
+#[cfg(feature = "sched-check")]
+fn report_pass_costs(now: Nanos) {
+    let cpu = current_cpu();
+    let last = &PASS_COST_REPORTED[cpu.0 as usize].0;
+    if now.0 < last.load(Ordering::Relaxed) + PASS_COST_REPORT_EVERY_NS {
+        return;
+    }
+    last.store(now.0, Ordering::Relaxed);
+    crate::log!("{}", cpus().get(cpu).pass_costs().report(cpu));
+}
+
 pub fn cpus() -> &'static CpuHandles<KMsg> {
     let ptr = CPUS.load(Ordering::Acquire);
     assert!(!ptr.is_null(), "scheduler used before sched::init");
@@ -377,6 +428,11 @@ pub fn pass(dispose: Dispose) {
             current.ext().handle.publish(current.acct(), Some(now));
         }
     });
+    // The one report site, and `pass_block` is deliberately not a second one:
+    // every CPU with anything to run takes a timer tick through here, and a CPU
+    // with nothing to run is idling through here too.
+    #[cfg(feature = "sched-check")]
+    report_pass_costs(now);
     execute(action);
     crate::preempt::enable_no_resched();
 }
