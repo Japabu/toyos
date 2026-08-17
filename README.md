@@ -57,7 +57,7 @@ chain.
 | ✅ | Full SMP — every core brought up, per-CPU run queues, work balanced across them |
 | ✅ | A desktop: compositor, windows, mouse, keyboard, copy and paste |
 | ✅ | **Doom**, with sound effects and General MIDI music |
-| 🔨 | Doom on the laptop, on its own panel, with its own keyboard and sound |
+| ✅ | **Doom on the laptop** — its own panel, its own keyboard, HDA sound on metal |
 | 🔨 | The desktop on the laptop, with the console handing over to it |
 | ⬜ | Suspend and resume |
 | ⬜ | ARM64 |
