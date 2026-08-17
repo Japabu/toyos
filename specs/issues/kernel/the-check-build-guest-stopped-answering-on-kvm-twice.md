@@ -1,8 +1,16 @@
 ---
-status: open
+status: closed
 kind: defect
 opened: 2026-08-17
+closed: 2026-08-17
 ---
+
+> **Closed by the change this file asked for.** Invariant P no longer exists:
+> `toyos-sched`'s check build records the pass-cost distribution
+> (`cpu::PassCosts`) and publishes it, and `tests/common/passcost.rs` gates it.
+> The "what is owed" section below is item 1 delivered; item 2 is still filed
+> with its own owner. What the gate claims, and why it claims a fraction rather
+> than every pass, is at the end.
 
 # The check-build guest stopped answering on KVM: on the sighting that left a record, invariant P fired at 200569 ns
 
@@ -61,6 +69,9 @@ times budget, this one fires in `timer_handler` during `sched_stress` at 1.0028
 times budget.
 
 ## Why the harness called a panic a stall
+
+*As it was on 2026-08-16. It is not that any more — see item 2 of what is owed —
+and the paragraphs below are kept as the record of what produced this verdict.*
 
 `tests/common/qemu.rs` holds two waits with two different vocabularies for a
 fatal line, and only one of them is complete.
@@ -153,7 +164,8 @@ name lives, not one chance in twelve twice.
 ## What is owed
 
 1. **`toyos-sched`** — the pass-cost distribution above, in `feature = "check"`.
-   It is the only thing that turns this from a rate into a cause.
+   It is the only thing that turns this from a rate into a cause. **Done**, and
+   what it turned into is below.
 2. **`tests/common/qemu.rs`** — half done. `run_test_paced`, `wait_for_ready`
    and `await_guest` now read one vocabulary in `tests/common/serial.rs`, so a
    kernel panic during a test ends the run at the silence bound and the verdict
@@ -164,3 +176,73 @@ name lives, not one chance in twelve twice.
    `specs/issues/build/a-failure-message-drops-the-lines-before-the-test-started.md`.
    Nothing in this file waits on either; the verdict above is already decided
    without them.
+
+## What the measurement became, and what is claimed now
+
+Invariant P is deleted. `CpuHandle` carries a `PassCosts` in a
+`feature = "check"` build — a per-CPU count, maximum, exact over-budget count
+and a power-of-two histogram, written by the owning CPU with relaxed
+load/stores. `SchedPass::finish` records into it where it used to assert.
+`kernel/src/sched/driver.rs` publishes one line per CPU at most every 200 ms of
+guest time, and `tests/common/passcost.rs` reads and judges it.
+
+**The judgement is one claim: nine passes in ten are provably under
+`MAX_PASS_NS`.** Every term of it is derived rather than picked:
+
+- The magnitude is `MAX_PASS_NS` unchanged. The bound the panic stood over is
+  the bound the gate stands over.
+- The fraction is not *all* passes, because "not decided" above cannot be
+  decided: there is no magnitude a hypervisor cannot produce by taking a vCPU
+  away, so no bound over the maximum is a statement about the scheduler. That is
+  precisely what removing the panic gives up, and it is the whole of it.
+- The fraction is not ninety-nine in a hundred either, and the reason is sample
+  size rather than comfort. A whole boot plus `sched_stress` takes about 150
+  passes per CPU — measured on the dev host, 2026-08-17: 168, 149, 152, 152,
+  142, 139, 134 and 129 across two sessions. A quantum is 10 ms, so nearly every
+  pass is a block or a wake and not a tick. A 90th percentile over 150 samples
+  has fifteen above it; a 99th has one and a half.
+
+**Why the gate is green where the assert was, on the same evidence that opened
+this file.** Invariant P asserted every pass under 200 000 ns and was green on 89
+of these 91 KVM runs. In each of those 89, every sample was under the budget, so
+the 90th percentile was. In the two that fired, one crossing out of ~150 samples
+per CPU cannot move a 90th percentile. **The gate therefore passes on all 91,
+including the two the assert halted the machine on** — which is the direction
+that mattered and the direction no instrument available here could stage
+directly.
+
+**The cadence was measured too, and the first attempt at it was wrong.** A
+report every *N passes* is a feedback loop: a report is a log record, a record
+wakes `klogd`, and a wake is a pass. At one report per 64 passes cpu0 finished
+the same workload at 1,408 passes; at one per 256 it never reached 256 at all.
+The shipped cadence is wall clock, which nothing the reports do moves.
+
+**And the dev host demonstrates the direction that mattered.** In the serial
+tail of a run that ended 263 of 263 green:
+
+```
+cpu0: 147 passes, p50 < 32768 ns, p90 < 131072 ns, p99 < 2097152 ns, max 1974235 ns, 7 over the 200000 ns budget
+cpu1: 160 passes, p50 < 16384 ns, p90 < 131072 ns, p99 < 1048576 ns, max 2543303 ns, 6 over the 200000 ns budget
+```
+
+**Thirteen passes over the budget, one of them twelve times it, and the test is
+green.** Invariant P would have halted every CPU on the first of the thirteen —
+which is the failure this file opened on, staged here by an emulator instead of a
+hypervisor and answered instead of reproduced.
+
+The other direction, on the same tree minutes earlier in the same suite's 12-wide
+phase: `cpu0: 134 passes, p50 < 131072 ns, p90 < 262144 ns, max 1745977 ns, 14
+over`, and the gate reds. The maxima on the two sides are 1.7 ms and 2.5 ms, and
+the verdicts are opposite: **a lone enormous sample is the machine underneath,
+and mass is the scheduler.** The consequence landed with it — the test is
+`Sched::Serial` now, because a verdict that is a wall-clock distribution must
+have the machine to itself.
+
+**What the gate does not catch, stated rather than left to be discovered.** A
+single pass that really ran long and a single pass whose CPU was descheduled are
+the same sample, and nothing separates them — so a rare long pass is *reported*
+(the maximum and the exact over-budget count are in every line the test prints)
+and not gated. A pass that grew but stayed under the budget is reported the same
+way, in the median. Both are visible every run, which is more than the assert
+ever left behind: it threw every measurement away except the one that killed the
+machine.

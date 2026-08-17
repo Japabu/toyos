@@ -72,8 +72,9 @@ pub fn boot_census() -> (u32, u32, Vec<String>) {
 /// the alternative had already been paid for and delivered nothing —
 /// `kernel/Cargo.toml` has forwarded `sched-check = ["toyos-sched/check"]` since
 /// the check build was written, and nothing in `src/` or `tests/` ever asked for
-/// it, so `cpu::MAX_PASS_NS`, invariant P and `invariants::check_cpu` were
-/// compiled by no CI run at all. `sched_check_build` is the test that asks.
+/// it, so `cpu::MAX_PASS_NS`, the pass-cost recorder and `invariants::check_cpu`
+/// were compiled by no CI run at all. `sched_check_build` is the test that asks,
+/// and `common::passcost` is what judges the half of it that is a measurement.
 ///
 /// A fifth entry is that decision again, and it gets this paragraph's argument
 /// made afresh. Interactive debug mode is separate: it builds
