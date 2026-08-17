@@ -31,7 +31,9 @@ diffs:
 - **The line numbers rotted almost completely and the symbols did not.** All
   twelve rows of §4.1 moved; every one of §4.5's six; seven of §4.4's twelve. Of
   the enclosing *function* names the §4.6 gate actually keys on, one changed
-  (`hda_probe`'s is `spin_until_ns`, not `spin_ns`) and one was never right
+  (the HDA probe's was `spin_until_ns`, not `spin_ns` — that estate has since
+  been deleted, and the finding stands as the sweep recorded it) and one was
+  never right
   (`panic_console`'s is `screen_claimed_by_userland`). **So the site-granular
   allow-list was the right design and a line-granular one would have been
   worthless** — which is the sweep's own vindication of §4.6.
@@ -375,7 +377,7 @@ are named exceptions with the chunk that owes each:
 | exception | why it is still a `u64` |
 |---|---|
 | `USB_TIMEOUT_NS` (`xhci/mod.rs:319`) | §12.3's open decision is C7's: a `Tripwire` on the transfer, or a `Budget` at the filesystem layer. Typing it at C1 would be taking that decision |
-| `hda.rs`'s and `hda_probe.rs`'s `SETTLE_NS` | a `Bound` whose citation does not exist yet. Their own doc says "the specification's own numbers are microseconds", and §3.2 gives C10 the job of deciding each settle site and saying which. Inventing a section number here is what §3.4 forbids |
+| `hda.rs`'s `SETTLE_NS` | a `Bound` whose citation does not exist yet. Their own doc says "the specification's own numbers are microseconds", and §3.2 gives C10 the job of deciding each settle site and saying which. Inventing a section number here is what §3.4 forbids |
 | `PORT_DEBOUNCE_NS` | it is `toyos_xhci::portmachine::DEBOUNCE_NS`, a constant in a pure host-tested crate. RT7 reaches `kernel/src/` |
 
 Not counted, and each is a class rather than an item: **ten actuator durations**
@@ -513,23 +515,15 @@ rest on.
 
 ### 4.3 Class S — a register with no interrupt behind it. Spin becomes `Poll`.
 
-`xhci/wait/mod.rs:169` (`settles`), `hda.rs:767`, `hda_probe.rs:985`,
+`xhci/wait/mod.rs:169` (`settles`), `hda.rs:767`,
 `iommu/vtd/mod.rs:276`, `iommu/vtd/queue.rs:130`, `nvme.rs:436`, `nvme.rs:460`,
 `virtio.rs:455`, `xhci/legacy.rs:181`, `rtc.rs:180`, `fat32_adapter.rs:879`,
-`xhci/wait/boot.rs:117`, `hda.rs:775` (`spin_ns`) and `hda_probe.rs:993`
-(**`spin_until_ns`**).
+`xhci/wait/boot.rs:117` and `hda.rs:775` (`spin_ns`).
 
-Three of them are written byte-for-byte three times against three different
-constants — `xhci/wait/mod.rs:163`, `hda.rs:761`, `hda_probe.rs:979`, all three
-named `settles` — which
+Two of them are written byte-for-byte against different constants —
+`xhci/wait/mod.rs:163` and `hda.rs:761`, both named `settles` — which
 `specs/issues/kernel/driver-waits-without-a-deadline.md` already records. All
 become one `Poll<T> { bound: Bound, cadence: Cadence }`.
-
-**The pair at the end of the list is not one name, and the gate is why that
-matters.** `hda.rs`'s is `fn spin_ns` (`:772`) and `hda_probe.rs`'s is
-`fn spin_until_ns` (`:990`). §4.6's allow-list keys on the enclosing `fn`, so an
-allow-list written from the first draft's "`spin_ns`" would have missed one of
-them by name and red the tree it was written for.
 
 **Where a `Poll` runs on a thread it parks between reads; where it runs at boot it
 spins.** `fat32_adapter.rs:879` is inside `pub fn probe_boot_disks()` (`:852`) —
