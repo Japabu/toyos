@@ -700,10 +700,10 @@ impl Boot {
 /// and an unknown one stops the build by name.** Read from the manifest rather
 /// than listed here, so the check cannot drift from what cargo would accept —
 /// and, more to the point, so that deleting a feature takes its own command
-/// lines down with it. That is what a temporary feature needs: when
-/// `hda-probe` goes at `specs/plans/hda-driver-plan.md` H9, an invocation still
-/// asking for it fails saying so instead of quietly producing a kernel with no
-/// probe in it, which is the same image and a different machine.
+/// lines down with it. That is what a temporary feature needs: once one is
+/// deleted, an invocation still asking for it fails saying so instead of
+/// quietly producing a kernel with no diagnostic in it, which is the same
+/// image and a different machine.
 ///
 /// Cargo would refuse an unknown feature too — after the build lock, the
 /// toolchain check and the userland build, and with `kernel` in the message

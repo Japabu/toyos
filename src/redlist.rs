@@ -1259,7 +1259,14 @@ pub const KNOWN_RED: &[Red] = &[
         test: "i8042_undecoded_bytes",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(3, 14),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "both halves the write-up sanctions landed 2026-08-16: the driver claims `nothing \
+             decoded` only when something arrived to decode (an interrupt the ISR found no byte \
+             behind is counted apart and said in its own words), and the test reads its lines from \
+             `===I8042_READY===` — the marker its injection is timed off — so a bring-up line \
+             cannot be read as the Pause's. **Not cover for the CI row under this name**, which is \
+             a different producer",
+        ),
         what: "`the line names no byte: [kernel 0.418 cpu1] i8042: 1 interrupts and 0 bytes, \
                nothing decoded — first seen at 418ms`. The test takes the *first* `nothing \
                decoded` line in the capture and assumes it is the one its injection produced, and \
@@ -1313,7 +1320,11 @@ pub const KNOWN_RED: &[Red] = &[
         test: "i8042_undecoded_bytes",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(6, 10),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the same two halves as the fourteen-suite row, 2026-08-16. The rate this row measures \
+             is the bring-up line's, and the gate can no longer read one: what it reads now begins \
+             at the marker its injection is timed off",
+        ),
         what: "the same line, and **the rate tracks host load** — 6 of 10 with the suites run back \
                to back and the load average never below 6.4, against the 3 of 14 above with the \
                host allowed to settle between them, on one tree in one session. The harness's \
@@ -1450,7 +1461,13 @@ pub const KNOWN_RED: &[Red] = &[
         test: "null_sink_client_exits",
         instrument: Instrument::Ci,
         finding: Finding::Seen,
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the number was never the race and it is unchanged: `settle_null_sink_client_exits` \
+             (`tests/toyos.rs`) waits for both removals on the guest's own liveness, between the \
+             test and its check, so the window no longer closes on the line soundd writes about \
+             the exit that closed it. `expect: 2` stays exact — the departure vocabulary is \
+             asserted per removal",
+        ),
         what: "`soundd reported 1 client removals, expected 2` — and the capture shows the second \
                `soundd: client 0 removed (closed)` never arriving rather than arriving wrong: the \
                guest printed `null sink drained two clients in series` and exited, which is where \
@@ -1458,8 +1475,51 @@ pub const KNOWN_RED: &[Red] = &[
                it. `ALONE: GREEN, and it was alone both times — a rate and not a classification`",
         evidence: "PR #85 run 31904338273, job 95059750268 (`guest (1)`), on a branch of \
                    documentation and this table",
-        source: "specs/issues/audio/null-sink-client-exits-counts-a-removal-it-does-not-wait-for.md",
+        source: "tests/toyos.rs",
         measured: "2026-08-15",
+    },
+    // ---------------------------------------------------------------------
+    // PR #94 (`wt/toyos-schedfuture`), run 31944633004, 2026-08-16: five
+    // documentation files, two reds, both adjudicated here and fixed at their
+    // owners rather than re-run.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "null_sink_client_exits",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Retired(
+            "`settle_null_sink_client_exits` (`tests/toyos.rs`), landed with this row",
+        ),
+        what: "`soundd reported 1 client removals, expected 2` again, and **`ALONE: red again — \
+               the defect is real`** where PR #85's occurrence went green: one guest on a KVM \
+               runner with nothing to contend with \
+               reproduces it, so the wide phase was never what produced it. Both captures carry \
+               one removal and one `clients=0` — soundd flushes the window in the same mix-loop \
+               iteration that prints the removal, so the `clients=` statistic the write-up offered \
+               as the other way to buy non-vacuity is on the far side of the same close",
+        evidence: "PR #94 run 31944633004, job 95158684501 (`guest (1)`), `wakes=484` in the wide \
+                   run and `wakes=481` in the isolated re-run",
+        source: "tests/toyos.rs",
+        measured: "2026-08-16",
+    },
+    Red {
+        test: "i8042_undecoded_bytes",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`the line names no byte: [kernel 2.494 cpu1] i8042: 1 interrupts and 4 bytes, \
+               nothing decoded — first seen at 2494ms`. **Four bytes and not zero, so this is a \
+               different producer from the two dev-host rows under this name**: it is the test's \
+               own Pause, reported \
+               after the first interrupt delivered four of its six bytes, with the decoder's run \
+               still open and `Unexplained` therefore empty. Neither half that landed for those \
+               rows reaches it — the line is after the injection and the interrupt carried bytes. \
+               `ALONE: GREEN, and it was alone both times — a rate and not a classification`",
+        evidence: "PR #94 run 31944633004, job 95158684534 (`guest (2)`); the isolated re-run in \
+                   the same job reported the whole sequence, `2 interrupts and 6 bytes … no event \
+                   from [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5]`",
+        source: "specs/issues/kernel/the-i8042-mute-verdict-cannot-revise-a-line-it-said-too-early.md",
+        measured: "2026-08-16",
     },
 ];
 

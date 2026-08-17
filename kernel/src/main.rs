@@ -566,13 +566,6 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     fat32_adapter::probe_boot_disks();
     i8042::init(kernel_args.rsdp_addr);
     acpi::init_power(kernel_args.rsdp_addr);
-    // Last in the phase, so a probe of hardware nobody has driven cannot land
-    // between two devices this kernel depends on, and so its verdict block is
-    // the newest thing in the log ring the boot checkpoint paints.
-    #[cfg(feature = "boot-actuators")]
-    if actuator::hda_probe() {
-        drivers::hda_probe::run(kernel_args.rsdp_addr, &pci_devices);
-    }
 
     boot_phase!("peripherals ready", t_periph);
 

@@ -598,11 +598,19 @@ impl XhciController {
         data_in: bool,
     ) -> Scsi {
         let opcode = cdb.first().copied().unwrap_or(0);
+        // Which disk this command is on, in every line the retry writes. A
+        // machine that boots off USB carries at least two — the stick it
+        // started from and whatever else is plugged in — and an unnamed
+        // `transport broke` cannot be attributed to either, which is how a
+        // harness assertion came to count the boot stick's own recovery against
+        // the disk under test (`specs/issues/hardware/`).
+        let slot = self.slot(dev.slot_id);
         for attempt in 1..=MAX_TRANSPORT_ATTEMPTS {
             match self.bot(dev, cdb, cdb_len, data_phys, data_len, data_in) {
                 Ok(Bot::Done { delivered }) => {
                     if attempt > 1 {
-                        log!("usb-storage: SCSI {opcode:#04x} completed on attempt {attempt}");
+                        log!("usb-storage: {slot} SCSI {opcode:#04x} completed on attempt \
+                             {attempt}");
                     }
                     return Scsi::Ok { delivered };
                 }
@@ -611,17 +619,17 @@ impl XhciController {
                     return Scsi::Refused { key, asc, ascq };
                 }
                 Err(broke) => {
-                    log!("usb-storage: transport broke on SCSI {opcode:#04x}: {broke}");
+                    log!("usb-storage: {slot} transport broke on SCSI {opcode:#04x}: {broke}");
                     if !self.reset_recovery(dev) {
-                        log!("usb-storage: reset recovery failed; disk is offline");
+                        log!("usb-storage: {slot} reset recovery failed; disk is offline");
                         dev.failed = true;
                         return Scsi::Broken;
                     }
                 }
             }
         }
-        log!("usb-storage: SCSI {opcode:#04x} broke {MAX_TRANSPORT_ATTEMPTS} times running; \
-             the transport is not coming back on its own");
+        log!("usb-storage: {slot} SCSI {opcode:#04x} broke {MAX_TRANSPORT_ATTEMPTS} times \
+             running; the transport is not coming back on its own");
         Scsi::Broken
     }
 

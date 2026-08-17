@@ -15,16 +15,6 @@ const CLASS: u64 = 0x0B;
 const HEADER_TYPE: u64 = 0x0E;
 const BAR_BASE: u64 = 0x10;
 const CAPABILITIES_PTR: u64 = 0x34;
-/// Type 1 header only: the bus numbers a bridge forwards.
-#[cfg(feature = "boot-actuators")]
-const SECONDARY_BUS: u64 = 0x19;
-#[cfg(feature = "boot-actuators")]
-const SUBORDINATE_BUS: u64 = 0x1A;
-/// Where a PCIe function's extended capability list starts. Everything below
-/// it is the 256 bytes conventional PCI defines; the list above is what ECAM
-/// exists to reach, and where Access Control Services lives.
-#[cfg(feature = "boot-actuators")]
-const EXTENDED_CAPABILITIES: u64 = 0x100;
 
 const MULTI_FUNCTION: u8 = 0x80;
 const INVALID_VENDOR: u16 = 0xFFFF;
@@ -139,27 +129,6 @@ impl PciDevice {
         self.mmio.write_u16(COMMAND, cmd | 0x06);
     }
 
-    /// The MSI-X capability this function published, if it has one.
-    ///
-    /// Separate from [`Self::enable_msix`] because a diagnostic asks what a
-    /// function offers without arming anything, and the two must not be able
-    /// to disagree about what the registers said.
-    #[cfg(feature = "boot-actuators")]
-    pub fn msix(&self) -> Option<Result<msix::Msix, msix::Unusable>> {
-        let cap = self.capabilities().find(|c| c.id() == msix::CAP_ID)?;
-        Some(msix::Msix::decode(
-            cap.read_u16(msix::MESSAGE_CONTROL),
-            cap.read_u32(msix::TABLE),
-        ))
-    }
-
-    /// What this function's MSI capability says about itself, if it has one.
-    #[cfg(feature = "boot-actuators")]
-    pub fn msi(&self) -> Option<msi::Msi> {
-        let cap = self.capabilities().find(|c| c.id() == msi::CAP_ID)?;
-        Some(msi::Msi::decode(cap.read_u16(msi::MESSAGE_CONTROL)))
-    }
-
     /// Point this function's [`MSIX_ENTRY`] at `vector` and enable it.
     ///
     /// `false` is "this function's MSI-X cannot be armed", which is either the
@@ -230,53 +199,6 @@ impl PciDevice {
         self.vendor_id() == vendor && self.device_id() == device
     }
 
-    #[cfg(feature = "boot-actuators")]
-    pub fn class(&self) -> u8 {
-        self.mmio.read_u8(CLASS)
-    }
-
-    #[cfg(feature = "boot-actuators")]
-    pub fn subclass(&self) -> u8 {
-        self.mmio.read_u8(SUBCLASS)
-    }
-
-    /// The first and last bus this bridge forwards. Meaningless on a function
-    /// whose header type is not 1, so the caller checks the class first.
-    #[cfg(feature = "boot-actuators")]
-    pub fn secondary_bus(&self) -> u8 {
-        self.mmio.read_u8(SECONDARY_BUS)
-    }
-
-    #[cfg(feature = "boot-actuators")]
-    pub fn subordinate_bus(&self) -> u8 {
-        self.mmio.read_u8(SUBORDINATE_BUS)
-    }
-
-    /// The extended capability with this id, if the function publishes one.
-    ///
-    /// The list is firmware's and a malformed one must not be walked forever:
-    /// a next-pointer that does not advance, or that leaves the 4 KiB config
-    /// window, ends the walk. A function with no extended capabilities at all
-    /// reads a header of zero, which is the same stop.
-    #[cfg(feature = "boot-actuators")]
-    pub fn extended_capability(&self, id: u16) -> Option<ExtendedCapability<'_>> {
-        let mut offset = EXTENDED_CAPABILITIES;
-        loop {
-            let header = self.mmio.read_u32(offset);
-            if header == 0 || header == u32::MAX {
-                return None;
-            }
-            if (header & 0xFFFF) as u16 == id {
-                return Some(ExtendedCapability { device: self, offset });
-            }
-            let next = ((header >> 20) & 0xFFF) as u64;
-            if next <= offset || next + 4 > 4096 {
-                return None;
-            }
-            offset = next;
-        }
-    }
-
     pub fn matches_class(&self, class: u8, subclass: u8, prog_if: Option<u8>) -> bool {
         if self.mmio.read_u8(CLASS) != class { return false; }
         if self.mmio.read_u8(SUBCLASS) != subclass { return false; }
@@ -284,22 +206,6 @@ impl PciDevice {
             Some(pi) => self.mmio.read_u8(PROG_IF) == pi,
             None => true,
         }
-    }
-}
-
-/// A PCIe extended capability: the same shape as [`Capability`] one address
-/// space up, and a separate type because the two lists have different header
-/// layouts and nothing may walk one with the other's offsets.
-#[cfg(feature = "boot-actuators")]
-pub struct ExtendedCapability<'a> {
-    device: &'a PciDevice,
-    offset: u64,
-}
-
-#[cfg(feature = "boot-actuators")]
-impl ExtendedCapability<'_> {
-    pub fn read_u16(&self, field: u64) -> u16 {
-        self.device.read_config_u16(self.offset + field)
     }
 }
 

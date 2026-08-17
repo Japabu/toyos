@@ -24,7 +24,7 @@
 //! §3.1 added `Floor` and §3.3 added `Budget` the same way: the sweep is what
 //! makes the taxonomy total, and a duration that fits nothing is a finding
 //! rather than a licence to invent a citation. [`Delay`] is what the six could
-//! not hold — a mandatory hardware settle (`CODEC_DETECT_NS`, D3hot recovery,
+//! not hold — a mandatory hardware settle (`CODEC_DETECT`, D3hot recovery,
 //! the SDM's INIT/SIPI delays) and a calibration window (`clock::init`,
 //! `apic::init_timer`) are durations the CPU *spends*, not durations something
 //! is waited for. Nothing expires; there is no error, no panic and no degraded
