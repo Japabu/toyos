@@ -14,6 +14,20 @@
 //!   gate nobody raised answers `false`, so the idle loop takes no lock.
 //! * **A raise is never dropped** — the property the fix must not cost. Work
 //!   enrolled is work some trip claims, and the claimer sees it.
+//!
+//! On x86 every store is a release, so a build with the raise relaxed behaves
+//! identically to this one and no guest test can fail here. The negative case is
+//! a cargo feature rather than a comment:
+//!
+//! ```text
+//! cargo test --manifest-path kernel-loom/Cargo.toml --features reap-raise-relaxed \
+//!   --test reap_gate
+//! ```
+//!
+//! makes `reap_gate.rs`'s `raise` store relaxed and this file must red, at
+//! [`a_claim_sees_the_enrolled_work`] — *a claimed gate handed the reaper an
+//! empty poison slot*, which is the defect stated exactly. Verified 2026-08-17,
+//! both ways round.
 
 use kernel_loom::reap_gate::ReapGate;
 use loom::sync::atomic::{AtomicUsize, Ordering};

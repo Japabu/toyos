@@ -1634,8 +1634,18 @@ mod tests {
                 "boot-actuators",
                 "debug-wait",
                 "fpu-save-nothing",
+                // The five below cost no kernel build at all, for
+                // `wake-fence-off`'s reason: each is declared only so `cfg`
+                // checking knows the name, and turned on only by
+                // `kernel-loom`, one at a time, to relax the single edge its
+                // named model rests on and prove that model reds without it.
+                "lock-acquire-off",
+                "log-commit-release-off",
                 "loom",
+                "reap-raise-relaxed",
                 "sched-check",
+                "shard-publish-relaxed",
+                "shootdown-serve-relaxed",
                 "test-actuators",
                 // Costs no kernel build at all, for `loom`'s reason: declared
                 // so `cfg` checking knows the name, and turned on only by
@@ -1644,6 +1654,69 @@ mod tests {
                 "wake-fence-off",
             ],
             "the kernel declares a feature `specs/assessments/test-cost-audit.md` §5.9.7 does not account for"
+        );
+    }
+
+    /// Every negative control `kernel-loom/Cargo.toml` and
+    /// `toyos-sched/loom/Cargo.toml` declare — every feature name besides the
+    /// structural ones both crates carry for other reasons.
+    ///
+    /// `loom` selects loom's instrumented atomics; `check` and `protocol-port`
+    /// mirror `toyos-sched`'s own features so the shared sources compile
+    /// identically and name nothing a model turns on. Everything else declared
+    /// in either file is, by construction, a `--features <name>` command that
+    /// must red a named model — each file's own comment beside the name
+    /// carries the argument for why.
+    fn declared_loom_controls(root: &Path) -> Vec<(&'static str, String)> {
+        const NOT_A_CONTROL: &[&str] = &["loom", "check", "protocol-port", "default"];
+        let mut out = Vec::new();
+        for (crate_name, manifest) in [
+            ("kernel-loom", "kernel-loom/Cargo.toml"),
+            ("toyos-sched-loom", "toyos-sched/loom/Cargo.toml"),
+        ] {
+            let path = root.join(manifest);
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
+            let parsed: KernelManifest = toml::from_str(&text)
+                .unwrap_or_else(|e| panic!("Failed to parse {}: {e}", path.display()));
+            for name in parsed.features.into_keys() {
+                if !NOT_A_CONTROL.contains(&name.as_str()) {
+                    out.push((crate_name, name));
+                }
+            }
+        }
+        out
+    }
+
+    /// **A control nobody runs is a control nobody has shown can fail.** Every
+    /// name [`declared_loom_controls`] finds must appear as `--features <name>`
+    /// somewhere in `host-tests.yml` — the one place these are wired, by every
+    /// existing comment's own account — or a new control can be declared and
+    /// run nowhere, silently, which is exactly how five of `kernel-loom`'s six
+    /// and `toyos-sched-loom`'s `doorbell-kick-relaxed` went unwired until
+    /// 2026-08-17: nothing before this test required a declared control to
+    /// have a step.
+    ///
+    /// A substring check and not a YAML parse, for `src/ci.rs`'s `nameless`
+    /// reason: the shape a step's command line has is fixed, and a real parse
+    /// would have to reconstruct multi-line `run:` blocks to find it in.
+    #[test]
+    fn every_loom_control_is_wired_into_host_tests() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workflow = fs::read_to_string(root.join(".github/workflows/host-tests.yml"))
+            .expect("host-tests.yml is readable");
+        let mut missing = Vec::new();
+        for (crate_name, control) in declared_loom_controls(root) {
+            let needle = format!("--features {control}");
+            if !workflow.contains(&needle) {
+                missing.push(format!("{crate_name}: {control} ({needle:?} not found in host-tests.yml)"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "a loom negative control is declared with no CI step running it — \
+             wire it into .github/workflows/host-tests.yml beside the others:\n  {}",
+            missing.join("\n  ")
         );
     }
 

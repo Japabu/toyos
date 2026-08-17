@@ -439,6 +439,26 @@ pub enum Kick {
 const KICK_PENDING: u32 = 1 << 0;
 const SLEEPING: u32 = 1 << 1;
 
+/// The read [`Doorbell::ring`] decides `Send`/`Elide` from, and what it
+/// carries.
+///
+/// It reads the bits [`Doorbell::arm_sleep`] published, so this is the edge
+/// that makes SLEEPING-before-the-empty-check (spec §7.5) reach the producer:
+/// a `ring` that raced a sleeping target and did not see the bit would elide
+/// the IPI the target's own store had just earned.
+///
+/// **A cargo feature rather than a comment, because a model that has never
+/// failed proves nothing.** `toyos-sched-loom`'s `doorbell-kick-relaxed` makes
+/// it `Relaxed` and `loom/tests/loom_sleep.rs` must red under it:
+/// `a_halted_cpu_with_queued_work_was_kicked` finds a schedule where the
+/// target halts with both messages queued and no IPI in flight — a
+/// sleep-through. No kernel build can turn the name on: the crate declares it
+/// only so `cfg` checking knows it.
+#[cfg(not(feature = "doorbell-kick-relaxed"))]
+const KICK: Ordering = Ordering::AcqRel;
+#[cfg(feature = "doorbell-kick-relaxed")]
+const KICK: Ordering = Ordering::Relaxed;
+
 /// The per-CPU doorbell: the kick-pending edge plus the sleeping bit that
 /// makes the idle handshake safe (spec §7.3, §7.5).
 pub struct Doorbell {
@@ -455,7 +475,7 @@ impl Doorbell {
     /// Producer side, immediately after [`MailboxProducer::post`]. Returns
     /// whether a targeted IPI is required.
     pub fn ring(&self, urgency: Urgency) -> Kick {
-        let prev = self.bits.fetch_or(KICK_PENDING, Ordering::AcqRel);
+        let prev = self.bits.fetch_or(KICK_PENDING, KICK);
         match urgency {
             // Unconditional: a prior normal-wake edge may have elided its IPI.
             Urgency::Preempt => Kick::Send,
