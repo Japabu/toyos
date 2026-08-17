@@ -24,7 +24,7 @@ A subdirectory `CLAUDE.md` loads when a file in that subtree is `Read`, and not 
 - **Zero legacy.** No backwards compatibility, no fallbacks, no workarounds, no BIOS, no 32-bit. Research state-of-the-art OS design instead of replicating older OSes.
 - **Zero technical debt.** Dead code is deleted. Every abstraction earns its place.
 - **Fail fast, trust nothing.** Panics over silent degradation; exhaustive matches; the unimplemented dies loudly. Input that crossed a trust boundary is never trusted and never panics the kernel — it is refused.
-- **The kernel never crashes from userland.** A kernel bug crashes loudly; a userland bug never reaches it.
+- **The kernel never crashes from userland.** A kernel bug crashes loudly; a userland bug never reaches it. A panic asserts only what its own site observes and no workload scales — latency, progress and completion compose device and workload time, so they are measured, reported and gated, never asserted.
 - **Rust is first class.** Not POSIX, not C. Unrepresentable is best: prefer compile-time safety over runtime checks over tests.
 - **Development ergonomics above all.** Iteration speed beats feature count; tooling comes first.
 
