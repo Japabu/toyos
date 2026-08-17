@@ -689,9 +689,6 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("heap_ceiling_recovery", Sched::Parallel, Tier::Fast),
     ("iommu_context_absent", Sched::Parallel, Tier::Fast),
     ("iommu_empty_domain", Sched::Parallel, Tier::Fast),
-    // Two boots, one kernel build each: the probe's own, and the plain kernel
-    // on the same machine to show it stays out of an ordinary boot.
-    ("hda_probe", Sched::Parallel, Tier::Fast),
     // H4: soundd driving an Intel HDA controller itself, read back off the
     // device. Serial — its verdict is a wav capture, and one taken while eleven
     // other guests contend for the host measures the host.
@@ -7248,7 +7245,6 @@ fn run_machine_test(
         "iommu_context_absent" => common::iommu::iommu_context_absent(test_config, c_bins, rust_bins),
         "iommu_empty_domain" => common::iommu::iommu_empty_domain(test_config, c_bins, rust_bins),
         // Body in `tests/common/hda.rs`, same reason.
-        "hda_probe" => common::hda::hda_probe(test_config, c_bins, rust_bins),
         "hda_tone" => common::hda::hda_tone(test_config, c_bins, rust_bins),
         "hda_client_stall" => common::hda::hda_client_stall(test_config, c_bins, rust_bins),
         "hda_two_live_refused" => {

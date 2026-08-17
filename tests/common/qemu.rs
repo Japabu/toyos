@@ -568,30 +568,6 @@ pub enum Profile {
     /// refusals, because a platform that declares it cannot remap and a unit
     /// that cannot are different facts a user can act on differently.
     IommuNoIntremap,
-    /// metal-sim with three Intel HDA controllers, shaped so that one boot
-    /// runs both arms of every question `specs/plans/hda-driver-plan.md` H0 asks.
-    ///
-    /// A machine nobody ships, and deliberately so: H0's probe is a diagnostic
-    /// aimed at one laptop, and the only thing the harness can certify is that
-    /// each branch of it produces a sensible answer when the hardware takes
-    /// that shape. Which branch a real machine runs is the T14's to say.
-    ///
-    /// - `hda0` is function 0 of a multifunction slot with two codecs behind
-    ///   it. Its isolation scope is *not* a singleton, which is `iommu-spec.md`
-    ///   §7.3's refusal and the T14's own shape (function 3 of five); its two
-    ///   codecs are §2.3's first-match trap, where a driver taking the first
-    ///   answer binds display audio and plays silence out of the speakers.
-    /// - `hda1` is function 1 of that slot with **no codec at all**. That is
-    ///   question (b)'s dead answer — `STATESTS` reads zero — and on a real
-    ///   Tiger Lake it means the audio path is behind the vendor DSP or on
-    ///   SoundWire, and the plan is over on that machine.
-    /// - `hda2` has a slot to itself and one codec: the singleton scope §7.3
-    ///   permits, and the ordinary alive case.
-    ///
-    /// Slots 16 and 17 because q35 leaves them free and because a fixed
-    /// address is the only way to state "these two are functions of one
-    /// device" — which is the whole of the first bullet.
-    MetalHda,
     /// [`Profile::Headless`] with its virtio sound card replaced by an Intel
     /// HDA controller and one codec — the machine soundd drives itself.
     ///
@@ -599,8 +575,10 @@ pub enum Profile {
     /// virtio-serial, the NIC is still there, the disks are the same: what
     /// differs from the machine gate A's four recorded configs run on is the
     /// sound card, so a difference in the capture is a difference in the audio
-    /// path. It is not the T14's shape and does not try to be —
-    /// [`Profile::MetalHda`] is the shape arm and this is the audio one.
+    /// path. It is not the T14's literal shape and does not try to be — this is
+    /// the audio arm, not a PCI-topology one. `specs/plans/hda-driver-plan.md`
+    /// H0's diagnostic staged that comparison and is deleted now that the
+    /// driver above answers every question it was asked for.
     Hda,
     /// [`Profile::Hda`] with a second controller that also has a codec.
     ///
@@ -672,22 +650,6 @@ const XHCI_MSI_ONLY: &str = "nec-usb-xhci,id=xhci1,msix=off";
 /// position, how it takes USB storage off a machine entirely.
 const XHCI_NO_IRQ_FIRST: &str = "nec-usb-xhci,id=xhci,msix=off,msi=off";
 const XHCI_NO_IRQ_SECOND: &str = "nec-usb-xhci,id=xhci1,msix=off,msi=off";
-
-/// [`Profile::MetalHda`]'s three controllers, in the order QEMU creates them.
-///
-/// The slot numbers are the whole shape: `10.0` and `10.1` are two functions of
-/// one device, which is `iommu-spec.md` §7.3's non-singleton scope and the
-/// T14's own arrangement, and `11.0` has a slot to itself, which is the
-/// singleton the same rule permits. `cad=` places each codec at a chosen link
-/// address, so "two codecs answered" is staged rather than hoped for.
-const HDA_THREE: &[&str] = &[
-    "intel-hda,id=hda0,addr=10.0,multifunction=on",
-    "hda-output,bus=hda0.0,cad=0,audiodev=hdaaud",
-    "hda-duplex,bus=hda0.0,cad=1,audiodev=hdaaud",
-    "intel-hda,id=hda1,addr=10.1",
-    "intel-hda,id=hda2,addr=11.0",
-    "hda-output,bus=hda2.0,cad=0,audiodev=hdaaud",
-];
 
 /// One controller with one codec: the ordinary machine, and the one an audio
 /// arm needs. `hda-output` because it is a playback-only codec — the driver
@@ -800,9 +762,9 @@ struct Shape {
     usb_disks: &'static [UsbDisk],
     /// Every Intel HDA controller on the machine and the codecs behind each,
     /// as `-device` arguments in the order QEMU is to create them. Empty is
-    /// what every profile but [`Profile::MetalHda`] declares, and it is the
-    /// machine this kernel has always booted: audio through virtio-sound or
-    /// through nothing at all.
+    /// what every profile but [`Profile::Hda`] and [`Profile::HdaTwoLive`]
+    /// declares, and it is the machine this kernel has always booted: audio
+    /// through virtio-sound or through nothing at all.
     ///
     /// Presence of a class-0403 *function* is the shape dimension, and it is
     /// separate from whether anything answers on the link behind it — which is
@@ -1254,19 +1216,6 @@ impl Profile {
                 usb_disks: &[],
                 hda: &[],
                 iommu: Some(Iommu { intremap: false, ..IOMMU_DEFAULT }),
-            },
-            Self::MetalHda => Shape {
-                vga: "std",
-                vgamem_mb: Some(8),
-                virtio: Virtio::Absent,
-                xhci: &[XHCI_DEFAULT],
-                storage_bus: "xhci.0",
-                usb: &[],
-                nvme_bytes: NVME_SMALL,
-                nvme_lba_bytes: NVME_LBA_DEFAULT,
-                usb_disks: &[],
-                hda: HDA_THREE,
-                iommu: Some(IOMMU_DEFAULT),
             },
             Self::Hda => Shape {
                 virtio: Virtio::WithoutSound,

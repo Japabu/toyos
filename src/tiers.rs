@@ -780,9 +780,9 @@ mod tests {
     #[test]
     fn the_profile_gate_refuses_a_slow_fast_label() {
         let mut ci = committed_profile();
-        ci.insert("hda_probe".to_string(), FAST_CEILING_MS + 1);
+        ci.insert("iommu_empty_domain".to_string(), FAST_CEILING_MS + 1);
         let refusal = validate_ci_profile(&ci).unwrap_err();
-        assert!(refusal.contains("hda_probe"), "{refusal}");
+        assert!(refusal.contains("iommu_empty_domain"), "{refusal}");
         assert!(refusal.contains("remains Fast"), "{refusal}");
     }
 
@@ -831,7 +831,7 @@ mod tests {
     #[test]
     fn only_fast_can_carry_the_one_run_unmeasured_marker() {
         let mut ci = committed_profile();
-        ci.insert("hda_probe".to_string(), UNMEASURED_MS);
+        ci.insert("iommu_empty_domain".to_string(), UNMEASURED_MS);
         assert!(validate_ci_profile(&ci).is_ok());
 
         ci.insert("audio_tone_load (smp=1)".to_string(), UNMEASURED_MS);

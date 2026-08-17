@@ -33,11 +33,13 @@ which one.
 on its own: those waits moved behind a bounded `settles(ready)` against
 `USB_TIMEOUT_NS` = 2 s (`xhci/wait/mod.rs:126-135`, `xhci/mod.rs:319`), and the
 legacy handoff is bounded by `HANDOFF_TIMEOUT_NS` = 1 s (`xhci/legacy.rs:55`,
-`:177-180`). It is now written three times byte-for-byte against three
-constants — `xhci/wait/mod.rs:126`, `hda.rs:758`, `hda_probe.rs:979` — plus two
-copies of the spin delay beside it (`hda.rs:769`, `hda_probe.rs:990`), plus
-`scheduler.rs:190`'s `wait_until`, plus an IOMMU variant that `assert!`s where
-the others return (`iommu/vtd/queue.rs:125-130`, `iommu/vtd/mod.rs:271-276`).
+`:177-180`). It is now written twice byte-for-byte against two constants —
+`xhci/wait/mod.rs:126`, `hda.rs:758` — plus `scheduler.rs:190`'s `wait_until`,
+plus an IOMMU variant that `assert!`s where the others return
+(`iommu/vtd/queue.rs:125-130`, `iommu/vtd/mod.rs:271-276`). A third copy lived
+in `kernel/src/drivers/hda_probe.rs` (`:979`, `:990`), deleted with H0's whole
+diagnostic once the HDA driver above it answered every question H0 was asked
+for.
 
 **Standing.** `specs/assessments/type-safety-audit/kernel-drivers.md` F10 (`:928`, deadlines
 and durations as bare `u64` in two different units, so `wait_writable(500)`
