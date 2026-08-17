@@ -2777,14 +2777,21 @@ neither reading is inherited now that the file is gone. That is precisely why
   31875856466) — and red on the dev host at 1,684,167 ns then 1,749,243 ns,
   adjudicated 2026-08-15 as cross-arch TCG and scoped to `Instrument::DevHostAlone`
   (`src/redlist.rs`'s `sched_check_build` entry,
-  `specs/issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md`).
+  `specs/issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md`). Both of
+  those rows are retired since 2026-08-17 and the gate is a quantile of a
+  published distribution; the dev host, alone, passes it, and the name is
+  `Sched::Serial` because that verdict is wall clock.
   `specs/assessments/test-cost-audit.md:1022`'s *"No test uses it"* is stale with
   it, and `sched-check` is one of `TEST_SUITE_KERNEL_BUILDS`'s four entries.
 
   **What survives, and it is the whole of the real point: the window still starts
-  after `drain_irqs`** (`cpu.rs`'s `check_pass_duration`, `MAX_PASS_NS` 200 µs,
-  also in `cpu.rs`; `drain_irqs()` precedes `SchedPass::begin` in `driver.rs`'s
-  `pass` and in its `pass_block`). **Widening it is the change**, and what it would newly cover
+  after `drain_irqs`** (`cpu.rs`'s `SchedPass::finish` records into `PassCosts`,
+  `MAX_PASS_NS` 200 µs, also in `cpu.rs`; `drain_irqs()` precedes
+  `SchedPass::begin` in `driver.rs`'s `pass` and in its `pass_block`). Invariant
+  P is gone since 2026-08-17 — a pass's elapsed time is wall clock, which
+  advances while a hypervisor holds the vCPU, so the check build records the
+  distribution and the harness gates it — and none of that moves the window's
+  start. **Widening it is the change**, and what it would newly cover
   is `xhci::poll_if_pending` (in `driver.rs`'s `drain_irqs` — the two-second recovery path the
   companion issue is entirely about, and the largest term the widened window would
   swallow), `i8042::service`, the dump's `serve_if_owed`,
@@ -2839,7 +2846,7 @@ Two chunks below are merged pairs and keep both names, so a reference elsewhere 
 | C12 | the write-back queue; `FileObject::on_zero_handles`; `SYS_FSYNC` parks; page-cache eviction to `iod`; **§13.1's page pinning and `close_file`** | §13 | `close-cannot-report-io-error`'s reproduction; `disk_backtrace` and `esp_files` still green (§13.2) |
 | C13 | the deletion commit; the `src/sourcegate.rs` gates; **twelve** `specs/issues/` closures and the full-path citations that go stale with them (§19); CLAUDE.md | §19 | `cargo test --lib` green — **and no longer a real gate on the closures**, since `every_named_issue_file_resolves` was deleted with `src/docs.rs`. C13 puts rebuilding it to the owner (§19) and does the de-pathing as a stated deliverable rather than trusting a check |
 | C14 | measurement: the interleaved four-arm A/B (§20.1, ~68 min of guest time, two worktrees); `io-depth-probe`; the positive log-content assertion (§20.2); assertions recorded in `tests/audio-baseline.toml` | §20 | the numbers go in this spec |
-| C15 | `sched-check`: move invariant P's window to the scheduler entry, take its own baseline, then turn it on in one harness profile | §20.4 | its own baseline first — it will red on work this refactor did not do |
+| C15 | `sched-check`: move the pass-cost measurement's window to the scheduler entry, take its own baseline, then turn it on in one harness profile | §20.4 | its own baseline first — it will red on work this refactor did not do |
 
 ### 21.1 Why C7 and C8 are one chunk
 

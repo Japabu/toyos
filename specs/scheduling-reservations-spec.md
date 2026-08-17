@@ -93,7 +93,7 @@ document updates this table, and a number that grows says what it bought.
 | permanent concepts | not stated anywhere | 4 |
 | named constructs a reader holds to predict a dispatch | 9 | 6 |
 | kernel mechanisms in this layer | 4 | 4 |
-| kernel-side panic-grade assertions | 13 | 13, none of them added here |
+| kernel-side panic-grade assertions | 13 | 12, none of them added here and the one removed removed elsewhere |
 | …of which carry a term a workload sets | 2 | 0 |
 | simulator invariants | 14 | 15 |
 | negative gates / must-stay-clean controls | 10 / 2 | 15 / 3 |
@@ -110,10 +110,14 @@ background tier and the mark. The four mechanisms before are band precedence at
 the pick, the aged grant, the pipe lend and the retirer's end-to-end deadline;
 the four after are reservation-and-admission, earliest-deadline dispatch with
 the background tier, the period grid (replenishment, demotion, charge-back) and
-§1.8's mark. The thirteen assertions are `scheduler-core-spec.md` §2's ten
-numbered invariants, invariant T (`toyos-sched/src/invariants.rs`), invariant P
-(`toyos-sched/src/cpu.rs:1441`) and `GIVE_UP`
-(`kernel/src/scheduler.rs:687`); the two workload-set terms are `GIVE_UP`'s
+§1.8's mark. The thirteen assertions before are `scheduler-core-spec.md` §2's
+ten numbered invariants, invariant T (`toyos-sched/src/invariants.rs`),
+invariant P (`toyos-sched/src/cpu.rs`) and `GIVE_UP`
+(`kernel/src/scheduler.rs`). **Twelve after, and the twelfth left by this
+document's own doctrine rather than by its design**: invariant P panicked over a
+pass's elapsed time, which is wall clock, which advances while a hypervisor
+holds the vCPU — a composed quantity, so it is now measured in the check build
+and gated in the harness (§1.9's `G`). The two workload-set terms are `GIVE_UP`'s
 `peers = 8` and its stretch multiplier, which §8.3 replaces with fixed hops.
 Gates and controls are counted from `toyos-sched/sim/tests/scenarios.rs`'s
 register and from §5.5's table. The 64 sites are `grep -rn` counts for the five
@@ -745,12 +749,17 @@ instead of hiding inside a per-period allowance. `G` is 34.5 % of soundd's
 budget and 20 % of the dying server's, which is why it is a term this document
 states rather than a rounding error it ignores.
 
-**`G` is `MAX_PASS_NS` = 200 000 ns (`toyos-sched/src/cpu.rs:893`), and it is
+**`G` is `MAX_PASS_NS` = 200 000 ns (`toyos-sched/src/cpu.rs`), and it is
 one quantity rather than a sum.** It is the interval from the instant an event
 becomes true to the end of the pass that acts on it, and the pass is what the
-kernel already bounds: invariant P asserts the elapsed time of every pass
-against `MAX_PASS_NS` (`toyos-sched/src/cpu.rs:1441`) and the negative gate
-`overlong_pass` holds that bound. What stands in front of the pass — the local
+tree already measures: a `feature = "check"` build records every pass's elapsed
+time into a per-CPU distribution, the harness gates that distribution against
+`MAX_PASS_NS`, and the negative gate `overlong_pass` is what says the recorder
+sees a pass that costs more. **No assertion in the kernel stands over it, by
+§8's own doctrine**: a pass's elapsed time is wall clock, and a guest's wall
+clock advances while a hypervisor holds its vCPU, so the quantity composes the
+scheduler's work with an interval no workload and no constant bounds. What
+stands in front of the pass — the local
 interrupt's own delivery — is hardware latency in the microseconds, an estimate
 and the only term in this document not read off the tree, and it is an order
 below the bound that follows it; the document names it, declares it dominated,

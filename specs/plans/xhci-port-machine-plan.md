@@ -467,8 +467,10 @@ this conversion. That path does not run inside `drain_irqs`, so #156's prologue
 is closed and the lock-hold finding is not.
 
 Price: no new code beyond X2 — it is X2's proof obligation. One guest gate that
-measures the pass duration across a plug, plus the `sched-check` pass-budget
-assertion `specs/issues/` records as never enabled.
+measures the pass duration across a plug, plus the `sched-check` build's
+pass-cost distribution. Both of that sentence's premises are spent: the budget is
+no longer an assertion, and `sched_check_build` boots the build the plan records
+as never enabled.
 
 ### #100 rides X2; there is no fourth stage
 
