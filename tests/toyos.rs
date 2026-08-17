@@ -10303,8 +10303,8 @@ fn control_regs(log: &str, cpus: u32) -> Result<(), String> {
         (16, "FSGSBASE", true),
         (18, "OSXSAVE", false),
     ];
-    /// The three `CR4` bits the CPU may withhold, so neither answer is wrong.
-    const CR4_MAY: &[(u32, &str)] = &[(17, "PCIDE"), (20, "SMEP"), (21, "SMAP")];
+    /// The four `CR4` bits the CPU may withhold, so neither answer is wrong.
+    const CR4_MAY: &[(u32, &str)] = &[(11, "UMIP"), (17, "PCIDE"), (20, "SMEP"), (21, "SMAP")];
 
     let mut seen: Vec<(u32, u64, u64)> = Vec::new();
     for line in log.lines() {
@@ -10432,12 +10432,16 @@ fn control_regs_verdict() -> Result<(), String> {
     refused("OSXSAVE set", &[(DECLARED.0, DECLARED.1 | (1 << 18)); 4], "OSXSAVE")?;
     // Two bits a machine could hold uniformly, each one line of kernel diff
     // away, and neither reachable by an actuator. `AM` is named clear above and
-    // answers by name; `UMIP` is named nowhere, which is the case the whole
-    // never-named rule exists for — `PGE`, `TSD` and `PKE` are the same case.
+    // answers by name; `PGE` is named nowhere, which is the case the whole
+    // never-named rule exists for — `TSD` and `PKE` are the same case. `UMIP`
+    // used to be this file's example of the same thing, until it joined
+    // `CR4_MAY` (`specs/issues/isolation/cr4-umip-undeclared.md`) — a bit that
+    // moves from unnamed to optional is exactly the migration this gate exists
+    // to force a diff for.
     refused("every CPU with AM set", &[(DECLARED.0 | (1 << 18), DECLARED.1); 4], "AM")?;
     refused(
-        "every CPU with UMIP set",
-        &[(DECLARED.0, DECLARED.1 | (1 << 11)); 4],
+        "every CPU with PGE set",
+        &[(DECLARED.0, DECLARED.1 | (1 << 7)); 4],
         "never named",
     )?;
     // A CPU that agrees about every named bit and differs in one the CPU is
