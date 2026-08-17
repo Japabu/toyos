@@ -42,9 +42,9 @@ pub struct SimHwState {
     ///
     /// Zero everywhere except `scenarios::overlong_pass`, and that is the
     /// point: the VM's clock does not advance inside a step, so the core's
-    /// `feature = "check"` pass-duration assert (`cpu::MAX_PASS_NS`) would be
+    /// `feature = "check"` pass-cost recorder (`cpu::PassCosts`) would be
     /// arithmetic that can only ever compute zero. This is what gives it a
-    /// number to refuse.
+    /// number to record.
     pub pass_cost_ns: u64,
     /// Recorded rather than raised: a step machine has no stack to unwind
     /// from inside a `Hw` callback, and swallowing the first violation would
@@ -129,7 +129,7 @@ impl Machine for SimHw {
     type IrqGuard = ();
 
     /// The VM threads `now` into every pass as a value, so this is read by
-    /// exactly one caller: the core's check-build pass-duration assert. Inside
+    /// exactly one caller: the core's check-build pass-cost recorder. Inside
     /// a pass it therefore reports the pass's modelled cost; outside one it is
     /// the VM's clock.
     fn now(&self) -> Nanos {
