@@ -180,67 +180,6 @@ pub fn init(rsdp_addr: u64, devices: &[PciDevice]) {
     }
 }
 
-/// [`crate::iommu::describe_device`]'s backend: which unit's scope claims a
-/// stream, and every reserved region naming it.
-///
-/// The claim rule is the specification's. A `DRHD` whose device scope names
-/// the stream owns it; failing that, the segment's `INCLUDE_PCI_ALL` unit is
-/// the catch-all. Answering "the last unit" or "unit 0" instead would be a
-/// number this file made up, and the whole value of this call is that it is
-/// firmware's answer.
-#[cfg(feature = "boot-actuators")]
-pub(super) fn describe_device(rsdp_addr: u64, stream: StreamId) -> crate::iommu::DeviceFacts {
-    use crate::iommu::{DeviceFacts, ReservedRegion, UnitFacts};
-
-    let mut facts = DeviceFacts { unit: None, reserved: alloc::vec::Vec::new() };
-    let Ok(dmar) = Dmar::open(rsdp_addr) else { return facts };
-
-    let mut index = 0usize;
-    // The two candidates, each carried as the index the boot's own `iommu:
-    // unitN` lines use *and* the base its capabilities are read from — so the
-    // walk keeps two pairs rather than every unit's base for one lookup at the
-    // end. First of each wins: the specification requires the catch-all last,
-    // so a second unit claiming one stream is firmware contradicting itself.
-    let mut explicit: Option<(usize, u64)> = None;
-    let mut catch_all: Option<(usize, u64)> = None;
-    for structure in dmar.structures() {
-        match structure {
-            Ok(Structure::Drhd(drhd)) => {
-                if index == MAX_UNITS {
-                    break;
-                }
-                if names(drhd.scopes(), stream) {
-                    explicit = explicit.or(Some((index, drhd.register_base())));
-                } else if drhd.include_pci_all() {
-                    catch_all = catch_all.or(Some((index, drhd.register_base())));
-                }
-                index += 1;
-            }
-            // A reserved region binds only the devices its own scope names,
-            // and a machine's other RMRRs are not this device's problem.
-            Ok(Structure::Rmrr(rmrr)) if names(rmrr.scopes(), stream) => {
-                facts.reserved.push(ReservedRegion { base: rmrr.base(), limit: rmrr.limit() });
-            }
-            _ => {}
-        }
-    }
-
-    facts.unit = explicit.or(catch_all).and_then(|(index, base)| {
-        let regs = window(base)?;
-        let caps = Capabilities { cap: regs.read_u64(CAP_REG), ecap: regs.read_u64(ECAP_REG) };
-        Some(UnitFacts { index, explicit: explicit.is_some(), snoop_control: caps.snoop_control() })
-    });
-    facts
-}
-
-/// Whether any scope in this list names `stream` directly. A scope reached
-/// through a bridge carries no requester id (`Scope::stream_id`), so it cannot
-/// answer yes or no here and does not pretend to.
-#[cfg(feature = "boot-actuators")]
-fn names(scopes: Scopes, stream: StreamId) -> bool {
-    scopes.flatten().any(|scope| scope.stream_id() == Some(stream))
-}
-
 /// A unit whose window decodes, with the capabilities it advertises and the
 /// state of its global command register.
 struct Unit {
