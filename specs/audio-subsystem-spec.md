@@ -107,7 +107,7 @@ time ─────────────────────────
 soundd:  wake ── signal clients ── wait ── consume ── mix ── submit ── sleep
                     │                ▲
                     │                │ fills happen inside soundd's wait,
-client:             └── wake ── fill slots ── block   on soundd's wake grant
+client:             └── wake ── fill slots ── block   marked urgent by the wake
 ```
 
 Once per period, in order:
@@ -120,11 +120,18 @@ Once per period, in order:
 4. soundd dithers, quantizes to the device format, and submits.
 
 The signal precedes the read, which gives clients the whole period to fill.
-A signalled client fills under soundd's own precedence for the duration of
-its fill (`specs/scheduler-core-spec.md` §3, amended to the wake grant by
-`specs/scheduling-reservations-spec.md` §1.8.1), so it runs immediately even
-on one loaded CPU. Under the grant that time is charged to soundd's budget:
-soundd's reservation prices its clients' fills as well as its own mix.
+soundd's wake **marks a signalled client urgent** (`specs/scheduler-core-spec.md`
+§3, amended to the urgency mark by `specs/scheduling-reservations-spec.md`
+§1.8): the client is dispatched ahead of unmarked threads inside its own
+scheduling class, for a bounded window, so it starts filling promptly even on
+one loaded CPU rather than queueing behind whatever else that class is running.
+The mark moves no budget — the fill is charged to the client's own class, never
+to soundd's reservation — so a client that spins in its window delays nobody but
+its own class's threads, and soundd's own mix keeps the budget it was admitted
+with. What the mark does *not* promise is the whole of a fill: it ends at the
+first of the window expiring, the client blocking, or the wait that raised it
+ending, and a client whose fill outlives it finishes at its class's ordinary
+rate, inside the deferral window below.
 
 **Deferral.** soundd may hold a free buffer back for a client that has not
 finished filling, but only while at least five periods of unplayed audio

@@ -184,17 +184,18 @@ A real-time writer signalling a pipe lends its band to the blocked reader
 the reader's first dispatch, and ends at the earlier of the reader's next
 block or one quantum of running time under the lend.
 
-**Amended by `specs/scheduling-reservations-spec.md` §1.8.1, and applied at that
+**Amended by `specs/scheduling-reservations-spec.md` §1.8, and applied at that
 document's R4; the shipped form above is what the tree still implements.** The
-paragraph's defect is that it lends *precedence* and charges nobody for it,
-which is the one mechanism the reservation model abolishes. Its replacement is
-the **wake grant**: the woken reader runs against the *waker's deadline* for at
-most the waker's remaining budget, and every nanosecond it spends there is
-charged to the waker's budget — so the grant ends at the first of that budget
-being spent, the waker's period boundary, the reader's next block, or the
-reader's death, and the pair spends one budget between them rather than two. The
-quantum of running time above has no counterpart, because a quantum was never
-the quantity being lent.
+paragraph's defect is that it lends a *band* — an unbounded precedence over
+everything below it — and the reservation model has no band to lend. Its
+replacement is the **urgency mark**: the wake marks the woken reader, and a
+marked thread is dispatched ahead of unmarked threads **inside its own
+scheduling class**, for a bounded window, spending its own class's budget and
+never the waker's. The mark ends at the first of that window, the reader's next
+block, or the wait that raised it ending; it moves no budget, so a reader that
+runs long delays only its own class, and a waker's reservation is not something
+its wakees can drain. The quantum of running time above has no counterpart,
+because a quantum was never the quantity being lent.
 
 ## 4. Fairness
 
