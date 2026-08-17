@@ -467,6 +467,52 @@ pub fn wait_until(
     }
 }
 
+/// Arm, then park until `ready()` holds — for a wait a kill may not end and no
+/// deadline bounds.
+///
+/// **`SleepLock::lock`'s park, and it has no second caller.** §7.4's third
+/// shape, taken: the kill bit stays sticky and `WaitTicket::commit` still
+/// refuses to park a killed task on an ordinary ticket, so the *ticket* is what
+/// says whether the kill is this wait's answer. A killed thread's teardown
+/// takes `ProcessData` and then the VFS, and a lock acquire that answered a
+/// kill would leave that teardown with nothing it could acquire.
+///
+/// Three differences from [`wait_until`], each of them the reason this is its
+/// own function rather than a flag on that one:
+///
+/// * **The loop exits on the predicate and on nothing else.** `wait_until`
+///   returns on [`Reason::Expired`] and [`Reason::Closed`] as well, which is
+///   right for a caller that asked for a deadline or waits on a subject that can
+///   end — and wrong for a lock acquire, where returning without the predicate
+///   means returning without the lock.
+/// * **No deadline.** What ends this wait is the holder's release; a timeout
+///   would be a second answer to a question that already has one, and
+///   `retire_task`'s tripwire is where an unwind that never finishes is caught.
+/// * **The class is [`WaitClass::Other`] and is not the caller's to choose.**
+///   Blocked time on a lock belongs to whatever the *holder* is doing, which is
+///   not a fact this side can see; naming a class here would attribute the
+///   holder's disk wait to the contender's own reason for wanting the lock.
+#[track_caller]
+pub fn wait_uncancellable_until(
+    p: &Parkable,
+    subject: Subject<'_>,
+    token: Token,
+    ready: impl Fn() -> bool,
+) {
+    if ready() {
+        return;
+    }
+    // Unlike `wait_until`, "no current task" cannot be answered by returning:
+    // the caller would carry on believing it holds a lock it never took. It is
+    // also unreachable — `Parkable::of_current` asserts a baseline boot cannot
+    // meet — so it is a kernel bug and says so.
+    let armed = arm(subject, token, WaitClass::Other)
+        .expect("completion: an uncancellable wait with no task to park");
+    while !ready() {
+        let _ = wait_inner(p, &armed, Deadline::never(), Cancel::Ignores);
+    }
+}
+
 /// A kernel thread that has said everything it has to say.
 ///
 /// **Armed on itself, where nothing posts.** The two log actuator threads park

@@ -1655,6 +1655,11 @@ mod tests {
                 "sched-check",
                 "shard-publish-relaxed",
                 "shootdown-serve-relaxed",
+                // The eighth loom control, and the first over a *contended*
+                // acquire: `src/sleeplock.rs`'s two loads of `now` go
+                // `Relaxed` and `kernel-loom/tests/sleep_lock.rs` reds. Costs
+                // no kernel build, for the same reason as the six above it.
+                "sleeplock-acquire-off",
                 "test-actuators",
                 // Costs no kernel build at all, for `loom`'s reason: declared
                 // so `cfg` checking knows the name, and turned on only by

@@ -154,6 +154,20 @@ impl TaskId {
     }
 }
 
+/// The running task, or `None` where there is no task: boot, and an idle CPU.
+///
+/// **Two per-CPU reads and no lock**, which is a requirement rather than a
+/// nicety: `SleepLock::lock` calls this on every acquire, with preemption still
+/// on, so a reader that asked the `CpuSched` which task is running would alias
+/// the `&mut CpuSched` a preempting pass takes. `sched::kthread::current_row`
+/// reads the same two words for the same reason and says so at more length.
+pub fn current_task() -> Option<TaskId> {
+    match (percpu::current_pid(), percpu::current_tid()) {
+        (Some(pid), Some(tid)) => Some(TaskId(pid, tid)),
+        _ => None,
+    }
+}
+
 impl core::fmt::Display for TaskId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}:{}", self.0, self.1)
@@ -214,7 +228,7 @@ pub fn enqueue_new(
     id: TaskId,
     kernel_stack: crate::process::OwnedAlloc,
     entry_rsp: u64,
-    address_space: Option<crate::process::PageTables>,
+    address_space: crate::process::PageTables,
     fs_base: u64,
 ) -> ThreadSched {
     driver::spawn(NewTask {

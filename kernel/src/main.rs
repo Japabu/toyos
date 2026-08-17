@@ -11,6 +11,7 @@ static DEBUG_WAIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 pub use mm::{UserAddr, DirectMap, PHYS_OFFSET};
 
 mod shootdown;
+mod sleeplock;
 mod sync;
 mod id_map;
 
