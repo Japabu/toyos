@@ -270,6 +270,17 @@ actuators! {
     /// See `xhci/device.rs`'s `selftest`.
     xhci_descriptor_selftest = "xhci-descriptor-selftest";
 
+    /// Run `Virtqueue::poll_used` over eleven crafted used-ring elements at
+    /// init. Both fields of a used-ring element are written by the device, and
+    /// every virtio device QEMU implements writes correct ones — no device
+    /// property, machine property or backend makes one report a head
+    /// descriptor it was never given or a length past the buffer it was
+    /// posted. So without this the parse's refusals would ship never having
+    /// executed. The queue and its DMA page are real and the shipped
+    /// `poll_used` is what runs; only the writer of the ring is the kernel
+    /// instead of a device. See `drivers/virtio.rs`'s `used_selftest`.
+    virtio_used_selftest = "virtio-used-selftest";
+
     /// Leave every AP holding the CR0 and CR4 that INIT left it, which is what
     /// every boot before `arch/control_regs.rs` was: caching disabled, WP clear,
     /// NE clear. `control_regs_negative` boots it and holds the verdict against

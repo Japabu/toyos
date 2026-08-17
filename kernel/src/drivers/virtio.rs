@@ -166,13 +166,57 @@ impl VirtqueueRegions {
     }
 }
 
-/// Proof that a descriptor slot is available for submission.
-/// Non-Copy, non-Clone: must be obtained from `poll_used()` or `initial_slots()`.
-/// Consumed by `submit()` — prevents overwriting in-flight descriptors.
+/// Proof that a descriptor slot is available for submission, **and that its
+/// number indexes this queue**.
+///
+/// Non-Copy, non-Clone: must be obtained from `poll_used()` or
+/// `initial_slots()`. Consumed by `submit()` — prevents overwriting in-flight
+/// descriptors. `id()` is below `Virtqueue::size` for every slot either
+/// constructor hands out, which is what lets a driver index a table sized by
+/// its queue with it and not have to know that the number came off DMA.
 pub struct DescSlot(u16);
 
 impl DescSlot {
     pub fn id(&self) -> u16 { self.0 }
+}
+
+/// Why a used-ring element this driver read is not one it will act on.
+///
+/// **Both fields of a used-ring element are written by the device**, and for
+/// virtio-sound's control and event queues the ring itself is in memory a
+/// userland process maps writable — so neither number is evidence about
+/// anything until it has been compared with what the driver published.
+/// Refused rather than clamped: an element that names a descriptor this queue
+/// does not have, or claims more bytes than the chain it names was given, is
+/// not a completion with a bad field in it, and there is nothing to recover
+/// from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsedRefusal {
+    /// The head descriptor id is not an index into this queue's table.
+    IdPastQueue { id: u32, size: u16 },
+    /// The head names a descriptor this queue has published no chain at. A
+    /// completion for a request that was never made.
+    NoChain { id: u16 },
+    /// The device claims to have written more bytes than the chain whose head
+    /// this is was ever given. A driver that believes it reads past the buffer
+    /// it posted.
+    LenPastChain { id: u16, len: u32, chain: u32 },
+}
+
+impl core::fmt::Display for UsedRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::IdPastQueue { id, size } => {
+                write!(f, "head descriptor {id} in a queue of {size}")
+            }
+            Self::NoChain { id } => {
+                write!(f, "a completion for descriptor {id}, where this queue published no chain")
+            }
+            Self::LenPastChain { id, len, chain } => {
+                write!(f, "{len} bytes written into chain {id}, which is {chain} bytes")
+            }
+        }
+    }
 }
 
 /// Interrupt-context consumer of a virtqueue's used ring, split off with
@@ -183,25 +227,47 @@ pub struct UsedRingConsumer {
     used: KernelSlice,
     size: u16,
     last_used_idx: u16,
+    refused: u32,
 }
 
 impl UsedRingConsumer {
     /// Non-blocking poll: returns the head descriptor id of a completed
     /// chain, or `None` if nothing new.
+    ///
+    /// A head past the queue is skipped and counted, never returned — the
+    /// caller indexes an array with it. Skipped rather than answered `None`,
+    /// because `None` here means *the ring is empty* and one bad element must
+    /// not hide the completions behind it.
+    ///
+    /// **Nothing here logs.** The only caller is an ISR, and the log backend
+    /// takes a lock this context cannot wait on; [`refused`](Self::refused) is
+    /// how the count is read from somewhere that can.
     pub fn poll(&mut self) -> Option<u16> {
-        let used_idx = unsafe { read_volatile(self.used.ptr_at(USED_IDX_OFF) as *const u16) };
-        if used_idx == self.last_used_idx {
-            return None;
+        loop {
+            let used_idx = unsafe { read_volatile(self.used.ptr_at(USED_IDX_OFF) as *const u16) };
+            if used_idx == self.last_used_idx {
+                return None;
+            }
+            // Acquire: the device wrote the used element before bumping the
+            // used idx — pair with that ordering before reading the element.
+            fence(Ordering::Acquire);
+            let slot = self.last_used_idx % self.size;
+            let id = unsafe {
+                read_volatile(self.used.ptr_at(USED_RING_OFF + slot as usize * USED_ELEM_SIZE) as *const u32)
+            };
+            self.last_used_idx = self.last_used_idx.wrapping_add(1);
+            if id >= self.size as u32 {
+                self.refused = self.refused.saturating_add(1);
+                continue;
+            }
+            return Some(id as u16);
         }
-        // Acquire: the device wrote the used element before bumping the
-        // used idx — pair with that ordering before reading the element.
-        fence(Ordering::Acquire);
-        let slot = self.last_used_idx % self.size;
-        let id = unsafe {
-            read_volatile(self.used.ptr_at(USED_RING_OFF + slot as usize * USED_ELEM_SIZE) as *const u32)
-        };
-        self.last_used_idx = self.last_used_idx.wrapping_add(1);
-        Some(id as u16)
+    }
+
+    /// How many used-ring elements this consumer has refused, for the life of
+    /// the boot.
+    pub fn refused(&self) -> u32 {
+        self.refused
     }
 }
 
@@ -214,12 +280,32 @@ pub struct Virtqueue {
     last_used_idx: u16,
     notify_offset: u16,
     used_split: bool,
+    /// How many bytes the chain headed by each descriptor was given, written
+    /// by [`Virtqueue::submit`] and [`Virtqueue::write_chain`] and read by
+    /// [`Virtqueue::poll_used`].
+    ///
+    /// **The one number the device's `len` can be compared against.** The
+    /// device reports how much it wrote; only the driver knows how much room
+    /// it published, and without this the two are never compared. A descriptor
+    /// no chain has been built at holds 0, so a completion for one is refused
+    /// rather than believed.
+    chain_bytes: alloc::vec::Vec<u32>,
+    refused: u32,
 }
 
 /// Direction of a buffer in a descriptor chain.
 pub enum BufDir {
     Readable,
     Writable,
+}
+
+/// How many bytes a chain gives the device to write into.
+///
+/// Saturating rather than wrapping: a chain whose lengths sum past `u32` is
+/// one no caller in this tree builds, and a wrap would make the bound *smaller*
+/// than the buffers actually posted, which refuses legal completions.
+fn chain_bytes(bufs: &[(u64, u32, BufDir)]) -> u32 {
+    bufs.iter().fold(0u32, |sum, (_, len, _)| sum.saturating_add(*len))
 }
 
 impl Virtqueue {
@@ -244,6 +330,8 @@ impl Virtqueue {
             last_used_idx: 0,
             notify_offset: 0,
             used_split: false,
+            chain_bytes: alloc::vec![0u32; queue_size as usize],
+            refused: 0,
         }
     }
 
@@ -257,6 +345,7 @@ impl Virtqueue {
             used: self.used,
             size: self.size,
             last_used_idx: self.last_used_idx,
+            refused: 0,
         }
     }
 
@@ -281,13 +370,14 @@ impl Virtqueue {
     /// index rather than by a [`DescSlot`], because the proof a slot carries —
     /// that this descriptor is not in flight — is the publisher's to hold and
     /// the publisher is not here.
-    pub fn write_chain(&self, first_desc: u16, bufs: &[(u64, u32, BufDir)]) {
+    pub fn write_chain(&mut self, first_desc: u16, bufs: &[(u64, u32, BufDir)]) {
         assert!(
             (first_desc as usize + bufs.len()) <= self.size as usize,
             "virtqueue: chain at {first_desc} of {} descriptors runs past a queue of {}",
             bufs.len(),
             self.size
         );
+        self.chain_bytes[first_desc as usize] = chain_bytes(bufs);
         for (i, (addr, len, dir)) in bufs.iter().enumerate() {
             let desc_idx = first_desc + i as u16;
             let mut flags: u16 = match dir {
@@ -342,6 +432,7 @@ impl Virtqueue {
     ) -> u16 {
         let size = self.size;
         let first_desc = slot.0;
+        self.chain_bytes[first_desc as usize] = chain_bytes(bufs);
         for (i, (addr, len, dir)) in bufs.iter().enumerate() {
             let desc_idx = (first_desc + i as u16) % size;
             let is_last = i == bufs.len() - 1;
@@ -384,18 +475,67 @@ impl Virtqueue {
     /// Non-blocking poll of the used ring. Returns `(DescSlot, written_len)` if
     /// the device has completed a request, or `None` if nothing new.
     /// The returned `DescSlot` can be reused for a new submission.
+    ///
+    /// **This is the one place a device-chosen number enters this kernel, and
+    /// it is parsed here so that no consumer has to know it should.** Both
+    /// fields of the element are the device's, and on virtio-sound's control
+    /// and event queues the ring is inside memory a userland process maps
+    /// writable — so an id is compared with the queue's size and a length with
+    /// the bytes the chain it names was published with. A refused element is
+    /// counted and *skipped*, never returned: `None` means the ring is empty,
+    /// and one forged element must not hide the completions queued behind it.
+    ///
+    /// The slot a refused element named is forfeit for the life of the boot —
+    /// the safe direction, since a `DescSlot` is a token and losing one costs
+    /// throughput where believing a bad one costs memory.
+    ///
+    /// **Nothing here logs.** `virtio_console::try_read_byte_locked` calls
+    /// this while holding `serial::BackendGuard`, which is the lock the log
+    /// backend itself takes; [`refused`](Self::refused) is how a caller in a
+    /// context that *can* log reads the count.
     pub fn poll_used(&mut self) -> Option<(DescSlot, u32)> {
         assert!(!self.used_split, "virtqueue: used ring split off");
-        let used_idx = unsafe { read_volatile(self.used_idx_ptr()) };
-        if used_idx == self.last_used_idx {
-            return None;
+        loop {
+            let used_idx = unsafe { read_volatile(self.used_idx_ptr()) };
+            if used_idx == self.last_used_idx {
+                return None;
+            }
+            fence(Ordering::Acquire);
+            let slot = self.last_used_idx % self.size;
+            let id = unsafe { read_volatile(self.used_ring_id_ptr(slot)) };
+            let len = unsafe { read_volatile(self.used_ring_len_ptr(slot)) };
+            self.last_used_idx = self.last_used_idx.wrapping_add(1);
+            match self.parse_used(id, len) {
+                Ok(elem) => return Some(elem),
+                Err(_) => {
+                    self.refused = self.refused.saturating_add(1);
+                    continue;
+                }
+            }
         }
-        fence(Ordering::Acquire);
-        let slot = self.last_used_idx % self.size;
-        let id = unsafe { read_volatile(self.used_ring_id_ptr(slot)) };
-        let len = unsafe { read_volatile(self.used_ring_len_ptr(slot)) };
-        self.last_used_idx = self.last_used_idx.wrapping_add(1);
-        Some((DescSlot(id as u16), len))
+    }
+
+    /// The whole of what a used-ring element has to satisfy, separated from
+    /// the volatile reads that produce it so the self-test can run the shipped
+    /// decision over elements no device on this host will write.
+    fn parse_used(&self, id: u32, len: u32) -> Result<(DescSlot, u32), UsedRefusal> {
+        if id >= self.size as u32 {
+            return Err(UsedRefusal::IdPastQueue { id, size: self.size });
+        }
+        let chain = self.chain_bytes[id as usize];
+        if chain == 0 {
+            return Err(UsedRefusal::NoChain { id: id as u16 });
+        }
+        if len > chain {
+            return Err(UsedRefusal::LenPastChain { id: id as u16, len, chain });
+        }
+        Ok((DescSlot(id as u16), len))
+    }
+
+    /// How many used-ring elements this queue has refused, for the life of the
+    /// boot. A driver in a context that can log reads it and says so.
+    pub fn refused(&self) -> u32 {
+        self.refused
     }
 
     /// Submit a descriptor chain and wait for the device to complete it.
@@ -416,6 +556,102 @@ impl Virtqueue {
             core::hint::spin_loop();
         }
     }
+}
+
+/// Run [`Virtqueue::poll_used`] over eleven crafted used-ring elements.
+///
+/// **What nothing else on this host reaches.** Both fields of a used-ring
+/// element are written by the device, and every virtio device QEMU implements
+/// writes correct ones — there is no device property, machine property or
+/// backend that makes one report a head descriptor it was never given or a
+/// length past the buffer it was posted. So without this the refusals below
+/// would ship never having executed, which is what
+/// `specs/device-test-strategy.md` asks a driver-side bound to answer for.
+///
+/// Nothing is simulated: the queue is a real [`Virtqueue`] over a real DMA
+/// page, the elements are written into its used ring the way a device writes
+/// them, and what runs is the shipped `poll_used` including its volatile reads.
+/// Only the writer of the ring is us instead of a device.
+#[cfg(feature = "boot-actuators")]
+pub fn used_selftest() {
+    use super::DmaPool;
+
+    const SIZE: u16 = 16;
+    /// The chain the self-test publishes at descriptor 3, in bytes.
+    const CHAIN: u32 = 256;
+    /// A descriptor inside the queue that no chain was ever built at.
+    const UNBUILT: u32 = 5;
+    const CASES: usize = 11;
+
+    let pool = DmaPool::alloc(0x1000);
+    let mut q = Virtqueue::new(pool.slice().subslice(0, 0x1000), SIZE);
+    q.write_chain(3, &[(pool.slice().phys(), CHAIN, BufDir::Writable)]);
+
+    // Write one element where the device would write it and bump the index the
+    // device bumps. `at` is what the queue's own `last_used_idx` will be.
+    fn publish(q: &Virtqueue, at: u16, id: u32, len: u32) {
+        let slot = at % q.size;
+        unsafe {
+            write_volatile(q.used_ring_id_ptr(slot) as *mut u32, id);
+            write_volatile(q.used_ring_len_ptr(slot) as *mut u32, len);
+            fence(Ordering::Release);
+            write_volatile(q.used_idx_ptr() as *mut u16, at.wrapping_add(1));
+        }
+    }
+
+    /// One element, and what `poll_used` must answer for it.
+    const TABLE: [(&str, u32, u32, Option<(u16, u32)>); 9] = [
+        ("a chain the device filled", 3, CHAIN, Some((3, CHAIN))),
+        ("a chain the device part-filled", 3, 1, Some((3, 1))),
+        // A readable-only chain: the device wrote nothing into it and says so.
+        ("a chain the device wrote nothing into", 3, 0, Some((3, 0))),
+        ("a head past the queue", SIZE as u32, 0, None),
+        // The one the `id as u16` cast could not see: 0x1_0003 narrows to 3, a
+        // descriptor this queue really has, so a driver that truncated before
+        // comparing would accept it.
+        ("a head whose low 16 bits are in range", 0x1_0003, CHAIN, None),
+        ("a head of every bit", u32::MAX, 0, None),
+        ("one byte more than the chain", 3, CHAIN + 1, None),
+        ("a length of every bit", 3, u32::MAX, None),
+        ("a completion for a chain never published", UNBUILT, 0, None),
+    ];
+
+    let mut passed = 0usize;
+    let mut at = 0u16;
+    for (name, id, len, want) in TABLE {
+        publish(&q, at, id, len);
+        at = at.wrapping_add(1);
+        let got = q.poll_used().map(|(slot, len)| (slot.id(), len));
+        if got == want {
+            passed += 1;
+        } else {
+            log!("virtio: used-ring selftest FAILED on {name}: got {got:?}, want {want:?}");
+        }
+    }
+
+    // A completion behind a refused element is still delivered: `None` means
+    // the ring is empty, and a device that forges one element must not be able
+    // to hide the ones queued behind it.
+    publish(&q, at, u32::MAX, u32::MAX);
+    publish(&q, at.wrapping_add(1), 3, CHAIN);
+    let got = q.poll_used().map(|(slot, len)| (slot.id(), len));
+    if got == Some((3, CHAIN)) {
+        passed += 1;
+    } else {
+        log!("virtio: used-ring selftest FAILED on a chain behind a refused element: got {got:?}");
+    }
+
+    // Eleven elements published, seven refused. The count is checked because
+    // every case above would pass just as well against a `poll_used` that
+    // refused correctly and counted nothing, and the count is what a driver in
+    // a loggable context reports.
+    let refused = q.refused();
+    if refused != 7 {
+        log!("virtio: used-ring selftest FAILED on the count: refused {refused}, want 7");
+    } else {
+        passed += 1;
+    }
+    log!("virtio: used-ring selftest {passed}/{CASES}");
 }
 
 /// Which of a device's two interrupt sources it declined to bind. Not a

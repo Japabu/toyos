@@ -107,6 +107,7 @@ fn drain_tx() -> u32 {
     // init has installed the consumer.
     let Some(consumer) = consumer.as_mut() else { return 0 };
     let mut mask = 0u32;
+    let refused_before = consumer.refused();
     while let Some(head) = consumer.poll() {
         let idx = head as usize / abi::TX_CHAIN as usize;
         if idx >= abi::PERIODS || head % abi::TX_CHAIN != 0 {
@@ -114,6 +115,14 @@ fn drain_tx() -> u32 {
             continue;
         }
         mask |= 1 << idx;
+    }
+    // The consumer's own refusals join this driver's count, so one line names
+    // both. A head past the queue never reaches the loop above — the caller
+    // indexes with it — so without this it would be counted nowhere. The ISR
+    // cannot log, which is why both are counters and the naming is elsewhere.
+    let refused = consumer.refused() - refused_before;
+    if refused != 0 {
+        TX_ISR.stray.fetch_add(refused, Ordering::Relaxed);
     }
     mask
 }
@@ -249,7 +258,7 @@ pub fn drain_completed(buf: &mut crate::user_ptr::UserBytesMut) -> usize {
     if stray != 0 && !TX_ISR.named_stray.swap(true, Ordering::Relaxed) {
         log!(
             "virtio-sound: the device completed a chain this driver never built ({stray} so far) \
-             — its avail ring names a descriptor that heads none"
+             — a used-ring head past the queue, or one that heads no chain"
         );
     }
     let max = buf.len() / AudioCompletionRecord::SIZE;
@@ -410,7 +419,7 @@ pub fn init(devices: &[PciDevice]) {
         abi::TX_QUEUE_SIZE,
     );
 
-    build_chains(&controlq, &eventq, &txq, shared.phys());
+    build_chains(&mut controlq, &mut eventq, &mut txq, shared.phys());
 
     // Install the used-ring consumer before the vector can fire, so no interrupt
     // observes a half-written Option — configuration-change interrupts share it.
@@ -475,7 +484,7 @@ fn queue(desc: KernelSlice, avail: KernelSlice, used: KernelSlice, size: u16) ->
 /// write, so the driver's whole vocabulary is an index into an avail ring and a
 /// doorbell. One control chain serves every command because the device reads the
 /// header first and takes only what that command defines.
-fn build_chains(controlq: &Virtqueue, eventq: &Virtqueue, txq: &Virtqueue, base: u64) {
+fn build_chains(controlq: &mut Virtqueue, eventq: &mut Virtqueue, txq: &mut Virtqueue, base: u64) {
     let at = |offset: usize| base + offset as u64;
 
     controlq.write_chain(

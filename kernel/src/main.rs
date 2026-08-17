@@ -635,6 +635,14 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // Phase 6: Devices
     let t_devices = clock::nanos_since_boot();
 
+    // Once for the machine, before any device is brought up: it touches no
+    // device and reads no register, so a run per virtio driver would say the
+    // same thing four times.
+    #[cfg(feature = "boot-actuators")]
+    if actuator::virtio_used_selftest() {
+        drivers::virtio::used_selftest();
+    }
+
     virtio_console::init(&pci_devices);
     virtio_net::init(&pci_devices);
 
