@@ -8,23 +8,31 @@
 //! [`RELEGATED`] is exactly the set the nightly job selects, and `tests/toyos.rs`
 //! writes [`Tier::Nightly`] against each of those names in its own registration.
 //!
-//! **This is interim and it is a loss.** Fifty-three registered tests are
-//! Nightly: twenty-seven for [`Why::Cost`] — a CI execution over the line
+//! **This is interim and it is a loss.** Fifty-two registered tests are
+//! Nightly: twenty-six for [`Why::Cost`] — a CI execution over the line
 //! (loaded audio and ordinary `audio_tone` each have two measured SMP labels,
 //! all four over it) — twenty-two for [`Why::TimerAnchored`], Nightly by
 //! classification rather than by cost, mostly nowhere near the line and one
 //! (`i8042_quarantine`) straddling it run to run for the classification's own
 //! reason — and four for [`Why::RidesTheBootOf`], riding
 //! `metal_sim_compositor`'s shared boot. Between them they account for
-//! 1,791.2 s of the effective 2,126.6 s CI profile, and none is gated per pull
-//! request. `guards` on every row says what stopped being gated, because a run
-//! that quietly does less is the whole failure mode here —
+//! 1,755.2 s of the 2,135.0 s the committed profile prices across 317 labels,
+//! and none is
+//! gated per pull request. `guards` on every row says what stopped being gated,
+//! because a run that quietly does less is the whole failure mode here —
 //! `specs/assessments/test-cost-audit.md` §7 is the long form.
 //!
 //! **Nothing here is an optimisation and nothing here changes an assertion.**
 //! A relegated test measures exactly what it measured; the manual nightly
 //! command runs it. #188 holds only the optimisation work that would make one
-//! of these fast enough to come back to the per-PR tier.
+//! of these fast enough to come back to the per-PR tier — and **two names left
+//! by that door on 2026-08-17**: `xhci_msi_only` (35,223 ms) and
+//! `swiss_german_layout` (12,645 ms) were each a guest binary waiting out a
+//! fixed fallback deadline nobody had sent the sentinel for, 30 s and 8 s of
+//! host wall clock with no assertion behind either. Both are `Tier::Fast`
+//! again, on run 32023797195's twelve shards rather than on the dev host:
+//! **5,857 ms and 5,441 ms**. `specs/assessments/test-cost-audit.md` §5.10 is
+//! the measurement.
 //!
 //! **CI is the instrument for a per-PR policy.** The effective profile starts
 //! with the last full twelve-shard run and replaces every name measured by the
@@ -274,15 +282,6 @@ pub const RELEGATED: &[Relegated] = &[
                  text survive in the middle of a cleared screen.",
     },
     Relegated {
-        test: "xhci_msi_only",
-        ci_ms: 35_223,
-        why: Why::Cost,
-        guards: "The T14's Thunderbolt controller, which printed `no MSI-X capability, \
-                 using polled mode` on a real boot when there was no polled mode. Every \
-                 other controller in this suite has MSI-X, so `msix=off` is the only way \
-                 this branch executes at all.",
-    },
-    Relegated {
         test: "desktop_typing_damage",
         ci_ms: 81_197,
         why: Why::Cost,
@@ -298,7 +297,14 @@ pub const RELEGATED: &[Relegated] = &[
         guards: "The guard page under every per-CPU idle stack. Its absence is invisible \
                  to every log line and every screendump — an overflow rewrote whatever the \
                  allocator had put underneath — so the only way to ask is to touch it, and \
-                 SYS_DEBUG action 9 is the one read.",
+                 SYS_DEBUG action 9 is the one read. **`ci_ms` is now stale on the high \
+                 side and deliberately left:** 2026-08-17 took a flat 20 s `drain_serial` \
+                 off it — the fatal path halts every CPU without QEMU exiting, so the drain \
+                 waited out its whole ceiling for a machine that would never speak again — \
+                 and the same test measures 28.5 s to 3.0 s on the dev host. Whether \
+                 that is enough to cross back is a KVM question this branch cannot answer, \
+                 so the number above is the last CI measurement and the next nightly run \
+                 replaces it.",
     },
     Relegated {
         test: "dump_nmi_probe",
@@ -307,7 +313,14 @@ pub const RELEGATED: &[Relegated] = &[
         guards: "Ctrl+Alt+D's NMI probe: a CPU that ignores a kick is named and then asked \
                  where it is with the one interrupt it cannot mask, with the rip it brings \
                  back resolved against the kernel's own symbols. On the T14 the dump named \
-                 three CPUs without saying which of three causes each was.",
+                 three CPUs without saying which of three causes each was. **`ci_ms` is \
+                 stale on the high side for the same reason `idle_stack_guard`'s is:** \
+                 2026-08-17 replaced its flat 20 s `drain_serial` with the two lines the \
+                 report actually owes — an NMI interrupts a CPU rather than killing it, so \
+                 the guest neither exits nor halts and the drain was paid in full on every \
+                 green run — and it measures 22.4 s to 6.0 s on the dev host. That may put \
+                 it under the line on KVM; the next nightly measurement decides, and it is \
+                 the one row here most likely to return to Fast.",
     },
     Relegated {
         test: "metal_sim_pointer_churn",
@@ -365,14 +378,6 @@ pub const RELEGATED: &[Relegated] = &[
                  it read it, at the fourth completion and at the first. A Logitech mouse \
                  on the T14 went silent for the rest of the boot with every bind-time line \
                  reading perfectly.",
-    },
-    Relegated {
-        test: "swiss_german_layout",
-        ci_ms: 12_645,
-        why: Why::Cost,
-        guards: "Swiss German end to end, injected by physical key position — which asserts \
-                 the table, the modifier levels, the ISO key and the dead-key machine at \
-                 once.",
     },
     Relegated {
         test: "iommu_discovery",
