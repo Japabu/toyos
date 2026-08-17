@@ -8065,7 +8065,15 @@ fn run_machine_test(
         }
         // No guest: the instrument itself, in both directions. `screen_decoder`
         // is the same idea for the framebuffer decoder.
-        "serial_vocabulary" => serial::self_check(),
+        //
+        // Three of them under one name, because they are one subject: what a
+        // console line says died, what a wait does about it, and the fact that
+        // only one place in the harness is allowed to answer either.
+        "serial_vocabulary" => {
+            serial::self_check()?;
+            qemu::ceiling_self_check()?;
+            one_vocabulary()
+        }
         "suspend_detector" => common::clock::self_check(),
         "suspend_invalidates_a_verdict" => suspend_invalidates_a_verdict(),
         "stall_is_not_a_verdict" => stall_is_not_a_verdict(),
@@ -11852,6 +11860,80 @@ fn expected_failure_exit_status() -> Result<(), String> {
     if before_review.exit_code() != 0 {
         return Err("an entry whose review date has not arrived reds anyway".to_string());
     }
+    Ok(())
+}
+
+/// A wait that hands a death spelling to a scan of its own, asked of the
+/// harness's source.
+///
+/// **The one place the vocabulary lives is the whole of the fix, so this is
+/// what keeps it the one place.** `tests/common/qemu.rs` holds three waits on a
+/// guest and they used to disagree: the boot half ended on three spellings, the
+/// test half on one and `await_guest` on none at all — so a Rust `panic!` in the
+/// kernel matched nothing while a test was running, the machine halted every
+/// CPU, and the guard expired onto a verdict saying the guest had stopped
+/// answering. All three ask `serial::died` now, which is the only thing in the
+/// harness that knows the words and the only thing that knows the prefix decides
+/// whose death they report.
+/// `specs/issues/build/every-recorded-stall-predates-the-panic-discriminator.md`
+/// is what the years before it are worth.
+///
+/// The way that comes back is the obvious patch: one more spelling handed
+/// straight to a `contains` beside the call. It would match a *program's* panic
+/// as readily as the kernel's and take the run down with a guest binary that
+/// was expected to die — so the shape is refused by name rather than left to a
+/// reviewer. Comment lines go first: this file argues about these words at
+/// length, and prose is not a second answer.
+fn hand_rolled_deaths(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
+        for word in serial::spellings() {
+            // The shape is the spelling as somebody's first argument —
+            // `contains`, `starts_with`, `find`, any of them. A spelling
+            // *inside* a longer staged line is how this file's own gates build
+            // their inputs, and those are not scans.
+            if line.contains(&format!("(\"{word}")) {
+                found.push(format!("{}:{}: {}", n + 1, word, line.trim()));
+            }
+        }
+    }
+    found
+}
+
+/// [`hand_rolled_deaths`] over the file that has to stay clean, with its own
+/// bad input beside it so a check that stopped finding anything says so.
+fn one_vocabulary() -> Result<(), String> {
+    const FILE: &str = "tests/common/qemu.rs";
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(FILE);
+    let text = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let found = hand_rolled_deaths(&text);
+    if !found.is_empty() {
+        return Err(format!(
+            "{FILE} scans for a death spelling itself, and `serial::died` is where that is \
+             decided for every wait at once — a second answer here is what let a kernel panic \
+             read as a stall, and it matches a program's own panic besides:\n  {}",
+            found.join("\n  ")
+        ));
+    }
+    // The negative control. Every line of it is a shape this must name, and the
+    // last two are shapes it must not: prose, and a staged capture built out of
+    // the same words.
+    let staged = "\
+        } else if line.contains(\"KERNEL PANIC\") {\n\
+        if line.starts_with(\"SEGFAULT\") {\n\
+        // ends on `PANIC:` and nothing else, which is the defect\n\
+        const KERNEL: &str = \"[kernel 1.450 cpu3] PANIC: panicked at reserve.rs:812:9:\";\n";
+    let named = hand_rolled_deaths(staged);
+    if named.len() != 2 {
+        return Err(format!(
+            "the check names {} of the two hand-rolled scans staged for it: {named:?}",
+            named.len()
+        ));
+    }
+    eprintln!("  [vocabulary] {FILE} asks `serial::died` and nothing else");
     Ok(())
 }
 

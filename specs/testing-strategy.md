@@ -19,6 +19,14 @@
    test that reaches it**, because an overflow path runs only when something is
    already going wrong, which makes it the path most likely never to have run at
    all.
+5. **A liveness guard may report that the guest stopped only when the capture
+   does not say why it stopped, and every wait decides that from one shared
+   vocabulary rather than its own.** A blown guard is a run that established
+   nothing — re-run it, do not bisect it — so a guard reporting one over a
+   kernel panic four lines up in the same capture sends the reader away from the
+   answer it already has. The vocabulary is `tests/common/serial.rs`'s, which
+   also owns the half a spelling cannot carry: `PANIC:` from the kernel is a
+   halted machine and the same word from a program is a program doing its job.
 
 ## 2. Instruments and ownership
 
