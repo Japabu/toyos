@@ -1584,6 +1584,35 @@ impl<T> SleepLock<T> {
 }
 ```
 
+**Landed at C5, in `kernel/src/sleeplock.rs`, and three things about it are
+decisions this block did not record.**
+
+- **The acquire is a ticket, not a bit, and the reason is starvation rather than
+  economy.** One word CASed `FREE` → me, with a release that posts to everyone
+  armed, is shorter and wrong twice: it is a thundering herd, and a woken
+  contender that loses the race to a caller arriving fresh on another CPU goes
+  back to sleep with nothing owed to it, for ever. A contender arms with its own
+  ticket as the completion token and the release posts to *that* token with a
+  limit of one — [`post_n`]'s existing shape, and the reason that function takes
+  a token at all. One waiter wakes, it is the one whose turn it is, and service
+  order is arrival order.
+- **`lock` parks uncancellably**, which is why §8's signature can be infallible
+  and has no `Result` for a caller to `?`. §7.4 is the whole argument and this is
+  where its third shape gets its second caller: a killed thread's teardown takes
+  `ProcessData` and then the VFS through `ops::close_all`, and an acquire that
+  answered a kill would leave that teardown with nothing it could acquire.
+  `completion::wait_uncancellable_until` is the park, and it differs from
+  `wait_until` in three ways it states at the site — it exits on the predicate
+  and on nothing else, it carries no deadline, and it fixes the `WaitClass`,
+  because blocked time on a lock belongs to whatever the *holder* is doing.
+- **A `SleepLock` may not be acquired from inside an armed wait's predicate.**
+  `completion::arm` refuses a second arm on one inbox by name and a contended
+  acquire arms, so the `ready` closure a caller hands `wait_until` may take a
+  `try_lock` and may not take a `lock`. Nothing in the tree does either; it is
+  written down at the site because the failure is a named panic at a call site
+  that looks innocent, and because C7+C8 is about to write a great many
+  predicates.
+
 - Contenders arm on the lock's own watch list and park. Release posts to one.
 - **`preempt::count()` is not raised by a `SleepGuard`**, so `assert_baseline`
   keeps meaning exactly what it means today: *a spinlock is held*. §9 depends on
@@ -1596,7 +1625,10 @@ impl<T> SleepLock<T> {
   `specs/issues/kernel/lock-spin-unreachable-by-loom.md` records that
   `Lock::lock`'s spin is unreachable by loom — "loom explores a spin as an
   unbounded branch and gives up". A parking acquire has no unbounded branch, so
-  `kernel-loom/tests/sleep_lock.rs` covers what nothing covers today.
+  `kernel-loom/tests/sleep_lock.rs` covers what nothing covers today. **It is
+  written and green**, four models over the real file, and the queued path is
+  reached by three of them — verified by making the shimmed park panic and
+  watching exactly those three red.
 
 Ordering: a `SleepLock` may be taken while holding a `Lock` only through
 `try_lock` (the `Parkable` is unavailable at that depth — `of_current` asserted it
@@ -1719,6 +1751,15 @@ about the *completion core* and does not cover these. **C6 records the
 measurement or the reason one is enough**; per-CPU is the obvious escape and
 costs nothing to leave open.
 
+**C6 recorded the reason and it is that there is nothing to measure yet.** At C6
+neither thread has a producer — `usbd`'s step is C7's and `iod`'s drain is
+C12's — so a serialisation point has no arrivals and any number taken here would
+be a number about an empty queue. **C12 measures it against real producers**,
+which is where a per-CPU `iod` would be decided; `iod`'s own module header
+carries the question so it is asked at the site rather than looked up. Recorded
+rather than left silent, because "one, machine-wide" read as a settled answer is
+exactly how a serialisation point survives to 128 cores.
+
 Mechanics: a task with no user address space, at baseline 0, running a Rust
 function. **This is built, on `main`, and C6 inherits it rather than owing it.**
 The first draft named `driver::spawn`'s
@@ -1745,6 +1786,19 @@ clause and falls through to `halt_all_cpus`. So moving the log flush off a sysca
 stack converts a survivable panic into a dead machine. **C6 owns extending the
 predicate** to cover a kernel thread — it has a stack to unwind to and a task to
 kill, which is exactly what the predicate is testing for.
+
+**Log L3 built the extension and C6 filled it in, and the sentence above is
+milder than the defect turned out to be.** The ordinary predicate does not merely
+give a kernel thread the wrong answer: `syscall_rip` is never cleared
+(`specs/issues/panic-path/syscall-rip-never-cleared.md`), so a kernel task reads
+whatever user thread last ran on *that* CPU left behind and the same panic on the
+same build recovers or halts by accident of work stealing.
+`sched::kthread::Row` is where the answer became a property of the thread, and
+C6's contribution is the two `OnPanic::Recover` rows plus the arm that walks that
+branch: until `usbd-panic` existed every kernel-thread panic this tree had ever
+run took `Halt`, so "recoverable" was a value in a table and not a path — and the
+path it names runs through `poison_tid`, the idle loop's `reap_poisoned` and
+`zombify_poisoned`, none of which had seen a task with no user address space.
 
 **Identity.** A kernel thread gets a `ProcessObject` in the process table whose
 address space **is the kernel address space**. That is not a convenience: it is
@@ -2392,7 +2446,7 @@ of their *code*. Rows 18–22 were added by this review; 2, 3, 4, 9, 10, 12, 16 
 | 9 | **`on_zero_handles` runs from a deferred per-CPU queue drained "at syscall exit, `do_schedule` entry and the idle loop"** (their §1.1; the first draft cited §5.2, which is *Backpressure*) | Three things. (a) ~~The third drain site goes~~ — **withdrawn: the landed code keeps all three deliberately and documents why.** `object::drain_zero_handles`'s doc reads *"Called at syscall exit, at the top of every scheduler pass and from the idle loop — the same three sites, and for the same reason, as the wake drains beside them"*, and the idle-loop call (`driver.rs:692`) carries its own rationale: *"`pass` below covers this too; it is here so a CPU that reaches the loop and then halts has run every hook first, rather than leaving one queued behind an interrupt that may be 102 s away."* That is the case this row's argument did not consider — subsumption by `pass` is about a CPU that keeps running, and the idle site is about one that stops. **This branch would have to actively remove an already-justified, already-shipped call**, so it does not: the recommendation is struck and all three sites stay. (b) C12 adds `FileObject::on_zero_handles → writeback::push`, because `Drop` cannot take a `&Parkable` (§13). Their spec has no hook *table* to add a row to — their §5.3 is a six-row teardown table with no `FileObject` row — so this is an extension, not an entry. C12 lands after their chunk 2. (c) **The general rule, which is new and binds their chunks 1 and 2**: none of the three drain sites has a `Parkable` (`do_schedule` entry provably does not, §6.1), so after C5 **no `on_zero_handles` hook may take a `SleepLock` at all** — the compiler refuses it. `FileObject → writeback::push` is the shape *every* hook needing the VFS must take, not a one-off. |
 | 10 | **Their §1.1's closing rule: "The failing shape to check any new type against is `toyos-sched`'s `Registration`: a guard that lives on the victim's own stack and is therefore never dropped when another CPU kills it. No object introduced below places a release obligation on a blocked thread's stack."** | §7 **fixes `Registration` itself** — but by §7.2's rewrite of `handle_retire`'s two reap-in-place arms, not by `Commit::Killed`, which the first draft named and which is the wrong path (`commit()` already dequeues). The victim runs again on its own stack and drops the guard. So their rule stops being a constraint they must design around and becomes a property the kernel has. **They should not relax it until C4 has actually landed and its `toyos-sched` tests are green**: it costs them nothing to keep, and until then it is still true. `retired-thread-leaks-wait-queue-node` is closed by C4, and it is this spec's to close. |
 | 11 | **Their §1.1: an `Arc` cloned before blocking "is stranded on a freed kernel stack … leaks memory, bounded and census-visible"** | Same mechanism as row 10 retires the leak class outright. `capability-handles-spec.md` §13 said the structural fix was "Phase 2 try-once syscalls"; it is not — it is the cancellable park, which keeps one-syscall blocking I/O (§14.3). **Their census baseline assertions should tighten once C4 lands.** |
-| 12 | **`KernelPayload.address_space: Option<PageTables>` → non-`Option`** (`capability-handles-spec.md` §9.4's one surviving retype) | §10: a kernel thread's `ProcessObject` names the **kernel** address space. A kernel thread naming *no* address space would have forced that field to stay an `Option` forever, so the retype is *enabled* by this one. **The endowment spec does not claim it**: `KernelPayload` appears nowhere in it, and its §1.3 lists `AddressSpaceObject` only as a `KObjectRef` variant adopted "with no change of shape" — a different type from `payload.rs:88`'s field. So this row is a contact point with `capability-handles-spec.md`, not with the endowment branch, and nobody currently owns doing it. **C6 does it**, since C6 is what makes it possible. |
+| 12 | **`KernelPayload.address_space: Option<PageTables>` → non-`Option`** (`capability-handles-spec.md` §9.4's one surviving retype) | §10: a kernel thread's `ProcessObject` names the **kernel** address space. A kernel thread naming *no* address space would have forced that field to stay an `Option` forever, so the retype is *enabled* by this one. **The endowment spec does not claim it**: `KernelPayload` appears nowhere in it, and its §1.3 lists `AddressSpaceObject` only as a `KObjectRef` variant adopted "with no change of shape" — a different type from `payload.rs:88`'s field. So this row is a contact point with `capability-handles-spec.md`, not with the endowment branch, and nobody currently owns doing it. **C6 does it**, since C6 is what makes it possible. **Done at C6, and the cost was one level lower than the field.** A kernel thread could not name the kernel address space because the kernel did not have one to name: `mm::paging`'s `KERNEL` was a `Lock<Option<AddressSpace>>` and a task's is an `Arc<Lock<AddressSpace>>`. It is now the second, published once from a leaked `Arc` — leaked because the kernel's page tables outlive every task, so no payload may hold the last reference. What the retype then deleted is what it was for: `driver::spawn`'s two-armed `cr3` choice, `spawn_thread`'s two `expect("no address space")`s, and `sync.rs`'s `lock_unwrap`/`OptionGuard`, whose only caller was `paging::map_mmio`. One consequence had to be said out loud rather than fallen into — `handle_page_fault` used to refuse a kernel thread by way of `current_address_space()` answering `None`, and now refuses it by name. |
 | 13 | **Bad-handle policy flips to kill-the-process** (their chunk 7) | §7 makes that kill safe from a thread parked anywhere, including inside a sleep-locked critical section. Their chunk 7 flips it before C4 lands, so between the two landings a killed handle-abuser can still be killed at a park under the *old* locks — which is today's behaviour and no worse. |
 | 14 | **Their gates `kill_while_blocked` and `device_claim_crash_release`** (their chunk 6) | Both are strengthened rather than changed: after C4 the killed client's stack is unwound by returning, so the census returns to baseline for a reason stronger than the handle drain. Do not weaken either to accommodate this spec. |
 | 15 | **The SDK** (§6.5) | Disjoint in *intent*: they change what an argument names, this changes what a timeout means (§14.3 keeps the blocking ABI shape). `toyos/src/services.rs` and `toyos/src/pipe.rs` are deleted by them; `Poller` is replaced by `toyos::ring::Ring` in C11 either way. **Not disjoint in *files*** — see row 18. |
@@ -2414,11 +2468,11 @@ x86's TSO gives every load acquire and every store release semantics, so a missi
 acquire edge is invisible on the only architecture ToyOS boots. Loom is the only
 gate.
 
-**What `kernel-loom/tests/` holds today, counted rather than remembered: seven
+**What `kernel-loom/tests/` holds today, counted rather than remembered: eight
 models** — `ticket_lock.rs`, `tlb_shootdown.rs`, `reap_gate.rs`,
-`log_record.rs`, `log_publish.rs`, `log_wake.rs` and `inbox.rs`, 27 `#[test]`s
-and 27 `loom::model` calls between them — beside two files that are not models
-at all. `log_body_words.rs` and `log_zeroed_init.rs` are
+`log_record.rs`, `log_publish.rs`, `log_wake.rs`, `inbox.rs` and C5's
+`sleep_lock.rs`, 31 `#[test]`s and 31 `loom::model` calls between them — beside
+two files that are not models at all. `log_body_words.rs` and `log_zeroed_init.rs` are
 `cfg(not(feature = "loom"))` host-fast regressions with zero `loom::model`
 calls, run by the `--no-default-features` invocation
 `.github/workflows/host-tests.yml` names second, and neither carries a control
@@ -2431,7 +2485,7 @@ wait on the primitives C5 and C11 create:
 | model | status | what it explores | why the guest suite cannot |
 |---|---|---|---|
 | `inbox.rs` | **landed** | Invariant W (§5.4): producer stores a record then claims; consumer arms, rechecks, parks. Two producers, one consumer, and a producer that runs entirely before the arm. **And the producer that takes no lock**: `Inbox::post`'s plain writes are sound only under the subject's leaf lock, so the log's `emit`-side producer uses `Inbox::signal` — one atomic store — and two of them racing must be sound where two `post`s are not | the race window is a handful of instructions on two CPUs; TSO makes the missing edge unobservable |
-| `sleep_lock.rs` | **not written; waits on C5** | `SleepLock` acquire/release against a parking contender and a concurrent `try_lock`; FIFO among contenders | `Lock::lock`'s spin is unreachable by loom (`lock-spin-unreachable-by-loom`); a parking acquire has no unbounded branch, so this is the **first** contended-acquire model in the tree |
+| `sleep_lock.rs` | **landed at C5** | `SleepLock` acquire/release against a parking contender and a concurrent `try_lock`; mutual exclusion; that a queued contender is served and that `holder()` names it. **Not FIFO**: service order is the ticket arithmetic's own property — `now` advances once per release and a contender waits for the ticket it took — and there is no interleaving that makes it false, so the model states it rather than asserting it | `Lock::lock`'s spin is unreachable by loom (`lock-spin-unreachable-by-loom`); a parking acquire has no unbounded branch, so this is the **first** contended-acquire model in the tree |
 | the cancel model — **in `toyos-sched/loom/tests/loom_retire.rs`**, not a new file | **landed**: that file holds `a_retire_racing_the_park_commit_always_leaves_someone_to_reap` and `a_retire_and_a_wake_never_both_claim_a_parked_task` | kill racing a park racing a post: cancel before arm, between arm and commit, and after `Blocked` | the interleaving needs a remote CPU acting between two of the victim's instructions |
 | `outstanding.rs` | **not written; waits on C11** | an ISR on CPU A records into `irq_ring`, a drain on CPU B posts, a waiter on CPU C observes | three CPUs, one publication chain; nothing in QEMU orders them |
 
@@ -2439,7 +2493,7 @@ wait on the primitives C5 and C11 create:
 atomics, so each model drives the primitive rather than a transliteration. Any new
 primitive that does not compile that way is the wrong shape.
 
-**All seven models in `kernel-loom/tests/` carry a negative control that stages
+**All eight models in `kernel-loom/tests/` carry a negative control that stages
 a mechanism, never a verdict.** Until 2026-08-16 three of them did and this
 sentence claimed all seven: `ticket_lock`, `tlb_shootdown`, `reap_gate`,
 `log_record` and `log_publish` had none. All five were in the tree before the
@@ -2453,8 +2507,8 @@ weakens one edge, run as
 cargo test --manifest-path kernel-loom/Cargo.toml --features <control> --test <model>
 ```
 
-and each was read **both ways round on 2026-08-16** — green with the feature
-off, red with it on:
+and each was read **both ways round on 2026-08-16**, and the ninth on
+2026-08-17 — green with the feature off, red with it on:
 
 | control | what it weakens | the model that must red, and how it says so |
 |---|---|---|
@@ -2466,10 +2520,11 @@ off, red with it on:
 | `wake-fence-off` | `log/shard.rs`'s two `SeqCst` fences removed — obligation W3 | `log_wake`: *the producer posted nothing and the reader decided to park* |
 | `inbox-release-off` | `completion/inbox.rs`'s record publication and observation go `Relaxed` | `inbox`, loom's own `Causality violation: Concurrent write accesses to UnsafeCell` |
 | `inbox-signal-as-post` | the log's lock-free producer goes back on `Inbox::post` | `inbox`, at `two_unlocked_producers_are_a_race_and_a_signal_is_not`, same words |
+| `sleeplock-acquire-off` | `sleeplock.rs`'s two loads of `now` — the ones that decide whose turn it is — go `Relaxed` | `sleep_lock`, loom's own `Causality violation: Concurrent write accesses to UnsafeCell`; all four models red, and the queued one names the defect exactly |
 
-Every one of the eight is declared in `kernel-loom/Cargo.toml` with its own
-command beside it, and none is ever on by default. Seven have their `cfg` site
-in kernel source, so `kernel/Cargo.toml` declares those seven names too —
+Every one of the nine is declared in `kernel-loom/Cargo.toml` with its own
+command beside it, and none is ever on by default. Eight have their `cfg` site
+in kernel source, so `kernel/Cargo.toml` declares those eight names too —
 purely so `cfg` checking knows them, never enabled there, and each therefore
 has to appear in `src/build.rs`'s
 `the_kernel_declares_only_the_builds_that_earned_one`, which is the list that
@@ -2479,9 +2534,9 @@ the other direction — its `cfg` site is in `kernel-loom/tests/inbox.rs` itself
 because what it swaps is which producer the model drives, so no kernel
 declaration exists or is wanted.
 
-**CI runs one of the eight.** `.github/workflows/host-tests.yml`'s
+**CI runs one of the nine.** `.github/workflows/host-tests.yml`'s
 *kernel-loom wake fences have teeth* step demands `log_wake`'s FAILED line by
-name under `wake-fence-off`; the other seven are read at the landing that adds
+name under `wake-fence-off`; the other eight are read at the landing that adds
 or changes them, which is what the dated verification above is.
 
 `inbox-signal-as-post` is the one C3+C4 owed: the shipped argument for `post`'s
@@ -2548,6 +2603,24 @@ follow and each is a review item:
    by one store on the converted paths and by however many RMWs the contended
    enqueue costs. **C5 counts it and C14 measures it**; it is plausibly free
    against a 2.902 ms period and it is not free by construction.
+
+   **Counted at C5, path by path, from `sleeplock.rs` and the `completion`
+   calls under it.** The uncontended paths are one for one with `Lock`'s and the
+   surcharge is exactly the store this rule predicted:
+
+   | path | `SleepLock` | `Lock` |
+   |---|---|---|
+   | uncontended acquire | 1 RMW (`ticket` compare-exchange) + 1 plain store (`holder`) | 1 RMW (`ticket`) |
+   | uncontended release | 1 RMW (`now` fetch_add) + 1 plain store (`holder`) + 1 relaxed load (`watch.armed`) | 1 RMW (`now` fetch_add) |
+
+   The contended paths add four RMWs to the acquirer — the `ticket` fetch_add,
+   and the watch's leaf `Lock` taken and dropped at the arm and again at the
+   disarm — and three to the releaser: that leaf `Lock`, and the rendezvous CAS
+   `wake_sched` performs per waiter it claims. **Both sit on the far side of a
+   park**, which is a context switch, so they are not the quantity this rule is
+   about; the uncontended pair is, and it grew by one plain store and one
+   relaxed load. Nothing on either path is a `fetch_add` on a count, which is
+   rule 1.
 3. **Any A/B that adds an atomic is interleaved and re-measured on the source**,
    not on an instrumented build — that issue's own second lesson, where an added
    `log!` moved the cost somewhere the instrument could not see and disproved a
@@ -2591,6 +2664,13 @@ changes. Three things do:
    state, a new write on every acquire and release, it is not in §16.2's RMW
    budget, and it appears in no chunk. **C5 owns it**, and §20 should not claim a
    diagnostics improvement this refactor does not deliver.
+
+   **Landed at C5, and the write is now in §16.2's budget rather than outside
+   it**: one plain store per acquire and one per release, counted there beside
+   the two read-modify-writes `Lock` already pays. Its consumer is RT6 and
+   nothing else — the answer is `Option<TaskId>`, `None` for a free lock and
+   `None` again for one boot took through `try_lock`, because neither is a
+   thread and that is the only thing a reader of this can name.
 2. **A parked task now says what it is parked on.** `driver::ParkedInfo` gains the
    armed `Subject`'s kind. Today it carries `WaitClass`, deadline and duration; a
    thread parked on a disk transfer and one parked on a pipe are the same row.
@@ -2979,6 +3059,19 @@ does not move. Either the control's gate moves to **C7** (its first real consume
 or C5's gate is "the feature exists and its own unit test shows the spin", which
 is weaker and should be labelled as such.
 
+**Taken at C5: the row moves to C7, and C5 ships a different control rather than
+a weaker one.** Neither offered option is what landed. The actuator is not
+written at all — an actuator with nothing to act on is a row in
+`kernel/src/actuator.rs` that no boot can distinguish, which is the vacuous
+control this section refuses one paragraph above — and C7 writes it beside the
+first `SleepLock` on the disk path, where `io-depth-probe` and the `--slow-usb`
+A/B can both see it. What C5 ships instead is `sleeplock-acquire-off` (§16.1), a
+control over the property C5 actually delivers: the acquire edge. It stages a
+mechanism, it reds all four models with loom's own words, and it is read both
+ways round at the landing. **The two are not substitutes and neither replaces
+the other**: this row is about a lock that spins where it should park, and that
+defect has no observer until something holds one.
+
 (The first draft said the probe "reads the same 5 and 4 in both arms". Both
 numbers were produced by frames inside `log_file.rs` — 4 from `log_file::poll` on
 the idle loop, 5 from `log_file::flush_final` under `syscall_handler` — and
@@ -3110,8 +3203,8 @@ Two chunks below are merged pairs and keep both names, so a reference elsewhere 
 | C1 | the six duration kinds (§3, §3.1, §3.3); `Instant`/`Duration`; `Deadline::{at,never,passed}`; `Parkable` | **every one of the 41 production durations has a kind or a named exception** (§3.4) — not "the kinds exist" | no behaviour change; `MIN_ONE_SHOT_NS` still compiles |
 | C2 | `kernel/src/completion/`: `Record`, `Outcome`, `Inbox`, `Subject`, `arm`, `post`. Wired **behind** the existing waitq — every wake also posts | behaviour-preserving | `kernel-loom/tests/inbox.rs` |
 | **C3+C4 — one chunk, not two** | the one park site (`wait_until`/`prepare_wait`/`block_on` → `completion::wait`, futex folded in, `park_lot`/`PARK_BUCKETS`/`wake_task` deleted) **and** the cancellable kill (§7.2's **four** changes — `handle_retire`'s parked arm claim-arbitrated, `SchedPass::pick`'s kill arm, `preempt_if_due`'s interaction with it, and `hand_off`/`adopt` — plus `Commit::Killed` → `dispose_none`, the one-shot cancel and §7.4's choice of teardown park). **They cannot be split**: C3 puts an `Armed` on a parked thread's stack while `Commit::Killed` still discards it, so RT5 turns an ordinary kill of a blocked thread — the endowment branch's own `kill_while_blocked` gate — into a kernel panic. **Plus the log branch's two surviving fallbacks (§11)**: `klogd`'s park becomes an `Inbox` park, and `emit`'s relaxed signal becomes the degenerate one-waiter post; `Source::Log` folds into the watch list carrying §5.3a's edge contract. The third — deleting a `log::pending()` pre-`hlt` condition — is struck: there is none. **Plus §7.2a's amendment to `scheduler-core-spec.md` invariant 7 and the re-derivation of sim I14's bound**, without weakening `old_migrate_kept_the_corpse_i14` | §7, **15 park sites → 1** | `toyos-sched` host tests for the new arms — `cpu.rs` has none today; `toyos-sched`'s loom model for cancel, extending `loom/tests/loom_retire.rs` rather than opening a fifth file; `blocking_read_stress`; `exit_wait_storm`; grep: one `dispose_block` caller; **`kernel-loom/tests/log_wake.rs` — already green, re-verify**, because the log branch shipped W3's model with its code rather than deferring it |
-| C5 | `SleepLock`, `holder()` (§17.1), the `Parkable` threading. Nothing converted | §8 | `kernel-loom/tests/sleep_lock.rs`; the RMW count of §16.2 rule 2 |
-| C6 | kernel threads, **shrunk further than the plan thought**: `klogd`, `sched/kthread.rs`, `driver::spawn`'s `None` fallback and `loader::start::kernel_start` are all on `main` and were written naming this chunk (§10), so C6 spawns `usbd` and `iod` on existing machinery, adds their two *recoverable* rows to the panic predicate — `klogd`'s is deliberately not one — and does the `KernelPayload.address_space` retype (§15 row 12). `iod`'s body is C12's | §10 | `blocked_dump` names all three |
+| C5 | **Landed.** `SleepLock` (`kernel/src/sleeplock.rs`), `holder()` (§17.1), `completion::wait_uncancellable_until` and `scheduler::current_task`. Nothing converted, so the module carries an `allow(dead_code)` naming C7+C8 as what retires it | §8 | **`kernel-loom/tests/sleep_lock.rs`, four models, with `sleeplock-acquire-off` as the control that reds them; the RMW count of §16.2 rule 2, counted there.** `sleeplock-spins` is *not* here — §20.3 moves it to C7, where the defect it stages first has an observer |
+| C6 | **Landed**, and exactly as shrunk: `klogd`, `sched/kthread.rs`, `driver::spawn` and `loader::start::kernel_start` were all on `main`, so C6 spawns `usbd` (`drivers/xhci/usbd.rs`) and `iod` (`iod.rs`) on them with `OnPanic::Recover`, and does the `KernelPayload.address_space` retype (§15 row 12) — which took `mm::paging::kernel` from a `Lock<Option<AddressSpace>>` to the `PageTables` a task can name, deleted `driver::spawn`'s fallback arm and `sync.rs`'s `lock_unwrap`/`OptionGuard` with it. `iod`'s body is C12's and `usbd`'s is C7's; both park on their own watch until then | §10 | `blocked_dump` names all three, in the fast tier; `klogd_hosted` reads all three panic rows off one boot and walks **both** branches — `klogd-panic` halts the machine, `usbd-panic` kills the thread and the machine boots |
 | **C7+C8 — one chunk, not two** | xHCI async (`wait_transfer`/`wait_command`/`configure`, the per-disk claim, `XHCI` → `SleepLock`, `poll_if_pending` → `usbd` + `try_lock`) **and** `VFS`/`VOLUMES`/`ProcessData` → `SleepLock` with their 30 + 55 call sites and the boot/task split. **§11.4's obligation is discharged and is not in this chunk** — there is no kernel file sink left to re-home. **They cannot be split — see below** | §9, §12 | `toyos-xhci` host tests; `usb_storage_gate`; `killed_holder_releases`; `cancel_while_parked`; `sleeplock-spins` and `park-holding-a-spinlock` red; `io-depth-probe`'s syscall arm falls to 1; **`kernel_log_file` green against `/bin/logd`, which §12.3's choice can silently break**; the syscall half of the `--slow-usb` A/B moves here |
 | C9 | the idle loop's declared end state: `i8042::verdict_due` off the halt check and the i8042 as a polled device on `usbd`; `xhci::port_work_pending` gone with C7's `poll_if_pending`; `log_health` and `reap_poisoned` stay and the chunk says why (§11.1, §11.2). **The log subsystem is not here** — log L1–L6 | §11 | the two `sched: cpu=` tests (`tests/toyos.rs:8974`, `:9478`) stay green **unmodified**, which is what makes the halt-check change checkable |
 | C10 | `Poll<T>`; NVMe `CAP.TO`; virtio, HDA, IOMMU, RTC settles; the three duplicate `settles` become one | §4.3 | `no_spin_outside_the_allow_list` |
