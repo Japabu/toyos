@@ -886,7 +886,18 @@ pub const KNOWN_RED: &[Red] = &[
         test: "sched_check_build",
         instrument: Instrument::Ci,
         finding: Finding::Seen,
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the assert is gone. Elapsed time across a pass is wall clock and a guest's wall \
+             clock advances while the hypervisor has its vCPU, so the quantity carried a term \
+             the kernel neither observes nor controls; `toyos-sched` now records the \
+             distribution and `tests/common/passcost.rs` gates it at `MAX_PASS_NS` on the 90th \
+             percentile. **What retires this row is the same 91-run record that produced it**: \
+             invariant P asserted *every* pass under 200 000 ns and was green on 89 of those \
+             91 runs, so in each of the 89 the 90th percentile was under the budget too, and \
+             one crossing cannot move the 90th percentile of ~150 samples in the other two. \
+             The gate is green wherever the assert was, and green on the two runs the assert \
+             killed the machine on",
+        ),
         what: "`invariant P: a scheduler pass took 200569 ns, budget 200000 ns` — the assert \
                firing on native x86-64 under KVM, in `timer_handler` -> `driver::pass` -> \
                `SchedPass::finish` while `test_rs_sched_stress` pid=7 was in syscall 8, at 1.449 s \
@@ -916,7 +927,13 @@ pub const KNOWN_RED: &[Red] = &[
         test: "sched_check_build",
         instrument: Instrument::DevHostAlone,
         finding: Finding::fires(2, 2),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the panic is gone and the machine survives, so what this row measured cannot \
+             happen. The red under this name on this instrument is now the harness's \
+             pass-cost gate refusing a distribution, which is the row below — a different \
+             measurement of the same emulator, and the guest runs `sched_stress` to \
+             completion under it",
+        ),
         what: "`invariant P: a scheduler pass took 1684167 ns, budget 200000 ns`, panicking in \
                `driver::idle_loop` before userland — then 1749243 ns on cpu1 in the isolated \
                re-run. The dev host emulates x86-64 instruction by instruction while the guest \
@@ -933,6 +950,35 @@ pub const KNOWN_RED: &[Red] = &[
                    other accelerator does not",
         source: "specs/issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
         measured: "2026-08-15",
+    },
+    Red {
+        test: "sched_check_build",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(6, 10),
+        standing: Standing::Stands,
+        what: "`this distribution has mass over the budget: nine passes in ten must be provably \
+               under 200000 ns and it cannot show that` — the harness's pass-cost gate, which \
+               replaced the panic, refusing a distribution the *host* inflated. The guest is \
+               fine either way: `sched_stress` runs to completion and prints `all sched_stress \
+               tests passed`. **Contention moves this guest's median by a factor of eight and \
+               the gate follows it**: with the machine to itself, `cpu0: 168 passes, p50 < \
+               16384 ns, p90 < 131072 ns, max 1504209 ns, 7 over the 200000 ns budget` and it \
+               passes; in the same suite's 12-wide phase, `cpu0: 134 passes, p50 < 131072 ns, \
+               p90 < 262144 ns, max 1745977 ns, 14 over` and it reds. **Note the maxima on the \
+               green side**: 1974235 ns and 2543303 ns in the serial tail of the run that ended \
+               263 of 263 green — nine and twelve times the budget, refused by nothing, where \
+               the assert this replaced would have halted the machine on any one of them",
+        evidence: "`cargo test` on `wt/toyos-invariantp`, 2026-08-17, ten CPU-runs over three \
+                   sessions. Every one of the six reds was taken beside other guests: four \
+                   under another agent's suite on the shared host (`fastest boot 2330 ms \
+                   against the reference 1320 ms`, 1.77x) and two in a 12-wide parallel phase. \
+                   Every one of the four greens had the machine to itself — an isolated re-run \
+                   at 1.02x and the serial tail at 1.05x. `sched_check_build` is `Sched::Serial` \
+                   since the same day, on this measurement, which removes the second half of \
+                   this row's own cause. Not evidence about KVM in either direction — the dev \
+                   host boots no KVM guest",
+        source: "specs/issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
+        measured: "2026-08-17",
     },
     Red {
         test: "screen_pager_keys",
