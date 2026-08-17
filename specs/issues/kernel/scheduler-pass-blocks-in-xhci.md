@@ -16,9 +16,9 @@ call is not bookkeeping. Its own doc-comment says so:
 > spinlock and therefore preemption off for its whole life.
 
 The deadline is `xhci::USB_TIMEOUT_NS` = 2 s. `cpu::MAX_PASS_NS`, the budget the
-scheduler core asserts against in `feature = "check"` builds, is 200 µs. The two
-numbers disagree by four orders of magnitude, and the driver's prologue sits on
-the wrong side of the boundary the budget describes.
+scheduler core measures a pass against in `feature = "check"` builds, is 200 µs.
+The two numbers disagree by four orders of magnitude, and the driver's prologue
+sits on the wrong side of the boundary the budget describes.
 
 What a CPU inside that recovery holds is *every message addressed to it*: an
 `Adopt` carrying a task, a `Wake` for a parked thread, a `Retire`. Nothing in the
@@ -51,13 +51,21 @@ the port reset were already moved off this path for exactly this reason (CLAUDE.
 USB hotplug); the control transfers inside `configure` and `recover_endpoints`
 were not. Until then, `retire_task`'s bound is measuring the USB bus.
 
-**And the budget cannot see it, twice over.** `cpu::MAX_PASS_NS` is asserted by
-`check_pass_duration`, which measures from `SchedPass::begin`'s `now` to the end
-of `finish()` — and `drain_irqs()` runs *before* `SchedPass::begin`. The
-prologue is outside the window the budget covers, so invariant P would report a
-200 µs pass while the CPU had been in the driver for two seconds. Separately,
-the assertion is behind `feature = "check"`, whose kernel switch is
-`sched-check` (`kernel/Cargo.toml:228`) — and **nothing in `src/` or `tests/`
-ever turns it on**, so invariant P has never executed against the kernel in any
-image or any test run. Both halves want fixing together: the measured window has
-to start where the scheduler entry starts, and the gate has to run somewhere.
+**And the budget cannot see it.** `cpu::MAX_PASS_NS` is measured against by
+`SchedPass::finish`, from the `now` the pass was entered with to the end of
+`finish_inner()` — and `drain_irqs()` runs *before* `SchedPass::begin`. The
+prologue is outside the window the budget covers, so the pass-cost histogram
+records a microsecond pass while the CPU had been in the driver for two seconds.
+**The measured window has to start where the scheduler entry starts, and that
+half of this issue is still open.**
+
+The other half — that the gate ran nowhere — is closed. `sched_check_build`
+(`tests/toyos.rs`) boots the `sched-check` kernel and `tests/common/passcost.rs`
+judges what it publishes; the second sentence of the paragraph this replaced,
+that invariant P "has never executed against the kernel in any image or any test
+run", was true when it was written and has not been since. Invariant P itself no
+longer exists: a pass's elapsed time is wall clock and a guest's wall clock
+advances while a hypervisor holds its vCPU, so the budget is measured and gated
+in the harness rather than asserted in the kernel
+(`specs/issues/kernel/the-check-build-guest-stopped-answering-on-kvm-twice.md`).
+Widening the window is untouched by that and is what this file still wants.

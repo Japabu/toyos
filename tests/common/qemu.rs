@@ -72,8 +72,9 @@ pub fn boot_census() -> (u32, u32, Vec<String>) {
 /// the alternative had already been paid for and delivered nothing —
 /// `kernel/Cargo.toml` has forwarded `sched-check = ["toyos-sched/check"]` since
 /// the check build was written, and nothing in `src/` or `tests/` ever asked for
-/// it, so `cpu::MAX_PASS_NS`, invariant P and `invariants::check_cpu` were
-/// compiled by no CI run at all. `sched_check_build` is the test that asks.
+/// it, so `cpu::MAX_PASS_NS`, the pass-cost recorder and `invariants::check_cpu`
+/// were compiled by no CI run at all. `sched_check_build` is the test that asks,
+/// and `common::passcost` is what judges the half of it that is a measurement.
 ///
 /// A fifth entry is that decision again, and it gets this paragraph's argument
 /// made afresh. Interactive debug mode is separate: it builds
@@ -289,6 +290,197 @@ pub fn guest_liveness() -> Liveness {
     Liveness::new(GUEST_QUIET, GUEST_WEDGED)
 }
 
+/// A kernel line without its `[kernel <t> cpu<N>] ` stamp.
+///
+/// The stamp is the instance and the rest is the finding, and which of the two
+/// a verdict quotes decides an adjudication. `alone_line` compares the wide
+/// run's sentence against the lone re-run's, and two runs of one deterministic
+/// panic differ in the stamp alone — quoted whole, a staged double fault read
+/// `red again on a DIFFERENT failure`, which is the harness reporting two
+/// defects where there is one. The stamp is still in the capture underneath.
+fn without_stamp(line: &str) -> &str {
+    if !is_kernel_line(line) {
+        return line;
+    }
+    line.split_once("] ").map_or(line, |(_, rest)| rest)
+}
+
+/// The sentence a wait gives when what stopped the guest is on the console.
+///
+/// **One wording for all three waits**, so a summary line, a redlist row and an
+/// issue file quote the same words wherever the wait was — and so that nothing
+/// in it is a measurement of the host. The silence that proved the panic was
+/// fatal is deliberately not in the sentence: it differs by a poll interval
+/// between two runs of one panic, and `alone_line` compares those two sentences
+/// to decide whether a re-run reproduced the defect or found a second one.
+fn kernel_died_here(line: &str) -> String {
+    format!(
+        "kernel panic: {} — the guest went quiet because every CPU is halted, not because it \
+         was still working. The panic is the finding and the guard never got to be one.",
+        without_stamp(line.trim())
+    )
+}
+
+/// What a test's ceiling caught — the panic, the stall, or the slow test.
+///
+/// Pure, and every input a parameter, so [`ceiling_self_check`] can stage all
+/// three rather than wait for a guest to produce one.
+///
+/// `dying` is the line on which the kernel said it was dying, if it ever did,
+/// and `quiet` is how long the guest has said nothing. **The first arm is the
+/// whole point.** A Rust `panic!` in the kernel prints `PANIC:` and then
+/// `halt_all_cpus` stops every CPU, so the guest goes silent and the ceiling —
+/// which is a liveness guard and never a verdict — expired on a machine that
+/// had been dead since the first second. `sched_check_build` in run
+/// `31946183485` was reported `STALLED: 382s of guard expired` with the panic
+/// and its full backtrace four lines above that sentence, on a guest that died
+/// at 1.450 s of its own uptime.
+///
+/// A kernel panic does not end the wait *by itself*, and that is deliberate:
+/// the same handler recovers a panic taken in syscall context, killing the
+/// caller and leaving the machine running, which is exactly what
+/// `panic_recovery`, `heap_ceiling` and `screen_recoverable_untouched` assert.
+/// Silence is what separates the two, and it is the separation the harness
+/// already trusts everywhere else ([`GUEST_QUIET`]): a recovering guest keeps
+/// talking — it has a periodic speaker on every config and the test's own
+/// `===TEST_END` arrives in milliseconds — and a halted one cannot.
+pub fn ceiling_verdict(
+    dying: Option<&str>,
+    elapsed: Duration,
+    ceiling: Duration,
+    quiet: Duration,
+    lines: usize,
+) -> Option<String> {
+    if let Some(line) = dying {
+        if quiet >= GUEST_QUIET {
+            return Some(kernel_died_here(line));
+        }
+    }
+    if elapsed <= ceiling {
+        return None;
+    }
+    let secs = ceiling.as_secs();
+    Some(if quiet >= GUEST_QUIET {
+        format!(
+            "{STALLED} {secs}s of guard expired, and the guest had said nothing for the last \
+             {quiet:.0?} of it — the ceiling caught a machine that had stopped, which is not an \
+             answer to what this test asked"
+        )
+    } else {
+        format!(
+            "timed out after {secs}s, with the guest still talking {quiet:.0?} ago ({lines} \
+             console line(s) while it ran) — it was working and did not finish"
+        )
+    })
+}
+
+/// The three verdicts a ceiling reaches, staged with no guest at all.
+///
+/// The gate for [`ceiling_verdict`], and it runs in both directions on each:
+/// the panic must be named *and* not read as a stall, the stall must still read
+/// as one, and a program's own panic must not end anybody's run. That last one
+/// is the case the obvious patch breaks — a bare panic spelling in the read
+/// loop matches a guest binary's panic, and a guest binary is allowed to die.
+pub fn ceiling_self_check() -> Result<(), String> {
+    const CEILING: Duration = Duration::from_secs(380);
+    const KERNEL: &str =
+        "[kernel 1.450 cpu3] PANIC: panicked at kernel/src/sched/reserve.rs:812:9:";
+    let quiet = GUEST_QUIET + Duration::from_secs(1);
+    let talking = Duration::from_millis(200);
+
+    // 1. The kernel panicked and the machine went quiet. Named, and named
+    //    *before* the ceiling: the guest died at 1.45 s and the guard is 380 s.
+    let early = Duration::from_secs(17);
+    let Some(panic) = ceiling_verdict(Some(KERNEL), early, CEILING, quiet, 40) else {
+        return Err(String::from(
+            "a kernel panic followed by silence did not end the wait, so it costs the whole guard",
+        ));
+    };
+    if !panic.contains("kernel panic") || !panic.contains("reserve.rs:812:9") {
+        return Err(format!("the verdict does not name the panic: {panic}"));
+    }
+    if panic.contains(STALLED) {
+        return Err(format!("a kernel panic is still reported as a stall: {panic}"));
+    }
+    if early >= CEILING {
+        return Err(String::from("staged the panic after the ceiling, so it proves nothing"));
+    }
+    // The same panic on a later boot, differing only in its stamp, is the same
+    // sentence — or the lone re-run of a reproducible panic reads as a second,
+    // different defect. `alone_line` is what compares the two.
+    let again = "[kernel 1.503 cpu7] PANIC: panicked at kernel/src/sched/reserve.rs:812:9:";
+    if ceiling_verdict(Some(again), early, CEILING, quiet, 40).as_deref() != Some(panic.as_str()) {
+        return Err(format!(
+            "one panic on two boots gives two sentences, so a re-run reads as a second defect:\n\
+             {panic}\n{:?}",
+            ceiling_verdict(Some(again), early, CEILING, quiet, 40)
+        ));
+    }
+
+    // 2. A **userland** panic is not the machine's death. `died` is what the
+    //    read loop asks, so the case is staged where the loop reads it: the
+    //    same words from a program classify as nobody's business, and a wait
+    //    with no kernel death in it runs on.
+    const USER: &str = "thread 'main' (1) panicked at sshd/src/main.rs:359:23:";
+    if super::serial::died(USER) == Some(super::serial::Died::Kernel) {
+        return Err(format!("a program's own panic reads as the kernel's: {USER:?}"));
+    }
+    if ceiling_verdict(None, early, CEILING, quiet, 40).is_some() {
+        return Err(String::from(
+            "a run with no kernel death in it ended before its ceiling — a program that panicked \
+             would take the whole test down with it",
+        ));
+    }
+
+    // 2b. The same two cases for the wait that holds a whole capture rather
+    //     than a line at a time — `await_guest`, whose `it went quiet` is the
+    //     wording #156's signature is stated in.
+    let halted = format!("[kernel 0.400 cpu0] compositor: frames=120\n{KERNEL}\n");
+    let Some(found) = super::serial::kernel_death(&halted) else {
+        return Err(String::from("a capture ending in a kernel panic reads as a guest that merely \
+                                 stopped, which is the verdict that threw the cause away"));
+    };
+    if kernel_died_here(found) != panic {
+        return Err(String::from("the two waits word one panic differently"));
+    }
+    let program_died = format!("[kernel 0.400 cpu0] compositor: frames=120\n{USER}\n");
+    if super::serial::kernel_death(&program_died).is_some() {
+        return Err(format!(
+            "a capture whose only panic is a program's reads as a halted machine:\n{program_died}"
+        ));
+    }
+
+    // 3. A guest that merely stopped, with no panic of either kind, still
+    //    reports as a stall — the classification the whole redlist is written
+    //    against.
+    let Some(stall) = ceiling_verdict(None, CEILING + Duration::from_secs(1), CEILING, quiet, 40)
+    else {
+        return Err(String::from("an expired guard on a silent guest returned no verdict at all"));
+    };
+    if !stall.starts_with(STALLED) {
+        return Err(format!("a genuine stall stopped reporting as one: {stall}"));
+    }
+    // And the other end of the same guard: a guest still talking at the ceiling
+    // was working, and that is a different red.
+    let Some(slow) = ceiling_verdict(None, CEILING + Duration::from_secs(1), CEILING, talking, 900)
+    else {
+        return Err(String::from("an expired guard on a talking guest returned no verdict"));
+    };
+    if slow.contains(STALLED) || !slow.contains("did not finish") {
+        return Err(format!("a slow test reads as a stall: {slow}"));
+    }
+    // Nothing has expired and nothing died: no verdict.
+    if ceiling_verdict(None, early, CEILING, talking, 40).is_some() {
+        return Err(String::from("a healthy run was given a verdict"));
+    }
+
+    eprintln!(
+        "  [ceiling] the panic, the stall, the slow test and the healthy run, each named apart \
+         from the other three"
+    );
+    Ok(())
+}
+
 /// Collect console output until `done` reads true of the whole capture, or the
 /// guest stops making progress.
 ///
@@ -313,6 +505,10 @@ pub fn await_guest(
     doing: &str,
     done: impl Fn(&str) -> bool,
 ) -> Result<(), String> {
+    // Where this wait's own evidence starts. The capture is the caller's and
+    // outlives every wait on it, so a panic the machine recovered from ten
+    // probes ago must not be handed to this one as its cause.
+    let from = log.len();
     let mut live = guest_liveness();
     while !done(log) && live.working(log) {
         let more = qemu.drain_serial(Duration::from_millis(200));
@@ -320,6 +516,15 @@ pub fn await_guest(
     }
     if done(log) {
         return Ok(());
+    }
+    // **The third wait, asking the one question the other two ask.** A guest
+    // that halted every CPU went quiet for a reason it wrote down first, and
+    // `it went quiet` is that reason thrown away — which is the shape #156's
+    // whole signature is stated in (`a total freeze of the guest`, judged by a
+    // periodic line that stopped arriving), so what this says decides how the
+    // next occurrence is read.
+    if let Some(line) = super::serial::kernel_death(&log[from..]) {
+        return Err(format!("{} It was waiting for {doing}", kernel_died_here(line)));
     }
     Err(format!("{STALLED} waiting for {doing} — {}", live.why()))
 }
@@ -1979,26 +2184,22 @@ impl QemuInstance {
         // and one still talking at the ceiling has not.
         let mut last_line = Instant::now();
         let mut lines = 0usize;
+        // **The line on which the kernel said it was dying, if it ever did.**
+        // The first one only: a crash report's later lines carry the spelling
+        // too, and the header is the one worth quoting. What it buys is in
+        // [`ceiling_verdict`] — until it existed, a Rust `panic!` in the kernel
+        // matched nothing here, the machine halted, and the whole guard expired
+        // onto a verdict that said the guest had stopped answering.
+        let mut dying: Option<String> = None;
 
         loop {
-            if start.elapsed() > timeout {
-                let quiet = last_line.elapsed();
-                let secs = timeout.as_secs();
-                let error = if quiet >= GUEST_QUIET {
-                    format!(
-                        "{STALLED} {secs}s of guard expired, and the guest had said nothing for \
-                         the last {:.0?} of it — the ceiling caught a machine that had stopped, \
-                         which is not an answer to what this test asked",
-                        quiet
-                    )
-                } else {
-                    format!(
-                        "timed out after {secs}s, with the guest still talking {:.0?} ago \
-                         ({lines} console line(s) while it ran) — it was working and did not \
-                         finish",
-                        quiet
-                    )
-                };
+            if let Some(error) = ceiling_verdict(
+                dying.as_deref(),
+                start.elapsed(),
+                timeout,
+                last_line.elapsed(),
+                lines,
+            ) {
                 return TestResult {
                     name: name.to_string(),
                     exit_code: None,
@@ -2015,6 +2216,11 @@ impl QemuInstance {
                     last_line = Instant::now();
                     lines += 1;
                     fire(&line, self.qmp_socket.as_ref());
+                    if dying.is_none()
+                        && super::serial::died(&line) == Some(super::serial::Died::Kernel)
+                    {
+                        dying = Some(line.clone());
+                    }
                     if line.contains(&format!("===TEST_START {want}===")) {
                         in_test = true;
                     } else if let Some(at) = line.find(END_MARKER) {
@@ -2073,16 +2279,6 @@ impl QemuInstance {
                             serial,
                             before,
                             error,
-                            started: in_test,
-                        };
-                    } else if line.contains("KERNEL PANIC") {
-                        return TestResult {
-                            name: name.to_string(),
-                            exit_code: None,
-                            stdout,
-                            serial,
-                            before,
-                            error: Some(format!("kernel panic: {line}")),
                             started: in_test,
                         };
                     } else if !in_test {
@@ -2855,12 +3051,28 @@ fn wait_for_ready(
                 }
                 break;
             }
+            // **A death nothing left on this machine can come back from.** The
+            // kernel's own, or a process the kernel killed — before the ready
+            // marker the second is as fatal as the first, because whatever died
+            // was `init` or one of its children and nothing else is going to
+            // reach the marker.
+            //
+            // A process that ended *itself* is not on that list, and the
+            // difference is not academic: `sshd` panics across boots that then
+            // come up perfectly
+            // (`specs/issues/build/sshd-panics-when-netd-exits-before-it-binds.md`).
+            // The words are the same words — `panicked at` — and who wrote the
+            // line is the whole of what tells them apart. `super::serial::died`
+            // is where that is decided, for this wait and for [`await_guest`]
+            // and [`QemuInstance::run_test_paced`] alike, so the three cannot
+            // drift into disagreeing about a spelling.
             Ok(ref line)
                 if panic_aborts
                     && !no_timeout
-                    && (line.contains("SEGFAULT")
-                        || line.contains("KERNEL PANIC")
-                        || line.contains("PANIC:")) =>
+                    && matches!(
+                        super::serial::died(line),
+                        Some(super::serial::Died::Kernel | super::serial::Died::Faulted)
+                    ) =>
             {
                 let mut crash_msg = line.clone();
                 let drain_deadline = Instant::now() + Duration::from_secs(2);
