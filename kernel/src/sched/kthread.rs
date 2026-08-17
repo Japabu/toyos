@@ -1,9 +1,11 @@
 //! Kernel threads: a task with no address space of its own, and the one place
 //! that says what a panic inside one means.
 //!
-//! `specs/log-architecture-spec.md` §4.3 is the design. L3 builds it for one
-//! thread, `klogd`; the completion branch's C6 spawns `usbd` and `iod` on it
-//! and adds their two rows to [`ROWS`].
+//! `specs/log-architecture-spec.md` §4.3 is the design and L3 built it for one
+//! thread, `klogd`. `specs/completion-architecture-spec.md` §10's C6 put the
+//! other two on it — `drivers::xhci::usbd` and `crate::iod` — so [`ROWS`] now
+//! carries all three, and the machine has one thread per kind of work that must
+//! not borrow whichever thread happened to trap.
 //!
 //! **A kernel thread is not a special kind of task.** It is an ordinary task
 //! whose `NewTask::address_space` is `None` — `driver::spawn` then names the
@@ -35,9 +37,10 @@ use super::payload::ThreadSched;
 
 /// How many kernel threads the machine may have.
 ///
-/// Three, which is every one either open design names: `klogd` here, and
-/// `usbd` and `iod` from the completion branch's C6. A fourth is a design
-/// decision and gets to notice that it is one.
+/// Three, and all three exist: `klogd` (`log::console`), `usbd`
+/// (`drivers::xhci::usbd`) and `iod` (`crate::iod`). A fourth is a design
+/// decision and gets to notice that it is one — `Claim::take` dies naming the
+/// thread that had nowhere to go, before it takes the process table.
 ///
 /// **The test kernel carries room for one `log-storm` thread per shard on top,
 /// and the shipping kernel carries none of it.** That storm is one ordinary
@@ -170,9 +173,30 @@ fn current_row() -> Option<&'static Row> {
 
 /// Is the task this CPU is running a kernel thread?
 ///
-/// A pid a row holds is never reused: these threads do not exit.
+/// **A pid a row holds is never reused, and the reason is `id_map`'s rather
+/// than this module's.** It used to be "these threads do not exit", which was
+/// true while `klogd` was the only one: its row is [`OnPanic::Halt`], so a panic
+/// in it takes the machine and no pid is ever given back. `usbd` and `iod` carry
+/// [`OnPanic::Recover`], so one of them *can* die — its entry is zombified by
+/// the idle loop and reaped — and a row holding a dead task's identity would
+/// then answer for whoever took the pid next. Nobody does: `IdMap` counts up
+/// from zero and never reissues a key, which is the property that makes a row
+/// safe to leave standing.
 pub fn current_is_kernel_thread() -> bool {
     current_row().is_some()
+}
+
+/// Is `id` one of this machine's kernel threads?
+///
+/// The same question [`current_is_kernel_thread`] asks, about a task that is not
+/// the one running — `sched::dump`'s census walks the process table and wants to
+/// name these three however they happen to be scheduled. At most
+/// [`MAX_KERNEL_TASKS`] acquire loads and no lock, which is what the dump needs:
+/// it runs from `drain_irqs` on a machine that is already suspected of being
+/// stuck, and may take nothing.
+pub fn is_kernel_task(id: TaskId) -> bool {
+    let packed = id.pack();
+    ROWS.iter().any(|row| row.task.load(Ordering::Acquire) == packed)
 }
 
 /// Whether a panic on the task this CPU is running is recoverable, or `None`
@@ -229,7 +253,17 @@ pub fn spawn(name: &str, body: extern "C" fn(u64) -> !, arg: u64, on_panic: OnPa
     // row is not published yet is answered by the coin toss the row exists to
     // replace. It was after until 2026-08-15.
     claim.publish(TaskId(pid, tid), on_panic);
-    let sched = scheduler::enqueue_new(TaskId(pid, tid), stack, entry_rsp, None, 0);
+    // **The kernel address space, named rather than defaulted to.** A kernel
+    // thread runs in the one every CPU is already in between two user threads;
+    // saying so here is what let `KernelPayload.address_space` stop being an
+    // `Option` (`specs/completion-architecture-spec.md` §15 row 12).
+    let sched = scheduler::enqueue_new(
+        TaskId(pid, tid),
+        stack,
+        entry_rsp,
+        crate::mm::paging::kernel().clone(),
+        0,
+    );
     table
         .get_mut(pid)
         .and_then(|p| p.threads_mut().get_mut(tid))

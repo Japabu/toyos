@@ -544,9 +544,19 @@ fn census() -> Census {
             c.zombie += 1;
             return;
         }
+        // **A kernel thread is named whatever it is doing, and it is the one
+        // exception to the rule below.** `klogd`, `usbd` and `iod` are almost
+        // always blocked, so the CPUs' parked lines are where they appear — and
+        // those lines carry a pid and a tid and no name. On a machine that has
+        // gone quiet the question is *which* of the three is stuck, and a pid is
+        // not an answer to it. `specs/completion-architecture-spec.md` §10.
+        let kernel = crate::sched::kthread::is_kernel_task(crate::scheduler::TaskId(
+            thread.pid,
+            thread.tid,
+        ));
         let (bucket, tag) = match thread.sched {
-            Some(SCHED_RUNNING) => (&mut c.running, None),
-            Some(SCHED_BLOCKED) => (&mut c.blocked, None),
+            Some(SCHED_RUNNING) => (&mut c.running, kernel.then_some("kernel")),
+            Some(SCHED_BLOCKED) => (&mut c.blocked, kernel.then_some("kernel")),
             Some(SCHED_READY) if thread.cpu_ns == 0 => {
                 c.never_ran += 1;
                 (&mut c.ready, Some("!! ready and has never run"))
@@ -558,9 +568,16 @@ fn census() -> Census {
         // Blocked and running threads are the CPUs' lines; printing them again
         // would push the ones only this half can see off the page.
         let Some(tag) = tag else { return };
-        printed += 1;
-        if printed > CENSUS_LINES {
-            return;
+        // The three kernel threads do not count against the budget and cannot
+        // flood it: `sched::kthread::MAX_KERNEL_TASKS` is the ceiling, and a
+        // shipping kernel's is three. Counting them would let a machine with
+        // enough ready threads push the very lines this exception exists for
+        // off the page.
+        if !kernel {
+            printed += 1;
+            if printed > CENSUS_LINES {
+                return;
+            }
         }
         log!(
             "  {tag}: pid={} tid={} {} cpu={}",

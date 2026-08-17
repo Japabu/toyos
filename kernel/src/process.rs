@@ -995,7 +995,10 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         if proc.tearing_down() {
             return None;
         }
-        let addr_space = scheduler::current_address_space();
+        // A thread is spawned by a running thread, which by construction has an
+        // address space: `None` here is "no task is running", and this is one.
+        let addr_space = scheduler::current_address_space()
+            .expect("spawn_thread: the spawning thread runs in an address space");
         (addr_space, Arc::clone(&proc.process_data))
     };
     let (tls_template, tls_memsz, tls_modules, tls_total_memsz, tls_max_align) = {
@@ -1011,7 +1014,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         setup_tls(tls_template, tls_memsz, tls_max_align)?
     };
     let (tls_alloc, fs_base) = {
-        let addr_space = parent_addr_space.as_ref().expect("spawn_thread: no address space");
+        let addr_space = &parent_addr_space;
         let parent_data = process_data_arc.lock();
         let tls_phys = tls_alloc.phys();
         // VA exhaustion is a resource failure a process can reach by spawning
@@ -1046,8 +1049,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     let (ks_alloc, ks_rsp) = match alloc_kernel_stack(thread_start, entry, stack_ptr, arg) {
         Some(ks) => ks,
         None => {
-            let pt = parent_addr_space.as_ref().expect("spawn_thread: no address space");
-            tls_alloc.release(pt);
+            tls_alloc.release(&parent_addr_space);
             return None;
         }
     };
@@ -1502,6 +1504,17 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     let t0 = crate::clock::nanos_since_boot();
     let tid = current_tid();
     if tid == Tid::MAX {
+        return false;
+    }
+    // **A kernel thread's fault is fatal, said out loud rather than fallen
+    // into.** It used to be answered by `current_address_space()` returning
+    // `None` two lines below; since C6 a kernel thread names the kernel address
+    // space, so that arm no longer catches it and the walk beneath would look
+    // for a user region in a `ProcessData` that has none — reaching the same
+    // `false` by accident. Nothing here can resolve a kernel fault: demand
+    // paging is a user mapping's mechanism, and the kernel's direct map is
+    // complete from `paging::init`.
+    if crate::sched::kthread::current_is_kernel_thread() {
         return false;
     }
 

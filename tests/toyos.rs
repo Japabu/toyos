@@ -6098,6 +6098,30 @@ fn blocked_dump() -> Result<(), String> {
         return Err(format!("no parked task was named by pid and tid:\n{report}"));
     }
 
+    // **All three kernel threads, by name.** They are almost always blocked, so
+    // the parked lines above carry them as a pid and a tid and nothing else —
+    // and on a machine that has gone quiet the question is *which* of the three
+    // is stuck. `sched::dump`'s census tags a kernel thread whatever it is
+    // doing, which is C6's gate: `specs/completion-architecture-spec.md` §10
+    // gives `klogd` the console drain, `usbd` the xHCI port machine and `iod`
+    // the write-back queue, precisely so that one of them wedging does not stop
+    // the other two. A report that cannot tell them apart cannot say which did.
+    //
+    // Matched with the ` cpu=` that follows the name on the census line, because
+    // a bare name appears in every one of these programs' own log lines and
+    // `/bin/init` speaks in a program's name before that program runs
+    // (`tests/CLAUDE.md`).
+    let unnamed: Vec<&str> = ["klogd", "usbd", "iod"]
+        .into_iter()
+        .filter(|name| !report.contains(&format!(" {name} cpu=")))
+        .collect();
+    if !unnamed.is_empty() {
+        return Err(format!(
+            "the report never names kernel thread(s) {unnamed:?}, so it cannot say which \
+             of them is stuck:\n{report}"
+        ));
+    }
+
     // The two halves must agree, which is what makes the verdict mean anything:
     // every parked task falls into exactly one deadline class, and every task a
     // scheduler holds is a thread the process table knows.
@@ -8274,6 +8298,23 @@ fn run_machine_test(
             }
             eprintln!("  [klogd] {}", line.trim());
 
+            // **The other two threads, and the opposite row.**
+            // `specs/completion-architecture-spec.md` §10: `usbd` owns the xHCI
+            // port machine and `iod` the write-back queue, so a stuck USB
+            // enumeration cannot stop the log. Their panics are *recoverable*
+            // and `klogd`'s deliberately is not — a killed drainer is the one
+            // loss nothing left alive can report — and this is the one boot in
+            // the suite where all three rows are on the wire together.
+            for name in ["usbd", "iod"] {
+                let line = boot.must_say(&format!("kthread: {name}"))?;
+                if !line.contains("kills the thread") {
+                    return Err(format!(
+                        "{name} is hosted but claims the wrong panic row: {line:?}"
+                    ));
+                }
+                eprintln!("  [kthread] {}", line.trim());
+            }
+
             drop(qemu);
 
             // The marker is a line of the crash *report* rather than `PANIC:`
@@ -8293,7 +8334,9 @@ fn run_machine_test(
             let mut dead = serial::Serial::boot(&qemu);
             dead.must_say("PANIC:")?;
             dead.must_say("klogd-panic: the console drainer died")?;
-            // The process table answered for a task with no address space.
+            // The process table answered for a task with no *user* address
+            // space — since C6 it names the kernel's, which is what let
+            // `KernelPayload.address_space` stop being an `Option`.
             dead.must_say("Process: klogd")?;
 
             // The verdict. A *recovered* panic kills the thread and lets the
@@ -8308,6 +8351,41 @@ fn run_machine_test(
             dead.push(&qemu.drain_serial(CARRIED_ON));
             dead.must_not_say(qemu::DEFAULT_READY)?;
             eprintln!("  [klogd] a kernel thread's panic halted the machine rather than recovering");
+
+            drop(qemu);
+
+            // **The same panic on the other row, and it is the direction
+            // nothing had ever taken.** Two rows in one table are one row
+            // until both branches have been walked: before this arm, every
+            // kernel-thread panic this tree had ever run took `OnPanic::Halt`,
+            // so `Recover` was a value rather than a path — and the path it
+            // names goes through `poison_tid`, the idle loop's `reap_poisoned`
+            // and `zombify_poisoned`, none of which had ever seen a task with
+            // no user address space. A row that quietly halted the machine
+            // would make `usbd` and `iod` worse than the thread they were
+            // split off from.
+            //
+            // The verdict is content in the same window and never a timeout:
+            // the boot returns at the crash report's own line, and what the
+            // three seconds after it must contain is the ready marker the
+            // arm above must *not*.
+            let mut qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    kernel_params: &["usbd-panic"],
+                    ready_marker: "Process: usbd",
+                    ..Default::default()
+                },
+            );
+            let mut survived = serial::Serial::boot(&qemu);
+            survived.must_say("PANIC:")?;
+            survived.must_say("usbd-panic: the device thread died")?;
+            survived.must_say("Process: usbd")?;
+            survived.push(&qemu.drain_serial(CARRIED_ON));
+            survived.must_say(qemu::DEFAULT_READY)?;
+            eprintln!("  [usbd] a kernel thread's panic killed the thread and the machine booted");
             Ok(())
         }
         "pre_idle_wedge_speaks" => {

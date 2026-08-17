@@ -239,15 +239,20 @@ fn placement() -> CpuId {
 /// Everything a new thread needs. `entry_rsp` points at the trampoline frame
 /// `alloc_kernel_stack` built.
 ///
-/// **`address_space: None` is a kernel thread and not an error.** It was one
-/// until L3 of `specs/log-architecture-spec.md`: `spawn` expected the `Option`
-/// and the field has always been one, so the whole of "the scheduler cannot
-/// host a kernel task" was a single `.expect` in the line below.
+/// **`address_space` is not an `Option`, and the history is worth one
+/// sentence.** "The scheduler cannot host a kernel task" was a single `.expect`
+/// here until L3 of `specs/log-architecture-spec.md`; L3 replaced it with a
+/// two-armed `match` that named the kernel's `cr3` for a task that named no
+/// address space, and C6 removed the second arm by giving that task the kernel
+/// address space to name (`mm::paging::kernel`,
+/// `specs/completion-architecture-spec.md` §15 row 12). One declaration decides
+/// a task's `cr3`, which is the rule the root `CLAUDE.md` states for control
+/// registers and is the same rule here.
 pub struct NewTask {
     pub id: TaskId,
     pub kernel_stack: OwnedAlloc,
     pub entry_rsp: u64,
-    pub address_space: Option<PageTables>,
+    pub address_space: PageTables,
     pub fs_base: u64,
     pub share: Arc<KShare>,
 }
@@ -255,15 +260,12 @@ pub struct NewTask {
 /// Place a new task by message — never by reaching into the destination's
 /// queue (spec §9.4). Returns what the process table keeps.
 pub fn spawn(new: NewTask) -> ThreadSched {
-    // A task with no address space of its own runs in the kernel's, which is
-    // the address space every CPU is already in between two user threads —
-    // `idle_ctx` above names the same `cr3` for the same reason. There is
-    // nothing to take a reference to and nothing to release: the kernel's
-    // page tables outlive every task by construction.
-    let cr3 = match new.address_space.as_ref() {
-        Some(space) => space.lock().cr3(),
-        None => crate::mm::paging::kernel_cr3(),
-    };
+    // A kernel thread's is the kernel address space — the one every CPU is
+    // already in between two user threads, which is why `idle_ctx` above names
+    // the same `cr3`. Nothing is released when the task ends: that `Arc` is a
+    // clone of a leaked one, and the kernel's page tables outlive every task by
+    // construction.
+    let cr3 = new.address_space.lock().cr3();
     let kernel_stack_top = new.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64;
     let ctx = KernelCtx {
         rsp: new.entry_rsp,
@@ -736,12 +738,13 @@ pub fn current_cpu() -> CpuId {
     CpuId(percpu::cpu_id())
 }
 
+/// The address space the running task runs in.
+///
+/// **`None` means "no task is running", never "this task has no address
+/// space"** — the second reading stopped existing when the payload's field did
+/// (`KernelPayload::address_space`). Boot and an idle CPU are the two answers.
 pub fn current_address_space() -> Option<PageTables> {
-    try_with_cpu(|cpu| {
-        cpu.running()
-            .and_then(|t| t.ext().address_space.clone())
-    })
-    .flatten()
+    try_with_cpu(|cpu| cpu.running().map(|t| t.ext().address_space.clone())).flatten()
 }
 
 pub fn with_current_acct<R>(

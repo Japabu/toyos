@@ -56,6 +56,7 @@ mod clock;
 mod rtc;
 
 mod completion;
+mod iod;
 mod object;
 mod io_uring;
 mod pipe;
@@ -714,6 +715,14 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // which is the window a machine with no console wedges in — while the boot
     // believed it had a drainer. `specs/log-architecture-spec.md` §4.2.
     log::console::start();
+    // The other two of §10's three, beside the drainer and for the same reason:
+    // a device's work needs a context of its own rather than whichever thread
+    // happened to trap. Here rather than earlier because nothing can run before
+    // `enter_idle_loop` anyway, and after `klogd` because a kernel thread that
+    // logs its own spawn wants a drainer to exist.
+    // `specs/completion-architecture-spec.md` §10.
+    drivers::xhci::usbd::start();
+    iod::start();
 
     smp::set_ready();
     crate::scheduler::enter_idle_loop();

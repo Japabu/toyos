@@ -82,7 +82,14 @@ pub struct KernelCtx {
 pub struct KernelPayload {
     pub id: TaskId,
     pub kernel_stack: OwnedAlloc,
-    pub address_space: Option<PageTables>,
+    /// The address space this task runs in. **Not an `Option`**: a kernel thread
+    /// runs in the kernel's, and `mm::paging::kernel` hands that out in the same
+    /// `PageTables` shape a process's has — so there is no task without one and
+    /// no second answer for `driver::spawn` to choose between.
+    /// `specs/completion-architecture-spec.md` §15 row 12 is the retype, the one
+    /// `capability-handles-spec.md` §9.4 left standing, and it is C6's because
+    /// C6 is what made a kernel thread able to name an address space at all.
+    pub address_space: PageTables,
     /// The cross-CPU-readable face of this task. A `CpuSched` is `!Sync`, so a
     /// remote `ps` cannot walk it; what it can read is here.
     pub handle: Arc<TaskHandle>,
