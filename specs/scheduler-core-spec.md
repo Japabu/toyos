@@ -194,8 +194,10 @@ scheduling class**, for a bounded window, spending its own class's budget and
 never the waker's. The mark ends at the first of that window, the reader's next
 block, or the wait that raised it ending; it moves no budget, so a reader that
 runs long delays only its own class, and a waker's reservation is not something
-its wakees can drain. The quantum of running time above has no counterpart,
-because a quantum was never the quantity being lent.
+its wakees can drain. The quantum of running time above does have a counterpart,
+one tenth its size: the mark's window is 1 ms of running time, the same for a
+wake mark and for a hold mark. What has no counterpart is the *band* — that was
+never a quantity anybody could lend.
 
 ## 4. Fairness
 

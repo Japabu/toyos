@@ -16,6 +16,49 @@ of unwind work starves the unwind, unwind work ahead of real-time work starves
 real-time, and an aged grant between them starves whichever side the workload
 happens to put more of on one CPU. One invariant replaces all of it.
 
+## The four permanent concepts
+
+Simple means **few permanent concepts, not few lines**. Scheduling in this
+estate is four of them, and nothing this design's future may add a fifth:
+
+1. **Task and service state** — ownership, runnable/running/blocked/in-transit,
+   wake, block, migrate, kill. `scheduler-core-spec.md` owns it and this
+   document does not touch it.
+2. **Entitlement** — how much CPU service an entity is owed, and by when:
+   reservations, admission, urgency. This document.
+3. **Machine capacity** — which CPUs exist, how capable each is, and what each
+   costs to use. Today it is one per-CPU ledger and §1.3's statement that a
+   budget is time and not work.
+4. **Placement policy** — among the choices the first three leave legal, which
+   one is best. That is the two seams below, and a ranker behind one of them —
+   including a learned one — can cost performance and nothing else.
+
+**Every future feature enters as data or as policy, never as a new mechanism.**
+A P-core is a different capacity, a NUMA hop is a different cost, SMT is an
+interference relation; EEVDF is a policy at the fair seam and a ranker is a
+policy at the placement seam. A change that can be expressed as neither is a
+change to this frame, and the frame changes with the owner rather than with a
+chunk.
+
+**What is implemented is the shipped machine**: four identical cores and one
+real-time client — three entities, admission with refusal by name,
+earliest-deadline dispatch, §1.11's timer discipline, and §1.8's mark preserving
+today's pipe lend. Everything else is deferred, and each deferral is a **hook**
+— one sentence here, costing nothing until somebody implements it:
+
+- **Heterogeneous capacity** is data: a per-CPU capacity normalisation inside
+  §1.3's ledger, whose open question §1.3 already states and does not answer.
+- **Topology and NUMA** are a cost function at the placement seam (§2).
+- **EEVDF** is a policy at the fair seam (§2), which already names it as the
+  intended occupant.
+- **Hierarchical shares** are reservations nesting: an entity whose budget is
+  the capacity a sub-ledger is admitted against, by §1.1's arithmetic unchanged.
+- **DVFS and idle states** make capacity a function of a CPU's state rather than
+  a constant, which §1.1's ratio-of-wall-clock definition already tolerates.
+
+None of the five is designed here, and a hook that grows past a sentence has
+become a chunk somebody has to justify.
+
 ## The three layers, and the two seams
 
 Scheduling in this estate is three layers, and knowing which one a question
@@ -39,6 +82,87 @@ first two layers have already made legal, so a bad ranking costs performance and
 can cost nothing else** — it cannot starve a real-time client, cannot take the
 dying server's reservation, and cannot make a guarantee false, because the
 guarantee was admitted before the policy ran.
+
+## The complexity ledger
+
+What this design costs, counted rather than asserted. Every later change to this
+document updates this table, and a number that grows says what it bought.
+
+| | before | after |
+|---|---|---|
+| permanent concepts | not stated anywhere | 4 |
+| named constructs a reader holds to predict a dispatch | 9 | 6 |
+| kernel mechanisms in this layer | 4 | 4 |
+| kernel-side panic-grade assertions | 13 | 13, none of them added here |
+| …of which carry a term a workload sets | 2 | 0 |
+| simulator invariants | 14 | 15 |
+| negative gates / must-stay-clean controls | 10 / 2 | 15 / 3 |
+| sites in `toyos-sched/src` naming the deleted estate | 64 | 0 |
+| production lines in `toyos-sched/src` | 6 615 | ≈ 7 200, an **estimate** |
+| lines of this document | 1 899 | 2 160 |
+
+Where each number comes from. The nine constructs before are `DYING_AGE_NS`,
+`DYING_CHUNK_NS`, `Corpse::since`, `aged_grant`, `serves_rt_band`, `pick`'s
+`rq.has_rt()` band test, the pipe lend's borrowed priority, the simulator's
+`rt_deferral_stretch`, and `GIVE_UP`'s `1 + peers` deadline; the six after are
+the reservation, the entity, the per-CPU ledger, the deadline order, the
+background tier and the mark. The four mechanisms before are band precedence at
+the pick, the aged grant, the pipe lend and the retirer's end-to-end deadline;
+the four after are reservation-and-admission, earliest-deadline dispatch with
+the background tier, the period grid (replenishment, demotion, charge-back) and
+§1.8's mark. The thirteen assertions are `scheduler-core-spec.md` §2's ten
+numbered invariants, invariant T (`toyos-sched/src/invariants.rs`), invariant P
+(`toyos-sched/src/cpu.rs:1441`) and `GIVE_UP`
+(`kernel/src/scheduler.rs:687`); the two workload-set terms are `GIVE_UP`'s
+`peers = 8` and its stretch multiplier, which §8.3 replaces with fixed hops.
+Gates and controls are counted from `toyos-sched/sim/tests/scenarios.rs`'s
+register and from §5.5's table. The 64 sites are `grep -rn` counts for the five
+deleted names in `toyos-sched/src`; 6 615 is `wc -l` of that directory, of which
+the five crate gates §3.1 and §3.2 dispose of are 239 measured lines
+(`cpu.rs:2263-2287` and `:2393-2606`). **The production-line figure after is an
+estimate and nothing else** — no line of the reservation layer is written — and
+it is the only number in this table that is not read off the tree or off this
+document.
+
+**Why each of the four concepts exists, as what breaks without it.** A concept
+that cannot say what its own deletion costs is a concept somebody added, so each
+witness below is a deletion argument rather than a description: it names the
+property that becomes unguaranteeable, in terms that avoid the concept's own
+vocabulary, and the workload that reaches it.
+
+| concept | what becomes impossible without it, and the workload that shows it |
+|---|---|
+| task and service state | Two CPUs act on one thread — it is dispatched twice, or its stack is freed under it — the moment nothing decides which CPU may touch it. The workloads are in the harness: the old steal-and-scan balance path taking a task its owner was already dispatching (`old_steal_port`), and a retire and a wake both claiming one parked thread. |
+| entitlement | Some legal workload starves another indefinitely, and both directions were reached in this estate: a permanently-runnable real-time thread held a CPU's unwind queue closed for ever, eleven corpses closed the rotation on the real-time band, and commit `9c2fc4d` measured 93.3 ms of audio starvation behind a fair storm. |
+| machine capacity | Work is accepted against a machine that may not exist: the same numbers accepted on a core half as fast, or clocked down, buy half the work inside the same fraction of time. **This witness is weak today and the weakness is recorded rather than dressed up** — the shipped machine's four cores are alike, so no workload on it can reach the failure, and the concept earns its place from a machine the estate does not yet run (the T14's unlike cores) and from §1.3's open question about what a budget means there. |
+| placement policy | CPUs that are interchangeable under everything above differ in locality, capacity and energy, and nothing above can express the difference. The tree has already paid for it: the steal probe sent a thief to the CPU holding the most *work* — one deep in two teardowns, with nothing stealable — which cost a whole idle round and broke no rule. |
+
+**What the difference bought.** The mechanism count did not fall and the line
+count rose. What fell is the number of quantities a reader has to hold to
+predict a dispatch, from nine to six, and what replaced four pairwise
+derivations — real-time against corpse, corpse against real-time, a stretch
+factor between them, and a tripwire spending it — is one invariant that is also
+one instrument (§1.9 and I15 are one predicate). Admission refuses overcommit
+where the reservation is created rather than letting it appear later as a
+latency. And the kill path's only assertion stops carrying a term a workload
+sets. Three review rounds also *deleted* two mechanisms this document once had —
+a derived bound on a blocked wait and a derived system reserve — because both
+priced a quantity a workload sets, and what stands in their place is a
+measurement (§1.8, §1.3). That is where a fourth round would have gone, and
+review is closed here: the remaining risk is carried by the implementation's own
+gates, by R8's measurements, and by the metal track.
+
+**Why the document is longer and not shorter, since the round that ordered these
+deletions expected shorter.** Two of the sections above are the additions that
+round ordered — the four concepts (43 lines) and this ledger (83) — which is 126
+of the 261. The rest is what deleting a derivation costs in prose: a formula is
+four lines and a constant is one, while the sentences that say why there is no
+formula, what is measured instead, which shape falsified each of the three
+attempts, and what a reader may therefore *not* assume are ten times that. §8.1
+gave back 20 lines and §3.4 and §8.2's recitals another 17, which is every line
+this round was licensed to cut; what remains is arithmetic three review rounds
+confirmed, and trimming that to make a line count look better is how a document
+loses the derivation somebody later has to re-invent.
 
 ---
 
@@ -128,29 +252,44 @@ CPU's capacity:
 | quantity | reservation | utilization |
 |---|---|---|
 | capacity | — | 1000 permille |
-| the system reserve | — | 100 permille |
+| the system reserve | — | 100 permille (provisional, §9.2's R8) |
 | therefore the admissible capacity | — | 900 permille |
 | the fair class | 5 ms every 10 ms | 500 permille |
 | the dying server | 1 ms every 10 ms | 100 permille |
 | therefore the real-time ceiling | — | 300 permille |
 
-**The reserve is derived, declared as an estimate, and re-measured where soundd
-is.** It pays for what §1.2 charges to it: one scheduling pass costs at most
-`MAX_PASS_NS` = 200 000 ns (`toyos-sched/src/cpu.rs:893`), and the shipped
-machine's own two clocks force a pass rate of `1/QUANTUM_NS` + one per device
-period = 100 + 344.53 = **444.53 passes per second**, which at the pass bound is
-88 906 258 ns of every second — 88.9 permille. The reserve is 100 permille: that
-bound rounded up, and it is the only number in §1.3 that is not exact. R8
-measures it on the same runs that measure soundd's budget (§9.3), because a
-reserve that was never measured is a slack allowance with a better name.
+**The reserve is held back rather than derived, and its value is provisional
+until it is measured.** It pays for what §1.2 charges to it — interrupt service
+routines and scheduling passes — and this document deliberately computes no
+figure for that from an assumed rate. Every attempt to do so priced a pass rate
+the rest of this document falsifies: §1.11's predicate forces a pass on six
+kinds of event rather than on two clocks, and the dominant one — a replenishment
+boundary — recurs at `1/period` of *each admitted reservation*, so the rate is a
+function of the admitted set and of the machine's devices. A number derived from
+one machine's clocks is a bound on nothing, and **a quantity a workload sets
+does not become a bound by being written down as a constant.**
 
-**Interrupt load above the reserve is a device defect and is reported, never
-asserted.** No reserve can price an unbounded interrupt stream; what the design
-owes is that the overspend is *visible* — the reserve's spend per period is
-counted and reported beside the demotion counts of §1.5 — and that no assertion
-in the kernel is stated over it. A machine whose devices interrupt past its
-reserve underdelivers its entities, and the honest place to see that is a
-counter naming the device, not a panic naming the scheduler.
+What the design states instead is the rule: **admission never fills capacity.**
+The reserve is the fraction of each CPU that is never admitted to anybody; its
+value here is **100 permille, provisional**; and R8 (§9.2, §9.3) measures the
+reserve's actual spend on the same runs that measure soundd's budget. Until that
+measurement exists, every number that rests on it — the 900-permille admissible
+capacity, the 300-permille real-time ceiling, and §9.3's 870 748 ns budget
+ceiling — is provisional in exactly the same way and moves with it. That is the
+honest state of this number, and a reserve that was never measured is a slack
+allowance with a better name.
+
+**An overspend of the reserve is reported, never asserted, whatever produced
+it.** No reserve can price an unbounded interrupt stream, and none can price a
+pass rate an arbitrary admitted set forces; what the design owes is that the
+overspend is *visible* — the reserve's spend per period is counted and reported
+beside the demotion counts of §1.5 — and that no assertion in the kernel is
+stated over it. Interrupt load past the reserve is a device defect and the
+counter names the device. Passes past the reserve are this scheduler's own
+overhead against a set admission accepted, there is no device to name, and the
+counter names the reserve. A machine that overspends its reserve underdelivers
+its entities either way, and the honest place to see that is a counter and not a
+panic naming the scheduler.
 
 **The 10 ms period is `QUANTUM_NS`** (`toyos-sched/src/fair.rs:16`), and the
 choice is derived rather than inherited:
@@ -187,7 +326,11 @@ of the 900 admissible, so 100 are slack and 100 are the reserve. Slack is not
 lost, because §1.5's background tier is work-conserving: a CPU with only fair
 work still gives the fair band the whole machine. But no guarantee rests on it,
 which is what makes it the honest place to pay for everything this model cannot
-price exactly. The floor is a guarantee and not a cap, and the same is true of
+price exactly — including a reserve measured to be too small, which the shipped
+machine's 100 permille of slack absorbs before any admitted entity is
+underdelivered. That is a statement about the shipped machine and not a
+guarantee: a machine admitted to the full 900 has no slack, and its reserve has
+to be right rather than generous. The floor is a guarantee and not a cap, and the same is true of
 every other reservation in the table: a reservation is the least an entity gets,
 never the most it may have.
 
@@ -373,6 +516,14 @@ by a process.
   which the only corpse is parked is a period the server was not runnable in and
   is owed nothing for; and §5.4's head-relative interval is an interval of
   *runnable* time, which a wait ends rather than inflates.
+- **Whether a corpse can park at all is R2's question, and this document does
+  not answer it.** `WaitTicket::commit` refuses to park a killed task on any
+  wait that answers cancellation (`toyos-sched/src/waitq.rs:463-467`), which is
+  what keeps it running on its own stack, so the parked-corpse state is reachable
+  today only through an uncancellable teardown wait and an in-unwind device wait
+  is still a spin. The rule above is stated for the arrangement the tree will
+  have once `completion-architecture-spec.md`'s C7 lands; where the state is not
+  reachable, nothing in this document is weaker for it.
 - It is dispatched, preempted, demoted and replenished by §§1.4–1.6 and §1.11,
   with no rule of its own. It has no age, no stamp, no grant and no chunk.
 - Its reservation is a **floor, not a cap**: on a CPU with nothing else runnable
@@ -421,25 +572,35 @@ bound stop depending on client behaviour.
 **Marks are totally ordered.** By the instant the mark was set, first set first
 served, ties broken by thread key. A class dispatches the head of its mark queue
 before any unmarked thread. Without a stated order among marked threads, `k`
-marks in one class divide the class's service by a quantity the workload sets
-and every bound below loses its denominator.
+marks in one class divide its service by a quantity the workload sets, and the
+head of the queue is decided by a race rather than by a rule.
 
 **The marked half.** In each of its own periods a class may deliver at most
 **half its budget** under marks; past that the marks confer no precedence for
 the remainder of that period and the class's ordinary policy decides, which is a
-cap on precedence and never an idle CPU. Half is the largest cap at which marked
-threads can never take more of a class than the unmarked ones get, which is what
-keeps §2's per-process fairness a property of the class rather than of who holds
-a lock. For the fair class the guaranteed marked rate is therefore **250
-permille** — 2.5 ms of every 10 ms — and that is the denominator every wait
-below divides by.
+cap on precedence and never an idle CPU. Half is the largest cap at which the
+service a class delivers *under marks* never exceeds the service it delivers
+outside them — a statement about service and not about threads, because a marked
+thread also draws its ordinary share of the unmarked half and therefore does
+take more than an unmarked peer. What the cap bounds is how much of a class
+marks can move, which is why §2 measures per-process fairness over the unmarked
+half and reports the marked service per process beside it rather than treating
+the cap as making marks invisible to fairness. For the fair class the marked
+half is **250 permille** — 2.5 ms of every 10 ms — and that is the rate a
+cross-process mark buys.
 
 **A mark ends** at the first of: the wait that set it ending, the marked thread
-blocking, or the mark's window — `RUN_CHUNK_NS` = 1 ms of running time
-(`toyos-sched/sim/src/vm.rs:46`) for a wake mark, and the lock's declared hold
-bound (below) for a hold mark. A thread cannot re-mark itself: a fresh mark
-takes a fresh wake or a fresh waiter, and the party that raises one is the party
-that loses by waiting.
+blocking, or the mark's window — `RUN_CHUNK_NS` = 1 ms **of running time**, for
+both shapes of mark. One window in one clock is deliberate: the previous form
+gave a hold mark the lock's declared hold bound as its window, which required
+that bound to be CPU time while the only bound a lock can honestly declare is a
+wall-clock device timeout, so the two readings differed by the class's own rate
+and each mark cost the class a different amount. `RUN_CHUNK_NS` is the
+*simulator's* step granularity (`toyos-sched/sim/src/vm.rs:46`) and not a kernel
+constant; R4 introduces the kernel's own and this document is where its value is
+stated, the same way §1.9 names the simulator's `IPI_LATENCY_NS` for the hop it
+prices. A thread cannot re-mark itself: a fresh mark takes a fresh wake or a
+fresh waiter, and the party that raises one is the party that loses by waiting.
 
 **A mark inside one process buys that process nothing.** A mark whose waiter is
 a thread of the marked thread's own process orders the holder ahead of that
@@ -466,24 +627,35 @@ mark follows the chain; the kernel's sleep locks are a fixed, ordered set —
 `{ProcessData, VFS, VOLUMES, XHCI}`, `completion-architecture-spec.md` §9 — so
 no cycle exists and no chain is longer than four links.
 
-**The wait a blocked real-time client suffers is derived, and `k` is in it.**
+**The wait a blocked real-time client suffers is measured and reported, and this
+document states no bound for it.** Three forms of this design derived one and
+each was falsified by an ordinary workload: the first divided a hold bound by
+the class's whole utilization, and one concurrent holder broke it; the second
+divided by the marked rate, and `k` concurrent marks broke it; the third carried
+`k` explicitly and was broken by the shape the tree actually produces. That
+shape is worth naming, because it is the only one the shipped machine has:
+`ProcessData` is per process (`completion-architecture-spec.md` §9), every
+`with_fd_owner_data` site locks the *calling* process's copy
+(`kernel/src/process.rs:960-968`), and §1.8's own same-process rule pays such a
+mark nothing — so a real-time thread blocked on its own process's lock waits for
+a sibling served at that process's share of the fair class, which the number of
+runnable fair processes sets. **A quantity a workload sets is not made into a
+bound by being moved one level down** — out of a kernel assertion and into a
+formula, a harness gate or an admission constant — and the honest half is what
+stays here.
 
-> `W_block` = summed over the links of the chain: (the bounded work of the marks
-> ahead of this holder in its class's mark queue, plus this holder's declared
-> hold bound) ÷ the class's marked rate, plus one period of that class for the
-> phase the block arrives in.
-
-Every term is stated. The marked rate is the marked half of an admitted budget —
-250 permille for the fair class, wherever it runs; a real-time holder is one
-thread and its own entity, so its marked rate is its own utilization. The hold
-bound is declared by the lock. The mark-queue depth `d` is the one workload
-quantity in the formula, and it appears *explicitly* rather than hiding in a
-denominator: for a fair-band holder of a lock declaring a 2 ms hold bound,
-`2 ÷ 0.25 + 10` = **18 ms** with no other mark ahead of it, and each 1 ms mark
-ahead adds `1 ÷ 0.25` = 4 ms — 22 ms at `d` = 1, 26 ms at `d` = 2. The previous
-form of this bound divided by the class's *whole* utilization and read 14 ms:
-that was a `d` = 0 bound wearing a general claim, and one ordinary concurrent
-holder falsified it.
+- **The kernel counts the interval an entity spends blocked on a sleep lock**
+  and reports past an expectation it computes from what it holds at the block:
+  the lock's declared hold bound at the holder class's marked rate, plus one
+  period of that class, plus the marks already queued ahead. For a cross-process
+  fair-band holder of a lock declaring a 2 ms bound that is `2 ÷ 0.25 + 10` = 18
+  ms, with 4 ms per queued mark. It is an expectation about a composed quantity,
+  so it names the lock, the holder's class and the mark's fate, and **nothing is
+  asserted over it**.
+- **The harness measures the same interval** in §6.2's lock cells and reports
+  its distribution beside I4 rather than gating on it (§5.3).
+- **The per-lock obligation stays**, below, because it is the half that is cheap,
+  static and checkable.
 
 **Every sleep lock in the fixed set declares a bound on how long it may be
 held**, in its own contract, and **a lock that declares none may not be taken on
@@ -497,13 +669,21 @@ bound it can honestly declare is a device timeout — `USB_TIMEOUT_NS` = 2 s
 **The design constraint is therefore stated rather than a bound invented: no
 real-time client's path may take `VFS`**, which is true of `soundd` today (its
 cycle opens no file and reaches no filesystem call — `userland/soundd/src`
-contains no `Vfs`, `fsync` or file-open site). Where the per-lock bounds are
-declared is `completion-architecture-spec.md` §9's own lock table, not here
-(§10).
+contains no `Vfs`, `fsync` or file-open site). `ProcessData` is the second row
+the rule reaches and this document does not settle it: soundd's real-time thread
+takes that lock on every period through its poll and read calls, while a holder
+inside an `fsync` parks under `{VFS, VOLUMES, XHCI}` — so either the lock
+declares a bound its own paths meet or the rule bites the shipped audio client.
+That is recorded in §10 as the owner's question, and R4 is where it is asked
+statically rather than assumed. Where the per-lock bounds are declared is
+`completion-architecture-spec.md` §9's own lock table, not here (§10).
 
-18 ms is 6.2 device periods, so a real-time client that takes a sleep lock
-inside its own period is a client whose design is wrong, and this bound exists
-to make that a number rather than a dropout. What it never becomes is unbounded.
+The expectation above is 6.2 device periods, so a real-time client that takes a
+sleep lock inside its own period is a client whose design is wrong, and the
+report exists to make that a number rather than a dropout. What this document no
+longer claims is that the wait has a bound the scheduler delivers: it has a
+declared hold bound at one end, a measurement at the other, and a design rule in
+between.
 
 **The mark is an input to §2's seam, and the seam is amended to take it.** The
 reservation layer hands the intra-fair policy an ordered mark queue and the
@@ -532,8 +712,11 @@ implicit-deadline EDF result: at a utilization sum of at most one, every entity
 meets every deadline, which for a server means it receives its whole budget
 inside every period it can use it in — and the sum admission enforces is at most
 900 permille rather than 1000 precisely so that the machine's own overhead is
-not spent out of it (§1.2). The background tier cannot weaken it because it runs
-only when no entity holds budget and is runnable.
+not spent out of it (§1.2). Whether the 100 permille held back is *enough* is a
+measurement and not a derivation (§1.3): §1.9 guarantees delivery against the
+admitted sum, and it is never a claim that the reserve was priced right. The
+background tier cannot weaken it because it runs only when no entity holds
+budget and is runnable.
 
 **The sliding window gets the weaker guarantee, and it is stated here so that no
 later reader upgrades it from memory.** Over an arbitrary window of length
@@ -655,8 +838,12 @@ between the model and the machine: it is why §1.6 charges an overrun back at th
 next boundary, why §1.9 carries one tolerance rather than one per period, and
 why §7.1 floors both coordinates of a reservation at it. The *pass itself* is
 paid for out of §1.3's system reserve rather than out of the dispatched entity's
-budget, and the reserve's derivation is the pass bound times the pass rate. `G`
-is not a term any workload scales — one pass, once per event, whatever `k` is.
+budget, and how much of the reserve the passes take is measured rather than
+derived: the list above makes the pass rate a function of the admitted set, its
+periods and the machine's devices, which is exactly why §1.3 holds a fraction
+back instead of pricing one. `G` is not a term any workload scales — one pass,
+once per event, whatever `k` is — and that is a statement about a pass's
+*length*, never about how many of them a second contains.
 
 ---
 
@@ -794,8 +981,9 @@ with the constants, and each is replaced in the direction it guarded:
 - The workload doc's restatement of the age-then-chunk rule.
 - `Op`'s vocabulary gains `Acquire` and `Release` rather than losing anything:
   §1.8's waiter and holder are unrepresentable in a script that has no
-  resource-holding op, so `old_park_kept_the_lend`'s re-derivation and the two
-  mark gates cannot be staged until they exist. R4 owns that (§9.2).
+  resource-holding op, so `old_park_kept_the_lend`'s re-derivation,
+  `old_uncapped_mark` and the blocked-wait measurement of §6.2's lock cells
+  cannot be staged until they exist. R4 owns that (§9.2).
 
 `toyos-sched/src/task.rs`
 
@@ -870,42 +1058,34 @@ with the constants, and each is replaced in the direction it guarded:
 
 `specs/audio-subsystem-spec.md`
 
-- §4's "under the lent band" (`:110`), which names a mechanism §7.1 abolishes,
-  and the sentence that replaced it, which promised soundd's precedence "for the
-  duration of its fill" — a whole-fill guarantee no mechanism in this document
-  delivers. Both become §1.8's mark: a signalled client is marked urgent, is
-  dispatched ahead of unmarked threads inside its own class for the mark's
-  window, and is charged to its own class rather than to soundd's budget.
-  Updated at the site in the same pass as the scheduler-core amendment above.
+- §4's lend — the "under the lent band" phrase and the sentence that replaced
+  it, which promised soundd's precedence "for the duration of its fill", a
+  whole-fill guarantee no mechanism in this document delivers. **Already deleted
+  at the site**, in the same pass as the scheduler-core amendment above: §4 now
+  says the wake marks a signalled client urgent, names §1.8, charges the fill to
+  the client's own class, and states what the mark does *not* promise. The
+  mechanism abolished there is the lend and §1.8 is what abolishes it; this row
+  records a deletion that has happened rather than one that is owed.
 
 ### 3.4 The three findings this design answers, at the statements that were false
 
 The adversarial pass that preceded this document confirmed three unsound
-statements about bounded deferral, and each is answered here rather than
-patched:
+statements about bounded deferral. Each is answered by a rule above rather than
+patched, and the story of how each was found is in that pass's own record:
 
-- **Bounded deferral was bounded per corpse and not per CPU.** `k` corpses on
-  one CPU took `k` consecutive grants, so real-time work waited `k` milliseconds
-  per age window and the stated "at most one chunk" was a `k = 1` argument;
-  at `k ≥ 11` the rotation closed on itself and the real-time band was starved
-  without bound. Under §1 there is no per-corpse grant to multiply: the dying
-  server is one entity with one reservation however many corpses it holds, and
-  the real-time clients' reservations are what the queue depth cannot touch.
-- **The stretch factor was not a bound in the other direction.** A real-time
-  band that briefly emptied dispatched the corpse instantly with a full
-  unprotected quantum and no aged grant, and the next real-time wake restamped
-  it — so the corpse's accumulated age was thrown away on every brief dispatch
-  and its service rate had no lower bound at all. Under §1.6 there is nothing to
-  restamp: budget is replenished on a period boundary the workload cannot move,
-  and a brief dispatch spends budget rather than resetting a claim to it.
-- **The real-time latency term was a `k = 1` term.** The simulator's real-time
-  bound carried a single `DYING_CHUNK_NS` = 1 ms. §5.3 re-derives it against the
-  reservation instead, where the quantity that bounds real-time latency is the
-  budget of the entities whose deadlines are earlier and not the number of
-  corpses. The re-derived term is **larger** than the one it replaces —
-  2 322 494 ns against 1 ms for soundd's CPU — and saying it is tighter would be
-  this document flattering itself: the old number was smaller because it priced
-  one corpse, and it was false for every `k` above one.
+- **Bounded deferral was per corpse, not per CPU** — `k` corpses took `k`
+  grants, and at `k ≥ 11` the rotation closed on itself. §1.7's dying server is
+  one entity with one reservation however many corpses it holds.
+- **The stretch factor bounded nothing in the other direction** — a briefly
+  empty real-time band restamped the corpse's age and threw its accumulated
+  claim away. §1.6 replenishes on a boundary the workload cannot move, and there
+  is no stamp to restart.
+- **The real-time latency term was a `k = 1` term** — one `DYING_CHUNK_NS`.
+  §5.3 re-derives it against the reservations whose deadlines are earlier, and
+  the re-derived term is **larger** — 2 322 494 ns against 1 ms on soundd's CPU.
+  The old number was smaller because it priced one corpse and was false for
+  every `k` above one; calling the new one tighter would be this document
+  flattering itself.
 
 ---
 
@@ -984,14 +1164,19 @@ client is a fair-band thread on its own CPU, marked by soundd's wake and
 therefore first inside its class. Its wait is the fair class's own first-dispatch
 bound: `W_fair` = the smaller of the interference sum — `ceil(10 ms / P)` = 4
 soundd budgets plus one dying-server budget = 3 320 000 ns — and `period −
-budget` = 5 000 000 ns, so **3.32 ms**, plus 4 ms for each 1 ms mark already
-ahead of it in the class (§1.8). That is 1.14 device periods, so a cooperative
-client's fill lands inside soundd's own wait when the mark queue is short and
-inside the deferral window — three periods, `audio-subsystem-spec.md` §4 — when
-it is not. What the mark abolishes is the shape commit 9c2fc4d measured before
-the lend existed: 93.3 ms of starvation behind a fair storm and a 24-period,
-70 ms gap. The fair class's admitted floor is what makes that unreachable now,
-and the mark is what keeps the marked client at the front of it.
+budget` = 5 000 000 ns, so **3.32 ms**, plus 4 ms for each mark already ahead of
+it in the class (§1.8): every mark carries the same 1 ms running-time window, so
+that term is a constant per mark rather than a function of what the mark was
+raised for. That is 1.14 device periods, so a cooperative client's fill lands
+inside soundd's own wait when the mark queue is short and inside the deferral
+window — three periods, `audio-subsystem-spec.md` §4 — when it is not. This is
+the one place a marked client is a *different* process from its marker, which is
+where the mark buys the marked half rather than nothing (§1.8). What the mark
+abolishes is the shape commit 9c2fc4d measured before the lend existed: 93.3 ms
+of starvation behind a fair storm and a 24-period, 70 ms gap. The fair class's
+admitted floor is what makes that unreachable now, the mark is what keeps the
+marked client at the front of it, and `old_park_kept_the_lend` (§5.5) is the
+gate that holds the shipped behaviour the mark has to preserve.
 
 The admission arithmetic for the shipped machine, on one CPU: 200 permille for
 soundd, 100 for the dying server, 500 for the fair class — 800 of the 900
@@ -1103,8 +1288,9 @@ spend before its own deadline arrives**.
 > I4's bound is interrupt delivery, plus the longest preempt-off section, plus
 > the observation granularity, plus `W`, where `W` is the **smaller** of two
 > quantities: the interference sum — over the other entities on that CPU,
-> `ceil(P / Pⱼ) × Bⱼ`, where `P` is the waking client's period — and
-> `period − budget` of the waking client's own reservation.
+> `ceil(P / Pⱼ) × Bⱼ`, where `P` is the waking client's period, plus the system
+> reserve's share of that period, `r × P` — and `period − budget` of the waking
+> client's own reservation.
 
 Both halves are derived and each is the tighter one in a different shape.
 
@@ -1119,7 +1305,12 @@ Both halves are derived and each is the tighter one in a different shape.
   the honest form and the earlier "at most one budget each" was true only of the
   shipped one-client machine. Its closed form is unit-coherent and needs no
   ordering assumption: `Σ ceil(P/Pⱼ)·Bⱼ ≤ P · Σ uⱼ + Σ Bⱼ` over the other
-  entities.
+  entities. **The reserve is a term of this sum and was missing from it.** §1.2
+  moves interrupt and pass time out of every entity's budget, so it appears in
+  neither factor above while delaying the waking client exactly as interference
+  does; `r × P` — the reserve's share of one of the client's own periods —
+  restores it. It is the reserve as §1.3 holds it back, provisional with it, and
+  it is written as a term rather than folded into a constant.
 - *The guarantee half* comes from §1.9: a client continuously runnable from its
   wake receives its whole budget inside the period it woke in, so it cannot
   still be waiting `period − budget` after a wake that landed at a boundary. The
@@ -1128,8 +1319,11 @@ Both halves are derived and each is the tighter one in a different shape.
   it does after it, so the counterfactual is exact.
 
 On soundd's CPU `ceil(P / 10 ms)` = 1 for both kernel entities, so the sum is
-5 ms (the fair class) + 1 ms (the dying server) = 6 ms and the guarantee half is
-2 322 494 ns; `W` is 2 322 494 ns. The bound is **larger** than the
+5 ms (the fair class) + 1 ms (the dying server) + 0.1 × 2 902 494 = 290 249 ns
+(the reserve) = 6 290 249 ns, and the guarantee half is 2 322 494 ns; `W` is
+2 322 494 ns. The missing term therefore moves no shipped number — the guarantee
+half was and remains the smaller — and it bites only where `period − budget`
+exceeds the sum. The bound is **larger** than the
 `DYING_CHUNK_NS` = 1 ms term it replaces, and it is a bound in every workload
 rather than in the one-corpse case; the term it replaces was smaller because it
 counted one corpse, and `k` corpses made it false.
@@ -1145,11 +1339,22 @@ discovered.**
   soundd's CPU. It is a bound and not a hole, and a real-time client that
   regularly wakes exhausted is a client whose reservation is sized wrong —
   §1.5's demotion count is where that shows, before the latency does.
-- *A client blocked on a resource* resumes within `W_block` (§1.8) of the block,
-  which is the mark's bound and carries the mark-queue depth `d` explicitly.
-  `old_mark_dropped_under_a_waiter` is the gate that reds here;
-  `old_park_kept_the_lend` reds on the other side of the same mechanism, where a
-  mark outlives the wait that justified it.
+- *A client blocked on a resource* is **not covered by a bound, and I4 does not
+  gate on it.** The clause the previous form stated over `W_block` is withdrawn
+  rather than repaired: §1.8 no longer derives that wait, because its
+  denominator is the holder's service rate and the shipped shape — a real-time
+  thread on its own process's `ProcessData`, held by a fair-band sibling the mark
+  pays nothing — puts that rate in the workload's hands. A gate here would have
+  to carry both the mark population and the count of runnable fair processes in
+  its own bound to be true of that shape, and this document declines to state a
+  bound it would then have to repair a fourth time. **What replaces it is a
+  report on both sides**: the kernel's blocked-on-lock counter (§1.8) and the
+  harness's measurement of the same interval in §6.2's lock cells, printed
+  beside I4 rather than compared against it. The obligation that keeps the wait
+  short is unchanged and is the checkable half — a lock that declares no hold
+  bound may not be taken where a real-time client can block on it.
+  `old_park_kept_the_lend` still reds on the other side of the same mechanism,
+  where a mark outlives the wait that justified it, and it reds under I9.
 
 ### 5.4 Invariant I14 — a retire reaches release, in the simulator
 
@@ -1166,8 +1371,12 @@ records — and changes shape twice.
 **The rate replaces the stretch factor.** An unwind's wall-clock cost is the
 victim's own unwind time divided by the dying server's utilization, plus one
 period for the phase the retire arrives in: with the server at 1 ms every 10 ms
-the stretch is `period ÷ budget` = 10 exactly, so one quantum of unwind CPU is
-100 ms of wall clock plus at most one 10 ms phase. The elevenfold factor is
+the stretch is `period ÷ budget` = 10 exactly, so the modelled unwind —
+`UNWIND_NS` = 4 ms (`toyos-sched/sim/src/vm.rs:81`), which is the length the sim
+actually charges — is 40 ms of wall clock plus at most one 10 ms phase. The
+unwind's length is the sim's own constant wherever this document prices one; a
+quantum is what the *victim* may hold, not what an unwind costs. The elevenfold
+factor is
 deleted; it was the aged grant's delivery cadence — one chunk per
 `DYING_AGE_NS + DYING_CHUNK_NS` — and the reservation does not have it.
 
@@ -1179,10 +1388,17 @@ the retirer's deadline — the composition of `n` waits is the sum of `n` bounds
 and writing the sum down as a constant is what forces a term the workload sets
 into a place nothing can read it — and there it ends in deletion, because the
 kernel can read none of the terms. Here the sim can read them, so the bound
-survives in head-relative form. The end-to-end retire-to-release time is then a
-*consequence*: FIFO order (which `check_retires` already asserts) plus the
-head-relative bound, summed over the corpses ahead. The sim can still print the
-sum; nothing derives a constant from it.
+survives in head-relative form. **The end-to-end retire-to-release time is not a
+sum this document states.** It is not FIFO order plus the head-relative bound
+over the corpses ahead, for two reasons that were both wrong in the previous
+form: `check_retires` asserts no ordering at all — its two halves are that a
+killed task is never migrated and that each retire completes inside
+`retire_latency_bound` — and §1.7's rejoin rule means a corpse that parks
+returns to the *tail*, so it is overtaken by whatever arrived meanwhile and its
+release is a function of how often it parks and how deep the queue was each
+time. The sim prints what it measured, per corpse and end to end; nothing
+derives a constant from either, and liveness does not need one (§5.2 rests on
+the chain being finite).
 
 > I14's bound, per corpse: from reaching the head of its CPU's dying queue,
 > release completes within the corpse's remaining unwind CPU time ÷ the dying
@@ -1193,9 +1409,9 @@ sum; nothing derives a constant from it.
 queue** (§1.7): it leaves the queue when it parks and rejoins at the tail when
 it wakes, so a park *ends* the head-relative interval and a fresh one begins
 when the corpse next reaches the head. The waits are therefore not a term of
-this bound; they are separate intervals, each carrying its own bound (a device
-timeout, or `W_block`), and the sim reports them beside I14 rather than folding
-them into it. A release that is late by a device timeout is a fact about the
+this bound; they are separate intervals — a device wait carries that device's
+declared timeout, a lock wait carries the report of §1.8 and no bound — and the
+sim reports them beside I14 rather than folding them into it. A release that is late by a device timeout is a fact about the
 device, and a bound that absorbed it would be a bound about nothing.
 
 I14 is not a special case of §1.9; it is a consequence of it, and it stays a
@@ -1221,7 +1437,7 @@ not kept as decoration.
 | `old_preemptible_window` | **survives verbatim.** The registration window's preempt-off requirement is untouched. |
 | `old_migrate_kept_the_corpse` | **survives verbatim.** A corpse handed to another CPU is a corpse taken away from the dying server that was admitted to serve it, which is if anything a sharper statement of the same break. |
 | `old_rt_starved_the_corpse` | **replaced by a strictly stronger gate, and the arithmetic of "stronger" is below.** Its escape hatch stages "the real-time band outranks every corpse", which is one point of the design space this document deletes. Its replacement stages "the dying server is dispatched only when no real-time client is runnable" — the same break expressed against entities — on the same scenario shape, so it keeps the old gate's quantifier: **it must red under I14 on every seed**, which is the certification the old gate carried and the only one re-derived I14's rate term has. It **also** reds under I15, and on two shapes the old gate could not see. |
-| `old_park_kept_the_lend` | **re-derived.** The break is unchanged — a park that keeps a lapsed window — but the window is now §1.8's mark, so the gate stages a park that keeps a mark after the wait that raised it ended, and what catches it is **I5**: the marked half is spent on a thread nobody is waiting for, and the processes behind it fall below their share. It needs `Op::Acquire`/`Op::Release` to be stageable at all (§3.2), which is R4's prerequisite and not a licence to land R4 without it. |
+| `old_park_kept_the_lend` | **re-derived, and it keeps I9.** The break is unchanged — a park that keeps a lapsed window — but the window is now §1.8's mark, so the gate stages a park that keeps a mark after the wait that raised it ended. What catches it is **I9**, the boost-window invariant, re-derived at R4 into the mark's terms (§6.1): one raise buys precedence until one of §1.8's three end conditions and no further. It is I9's only certifier (`toyos-sched/sim/tests/scenarios.rs`'s register), so moving the catch to I5 would have retired that certification — and I5 could not have taken it, because §2 scopes I5 to the service delivered while no mark was being honoured, which excludes precisely the service a stale mark buys. This gate is also what holds the shipped pipe-lend behaviour commit `9c2fc4d` measured (§4.1). It needs `Op::Acquire`/`Op::Release` to be stageable at all (§3.2), which is R4's prerequisite and not a licence to land R4 without it. |
 | `fair_share_per_thread` | **survives verbatim.** It is I5's negative gate and per-process fairness is inside the fair class, which reservations do not touch. What changes is I5's *scope*, not this gate: §2 puts §1.8's marked half inside what I5 measures, and `old_uncapped_mark` is the gate for that half. |
 | `fair_double_charge` | **survives verbatim.** |
 | `fair_identity_within_share` | **survives verbatim**, and gains a second job: it is the gate that holds §2's seam, since an intra-fair policy replacement that regressed thread identity would red here. |
@@ -1232,12 +1448,11 @@ not kept as decoration.
 | **`old_aged_grant`** (new) | Stages *this document's predecessor* — per-corpse age stamps, a one-chunk grant ahead of the real-time band, and a restamp on every re-entry. Must red under I15 in two cells, and the arithmetic of each is below. The design being replaced becomes the gate that proves the replacement measures something. |
 | **`old_arm_time_snapshot`** (new) | Stages the superseded §8: the retirer reads the victim CPU's queue depth when it arms and computes a wall-clock deadline from it. What reds is the staged design's **own tripwire**, not a roster invariant — that is the point of it, since the schedule breaks no rule this document states. The cell is (retirer concurrency = `k` ≥ 4 inside one drain window; corpses ≥ 4; real-time load = one client that spends its whole budget), with the dying server honouring its reservation exactly throughout, so the red reads "a deadline expired while every reservation was met". The review's probe `probe_arm_time_depth_is_blind_to_in_flight_siblings` is this gate's seed: it already demonstrates the blind read on four victims, and what the gate adds is the deadline the read was feeding and the release time it fails against. |
 | **`old_underdelivered_dying_server`** (new) | Stages a scheduler that delivers the dying server less than its reservation while it has runnable corpses. Must red under **I15** on every seed, in every cell with corpses ≥ 1. Its subject survives this revision's deletions intact: I15 is what says the dying server is owed its budget, and this is the gate that proves I15 has teeth on the one entity nobody outside the kernel can observe. |
-| **`old_mark_dropped_under_a_waiter`** (new) | Stages §1.8's mark ending while the waiter that raised it is still blocked, so the holder finishes the critical section at ordinary fair-share rates — storm-divided, which is what makes the wait grow while `W_block` does not. Must red under I4's blocked clause, in the cell (fair load = a storm; marks = one; lock holding = a fair-band thread holds a lock a real-time client blocks on). |
 | **`old_uncapped_mark`** (new) | Stages §1.8's mark without its cap or its window: a marked thread is dispatched ahead of unmarked threads for as long as it holds the resource, which is the shipped lend's unpriced promotion in the mark's clothes. Must red under **I5**, the per-process fairness invariant `fair_share_per_thread` already certifies, in the cell (marks = `k` concurrent in one class; fair load = a storm), where the marking processes take the whole class and the unmarked ones fall below their share. |
 | **`many_victims_many_retirers_slow_device`** (new control) | `m` victims, `k` concurrent retirers, and an in-unwind device wait at its own timeout, on a CPU whose real-time client spends its whole budget every period — the cell (corpses = 9; retirer concurrency = `k`; in-unwind device wait = one at its declared timeout; real-time load = one client that spends its whole budget). Must come back **clean**, and now nothing in the kernel could make it dirty: this is the schedule every previous tripwire panicked on, no assertion in this document is stated over a device's wait, and a corpse inside one is not in the queue the reservation serves (§1.7). |
 
-**Two gates this document's previous form proposed are deleted with the
-machinery they certified, and neither leaves an invariant uncovered.**
+**Three gates this document's previous forms proposed are deleted with the
+machinery they certified, and none leaves an invariant uncovered.**
 `old_stalled_head_corpse` staged a served head corpse that bumped no progress
 marker: there is no marker (§8), so there is nothing to stage, and the invariant
 it named — I14 — keeps its certifier in `old_rt_starved_the_corpse`'s
@@ -1245,9 +1460,17 @@ replacement, which must red under I14 on every seed.
 `old_unaccounted_wake_grant` staged a grant that charged nobody: under §1.8
 *nothing* is charged, deliberately, so the break it staged is now the design, and
 the direction it guarded — precedence without a bound — is guarded instead by
-`old_uncapped_mark`. Neither was landed, so both deletions cost text and no
-coverage; keeping a gate whose subject is gone would have been a claim the
-harness cannot check.
+`old_uncapped_mark`. `old_mark_dropped_under_a_waiter` staged a mark ending
+under a live waiter, and it goes for two reasons: the clause it would have red
+under is withdrawn (§5.3), and §1.8 *itself* ends a mark when the marked thread
+blocks,
+so a faithful implementation produces the staged break and the gate cannot tell
+the design from the defect. Its direction is now measured — the blocked-on-lock
+report in the kernel and the same interval in §6.2's lock cells. (It is the
+same subject the previous revision carried as `old_donation_not_renewed`, so
+what leaves here is one gate under two names and not two.) None of the three was
+landed, so the deletions cost text and no coverage; keeping a gate whose subject
+is gone would have been a claim the harness cannot check.
 
 **Which cell each must-red claim reds on, with the arithmetic.** The continuity
 dimension's recurrence interval (§6.2) decides two of these, which is why it
@@ -1359,7 +1582,8 @@ The ownership and accounting invariants are untouched. **Three are amended and
 this document says so rather than listing them as untouched**: the timer
 invariant gains §1.11's arming list (the running entity's exhaustion instant and
 the boundaries that can change the winner join `quantum_end` and the parked
-deadlines); the boost-window invariant is re-derived at R4 into the mark's terms
+deadlines); the boost-window invariant **I9** is re-derived at R4 into the mark's
+terms
 — a window that ends at one of §1.8's three conditions, honoured only inside the
 marked thread's own class, and charged to that class rather than to whoever
 raised it; and **I5 gains the marked half in its scope** (§2), comparing
@@ -1372,6 +1596,17 @@ invariants follow: a run in which no entity was ever continuously runnable for a
 whole period proves nothing, so the harness reports the fraction of periods I15
 actually compared and gates on that number as well as on pass or fail. A change
 that closes I15's window is as loud as one that violates it.
+
+**The entity I15 will least often have a window on is the audio client**, and
+saying so is the honest form of the fraction above: soundd mixes for a fraction
+of its period and blocks, so it is continuously runnable for a whole period only
+when it is already late, and I15 may compare nothing on it across a whole run.
+That is not a hole in §1.9 — §4.1 and §5.3 derive soundd's bound as a
+counterfactual over the interval it *is* runnable on, and §5.3 says why the
+counterfactual is exact — but it does mean I15 is not soundd's instrument. I4's
+wake latency and gate A's measured audio (§4.2) are, and a reading of the
+liveness fraction that expected soundd to fill it would be reading the wrong
+number.
 
 ### 6.2 The standing scenario matrix
 
@@ -1386,7 +1621,7 @@ real-time work got its reservation and that the dying server got its.
 | real-time band continuity | continuously occupied; briefly empty with the gap at one interrupt delivery, at one execution chunk, and at zero |
 | the recurrence interval of those gaps | one gap per real-time period; one per dying-server period; one per three dying-server periods |
 | fair load | idle; one thread; a storm |
-| lock holding | none; a fair-band thread holds a lock a real-time client blocks on, same CPU and other CPU; a two-link chain |
+| lock holding | none; a fair-band thread holds a lock a real-time client blocks on — same CPU and other CPU, **and a thread of the waiter's own process or of another**; a two-link chain |
 | marks | none; one; `k` concurrent in one class; one kept after its wait ended; one dropped while its waiter still waits |
 | retirer concurrency | one retirer; `k` retirers aiming victims at one CPU inside one drain window |
 | in-unwind device wait | none; one at its declared timeout |
@@ -1409,7 +1644,11 @@ The values that are not arbitrary:
 - **The lock and mark dimensions** exist because §1.8 is the one mechanism in
   this document whose failures are invisible to every other row: a blocked
   waiter is not continuously runnable, so I15 opens no window on it, and the
-  wait it suffers is charged to nobody. They are also the two dimensions the
+  wait it suffers is charged to nobody. Those cells are therefore where the
+  blocked-wait *report* is read (§1.8, §5.3) rather than where a bound is gated,
+  and the same-process value is in the dimension because it is the shape the
+  shipped tree produces and the one where a mark buys nothing. They are also the
+  two dimensions the
   sim's `Op` vocabulary cannot yet express (§3.2). **`k` concurrent marks** is
   the value the previous form of §1.8 had no bound for: one holder made every
   stated wait true and a second made it false, so a dimension with only "live,
@@ -1564,46 +1803,40 @@ against:**
 > sizes enter them — so they are measured, reported and gated in the harness and
 > the simulator, and never panic the kernel. An estimate never panics.
 
-Two adversarial passes over this document found the same defect five times, and
-each instance had this shape: a panic-grade assertion stated over a quantity a
-workload, a device or userland sets. A retirer's wall-clock deadline over `k`
+**And the same rule one level down, because that is where the third pass found
+it:**
+
+> **No hard bound at any level — a kernel assertion, a harness gate, or a
+> derived constant — may be stated over a quantity a workload sets, unless the
+> bound carries that term explicitly.** Everything else is measured and
+> reported. A number does not stop being workload-set by being written down as a
+> constant, and a gate is not safer than a panic for being a red.
+
+Three adversarial passes over this document found the same defect seven times,
+and each instance had this shape. A retirer's wall-clock deadline over `k`
 retirers and `m` transfers. A sliding window. A head-relative bound over a
 device wait. A queue-occupancy condition over a parked corpse. A progress
-cadence over the dirty pages of one file. Each repair moved the term; the
-doctrine removes the class, and the deletions below are what applying it costs.
+cadence over the dirty pages of one file. Then, inside the repairs themselves: a
+must-not-red bound on a blocked wait whose denominator the runnable process
+count sets, and a reserve constant derived from a pass rate the admitted set
+multiplies. The first five moved the term out of the kernel; the last two are
+what proves that moving it was not enough. The doctrine removes the class, and
+the deletions below and in §1.3 and §1.8 are what applying it costs — including
+two mechanisms the previous round's rulings had added a day earlier.
 
-### 8.1 What the previous form was, and why no repair of it exists
+### 8.1 The superseded design, which is what one gate stages
 
 The form this replaces had the retirer read the depth of its victim's CPU's
-unwind queue when it armed, and compute a wall-clock deadline from that depth
-and the dying server's declared rate. It fails three ways, and each is fatal on
-its own:
-
-- **The snapshot undercounts, provably.** A retire is a message; a victim's
-  position in the FIFO becomes real only when its CPU drains that message. So
-  every arm-time read precedes every arrival, and `m` independent killers aiming
-  victims at one CPU inside one drain window all read approximately zero while
-  all `m` victims are already in flight. The review's probe
-  (`probe_arm_time_depth_is_blind_to_in_flight_siblings`) demonstrates exactly
-  this on four victims: four arm-time reads of zero, then one drain, then four
-  corpses in FIFO order. The last victim is released after `m` unwinds and its
-  retirer's deadline priced one.
-- **The read is not the retirer's to make.** `scheduler-core-spec.md` invariant
-  2 says a CPU's scheduler state is exclusively its own; the only published
-  per-CPU numbers are a combined `rq + dying` load and a fair-only surplus, and
-  publishing a dying depth would publish a value that is stale by construction —
-  it can only be written at a pass, and the arm happens between passes.
-- **No wall-clock deadline computed at arm time can price what arrives after
-  it.** Not the corpses queued later, not a sleep-lock chain whose holder is on
-  another CPU, and not a device wait inside the unwind — `close_all` flushes
-  modified files, which reaches a USB transfer bounded by `USB_TIMEOUT_NS` = 2 s
-  (`kernel/src/drivers/xhci/mod.rs:319`) per transfer, and a wait is not CPU
-  time the reservation multiplies.
-
-The common shape is that a *deadline* is a claim about a future the arming CPU
-cannot see. Parameterising the constant moved the workload term from the queue
-depth into the unwind length and left it exactly as reachable. So the deadline
-goes, and what replaces it is not a bigger number.
+unwind queue when it armed and compute a wall-clock deadline from that depth and
+the dying server's declared rate. That read precedes every arrival — a retire is
+a message, and a victim joins the FIFO only when its CPU drains it — so `m`
+killers aiming victims at one CPU inside one drain window all read approximately
+zero while all `m` victims are in flight. That is what `old_arm_time_snapshot`
+(§5.5) stages and what `probe_arm_time_depth_is_blind_to_in_flight_siblings`
+seeds. The rest of the story — invariant 2's exclusivity objection, the device
+wait inside `close_all`, and both withdrawals — is in
+`specs/issues/kernel/retire-tripwire-is-not-queue-shaped.md`, which is the file
+that closes on it and the one place it belongs.
 
 ### 8.2 The dying server is an entity, and that is the whole service guarantee
 
@@ -1616,21 +1849,21 @@ were not:
   *continuous runnability*; a queue-occupancy condition and a runnability
   condition are the same sentence only under §1.7's rule that the queue **is**
   the runnable set — which this document now states, in the place that owns it.
-  With that rule the assertion says exactly what I15 already says about one
-  entity, and a second statement of a predicate is not a second guarantee. Its
-  deletion loses nothing: **I15 covers the dying server correctly, and no `k`
-  changes what one entity is owed per period.**
+  With that rule the assertion says of one entity what I15 already says of every
+  entity, over the periods the assertion could have been true of; the periods it
+  could have been true of and I15 opens no window on are the ones a parked corpse
+  creates, where the queue is non-empty and the server is not runnable — which is
+  exactly the half of the assertion that was reachable from legal userland and
+  the half it panicked on. Its deletion therefore loses nothing: **I15 covers the
+  dying server correctly, and no `k` changes what one entity is owed per
+  period.**
 - *"A served head corpse bumps a progress marker"* was a panic over a cadence
-  that the process's own size sets. One handle's drop flushes a file whose
-  dirty-page count userland chose; one region's drop frees a page count userland
-  chose. Between two bumps of the enumerated cadence a legal kill puts more than
-  the stated 1 ms of served CPU: the 2026-08-17 review measured a host port of
-  the kernel's own `pmm` and ticket lock at **14.4 ms** for one 1 GB region freed
-  against three legally-looping `mmap` callers, and 835.9 µs for the bare 4 KiB
-  copies of a 16 MiB dirty file's flush — so the tripwire panics on input that
-  broke no rule. Threading the marker deeper is
-  not a repair: it puts a scheduling obligation into `vfs.rs`, `toyos-fat32` and
-  collection drop glue, and the cadence still belongs to the workload.
+  the process's own size sets — a flush's dirty pages, a region's freed pages,
+  both chosen by userland. The 2026-08-17 review measured **14.4 ms** between
+  two legal bumps on a host port of the kernel's own `pmm` and ticket lock, so
+  the tripwire panics on input that broke no rule; and threading the marker
+  deeper is not a repair, because it puts a scheduling obligation into `vfs.rs`,
+  `toyos-fat32` and drop glue while leaving the cadence with the workload.
 
 **What replaces them is not a third assertion. It is the guarantee that was
 always the real one**, plus a report:
@@ -1707,20 +1940,25 @@ wait.
 ### 8.4 What the sim prices, and what it does not
 
 I14 (§5.4) is the head-relative bound and the sim reads its terms off the run,
-which it can and the kernel cannot. With the dying server at 1 ms every 10 ms,
-one quantum of unwind CPU costs `10 ms ÷ 0.1` = **100 ms of wall clock**, and a
-victim behind `n` others is `(1 + n) × 100 ms` plus **one** 10 ms phase term —
-the phase is paid once, when the retire arrives, because every later unwind
-starts inside a period stream that is already running. The superseded
-derivation's 110 ms per corpse was the aged grant's cadence, one chunk per
-`DYING_AGE_NS + DYING_CHUNK_NS` = 11 ms; it is not this rate, and the claim that
-the two agreed was arithmetic bent to make a rhetorical point. They differ by
-10 %, in the direction that says the reservation delivers an unwind *faster*
-than the design it replaces.
+which it can and the kernel cannot. With the dying server at 1 ms every 10 ms
+and the sim's modelled unwind at `UNWIND_NS` = 4 ms
+(`toyos-sched/sim/src/vm.rs:81`), one unwind costs `4 ms ÷ 0.1` = **40 ms of
+wall clock**, and a victim behind `n` others that never park is
+`(1 + n) × 40 ms` plus **one** 10 ms phase term — the phase is paid once, when
+the retire arrives, because every later unwind starts inside a period stream
+that is already running. That composition is what the sim prints, not a bound it
+asserts (§5.4: a corpse that parks rejoins at the tail). The rate comparison is
+the part worth keeping: the superseded design delivered one chunk per
+`DYING_AGE_NS + DYING_CHUNK_NS` = 11 ms, an 11× stretch, against this design's
+`period ÷ budget` = 10× — the same modelled unwind costs 44 ms there and 40 ms
+here. They differ by 10 %, in the direction that says the reservation delivers
+an unwind *faster* than the design it replaces.
 
-**The unwind's own length is an estimate and stays declared as one.** One
-quantum of the victim's CPU time is a stand-in for handle closes and a teardown;
-the reservation multiplies it, it does not measure it, and **nothing the kernel
+**The unwind's own length is an estimate and stays declared as one.**
+`UNWIND_NS` is a stand-in for handle closes and a teardown, derived in the sim
+from what I4's widest bound has to be able to show rather than from a
+measurement of one; the reservation multiplies it, it does not measure it, and
+**nothing the kernel
 asserts depends on it** — which is the difference between this section and the
 three designs before it. The sim may multiply an estimate because the sim reds a
 test; the kernel may not, because the kernel panics a machine.
@@ -1756,14 +1994,15 @@ the value of a redesign is partly in what it does not reopen:
 ### 9.2 The chunks
 
 Ordered, each landing green on its own, and none of them larger than a day of
-work:
+work. They are also their own branch: this document lands with the work that
+happened to precede it, and R1 starts fresh — chronology is not architecture.
 
 | chunk | content | size |
 |---|---|---|
 | **R1** | The reservation type, the per-CPU admission ledger, §1.3's policy constants — the fair class's own `(budget, period)` and the system reserve among them — and the checked admission arithmetic with its overflow refusal, run against the admissible capacity rather than 1000 permille. Host code and tests only, no dispatch change and no behaviour change. | small |
 | **R2** | The dying server: the entity, its reservation, its queue, demotion to the background tier and replenishment, **with §1.11's timer discipline and preemption predicate**, because an exhaustion nothing notices is not one. Deletes §3.1's aging cluster and dispositions its four crate gates in the same chunk, since a tree with both is a tree with two answers. Re-derives I14 head-relative, re-stages `old_rt_starved_the_corpse` — which is the only gate that certifies I14's rate term, so it lands with the term it certifies — and lands `old_aged_grant`. | large |
 | **R3** | Real-time clients become reservation clients: earliest-deadline dispatch among entities with budget, the total tie-break, demotion at exhaustion, replenishment at the boundary with the overrun charged back, and the background tier's work-conserving order — the second half of §1.11 lands here with the entities that need it. Re-derives I4 with its multiplicity factor and lands `old_unbounded_rt_precedence`. Deletes `RunningTask::serves_rt_band` with its last caller, the sim's I4 predicate (§3.2). Amends `scheduler-core-spec.md` §5's real-time wake placement in the same chunk (§10). | large |
-| **R4** | §1.8's urgency mark: the two events that set one, the total order, the marked half, the window, the same-process rule, and the mark's transitive walk along the sleep-lock chain. **Prerequisite inside this chunk**: `Op::Acquire`/`Op::Release` in the sim's workload vocabulary, without which the waiter/holder trigger cannot be staged and neither `old_park_kept_the_lend` nor `old_mark_dropped_under_a_waiter` exists as a gate. Re-derives the boost-window invariant and lands `old_uncapped_mark`. Amends `scheduler-core-spec.md` §3's pipe-lend paragraph and `audio-subsystem-spec.md` §4 to the mechanism the tree then has. | medium |
+| **R4** | §1.8's urgency mark: the two events that set one, the total order, the marked half, the one running-time window with the kernel constant it needs, the same-process rule, and the mark's transitive walk along the sleep-lock chain. Lands the blocked-on-lock counter and its report, and asks §1.8's static question of `ProcessData` rather than assuming it. **Prerequisite inside this chunk**: `Op::Acquire`/`Op::Release` in the sim's workload vocabulary, without which the waiter/holder trigger cannot be staged, `old_park_kept_the_lend` does not exist as a gate and the lock cells have nothing to measure. Re-derives the boost-window invariant I9 and lands `old_uncapped_mark`. Amends `scheduler-core-spec.md` §3's pipe-lend paragraph and `audio-subsystem-spec.md` §4 to the mechanism the tree then has. | medium |
 | **R5** | The manifest row, the parser's refusals (the period bounds and §7.1's budget floor among them), init's endowment-time check against the admissible capacity, the refusal wording with its five things, and the build gate. | medium |
 | **R6** | I15 in its cumulative form and the §6.2 scenario matrix with every dimension — recurrence interval, lock holding, marks, retirer concurrency and the in-unwind device wait — with the liveness fraction reported. | medium |
 | **R7** | §8 at the sites: the head-tenure counters and the report that replaces the two deleted assertions, the retirer's fixed-hop tripwire in place of `GIVE_UP`'s end-to-end form, and `old_arm_time_snapshot` and `old_underdelivered_dying_server` plus the `many_victims_many_retirers_slow_device` control. Closes the queue-shaped-tripwire defect — by deleting the wait's end-to-end deadline and putting nothing in its place — and amends `scheduler-core-spec.md` invariant 7 and the completion spec's §7.2a, §7.3 and §22 to their reservation forms. | medium |
@@ -1830,6 +2069,19 @@ exactly one of:
   a headroom question but a regression investigation at soundd, escalated with
   the numbers that produced it.
 
+**The reserve is measured on the same runs, and it has one branch.** R8 counts
+what §1.2 charges to the reserve — interrupt service routines and scheduling
+passes — per period, across gate A's four configurations, and reports it as a
+permille of a CPU. At or below 100 permille the held-back fraction stands and
+§1.3 loses the word *provisional*. Above it the reserve rises, and everything
+derived from it falls with it: the admissible capacity, the real-time ceiling,
+and the budget ceiling in the branches above. **That is escalated to the owner
+as a design question with the measured numbers**, never absorbed by admitting
+past a reserve the machine was measured to need — and never answered by deriving
+a new constant, which is the thing this section's own history says does not
+work. What the shipped machine has meanwhile is 100 permille of slack (§1.3) and
+a counter that says when it is being spent.
+
 ---
 
 ## 10. What resists, and is not overridden
@@ -1840,9 +2092,9 @@ withdrawn one included — a resistance that dissolved is evidence about the
 design that dissolved it.
 
 - **The sleep locks owe a hold bound they do not currently declare.** §1.8's
-  `W_block` composes a per-lock declared hold bound, and the rule that comes
-  with it — a lock that declares none may not be taken where a real-time client
-  can block on it — is an obligation on a set this document does not own. **The
+  report composes a per-lock declared hold bound, and the rule that comes with
+  it — a lock that declares none may not be taken where a real-time client can
+  block on it — is an obligation on a set this document does not own. **The
   declarations land in `completion-architecture-spec.md` §9's lock table**, one
   bound per lock, beside the four rows that are already there; this document
   states the obligation and the checkable rule and writes no bound itself.
@@ -1850,6 +2102,15 @@ design that dissolved it.
   declare nothing shorter than `USB_TIMEOUT_NS` = 2 s, so the rule's other half
   bites and the constraint is that no real-time path takes `VFS` — true of
   soundd today, and a thing R4 can check rather than assume.
+  **`ProcessData` is the row this document cannot settle, and it is the owner's.**
+  It is per process, every handle syscall takes the caller's own copy, and
+  soundd's real-time thread takes it on every period; a holder inside an `fsync`
+  parks under `{VFS, VOLUMES, XHCI}`, so an honest bound there is a device
+  timeout too. Either that lock declares a bound its own paths meet, or the rule
+  bites the shipped audio client and soundd's real-time cycle has to stop taking
+  it. This document states neither a bound nor a constraint it knows the shipped
+  machine breaks: R4 asks the static question, and the answer is a design
+  decision rather than an arithmetic.
 - **A device-driven client's period grid is anchored where its reservation was
   admitted, not where its stream begins.** §1.6 fixes the phase origin at
   admission, deliberately, so that no entity can re-phase its way into budget;
