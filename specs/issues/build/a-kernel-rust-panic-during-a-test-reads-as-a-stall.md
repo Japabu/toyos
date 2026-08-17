@@ -31,20 +31,26 @@ not answers … The guest stopped making progress, so the run established nothin
 about this tree and there is nothing in it to bisect"*, and `durations` prices
 the name at the guard's own arithmetic.
 
-## The occurrence this was found on
+## The occurrences this was found on
 
-Run 31946183485, job 95162423932, `guest (8)`, 2026-08-16: `sched_check_build`
-reported `STALLED: 382s of guard expired, and the guest had said nothing for the
-last 383s of it`, and four lines below that same message the capture carried
-`invariant P: a scheduler pass took 200569 ns, budget 200000 ns` with its full
-kernel and user backtrace. The guest died at 1.450 s of its own uptime.
-`specs/issues/kernel/the-check-build-guest-stopped-answering-on-kvm-twice.md`
-is the adjudication.
+Both are `sched_check_build` on 2026-08-16, and in both the capture printed
+inside the `STALLED:` message carries the panic that caused it:
 
-Cost, measured rather than estimated: that shard's parallel phase took 481.2 s
-for six tests whose other five measured 5, 5, 5, 4 and 4 s. The name is priced
-at `sched_check_build 6635` in `tests/test-durations`; the run recorded 387502
-ms for it.
+- Run 31946183485, job 95162423932, `guest (8)`: `STALLED: 382s of guard expired,
+  and the guest had said nothing for the last 383s of it`, and four lines below
+  it `invariant P: a scheduler pass took 200569 ns, budget 200000 ns` with its
+  full kernel and user backtrace. The guest died at 1.450 s of its own uptime.
+- Run 31936533470, job 95139261820, `guest (8)`, a push to `main`: `STALLED:
+  387s`, `invariant P: a scheduler pass took 277260 ns`, dead at 1.140 s.
+
+`specs/issues/kernel/the-check-build-guest-stopped-answering-on-kvm-twice.md` is
+the adjudication; a survey of the 100 most recent `ci` runs puts the pair at 2 of
+91 sampled runs, so this is not a once-off.
+
+Cost, measured rather than estimated: those shards' parallel phases took 481.2 s
+and 544.9 s for six tests whose other five measured 3–5 s each. The name is
+priced at `sched_check_build 6635` in `tests/test-durations`; one run recorded
+387502 ms for it.
 
 ## Why the naive patch is not the fix
 

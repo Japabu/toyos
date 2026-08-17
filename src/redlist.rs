@@ -885,25 +885,27 @@ pub const KNOWN_RED: &[Red] = &[
     Red {
         test: "sched_check_build",
         instrument: Instrument::Ci,
-        finding: Finding::Seen,
+        finding: Finding::fires(2, 91),
         standing: Standing::Stands,
-        what: "`invariant P: a scheduler pass took 200569 ns, budget 200000 ns` — the assert \
-               firing on native x86-64 under KVM, in `timer_handler` -> `driver::pass` -> \
-               `SchedPass::finish` while `test_rs_sched_stress` pid=7 was in syscall 8, at 1.449 s \
-               of guest uptime. `schedule_no_return: panicked inside a pass, cannot rejoin` halts \
-               every CPU 1 ms later, which is the whole of the 383 s of silence the run then \
-               reported as `STALLED:`. **The red is the panic and the stall is its shadow**: \
-               `run_test_paced` ends early on `KERNEL PANIC` only, which the CPU-exception path \
-               prints and a Rust `panic!` does not, so the wait ran its full 382 s ceiling on a \
-               machine that had been halted since second two and the summary said the run \
-               `established nothing about this tree`",
-        evidence: "PR #95 (`wt/toyos-harness2`), run 31946183485, job 95162423932 (\"guest (8)\"), \
-                   sha 4ec5d01, on an Azure 4-core EPYC 7763 with `/dev/kvm` — so KVM nested in a \
-                   hypervisor guest. One firing, not a rate: the earlier STALL under this name \
-                   (run 31890991692, job 95027203184, guest 8, 2026-08-15) printed an empty \
-                   `serial:` because `in_test` never became true, so its lines went to \
-                   `TestResult::before` and the caller drops that — its cause is unrecorded and is \
-                   not counted here",
+        what: "`invariant P: a scheduler pass took 277260 ns, budget 200000 ns` on cpu1 in \
+               `driver::idle_loop`, and `200569 ns` on cpu0 in `timer_handler` -> `driver::pass` \
+               while `test_rs_sched_stress` pid=7 was in syscall 8 — the assert firing on native \
+               x86-64 under KVM, at 1.140 s and 1.449 s of guest uptime, on two different EPYC \
+               SKUs. `schedule_no_return: panicked inside a pass, cannot rejoin` halts every CPU \
+               1 ms later, which is the whole of the ~385 s of silence each run then reported as \
+               `STALLED:`. **The red is the panic and the stall is its shadow**: `run_test_paced` \
+               ends early on `KERNEL PANIC` only, which the CPU-exception path prints and a Rust \
+               `panic!` does not, so the wait ran its full ceiling on a machine halted since \
+               second two and the summary said the run `established nothing about this tree`",
+        evidence: "run 31936533470, job 95139261820 (a push to `main`, EPYC 9V74) and PR #95's \
+                   run 31946183485, job 95162423932 (sha 4ec5d01, EPYC 7763) — both \"guest (8)\", \
+                   2026-08-16, both with the panic in the capture. The denominator is a survey of \
+                   the 100 most recent `ci` runs (2026-08-15 16:57 to 2026-08-17 13:29 UTC): 91 in \
+                   which the shard carrying this name actually ran it, 9 excluded as non-samples \
+                   for a cancelled shard. A third STALL (run 31890991692, job 95027203184, \
+                   2026-08-15) is in neither number — it predates the window, and its `serial:` \
+                   was empty because `in_test` never became true, so its lines went to \
+                   `TestResult::before` and the caller drops that",
         source: "specs/issues/kernel/the-check-build-guest-stopped-answering-on-kvm-twice.md",
         measured: "2026-08-16",
     },
@@ -928,8 +930,9 @@ pub const KNOWN_RED: &[Red] = &[
                    then ALONE re-run); green on KVM the same day — twelve of twelve guest shards, \
                    run 31875856466, where it measured 5,879 ms. **What this row may no longer be \
                    read as saying is that the budget fits natively**: the same assert has since \
-                   fired on a KVM shard at 200569 ns, which is the `Instrument::Ci` row above. \
-                   The TCG explanation of *this* magnitude stands; the implied claim about the \
+                   fired on KVM shards twice, at 277260 ns and 200569 ns, which is the \
+                   `Instrument::Ci` row above. The TCG explanation of *this* magnitude stands — \
+                   nothing on KVM has come within five times it — but the implied claim about the \
                    other accelerator does not",
         source: "specs/issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
         measured: "2026-08-15",
