@@ -8,7 +8,7 @@
 //! whole history of the tree.
 //!
 //! Both registers are written whole, so every bit of both is decided here.
-//! `CR0`'s value is a constant; three of `CR4`'s bits are the silicon's to
+//! `CR0`'s value is a constant; four of `CR4`'s bits are the silicon's to
 //! offer, so its value is *required plus whatever of the optional set this CPU
 //! has* — a function every CPU evaluates and has to agree on.
 
@@ -37,6 +37,7 @@ mod cr4 {
     pub const OSFXSR: u64 = 1 << 9;
     pub const OSXMMEXCPT: u64 = 1 << 10;
     pub const LA57: u64 = 1 << 12;
+    pub const UMIP: u64 = 1 << 11;
     pub const FSGSBASE: u64 = 1 << 16;
     pub const PCIDE: u64 = 1 << 17;
     pub const SMEP: u64 = 1 << 20;
@@ -83,7 +84,16 @@ const CR4_REQUIRED: u64 = cr4::DE
 
 /// The `CR4` bits this kernel takes when the CPU offers them and does without
 /// when it does not.
-const CR4_OPTIONAL: u64 = cr4::SMEP | cr4::SMAP | cr4::PCIDE;
+///
+/// `UMIP` (bit 11) joined `SMEP`/`SMAP`/`PCIDE` here rather than
+/// [`CR4_REQUIRED`] for the same reason they did: it is silicon's to offer,
+/// not every CPU this kernel targets does, and `declaration` already checks
+/// it against CPUID before setting it. With it set, `SGDT`, `SIDT`, `SLDT`,
+/// `SMSW` and `STR` executed in Ring 3 raise `#GP` instead of handing a
+/// process the GDT, IDT and TSS addresses (SDM Vol. 3A §2.5) — the addresses
+/// a KASLR bypass is built out of, and nothing in this kernel's userland
+/// executes any of the five. Free hardening, taken.
+const CR4_OPTIONAL: u64 = cr4::SMEP | cr4::SMAP | cr4::PCIDE | cr4::UMIP;
 
 /// The declaration as the BSP computed it, for every AP to reproduce and match.
 ///
@@ -198,6 +208,7 @@ fn supported() -> u64 {
     ];
     const CPUID_7_EBX: [(u32, u64); 3] =
         [(0, cr4::FSGSBASE), (7, cr4::SMEP), (20, cr4::SMAP)];
+    const CPUID_7_ECX: [(u32, u64); 1] = [(2, cr4::UMIP)];
 
     let (max_leaf, _, _, _) = cpu::cpuid(0, 0);
     let (_, _, ecx1, edx1) = cpu::cpuid(1, 0);
@@ -206,7 +217,7 @@ fn supported() -> u64 {
     // somebody else's data — and a `CR4` bit the CPU does not define is the
     // triple fault the CPUID gating exists to replace with a named refusal.
     // Zero instead gives `declaration`'s assertion, which names the CPU.
-    let (_, ebx7, _, _) = if max_leaf >= 7 { cpu::cpuid(7, 0) } else { (0, 0, 0, 0) };
+    let (_, ebx7, ecx7, _) = if max_leaf >= 7 { cpu::cpuid(7, 0) } else { (0, 0, 0, 0) };
 
     let mut have = 0;
     for (bit, flag) in CPUID_1_EDX {
@@ -216,6 +227,11 @@ fn supported() -> u64 {
     }
     for (bit, flag) in CPUID_7_EBX {
         if ebx7 & (1 << bit) != 0 {
+            have |= flag;
+        }
+    }
+    for (bit, flag) in CPUID_7_ECX {
+        if ecx7 & (1 << bit) != 0 {
             have |= flag;
         }
     }
@@ -238,13 +254,14 @@ fn self_check(cpu_id: u32, declared_cr4: u64) {
     let live_cr0 = cpu::read_cr0();
     let live_cr4 = cpu::read_cr4();
     log!(
-        "control_regs: cpu{} cr0={:#010x} cr4={:#010x}{}{}{}",
+        "control_regs: cpu{} cr0={:#010x} cr4={:#010x}{}{}{}{}",
         cpu_id,
         live_cr0,
         live_cr4,
         opt(live_cr4, cr4::SMEP, " smep"),
         opt(live_cr4, cr4::SMAP, " smap"),
         opt(live_cr4, cr4::PCIDE, " pcid"),
+        opt(live_cr4, cr4::UMIP, " umip"),
     );
     assert!(
         live_cr0 == CR0,
