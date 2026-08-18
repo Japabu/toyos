@@ -361,8 +361,10 @@ impl<F: FnMut(&[u8])> core::fmt::Write for Line<F> {
 ///
 /// **Public because `/log`'s sink renders the same line**, and a second
 /// implementation of it there would be a second thing to keep agreeing with the
-/// panel. It goes when `logd` does the rendering (L6), which is also when the
-/// wall-clock prefix stops being this one.
+/// panel. An earlier note here predicted it would go when `logd` took over the
+/// rendering; it did not, because `logd` renders the same record through the
+/// same `Display` and writes a *wall-clock* prefix in front of it. One
+/// implementation of everything that varies, two prefixes over it.
 pub fn write_line(record: &LogRecord, emit: impl FnMut(&[u8])) {
     use core::fmt::Write;
     let mut line = Line::new(emit);
