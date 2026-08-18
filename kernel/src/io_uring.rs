@@ -88,7 +88,7 @@ impl Drop for RingRef {
         };
         if let Some(mut instance) = instance {
             for poll in instance.pending_polls.drain(..) {
-                for source in [poll.read_source, poll.write_source].into_iter().flatten() {
+                for source in poll.sources.iter() {
                     source.remove_watcher(self.0);
                 }
             }
@@ -168,6 +168,71 @@ pub enum Source {
     /// which is why [`Source::is_ready`] answers `false` here and every
     /// completion comes from `log::user::post_readiness`.
     Log,
+}
+
+/// A source whose whole lifetime is one object's.
+///
+/// **[`remove_fd`] takes only these, and that is what makes the mistake it
+/// exists to stop a compile error rather than a review note.** Cancellation is
+/// by source across every ring in the machine, which is what a pipe needs — a
+/// client closing its end must complete the server's poll on the other, and an
+/// fd number means nothing outside the process that owns it. Handing it a
+/// source the closing object does *not* own cancels polls that belong to
+/// processes which were never consulted, and there is now no way to write that:
+/// [`Source::ended_by_its_last_handle`] is the only constructor.
+pub struct EndedSource(Source);
+
+impl Source {
+    /// This source, if the last handle to the object naming it is what ends it.
+    ///
+    /// **Two sources answer `None`, and both are the machine's rather than any
+    /// holder's.** [`Source::Log`] is named by every `SysCap`, and the machine's
+    /// log is not something a capability going away ends: closing one is a
+    /// process putting down its authority to read a stream that outlives every
+    /// handle, and `/bin/logd`'s whole loop is read-then-park, so that was a
+    /// daemon which stopped reading the moment anything anywhere closed a
+    /// capability. [`Source::Keyboard`] is the machine's one keyboard, which no
+    /// claim and no console creates or destroys: the `Device(Keyboard)` claim
+    /// names it *and* so does every `Console` (`object::ops::read_source`), so
+    /// the claim's holder closing its handle posted `-NotFound` into every
+    /// pending poll on stdin in the machine — which is what libc's terminal read
+    /// arms — for processes that hold no device. It stayed quiet only because
+    /// the compositor takes the claim at boot and holds it until the machine
+    /// stops; a restart, a handoff or a rearm would have cancelled every
+    /// terminal read on the machine in between.
+    ///
+    /// **The question is the source's and asking the object was the defect.**
+    /// What makes cancelling safe is that no *other kind* of object names the
+    /// same source, and an exhaustive match over `KObjectRef` cannot state that
+    /// — `object::ops` had one, and its argument was "a claim admits exactly one
+    /// handle by construction, so every ring watching it is the one holder's",
+    /// which is true of the claim and false of the source. The match is here
+    /// because the fact is here, beside [`Source::is_ready`] and
+    /// [`Source::watchers`], and a source added to this enum has to answer it.
+    ///
+    /// Every other source really is its object's: a pipe end, a connection, a
+    /// port and the four remaining device classes each go away with their last
+    /// handle, and nothing else in the kernel names any of them.
+    pub fn ended_by_its_last_handle(self) -> Option<EndedSource> {
+        // The negative controls restore the prior behaviour for one source
+        // each, so the gate covering it reds on the tree that had it.
+        // `log-close-cancels-any-syscap` covered both while the question was
+        // asked of the object; the keyboard half has its own name now, because
+        // a keyboard *claim* closing is the reachable stimulus for it and no
+        // `SysCap` is involved.
+        let ends = match self {
+            Self::Log => crate::actuator::log_close_cancels_any_syscap(),
+            Self::Keyboard => crate::actuator::keyboard_close_cancels_every_console(),
+            Self::Mouse
+            | Self::Network
+            | Self::VirtioSound
+            | Self::Hda
+            | Self::Port(_)
+            | Self::PipeReadable(_)
+            | Self::PipeWritable(_) => true,
+        };
+        ends.then_some(EndedSource(self))
+    }
 }
 
 impl PartialEq for Source {
@@ -803,9 +868,9 @@ fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPol
 /// `enter` on it — that is what a pending `POLL_ADD` means — and nothing else
 /// can end that park: the poll is gone, so the source's own close-path wake
 /// finds no watcher for it, and a `u64::MAX` wait never returns.
-pub fn remove_fd(sources: &[Option<Source>]) {
+pub fn remove_fd(sources: &[Option<EndedSource>]) {
     let mut affected: Vec<RingId> = Vec::new();
-    for source in sources.iter().flatten() {
+    for EndedSource(source) in sources.iter().flatten() {
         for &id in source.watchers().iter() {
             if !affected.contains(&id) {
                 affected.push(id);
@@ -816,7 +881,7 @@ pub fn remove_fd(sources: &[Option<Source>]) {
     if affected.is_empty() { return; }
 
     let watches_a_closing_source =
-        |pp: &PendingPoll| sources.iter().flatten().any(|s| pp.watches(s));
+        |pp: &PendingPoll| sources.iter().flatten().any(|EndedSource(s)| pp.watches(s));
 
     let mut to_wake: Vec<Arc<KWaitQueue>> = Vec::new();
     let mut guard = IO_URINGS.lock();
