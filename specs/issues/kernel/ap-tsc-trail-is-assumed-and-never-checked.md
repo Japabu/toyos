@@ -10,7 +10,8 @@ opened: 2026-08-14
 during `clock::init` — from whatever `rdtsc` this CPU answers. A CPU whose TSC
 reads below that value has no honest answer to give.
 
-`specs/log-architecture-spec.md` §2.1 states the assumption out loud:
+The log architecture stated the assumption out loud, and `kernel/src/clock.rs`
+carries it now:
 
 > **Cross-CPU ordering rests on the TSC being invariant and firmware-synchronised.**
 > ToyOS targets 2020+ x86-64, where it is. If it is not, two records from two

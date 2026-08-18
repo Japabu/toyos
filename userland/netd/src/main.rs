@@ -13,8 +13,8 @@ use toyos::ipc::{Connection, IpcPayload, RxStep};
 /// `init: started test-runner` arrived interleaved and the harness parsed a cap
 /// out of the wrong number. `userland/soundd` has the same macro for the same
 /// reason. **The class is closed at the kernel since L5** — a `ConsoleObject`
-/// per holder buffers a line and emits it whole under one `BackendGuard`
-/// (`specs/log-architecture-spec.md` §4.4) — so what this still buys is one
+/// per holder buffers a line and emits it whole under one `BackendGuard` — so
+/// what this still buys is one
 /// syscall per line instead of one per fragment.
 macro_rules! say {
     ($($arg:tt)*) => {{

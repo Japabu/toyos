@@ -9,7 +9,7 @@ closed: 2026-08-15
 
 `Source::Log` — the io_uring readiness a reader of `SYS_LOG_READ` arms on — is
 posted by `klogd` after each drain batch, and by nothing else
-(`kernel/src/log/console.rs`, `specs/log-architecture-spec.md` §3.2). That is
+(`kernel/src/log/console.rs`). That is
 the right context and the right cost: it is the one place in the machine that
 has just observed committed records and may take a lock, and it costs one wake
 per batch rather than one per record.

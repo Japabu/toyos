@@ -14,8 +14,6 @@
 //! This file names nothing outside itself, which is what lets `kernel-elide`
 //! compile it and run the tests below on the host — where a seam falling inside
 //! a four-byte character costs milliseconds to check and no guest at all.
-//!
-//! `specs/log-architecture-spec.md` §2.1.
 
 use core::fmt::{self, Display, Write};
 

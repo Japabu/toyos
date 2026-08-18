@@ -316,8 +316,8 @@ impl UserBytesMut<'_> {
 ///
 /// It existed for two callers: `file_cache::write_page` was reached both by a
 /// syscall carrying a [`UserBytes`] window and by `log_file`, whose bytes were
-/// the kernel's own. **`log_file` is gone at L6 of
-/// `specs/log-architecture-spec.md`** and `/bin/logd` reaches the page cache
+/// the kernel's own. **The kernel's own file sink is gone**
+/// and `/bin/logd` reaches the page cache
 /// through `SYS_WRITE` like any other program, so the second caller is a
 /// kernel-owned buffer no more. The abstraction stays because the page cache
 /// naming the capability it needs is still the right shape and the kernel still

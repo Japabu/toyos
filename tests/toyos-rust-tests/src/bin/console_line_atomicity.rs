@@ -8,10 +8,10 @@
 //! gap lands inside the line.
 //! Two splices were recorded against it before it was closed, one of them a
 //! measured 1 run in 10 for `desktop_audio_client` on CI;
-//! `specs/log-architecture-spec.md` §4.4 keeps both measurements, because the
+//! `src/redlist.rs`'s retired rows keep both measurements, because the
 //! issue file that held them is closed and its numbers are still numbers.
 //! `ConsoleObject`'s line buffer is what closes it
-//! (`specs/log-architecture-spec.md` §4.4), and the buffer is per holder — so
+//! and the buffer is per holder — so
 //! two *processes* is the shape that tests it and two threads would not.
 //!
 //! The two writes are made by hand rather than through `println!` because the
@@ -53,8 +53,8 @@ const WIDTH: usize = 200;
 /// **The other half of the same buffer.** A line leaves on the `\n` that ends
 /// it; the one moment a partial line stops being "not finished yet" and becomes
 /// "all there will ever be" is the last handle to the console going away, and
-/// `ConsoleObject::drop` is what flushes it (`specs/log-architecture-spec.md`
-/// §4.4). Without that flush these bytes are dropped on the floor — a buffer
+/// `ConsoleObject::drop` is what flushes it. Without that flush these bytes
+/// are dropped on the floor — a buffer
 /// that loses a dying process's last words, which is the opposite of what it is
 /// for — and a hundred of them arriving whole is also proof the buffer
 /// accumulated across two `write`s to get there.

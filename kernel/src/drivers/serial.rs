@@ -3,7 +3,7 @@
 //! **There is one thing here now where there were two.** `SerialWriter` was a
 //! per-invocation stack buffer that every `log!` formatted into and committed
 //! to a 64 KiB byte ring, which something else drained later; the ring is gone
-//! (`specs/log-architecture-spec.md` §8.1) and what reaches this file is whole
+//! and what reaches this file is whole
 //! units — a rendered record from `log::console`, a userland `write`, a panic
 //! report — each of which takes [`BackendGuard`] once and holds it for its own
 //! whole unit. That is where line atomicity comes from, and it is the only
@@ -307,7 +307,7 @@ pub fn flush_final() {
 /// no buffering.** It replaced `SerialWriter::console()` and the lossless
 /// byte-ring append underneath it, whose unit of interleaving was a `write`
 /// syscall — and two recorded splices to show for it, whose measurements
-/// `specs/log-architecture-spec.md` §4.4 keeps now that the entry that held
+/// `src/redlist.rs`'s retired rows keep now that the entry that held
 /// them is closed. Taking the guard here is what makes this
 /// write whole against a kernel record and against another process; what it
 /// does *not* fix is `println!` handing the kernel half a line at a time.
@@ -315,8 +315,7 @@ pub fn flush_final() {
 /// **That is what [`ConsoleLine`] fixes, and this function is now the thing it
 /// is measured against.** Every ordinary write goes through the line buffer;
 /// this path survives as the `console-unbuffered` actuator's behaviour, which
-/// is the state the tree shipped between L3 and L5 rather than an invented one
-/// (`specs/log-architecture-spec.md` §9.4).
+/// is a state this tree really shipped rather than an invented one.
 ///
 /// **The guard is taken and released per chunk, and the bound is the reason
 /// this function may be called with a userland length at all.** `BackendGuard`
@@ -328,8 +327,8 @@ pub fn flush_final() {
 /// ring this replaced never did — it appended under its own short lock and
 /// something else drained.
 ///
-/// **[`MAX_CONSOLE_LINE`] rather than a number invented here.** §4.4 of
-/// `specs/log-architecture-spec.md` bounds a console *line* by it and emits a
+/// **[`MAX_CONSOLE_LINE`] rather than a number invented here.** The console
+/// object bounds a *line* by it and emits a
 /// longer one in pieces of it, so the interleaving unit this chunking creates
 /// is the same one the finished design already has: anything that will be whole
 /// after L5 is whole now, and nothing that is atomic today stops being so.

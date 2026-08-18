@@ -1,7 +1,7 @@
 //! The kernel's console sink, the two drain modes, and `klogd`.
 //!
 //! One thread where every idle CPU used to drain, and that is a reduction this
-//! design accepts and names (`specs/log-architecture-spec.md` §4.3). Three
+//! design accepts and names. Three
 //! things bound it: boot does not need a thread at all, the panic and shutdown
 //! paths drain inline and never depend on `klogd` being schedulable, and
 //! **`klogd`'s own death is not survivable quietly** — its row in
@@ -437,7 +437,7 @@ extern "C" fn body(_arg: u64) -> ! {
 
         // **The one context in the machine that has just observed committed
         // records and may take a lock**, which is why the readiness post is
-        // here and not in `emit` (`specs/log-architecture-spec.md` §3.2). One
+        // here and not in `emit`. One
         // post per batch rather than one per record, and none at all while
         // nothing is watching.
         //

@@ -9,8 +9,6 @@
 //!
 //! `SHARD_RECORDS` is 4 here, which is what makes the recycle cases reachable
 //! in a model at all — `shard.rs` says why.
-//!
-//! `specs/log-architecture-spec.md` §2.5, obligations W1, W2 and W4.
 
 #![cfg(feature = "loom")]
 

@@ -6,8 +6,6 @@
 //! slot's sequence number and accept it if it happened to equal the number it
 //! asked for. On x86 every store is a release and this cannot happen. **ARM64
 //! is planned.**
-//!
-//! `specs/log-architecture-spec.md` §2.2.
 
 #![cfg(feature = "loom")]
 

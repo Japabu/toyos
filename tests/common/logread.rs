@@ -10,7 +10,7 @@
 //! The gate runs *inside* `test-runner` rather than in a binary it spawns:
 //! `logread` is a `SysCap` dup and not a namespace entry, so it is not part of
 //! what the runner hands its children (`specs/capability-endowment-spec.md`
-//! §6.7a, `specs/log-architecture-spec.md` §3.2).
+//! §6.7a).
 
 use std::collections::BTreeMap;
 use std::path::Path;

@@ -684,8 +684,8 @@ impl Vfs {
 
     /// Is there a filesystem mounted under this name?
     ///
-    /// The one thing the kernel still knows about `/log` after L6 of
-    /// `specs/log-architecture-spec.md`: it mounts the volume and hands it to
+    /// The one thing the kernel still knows about `/log`: it mounts the volume
+    /// and hands it to
     /// userland, and `/bin/logd` is what knows whether a file was opened on it.
     /// `report_log_destination` is the caller and the panel is why it exists —
     /// logd's own line reaches a console and never the screen.
