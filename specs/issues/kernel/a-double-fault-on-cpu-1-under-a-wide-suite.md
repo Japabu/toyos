@@ -149,9 +149,10 @@ this kernel is a missing gate, not a stack.
 
 What survives of that class was audited here, in code:
 
-- the legacy 8259 is masked outright at `idt::init` (`disable_pic`, `0xFF` to
-  both OCW1s) and `ioapic::init` masks every redirection entry firmware left, so
-  neither can deliver a vector into the exception range. **Closed.**
+- the legacy 8259 is remapped off the exception range and then masked outright
+  at `idt::init` (`disable_pic`, `0xFF` to both OCW1s), and `ioapic::init` masks
+  every redirection entry firmware left, so neither can deliver a vector at all.
+  **Closed.**
 - every vector Intel names for 64-bit mode has a gate. **Closed by `9bd7a9e`.**
 - **the LAPIC's spurious-interrupt vector is `0xFF` and the IDT has no entry at
   `0xFF`.** That is a defect on its own terms and is filed as
@@ -169,10 +170,10 @@ What survives of that class was audited here, in code:
 265 of 265 at `1.05x width`, 265 of 265 at `1.36x`, and 264 of 265 at `1.12x`
 whose one red was `sched_check_build`'s pass-cost distribution — `KNOWN-RED`,
 `FIRES 6 of 10` on the dev-host-loaded instrument, and no `DOUBLE FAULT`
-anywhere in that run. Two of the three were at or above the `1.15x` the sighting
-was taken at, so the runs closest to its conditions were the clean ones. That is
-three samples against one observation and it establishes no rate whatsoever; it
-is recorded so nobody counts it as evidence in either direction.
+anywhere in that run. One of the three was above the `1.15x` the sighting was
+taken at and it was 265 of 265 green; the other two were below it. That is three
+samples against one observation and it establishes no rate whatsoever; it is
+recorded so nobody counts it as evidence in either direction.
 
 Nothing here is a repro recipe, and there is no cheap one to offer: a `#DF`
 reached only beside eleven other guests does not reproduce alone, and this file
