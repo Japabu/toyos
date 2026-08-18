@@ -11,9 +11,25 @@
 //! It is the **producer's** decision, so the record still holds a whole message
 //! and `elided` still means what the ABI says it means.
 //!
-//! This file names nothing outside itself, which is what lets `kernel-elide`
-//! compile it and run the tests below on the host — where a seam falling inside
-//! a four-byte character costs milliseconds to check and no guest at all.
+//! **That is also why this is not in `toyos-abi`**, where `elided` and the rest
+//! of `LogRecord` live. The ABI is the contract between the kernel and
+//! userland; this is one side deciding what to put in a field before it fills
+//! it in, with one caller and nothing on the far side of the contract that
+//! needs it — and `toyos-abi` is a dependency of `std`, so a formatter that
+//! reaches no reader would ship in every program.
+//!
+//! Pure: `core::fmt` and nothing else — no allocation, no `unsafe`, and no
+//! record. The one caller is `kernel/src/symbols.rs`, which spends the budget
+//! `MAX_RECORD_MESSAGE` leaves a backtrace frame, and everything it decides is
+//! checked here on the host, where a seam falling inside a four-byte character
+//! costs milliseconds and no guest at all — the tree's own widest symbol is
+//! under a third of what triggers the elision, so no boot reaches it.
+
+#![no_std]
+#![forbid(unsafe_code)]
+
+#[cfg(test)]
+extern crate std;
 
 use core::fmt::{self, Display, Write};
 
@@ -152,6 +168,7 @@ impl<const HEAD: usize, const TAIL: usize> Write for HeadTail<'_, '_, HEAD, TAIL
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::format;
     use std::string::{String, ToString};
 
     const HEAD: usize = 16;

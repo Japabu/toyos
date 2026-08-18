@@ -88,11 +88,12 @@ fn translate(user_addr: u64) -> Option<*mut u8> {
 
 /// The direct-map address of a `T` the kernel may read or write at `ptr`.
 ///
-/// One translation answers for one 2 MiB page, so [`user_span::is_user_object`]
-/// is what stands between a value near a page boundary and a copy that walks
-/// off the end of a *physical* page into whatever the PMM handed out next.
+/// One translation answers for one 2 MiB page, so
+/// [`toyos_userbound::is_user_object`] is what stands between a value near a
+/// page boundary and a copy that walks off the end of a *physical* page into
+/// whatever the PMM handed out next.
 fn object<T: UserSafe>(ptr: UserAddr) -> Result<*mut u8, SyscallError> {
-    let ok = crate::mm::user_span::is_user_object(
+    let ok = toyos_userbound::is_user_object(
         ptr.raw(),
         core::mem::size_of::<T>() as u64,
         core::mem::align_of::<T>() as u64,
@@ -354,7 +355,7 @@ impl ByteSource for UserBytes<'_> {
 /// whose pages are not physically adjacent would make an offset into it name a
 /// page belonging to somebody else.
 fn window(ptr: UserAddr, len: usize) -> Option<*mut u8> {
-    if !crate::mm::user_span::in_user_half(ptr.raw(), len as u64) {
+    if !toyos_userbound::in_user_half(ptr.raw(), len as u64) {
         return None;
     }
     let kptr = translate(ptr.raw())?;

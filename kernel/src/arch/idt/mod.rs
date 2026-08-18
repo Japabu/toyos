@@ -1,7 +1,6 @@
 pub(crate) mod exceptions;
 mod device_irq;
 mod dma_fault;
-mod fault_class;
 mod hda;
 mod i8042;
 #[cfg(feature = "boot-actuators")]
@@ -61,9 +60,9 @@ const PF_PRESENT: u64 = 1 << 0;
 const PF_WRITE: u64 = 1 << 1;
 const PF_INSTRUCTION_FETCH: u64 = 1 << 4;
 
-// The ring a `cs` names is `fault_class::Ring`'s to decide and nobody else's:
-// a second reading of the RPL field beside it is a second place the crash path
-// can be told the wrong privilege level.
+// The ring a `cs` names is `toyos_userbound::Ring`'s to decide and nobody
+// else's: a second reading of the RPL field beside it is a second place the
+// crash path can be told the wrong privilege level.
 
 // IDT entry (16 bytes in 64-bit mode)
 #[repr(C)]

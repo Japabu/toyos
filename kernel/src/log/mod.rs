@@ -6,7 +6,6 @@
 //! module accepts is a whole one.
 
 pub mod console;
-pub mod elide;
 pub mod nested;
 pub mod read;
 pub mod registry;

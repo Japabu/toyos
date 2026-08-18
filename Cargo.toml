@@ -16,14 +16,12 @@
 [workspace]
 members = [
     "bcachefs",
-    "kernel-elide",
-    "kernel-fault",
     "kernel-loom",
-    "kernel-span",
     "toyos-abi",
     "toyos-cc",
     "toyos-desktop",
     "toyos-elf",
+    "toyos-elide",
     "toyos-fat32",
     "toyos-fat32-check",
     "toyos-gpt",
@@ -36,6 +34,7 @@ members = [
     "toyos-sched",
     "toyos-sched/loom",
     "toyos-sched/sim",
+    "toyos-userbound",
     "toyos-wallclock",
     "toyos-xhci",
     "toyos-xhci/sim",

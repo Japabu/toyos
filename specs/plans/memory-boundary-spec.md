@@ -420,10 +420,13 @@ from it or settles something it left open:
   dereferences a futex word on every wake check — an unaligned one reads its
   tail out of the next physical page. `futex_word` carries both.
 
-The arithmetic lives in `kernel/src/mm/user_span.rs`, pure and with no `crate::`
-reference, compiled into `kernel-span/` for the host the way `kernel-loom`
-compiles `sync.rs`. `check_user_range` was a third home for the same constant
-and is gone; `in_user_half` is the one, and `sys_mmap` and the loader call it.
+The arithmetic lives in `toyos-userbound/src/span.rs`, a pure crate the kernel
+depends on by path. It was `kernel/src/mm/user_span.rs` compiled onto the host
+through a `#[path]` attribute in a `kernel-span/` harness; a file that names
+nothing outside itself is a library, so it is one, beside `toyos-userbound`'s
+other half — the fault classification that reads the same bound.
+`check_user_range` was a third home for the same constant and is gone;
+`in_user_half` is the one, and `sys_mmap` and the loader call it.
 
 **Fix shape.**
 
@@ -482,7 +485,7 @@ and is gone; `in_user_half` is the one, and `sys_mmap` and the loader call it.
 | guest | `futex_wait` on a kernel address returns an error rather than blocking-or-not | revert → the oracle answers; the test distinguishes the two outcomes |
 
 **Built, and every control was seen red before it was seen green.**
-`kernel-span`'s six host tests are the first row: each of its three arms
+`toyos-userbound`'s six span tests are the first row: each of its three arms
 deleted alone reds exactly one test (straddle, bound, alignment), in 0.00 s.
 `abuse_page_straddle` is rows two and three; with the straddle arm deleted it
 reds twice, `fstat wrote 16 bytes past the end of the physical page it
@@ -516,7 +519,7 @@ each observing the memory rather than the verdict:
 The controls were narrowed *by size* rather than deleted outright, because
 `Stat` and `SchedInfo` are both 24 bytes and the pre-existing `fstat` row would
 otherwise red first and stop the run — the same reason the existing rows assert
-the canary before the verdict. `kernel-span`'s table grew the three new
+the canary before the verdict. The span table grew the three new
 `UserSafe` shapes (`SchedInfo` 24/8, `FramebufferInfo` 32/4, `ProcessStats`
 128/8), whose sizes were measured by compiling the declarations rather than
 counted by hand.

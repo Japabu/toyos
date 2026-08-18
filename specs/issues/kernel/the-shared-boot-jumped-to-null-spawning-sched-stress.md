@@ -45,7 +45,7 @@ took the recovery path for a null jump, wedged, and said nothing more — a
 machine that halts at least flushes.
 
 **Fixed**, on the branch that carries this rewrite:
-`kernel/src/arch/idt/fault_class.rs` is the classification now, `Ring` is
+`toyos-userbound/src/fault.rs` is the classification now, `Ring` is
 opaque and built from `cs` alone, and a Ring 0 frame whose `rip` is not a kernel
 address is the kernel's whatever `cr2` holds. A fourth sighting therefore
 prints `KERNEL PANIC: execute unmapped address at 0x0`, a kernel `rip`, a kernel
