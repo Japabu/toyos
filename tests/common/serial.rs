@@ -166,12 +166,12 @@ const REPORT_LINES: usize = 80;
 ///
 /// **The artefact, and a verdict that named the death used to throw it away.**
 /// On 2026-08-18 a `DOUBLE FAULT on CPU 1` took a twelve-wide suite's guest
-/// down; the double-fault handler wrote its whole report on IST1 — registers,
-/// the faulting frame, the page walk, the backtrace, 6688 bytes of it measured
-/// by the kernel itself in that very run — and the failing test's arm printed
-/// `result.stdout`, which is the *userland* half of the capture and carried two
-/// daemon lines. The report was in `result.serial` and nothing read it
-/// (`specs/issues/kernel/a-double-fault-on-cpu-1-under-a-wide-suite.md`).
+/// down; `double_fault_handler` writes its whole report on IST1 — the header,
+/// `cr2`, the `#DF` frame, a page walk, a kernel backtrace and a scan of the
+/// original stack for the frame that started the chain — and the failing test's
+/// arm printed `result.stdout`, which is the *userland* half of the capture and
+/// carried two daemon lines. The report was in `result.serial` and nothing read
+/// it (`specs/issues/kernel/a-double-fault-on-cpu-1-under-a-wide-suite.md`).
 ///
 /// The death line is where it starts, because everything before it is the run
 /// going normally and the point of a bound is that the report survives it.

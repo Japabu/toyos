@@ -165,12 +165,14 @@ What survives of that class was audited here, in code:
 
 ## Reproduction
 
-**Not reproduced.** Two full `cargo test` suites on this tree, 2026-08-18,
-265 of 265 green each: the first at `1.05x width`, the second at `1.36x` — which
-is *more* loaded than the `1.15x` the sighting was taken at, so the run that
-came closest to its conditions was clean. That is two samples against one
-observation and it establishes no rate whatsoever; it is recorded so nobody
-counts it as evidence in either direction.
+**Not reproduced.** Three full `cargo test` suites on this tree, 2026-08-18:
+265 of 265 at `1.05x width`, 265 of 265 at `1.36x`, and 264 of 265 at `1.12x`
+whose one red was `sched_check_build`'s pass-cost distribution — `KNOWN-RED`,
+`FIRES 6 of 10` on the dev-host-loaded instrument, and no `DOUBLE FAULT`
+anywhere in that run. Two of the three were at or above the `1.15x` the sighting
+was taken at, so the runs closest to its conditions were the clean ones. That is
+three samples against one observation and it establishes no rate whatsoever; it
+is recorded so nobody counts it as evidence in either direction.
 
 Nothing here is a repro recipe, and there is no cheap one to offer: a `#DF`
 reached only beside eleven other guests does not reproduce alone, and this file

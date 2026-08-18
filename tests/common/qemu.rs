@@ -438,8 +438,9 @@ pub const DIED_SAYING: &str = "--- what the kernel said as it died ---";
 /// Why a wait ended badly, carrying the guest's own account of it.
 ///
 /// **A newtype, because what this closes is an omission and an omission cannot
-/// be gated by review.** Every failure arm in this suite formats
-/// [`TestResult::error`]; fifty of them print no capture beside it, and on
+/// be gated by review.** Fifty-two sites in this suite format
+/// [`TestResult::error`] and thirty-six of them printed no capture beside it
+/// (counted on the tree, 2026-08-18), and on
 /// 2026-08-18 that is what a `DOUBLE FAULT on CPU 1` cost — the wait named the
 /// death in one sentence, the kernel's report sat in `TestResult::serial`, and
 /// the arm printed `stdout`
@@ -1827,7 +1828,7 @@ pub struct TestResult {
     /// A [`WaitVerdict`] and not a `String`, so that the sentence and the
     /// kernel's own account of its death cannot come apart — see that type.
     /// Every arm that formats this gets the report for free, and there are
-    /// fifty of them that were never going to be edited one at a time.
+    /// fifty-two of them that were never going to be edited one at a time.
     pub error: Option<WaitVerdict>,
     /// Whether the guest ever announced *this* test.
     ///
