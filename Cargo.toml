@@ -35,6 +35,7 @@ members = [
     "toyos-sched",
     "toyos-sched/loom",
     "toyos-sched/sim",
+    "toyos-untrusted",
     "toyos-wallclock",
     "toyos-xhci",
     "toyos-xhci/sim",
