@@ -1,3 +1,4 @@
+mod kbd_close;
 mod log_close;
 mod log_gate;
 
@@ -16,8 +17,16 @@ use toyos::syscap::SysCap;
 /// capability has nowhere else to run (`specs/capability-endowment-spec.md`
 /// §6.7a). They answer the same `===TEST_START===`/`===TEST_END===` protocol as
 /// a binary, so the host cannot tell the difference and does not have to.
-const BUILTINS: &[(&str, fn(Option<&SysCap>) -> i32)] =
-    &[("log-gate", log_gate::run), ("log-close", log_close::run)];
+///
+/// `kbd-close` is here for a second reason as well as that one: its subject is a
+/// pending poll on **this process's own stdin**, which is a `Console`. A spawned
+/// binary's stdin is a pipe (see the `Stdio::piped()` below), so the object the
+/// collision is about does not exist in one.
+const BUILTINS: &[(&str, fn(Option<&SysCap>) -> i32)] = &[
+    ("log-gate", log_gate::run),
+    ("log-close", log_close::run),
+    ("kbd-close", kbd_close::run),
+];
 
 fn main() {
     // **The test estate's authority, and the one place least authority is not
