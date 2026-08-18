@@ -8,8 +8,6 @@
 //! BSP writes before storing the pointer; a reader that saw the pointer without
 //! that would read whatever the heap held under a slot's sequence number, and
 //! accept it if it happened to equal the number it asked for.
-//!
-//! `specs/log-architecture-spec.md` §2.2.
 
 #[cfg(not(feature = "loom"))]
 use core::sync::atomic::{AtomicPtr, Ordering};

@@ -244,8 +244,7 @@ const LOG_PRODUCERS: &[&str] = &["log!(", "alert!(", "boot_phase!(", "log::emit(
 ///
 /// Both of these write raw bytes straight to the UART. They never enter the
 /// ring, so `panic_console`'s deleted scan could not see them either and
-/// `Level` was never their business
-/// (`specs/log-architecture-spec.md` §2.1).
+/// `Level` was never their business.
 /// Counted in occurrences of `!!!` and not in lines, because each of these
 /// writes one at each end of its message.
 const SENTINEL_ALLOWED: &[(&str, usize)] = &[
@@ -275,8 +274,7 @@ mod tests {
     /// put back into a message would be a marker marking nothing — a second,
     /// silent alert channel beside the typed one. The two `!!!` still in
     /// `kernel/` write raw bytes straight to the UART, never enter the ring, and
-    /// were never `has_alert`'s business either
-    /// (`specs/log-architecture-spec.md` §2.1).
+    /// were never `has_alert`'s business either.
     #[test]
     fn nmi_does_not_log() {
         let lines = kernel_lines();

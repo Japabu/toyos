@@ -6,7 +6,7 @@ opened: 2026-08-15
 
 # The kernel's console tag is composed by replacing the ABI formatter's first byte
 
-`specs/log-architecture-spec.md` §3.3 puts one formatter in `toyos-abi`, beside
+The log architecture puts one formatter in `toyos-abi`, beside
 the record, so the kernel's console sink, the panel, `logd` and any diagnostic
 tool produce byte-identical text from one implementation. `Display for
 LogRecord` renders

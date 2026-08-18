@@ -126,7 +126,7 @@ jobs:
       # under it; a model that has never failed proves nothing, and this is the
       # only obligation in the tree whose *negative* no guest test can express —
       # on x86 a build with either fence gone behaves identically, which is the
-      # whole reason it is a model. `specs/log-architecture-spec.md` §2.5.
+      # whole reason it is a model.
       #
       # **A non-zero exit is not the check, and until 2026-08-15 it was the
       # whole of it.** Anything that stops `cargo test` before a model runs — a

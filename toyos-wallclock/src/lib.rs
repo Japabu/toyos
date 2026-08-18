@@ -13,7 +13,7 @@
 //!
 //! # The zone recovery
 //!
-//! [`resolve`] is the whole of `specs/log-architecture-spec.md`'s wall-clock
+//! [`resolve`] is the whole of `/log`'s wall-clock
 //! question, and [`Recovery`] is its honest answer type. The syscall surface
 //! gives userland two readings of one instant — `SYS_CLOCK_EPOCH`, which is UTC
 //! seconds, and `SYS_CLOCK_REALTIME`, which is local `h:m:s` and no date — so
