@@ -203,7 +203,12 @@ pub const KVM: Baseline = Baseline {
 ///
 /// The sample is kept rather than dropped because it *is* that argument, and
 /// because the next person to propose a dev-host pass-cost gate should have to
-/// read it first.
+/// read it first. **It also understates the range**, which is the confirming
+/// run rather than a caveat: the same test under the same load at 4.09x boot
+/// width — harder than either arm — reported `p50 < 131072 ns, p90 < 524288 ns,
+/// max 22666022 ns` on a tree whose `sched_stress` passed and whose boot was
+/// clean. That is 2.6 times the budget at the 90th percentile and a hundred
+/// times it at the maximum, from nothing but fourteen shell loops.
 pub const TCG: Baseline = Baseline {
     accelerator: "cross-arch TCG, arm64 dev host",
     recorded: "12 quiet + 12 loaded CPU-runs, 2026-08-18, one interleaved session; the load is \
