@@ -6,8 +6,8 @@ opened: 2026-08-14
 
 # A record's one formatter drops `tid=0`, and the first thread of every process is `Tid(0)`
 
-`toyos_abi::log::LogRecord`'s `Display` — the one formatter §3.3 of
-`specs/log-architecture-spec.md` says every consumer renders through — writes
+`toyos_abi::log::LogRecord`'s `Display` — the one formatter every consumer
+of a record renders through — writes
 the thread only when it is non-zero:
 
 ```rust

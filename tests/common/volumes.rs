@@ -459,9 +459,9 @@ fn volume_lines(log: &str) -> String {
 ///
 /// **What it is evidence for changed with the writer.** It used to prove the
 /// idle loop's sink; it now proves a userland process holding `logread` reads a
-/// cursor, renders, writes, `fsync`s and keeps up — which is the whole of
-/// `specs/log-architecture-spec.md` §5 observed from outside the machine.
-/// §9.3's positive log-content assertion is this, and without it the headline
+/// cursor, renders, writes, `fsync`s and keeps up, observed from outside the
+/// machine.
+/// The positive log-content assertion is this, and without it the headline
 /// number of that section is unfalsifiable: the cheapest way to make an
 /// idle-loop I/O measurement look good is for the log to stop being written.
 ///

@@ -30,8 +30,8 @@ use std::sync::Arc;
 /// removal exactly when the kernel is printing that client's exit.
 ///
 /// **Fixed for everyone at the kernel since L5**: a `ConsoleObject` per holder
-/// buffers a line and emits it whole under one `BackendGuard`
-/// (`specs/log-architecture-spec.md` §4.4), so this macro is about the *count*
+/// buffers a line and emits it whole under one `BackendGuard`, so this macro
+/// is about the *count*
 /// of syscalls now rather than about atomicity.
 macro_rules! say {
     ($($arg:tt)*) => {{

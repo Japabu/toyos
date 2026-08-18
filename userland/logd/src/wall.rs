@@ -4,8 +4,8 @@
 //! # The problem
 //!
 //! `/log`'s file names are local timestamps and have been since the kernel
-//! wrote them (`specs/log-architecture-spec.md` §5.5: identical naming, so a
-//! stick from before this change and one from after sort together). The kernel
+//! wrote them — identical naming, so a
+//! stick from before this change and one from after sort together. The kernel
 //! had `clock::local_secs()`. Userland has two calls and neither is it:
 //!
 //! - `clock_epoch` — seconds since the Unix epoch, which is **UTC** by

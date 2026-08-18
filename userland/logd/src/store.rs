@@ -2,7 +2,7 @@
 //! retention.
 //!
 //! Moved out of `kernel/src/log_file.rs` unchanged in behaviour
-//! (`specs/log-architecture-spec.md` §5.5) — the constants keep their values
+//! — the constants keep their values
 //! and their reasons, the names keep their shape, and [`classify`] keeps being
 //! strict. What changed is who runs it: a userland process with an ordinary
 //! `File`, so every byte goes through `SYS_WRITE` and `SYS_FSYNC` exactly as

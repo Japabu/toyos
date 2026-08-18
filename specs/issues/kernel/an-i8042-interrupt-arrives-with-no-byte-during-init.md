@@ -62,7 +62,7 @@ and the byte ring this branch deleted had never held that lock at all. So a
 guest doing ordinary console output could mask interrupts for as long as it
 liked, on the same machine whose i8042 was being brought up, and that window was
 live for every measurement in the table's third and fourth rows.
-`specs/log-architecture-spec.md` §8.1 carries the fix; the drain's eight-record
+`kernel/src/drivers/serial.rs`'s `write_console` carries the fix; the drain's eight-record
 bound and this one are the two halves of what `kernel/CLAUDE.md`'s
 `BackendGuard` caveat asks for.
 

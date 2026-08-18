@@ -403,8 +403,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // everything above 200 characters in the measured corpus is this line, 18
     // of 12,497 — and unlike a demangled symbol it is a producer the kernel can
     // split. So it is split, grouped by the question each field answers, rather
-    // than truncated with a count of what was lost
-    // (`specs/log-architecture-spec.md` §2.1).
+    // than truncated with a count of what was lost.
     log!(
         "boot: memory map {:#x}+{:#x}, kernel {:#x}+{:#x}, stack {:#x}+{:#x}",
         kernel_args.memory_map_addr, kernel_args.memory_map_size,
@@ -702,7 +701,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // below and the BSP reaches no pass before `enter_idle_loop`. A `klogd`
     // spawned earlier would sit in a run queue through phases 5, 6 and 7 —
     // which is the window a machine with no console wedges in — while the boot
-    // believed it had a drainer. `specs/log-architecture-spec.md` §4.2.
+    // believed it had a drainer.
     log::console::start();
 
     smp::set_ready();

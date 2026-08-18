@@ -17,7 +17,7 @@ loom = []
 # `kernel-loom/tests/log_wake.rs` must red when it does. A model that has never
 # failed proves nothing, and no guest test can stand in for it — on x86 a build
 # with either fence removed behaves identically, which is the whole reason the
-# obligation is a model. `specs/log-architecture-spec.md` §2.5's W3.
+# obligation is a model.
 wake-fence-off = []
 # **Every actuator, and which one is armed comes from the boot parameter.**
 # `kernel/src/actuator.rs` declares all 47 with the claim each rests on; this

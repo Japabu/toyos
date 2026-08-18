@@ -194,7 +194,7 @@ impl ZeroHandles for DeviceClaim {
 /// Not a [`DeviceClaim`] — a claim's whole content is exclusivity — and not a
 /// file: it has no path, no cursor and no backing. What it *is* is the line
 /// buffer in front of one backend, which is where console line atomicity comes
-/// from (`specs/log-architecture-spec.md` §4.4).
+/// from.
 ///
 /// **One backend, one object per holder, and the second half is load-bearing.**
 /// A buffer on one object every process shares is one buffer two processes

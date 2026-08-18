@@ -1,8 +1,8 @@
 //! `/bin/logd` — the machine's log, written to a file by a process that can be
 //! killed without taking the kernel with it.
 //!
-//! `specs/log-architecture-spec.md` §5 and §6 are the design. What this program
-//! replaces is `kernel/src/log_file.rs`: a kernel module that appended the log
+//! What this program replaces is the kernel's own file sink, a module that
+//! appended the log
 //! ring to a FAT volume **from the idle loop**, which is why an idle CPU on this
 //! machine could be found four spinlocks deep inside a USB transfer with a
 //! userland `println!` behind it. The kernel keeps the record ring and the

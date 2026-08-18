@@ -8411,7 +8411,7 @@ fn run_machine_test(
             // so a kernel task reads whatever user thread last ran on *that*
             // CPU left behind, and recovers or halts by accident of work
             // stealing. The row in `sched::kthread` is what replaces the
-            // accident with an answer. `specs/log-architecture-spec.md` §4.3.
+            // accident with an answer.
             let qemu = QemuInstance::boot_with_options(
                 test_config,
                 c_bins,

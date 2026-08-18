@@ -26,19 +26,19 @@ entry names a measurement, not a topic, and names what closes it.
 | # | measurement | closes |
 |---|---|---|
 | 1 | one boot with `no-ap-control-regs` armed against one without, same image, same session; record the delta | `specs/issues/kernel/ap-control-registers-inherit-init.md` |
-| 2 | transcribe `serial: 16550 loopback read 0xNN (…)` from the metal boot, and the boot's own `Boot: complete (Nms)` beside the last metal-sim reading of the same image | `specs/log-architecture-spec.md` §9.6's *"`Drain::Inline`'s cost on a real UART"* — see below, this closes the T14 half only |
+| 2 | transcribe `serial: 16550 loopback read 0xNN (…)` from the metal boot, and the boot's own `Boot: complete (Nms)` beside the last metal-sim reading of the same image | the cost of `Drain::Inline` on a real UART — see below, this closes the T14 half only |
 
 **On item 2, because it is the half of an obligation rather than the whole of
-it.** §9.6 asks what `Drain::Inline` costs when every boot record is written
-synchronously to a 115200-baud port; QEMU answers instantly and cannot price it,
+it.** What is owed is what `Drain::Inline` costs when every boot record is
+written synchronously to a 115200-baud port; QEMU answers instantly and cannot price it,
 which is why the row came here. **The T14 cannot price it either** — it has no
 SuperIO, so the loopback probe reads `0xFF`, `has_console()` is false and the
 mode is a branch not taken. What the metal session *can* close is exactly that:
-the probe byte is the evidence that the T14 pays nothing, which is the claim
-§4.2 makes about this machine and the one a flashed image depends on. The
-115200-baud arm needs a machine with a real port and stays open until there is
-one; the arithmetic §4.2 states for it (~40 KB at ~87 µs/byte, so seconds) is a
-prediction and says so.
+the probe byte is the evidence that the T14 pays nothing, which is what
+`kernel/src/log/console.rs` claims about this machine and what a flashed image
+depends on. The 115200-baud arm needs a machine with a real port and stays open
+until there is one; the arithmetic for it — ~40 KB at ~87 µs/byte, so seconds —
+is a prediction and says so.
 
 ## Pre-flash checklist (verified 2026-08-13 — re-verify before acting, this ages)
 

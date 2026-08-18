@@ -386,7 +386,7 @@ actuators! {
     /// one reader and the ring begins to drop. Nothing is faked: the records go
     /// through the shipped `emit`, the shipped reservation and the shipped
     /// publication, and only their number and their text belong to the test.
-    /// See `kernel/src/log/storm.rs`; `specs/log-architecture-spec.md` §9.1.
+    /// See `kernel/src/log/storm.rs`.
     log_storm = "log-storm";
 
     /// Remove §2.3a's IF/TF bracket from shard selection through final
@@ -414,7 +414,7 @@ actuators! {
     /// across the whole publication and lands the instant the guard drops, so
     /// the burst laps the shard and the outer record goes by the ring's own
     /// drop-oldest policy. Without it the same IPI lands inside the copy.
-    /// See `kernel/src/log/nested.rs`; `specs/log-architecture-spec.md` §9.2.
+    /// See `kernel/src/log/nested.rs`.
     log_nested_emit = "log-nested-emit";
 
     /// Turn the reservation's one unlocked `xadd` into a load, an open
@@ -442,7 +442,6 @@ actuators! {
     /// poll. It cannot be staged from the host — which process closes which
     /// handle is decided inside the guest, and the two processes involved need
     /// not know about each other at all, which is the whole shape of the bug.
-    /// `specs/log-architecture-spec.md` §3.2.
     log_close_cancels_any_syscap = "log-close-cancels-any-syscap";
 
     /// Bypass `ConsoleObject`'s line buffer: every userland `write` reaches the
@@ -456,7 +455,7 @@ actuators! {
     /// stimulus can make the kernel forget a buffer it holds. What it produces
     /// is a line one process began and another finished —
     /// `console_line_atomicity` counts them and `Serial::interleaved` names the
-    /// kernel-into-userland half. `specs/log-architecture-spec.md` §4.4, §9.4.
+    /// kernel-into-userland half.
     console_unbuffered = "console-unbuffered";
 
     /// Panic inside `klogd`, the kernel thread, on its first instruction.
@@ -468,7 +467,6 @@ actuators! {
     /// `sched::kthread`'s row the outcome is decided by which CPU work stealing
     /// last put a user thread on, so no host-side stimulus could exist even in
     /// principle — there is no process to kill and no syscall to make.
-    /// `specs/log-architecture-spec.md` §4.3.
     klogd_panic = "klogd-panic";
 
     /// Stop the boot dead in phase 3, with interrupts off, before anything that
@@ -482,7 +480,6 @@ actuators! {
     /// nothing whatsoever, including everything it had logged
     /// (`specs/issues/diagnostics/pre-idle-wedge-says-nothing.md`), because the
     /// only two drains in the machine were the timer tick and the idle loop.
-    /// `specs/log-architecture-spec.md` §4.1.
     pre_idle_wedge = "pre-idle-wedge";
 
     /// Fail every re-read of a page of a file on either FAT mount through
@@ -494,8 +491,8 @@ actuators! {
     /// What it drives is the partial write an appender makes into an evicted
     /// page — `log_file`'s until L6 and `/bin/logd`'s since, which is the same
     /// path through the page cache and a *more* reachable one, because a
-    /// userland writer's tail page is ordinary evictable cache
-    /// (`specs/log-architecture-spec.md` §8.2). See `fat32_adapter.rs`'s
+    /// userland writer's tail page is ordinary evictable cache.
+    /// See `fat32_adapter.rs`'s
     /// `fat_backing_reads`.
     fat_backing_read_fails = "fat-backing-read-fails";
 

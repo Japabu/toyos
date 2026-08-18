@@ -711,7 +711,7 @@ pub const KNOWN_RED: &[Red] = &[
                rather than chance — soundd prints a client's removal exactly while the kernel \
                prints that client's exit",
         evidence: "probe-green run 31282019974 rep 10, and run 31271983043 on `main`",
-        source: "specs/log-architecture-spec.md §4.4",
+        source: "src/redlist.rs",
         measured: "2026-08-09",
     },
     // ---------------------------------------------------------------------
@@ -1022,7 +1022,7 @@ pub const KNOWN_RED: &[Red] = &[
                it is not the audio path and not load in any way a re-run answers; it is which two \
                writers happen to collide",
         evidence: "landing-1786130703-71774.log, a documentation-only branch",
-        source: "specs/log-architecture-spec.md §4.4",
+        source: "src/redlist.rs",
         measured: "2026-08-07",
     },
     Red {
@@ -1035,7 +1035,7 @@ pub const KNOWN_RED: &[Red] = &[
         ),
         what: "green 3 of 3 alone on a quiet host, against the splice red in the same session",
         evidence: "the same session as the splice above",
-        source: "specs/log-architecture-spec.md §4.4",
+        source: "src/redlist.rs",
         measured: "2026-08-07",
     },
     Red {

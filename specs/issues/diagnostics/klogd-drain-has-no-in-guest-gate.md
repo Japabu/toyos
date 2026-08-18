@@ -6,8 +6,8 @@ opened: 2026-08-14
 
 # `klogd`'s drain has no in-guest gate, and Ctrl+Alt+D cannot be one on a headless guest
 
-`specs/log-architecture-spec.md` L3 gives the machine a kernel thread, `klogd`,
-made runnable at the commit of the record it will drain (§2.6a). The *ordering*
+The log architecture gives the machine a kernel thread, `klogd`,
+made runnable at the commit of the record it will drain. The *ordering*
 of that wake is modelled — `kernel-loom/tests/log_wake.rs`, with its
 `wake-fence-off` negative control — and the thread's *hosting* is gated by
 `klogd_hosted`. **What no test asserts is that the wake fires in a guest**: that
