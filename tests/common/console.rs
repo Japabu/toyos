@@ -669,6 +669,22 @@ pub fn keyboard_claim_close_spares_stdin(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
+    kbd_close_probe(test_config, c_bins, rust_bins, &[])
+}
+
+/// The gate's body, parameterised on the boot's actuators so its negative
+/// control is one argument rather than a second copy of it.
+///
+/// `keyboard-close-cancels-every-console` restores what the tree had — every
+/// object naming `Source::Keyboard` ending it on close — and this must red on a
+/// boot carrying it. The measurement is in the commit that took the actuator's
+/// name.
+fn kbd_close_probe(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+    params: &'static [&'static str],
+) -> Result<(), String> {
     /// What the guest prints once both claim arms have run.
     const READY: &str = "===KBD_CLOSE_READY===";
 
@@ -679,6 +695,7 @@ pub fn keyboard_claim_close_spares_stdin(
         BootOptions {
             profile: super::qemu::Profile::Metal,
             qmp: true,
+            kernel_params: params,
             ..Default::default()
         },
     );

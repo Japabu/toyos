@@ -194,6 +194,7 @@ iommu_discovery 17594
 iommu_empty_domain 5668
 kernel_heartbeat 6794
 kernel_log_file 43056
+keyboard_claim_close_spares_stdin 18446744073709551615
 kill_while_blocked 51
 klogd_hosted 11805
 late_storage_connect 6229
