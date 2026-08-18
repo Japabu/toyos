@@ -889,19 +889,17 @@ pub const KNOWN_RED: &[Red] = &[
         standing: Standing::Retired(
             "the assert is gone. Elapsed time across a pass is wall clock and a guest's wall \
              clock advances while the hypervisor has its vCPU, so the quantity carried a term \
-             the kernel neither observes nor controls; `toyos-sched` now records the \
-             distribution and `tests/common/passcost.rs` gates it at `MAX_PASS_NS` on the 90th \
-             percentile. **What retires this row is the panic, which cannot happen again.** \
-             The same 91-run record says the replacement would have been green across it: \
-             invariant P asserted *every* pass under 200 000 ns and was green on 89 of the 91, \
-             which is *zero* crossings in each, so their 90th percentiles were far under the \
-             budget. **That is a rate over the period those runs sampled and not a bound**, \
-             and the other two settle nothing about counts — the machine halted at the first \
-             crossing and could never have shown a second. What is still open about the \
-             fraction is \
-             `specs/issues/kernel/the-p90-pass-cost-gate-rests-on-an-observed-steal-rate.md`, \
-             and a red under the new gate is a fresh measurement rather than this one \
-             returning",
+             the kernel neither observes nor controls; `toyos-sched` records the distribution \
+             and `tests/common/passcost.rs` judges it. **What retires this row is the panic, \
+             which cannot happen again.** The replacement's first shape gated the 90th \
+             percentile at `MAX_PASS_NS` on the argument that a busy host moves the maximum \
+             and not the mass — an observed rate rather than a bound, and **measured false on \
+             2026-08-18**: host load moves every order statistic, median as much as tail. So \
+             the line is now the accelerator's own recorded sample, and for this instrument \
+             that sample is sixteen CI runs and 7 612 passes with **zero over 200 000 ns**, \
+             largest single pass 173 906 ns, 90th percentile 32 768 ns. The gate on this \
+             instrument is therefore *tighter* than the number this row's assert stood over, \
+             and a red under it is a fresh measurement rather than this one returning",
         ),
         what: "`invariant P: a scheduler pass took 200569 ns, budget 200000 ns` — the assert \
                firing on native x86-64 under KVM, in `timer_handler` -> `driver::pass` -> \
@@ -960,7 +958,22 @@ pub const KNOWN_RED: &[Red] = &[
         test: "sched_check_build",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(6, 10),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the dev host takes no verdict on pass cost any more, so this red cannot be \
+             produced. What retired it is the experiment this row's own last paragraph asked \
+             for: 2026-08-18, six repetitions an arm, quiet and loaded interleaved in one \
+             session, twelve CPU-runs each. **0 of 12 quiet CPU-runs over the budget at the \
+             90th percentile against 9 of 12 loaded; 6 of 6 runs green against 6 of 6 red**, \
+             with the arms separated by boot width 1.74x-2.34x against 2.66x-2.78x and \
+             nothing else. The whole distribution translates one power-of-two bucket under \
+             host load — median 65 536 -> 131 072 ns, p90 131 072 -> 262 144 ns — and 200 000 \
+             sits between the two, which is the entirety of why the verdict flipped. So \
+             `tests/common/passcost.rs` records that sample and, because it spans four buckets \
+             on one unchanged tree, has cross-arch TCG report its distribution and judge no \
+             magnitude at all. `sched_check_build` still gates the clean boot, the three \
+             check-build asserts and `sched_stress` on this instrument; only the cost half is \
+             now CI's alone",
+        ),
         what: "`this distribution has mass over the budget: nine passes in ten must be provably \
                under 200000 ns and it cannot show that` — the harness's pass-cost gate, which \
                replaced the panic, refusing a distribution the *host* inflated. The guest is \
@@ -973,14 +986,10 @@ pub const KNOWN_RED: &[Red] = &[
                green side**: 1974235 ns and 2543303 ns in the serial tail of the run that ended \
                263 of 263 green — nine and twelve times the budget, refused by nothing, where \
                the assert this replaced would have halted the machine on any one of them. \
-               **Reading a red under this name in one line: look at the median in the same \
-               failure text.** Every red measured carried `p50 < 131072 ns` against `p50 < \
-               16384` or `< 32768 ns` on every green, because contention moves the whole \
-               distribution; a p90 red whose *median* sits with the green baseline is the shape \
-               host load has not been observed to produce, and is the one to bisect. That is a \
-               heuristic with its evidence attached and not a discriminator — the verdict still \
-               needs the isolated re-run red **and** a same-session A/B against `main` green, \
-               which is the standing law for the `ALONE: GREEN` class",
+               Every red measured carried `p50 < 131072 ns` against `p50 < 16384` or `< 32768 \
+               ns` on every green — the median moving with the 90th percentile, which is the \
+               observation the controlled experiment then confirmed and which is why no line \
+               over this distribution survives on this instrument",
         evidence: "`cargo test` on `wt/toyos-invariantp`, 2026-08-17, ten CPU-runs over three \
                    sessions. Every one of the six reds was taken beside other guests: four \
                    under another agent's suite on the shared host (`fastest boot 2330 ms \
@@ -992,8 +1001,9 @@ pub const KNOWN_RED: &[Red] = &[
                    host boots no KVM guest. **This row is also the counter-evidence to the \
                    gate's own warrant**: 14 of 134 and 19 of 140 passes over budget is 10–13 %, \
                    which is correlated inflation with mass in it rather than the handful of \
-                   samples the gate's argument assumes a busy machine produces \
-                   (`specs/issues/kernel/the-p90-pass-cost-gate-rests-on-an-observed-steal-rate.md`)",
+                   samples the gate's argument assumed a busy machine produces. The controlled \
+                   experiment that turned that counter-evidence into the retirement above is in \
+                   `tests/common/passcost.rs`",
         source: "specs/issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
         measured: "2026-08-17",
     },

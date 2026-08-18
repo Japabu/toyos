@@ -186,11 +186,12 @@ load/stores. `SchedPass::finish` records into it where it used to assert.
 `kernel/src/sched/driver.rs` publishes one line per CPU at most every 200 ms of
 guest time, and `tests/common/passcost.rs` reads and judges it.
 
-**The judgement is one claim: nine passes in ten are provably under
-`MAX_PASS_NS`.** Every term of it is derived rather than picked:
+**The judgement was one claim: nine passes in ten are provably under
+`MAX_PASS_NS`.** Every term of it was derived rather than picked — and the
+magnitude has since been replaced, for the reason two paragraphs down:
 
-- The magnitude is `MAX_PASS_NS` unchanged. The bound the panic stood over is
-  the bound the gate stands over.
+- The magnitude was `MAX_PASS_NS` unchanged. The bound the panic stood over was
+  the bound the gate stood over.
 - The fraction is not *all* passes, because "not decided" above cannot be
   decided: there is no magnitude a hypervisor cannot produce by taking a vCPU
   away, so no bound over the maximum is a statement about the scheduler. That is
@@ -202,15 +203,26 @@ guest time, and `tests/common/passcost.rs` reads and judges it.
   pass is a block or a wake and not a tick. A 90th percentile over 150 samples
   has fifteen above it; a 99th has one and a half.
 
-**And the fraction is where this file's reasoning is weakest, which is its own
-open entry.** "Nine in ten" rests on the claim that a busy host reaches a handful
-of passes rather than a tenth of them — an *observed rate* on this
-infrastructure, not a bound, and one the two red runs above cannot support
-because the machine halted at the first crossing and could never have shown a
-second. The counts are censored where the magnitudes were.
-`specs/issues/kernel/the-p90-pass-cost-gate-rests-on-an-observed-steal-rate.md`
-carries that, with the measurement that makes it concrete rather than
-speculative and the two instruments that would settle it.
+**The fraction was where this file's reasoning was weakest, and it has since
+been measured — with the unfavourable answer.** "Nine in ten" rested on the claim
+that a busy host reaches a handful of passes rather than a tenth of them: an
+*observed rate* on this infrastructure, not a bound, and one the two red runs
+above could not support, because the machine halted at the first crossing and
+could never have shown a second — the counts censored where the magnitudes were.
+The controlled experiment ran on 2026-08-18, quiet and loaded arms interleaved in
+one session, twelve CPU-runs each, and **host load moves every order statistic,
+the median as much as the tail**: 0 of 12 quiet CPU-runs over the budget at the
+90th percentile against 9 of 12 loaded, 6 of 6 runs green against 6 of 6 red. No
+fraction chosen instead of nine-in-ten would have survived.
+
+So the *magnitude* moved instead of the fraction. A run is judged against what
+its own accelerator has been recorded producing, and where a recorded sample
+supports no line at all — cross-arch TCG, whose sample spans four buckets on one
+unchanged tree — the distribution is reported and no verdict is taken.
+`tests/common/passcost.rs` carries the experiment, both recorded samples and the
+reasoning. Reading KVM's paravirtual steal-time MSR, the other instrument that
+would have settled it, is closed by owner ruling: a hypervisor-specific facility
+cannot be the basis of a gate in a tree whose north star is metal.
 
 **Why the gate is green where the assert was, on the same evidence that opened
 this file.** Invariant P asserted every pass under 200 000 ns and was green on 89
