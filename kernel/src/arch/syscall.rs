@@ -974,18 +974,31 @@ fn sys_device_reg(handle: RawHandle, offset: u64, width: u64, value: Option<u64>
     let Some(width) = toyos_abi::syscall::RegWidth::from_raw(width) else {
         return SyscallError::InvalidArgument.to_u64();
     };
+    // **The table's own rule, and not one invented here.** This answered
+    // `NotFound` for every way the handle could fail to resolve, so a process
+    // naming a slot it never held — or one it had closed — was told its device
+    // was missing, where `SYS_DEVICE_CLAIM` beside it ends the caller for the
+    // same mistake (`specs/capability-endowment-spec.md` §1.2). `get` is asked
+    // for the type, so a pipe presented here is the `WrongType` that it is.
     let target = process::with_fd_owner_data(|data| {
-        match data.handles.get_ref(handle, Rights::NONE) {
-            Ok(KObjectRef::Device(d)) => match d.class() {
+        data.handles
+            .get::<crate::object::device::DeviceClaim>(handle, Rights::NONE)
+            .map(|claim| match claim.class() {
                 device::DeviceType::HdaAudio => Some(RegTarget::Hda),
                 device::DeviceType::VirtioSound => Some(RegTarget::VirtioSound),
                 _ => None,
-            },
-            _ => None,
-        }
+            })
     });
+    // Nothing held: `with_fd_owner_data` has given the guard up, which is what
+    // `refuse` requires of the three kinds that do not come back from it.
+    let target = match target {
+        Ok(t) => t,
+        Err(e) => return e.refuse(),
+    };
+    // A claim of a class with no register window. A different fact from "no
+    // such device", and the one word left here that is not a lie.
     let Some(target) = target else {
-        return SyscallError::NotFound.to_u64();
+        return SyscallError::NotSupported.to_u64();
     };
     match value {
         None => {

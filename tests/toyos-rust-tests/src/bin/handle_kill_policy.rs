@@ -84,6 +84,11 @@ const FATAL: &[(&str, &str)] = &[
     // `io_uring_enter` on the submitting thread.
     ("poll-bad-handle", "a POLL_ADD on a slot this process never held"),
     ("poll-stale", "a POLL_ADD on a slot this process closed"),
+    // The third site the same audit found. It answered `NotFound` for every
+    // way the handle could fail, so "you named a handle you do not hold" and
+    // "this machine has no such device" were one word — and the second is a
+    // fact a driver acts on.
+    ("device-reg-bad-handle", "a device register read on a slot this process never held"),
 ];
 
 fn main() {
@@ -336,6 +341,16 @@ fn fatal_role(role: &str) -> ! {
             let mut seen = 0usize;
             poller.wait(1, POLL_ANSWER.as_nanos() as u64, |_| seen += 1);
             panic!("a POLL_ADD on a handle this process closed left it running ({seen} CQEs)");
+        }
+        // No capability needed: the handle never resolves, so the call is
+        // refused before anything asks what device it names.
+        "device-reg-bad-handle" => {
+            let read = syscall::device_reg_read(
+                RawHandle(UNHELD_SLOT),
+                0,
+                toyos_abi::syscall::RegWidth::U32,
+            );
+            panic!("a device register read on a slot this process never held answered {read:?}");
         }
         // The kill is the process's, not the thread's: a handle fault raised on
         // any thread ends every thread. Asserted from the exit code, which the
