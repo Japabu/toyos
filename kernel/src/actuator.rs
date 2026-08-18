@@ -127,6 +127,17 @@ actuators! {
     /// watch a log cadence is the wrong trade. Only the period moves.
     i8042_fast_health = "i8042-fast-health";
 
+    /// Shorten the idle loop's own health/PMM snapshot cadence
+    /// (`scheduler.rs`'s `snapshot_interval_ns`) from 10 s to 200 ms. The line
+    /// carries a per-CPU idle-trip counter that is not itself rate-limited, but
+    /// the *print* is — so telling a spinning CPU from a halting one needs at
+    /// least two prints to compare, and no guest test program this suite runs
+    /// lives past the shipped 10 s once, let alone twice. Only the period
+    /// moves: the counter, the fields and the halt/spin behaviour underneath
+    /// are the shipped ones. See `i8042_quarantine`'s idle-trip check,
+    /// `specs/issues/kernel/i8042-quarantine-health-line-count-is-vacuous.md`.
+    sched_fast_health = "sched-fast-health";
+
     /// Script the input core directly at end of boot. QEMU activates one input
     /// handler per device class, so two keyboards or two pointers can never both
     /// be live in a guest — the merge has no end-to-end test and this is its
