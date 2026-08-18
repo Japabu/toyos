@@ -458,6 +458,9 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // Every verdict is a line of text or a device property, and no clock is in
     // any of them.
     ("virtio_net_no_msix", Sched::Parallel, Tier::Fast),
+    // One boot, and its verdict is a line the kernel printed before any device
+    // was brought up. No clock and no device in it.
+    ("virtio_used_ring", Sched::Parallel, Tier::Fast),
     ("xhci_many_devices", Sched::Parallel, Tier::Fast),
     // Its whole assertion is that a keystroke injected from the host crossed a
     // USB keyboard on the *second* controller, and `input_events_run` sends
@@ -9070,6 +9073,60 @@ fn run_machine_test(
             eprintln!("  [i8042] {}", quiet.trim());
             eprintln!("  [i8042] {}", line.trim());
             eprintln!("  [i8042] {health} idle-health lines — the CPU still halts");
+            Ok(())
+        }
+        "virtio_used_ring" => {
+            // Both fields of a virtqueue used-ring element are written by the
+            // device, and on virtio-sound's control and event queues the ring
+            // is inside a page a userland process maps writable. Every virtio
+            // device QEMU implements writes correct elements and no device or
+            // machine property makes one report a head descriptor it was never
+            // given, so a boot certifies the correct case and nothing else.
+            // The driver therefore runs the shipped `poll_used` over eleven
+            // crafted elements at init under this parameter — a real queue on a
+            // real DMA page, with the kernel writing the ring where the device
+            // would.
+            let qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    kernel_params: &["virtio-used-selftest"],
+                    ..Default::default()
+                },
+            );
+            let log = qemu.boot_log().to_string();
+            if let Some(bad) = log.lines().find(|l| l.contains("used-ring selftest FAILED")) {
+                return Err(format!("{bad}\n{log}"));
+            }
+            let Some(verdict) = log.lines().find(|l| l.contains("used-ring selftest")) else {
+                return Err(format!("the parse's self-test never ran:\n{log}"));
+            };
+            // `11/11`, not "no failures": a self-test that ran zero cases would
+            // satisfy the absence of a FAILED line just as well.
+            if !verdict.contains("11/11") {
+                return Err(format!("not every used-ring element was parsed as required: {verdict}"));
+            }
+            // Once for the machine. It touches no device, so a run per virtio
+            // driver would be four verdicts about the same eleven elements.
+            let ran = log.matches("used-ring selftest").count();
+            if ran != 1 {
+                return Err(format!("the self-test ran {ran} times, wanted once\n{log}"));
+            }
+            // And the legal direction, on the same boot and not by assertion:
+            // this log arrived over virtio-console, whose TX path is
+            // `submit_and_wait` around the same `poll_used`. A parse that
+            // refused a correct element would have produced no capture to
+            // search — but virtio-net says so in its own words, so that the
+            // legal case is *named* rather than inferred from the test running
+            // at all.
+            if !log.contains("VirtIO net:") {
+                return Err(format!("the NIC did not come up on this boot\n{log}"));
+            }
+            if let Some(bad) = log.lines().find(|l| l.contains("refused") && l.contains("RX used-ring")) {
+                return Err(format!("a correct completion was refused on the ordinary path: {bad}"));
+            }
+            eprintln!("  [virtio] {}", verdict.trim());
             Ok(())
         }
         "xhci_descriptor_walk" => {

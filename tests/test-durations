@@ -295,6 +295,7 @@ usb_storage_write_error 4954
 usb_transport_break 5382
 va_exhaustion 4751
 virtio_net_no_msix 1976
+virtio_used_ring 18446744073709551615
 wall_clock_file 5594
 wall_clock_now 23
 wall_clock_refusals 103987
