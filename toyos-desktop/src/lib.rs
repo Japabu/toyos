@@ -45,4 +45,4 @@ pub use plan::{compose, content_blit, Blit, Layer};
 pub use rect::{Point, Rect};
 pub use stack::Stack;
 pub use taskbar::{Taskbar, MAX_STATUS_CHARS, STATUS_MARGIN};
-pub use window::{Window, WindowMode};
+pub use window::{Window, WindowId, WindowMode};

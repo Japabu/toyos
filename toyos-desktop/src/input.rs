@@ -4,7 +4,7 @@ use crate::hit::{hit_test, Hit};
 use crate::layout::{set_mode, Desk};
 use crate::rect::{Point, Rect};
 use crate::stack::Stack;
-use crate::window::WindowMode;
+use crate::window::{WindowId, WindowMode};
 
 /// HID usage codes for the keys the desktop keeps for itself.
 ///
@@ -181,6 +181,14 @@ pub const DRAG_THRESHOLD: i32 = 5;
 const SNAP_MARGIN: i32 = 3;
 
 /// What the pointer is doing to a window between a press and its release.
+///
+/// Named by [`WindowId`] and not by position: a drag or a resize outlives
+/// many event-loop passes, and a client can close — its own window, or
+/// nothing to do with it — on any pass in between. A position taken when the
+/// grab started is stale the moment that happens; an id is re-resolved
+/// against the stack on every use instead (`Stack::position`), so a window
+/// that is gone is *found* to be gone rather than silently standing in for
+/// whatever slid into its old slot.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Grab {
     #[default]
@@ -192,9 +200,9 @@ pub enum Grab {
     /// window has nothing to defer and goes straight to
     /// [`Dragging`](Self::Dragging), which is why this carries no "was it
     /// maximized" flag: it exists only in the case where the answer is yes.
-    Pending { window: usize, start: Point },
-    Dragging { window: usize },
-    Resizing { window: usize },
+    Pending { window: WindowId, start: Point },
+    Dragging { window: WindowId },
+    Resizing { window: WindowId },
 }
 
 /// What one pointer sample did while the button was held.
@@ -225,7 +233,7 @@ pub enum Released {
 
 impl Grab {
     /// What a press on a window's title bar starts.
-    pub fn on_title(window: usize, mode: WindowMode, at: Point) -> Self {
+    pub fn on_title(window: WindowId, mode: WindowMode, at: Point) -> Self {
         if mode == WindowMode::Normal {
             Self::Dragging { window }
         } else {
@@ -233,16 +241,12 @@ impl Grab {
         }
     }
 
-    pub fn window(&self) -> Option<usize> {
-        match *self {
-            Self::None => None,
-            Self::Pending { window, .. } | Self::Dragging { window } | Self::Resizing { window } => {
-                Some(window)
-            }
-        }
-    }
-
     /// Advance the grab by one pointer sample with the button still down.
+    ///
+    /// A name that no longer resolves — the window closed on some earlier
+    /// pass — ends the grab and reports the sample as free, rather than
+    /// indexing a position that may not exist, or may now belong to a window
+    /// that never asked to move.
     pub fn hold<C>(
         &mut self,
         desk: &Desk,
@@ -253,42 +257,64 @@ impl Grab {
         match *self {
             Self::None => Held::Free,
             Self::Pending { window, start } => {
+                let Some(idx) = stack.position(window) else {
+                    *self = Self::None;
+                    return Held::Free;
+                };
                 if (at.x - start.x).abs() <= DRAG_THRESHOLD
                     && (at.y - start.y).abs() <= DRAG_THRESHOLD
                 {
                     return Held::Idle;
                 }
-                let old_frame_w = stack[window].frame(&desk.chrome).w();
-                let restored = set_mode(desk, stack, window, WindowMode::Normal);
-                stack[window].content =
+                let old_frame_w = stack[idx].frame(&desk.chrome).w();
+                let restored = set_mode(desk, stack, idx, WindowMode::Normal);
+                stack[idx].content =
                     desk.chrome.restore_under_pointer(restored, start.x, old_frame_w, at);
                 *self = Self::Dragging { window };
-                Held::Restored { window }
+                Held::Restored { window: idx }
             }
             Self::Dragging { window } => {
-                let from = stack[window].frame(&desk.chrome);
-                stack[window].content = desk.chrome.drag_to(stack[window].content, delta.x, delta.y);
-                Held::Moved { window, from, to: stack[window].frame(&desk.chrome) }
+                let Some(idx) = stack.position(window) else {
+                    *self = Self::None;
+                    return Held::Free;
+                };
+                let from = stack[idx].frame(&desk.chrome);
+                stack[idx].content = desk.chrome.drag_to(stack[idx].content, delta.x, delta.y);
+                Held::Moved { window: idx, from, to: stack[idx].frame(&desk.chrome) }
             }
             Self::Resizing { window } => {
-                let from = stack[window].frame(&desk.chrome);
-                stack[window].content =
-                    desk.chrome.resize_to(stack[window].content, delta.x, delta.y);
-                Held::Moved { window, from, to: stack[window].frame(&desk.chrome) }
+                let Some(idx) = stack.position(window) else {
+                    *self = Self::None;
+                    return Held::Free;
+                };
+                let from = stack[idx].frame(&desk.chrome);
+                stack[idx].content =
+                    desk.chrome.resize_to(stack[idx].content, delta.x, delta.y);
+                Held::Moved { window: idx, from, to: stack[idx].frame(&desk.chrome) }
             }
         }
     }
 
     /// End the grab, and say what the desktop owes the window.
-    pub fn release(&mut self, desk: &Desk, at: Point) -> Released {
+    ///
+    /// `Released::Nothing` is also the answer for a window that is no longer
+    /// in `stack`: there is nothing left to snap or resettle, and the grab is
+    /// discarded either way.
+    pub fn release<C>(&mut self, desk: &Desk, stack: &Stack<C>, at: Point) -> Released {
         let was = core::mem::take(self);
         match was {
             Self::None | Self::Pending { .. } => Released::Nothing,
-            Self::Dragging { window } => match edge_snap(desk, at) {
-                Some(mode) => Released::Snapped { window, mode },
+            Self::Dragging { window } => {
+                let Some(idx) = stack.position(window) else { return Released::Nothing };
+                match edge_snap(desk, at) {
+                    Some(mode) => Released::Snapped { window: idx, mode },
+                    None => Released::Nothing,
+                }
+            }
+            Self::Resizing { window } => match stack.position(window) {
+                Some(idx) => Released::Resized { window: idx },
                 None => Released::Nothing,
             },
-            Self::Resizing { window } => Released::Resized { window },
         }
     }
 }
@@ -522,49 +548,51 @@ mod tests {
     #[test]
     fn a_press_on_a_normal_title_bar_drags_at_once() {
         assert_eq!(
-            Grab::on_title(2, WindowMode::Normal, Point { x: 0, y: 0 }),
-            Grab::Dragging { window: 2 }
+            Grab::on_title(WindowId(2), WindowMode::Normal, Point { x: 0, y: 0 }),
+            Grab::Dragging { window: WindowId(2) }
         );
     }
 
     #[test]
     fn a_click_on_a_maximized_title_bar_does_not_unmaximize_it() {
         let mut stack = stack_of(1);
+        let id = stack[0].id;
         stack[0].mode = WindowMode::Maximized;
         stack[0].saved = Rect::new(100, 100, 400, 300);
         stack[0].content = DESK.chrome.content(DESK.chrome.mode_frame(WindowMode::Maximized, DESK.screen).unwrap());
         let start = Point { x: 900, y: 10 };
-        let mut grab = Grab::on_title(0, WindowMode::Maximized, start);
+        let mut grab = Grab::on_title(id, WindowMode::Maximized, start);
         // Every sample inside the threshold leaves it maximized.
         for d in [0, 1, DRAG_THRESHOLD] {
             let at = Point { x: start.x + d, y: start.y };
             assert_eq!(grab.hold(&DESK, &mut stack, at, Point { x: d, y: 0 }), Held::Idle);
             assert_eq!(stack[0].mode, WindowMode::Maximized);
         }
-        assert_eq!(grab.release(&DESK, Point { x: 905, y: 10 }), Released::Nothing);
+        assert_eq!(grab.release(&DESK, &stack, Point { x: 905, y: 10 }), Released::Nothing);
         assert_eq!(stack[0].mode, WindowMode::Maximized);
     }
 
     #[test]
     fn travelling_past_the_threshold_restores_the_window_under_the_pointer() {
         let mut stack = stack_of(1);
+        let id = stack[0].id;
         stack[0].mode = WindowMode::Maximized;
         stack[0].saved = Rect::new(100, 100, 400, 300);
         stack[0].content = DESK.chrome.content(DESK.chrome.mode_frame(WindowMode::Maximized, DESK.screen).unwrap());
         let start = Point { x: 900, y: 10 };
-        let mut grab = Grab::on_title(0, WindowMode::Maximized, start);
+        let mut grab = Grab::on_title(id, WindowMode::Maximized, start);
         let at = Point { x: start.x + DRAG_THRESHOLD + 1, y: start.y };
         assert_eq!(grab.hold(&DESK, &mut stack, at, Point { x: 6, y: 0 }), Held::Restored { window: 0 });
         assert_eq!(stack[0].mode, WindowMode::Normal);
         assert_eq!((stack[0].content.w(), stack[0].content.h()), (400, 300));
         assert!(stack[0].frame(&DESK.chrome).contains_point(at), "the pointer let go of the title bar");
-        assert_eq!(grab, Grab::Dragging { window: 0 });
+        assert_eq!(grab, Grab::Dragging { window: id });
     }
 
     #[test]
     fn dragging_reports_both_the_rect_it_left_and_the_one_it_took() {
         let mut stack = stack_of(1);
-        let mut grab = Grab::Dragging { window: 0 };
+        let mut grab = Grab::Dragging { window: stack[0].id };
         let before = stack[0].frame(&DESK.chrome);
         let held = grab.hold(&DESK, &mut stack, Point { x: 500, y: 500 }, Point { x: 300, y: 200 });
         let Held::Moved { from, to, .. } = held else { panic!("{held:?}") };
@@ -576,7 +604,7 @@ mod tests {
     #[test]
     fn a_resize_grab_changes_the_size_and_not_the_origin() {
         let mut stack = stack_of(1);
-        let mut grab = Grab::Resizing { window: 0 };
+        let mut grab = Grab::Resizing { window: stack[0].id };
         let before = stack[0].frame(&DESK.chrome);
         let held = grab.hold(&DESK, &mut stack, Point { x: 0, y: 0 }, Point { x: 50, y: -20 });
         let Held::Moved { to, .. } = held else { panic!("{held:?}") };
@@ -592,9 +620,10 @@ mod tests {
         assert_eq!(edge_snap(&DESK, Point { x: 900, y: 0 }), Some(WindowMode::Maximized));
         assert_eq!(edge_snap(&DESK, Point { x: 900, y: 500 }), None);
 
-        let mut grab = Grab::Dragging { window: 1 };
+        let stack = stack_of(2);
+        let mut grab = Grab::Dragging { window: stack[1].id };
         assert_eq!(
-            grab.release(&DESK, corner),
+            grab.release(&DESK, &stack, corner),
             Released::Snapped { window: 1, mode: WindowMode::SnappedLeft }
         );
         assert_eq!(grab, Grab::None);
@@ -602,9 +631,62 @@ mod tests {
 
     #[test]
     fn releasing_a_resize_asks_for_the_buffer_and_never_snaps() {
-        let mut grab = Grab::Resizing { window: 0 };
-        assert_eq!(grab.release(&DESK, Point { x: 0, y: 0 }), Released::Resized { window: 0 });
+        let stack = stack_of(1);
+        let mut grab = Grab::Resizing { window: stack[0].id };
+        assert_eq!(grab.release(&DESK, &stack, Point { x: 0, y: 0 }), Released::Resized { window: 0 });
         assert_eq!(grab, Grab::None);
+    }
+
+    /// `specs/issues/kernel/compositor-holds-stale-window-index.md`: a client
+    /// that exits while its window is being dragged must not panic the next
+    /// sample and must not let the drag jump to whatever window slid into its
+    /// slot. Named by `WindowId`, `hold` finds the window gone and ends the
+    /// grab instead of indexing a position that may not even exist anymore.
+    #[test]
+    fn a_window_closed_mid_drag_ends_the_grab_instead_of_panicking_or_moving_another() {
+        let mut stack = stack_of(2);
+        let dragged = stack[1].id;
+        let survivor_before = stack[0].content;
+        let mut grab = Grab::Dragging { window: dragged };
+
+        // The dragged window's client exits — the same shape as the dead-client
+        // sweep's `Stack::retain`, which shifts every later index down by one.
+        stack.remove(1);
+
+        assert_eq!(
+            grab.hold(&DESK, &mut stack, Point { x: 999, y: 999 }, Point { x: 50, y: 50 }),
+            Held::Free,
+            "a name that no longer resolves must not index whatever is left"
+        );
+        assert_eq!(grab, Grab::None, "the grab must not survive a window it can no longer find");
+        assert_eq!(survivor_before, stack[0].content, "the surviving window must not have moved");
+
+        // The same id, offered to `release`, must not resolve to the survivor
+        // either — a lookup missing entirely is not the same failure as a
+        // lookup landing on the wrong window because it recycled a position.
+        let mut grab = Grab::Resizing { window: dragged };
+        assert_eq!(grab.release(&DESK, &stack, Point { x: 0, y: 0 }), Released::Nothing);
+    }
+
+    /// The other half of the same defect: a window *below* the dragged one
+    /// closing must not make the drag silently act on whichever window the
+    /// shift left behind at the old numeric position.
+    #[test]
+    fn dragging_survives_a_lower_window_closing_and_still_moves_the_right_one() {
+        let mut stack = stack_of(3);
+        let dragged = stack[2].id;
+        let mut grab = Grab::Dragging { window: dragged };
+
+        // Removing index 0 shifts the dragged window from position 2 to 1.
+        stack.remove(0);
+        assert_eq!(stack.position(dragged), Some(1));
+
+        let before = stack[1].frame(&DESK.chrome);
+        let held = grab.hold(&DESK, &mut stack, Point { x: 500, y: 500 }, Point { x: 10, y: 10 });
+        let Held::Moved { from, to, .. } = held else { panic!("{held:?}") };
+        assert_eq!(from, before);
+        assert_eq!(to, before.translate(10, 10));
+        assert_eq!(stack[1].id, dragged, "the window that moved is still the one that was being dragged");
     }
 
     #[test]
@@ -631,7 +713,7 @@ mod tests {
         let stack = stack_of(1);
         let far_away = Point { x: 5, y: 5 };
         assert_eq!(
-            cursor_style(&DESK, &stack, &Grab::Resizing { window: 0 }, far_away, false),
+            cursor_style(&DESK, &stack, &Grab::Resizing { window: stack[0].id }, far_away, false),
             CursorStyle::Resize
         );
         assert_eq!(
