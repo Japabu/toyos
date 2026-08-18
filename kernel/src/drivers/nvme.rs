@@ -420,7 +420,19 @@ pub fn init(devices: &[PciDevice]) -> Option<NvmeBlockDevice> {
     log!("NVMe: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
     *DMA_POOL.lock() = Some(DmaPool::alloc(DMA_SIZE));
 
-    let bar_addr = pci_dev.read_bar_64(0);
+    // A refusal rather than a panic, like this driver's existing one for a
+    // sector size it cannot serve: a machine whose NVMe function publishes
+    // something other than a memory BAR 0 has no disk this driver can drive,
+    // and it still boots and still says why. NVMe 2.0 §3.1 requires BAR 0 to be
+    // memory, so this is a controller disagreeing with its own specification.
+    let bar_addr = match pci_dev.memory_bar(0) {
+        Ok(memory) => memory.address(),
+        Err(why) => {
+            log!("NVMe: NOT INITIALISED at PCI {:02x}:{:02x}.{} — its registers are in BAR 0 and \
+                 {}", pci_dev.bus, pci_dev.dev, pci_dev.func, why);
+            return None;
+        }
+    };
     pci_dev.enable_bus_master();
     log!("NVMe: BAR0={:#x}", bar_addr);
 

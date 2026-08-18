@@ -90,9 +90,20 @@ impl VirtioPciConfig {
             if cap.id() != PCI_CAP_ID_VENDOR { continue; }
             let bar_idx = cap.read_u8(4) as usize;
             if bar_idx < 6 && mapped_bars[bar_idx].is_none() {
-                let bar_addr = pci_dev.read_bar_64(bar_idx as u8);
-                if bar_addr != 0 {
-                    mapped_bars[bar_idx] = Some(crate::mm::paging::map_mmio(bar_addr, 0x4000, CachePolicy::DeferToMtrr));
+                // The index is the device's, so the BAR it names may be
+                // anything — including an I/O BAR, whose port number this used
+                // to map as a physical address. A capability whose BAR is not
+                // memory is skipped and the loop below then finds no window for
+                // it; `parse`'s `expect`s are what say which one was missing.
+                match pci_dev.memory_bar(bar_idx as u8) {
+                    Ok(memory) => {
+                        mapped_bars[bar_idx] = Some(crate::mm::paging::map_mmio(
+                            memory.address(), 0x4000, CachePolicy::DeferToMtrr));
+                    }
+                    Err(why) => log!(
+                        "VirtIO: PCI {:02x}:{:02x}.{} names BAR {bar_idx} and {why} — skipping \
+                         every capability in it",
+                        pci_dev.bus, pci_dev.dev, pci_dev.func),
                 }
             }
         }
