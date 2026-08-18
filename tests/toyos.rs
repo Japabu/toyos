@@ -1943,7 +1943,7 @@ fn measure_audio_run(
 
     let result = qemu.run_test(&format!("test_rs_{name}"), Duration::from_secs(30));
     if let Some(err) = &result.error {
-        return Err(err.clone());
+        return Err(err.to_string());
     }
     match result.exit_code {
         Some(0) => {}
@@ -4815,9 +4815,17 @@ fn metal_sim_window_drag(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> 
     );
 
     if result.error.is_some() || result.exit_code != Some(0) {
+        // **`{:?}` on the verdict is what this arm used to say**, and a `Debug`
+        // of a multi-line report is one line of `\n` escapes — the kernel's own
+        // account of a death, rendered unreadable by a format specifier. It is
+        // printed as itself now.
+        let why = match &result.error {
+            Some(err) => err.to_string(),
+            None => String::from("it finished and its exit code is the finding"),
+        };
         return Err(format!(
-            "window_drag exited {:?} ({:?}):\n{}",
-            result.exit_code, result.error, result.stdout
+            "window_drag exited {:?}: {why}\n{}",
+            result.exit_code, result.stdout
         ));
     }
 
@@ -12488,7 +12496,8 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
                     let reason = (!(test.check)(&result)).then(|| {
                         result
                             .error
-                            .clone()
+                            .as_ref()
+                            .map(ToString::to_string)
                             .unwrap_or_else(|| format!("exit code {:?}", result.exit_code))
                     });
                     done += 1;
