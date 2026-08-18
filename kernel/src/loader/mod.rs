@@ -130,7 +130,7 @@ fn read_elf_table(
 /// covers every segment. The bound is the hardware's user/kernel split, not a
 /// policy number.
 fn image_fits_user_half(layout: &Layout) -> bool {
-    crate::mm::user_span::in_user_half(USER_VM_BASE, layout.span())
+    toyos_userbound::in_user_half(USER_VM_BASE, layout.span())
 }
 
 /// Insert one demand-paged region per `PT_LOAD` segment.

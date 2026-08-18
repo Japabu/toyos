@@ -11,11 +11,19 @@
 //! It is the **producer's** decision, so the record still holds a whole message
 //! and `elided` still means what the ABI says it means.
 //!
-//! This file names nothing outside itself, which is what lets `kernel-elide`
-//! compile it and run the tests below on the host — where a seam falling inside
-//! a four-byte character costs milliseconds to check and no guest at all.
+//! Pure: `core::fmt` and nothing else — no allocation, no `unsafe`, and no
+//! record. The one caller is `kernel/src/symbols.rs`, which spends the budget
+//! `MAX_RECORD_MESSAGE` leaves a backtrace frame, and everything it decides is
+//! checked here on the host, where a seam falling inside a four-byte character
+//! costs milliseconds and no guest at all.
 //!
-//! `specs/log-architecture-spec.md` §2.1.
+//! `specs/log-architecture-spec.md` §2.1a.
+
+#![no_std]
+#![forbid(unsafe_code)]
+
+#[cfg(test)]
+extern crate std;
 
 use core::fmt::{self, Display, Write};
 
@@ -154,6 +162,7 @@ impl<const HEAD: usize, const TAIL: usize> Write for HeadTail<'_, '_, HEAD, TAIL
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::format;
     use std::string::{String, ToString};
 
     const HEAD: usize = 16;

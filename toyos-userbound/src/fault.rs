@@ -24,12 +24,12 @@
 //! machine — so [`blame`] answers that one at runtime, from the two addresses
 //! the frame carries rather than from one of them.
 //!
-//! This file names exactly one thing outside itself, the user/kernel bound in
-//! `kernel/src/mm/user_span.rs`. That is what lets `kernel-fault/` compile both
-//! and run the table below on the host, against the same constant the kernel
-//! reads rather than a copy of it.
+//! The one thing this names outside itself is the user/kernel bound, and it
+//! names it in [`crate::span`] — the same constant `user_ptr.rs` refuses an
+//! address above, not a copy of it. That is what makes the two boundary rows in
+//! the table below mean anything.
 
-use crate::mm::user_span::is_user_addr;
+use crate::span::is_user_addr;
 
 /// The privilege level a trap frame arrived from.
 ///
@@ -193,7 +193,7 @@ mod tests {
             blame(
                 Ring::of_cs(KERNEL_CS),
                 KERNEL_RIP,
-                Faulted::Address(crate::mm::user_span::USER_TOP - 1),
+                Faulted::Address(crate::span::USER_TOP - 1),
                 true,
             ),
             Blame::ProcessThroughKernel,
@@ -236,7 +236,7 @@ mod tests {
     /// The bound itself, at both of the places the classification turns on it.
     #[test]
     fn the_user_kernel_bound_is_where_both_answers_change() {
-        use crate::mm::user_span::USER_TOP;
+        use crate::span::USER_TOP;
         let k = Ring::of_cs(KERNEL_CS);
         // The faulted address, one byte either side.
         assert_eq!(

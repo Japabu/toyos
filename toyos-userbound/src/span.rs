@@ -2,9 +2,9 @@
 //! alignment a type needs, and whether a value the kernel is about to
 //! dereference lies inside one mapping.
 //!
-//! Pure, and deliberately free of any `crate::` reference: `kernel-span/`
-//! compiles this file into a host crate, so the boundary table below runs in
-//! milliseconds rather than in a boot.
+//! Every refusal here is argued in `specs/plans/memory-boundary-spec.md`. The
+//! bound is also the one [`crate::fault`] classifies a trap against — one
+//! constant, read by the check before an access and by the verdict after it.
 
 /// One past the highest address userland can name.
 ///

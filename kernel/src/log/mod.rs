@@ -8,7 +8,6 @@
 //! `specs/log-architecture-spec.md` §2.
 
 pub mod console;
-pub mod elide;
 pub mod nested;
 pub mod read;
 pub mod registry;

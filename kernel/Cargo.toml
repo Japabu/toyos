@@ -110,11 +110,13 @@ bcachefs = { path = "../bcachefs", default-features = false }
 toyos-abi = { path = "../toyos-abi" }
 toyos-fat32 = { path = "../toyos-fat32" }
 toyos-elf = { path = "../toyos-elf" }
+toyos-elide = { path = "../toyos-elide" }
 toyos-gpt = { path = "../toyos-gpt" }
 toyos-hda = { path = "../toyos-hda" }
 toyos-pci = { path = "../toyos-pci" }
 toyos-ps2 = { path = "../toyos-ps2" }
 toyos-sched = { path = "../toyos-sched" }
+toyos-userbound = { path = "../toyos-userbound" }
 toyos-wallclock = { path = "../toyos-wallclock" }
 toyos-xhci = { path = "../toyos-xhci" }
 rustc-demangle = "0.1"
