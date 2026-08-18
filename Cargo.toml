@@ -92,6 +92,19 @@ toyos-cc = { path = "toyos-cc" }
 toyos-fat32-check = { path = "toyos-fat32-check" }
 toyos-gpt = { path = "toyos-gpt" }
 toyos-ld = { path = "toyos-ld" }
+# The scheduler core, for the one type the check build publishes and the
+# harness judges: `cpu::PassCostReport` is the wire form of the pass-cost
+# distribution, and its `Display`/`parse` pair is what keeps the kernel that
+# writes it and `tests/common/passcost.rs` that reads it on one format.
+#
+# `check` because that is where the type lives, and it lives there because
+# `src/build.rs`'s artifact gate asks the *shipping* kernel to carry none of the
+# check instruments' literals — `toyos-ld` keeps a string constant no code
+# reaches, so an unconditional `Display` puts the report's prefix in every
+# image. This is a dev-dependency of a host binary and `kernel/` is excluded
+# from this workspace with its own lockfile, so nothing here reaches the kernel's
+# resolution of the same crate.
+toyos-sched = { path = "toyos-sched", features = ["check"] }
 
 [profile.release]
 opt-level = 2

@@ -1037,6 +1037,7 @@ dependencies = [
  "toyos-gpt",
  "toyos-ld",
  "toyos-manifest",
+ "toyos-sched",
  "uuid",
 ]
 
