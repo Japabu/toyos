@@ -602,6 +602,12 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // timer-anchored, and its price straddles the ceiling run to run (9,355 /
     // 10,568 / 11,073 ms across three measurements) for exactly that reason.
     ("i8042_quarantine", Sched::Parallel, Tier::Nightly),
+    // The negative-direction half of the same gate, and the one that runs on
+    // every PR: no QEMU can stage a CPU into spinning through idle on
+    // purpose, so this is `idle_is_spinning` proving its teeth against a
+    // crafted trace shaped like the regression, the way
+    // `control_regs`/`control_regs_verdict` split the same question.
+    ("i8042_quarantine_verdict", Sched::Parallel, Tier::Fast),
     ("i8042_budget_expiry", Sched::Parallel, Tier::Fast),
     ("i8042_fadt_denial", Sched::Parallel, Tier::Fast),
     ("i8042_kbd_echo", Sched::Parallel, Tier::Fast),
@@ -8074,6 +8080,7 @@ fn run_machine_test(
         "expected_failure_exit_status" => expected_failure_exit_status(),
         "expected_failure_entries" => expected_failure_entries(),
         "control_regs_verdict" => control_regs_verdict(),
+        "i8042_quarantine_verdict" => idle_trip_verdict(),
         "suite_split" => suite_split(),
         "nightly_tier_is_announced" => nightly_tier_is_announced(),
         "nvme_wide_sector" => {
@@ -9519,7 +9526,12 @@ fn run_machine_test(
                 BootOptions {
                     profile: qemu::Profile::Metal,
                     qmp: true,
-                    kernel_params: &["i8042-fault"],
+                    // `sched-fast-health` shortens the idle-trip print from
+                    // 10 s to 200 ms: comparing two samples is how a spinning
+                    // CPU is told from a halting one, and this test's whole
+                    // capture is a handful of seconds — shorter than one
+                    // shipped period, let alone two.
+                    kernel_params: &["i8042-fault", "sched-fast-health"],
                     ..Default::default()
                 },
             );
@@ -9566,19 +9578,22 @@ fn run_machine_test(
                 return Err(format!("quarantined without masking any line: {line}"));
             }
             // "A keyboard, not a CPU" is the claim, so measure the CPU. The
-            // idle loop logs its health every 1000 iterations and halts when
-            // there is nothing to do, so a spinning CPU is loud: the first
-            // version of this driver left the `irq_ring` record undrained
-            // after quarantine and produced 2685 of these lines in 5 s,
-            // against 1 on a healthy run.
-            let health = result.serial.matches("sched: cpu=").count();
-            if health > 50 {
+            // first version of this driver left the `irq_ring` record
+            // undrained after quarantine and produced 2685 idle-health lines
+            // in 5 s, against 1 on a healthy run — a regression this exact
+            // shape would no longer trip a *count of lines* now that
+            // `log_health` prints at a fixed rate whether the CPU behind it
+            // is halting or spinning (`specs/issues/kernel/
+            // i8042-quarantine-health-line-count-is-vacuous.md`). What still
+            // moves at two different speeds is the `trips=` counter inside
+            // each line, which is not rate-limited.
+            if let Some((cpu, delta)) = idle_is_spinning(&result.serial) {
                 return Err(format!(
-                    "{health} idle-health lines after the quarantine — a CPU is spinning, not halting"
+                    "cpu{cpu}'s idle-trip counter moved by {delta} within the capture — spinning, not halting"
                 ));
             }
             eprintln!("  [i8042] {}", line.trim());
-            eprintln!("  [i8042] {health} idle-health lines — the CPU still halts");
+            eprintln!("  [i8042] idle-trip counters stayed sane — the CPU still halts");
             Ok(())
         }
         "metal_sim_window_drag" => metal_sim_window_drag(rust_bins),
@@ -10541,6 +10556,103 @@ fn control_regs_negative(
         }
     }
     eprintln!("  [control_regs] a real divergent AP, refused: {refusal}");
+    Ok(())
+}
+
+/// The largest an idle-trip counter (`kernel/src/scheduler.rs`'s
+/// `IDLE_TRIPS`, printed as `trips=` on `sched: cpu=`'s now rate-limited
+/// line) may move for one CPU across a captured serial before
+/// [`idle_is_spinning`] calls it spinning rather than halting.
+///
+/// Two orders of magnitude above the worst real trip delta this suite has
+/// measured on a healthy `i8042_quarantine` run on this host (`cargo test --
+/// i8042_quarantine`, 2026-08-17: cpu1 moved by 2 within the capture — one
+/// print at readiness, one roughly ten seconds later, the rate limit's own
+/// cadence) and well under the shape of the regression this gate exists for:
+/// the first quarantine driver's undrained `irq_ring` produced 2685 printed
+/// lines in 5 s under the *old*, unthrottled-per-1000-trips counter — at
+/// least 2,685,000 trips in that one window alone.
+const MAX_IDLE_TRIP_DELTA: u64 = 100_000;
+
+/// Whether any CPU's idle-trip counter moved by more than [`MAX_IDLE_TRIP_DELTA`]
+/// across `serial`, and which one if so.
+///
+/// **Not the same question a count of `sched: cpu=` lines answers**, and
+/// deliberately not: `log_health` prints at most once per
+/// `SNAPSHOT_INTERVAL_NS` now, so a CPU that spins through idle and one that
+/// halts cleanly between rare wakes produce the same number of *lines* —
+/// only the counter inside each line still moves at the two different
+/// speeds (`specs/issues/kernel/i8042-quarantine-health-line-count-is-vacuous.md`).
+/// Per CPU, and the worst offender rather than every one, because a spin on
+/// one CPU must not be hidden by averaging it against another CPU's healthy
+/// rate.
+fn idle_is_spinning(serial: &str) -> Option<(u32, u64)> {
+    let mut spread: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
+    for line in serial.lines() {
+        let Some(rest) = line.split("sched: cpu=").nth(1) else { continue };
+        let Some((id, rest)) = rest.split_once(' ') else { continue };
+        let Some(trips) = rest.split("trips=").nth(1).and_then(|t| t.split_whitespace().next())
+        else {
+            continue;
+        };
+        let (Ok(id), Ok(trips)) = (id.parse::<u32>(), trips.parse::<u64>()) else { continue };
+        spread
+            .entry(id)
+            .and_modify(|(min, max)| {
+                *min = (*min).min(trips);
+                *max = (*max).max(trips);
+            })
+            .or_insert((trips, trips));
+    }
+    spread.into_iter().map(|(id, (min, max))| (id, max - min)).find(|&(_, delta)| delta > MAX_IDLE_TRIP_DELTA)
+}
+
+/// [`idle_is_spinning`] against a healthy trace and a crafted one shaped like
+/// the regression it exists to catch, with no guest — the same split
+/// `control_regs`/`control_regs_verdict` use, and for the same reason: a
+/// gate's own teeth are a claim a live boot cannot demonstrate on the
+/// negative side, because nothing in this tree can stage a CPU into spinning
+/// through idle on purpose.
+///
+/// This is the demonstration `i8042-quarantine-health-line-count-is-vacuous`
+/// asked for: proof the restored assertion still fails when the condition it
+/// names is violated, not just that it still passes when it is not.
+fn idle_trip_verdict() -> Result<(), String> {
+    let healthy = "\
+[kernel 0.1 cpu0] sched: cpu=0 ready=0 parked=0 current=None trips=1\n\
+[kernel 0.1 cpu1] sched: cpu=1 ready=0 parked=0 current=None trips=1\n\
+[kernel 0.1 cpu1] sched: cpu=1 ready=0 parked=0 current=None trips=3\n\
+[kernel 0.1 cpu0] sched: cpu=0 ready=0 parked=0 current=None trips=2\n";
+    if let Some((cpu, delta)) = idle_is_spinning(healthy) {
+        return Err(format!("a healthy trace was refused: cpu{cpu} moved by {delta}"));
+    }
+
+    // The regression's own shape: one CPU quarantines cleanly and stays
+    // quiet, the other's undrained ring never lets it halt.
+    let spinning = "\
+[kernel 0.1 cpu0] sched: cpu=0 ready=0 parked=0 current=None trips=1\n\
+[kernel 0.1 cpu1] sched: cpu=1 ready=0 parked=0 current=None trips=4\n\
+[kernel 0.1 cpu0] sched: cpu=0 ready=0 parked=0 current=None trips=2\n\
+[kernel 0.1 cpu1] sched: cpu=1 ready=0 parked=0 current=None trips=2685004\n";
+    match idle_is_spinning(spinning) {
+        Some((1, delta)) if delta > MAX_IDLE_TRIP_DELTA => {}
+        Some((cpu, delta)) => {
+            return Err(format!("refused the wrong CPU or by the wrong margin: cpu{cpu} delta {delta}"))
+        }
+        None => return Err("a spinning CPU's trace was accepted".to_string()),
+    }
+
+    // And the line the old, count-of-lines check would have been fooled by:
+    // the same number of `sched: cpu=` lines either way, because the print
+    // itself is rate-limited regardless of what is underneath it — which is
+    // exactly the vacuity this replaces.
+    assert_eq!(
+        healthy.matches("sched: cpu=").count(),
+        spinning.matches("sched: cpu=").count(),
+        "the crafted traces must differ only in trips=, not in line count — otherwise this proves nothing about the old check's blindness"
+    );
+
+    eprintln!("  [i8042] the idle-trip verdict accepts a healthy trace and refuses a spinning one");
     Ok(())
 }
 

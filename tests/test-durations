@@ -184,6 +184,7 @@ i8042_keyboard 5454
 i8042_mouse 4560
 i8042_no_spurious_wake 255
 i8042_quarantine 11073
+i8042_quarantine_verdict 18446744073709551615
 i8042_undecoded_bytes 5125
 idle_stack_guard 52822
 input_merge 5019
