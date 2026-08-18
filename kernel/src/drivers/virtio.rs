@@ -1,6 +1,8 @@
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 
+use toyos_untrusted::{Refused, Untrusted};
+
 use crate::mm::Mmio;
 use super::pci::PciDevice;
 use crate::mm::paging::CachePolicy;
@@ -190,30 +192,33 @@ impl DescSlot {
 /// does not have, or claims more bytes than the chain it names was given, is
 /// not a completion with a bad field in it, and there is nothing to recover
 /// from it.
+/// Two of the three come straight out of [`Untrusted`]'s own exits — an id
+/// that is not an index into the descriptor table, a length past the chain —
+/// because those are the questions the type asks and there is no version of
+/// this driver that gets to skip them. The third is a fact only this queue
+/// holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsedRefusal {
     /// The head descriptor id is not an index into this queue's table.
-    IdPastQueue { id: u32, size: u16 },
+    Head(Refused),
     /// The head names a descriptor this queue has published no chain at. A
     /// completion for a request that was never made.
     NoChain { id: u16 },
     /// The device claims to have written more bytes than the chain whose head
     /// this is was ever given. A driver that believes it reads past the buffer
     /// it posted.
-    LenPastChain { id: u16, len: u32, chain: u32 },
+    Written { id: u16, refused: Refused },
 }
 
 impl core::fmt::Display for UsedRefusal {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::IdPastQueue { id, size } => {
-                write!(f, "head descriptor {id} in a queue of {size}")
-            }
+            Self::Head(refused) => write!(f, "its head descriptor {refused}"),
             Self::NoChain { id } => {
                 write!(f, "a completion for descriptor {id}, where this queue published no chain")
             }
-            Self::LenPastChain { id, len, chain } => {
-                write!(f, "{len} bytes written into chain {id}, which is {chain} bytes")
+            Self::Written { id, refused } => {
+                write!(f, "chain {id} was written {refused}")
             }
         }
     }
@@ -252,15 +257,17 @@ impl UsedRingConsumer {
             // used idx — pair with that ordering before reading the element.
             fence(Ordering::Acquire);
             let slot = self.last_used_idx % self.size;
-            let id = unsafe {
+            let id: Untrusted<u32> = Untrusted::new(unsafe {
                 read_volatile(self.used.ptr_at(USED_RING_OFF + slot as usize * USED_ELEM_SIZE) as *const u32)
-            };
+            });
             self.last_used_idx = self.last_used_idx.wrapping_add(1);
-            if id >= self.size as u32 {
+            let Ok(head) = id.index(self.size as usize) else {
                 self.refused = self.refused.saturating_add(1);
                 continue;
-            }
-            return Some(id as u16);
+            };
+            // Exact: `index` proved `head < self.size`, and `self.size` is a
+            // `u16`.
+            return Some(head as u16);
         }
     }
 
@@ -406,11 +413,28 @@ impl Virtqueue {
     fn used_idx_ptr(&self) -> *const u16 {
         self.used.ptr_at(USED_IDX_OFF) as *const u16
     }
-    fn used_ring_id_ptr(&self, i: u16) -> *const u32 {
-        self.used.ptr_at(USED_RING_OFF + i as usize * USED_ELEM_SIZE) as *const u32
+
+    /// Where the used element at ring position `i` sits.
+    fn used_elem_at(&self, i: u16) -> usize {
+        USED_RING_OFF + i as usize * USED_ELEM_SIZE
     }
-    fn used_ring_len_ptr(&self, i: u16) -> *const u32 {
-        self.used.ptr_at(USED_RING_OFF + i as usize * USED_ELEM_SIZE + 4) as *const u32
+
+    /// The two fields of a used element, as what they are: numbers the device
+    /// wrote.
+    ///
+    /// **These are the only reads of the used ring in this driver**, and they
+    /// hand back [`Untrusted`] rather than `u32`, so there is no expression
+    /// anywhere below them that turns one into an index or a length without
+    /// naming the bound. That is the difference between this bound and the
+    /// hand-written ones it replaced: the next consumer of this queue does not
+    /// have to know the rule, because the code that breaks it does not compile.
+    fn used_ring_id(&self, i: u16) -> Untrusted<u32> {
+        Untrusted::new(unsafe { read_volatile(self.used.ptr_at(self.used_elem_at(i)) as *const u32) })
+    }
+    fn used_ring_len(&self, i: u16) -> Untrusted<u32> {
+        Untrusted::new(unsafe {
+            read_volatile(self.used.ptr_at(self.used_elem_at(i) + 4) as *const u32)
+        })
     }
 
     /// Return the initial pool of descriptor slots. Call once after construction.
@@ -502,8 +526,8 @@ impl Virtqueue {
             }
             fence(Ordering::Acquire);
             let slot = self.last_used_idx % self.size;
-            let id = unsafe { read_volatile(self.used_ring_id_ptr(slot)) };
-            let len = unsafe { read_volatile(self.used_ring_len_ptr(slot)) };
+            let id = self.used_ring_id(slot);
+            let len = self.used_ring_len(slot);
             self.last_used_idx = self.last_used_idx.wrapping_add(1);
             match self.parse_used(id, len) {
                 Ok(elem) => return Some(elem),
@@ -518,24 +542,51 @@ impl Virtqueue {
     /// The whole of what a used-ring element has to satisfy, separated from
     /// the volatile reads that produce it so the self-test can run the shipped
     /// decision over elements no device on this host will write.
-    fn parse_used(&self, id: u32, len: u32) -> Result<(DescSlot, u32), UsedRefusal> {
-        if id >= self.size as u32 {
-            return Err(UsedRefusal::IdPastQueue { id, size: self.size });
-        }
-        let chain = self.chain_bytes[id as usize];
+    fn parse_used(
+        &self,
+        id: Untrusted<u32>,
+        len: Untrusted<u32>,
+    ) -> Result<(DescSlot, u32), UsedRefusal> {
+        // `chain_bytes` is exactly `size` long, so this is the descriptor
+        // table's own bound and not a constant written out beside it. Exact
+        // narrowing: `index` proved `head < size`, and `size` is a `u16`.
+        let head = id.index(self.chain_bytes.len()).map_err(UsedRefusal::Head)?;
+        let id = head as u16;
+        let chain = self.chain_bytes[head];
         if chain == 0 {
-            return Err(UsedRefusal::NoChain { id: id as u16 });
+            return Err(UsedRefusal::NoChain { id });
         }
-        if len > chain {
-            return Err(UsedRefusal::LenPastChain { id: id as u16, len, chain });
-        }
-        Ok((DescSlot(id as u16), len))
+        let written = len
+            .at_most(chain as u64)
+            .map_err(|refused| UsedRefusal::Written { id, refused })?;
+        // Exact: `at_most` proved it is no more than `chain`, a `u32`.
+        Ok((DescSlot(id), written as u32))
     }
 
     /// How many used-ring elements this queue has refused, for the life of the
     /// boot. A driver in a context that can log reads it and says so.
     pub fn refused(&self) -> u32 {
         self.refused
+    }
+
+    /// Write one used-ring element and bump the used index, the way a device
+    /// does — the only writer of a used ring in this kernel, and it exists for
+    /// [`used_selftest`] alone.
+    ///
+    /// `at` is what this queue's own `last_used_idx` will be when it reads the
+    /// element. Compiled only into the actuator kernel: the shipping kernel
+    /// has no way to write a used ring at all, which is what keeps
+    /// [`used_ring_id`](Self::used_ring_id)'s claim — that every used-ring
+    /// number arrives wrapped — true of the kernel anyone runs.
+    #[cfg(feature = "boot-actuators")]
+    fn write_used_as_a_device_would(&self, at: u16, id: u32, len: u32) {
+        let slot = at % self.size;
+        unsafe {
+            write_volatile(self.used.ptr_at(self.used_elem_at(slot)) as *mut u32, id);
+            write_volatile(self.used.ptr_at(self.used_elem_at(slot) + 4) as *mut u32, len);
+            fence(Ordering::Release);
+            write_volatile(self.used_idx_ptr() as *mut u16, at.wrapping_add(1));
+        }
     }
 
     /// Submit a descriptor chain and wait for the device to complete it.
@@ -589,15 +640,7 @@ pub fn used_selftest() {
 
     // Write one element where the device would write it and bump the index the
     // device bumps. `at` is what the queue's own `last_used_idx` will be.
-    fn publish(q: &Virtqueue, at: u16, id: u32, len: u32) {
-        let slot = at % q.size;
-        unsafe {
-            write_volatile(q.used_ring_id_ptr(slot) as *mut u32, id);
-            write_volatile(q.used_ring_len_ptr(slot) as *mut u32, len);
-            fence(Ordering::Release);
-            write_volatile(q.used_idx_ptr() as *mut u16, at.wrapping_add(1));
-        }
-    }
+    let publish = Virtqueue::write_used_as_a_device_would;
 
     /// One element, and what `poll_used` must answer for it.
     const TABLE: [(&str, u32, u32, Option<(u16, u32)>); 9] = [
