@@ -557,6 +557,10 @@ name = "kernel-elide"
 version = "0.1.0"
 
 [[package]]
+name = "kernel-fault"
+version = "0.1.0"
+
+[[package]]
 name = "kernel-loom"
 version = "0.1.0"
 dependencies = [
