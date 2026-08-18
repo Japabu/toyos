@@ -547,7 +547,7 @@ machine-wide.
 
 ### 2.1a A symbol nothing bounds keeps both its ends
 
-`kernel/src/log/elide.rs`. A backtrace frame renders
+`toyos-elide/src/lib.rs`. A backtrace frame renders
 `    {addr:#x}  {symbol}+{offset:#x}`, and the symbol is the only part of it
 whose width the kernel does not choose: `late_panic::Nest` is a generic nested
 in itself and nothing stops it being nested again. So the *record* bound cannot
@@ -575,19 +575,22 @@ implied.** The tree's own widest symbol is `late_panic::Nest` at 288 bytes
 against a budget of 944, so `screen_late_panic` proves the panel keeps a
 symbol's tail and proves nothing about the elision. The seams — a character
 straddling the head cut, a character straddling the start of the tail, a value
-arriving one character at a time — are checked on the host by `kernel-elide`,
-which compiles the kernel file itself rather than a transliteration of it.
+arriving one character at a time — are checked on the host by `toyos-elide`'s
+own nine tests, which exercise the code the kernel runs and not a
+transliteration of it.
 
-**`kernel-elide/` is a harness and not a crate of its own.** It is
-`kernel-span/`'s arrangement — `#[path = "../../kernel/src/log/elide.rs"]` and
-nothing else — and it sits beside `kernel/` rather than inside it because
-`kernel/.cargo/config.toml` cross-compiles everything below it to
-`x86_64-unknown-none` and cargo refuses to merge an inherited `build.target`
-away. It runs as `cargo test --manifest-path kernel-elide/Cargo.toml`, from
-`.github/workflows/host-tests.yml`'s host-crates list. **That is the property
-`elide.rs` has to keep to stay testable**: it names nothing outside itself, so
-the harness supplies nothing. A dependency added there is the file leaving the
-host, and the nine tests go with it.
+**`toyos-elide/` is a crate, and the mechanism is all of it.** It was
+`kernel-elide/`, a nine-line harness whose whole content was
+`#[path = "../../kernel/src/log/elide.rs"]`; the file names nothing outside
+`core::fmt`, which is what a pure library is, so it is one — `no_std`,
+`forbid(unsafe_code)`, a member of the host workspace that
+`cargo test --workspace --exclude toyos-build` runs, and a path dependency of
+`kernel/`. **It is not the ABI's**: `elided` is a field of `LogRecord` and lives
+in `toyos-abi::log` with the rest of the record, but the producer-side rendering
+that keeps the count honest has one caller — `kernel/src/symbols.rs` — and
+nothing on the userland side of the contract needs it. Keeping it out of the ABI
+crate is also what keeps it out of `std`, which resolves `toyos-abi` as a
+dependency of its own.
 
 ### 2.2 The shard
 

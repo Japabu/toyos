@@ -31,8 +31,9 @@ watchpoint, and that tool brings the store back with it.
   legitimately return for heterogeneous ARM cores; that day reintroduces it.
 - **`block.rs:73`'s private `PAGE_SIZE = 4096`** — the owner asked whether it
   belongs to the paging subsystem. It does, and **there is nothing there to
-  move it to**: `mm/paging.rs` exports only `PAGE_SIZE_BIT` (a PDE flag) and
-  `mm/user_span.rs` only `PAGE_2M`. Five private 4 KiB constants exist with no
+  move it to**: `mm/paging.rs` exports only `PAGE_SIZE_BIT` (a PDE flag), and
+  the one page size `mm` names is `PAGE_2M`, re-exported from
+  `toyos-userbound`. Five private 4 KiB constants exist with no
   common owner — `block.rs:73`, `file_cache.rs:13`, `file_backing.rs:9,10`,
   `fat32_adapter.rs:75`, `usb_gate.rs:31`. Whoever does this makes the export
   first.
