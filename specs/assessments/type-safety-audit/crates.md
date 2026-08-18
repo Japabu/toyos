@@ -29,7 +29,7 @@ a change.** Nothing in this document is softened because it is large.
 **One staleness correction, up front, because it changes what is worth fixing.**
 The record this was written against listed "A 3 MiB `fs::write` to `/home` panics the
 kernel — `bcachefs/src/btree.rs:184`, `MAX_PAYLOAD - used` underflows" as open and
-assigned; nothing under `specs/issues/` carries it now. It is **closed at
+assigned; nothing under `issues/` carries it now. It is **closed at
 `bccab15`** (2026-08-01): `btree.rs:184` is now
 `Ok(Self { level, entries })`, and `Node::write_to` (`:203-207`) returns
 `FsError::NodeOverfull` before the subtraction at `:217`. Not re-filed. Cited
@@ -73,7 +73,7 @@ format with none of these properties.
 **A reader who audits this as bcachefs will look for the wrong things.** There is
 no journal to check for replay soundness, no bset iteration, no `bch_val` union to
 validate. There is one 4096-byte node format, and everything below is about how it
-is parsed. `specs/issues/kernel/` already asks the owner to rename the crate;
+is parsed. `issues/kernel/` already asks the owner to rename the crate;
 this audit does not reopen that.
 
 ### The trust boundary, precisely
@@ -84,7 +84,7 @@ CRC32C checks out. A CRC is not authentication: whoever writes the image writes 
 CRC. So every on-disk field — superblock contents, node headers, entry counts,
 value bytes, child pointers, tree depth — is attacker-controlled input on any
 machine that boots with a disk somebody else prepared. That is the metal track's
-situation exactly (`specs/plans/metal-boot-plan.md`), and `specs/issues/kernel/`
+situation exactly (`specs/plans/metal-boot-plan.md`), and `issues/kernel/`
 already accepts the analogous statement about the NVMe namespace ("the device said
 so is not a bound").
 
@@ -96,12 +96,12 @@ so is not a bound").
 `Node::parse` (`:148-182`) accepts `val_len = 0`; it only rejects
 `val_end > BLOCK_SIZE`. A level-1 node whose first entry has a zero-length value
 makes `entry.value[..8]` a slice-index panic, inside `vfs::lock()` —
-`specs/issues/panic-path/`'s open "the VFS lock is the same shape" class.
+`issues/panic-path/`'s open "the VFS lock is the same shape" class.
 `btree.rs:258`'s `debug_assert!(!node.entries.is_empty())` is compiled out in the
 kernel and is followed immediately by `node.entries[0]`, so an *empty* interior
 node is the same panic by a second route.
 
-This is `specs/issues/isolation/`'s stated lesson verbatim — *a policy enforced at
+This is `issues/isolation/`'s stated lesson verbatim — *a policy enforced at
 one entry point was simply absent at another that reaches the same machinery.*
 `bccab15` made the **write** side fallible because "`used` is a sum over values
 whose size userland chooses"; the **read** side got nothing.
@@ -271,7 +271,7 @@ Not reproducible on a freshly formatted `/home`, where the allocator hands out
 contiguous runs. It needs a fragmented bitmap and a sparse write (`seek` past EOF,
 then `write`), so `needed > 1`.
 
-**This is `specs/issues/isolation/`'s filed class in a new shape.** That entry
+**This is `issues/isolation/`'s filed class in a new shape.** That entry
 ("two syscalls discard a failure signal they already have") is about a caller
 ignoring *no*. This caller ignores *yes, partially* — worse, because there is no
 refusal to notice and the wrong answer is a block number that looks exactly like a
@@ -351,7 +351,7 @@ if entry_count > MAX_ENTRIES {
 }
 ```
 
-This is the shape `specs/issues/isolation/` prefers to a bound — *count by type,
+This is the shape `issues/isolation/` prefers to a bound — *count by type,
 then reserve exactly*. `fs.rs:266`'s sibling `with_capacity(extent_count)` is **not**
 a defect: that count is derived from the value's own length, which `Node::parse`
 has already bounded.
@@ -369,7 +369,7 @@ nine raw integers with no cross-check: `block_count`, `root_node`, `root_level`,
 `BlockNum` (`block_io.rs:7`) names the *unit* and asserts nothing about the
 *range* — `BlockNum::new` is `pub const fn` over any `u64`. A `BlockNum` from disk
 is indistinguishable from one the allocator produced. That is
-`specs/issues/isolation/`'s class header ("an id or a name treated as a
+`issues/isolation/`'s class header ("an id or a name treated as a
 capability") applied to a disk block.
 
 Reachable consequences, all from a mounted foreign disk:
@@ -476,7 +476,7 @@ and the product cannot overflow.
 - **`decode_leaf_value`** (`fs.rs:246-281`) — bounds-checked, `from_utf8` mapped to
   an error, unknown `entry_type` refused. The one function in the crate that parses
   untrusted bytes properly.
-- **`Mounted::list` unbounded** — already filed (`specs/issues/isolation/`). Not
+- **`Mounted::list` unbounded** — already filed (`issues/isolation/`). Not
   re-filed. Note only that B4's per-node cap does not close it: `collect_all`
   accumulates across nodes.
 - **`Formatted::format`'s `total_blocks - metadata_blocks`** (`alloc_bitmap.rs:210`,
@@ -571,7 +571,7 @@ Deleting that first line compiles. `TimerPlan` is `#[must_use]`
 (`timer.rs:90`) but `apply_timer` already consumed it, and `TimerApplied` is
 dropped on the floor. The RT backstop is
 `#[cfg(feature = "check")] crate::invariants::check_cpu(self.cpu)` inside
-`apply_timer` (`cpu.rs:905-906`) — and `specs/issues/kernel/` records that
+`apply_timer` (`cpu.rs:905-906`) — and `issues/kernel/` records that
 `src/build.rs` cannot enable `sched-check`, **so no CI run exercises it**. A quantum
 never armed is therefore caught by nothing.
 
@@ -715,7 +715,7 @@ the normal return from `with_cpu`, so a panic inside a pass would strand the fla
 but `scheduler::schedule_no_return` (`kernel/src/scheduler.rs:449-453`) tests
 `in_schedule_self()` first and calls `halt_all_cpus()`, so the case is handled
 loudly rather than wedging. Recorded because a future change to panic recovery
-turns this into `specs/issues/panic-path/`'s stranded-lock class, and the one `if`
+turns this into `issues/panic-path/`'s stranded-lock class, and the one `if`
 that stops it lives in a different file from the flag.
 
 The point for the verdict: **the core's typing is airtight up to the boundary, and
@@ -742,7 +742,7 @@ is never run down: `Registration::drop` never executes, neither the assert nor t
 `queue.dequeue` in `finish` (`:320-323`), and the `Arc<TaskShared>` stays in the
 `WaitList` forever.
 
-`specs/issues/kernel/` files the leak and correctly names the owed intrusive
+`issues/kernel/` files the leak and correctly names the owed intrusive
 `wait_node` as the fix. **What is not recorded, and is the reusable part: the type
 that was supposed to prevent it cannot fire on that path.** The guard is armed by
 `Drop`; the kill path is the one path where `Drop` does not run.
@@ -885,7 +885,7 @@ expressible (the SMP-regression reason survives and keeps `fetch_max`); the sent
 **Blast radius:** `queue.rs`, `fair.rs`, `cpu.rs` (5 sites), plus the simulator's
 I5/I13 checkers, which read vruntime.
 
-**Sequencing note, not an objection.** `specs/issues/kernel/` sets three entry
+**Sequencing note, not an objection.** `issues/kernel/` sets three entry
 criteria for the per-share-FIFO redesign, and criterion 2 says a change touching
 `pop_surplus`'s neighbourhood can silently collapse I13's reach. This edit is in
 that neighbourhood and changes no arithmetic and no ordering — so it wants the same
@@ -895,7 +895,7 @@ a type change. That is a verification requirement, not a reason to defer.
 ### Examined and deliberately not flagged (toyos-sched)
 
 - **`WaitList`'s unbounded `VecDeque`** — one `Arc` clone per waiter, bounded by
-  live thread count, which is itself uncapped (`specs/issues/isolation/`,
+  live thread count, which is itself uncapped (`issues/isolation/`,
   `SYS_SYSINFO`). Second-order under a filed entry. S5 removes the allocation
   anyway.
 - **`TaskKey(pub u64)`, `CpuId(pub u32)`, `Nanos(pub u64)`** — public tuple fields,
@@ -922,7 +922,7 @@ a type change. That is a verification requirement, not a reason to defer.
   crate, one call site (`cpu.rs:907`). Making it private needs `TimerPlan::apply` to
   move into `timer.rs`, which does not obviously read better. Noted, not proposed.
 - **The per-process fairness degradation and its three entry criteria** — filed in
-  full (`specs/issues/kernel/`). Untouched here; S6 says so explicitly.
+  full (`issues/kernel/`). Untouched here; S6 says so explicitly.
 
 ---
 
@@ -1008,7 +1008,7 @@ tests `== 0` becomes wrong silently. Recommended on the reading test.
   unrepresentable, and `PointerSource` is already a newtype. `buttons: u8` is the
   only bare bitfield left, and PS/2 button order is HID boot-mouse order unchanged,
   so the conversion is the identity. No bug, no reading improvement.
-- **The `0xAA` reset ambiguity** — `specs/issues/kernel/` files it. A property of
+- **The `0xAA` reset ambiguity** — `issues/kernel/` files it. A property of
   the wire under controller translation, not of this code, and `key.rs:152-155`
   documents it exactly.
 
@@ -1040,7 +1040,7 @@ and it is measurable: **17 comment lines exist because the type does not say it.
 
 This is a host build tool, so nothing here is a security finding — the input is
 object files the build system just produced. The cost of a defect is a wrong
-binary, which is worse than a crash: `specs/issues/isolation/`'s standing
+binary, which is worse than a crash: `issues/isolation/`'s standing
 judgement, *"a refusal is a limitation, a wrong answer that looks right is a
 correctness defect."*
 
@@ -1495,17 +1495,17 @@ which currently carries a `_` for the bool it does not want.
 | # | crate | finding | permits a bug? | code delta | class already bit? |
 |---|---|---|---|---|---|
 | B1 | bcachefs | six `value[..8]` panics on interior nodes from disk | yes — kernel panic, VFS lock stranded | −6 decodes, −11 params, −8 branches, −7 decrements, −1 dead fn | yes — `bccab15`, same file, write side only |
-| B2 | bcachefs | `root_level` from disk drives unbounded recursion | yes — kernel stack overflow | shared with B1 | yes — `specs/issues/isolation/` |
-| B3 | bcachefs | partial allocation read as complete; write lands outside its extent | **yes — live data corruption on `/home`** | −1 `unreachable!`, 3 callers converge | yes — `specs/issues/isolation/`, ignored failure return |
-| B4 | bcachefs | `with_capacity` from a `u16` on disk, 387× the physical max | yes — kernel panic | +3 | yes — `specs/issues/isolation/` |
-| B5 | bcachefs | superblock fields never validated against the device | yes — arbitrary metadata writes | 24 `BlockNum::new` split two ways | yes — `specs/issues/isolation/` |
+| B2 | bcachefs | `root_level` from disk drives unbounded recursion | yes — kernel stack overflow | shared with B1 | yes — `issues/isolation/` |
+| B3 | bcachefs | partial allocation read as complete; write lands outside its extent | **yes — live data corruption on `/home`** | −1 `unreachable!`, 3 callers converge | yes — `issues/isolation/`, ignored failure return |
+| B4 | bcachefs | `with_capacity` from a `u16` on disk, 387× the physical max | yes — kernel panic | +3 | yes — `issues/isolation/` |
+| B5 | bcachefs | superblock fields never validated against the device | yes — arbitrary metadata writes | 24 `BlockNum::new` split two ways | yes — `issues/isolation/` |
 | B6 | bcachefs | `read_extents` sizes from on-disk file size (not a live kernel path) | latent | +2 | — |
 | B7 | bcachefs | `to_byte_offset` unchecked multiply | latent | +3, or 0 under B5 | — |
 | S1 | toyos-sched | invariant T is a type on the idle path, convention on the run path | not today; ledger claims CT | +2 variants | B5's own observed bug |
 | S2 | toyos-sched | kick obligation is a `must_use` lint | not today | **−25**, `Kick` enum deleted | — |
 | S3 | toyos-sched | `TaskShared`'s state machine is `pub` | no live misuse | +1 gated impl | — |
-| S4 | toyos-sched | `!Sync` re-derived by a runtime flag at the boundary | no — correct today | 0 | adjacent to `specs/issues/panic-path/` |
-| S5 | toyos-sched | the wait-registration drop bomb cannot fire on the kill path | **yes — the filed leak, plus O(n) dequeue** | −`VecDeque`, −`AtomicBool`+3 accessors, O(n)→O(1) | yes — `specs/issues/kernel/` files the leak, not the cause |
+| S4 | toyos-sched | `!Sync` re-derived by a runtime flag at the boundary | no — correct today | 0 | adjacent to `issues/panic-path/` |
+| S5 | toyos-sched | the wait-registration drop bomb cannot fire on the kill path | **yes — the filed leak, plus O(n) dequeue** | −`VecDeque`, −`AtomicBool`+3 accessors, O(n)→O(1) | yes — `issues/kernel/` files the leak, not the cause |
 | S6 | toyos-sched | sentinel vruntime `0` for RT tasks | yes — cited in `Frontier::advance`'s comment | ~0 | yes, in-tree citation |
 | L1 | toyos-ld | eleven parallel `Vec<(u64, ..)>` and three duplicated emit blocks | latent; adding a kind is silently incomplete | **−170, and all 17 which-integer comments** | — |
 | L2 | toyos-ld | `vaddr` means VA, vmaddr or RVA by format; shared reloc engine | yes — unit-blind overflow checks; two swappable params | +`.0` at arithmetic sites | — |
@@ -1526,4 +1526,4 @@ which currently carries a `_` for the bool it does not want.
 6. **L2 + L4** — together, once L1 and L3 have proved the verification harness.
 7. **S5** — already owed by the scheduler spec; needs a loom model for the new link.
 8. **S2, S1, S6, S3** — S6 wants the `thread_coverage_pct` A/B that
-   `specs/issues/kernel/` criterion 2 demands of anything near `pop_surplus`.
+   `issues/kernel/` criterion 2 demands of anything near `pop_surplus`.

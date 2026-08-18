@@ -223,7 +223,7 @@ impl core::fmt::Display for Answer {
 /// `slot 1` names two different devices and nothing reading the log can tell
 /// which. That is not hypothetical: a harness assertion counting endpoint
 /// recoveries counted the boot disk's as a mouse's on three CI runs
-/// (`specs/issues/hardware/xhci-hid-break-counts-any-endpoint-3.md`), and the
+/// (`issues/hardware/xhci-hid-break-counts-any-endpoint-3.md`), and the
 /// same shape counted the boot stick's transport recovery as the disk under
 /// test's (`…/usb-transport-break-counts-the-boot-sticks-recovery.md`).
 ///

@@ -950,7 +950,7 @@ fn assert_toolchain_is_honest(stage2: &Path) {
 /// serialisation, and two agents cannot both conclude the toolchain is stale
 /// and both start `x.py build` in the same directory. That pair is what left a
 /// half-written `librustc_driver` for cargo to probe, and cargo memoises a
-/// failed probe (`specs/issues/build/`).
+/// failed probe (`issues/build/`).
 ///
 /// The steps are ordered, and each invalidates what it makes stale rather than
 /// threading a `rebuilt` flag through: a step that decides for itself still

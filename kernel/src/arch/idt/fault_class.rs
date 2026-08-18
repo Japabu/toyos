@@ -13,7 +13,7 @@
 //! and the crash report that would have named the null call were therefore
 //! never written, the shared boot said nothing for the whole 88 s guard, and
 //! the defect underneath is still unbisectable
-//! (`specs/issues/kernel/the-shared-boot-jumped-to-null-spawning-sched-stress.md`).
+//! (`issues/kernel/the-shared-boot-jumped-to-null-spawning-sched-stress.md`).
 //!
 //! [`Ring`] is the repair. It is opaque and its one constructor takes a code
 //! segment selector, so a privilege level cannot be read out of a faulting

@@ -345,7 +345,7 @@ corrupt one thing in a hand-built volume and require the matching complaint.
 **It is stronger than what it replaces, and that was measured rather than
 assumed.** A development-time A/B ran 59 corruptions through both: no arm where
 `fsck_msdos` complained and the checker was silent, and twelve where the checker
-complains and fsck does not — including the two `specs/issues/filesystem/`
+complains and fsck does not — including the two `issues/filesystem/`
 records fsck missing outright, a stale FAT mirror and duplicate 8.3 short names.
 The hand-built fixture passes `fsck_msdos -n` clean, so it is a real volume.
 
@@ -353,7 +353,7 @@ The hand-built fixture passes `fsck_msdos -n` clean, so it is a real volume.
 `toyos-fat32/tests/` builds its volumes with `newfs_msdos` and populates them
 through a `hdiutil` mount, which is the point of that suite — our reader against
 bytes we did not write. Replacing those two is a larger job and is scoped in
-`specs/issues/filesystem/fat32-suite-needs-macos-binaries.md`. Nothing in the
+`issues/filesystem/fat32-suite-needs-macos-binaries.md`. Nothing in the
 *guest* suite touches them.
 
 `ps -Ao comm=` and `getloadavg` — the other two host calls the harness makes —
@@ -395,7 +395,7 @@ does not, so an AMD host ran userland with `SS = 0x18` and the first `iretq`
 back to such a thread died on "SS.RPL must equal CS.RPL". QEMU's `helper_sysret`
 implements Intel's wording, which is why no TCG guest anywhere — runner or dev
 host — can see the class. Fixed in `arch/percpu.rs`; the surviving record is
-`specs/issues/kernel/sysret-ss-attrs-unfixed.md`, the residual the RPL fix does
+`issues/kernel/sysret-ss-attrs-unfixed.md`, the residual the RPL fix does
 not reach.
 
 **The reusable part is the shape of the blind spot**, not the bug. A guest that
@@ -478,7 +478,7 @@ them itself and the classes are worth separating:
 - **`ALONE: GREEN` — the classification, not the tree.** `i8042_quarantine`,
   `i8042_fadt_denial`, `hda_client_stall`, `cache_eviction`, `nvme_large_device`,
   `usb_flush_optional`, `screen_console_scroll`, `metal_sim_input`. Every one is
-  `Sched::Parallel` and every one is on `specs/issues/design-debt/`'s list or
+  `Sched::Parallel` and every one is on `issues/design-debt/`'s list or
   belongs on it. Two lanes on four cores is still two guests.
 - **Input delivery, and this is the real finding.** `desktop_typing_damage` (6
   of 16 echoes, *alone*), `i8042_mouse` ("1007 of the 1007 packets injected came
@@ -494,7 +494,7 @@ them itself and the classes are worth separating:
   the guest is wrong" — and it is the next thing to settle.
 - **Two audio reds.** `hda_tone` with `1 mid-tone silences`, which the #88
   exemption correctly does not cover, and `audio_tone_load (smp=8)` timing out
-  with eight vCPUs on four cores. Both are `specs/issues/audio/` shapes.
+  with eight vCPUs on four cores. Both are `issues/audio/` shapes.
 - **`doom_sound_flood`**, timed out at 300 s wide and 104 s alone against 4–26 s
   here. Not input and not obviously the clock.
 - **`usb_storage_shapes`** — `the driver did not report "blocks of 4096 B"`,
@@ -550,7 +550,7 @@ was a variable this tree had never had a second data point on.
 `metal_sim_pointer_churn` was the harness sampling a console that had not caught
 up, and is fixed — the count waits for its evidence now instead of sleeping 400 ms
 for it. `xhci_flap` survives three collapsed replugs and stops on the fourth;
-that is a driver defect CI found, written up in `specs/issues/hardware/` and
+that is a driver defect CI found, written up in `issues/hardware/` and
 not fixed here.
 
 ### What the configuration is now, and what each part of it cost
@@ -594,7 +594,7 @@ both in the harness:
   ran is worse than one that pays for a boot.
 - **A `===TEST_END` naming another test is the previous one's.** The name has
   been on the wire since the runner was written and was parsed and thrown away;
-  taking it was `specs/issues/build/`'s cascade, where one timed-out test
+  taking it was `issues/build/`'s cascade, where one timed-out test
   made every later member of the block read a window that opened on its
   predecessor's output — 110 of 238 red on an "actual" that was verbatim the
   previous expectation.
@@ -631,7 +631,7 @@ the harness:
   `metal_sim_pointer_churn`, `usb_transport_break`, and `xhci_flap` from the
   probe. Every one drives `device_add`/`device_del` over QMP, every one is red
   again alone, and every one is green under TCG on the same runner image and the
-  same QEMU. `specs/issues/hardware/`. **`usb_transport_break` is closed and
+  same QEMU. `issues/hardware/`. **`usb_transport_break` is closed and
   belonged to the family only by its symptom** — it drives no QMP at all, and
   what it shared with the rest is the one variable: a guest running 50x faster
   wins a race against the device that a TCG guest loses.
@@ -695,7 +695,7 @@ as it was the only machine.
   replugs and stops on the fourth under KVM, and is green under TCG on the same
   runner image and the same QEMU, and green here — because the accelerator runs
   the guest about fifty times further between the host's two QMP writes
-  (`specs/issues/hardware/`). CI found a real driver defect the dev host has no
+  (`issues/hardware/`). CI found a real driver defect the dev host has no
   way of constructing.
 - **A machine that can run these guests natively at all.** The "every component
   within 2× of a production OS" bar is unmeasurable under cross-arch TCG, whose
@@ -717,7 +717,7 @@ as it was the only machine.
   `HostSlots`, `buildlock::guest_slot`, `qemu::budget`'s width multiplier and the
   whole `ALONE: GREEN` classification are untestable on a runner *by
   construction* — there is never a second guest for the first to contend with.
-  `specs/issues/design-debt/`'s parallel-red class is a dev-host phenomenon and CI
+  `issues/design-debt/`'s parallel-red class is a dev-host phenomenon and CI
   says nothing about whether it is fixed.
 - **Whether a `Sched::Parallel` is right.** Same reason: the answer requires two
   guests. Every CI retry is the width-1 kind and says only that a test failed
@@ -799,7 +799,7 @@ went with the command.
   are not (3.37× and 210×, on four cores QEMU itself warns about). **Still do
   not move the tier**: a runner's `wakes` are 1.6× the dev host's in every
   config, so it would need its own recorded sample
-  (`specs/issues/audio/gate-a-has-no-runner-baseline.md`), and one run is one
+  (`issues/audio/gate-a-has-no-runner-baseline.md`), and one run is one
   sample of a spread.
 - **An ARM runner running aarch64 guests.** Not possible: no `/dev/kvm` on
   `ubuntu-24.04-arm` and no HVF on `macos-latest`. An aarch64 guest there would
@@ -867,7 +867,7 @@ number is what it is, never to decide whether a name is on the list.
 
 | test | red | shard | `Sched` | what it says |
 |---|---|---|---|---|
-| ~~`usb_transport_break`~~ | ~~**5/5**~~ | 6 | Serial | **CLOSED** — the Bulk-Only Reset raced the transfer it recovered from (`specs/issues/hardware/`) |
+| ~~`usb_transport_break`~~ | ~~**5/5**~~ | 6 | Serial | **CLOSED** — the Bulk-Only Reset raced the transfer it recovered from (`issues/hardware/`) |
 | `std_unwind` | **5/5** | 10 | shared block | `exit code Some(-1)` — a #MF, §9.3 |
 | `std_unwind_so` | **5/5** | 10 | shared block | the same |
 | `metal_sim_null_audio` | **5/5** | 11 | Serial | soundd did not present a null sink on a device-less machine — **closed**, see below |
@@ -881,7 +881,7 @@ number is what it is, never to decide whether a name is on the list.
 
 **The top five reproduce and are therefore defects, not noise.** Four of them
 fail identically every time; `hda_tone` misses one rep and is
-`specs/issues/audio/`'s open item, which #88's exemption correctly does not
+`issues/audio/`'s open item, which #88's exemption correctly does not
 cover.
 
 **Two are closed and the defect was in this file's own subject matter, not in
@@ -893,7 +893,7 @@ soundd presents its null sink on every one of those boots; what differed is that
 init spawns its programs without waiting, so the ready marker orders nothing
 about a daemon's own first line — and these two were the only tests reading that
 line through a span of host wall clock. Both wait on the guest now.
-`specs/issues/hardware/` has the table and the half-second of skew between two
+`issues/hardware/` has the table and the half-second of skew between two
 init children that the probe found and did not explain, which is §7's contention
 class showing up somewhere new.
 
@@ -905,7 +905,7 @@ of why the earlier lists looked like they rotated.
 **The bottom six are a rate and the rate is 20–40%, which is not "noise" either.**
 The bar this work was measured against is "green means green, red means a real
 defect, and a re-run tells you which"; one run in five is far above the one in
-fifty that bar treats as tolerable. Each is named in `specs/issues/` with
+fifty that bar treats as tolerable. Each is named in `issues/` with
 this number beside it, and none is a candidate for an `EXPECTED_FAILURES` entry —
 an exemption names a defect and its write-up, and "fires 40% of the time for
 reasons nobody has looked at" is not one.
@@ -1003,7 +1003,7 @@ guest (2)   FAIL hda_two_live_refused  ALONE: red again — the defect is real.
   claimed to keep what a red run left had uploaded nothing, ever.
 - **Six names, and every one of them is on a list with a number beside it.**
   Five are §9.2's; `xhci_slow_connect` is 0 of 5 in the rate probe and is
-  `specs/issues/hardware/`'s own entry — a 1 ms margin inside the guest's boot
+  `issues/hardware/`'s own entry — a 1 ms margin inside the guest's boot
   that reds whenever anything moves boot by ten milliseconds.
 
 So **a red run is now readable without a second run**: the name, the sentence,
@@ -1023,7 +1023,7 @@ CI green, and none of it is CI.
 transport red was a driver defect the dev host is structurally unable to see: a
 Bulk-Only Reset issued while the device could still answer the transfer it was
 recovering from, which a TCG guest is too slow to reach in time and a KVM guest
-wins every run (`specs/issues/hardware/`). `probe-xhci-break.yml` is what
+wins every run (`issues/hardware/`). `probe-xhci-break.yml` is what
 settled it — the §7.3 pattern with a **control arm that drops main's driver back
 into the branch's tree**, so the reproduction and the fix are measured on one
 runner in one session: control 3 of 3 red, fixed 3 of 3 green, run
@@ -1141,7 +1141,7 @@ names reproducing on every run. Three closed on 2026-08-08 —
 `metal_sim_null_audio` and `hda_two_live_refused` two harness waits taken over a
 span of host wall clock — and **three remain**: `std_unwind` and `std_unwind_so`
 (x87 state on the context switch, §9.3) and `hda_tone`'s mid-tone silence
-(`specs/issues/audio/`). Each has an owner and a write-up. **Widening
+(`issues/audio/`). Each has an owner and a write-up. **Widening
 `EXPECTED_FAILURES` to cover them is refused** — an exemption names a defect and
 its write-up, and buying a green run while any Ring 3 process can kill the next
 unrelated one scheduled on that CPU is not that.
@@ -1363,7 +1363,7 @@ rate about the tree.**
   `soundd: client ` and `1 removed` came back either side of four kernel `exit:`
   accounting lines, so the test counted one removal of two and waited out its
   300 s guard. A userland line is several `write`s —
-  `specs/issues/diagnostics/serial-console-has-no-line-atomicity.md` — and this
+  `issues/diagnostics/serial-console-has-no-line-atomicity.md` — and this
   pair collides *systematically*, because soundd prints a client's removal
   exactly while the kernel prints that client's exit. soundd writes whole lines
   now; the other 176 `eprintln!` sites in `userland/` do not.
@@ -1467,7 +1467,7 @@ the eight are closed by this section's work. The two that are not:
   desktop test's boot happens to lose, and it took `desktop_window_child` and
   `desktop_audio_client` here. 2 of 10 per desktop boot, and a suite has four of
   them.
-- **`screen_pager_keys`** (`specs/issues/diagnostics/screen-pager-keys-red-on-main.md`),
+- **`screen_pager_keys`** (`issues/diagnostics/screen-pager-keys-red-on-main.md`),
   bisected there to a merge whose two parents are both green, and open.
 
 So the §10.4 trigger is reachable on luck and not on state, and **that is worth
@@ -1763,7 +1763,7 @@ same guest under cross-arch TCG. The thorough tier compares against a *recorded
 sample*, and the recorded one is the dev host's, so a runner's tier cannot use
 it: **it needs its own baseline, taken on a runner.** This run printed one, as
 the `toml:` lines it exists to print, and
-`specs/issues/audio/gate-a-has-no-runner-baseline.md` carries the whole sorted
+`issues/audio/gate-a-has-no-runner-baseline.md` carries the whole sorted
 sample so it survives the artifact's 30-day retention.
 
 What is left before the owner could move the tier: this is **one** run, so each

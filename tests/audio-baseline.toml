@@ -92,7 +92,7 @@
 # The one statistic that separated the arms was audio_tone.smp8 wake lateness:
 # 6691 with the sink off, 7346 with it on (recorded 6658). That is the ESP
 # log's residual flush cost on the idle path, not drift, and it is written up
-# in `specs/issues/boot-media/` rather than recorded here.
+# in `issues/boot-media/` rather than recorded here.
 #
 # Drift note, FIFTH instance, 2026-08-15, and the first one measured against
 # the sample below rather than against a superseded one — so the instrument

@@ -185,7 +185,7 @@ property of the design, and it is why §1.1's "read every hunk" instruction has
 to be obeyed on every future flash rather than trusted once.
 
 **`capture` being a no-op no longer implies a lost report.** The dead gate is
-still open (`specs/issues/panic-path/panic-console-capture-untested.md`: `screen_late_panic` passes with `capture`'s
+still open (`issues/panic-path/panic-console-capture-untested.md`: `screen_late_panic` passes with `capture`'s
 body replaced by `return`), but `daabd3c` established that capture's original
 reason is gone — retention (`3108e3a`) means `live_tail` after the flush
 returns the same text. So the consequence of the untested path has changed from

@@ -320,7 +320,7 @@ inliner enables itself only when
 **rustc's MIR inliner is off in every guest build today.** Harmless under LLVM,
 which inlines for itself. Load-bearing the moment a backend switch is attempted,
 because cg_clif has no inliner of its own (§5) and MIR is then the only one
-there is. Filed: `specs/issues/build/profile-toyos-incremental-disables-mir-inliner.md`.
+there is. Filed: `issues/build/profile-toyos-incremental-disables-mir-inliner.md`.
 
 ## 5. The blocking list, by the project that owns each item
 

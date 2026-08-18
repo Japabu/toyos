@@ -192,7 +192,7 @@ until it has consumed `header.len - count` bytes. A peer sending
 `len = u32::MAX` and then nothing parks the server thread forever. Grepping
 `MAX_` across `toyos/src/` and `toyos-abi/src/` returns exactly one constant —
 `Poller::MAX_HANDLES` — so the SDK has no frame bound at all. Same class as
-`specs/issues/`' "a client's request is an allocation request", with a thread as
+`issues/`' "a client's request is an allocation request", with a thread as
 the resource instead of memory.
 
 **Both ways.**
@@ -317,7 +317,7 @@ covers both.
 `rust/library/std/src/sys/pal/toyos/tls.rs:30`.
 
 The doc says "Panics in the kernel if module_id is invalid or allocation fails."
-The kernel has not panicked here since the hardening pass `specs/issues/` records at
+The kernel has not panicked here since the hardening pass `issues/` records at
 line 245: `tls_alloc_block` returns `InvalidArgument` for `module_id == 0` and
 for a module not in the process's list, and `ResourceExhausted` past
 `DTV_INITIAL_CAPACITY`. `sys_tls_alloc_block` encodes them with `e.to_u64()`.
@@ -579,7 +579,7 @@ connection to scope ownership to even if it wanted one; `tcp_close`,
 679, 703`). `for id in 0.. { tcp_close(TcpSocketId(id)) }` closes every TCP
 socket on the machine.
 
-This is `specs/issues/isolation/`'s class exactly, in a userland daemon's namespace, and
+This is `issues/isolation/`'s class exactly, in a userland daemon's namespace, and
 §7 of the spec tabulates kernel integers only. The spec supplies the mechanism
 (`SYS_HANDLE_SEND`/`RECV`) and assigns no obligation; no stage A–F touches netd.
 
@@ -855,7 +855,7 @@ a comment about why the tail is not garbage and becomes the precondition of
 **Delta.** Two functions (12 lines) become one type (~20 lines); three call
 sites. **Fork impact: none.**
 
-Distinct from `specs/issues/`' "the bootloader sizes every allocation from a file
+Distinct from `issues/`' "the bootloader sizes every allocation from a file
 the ESP handed it" — that entry is about the *bound*, which `MAX_ESP_FILE` now
 supplies; this is about the *type* the bounded allocation comes back in.
 
@@ -1229,7 +1229,7 @@ message this audit measured a padding leak in. §11 is a net **−1 syscall**
   a resurrection assert). The obvious reduction — "just require `on_zero_handles`
   to take no locks" — is a discipline rule, which is precisely what the spec
   rejects and precisely the class that has already bitten this codebase
-  (`specs/issues/panic-path/`). The machinery earns its place.
+  (`issues/panic-path/`). The machinery earns its place.
 - **§6.1's two pipe-end types.** `PipeReadEnd` with no write method makes
   "write to a read end" a compile error instead of a `Rights` check. This is
   strictly better than the `Rights::READ`/`WRITE` bits it partly duplicates, and

@@ -127,7 +127,7 @@ fn a_connection_peer_killed_in_the_read() {
 
     // **`NotFound` and not `Gone`**, which `specs/capability-endowment-spec.md`
     // §5 asks for and
-    // `specs/issues/isolation/a-broken-pipe-answers-not-found.md` is about;
+    // `issues/isolation/a-broken-pipe-answers-not-found.md` is about;
     // `connect_before_serve` asserts the same word for the same reason. What
     // this arm is for is the *release* — on a kernel where the killed thread's
     // stranded `Arc` kept the read end alive, this write succeeds — and either

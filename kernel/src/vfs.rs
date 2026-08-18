@@ -70,7 +70,7 @@ pub trait FileSystem: Send {
     /// `bcachefs::Mounted::list` has no count primitive and `btree::collect_all`
     /// under it builds the whole entry set first. Their check is on the result,
     /// so it makes the refusal uniform without making the allocation bounded —
-    /// see `specs/issues/isolation/untrusted-input-panics.md`.
+    /// see `issues/isolation/untrusted-input-panics.md`.
     fn list(&mut self, limit: usize) -> Result<Vec<(String, u64)>, SyscallError>;
 
     /// When `name` was last written, in whatever epoch the mount keeps.

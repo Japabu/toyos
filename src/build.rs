@@ -311,7 +311,7 @@ fn config_targets(root: &Path, config: &SystemConfig) -> Vec<(PathBuf, Clean)> {
 /// One name, passed to every `cargo build` here and declared by every crate
 /// root the image is made of. `--release` used to be a flag on `cargo run`, and
 /// it silently turned `debug-assertions` and `overflow-checks` off — the two
-/// knobs `specs/issues/`'s crafted-ELF panics were *found* by. There is
+/// knobs `issues/`'s crafted-ELF panics were *found* by. There is
 /// no longer a second profile to pick, which is why there is no longer a flag.
 pub const PROFILE: &str = "toyos";
 
@@ -471,7 +471,7 @@ fn assert_kernel_is_softfloat(path_env: &str) {
 /// [`PROFILE`] states them and `--release` is gone from this build system, so
 /// the way they can still be lost is somebody editing `[profile.toyos]`. This
 /// asks the artifact rather than the manifest, which is the only question worth
-/// asking: `specs/issues/`'s two crafted-ELF kernel panics were both
+/// asking: `issues/`'s two crafted-ELF kernel panics were both
 /// *found* by an overflow check, and one of them had no configuration in which
 /// it was an error return.
 fn assert_overflow_checked(what: &str, image: &[u8]) {

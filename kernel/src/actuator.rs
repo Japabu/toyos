@@ -135,7 +135,7 @@ actuators! {
     /// lives past the shipped 10 s once, let alone twice. Only the period
     /// moves: the counter, the fields and the halt/spin behaviour underneath
     /// are the shipped ones. See `i8042_quarantine`'s idle-trip check,
-    /// `specs/issues/kernel/i8042-quarantine-health-line-count-is-vacuous.md`.
+    /// `issues/kernel/i8042-quarantine-health-line-count-is-vacuous.md`.
     sched_fast_health = "sched-fast-health";
 
     /// Script the input core directly at end of boot. QEMU activates one input
@@ -480,7 +480,7 @@ actuators! {
     /// is a CPU that will never reach a scheduler pass. What the gate reads is
     /// the *console*: before `Drain::Inline` a boot that stopped here produced
     /// nothing whatsoever, including everything it had logged
-    /// (`specs/issues/diagnostics/pre-idle-wedge-says-nothing.md`), because the
+    /// (`issues/diagnostics/pre-idle-wedge-says-nothing.md`), because the
     /// only two drains in the machine were the timer tick and the idle loop.
     /// `specs/log-architecture-spec.md` §4.1.
     pre_idle_wedge = "pre-idle-wedge";

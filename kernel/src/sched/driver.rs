@@ -72,7 +72,7 @@ pub fn preempt_off<R>(f: impl FnOnce(&PreemptOff) -> R) -> R {
 /// read-modify-writes.** `preempt::disable` is `lock add` and `enable` is a
 /// `lock sub` plus a `need_resched` poll that can reach `do_preempt`, which is
 /// a scheduling pass — and one locked RMW per log line cost 350 ms of boot
-/// (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`). `IrqGuard` is
+/// (`issues/hardware/one-rmw-per-log-line-cost-350ms.md`). `IrqGuard` is
 /// `pushfq`/`pop`/`cli` with `push`/`popfq` on drop: no locked operation at
 /// all, and on the dominant path `IF` is already clear.
 pub struct IrqOff(());

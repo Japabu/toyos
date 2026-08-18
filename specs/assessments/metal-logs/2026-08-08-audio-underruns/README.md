@@ -36,7 +36,7 @@ Two things it had been hiding. `hda_tone`'s dither ratio read 3.2–3.3% against
 an expected 25% — QEMU's audio core was resampling 48000 → 44100 into the wav
 backend and smearing soundd's ±1 LSB dither away — and it reads 24.4–25.6% with
 the fix, so **every earlier `hda_tone` measurement was taken through a
-resampler**, the phase-break count of `specs/issues/audio/` / #88 included. And
+resampler**, the phase-break count of `issues/audio/` / #88 included. And
 `phase_breaks` cannot see the error itself: an 8.8% pitch error perturbs its
 recurrence by ~12 LSB against a 400 LSB tolerance.
 

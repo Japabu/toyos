@@ -1193,7 +1193,7 @@ pub fn xhci_slow_connect(
     /// guest's own clock and the settle re-reads it every `PORT_POLL_NS`, so the
     /// spread is a millisecond of polling and not a share of the host. Six runs
     /// here — three sequential, three with four concurrent test processes on the
-    /// machine — put the first port line at 0.400-0.402 s, and `specs/issues/`
+    /// machine — put the first port line at 0.400-0.402 s, and `issues/`
     /// records one at 0.413 under five-agent load. 13 ms of worst observed
     /// excursion against 150 of slack, and 700 of clearance to the shape above.
     const SETTLE_SLACK_S: f64 = 0.150;
@@ -1224,7 +1224,7 @@ pub fn xhci_slow_connect(
     // a delta from `controller started` instead compared a delta against an
     // absolute window, which silently required the boot to reach its controller
     // within `PORT_DEBOUNCE_NS`: a budget it has since grown out of, and four
-    // red runs and an afternoon in the driver (`specs/issues/`).
+    // red runs and an afternoon in the driver (`issues/`).
     let started = stamp_of(&log, "xHCI: controller started")?;
     // The first line this driver prints about any port at all. Every other
     // per-port line is preceded by that port's connect line, so the first match
@@ -1280,7 +1280,7 @@ pub fn xhci_slow_connect(
     // cost against this boot's `Boot: complete`, and the stamp reached only the
     // per-run UART file, which goes when the guest does. So the measurement had
     // to instrument something — and the lesson
-    // `specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md` leaves is that
+    // `issues/hardware/one-rmw-per-log-line-cost-350ms.md` leaves is that
     // the reading taken on an instrumented build is the one that misleads. One
     // line of output, `i8042_absent`'s arrangement, and the obligation is
     // re-runnable by anybody. It decides nothing: what is asserted is that the
@@ -1515,7 +1515,7 @@ pub fn usb_transport_break(
     // summed both, and on CI run 31684437719 the boot stick's clean
     // status-phase recovery at 2.616 s (one break, one retry, `SCSI 0x35`,
     // slot 1) pushed the total from the injected disk's real 2 to 3 and reddened
-    // the run (`specs/issues/hardware/usb-transport-break-counts-the-boot-sticks-recovery.md`).
+    // the run (`issues/hardware/usb-transport-break-counts-the-boot-sticks-recovery.md`).
     let under_test = broke_on(staged[0])?;
 
     // And the driver got over it. Two attempts are explained by the fault — the
@@ -2035,7 +2035,7 @@ fn hid_break_boot(
     // that, e.g. `31405969578` shard 10, where the disk's own
     // `slot 1 endpoint 3` and `slot 1 endpoint 4` at 2.639 s were counted beside
     // the mouse's and the keyboard's
-    // (`specs/issues/hardware/xhci-hid-break-counts-any-endpoint-3.md`).
+    // (`issues/hardware/xhci-hid-break-counts-any-endpoint-3.md`).
     let mut recovered: Vec<(&str, usize)> = Vec::new();
     for (_, who) in &broken {
         let running = format!("xHCI: {who} endpoint 3 is Running, recovering");

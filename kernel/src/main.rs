@@ -235,7 +235,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // **A kernel thread answers from its own row and never from the two words
     // below**, because for one of them the words do not merely give the wrong
     // answer — they give a *nondeterministic* one. `syscall_rip` is never
-    // cleared (`specs/issues/panic-path/syscall-rip-never-cleared.md`), so a
+    // cleared (`issues/panic-path/syscall-rip-never-cleared.md`), so a
     // kernel task reads whatever user thread last ran on this CPU left behind:
     // the same panic on the same build would recover or halt depending on which
     // CPU work stealing had put the thread on. `sched::kthread` is where the
@@ -609,7 +609,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // unbootable. The log volume is not — it is a diagnostic partition whose
     // worst loss is the diagnostic, and `toybox` writes to it. That the log
     // file itself is unprotected is the residual; see
-    // `specs/issues/boot-media/log-is-userland-writable.md`.
+    // `issues/boot-media/log-is-userland-writable.md`.
     match fat32_adapter::mount(Role::Boot) {
         Some(fs) => vfs::lock().mount(Role::Boot.mount(), Box::new(fs), UserAccess::KernelOnly),
         None => log!("boot-volume: not mounted; the kernel has no /boot this boot"),

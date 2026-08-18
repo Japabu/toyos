@@ -751,7 +751,7 @@ Three things follow:
    doom build can point `cc` at our own tool and the binary leaves the path
    entirely — which is the self-hosting answer rather than a workaround.
 
-Not filed in `specs/issues/`: audit §12 is populating `specs/issues/build/`
+Not filed in `issues/`: audit §12 is populating `issues/build/`
 and another agent owns it. This should be cross-filed by whoever lands next
 there.
 

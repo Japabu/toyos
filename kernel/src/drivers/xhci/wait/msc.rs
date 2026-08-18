@@ -599,7 +599,7 @@ impl XhciController {
         // started from and whatever else is plugged in — and an unnamed
         // `transport broke` cannot be attributed to either, which is how a
         // harness assertion came to count the boot stick's own recovery against
-        // the disk under test (`specs/issues/hardware/`).
+        // the disk under test (`issues/hardware/`).
         let slot = self.slot(dev.slot_id);
         for attempt in 1..=MAX_TRANSPORT_ATTEMPTS {
             match self.bot(dev, cdb, cdb_len, data_phys, data_len, data_in) {
@@ -873,7 +873,7 @@ impl XhciController {
     /// driver sends. That is a second broken transfer out of one fault, and a
     /// caller's write lost with it. Whether the window opens at all is a race
     /// between the guest and the device, which is why the dev host has never
-    /// seen it and CI reproduces it every run (`specs/issues/hardware/`).
+    /// seen it and CI reproduces it every run (`issues/hardware/`).
     ///
     /// [`Owed`](super::Owed) is what keeps that order rather than a comment.
     /// Everything this says to the device is [`Self::reset_the_device`], whose

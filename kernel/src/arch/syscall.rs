@@ -1930,7 +1930,7 @@ fn sys_shm_map(h: RawHandle) -> u64 {
 /// carries it, so everything that can be moved can be moved on: the
 /// non-transitive grant the pid ACL had is not expressible, and making it so
 /// is a rights word on *both* move paths rather than on this one
-/// (`specs/issues/isolation/a-moved-handle-is-always-re-movable.md`).
+/// (`issues/isolation/a-moved-handle-is-always-re-movable.md`).
 fn sys_handle_send(conn_h: RawHandle, handles: &crate::user_ptr::UserBytes, count: usize) -> u64 {
     let mut wanted = [RawHandle(0); MAX_TRANSFER_HANDLES];
     for (i, slot) in wanted.iter_mut().enumerate().take(count) {

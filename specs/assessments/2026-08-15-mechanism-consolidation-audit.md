@@ -65,7 +65,7 @@ five symbols, `rg -F` finds **0 of 5** as live code. `iouring-blocking-spec.md`
 **Nothing reds when a spec cites a file that no longer exists** — and as of the
 day before this audit was recorded, nothing reds when a spec cites a deleted
 *issue* either. `src/docs.rs` held `every_named_issue_file_resolves` (dangling
-`specs/issues/<area>/<slug>.md` pointers anywhere in the tree),
+`issues/<area>/<slug>.md` pointers anywhere in the tree),
 `every_issue_is_well_formed`, and the parsers' negative gate. It was **deleted
 whole on 2026-08-14 by `8d0db10`, an explicit owner ruling: "no tests over
 documentation."**
@@ -88,7 +88,7 @@ spec on `wt/toyos-compl` leans on that gate explicitly. Its §19 says
 `every_named_issue_file_resolves` *"walks every text file in the tree and reds
 on"* a citation whose issue was closed, and its chunk table calls it *"the real
 gate, not 'it compiles', which is a tautology"* for the twelve
-`specs/issues/` closures C13 performs. **That gate no longer exists.** The
+`issues/` closures C13 performs. **That gate no longer exists.** The
 twelve closures and their full-path citations now have nothing checking them.
 
 ---
@@ -131,7 +131,7 @@ numbers still resolve**.
 `rg -n 'deadline|timeout|nanos_since_boot' kernel/src/drivers/nvme.rs` → **0
 hits**. Task #171 ("one bounded-wait primitive, then the NVMe controller
 contract") is marked completed; whatever it delivered did not reach NVMe.
-`specs/issues/kernel/driver-waits-without-a-deadline.md` is the existing entry.
+`issues/kernel/driver-waits-without-a-deadline.md` is the existing entry.
 
 **What a completed pipeline 2 deletes — measured span by span:** ~**520 LOC of
 pure dual-notification bookkeeping** (the 8 watcher stores, the `Source` enum
@@ -342,7 +342,7 @@ allocator, pagination, an i8042-polled pager that works with every CPU halted.
 What exists instead of a console→compositor handoff (task #89 is pending) is
 **three boot images** (`bootable.img`, `bootable-diag.img`,
 `bootable-console.img`) — the real N-implementations finding for this concept.
-`specs/issues/hardware/kernel-log-unreadable-once-userland-owns-the-screen.md`
+`issues/hardware/kernel-log-unreadable-once-userland-owns-the-screen.md`
 states the trade.
 
 ### 1.6 Spawn and lifecycle — the scheduler half is already one
@@ -429,7 +429,7 @@ gate* asserting exactly that; merging would be a correctness defect).
 and its one call from `handle.rs:57-69`. There is no second way to end a process
 for a handle bug. Of 32 handle-access sites, 28 reach it; four fold
 `BadHandle`/`Stale`/rights-denied into one silent arm. One is a live defect
-(`specs/issues/kernel/a-poll-on-a-refused-handle-waits-forever.md`).
+(`issues/kernel/a-poll-on-a-refused-handle-waits-forever.md`).
 
 **Limit idioms: eleven, and the plurality is correct.** At the trust boundary
 there are exactly two (`InvalidArgument`, `ResourceExhausted`), which is what
@@ -607,7 +607,7 @@ implementation of a format we invented" inverts under this ruling: a real
 bcachefs implementation has upstream itself as the outside judge, which is the
 strongest possible answer to the defect history recorded in §1.4.
 
-`specs/issues/kernel/bcachefs-crate-is-not-bcachefs.md` carried this question at
+`issues/kernel/bcachefs-crate-is-not-bcachefs.md` carried this question at
 `status: owner` since 2026-08-01. This is its answer; the entry is updated in the
 same commit as this document and is now work rather than a question.
 
@@ -641,15 +641,15 @@ fixed here. Each was re-verified against `71a0559` before filing.
 
 | finding | issue |
 |---|---|
-| **CRITICAL** — a `MAP_FIXED` mapping is invisible to `find_gap`, so the next anonymous `mmap` can panic the kernel from userland | `specs/issues/kernel/map-fixed-is-invisible-to-the-va-allocator.md` |
-| `toyos-cc` honours designated array indices for globals and silently ignores them for locals | `specs/issues/build/toyos-cc-drops-local-array-designators.md` |
-| `process_poll_add` folds a refused handle into a silent arm and pushes a poll nothing can complete | `specs/issues/kernel/a-poll-on-a-refused-handle-waits-forever.md` |
-| `thread_exit` `.unwrap()`s a table entry its own neighbour documents as raceable | `specs/issues/kernel/main-thread-exit-unwraps-a-reaped-entry.md` |
-| std's `SystemTime::now` returns the epoch while libc reads the real clock | `specs/issues/build/std-systemtime-now-returns-the-epoch.md` |
-| `MAX_CPUS` is defined three times and nothing pins the copies together | `specs/issues/kernel/max-cpus-is-defined-three-times.md` |
-| `arch/tlb.rs`'s spin constant is defended by a false claim about the clock | `specs/issues/design-debt/tlb-spin-comment-names-a-clock-that-is-not-read.md` |
-| `kthread.rs` states a 16 KiB kernel stack; it is 128 KiB | `specs/issues/design-debt/kthread-comment-states-the-wrong-stack-size.md` |
-| `SYS_PROCESS_OPEN`'s latent panic — **not filed; the entry exists** | `specs/issues/kernel/process-open-panics-on-a-reopened-process.md` |
+| **CRITICAL** — a `MAP_FIXED` mapping is invisible to `find_gap`, so the next anonymous `mmap` can panic the kernel from userland | `issues/kernel/map-fixed-is-invisible-to-the-va-allocator.md` |
+| `toyos-cc` honours designated array indices for globals and silently ignores them for locals | `issues/build/toyos-cc-drops-local-array-designators.md` |
+| `process_poll_add` folds a refused handle into a silent arm and pushes a poll nothing can complete | `issues/kernel/a-poll-on-a-refused-handle-waits-forever.md` |
+| `thread_exit` `.unwrap()`s a table entry its own neighbour documents as raceable | `issues/kernel/main-thread-exit-unwraps-a-reaped-entry.md` |
+| std's `SystemTime::now` returns the epoch while libc reads the real clock | `issues/build/std-systemtime-now-returns-the-epoch.md` |
+| `MAX_CPUS` is defined three times and nothing pins the copies together | `issues/kernel/max-cpus-is-defined-three-times.md` |
+| `arch/tlb.rs`'s spin constant is defended by a false claim about the clock | `issues/design-debt/tlb-spin-comment-names-a-clock-that-is-not-read.md` |
+| `kthread.rs` states a 16 KiB kernel stack; it is 128 KiB | `issues/design-debt/kthread-comment-states-the-wrong-stack-size.md` |
+| `SYS_PROCESS_OPEN`'s latent panic — **not filed; the entry exists** | `issues/kernel/process-open-panics-on-a-reopened-process.md` |
 
 On the last: that issue already records both the panic and the fact that
 `SysCap::open_process` has no caller. This audit adds one disposition option it

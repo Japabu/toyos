@@ -5,7 +5,7 @@ copied byte for byte. Five froze. They are the best capture the machine has
 given: seven boots of one image inside seven minutes, with the healthy and the
 frozen side by side.
 
-Committed because the analysis in `specs/issues/kernel/` cites specific lines of
+Committed because the analysis in `issues/kernel/` cites specific lines of
 specific files, and a scratchpad path does not survive the session. Precedent is
 `toyos-hda/`, which is host-tested against the committed H0 dumps of both
 machines.

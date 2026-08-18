@@ -446,7 +446,7 @@ impl Shard {
 ///
 /// **One bit, and it is what keeps the producer's path free of locked
 /// read-modify-writes.** Without it every commit would pay `claim_wake`'s CAS,
-/// and `specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md` measured what
+/// and `issues/hardware/one-rmw-per-log-line-cost-350ms.md` measured what
 /// one of those per line costs under TCG: 350 ms of boot. What a producer pays
 /// here is a fence and a relaxed load; the five locked operations of the post
 /// are paid at most once per park, by whichever producer wins the swap.

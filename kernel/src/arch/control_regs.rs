@@ -284,7 +284,7 @@ fn opt(value: u64, bit: u64, name: &'static str) -> &'static str {
 /// **The dev host cannot answer this and no test asserts on it.** QEMU's TCG
 /// models no cache, so `CR0.CD` there is a bit with no timing consequence, and
 /// a KVM guest does not hold the bit at all — an AP that never cleared `CD`
-/// reads it clear (`specs/issues/kernel/ap-control-registers-inherit-init.md`).
+/// reads it clear (`issues/kernel/ap-control-registers-inherit-init.md`).
 /// The number is bare metal's, not a VM on
 /// it, and the owner takes it with
 /// `--diag-boot --kernel-param control-regs-bench`, off the panel.

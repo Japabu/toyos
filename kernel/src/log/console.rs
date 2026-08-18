@@ -197,7 +197,7 @@ pub fn drain_locked(guard: &mut BackendGuard) {
 /// `klogd` never wakes, so it never reaches `user::post_readiness`, so **the one
 /// machine shape this whole design exists for posts no log readiness at all**
 /// and `/bin/logd` parks for ever with `/log` unwritten
-/// (`specs/issues/diagnostics/a-console-less-machine-posts-no-log-readiness.md`).
+/// (`issues/diagnostics/a-console-less-machine-posts-no-log-readiness.md`).
 ///
 /// Advancing costs nothing that machine had: the records stay in their shards
 /// for the panel, which reads them through `snapshot_committed` and not through
@@ -342,7 +342,7 @@ impl<F: FnMut(&[u8])> core::fmt::Write for Line<F> {
             // `LogRecord::tagged(&str)` beside `Display` would be tidier and is
             // a *sysroot* change: §11 lands the ABI alone and it has already
             // landed, so this branch composes instead of reopening it.
-            // `specs/issues/diagnostics/a-console-tag-is-composed-by-replacing-a-bracket.md`.
+            // `issues/diagnostics/a-console-tag-is-composed-by-replacing-a-bracket.md`.
             //
             // If that leading bracket ever goes, the fragment passes through
             // whole: a visible `[kernel [0.1 …` beats a line silently missing

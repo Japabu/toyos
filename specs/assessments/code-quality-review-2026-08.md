@@ -85,7 +85,7 @@ where a file has moved since, the mark says where it went.
   each) while `read_dr6` and `context` have one each, from the #DB handler.
   Delete the five (git history is the shelf), keep the two, drop the allow.
   Folds into the crate-level `allow(dead_code)` entry, now filed as
-  `specs/issues/build/` by `451edff`.
+  `issues/build/` by `451edff`.
 - **`mtrr.rs`** — keep as-is, no new comment. It is the read-only decoder
   behind the one log line that diagnoses a mis-typed scanout on any future
   machine; the owner's question was a knowledge gap, not a code defect.
@@ -98,7 +98,7 @@ where a file has moved since, the mark says where it went.
   assert!(offset_of!(..) == N)` that pin the struct to literals and bind none
   of the 47. Target: `offset_of!` fed into asm as `const` operands — one
   source, asserts delete. **Must precede any PerCpu field surgery.** Filed as
-  `specs/issues/design-debt/`.
+  `issues/design-debt/`.
 - **`percpu.rs` fields** — **OPEN, confirmed.** All 22 consumed except
   `lapic_id`, which still has zero readers outside the file (`percpu.rs:81`
   declared, `:270` written, never read); drop it after the offset unification.
@@ -139,7 +139,7 @@ where a file has moved since, the mark says where it went.
   `claim_health(from: u8, to: u8)` (`:324`) as its transition — an enum with a
   transition method is the Rust form. ThinkPad mentions: see doctrine §1.5 —
   the sweep is **much larger than the "~20 sites across six kernel files" this
-  verdict recorded**; see the hardware-name entry in `specs/issues/design-debt/`.
+  verdict recorded**; see the hardware-name entry in `issues/design-debt/`.
 - **`panic_console/`** — **AFFIRMED, no rewrite, and the owner's own question
   is what it answers.** It already seizes the scanout from whoever holds it
   (direct-map write, WC + sfence), arms before serial, never paints on
@@ -147,7 +147,7 @@ where a file has moved since, the mark says where it went.
   decision (virtio-gpu's scanout needs the lock/poll family a panic path must
   never join, and that config has serial). Obligations elsewhere: the
   current-scanout-descriptor seam when mode-setting arrives; the capture test
-  (`specs/issues/panic-path/`, "Nothing distinguishes `panic_console::capture` from a
+  (`issues/panic-path/`, "Nothing distinguishes `panic_console::capture` from a
   no-op") remains the real gap.
 - **`xhci/`** — **SUBSTANTIALLY DONE, `2e81ae8`.** The one targeted extraction
   — the **port state machine** behind a register-access trait with a host
@@ -165,7 +165,7 @@ where a file has moved since, the mark says where it went.
 `bootloader/main.rs:164`, `bcachefs_adapter.rs:17` ("now runs the whole way" —
 still present, verbatim), `log_file.rs` narration (46% of its 564 lines are
 comment lines) — all fall to the one-time codebase-wide sweep under doctrine
-§1.5. **OPEN**, and now filed with its measurements as `specs/issues/design-debt/` rather
+§1.5. **OPEN**, and now filed with its measurements as `issues/design-debt/` rather
 than living only here, because five of the owner's 35 notes were this one
 position and none of them had a home an agent would find.
 
@@ -190,7 +190,7 @@ position and none of them had a home an agent would find.
 - **`process.rs`** — **OPEN**, 1,743 lines. Target: the lifecycle
   (created/running/zombie/reaped, kill-in-transit, wait) joins the simulated
   core in `toyos-sched`'s discipline; capability-handles defines what a process
-  *owns*, the state machine what it *is*. #142/#156 (`specs/issues/kernel/`) are the
+  *owns*, the state machine what it *is*. #142/#156 (`issues/kernel/`) are the
   standing evidence that its bugs are interleaving bugs.
 - **`main.rs` gates / `usb_gate.rs` / `input_merge_test.rs`** — **OPEN**,
   doctrine §1.6. `usb_gate` stays (hardware is the subject; a raw block device
@@ -209,12 +209,12 @@ position and none of them had a home an agent would find.
   stamping once) with sinks — serial, file, screen — as independent consumers
   with explicit backpressure: a slow sink drops-and-counts, never blocks, does
   no unbounded work in scheduler-adjacent paths, fails alone. Filed as an open
-  question in `specs/issues/design-debt/` with the file inventory attached.
+  question in `issues/design-debt/` with the file inventory attached.
 - **Kernel layout** — **OPEN, question for the owner.** 39 flat `.rs` files in
   `kernel/src/` beside seven subdirectories (`arch/`, `drivers/`, `elf/`,
   `iommu/`, `loader/`, `mm/`, `sched/`). Target: subsystem directories (fs/,
   ipc/, input/, proc/, log/, time/ — the syscall split already forces one).
-  Same `specs/issues/design-debt/` entry as the log question, because the owner asked both
+  Same `issues/design-debt/` entry as the log question, because the owner asked both
   in one note.
 - **`block.rs:73`** — **OPEN, and this verdict was wrong.** It said the private
   `PAGE_SIZE = 4096` "dedups to mm's export". **`mm` exports no 4 KiB
@@ -227,7 +227,7 @@ position and none of them had a home an agent would find.
   stats).
 - **`mm/region.rs`** — **OPEN, already filed.** The file's own TODOs are the
   verdict: `KernelSlice::from_raw` lets any caller invent base and size in a
-  type whose purpose is bounds. Covered in full by `specs/issues/design-debt/`,
+  type whose purpose is bounds. Covered in full by `issues/design-debt/`,
   "`KernelSlice::from_raw` cannot check the one thing that makes the type
   safe", which carries the three call sites and the fix shape. Open question
   for the deep dive: whether `check`'s `offset + len` arithmetic holds under
@@ -237,7 +237,7 @@ position and none of them had a home an agent would find.
   types (the `into_fd`/`mem::forget` dance at `toyos/src/lib.rs:120-124` is the
   symptom, still there), one error story, docs; aligned with capability-handles
   since that changes what a handle is. This crate must eventually survive
-  crates.io and upstream reviewers. Overlaps `specs/issues/design-debt/`'s "`Fd` is a
+  crates.io and upstream reviewers. Overlaps `issues/design-debt/`'s "`Fd` is a
   Unix-ism" and "`SharedToken` is a bare `u32` with no RAII", which are two
   instances of it.
 - **`compositor` / `soundd`** — **compositor DONE (`763712b`, `72705d9`);
@@ -280,14 +280,14 @@ Order deliberately unassigned.
     core/effects split has not started.
 11. **OPEN** — the comment-policy sweep + hardware-name scrub + gates
     quarantine + kernel directory layout (one mechanical wave). Filed with
-    measurements in `specs/issues/design-debt/`.
+    measurements in `issues/design-debt/`.
 12. **OPEN** — small deletions from §2 (gdt shim, empty AP hook, debug tools,
-    percpu items) — can ride any adjacent task. Filed in `specs/issues/design-debt/`.
+    percpu items) — can ride any adjacent task. Filed in `issues/design-debt/`.
 
 ## 4. The review channel
 
 `jan-review` was a message channel, not code: notes were read as a diff against
-main, converted to verdicts here and entries in `specs/issues/`, and never landed.
+main, converted to verdicts here and entries in `issues/`, and never landed.
 **The branch and its worktree are deleted** (2026-08-08) — a judgement reachable
 only from a branch nobody reads is a judgement that does not exist, and the
 notes had already begun to rot against files that moved underneath them
@@ -305,37 +305,37 @@ All 35 notes from `60855a4` and `d5b492e`, verbatim, with where each went.
 
 | # | Site | Note | Destination |
 |---|---|---|---|
-| 1 | `bootloader/main.rs:164` | why so long comments? | §2 comment policy; `specs/issues/design-debt/` comment sweep |
+| 1 | `bootloader/main.rs:164` | why so long comments? | §2 comment policy; `issues/design-debt/` comment sweep |
 | 2 | `arch/apic.rs` `init_timer_ap` | why? | §2 arch/ — OPEN, delete the ceremony |
 | 3 | `arch/gdt.rs` | no empty files no lazy refactorings | §2 arch/ — OPEN, delete the shim |
 | 4 | `arch/idt/mod.rs` `from_raw` | all of this mapping is brittle … can we use macros smarter and reduce code and complexity? | **ANSWERED `9bd7a9e`** (`idt_vectors!`) |
-| 5 | `arch/mod.rs` | `#[allow(dead_code)]` on `debug` — why is that needed? | §2 arch/ — OPEN, five uncalled tools; `specs/issues/build/` + `specs/issues/design-debt/` |
+| 5 | `arch/mod.rs` | `#[allow(dead_code)]` on `debug` — why is that needed? | §2 arch/ — OPEN, five uncalled tools; `issues/build/` + `issues/design-debt/` |
 | 6 | `arch/mtrr.rs` | what is this for? do we still need / want this? | §2 arch/ — answered, keep as-is |
 | 7 | `arch/percpu.rs` `PerCpu` | are all of those fields needed? | §2 — OPEN, `lapic_id` is the one dead field |
-| 8 | `arch/percpu.rs` asserts | verifies against constants but doesnt guarantee the constants are the same used in e.g. `preempt.rs` | **`specs/issues/design-debt/`** — 47 `gs:[N]` sites bound to nothing |
+| 8 | `arch/percpu.rs` asserts | verifies against constants but doesnt guarantee the constants are the same used in e.g. `preempt.rs` | **`issues/design-debt/`** — 47 `gs:[N]` sites bound to nothing |
 | 9 | `arch/percpu.rs` `alloc_percpu` | why not set all fields? do we have sentinels here? | §2 — OPEN, 8 of 22; sentinel is asm wire format and stays |
 | 10 | `arch/syscall.rs` | way too big … full analysis / refactor / rewrite … more testable and less architecture specific | §2 arch/, deep dive 2 — OPEN, 2,248 lines |
-| 11 | `bcachefs_adapter.rs:17` | "now runs the whole way" thats narration slop | `specs/issues/design-debt/` comment sweep — still present |
+| 11 | `bcachefs_adapter.rs:17` | "now runs the whole way" thats narration slop | `issues/design-debt/` comment sweep — still present |
 | 12 | `block.rs:73` | `PAGE_SIZE` belongs to the paging subsystem no? | §2 — OPEN; the recorded verdict was wrong, mm exports no such constant |
 | 13 | `drivers/acpi.rs` | can we make this more compile time safe and use more object oriented type checked patterns? | §2 drivers/, deep dive 8 — OPEN, `toyos-acpi` |
-| 14 | `drivers/i8042/mod.rs` | never mention ThinkPad in the kernel source code | **`specs/issues/design-debt/`** — 6 ThinkPad + 59 T14 sites in kernel `.rs` |
+| 14 | `drivers/i8042/mod.rs` | never mention ThinkPad in the kernel source code | **`issues/design-debt/`** — 6 ThinkPad + 59 T14 sites in kernel `.rs` |
 | 15 | `drivers/i8042/mod.rs` | pretty big … might include C isms | §2 drivers/ — one found: `HEALTH: AtomicU8` wants an enum |
 | 16 | `drivers/panic_console/mod.rs` | this is our BSOD … no matter who claimed the gpu we take it … do you agree? does this need a rewrite? | §2 drivers/ — **agreed, no rewrite**; that is what it already does |
 | 17 | `drivers/xhci/mod.rs` | really big. refactor / analysis / rewrite? | **SUBSTANTIALLY DONE `2e81ae8`**; `specs/plans/xhci-port-machine-plan.md` |
 | 18 | `elf.rs` | can maybe be moved into a crate and tested, is that true? | **ANSWERED — yes. `e2c6a06` + `42b29c9`** |
 | 19 | `input_merge_test.rs` | what is this, does this belong here? | §1.6 — a cfg-gated actuator; target is `kernel/src/gates/` |
 | 20 | `loader.rs` | splittable into a crate and testable? | **PARTLY `42b29c9`**; plan/execute split still owed |
-| 21 | `log.rs` | should we redesign and rewrite the log subsystem and rethink the kernel's file/folder structure? | **`specs/issues/design-debt/` — OPEN QUESTION for the owner**, evidence attached |
-| 22 | `log_file.rs` | theres slop narration in the comments | `specs/issues/design-debt/` comment sweep — 46% comment lines |
-| 23 | `main.rs:3` | `#![allow(dead_code)]` why? | **FILED `451edff`** — `specs/issues/build/`, 49 hidden warnings |
+| 21 | `log.rs` | should we redesign and rewrite the log subsystem and rethink the kernel's file/folder structure? | **`issues/design-debt/` — OPEN QUESTION for the owner**, evidence attached |
+| 22 | `log_file.rs` | theres slop narration in the comments | `issues/design-debt/` comment sweep — 46% comment lines |
+| 23 | `main.rs:3` | `#![allow(dead_code)]` why? | **FILED `451edff`** — `issues/build/`, 49 hidden warnings |
 | 24 | `main.rs:552` | those test gates … arent they a bit intrusive? … more use of host tests? | §1.6 — correctly gated, target is quarantine + extraction |
-| 25 | `main.rs` (end) | the whole codebase has too many comments. good code speaks for itself | **`specs/issues/design-debt/`** — the consolidated entry |
-| 26 | `mm/region.rs:12` | look at all TODOs | **already filed** — `specs/issues/design-debt/` `KernelSlice::from_raw`; still exactly two, tree-wide |
+| 25 | `main.rs` (end) | the whole codebase has too many comments. good code speaks for itself | **`issues/design-debt/`** — the consolidated entry |
+| 26 | `mm/region.rs:12` | look at all TODOs | **already filed** — `issues/design-debt/` `KernelSlice::from_raw`; still exactly two, tree-wide |
 | 27 | `process.rs` | huge. crate? test? | §2, deep dive 7 — OPEN, 1,743 lines |
-| 28 | `sched/driver.rs` | so many comments … refer to the spec and let the code speak? | `specs/issues/design-debt/` comment sweep |
+| 28 | `sched/driver.rs` | so many comments … refer to the spec and let the code speak? | `issues/design-debt/` comment sweep |
 | 29 | `symbols.rs` | crate material / host testable? | §2, deep dive 5 — OPEN, 293 lines |
 | 30 | `usb_gate.rs` | what is this? | §1.6 — a cfg-gated actuator; stays, hardware is its subject |
-| 31 | `user_ptr.rs:246` | `#[allow(dead_code)]` why? audit all places of this | **ANSWERED `4353289`** — `user_slice_of_mut` deleted; the audit is `specs/issues/build/` |
+| 31 | `user_ptr.rs:246` | `#[allow(dead_code)]` why? audit all places of this | **ANSWERED `4353289`** — `user_slice_of_mut` deleted; the audit is `issues/build/` |
 | 32 | `toyos/src/lib.rs` | audit this whole crate for a super clean and ergonomic api surface | §2, deep dive 9 — OPEN |
 | 33 | `compositor/main.rs` | too big. rewrite / refactor, migrate to host tests? | **DONE `763712b` + `72705d9`** |
 | 34 | `console/main.rs:214` | allow more keys like arrow | §2 — PARKED, arrows belong to a shell that does not exist |

@@ -4,7 +4,7 @@ name: green-probe
 # so a stall in one costs the others nothing
 # (specs/assessments/ci-plan-assessment-2026-08.md §9.1, §10.9).
 # The current name list answered its question there; `git log` on this file
-# has each prior target. `specs/issues/hardware/metal-sim-pointer-churn-red-again-on-main.md`
+# has each prior target. `issues/hardware/metal-sim-pointer-churn-red-again-on-main.md`
 # is the open question this shape is next aimed at — edit the name list below
 # and push to `ci/probe-green` to run it.
 #

@@ -137,7 +137,7 @@ pub const RELEGATED: &[Relegated] = &[
                  nondeterminism §4.3 exists to forbid. Two boots, and the second (the \
                  `klogd-panic` actuator) is the cost; the spawn half alone is one \
                  cheap boot, and \
-                 specs/issues/build/klogd-hosted-pays-two-boots-for-one-fast-verdict.md \
+                 issues/build/klogd-hosted-pays-two-boots-for-one-fast-verdict.md \
                  is the split that puts it back in the fast tier. What still runs per \
                  pull request: every boot's console output is klogd's drain, so the \
                  thread starving or dying is visible in any test that reads a line.",

@@ -397,16 +397,16 @@ name going red.
 
 | class | owner | why nothing else can | receipt |
 |---|---|---|---|
-| **Which vendor's reading of an instruction the kernel depends on** — `syscall`/`sysret`, segment loads, `iret`'s privilege checks | **KVM CI** | QEMU's helpers implement Intel's wording, so a TCG guest gives you one vendor and the dev host has no other. The vendor a job draws is a lottery, so the gate is *the matrix*, not one job | `specs/assessments/ci-plan-assessment-2026-08.md` §7: `STAR[63:48]` green on the dev host in every run there had ever been; eight EPYC runners lost **64 boots of 64**, two Xeon runners passed. `specs/issues/kernel/sysret-ss-attrs-unfixed.md` |
+| **Which vendor's reading of an instruction the kernel depends on** — `syscall`/`sysret`, segment loads, `iret`'s privilege checks | **KVM CI** | QEMU's helpers implement Intel's wording, so a TCG guest gives you one vendor and the dev host has no other. The vendor a job draws is a lottery, so the gate is *the matrix*, not one job | `specs/assessments/ci-plan-assessment-2026-08.md` §7: `STAR[63:48]` green on the dev host in every run there had ever been; eight EPYC runners lost **64 boots of 64**, two Xeon runners passed. `issues/kernel/sysret-ss-attrs-unfixed.md` |
 | **CPU state leaking between processes at native FPU speed** | **KVM CI** | The x87 `#MF` reproduced 5 of 5 on KVM and never on the dev host; the isolating probe changed one control word and nothing else | `specs/assessments/ci-plan-assessment-2026-08.md` §9.3, §10.8; `probe-x87` run `31260763462`, arms `0x037E` 3/3 red and `0x037F` 3/3 green; `src/redlist.rs` rows for `std_unwind`, `std_unwind_so` |
-| **Device races the guest only reaches at native speed** | **KVM CI** | KVM runs the guest ~50× further between the host's two QMP writes. `usb_transport_break` was 5 of 5 red on CI, green on the dev host *and* green under TCG on the same runner image and the same QEMU | `probe-xhci-break.yml` run `31264371902`: control arm 3/3 red, fixed arm 3/3 green, one runner, one session. `specs/issues/hardware/xhci-flap-wedges-under-kvm.md` |
-| **When two runnable tasks first run** | **KVM CI** | Two siblings spawned 1–3 ms apart reach their first line 0.53–0.56 s apart with the order flipping between reps; on the dev host the same pair is ~30 ms apart in spawn order every time, because its TCG runs one vCPU at a time | `specs/issues/hardware/process-start-skew-on-a-runner.md` |
-| **Contention: two guests on one machine, the whole `ALONE: GREEN` class** | **the dev host, loaded** | A shard is one guest per machine at `--jobs 1`. There is never a second guest for the first to contend with, so the class is untestable on a runner *by construction* | `specs/assessments/ci-plan-assessment-2026-08.md` §8.2; `specs/issues/build/parallel-tests-red-under-other-suites.md`; nine of the ten dev-host-only red names in `src/redlist.rs` are `Instrument::DevHostLoaded` |
-| **Concurrent unmaps deadlocking two shootdown initiators** | **the dev host, loaded** — found; **loom** — gated | Every one of the seven wide-phase failures was green run alone. The field signature is not a gate; the gate is the model that replays the schedule | `specs/issues/audio/wide-phase-reds-under-load.md`; `0c79fb5`; loom's `an_initiator_answers_while_it_waits` |
+| **Device races the guest only reaches at native speed** | **KVM CI** | KVM runs the guest ~50× further between the host's two QMP writes. `usb_transport_break` was 5 of 5 red on CI, green on the dev host *and* green under TCG on the same runner image and the same QEMU | `probe-xhci-break.yml` run `31264371902`: control arm 3/3 red, fixed arm 3/3 green, one runner, one session. `issues/hardware/xhci-flap-wedges-under-kvm.md` |
+| **When two runnable tasks first run** | **KVM CI** | Two siblings spawned 1–3 ms apart reach their first line 0.53–0.56 s apart with the order flipping between reps; on the dev host the same pair is ~30 ms apart in spawn order every time, because its TCG runs one vCPU at a time | `issues/hardware/process-start-skew-on-a-runner.md` |
+| **Contention: two guests on one machine, the whole `ALONE: GREEN` class** | **the dev host, loaded** | A shard is one guest per machine at `--jobs 1`. There is never a second guest for the first to contend with, so the class is untestable on a runner *by construction* | `specs/assessments/ci-plan-assessment-2026-08.md` §8.2; `issues/build/parallel-tests-red-under-other-suites.md`; nine of the ten dev-host-only red names in `src/redlist.rs` are `Instrument::DevHostLoaded` |
+| **Concurrent unmaps deadlocking two shootdown initiators** | **the dev host, loaded** — found; **loom** — gated | Every one of the seven wide-phase failures was green run alone. The field signature is not a gate; the gate is the model that replays the schedule | `issues/audio/wide-phase-reds-under-load.md`; `0c79fb5`; loom's `an_initiator_answers_while_it_waits` |
 | **Memory ordering** | **loom, or nobody** | x86's TSO makes every load an acquire and every store a release, so **no guest test on the only architecture ToyOS boots can fail on a missing edge**. `Lock::try_lock` loaded with `Relaxed` and CASed with `Acquire` — no synchronizes-with edge ever formed, through a `Lock<T>` that is `unsafe impl Sync`, at eight call sites | `cdc971d`; the negative control reverts the two tokens and loom reports `Causality violation: Concurrent write accesses to UnsafeCell`. Second instance, `3b3d238`: the log shard's reader accepted an uncommitted record 0 on every shard on every boot |
 | **A device whose emulation declines the feature** | **metal** | QEMU reports zero xHCI scratchpad demand and answers `OP_PAGESIZE` bit 0, so a misaligned scratchpad array overlapping slot 2's output context is green everywhere. Found by reading the code against §4.20, not by a test | `specs/assessments/metal-track-history.md`, "What QEMU structurally could not find", `5bb673c`, `71940c1` |
-| **Firmware variance** | **metal** | The T14 hands over an uninitialised 8042 about one boot in seven; QEMU's controller never drops a config write and never resets itself. A rate only repeated boots on the machine can measure | `specs/issues/hardware/t14-hands-over-an-uninitialised-8042.md`: seven boots of one image, six read `cfg=0x77→0x64`, one read `cfg=0x30→0x60` |
-| **Undefined behaviour below the software layer** | **metal** | A memory-type alias on one physical page — WC on one CPU, WB in another's stale TLB — is invisible to TCG, which models no memory types at all, and is the one thing in the freeze window that can stop a machine with no panic, no schedule and no interrupt | `specs/issues/hardware/pulling-the-boot-stick-freezes-the-t14.md` |
+| **Firmware variance** | **metal** | The T14 hands over an uninitialised 8042 about one boot in seven; QEMU's controller never drops a config write and never resets itself. A rate only repeated boots on the machine can measure | `issues/hardware/t14-hands-over-an-uninitialised-8042.md`: seven boots of one image, six read `cfg=0x77→0x64`, one read `cfg=0x30→0x60` |
+| **Undefined behaviour below the software layer** | **metal** | A memory-type alias on one physical page — WC on one CPU, WB in another's stale TLB — is invisible to TCG, which models no memory types at all, and is the one thing in the freeze window that can stop a machine with no panic, no schedule and no interrupt | `issues/hardware/pulling-the-boot-stick-freezes-the-t14.md` |
 | **The emulated path itself, `-cpu qemu64`** | **the nightly TCG shard** — D1, ruled 2026-08-12 | The one-test canary never named a tree defect in any role; a whole shard is what gives the class a reader | §3.3, §6.1 |
 | **CPU state whose only consequence is timing on silicon** | **the metal track** — D6, ruled 2026-08-12 | Both automated gates are green on it for opposite reasons — KVM clears the bit, TCG models no cache — so there is no automation to write and the owner is a session, not a job | §3.4, and the checklist in it |
 
@@ -442,7 +442,7 @@ The cleanest single "dev host red, CI green" pair is `screen_pager_keys`: `QUIET
 0 of 5` on CI against `FIRES 3 of 3` on the dev host **alone**, with the dev-host
 row explicitly ruling load out — the gate that produced one of them ran at 1.05×
 the reference boot and the failure was byte-identical to the ones taken at load
-11–16 (`specs/issues/diagnostics/screen-pager-keys-red-on-main.md`).
+11–16 (`issues/diagnostics/screen-pager-keys-red-on-main.md`).
 
 ### 3.3 The `tcg` job never named a tree defect, and it leaves the PR path
 
@@ -523,7 +523,7 @@ tree.
   with no timing consequence in the emulator. The dev host read
   `cr0=0xe0000011`.
 
-Both readings are in `specs/issues/kernel/ap-control-registers-inherit-init.md`,
+Both readings are in `issues/kernel/ap-control-registers-inherit-init.md`,
 from one commit. **A defect can be simultaneously invisible to both automated
 gates, in opposite ways — one masking it by fixing it, the other by not
 modelling it.**
@@ -546,7 +546,7 @@ entry naming what to boot, what to read off it, and what closes the entry.
 - **An entry names a measurement, not a topic.** "Check the control registers" is
   not an entry; "one boot with `no-ap-control-regs` armed against one without,
   the delta recorded" is.
-- **An entry names what closes it.** Usually an issue in `specs/issues/`, so the
+- **An entry names what closes it.** Usually an issue in `issues/`, so the
   checklist shrinks by the same mechanism everything else in this tree does.
 - **An entry does not replace the automated tripwire, and the tripwire does not
   replace the entry.** They answer different questions: the gates assert the
@@ -557,7 +557,7 @@ entry naming what to boot, what to read off it, and what closes the entry.
 
 | # | class | the measurement owed | what closes it |
 |---|---|---|---|
-| **1** | **AP control-register state, and what it costs** | **One T14 boot with the `no-ap-control-regs` actuator armed, one without, on the same image in the same session; the delta recorded.** `--kernel-param control-regs-bench` is built and has never been run on silicon — which is why root `CLAUDE.md` records that every multi-CPU measurement this project has taken was of a machine that no longer exists, and why the cost of the defect is still owed rather than known | `specs/issues/kernel/ap-control-registers-inherit-init.md` closed with the two numbers in it |
+| **1** | **AP control-register state, and what it costs** | **One T14 boot with the `no-ap-control-regs` actuator armed, one without, on the same image in the same session; the delta recorded.** `--kernel-param control-regs-bench` is built and has never been run on silicon — which is why root `CLAUDE.md` records that every multi-CPU measurement this project has taken was of a machine that no longer exists, and why the cost of the defect is still owed rather than known | `issues/kernel/ap-control-registers-inherit-init.md` closed with the two numbers in it |
 
 **The automated tripwire for entry 1, named so it is not confused with the
 entry.** `control_regs` asserts that the BSP and every AP agree on the register
@@ -762,7 +762,7 @@ a nightly job that does not exist yet, on a machine that runs 5–17 merges a da
 `toyos-abi` (17 tests) and `toyos-manifest` (6) are in the documentation and in
 no workflow, and `bcachefs` (71) is in neither. **94 host tests that no gate
 runs**, filed as
-`specs/issues/build/three-host-crates-are-tested-nowhere.md`.
+`issues/build/three-host-crates-are-tested-nowhere.md`.
 
 `toyos-manifest`'s round trip is the thing that makes the build system's renderer
 and `/bin/init`'s parser one format, and nothing runs it per pull request. This
@@ -953,10 +953,10 @@ required checks remain how the merged result is gated.
   every other worktree for the length of an ABI change — measured at 35 and 50
   minutes of nobody being able to build, and observed taking the local guest
   suite away entirely (`specs/assessments/ci-plan-assessment-2026-08.md` §8.1).
-- **Its verdicts expire on the host's clock.** `specs/issues/build/the-gate-is-a-full-suite.md`
+- **Its verdicts expire on the host's clock.** `issues/build/the-gate-is-a-full-suite.md`
   has three shapes of it — a boot timeout, a host-staged window the guest slid
   past, and a staged image that was not there — and
-  `specs/issues/build/landing-test-reds-under-a-concurrent-landing.md` is the
+  `issues/build/landing-test-reds-under-a-concurrent-landing.md` is the
   landing-storm form.
 
 **Rejected as a gate; §7 keeps it as the contention instrument, which is the one
@@ -986,7 +986,7 @@ real-time rule.
 ## 6. The nightly contract
 
 **The nightly tier exists and nothing runs it.** The entry is
-`nightly-tier-has-no-workflow` in `specs/issues/build/` — **which does not exist
+`nightly-tier-has-no-workflow` in `issues/build/` — **which does not exist
 on `main` yet**: it arrives with `wt/toyos-slowtests`, and this document is
 written against that branch's `src/tiers.rs` throughout. Opened 2026-08-11, still
 `status: open`:
@@ -1106,7 +1106,7 @@ elsewhere in it.
 |---|---|---|
 | **D1** | **The `tcg` job moves to nightly and leaves the pull-request path.** | The required set becomes four — `host`, `abi-split`, `gate-stage`, `guest-suite` (§5.1). The emulated-path class gets a whole TCG shard nightly instead of a one-test canary (§6.1). **Implementation constraint, and it is load-bearing: a per-run cache writer must stay on the pull-request path**, because `tcg` is what writes the entry the twelve shards read — §3.3 has the property the replacement must satisfy. A separate agent is implementing it. |
 | **D2** | **No merge queue; the repository does not move under an organization.** | §5.4(v) is closed rather than open. What a queue would have bought stays written down as the record; `specs/assessments/ci-plan-assessment-2026-08.md` §10.2's strict required checks remain how the merged result is gated. Larger runners go with it (§2.8). |
-| **D6** | **A defect class whose observable exists only on silicon is owned by the metal track**, and each such class gets a named entry on the metal session checklist. | §3.4 is the doctrine and the checklist. Entry 1 is the AP control-register measurement: one T14 boot with `no-ap-control-regs` armed against one without, the delta recorded, `specs/issues/kernel/ap-control-registers-inherit-init.md` closed. The value-assertions — `control_regs`, `control_regs_verdict`, `control_regs_negative` — stay named as the automated tripwire for a *recurrence*, which is a different question from what the divergence cost. |
+| **D6** | **A defect class whose observable exists only on silicon is owned by the metal track**, and each such class gets a named entry on the metal session checklist. | §3.4 is the doctrine and the checklist. Entry 1 is the AP control-register measurement: one T14 boot with `no-ap-control-regs` armed against one without, the delta recorded, `issues/kernel/ap-control-registers-inherit-init.md` closed. The value-assertions — `control_regs`, `control_regs_verdict`, `control_regs_negative` — stay named as the automated tripwire for a *recurrence*, which is a different question from what the divergence cost. |
 | — | **Self-hosted runners are ruled out.** | §2.6 opens with it, and everything in §2.6–§2.8 is priced against GitHub-hosted runners only. Recorded in one line so the proposal is not re-derived. |
 | — | **The 10 s Fast ceiling is hard, with no margin or hysteresis band** — a measured crossing reds `durations` however close. | It is `FAST_CEILING_MS`'s own doc comment on `wt/toyos-slowtests`, and §2.3 is an instance of it working: `audio_tone` measured 10,790 ms and 11,144 ms in run `31601279765` and was relegated by `118e3b7` because of that run. §5.3 and §4.2 rest on the companion rule from the same date, that only a compute-bound verdict stays Fast. |
 
@@ -1117,7 +1117,7 @@ elsewhere in it.
 | **D3** | **Should `Why` gain a `RealTime` variant** so a timer-anchored test cannot be dragged back into the fast tier by getting cheap (§6.4)? | It encodes his 2026-08-12 ruling in the type rather than in a comment. |
 | **D4** | **How much of §6's contract is in the nightly workflow's scope?** The workflow itself is assigned — a separate agent is building it, carrying D1's TCG shard and its cache-writer constraint. What is not settled is whether that agent also owns §6.3's reader obligation (a nightly red files or updates a `src/redlist.rs` row) and §6.1's duration merge, without which the withheld labels stay frozen and the tier cannot close downward. | A tier with a workflow and no reader is still a bin, so this is a coverage call rather than a scheduling one. |
 | **D5** | **Sweep the real-time rule across the rest of the fast tier now, or wait?** `src/tiers.rs` records the sweep as pending. §5.3 says it removes exactly the three standing flakes from the merge button; it will also relegate more tests, and every one of them lands in a tier with no reader until D4 is answered. **The two are coupled and the order matters.** | A coverage trade. |
-| **D7** | **Which substrate levers, in which order?** §2.7 says the mtime fingerprint (−185 s, already filed) then a pinned prebuilt image (−64 s); build-once is +124 s of solo latency for −41 min of runner time and should wait. A pinned image is also a new registry artifact, which is a dependency-bar question (`specs/issues/build/nothing-checks-the-dependency-bar.md`). | The dependency bar is his, and so is the ordering against everything else in flight. |
+| **D7** | **Which substrate levers, in which order?** §2.7 says the mtime fingerprint (−185 s, already filed) then a pinned prebuilt image (−64 s); build-once is +124 s of solo latency for −41 min of runner time and should wait. A pinned image is also a new registry artifact, which is a dependency-bar question (`issues/build/nothing-checks-the-dependency-bar.md`). | The dependency bar is his, and so is the ordering against everything else in flight. |
 
 ### What this document deliberately does not propose
 

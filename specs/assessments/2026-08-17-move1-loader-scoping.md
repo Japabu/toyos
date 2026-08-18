@@ -358,7 +358,7 @@ The gate is `tests/toyos-rust-tests/src/bin/abuse_kernel_addr.rs`, and it does
 not rest on the syscall's verdict — `SYS_DEBUG` actions 10 and 11 keep sixteen
 bytes of kernel memory with a known value and answer whether they still say it.
 
-**`dlopen`'s missing dedup.** `specs/issues/isolation/dlopen-never-dedups.md`
+**`dlopen`'s missing dedup.** `issues/isolation/dlopen-never-dedups.md`
 (open, 2026-07-30) is precise about what is closed and what is not: the *panic*
 is closed — `find_gap` returning `None` was an `.expect` on three paths in
 `spawn` and two in `sys_dlopen`, a kernel panic in syscall context — and the
@@ -383,7 +383,7 @@ The ones whose subject is a userland-reachable kernel defect in this code:
 | `dbde7ba` | 2026-08-06 | kernel: dlopen's init_out was sixteen bytes of kernel memory |
 | `845ee8a` | 2026-08-07 | elf: a section header table that declares no symbols is not a symbol count |
 
-`specs/issues/isolation/derived-allocations-unbounded.md` records the strongest
+`issues/isolation/derived-allocations-unbounded.md` records the strongest
 single item, and records honestly which of its three routes was demonstrated:
 Route A was two relocation tables of 87,210 entries each — individually accepted
 by `MAX_HEAP_ALLOC`, together producing `GlobalAlloc: dlmalloc asked for 2162688
@@ -441,7 +441,7 @@ this project to refuse.
   *"`bin/toyos-cc`'s 13,152,031 bytes, and `bin/sshd` … at 3,769,757"*. Measured
   on the 2026-08-15 build: toyos-cc **4,382,380**, sshd **2,953,531**. The
   numbers in the justification are stale by roughly 3×. Filed as
-  `specs/issues/design-debt/max-symbol-bytes-justification-is-stale.md`.
+  `issues/design-debt/max-symbol-bytes-justification-is-stale.md`.
 - `DTV_INITIAL_CAPACITY` = 64 is the one whose refusal is not recoverable.
   `tls_alloc_block` (`syscall.rs:2724`) returns `ResourceExhausted` above
   it; the only caller is std's `__tls_get_addr_slow`
@@ -450,7 +450,7 @@ this project to refuse.
   ABI is an address and there is nobody to return an error to. 18 `.so`s already
   sit in the hosted sysroot, each proc-macro one carrying 165 `DTPMOD64` pairs.
   Filed as
-  `specs/issues/isolation/dtv-capacity-is-a-workload-bound.md`.
+  `issues/isolation/dtv-capacity-is-a-workload-bound.md`.
 
 ### 3.3 What a Ring 3 loader would need
 
@@ -481,7 +481,7 @@ image today, and the demand-fault path (`process.rs:1542`) maps a 2 MiB page
 writable if *any* region overlapping it is writable. Library text is already
 writable in this kernel. Move 1 is neutral on W^X, and it removes the
 cross-process half of the problem recorded in
-`specs/issues/isolation/kernelslice-over-user-memory.md`: today one cached image
+`issues/isolation/kernelslice-over-user-memory.md`: today one cached image
 is mapped, writable, into every process that loaded that path.
 
 The first point is a real cost: a Ring 3 loader gets no page-cache sharing, so
@@ -659,9 +659,9 @@ Three, found while measuring, filed rather than fixed:
 
 | finding | issue |
 |---|---|
-| `SO_CACHE` never evicts, has no bound, and is keyed by path with no revalidation of the file behind it | `specs/issues/isolation/so-cache-never-evicts.md` |
-| `DTV_INITIAL_CAPACITY` is a fixed bound over a workload-set quantity whose refusal is `rtabort!` in std | `specs/issues/isolation/dtv-capacity-is-a-workload-bound.md` |
-| `MAX_SYMBOL_BYTES`'s justification cites 13,152,031 and 3,769,757 bytes; measured 4,382,380 and 2,953,531 | `specs/issues/design-debt/max-symbol-bytes-justification-is-stale.md` |
+| `SO_CACHE` never evicts, has no bound, and is keyed by path with no revalidation of the file behind it | `issues/isolation/so-cache-never-evicts.md` |
+| `DTV_INITIAL_CAPACITY` is a fixed bound over a workload-set quantity whose refusal is `rtabort!` in std | `issues/isolation/dtv-capacity-is-a-workload-bound.md` |
+| `MAX_SYMBOL_BYTES`'s justification cites 13,152,031 and 3,769,757 bytes; measured 4,382,380 and 2,953,531 | `issues/design-debt/max-symbol-bytes-justification-is-stale.md` |
 
 Two claims in `specs/assessments/2026-08-15-mechanism-consolidation-audit.md`
 §1.7 are, at `af1b52d`, no longer true and are recorded here rather than edited

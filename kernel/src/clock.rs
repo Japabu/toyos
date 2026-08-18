@@ -93,7 +93,7 @@ pub fn calibrated() -> bool {
 /// It stays an assumption that this does not happen: §2.1 of
 /// `specs/log-architecture-spec.md` rests cross-CPU ordering on an invariant,
 /// firmware-synchronised TSC, and
-/// `specs/issues/kernel/ap-tsc-trail-is-assumed-and-never-checked.md` is the
+/// `issues/kernel/ap-tsc-trail-is-assumed-and-never-checked.md` is the
 /// entry for the fact that nothing measures it.
 pub fn nanos_since_boot() -> u64 {
     let delta = cpu::rdtsc().saturating_sub(TSC_BOOT.load(Relaxed));

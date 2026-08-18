@@ -439,7 +439,7 @@ const PIPE_BUDGET_SHARE: u64 = 8;
 ///
 /// **A mitigation, not a policy anyone chose.** A piped connection's 4 MiB is
 /// charged to nobody — no per-process limit, no pressure signal, no OOM killer
-/// (`specs/issues/isolation/`) — so without a cap a client that opens sockets
+/// (`issues/isolation/`) — so without a cap a client that opens sockets
 /// in a loop walks the machine into exhaustion, and netd has no way to tell
 /// that from ordinary use. Delete this in favour of a kernel memory limit, not
 /// in favour of a bigger number.

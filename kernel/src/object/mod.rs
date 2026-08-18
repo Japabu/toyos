@@ -326,7 +326,7 @@ static ZERO_QUEUE: Lock<Vec<KObjectRef>> = Lock::new(Vec::new());
 /// The drain runs at every syscall exit and every scheduler pass, and
 /// `Lock::lock` is a `fetch_add` — the one operation TCG cannot emit inline,
 /// and a few hundred a boot of it cost 350 ms of boot
-/// (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`). Written under the lock at
+/// (`issues/hardware/one-rmw-per-log-line-cost-350ms.md`). Written under the lock at
 /// both ends, so it never says "empty" over a queued object; a stale
 /// "non-empty" costs one drain that finds nothing.
 static ZERO_PENDING: AtomicBool = AtomicBool::new(false);

@@ -272,7 +272,7 @@ capability migration inherits it.
 **The bug it permits.** Adding `DEVICE_TOUCHPAD = 5` and a `try_claim` arm, and
 forgetting `release`'s arm, gives a device that can be claimed and never
 released — the claim survives process exit, because `release` silently returns
-on an unknown type. Not hypothetical for this tree: `specs/issues/isolation/` records that
+on an unknown type. Not hypothetical for this tree: `issues/isolation/` records that
 `device.rs` recorded five owner PIDs and *nothing outside `release` ever read
 them* until `device::is_owner` was added — the same class from the other
 direction. The metal track is adding device types.
@@ -375,7 +375,7 @@ having whether or not the spec lands.
 **Same file, recorded not filed.** `try_claim`'s framebuffer arm grants
 `info.token` in a loop (`:73-78`); if the second grant fails it returns
 `GrantFailed` with the first still granted. A partial grant with no rollback. It
-matters once grant has a revoke, which `specs/issues/isolation/` keeps open deliberately —
+matters once grant has a revoke, which `issues/isolation/` keeps open deliberately —
 noted so the revoke work knows this call site exists.
 
 ---
@@ -429,7 +429,7 @@ true under both profiles, which is what the three functions that already do it �
 
 **Blast radius.** Four functions, one crate, zero API change.
 
-**Relation to filed work.** Extends `specs/issues/design-debt/`'s `KernelSlice::from_raw`
+**Relation to filed work.** Extends `issues/design-debt/`'s `KernelSlice::from_raw`
 entry. That says the *size* is a caller's assertion; this says that even given a
 correct size, the check against it is not total. Both close under "allocators
 construct the slice", and the `checked_add` stands alone in the meantime.
@@ -446,7 +446,7 @@ landed puts the handles in a child module whose field `pipe.rs` cannot name, and
 different id than the count it bumped is unwritable. `exists` and `creator` are
 deleted rather than kept for careful use, and `sys_pipe_open`'s entitlement
 became a closure evaluated inside the acquisition instead of a fact read a moment
-earlier. `specs/issues/kernel/ftruncate-takes-no-vfs-lock.md` carries the one of
+earlier. `issues/kernel/ftruncate-takes-no-vfs-lock.md` carries the one of
 those three residuals still open.
 
 **Location.** `pipe.rs:171-181`, panicking at `:262-268` / `:270-276`.
@@ -640,7 +640,7 @@ from the wrong quantity):
 
 - **The parameter is named `lba` and carries a 4 KiB filesystem block index.**
   The NVMe driver converts with `sectors_per_block = 4096 / ctrl.sector_size`
-  (`specs/issues/kernel/`). Passing a device LBA where a block index is expected is an
+  (`issues/kernel/`). Passing a device LBA where a block index is expected is an
   8× error on a 512-byte-sector disk, silently reading or writing the wrong
   place — no panic, no error return.
 - **`count` and `buf.len()` must agree and nothing says so.** `page_cache::sync`
@@ -1082,7 +1082,7 @@ whose entire purpose is to be it.
 
 **Blast radius.** Three lines.
 
-**A correction while here.** CLAUDE.md and `specs/issues/isolation/` both say
+**A correction while here.** CLAUDE.md and `issues/isolation/` both say
 "`mm::align_2m` has no checked form, and four callers take their size from a
 device or from userland". `align_2m_checked` **exists** at `mm/mod.rs:34-39`.
 `grep -rn "align_2m(" kernel/src/ | grep -v align_2m_checked` returns four
@@ -1151,7 +1151,7 @@ Impls: `u32`, `u64`, `[u32; 2]`, `[u64; 2]`, `fd::Stat`, `SpawnArgs`,
 memory wholesale, so a `T` with padding publishes uninitialised kernel stack.
 (When this was written it was `user_mut::<T>` and `user_slice_of_mut::<T>`
 handing out a `&mut T`; the copy makes the write more direct, not less.) Not
-hypothetical: `specs/issues/audio/` records
+hypothetical: `issues/audio/` records
 `AudioInfo::as_bytes` doing exactly that, fixed at `4fce59c` by *spelling the
 padding out as named fields with a `const _` size assert*, so omitting one is an
 E0063.
@@ -1201,30 +1201,30 @@ finding above rather than duplicated.**
   four). `PipeId::from_raw` being `pub` and reachable from `sys_pipe_open` is the
   filed defect.
 - `FileBacking` outliving unlink and `NvmeBacking::read_page` re-deriving a block
-  from stale extents (`specs/issues/isolation/`, deliberately unassigned pending the
+  from stale extents (`issues/isolation/`, deliberately unassigned pending the
   capability spec). I looked for the same shape elsewhere: `Descriptor::File`'s
   `path` + `file_id` pair goes stale across a `rename`, but the writes still land
   on the right `file_id`, so it is a wart of the same origin rather than a second
   instance.
 - `gpu::set_resolution` freeing the framebuffer under its consumers
-  (`specs/issues/design-debt/`). The `INFO` overwrite also drops the old `GpuInfo`'s three
+  (`issues/design-debt/`). The `INFO` overwrite also drops the old `GpuInfo`'s three
   `SharedToken`s with no `unregister` — that is the `SharedToken`-has-no-RAII
   item, not a second one.
-- `RingHeader`'s `u32` counters wrapping at 4 GiB (`specs/issues/isolation/`, ASSIGNED).
+- `RingHeader`'s `u32` counters wrapping at 4 GiB (`issues/isolation/`, ASSIGNED).
   §1 above is a different defect in the same struct.
 - The io_uring watcher triple (`add_io_uring_watcher` / `remove_io_uring_watcher`
   / `io_uring_watchers`) copied verbatim into `keyboard.rs`, `mouse.rs`,
   `net.rs`, `audio.rs`, `pipe.rs`, `listener.rs`, each paired with a
-  `wake_waiters` nothing links it to. This is `specs/issues/kernel/`'s "An io_uring
+  `wake_waiters` nothing links it to. This is `issues/kernel/`'s "An io_uring
   `Source` can carry one half of the wake pair", and
   `specs/plans/iouring-blocking-spec.md`'s single `post()` is the designed fix. A trait
   here would move the duplication without closing the pairing, so it would read
   no better — that, not its size, is why it is not a separate finding.
 - `SYS_LISTEN` having no namespace, so `listener::listen(name: &str, ..)` is
-  stringly-typed by design for now (`specs/issues/isolation/`). `Descriptor::Listener` is
+  stringly-typed by design for now (`issues/isolation/`). `Descriptor::Listener` is
   already a `ListenerId` — `e42532f` closed the survivor I was sent to find.
 - `sys_read` blocking on Keyboard and returning `NotFound` on Mouse
-  (`specs/issues/kernel/`), with `waitqs::MOUSE`/`NETWORK` having wakes and no waiters.
+  (`issues/kernel/`), with `waitqs::MOUSE`/`NETWORK` having wakes and no waiters.
   No type can decide which of the two answers is right; the entry already names
   that as the open decision.
 
@@ -1275,7 +1275,7 @@ findings propose copying.
 
 ---
 
-## What deserves promotion to `specs/issues/`
+## What deserves promotion to `issues/`
 
 Not done here — three other agents are writing to that file. In priority order:
 

@@ -15,7 +15,7 @@ uefi-services = { version = "0.23.0", features = ["panic_handler", "logger"] }
 # The one profile every guest binary is built with — `specs/plans/boot-image-split.md`
 # §6. Optimised, because an unoptimised guest mismeasures everything under TCG;
 # debug-assertions and overflow-checks on, because fail-fast beats speed here
-# and both crafted-ELF kernel panics in `specs/issues/` were *found* by
+# and both crafted-ELF kernel panics in `issues/` were *found* by
 # an overflow check. `--release` would turn the last two off silently, so this
 # build system no longer has the flag.
 [profile.toyos]

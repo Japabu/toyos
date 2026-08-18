@@ -110,7 +110,7 @@ jobs:
       # counted.
       #
       # Scoped to those targets rather than the crate:
-      # specs/issues/build/kernel-loom-ungated-models-red-without-loom.md
+      # issues/build/kernel-loom-ungated-models-red-without-loom.md
       # records that `tlb_shootdown.rs` reds deterministically under
       # --no-default-features, on main as much as here.
       - name: kernel-loom without loom
