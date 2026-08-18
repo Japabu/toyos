@@ -154,6 +154,25 @@ changes.
   `[host-slots]` lines. `the close probe exited Some(1)`, `ALONE … GREEN`, and
   `cargo run -- --known-red log_poll_outlives_a_close` answers `NOT ON THE
   LIST`, so this is its first recorded sighting. Not investigated.
+- **`metal_sim_input`** — added 2026-08-18, **1 of 4** runs on
+  `wt/toyos-lifecycle` (kernel delta: `process_poll_add`'s refusal split and
+  `Source::ended_by_its_last_handle`, neither of them on a boot path), inside a
+  window whose own console lines are `[build-lock] waiting for the artifact lock
+  … 26s so far` — another worktree staging an image throughout. `kernel panic:
+  DOUBLE PANIC … after 0 of the sequence`, so it died **before the first
+  injection**, which is the boot and not the test. `ALONE … GREEN` in 2 s
+  against 20 s under load, then green 3 of 3 more alone.
+  `cargo run -- --known-red metal_sim_input` answers `NOT ON THE LIST`.
+
+  **Its mechanism is not this file's census race and it is filed here for want
+  of a better register.** A kernel panic during a loaded boot is
+  `specs/issues/kernel/a-ring-0-fetch-at-0x1b-during-a-loaded-boot.md` and
+  `specs/issues/kernel/the-shared-boot-jumped-to-null-spawning-sched-stress.md`,
+  each of which is one sighting carrying the *guest's own panic text*. This one
+  has none: `TestResult::error` carried the verdict, a failing test's guest
+  console is not printed, and by the time the re-runs were green the capture was
+  gone. **What the next sighting owes is that console**, and the way to get it is
+  a full suite beside a second worktree's — not a search of a passing boot.
 
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits
