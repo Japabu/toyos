@@ -742,6 +742,9 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // under a red is about the run it claims to be about.
     ("stall_is_not_a_verdict", Sched::Parallel, Tier::Fast),
     ("alone_line_reports_the_alone_run", Sched::Parallel, Tier::Fast),
+    // Same: whether two guests can still be handed one lane's NVMe image, which
+    // is what a shared-boot reboot did to itself.
+    ("nvme_image_is_held_by_one_guest", Sched::Parallel, Tier::Fast),
     // Same: the expected-failure declaration asking whether it still refuses the
     // things it exists to refuse.
     ("expected_failure_verdicts", Sched::Parallel, Tier::Fast),
@@ -8098,6 +8101,7 @@ fn run_machine_test(
         "suspend_invalidates_a_verdict" => suspend_invalidates_a_verdict(),
         "stall_is_not_a_verdict" => stall_is_not_a_verdict(),
         "alone_line_reports_the_alone_run" => alone_line_reports_the_alone_run(),
+        "nvme_image_is_held_by_one_guest" => nvme_image_is_held_by_one_guest(),
         "expected_failure_verdicts" => expected_failure_verdicts(),
         "expected_failure_exit_status" => expected_failure_exit_status(),
         "expected_failure_entries" => expected_failure_entries(),
@@ -11342,6 +11346,68 @@ fn alone_line_reports_the_alone_run() -> Result<(), String> {
     Ok(())
 }
 
+/// One live guest holds its lane's NVMe image, and the next one may not.
+///
+/// **The overlap this stages is the one the shared-boot reboot used to
+/// produce.** `qemu = boot()` evaluates its right-hand side first, so the
+/// replacement was launched while the guest it replaced still held the lane's
+/// `test-nvme-*.img` open for write; QEMU's second process exited 1 on its own
+/// image lock, `wait_for_ready` panicked, and the panic escaped the shared
+/// block — 129 of one run's 131 reds on one sentence, 2026-08-17.
+///
+/// The ordering itself is now the type's: `boot` takes a [`qemu::LaneFree`] and
+/// the only thing that makes one out of a guest is `QemuInstance::shutdown`,
+/// which takes it by value. What is left to check at runtime is the claim
+/// underneath — that a hold is real while a guest is up and gone once it is
+/// not — and this checks it on the harness's own registry, in both directions,
+/// with no guest.
+fn nvme_image_is_held_by_one_guest() -> Result<(), String> {
+    // Names, not files: a claim is a hold on a path and touches no disk, so
+    // nothing here has to create or delete a hundred megabytes to ask.
+    let dir = common::lane::dir();
+    let image = dir.join("nvme-claim-gate.img");
+    let other = dir.join("nvme-claim-gate-other.img");
+
+    let held = qemu::NvmeClaim::take(&image).map_err(|why| {
+        format!("a free image refused its first guest: {why}")
+    })?;
+
+    // The overlap. This is the direction that must red, and it is what the
+    // reboot produced.
+    match qemu::NvmeClaim::take(&image) {
+        Ok(_) => {
+            return Err(format!(
+                "a second guest took {}, which a live one is holding — two QEMUs are then \
+                 handed one image and the second dies on its lock",
+                image.display()
+            ))
+        }
+        Err(why) => {
+            // The refusal has to name the image, or it cannot be acted on: a
+            // run makes dozens of guests and the message is all a reader gets.
+            if !why.contains(&image.display().to_string()) {
+                return Err(format!("the refusal does not name the image it is about: {why}"));
+            }
+        }
+    }
+
+    // A different image is not a conflict, or every lane would refuse every
+    // other lane's boot the moment this gate had teeth.
+    let elsewhere = qemu::NvmeClaim::take(&other)
+        .map_err(|why| format!("an unheld image was refused: {why}"))?;
+    drop(elsewhere);
+
+    // And the ordinary reboot: the replacement takes the image the guest it
+    // replaces released. Green, and it is the half a fix that simply refused
+    // every second boot would break.
+    drop(held);
+    let replacement = qemu::NvmeClaim::take(&image).map_err(|why| {
+        format!("a replacement was refused the image its predecessor released: {why}")
+    })?;
+    drop(replacement);
+    Ok(())
+}
+
 /// A blown guard stays red, and stops reading as an answer.
 ///
 /// Both halves, because each fails the other's way round. An implementation
@@ -12418,7 +12484,12 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
             // honest and says which one it died on.
             let mut done = 0usize;
             let outcome = catching(|| {
-                let boot = || {
+                // **The lane is the argument, and it is what makes the reboot
+                // below unwritable in the order that broke it.** `boot` cannot
+                // be called without a `LaneFree`, the only two things that
+                // produce one are this line and `QemuInstance::shutdown`, and
+                // `shutdown` takes the guest by value.
+                let boot = |_: qemu::LaneFree| {
                     QemuInstance::boot_with_options(
                         bins.test_config,
                         bins.c_bins,
@@ -12426,7 +12497,7 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
                         BootOptions { kernel_features: features, ..Default::default() },
                     )
                 };
-                let mut qemu = boot();
+                let mut qemu = boot(qemu::LaneFree::no_guest_yet());
                 let mut reboots = 0usize;
                 for test in &tests {
                     let start = common::clock::mark();
@@ -12445,6 +12516,19 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
                     // alternative is a suite that reports 150 reds it never ran.
                     // Bounded, because a block whose every member kills the
                     // guest must not boot one per test.
+                    //
+                    // **The old guest goes before the new one exists.** This
+                    // was `qemu = boot()`, and Rust evaluates the right-hand
+                    // side first: the replacement was launched, and waited on,
+                    // while the instance it replaced still held the lane's
+                    // `test-nvme-*.img` open for write. It exited 1 on QEMU's
+                    // own image lock before saying anything, `wait_for_ready`
+                    // panicked, and that panic escaped this block — so **every
+                    // test still owed a verdict was reported red on it**. 129
+                    // of one run's 131 reds carried that one sentence on
+                    // 2026-08-17, against two real failures. The ordering is
+                    // now the type's: `shutdown` takes the guest by value and
+                    // is the only thing `boot` can be called with.
                     if result.boot_stopped_answering() && reboots < MAX_SHARED_REBOOTS {
                         reboots += 1;
                         eprintln!(
@@ -12452,7 +12536,7 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
                              ({reboots}/{MAX_SHARED_REBOOTS}) ----",
                             test.name
                         );
-                        qemu = boot();
+                        qemu = boot(qemu.shutdown());
                         result = qemu.run_test(&test.qemu_name, test.timeout);
                     }
                     // Between the test and its check, with the guest still up:

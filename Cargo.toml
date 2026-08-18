@@ -17,6 +17,7 @@
 members = [
     "bcachefs",
     "kernel-elide",
+    "kernel-fault",
     "kernel-loom",
     "kernel-span",
     "toyos-abi",
