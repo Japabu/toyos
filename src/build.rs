@@ -311,7 +311,7 @@ fn config_targets(root: &Path, config: &SystemConfig) -> Vec<(PathBuf, Clean)> {
 /// One name, passed to every `cargo build` here and declared by every crate
 /// root the image is made of. `--release` used to be a flag on `cargo run`, and
 /// it silently turned `debug-assertions` and `overflow-checks` off — the two
-/// knobs `specs/issues/`'s crafted-ELF panics were *found* by. There is
+/// knobs `issues/`'s crafted-ELF panics were *found* by. There is
 /// no longer a second profile to pick, which is why there is no longer a flag.
 pub const PROFILE: &str = "toyos";
 
@@ -436,7 +436,7 @@ const OVERFLOW_CHECK_MARKER: &[u8] = b"attempt to add with overflow";
 /// `RustcAbi::Softfloat` and `+soft-float` in
 /// `rust/compiler/rustc_target/src/spec/targets/x86_64_unknown_none.rs` — and an
 /// edit turning it off would make every bracket in the kernel insufficient
-/// without changing a byte of `kernel/`. `specs/user-machine-state.md` §8.
+/// without changing a byte of `kernel/`.
 ///
 /// Asked of the compiler rather than of the manifest, and once per process: it
 /// is a property of the toolchain rather than of any one image.
@@ -471,7 +471,7 @@ fn assert_kernel_is_softfloat(path_env: &str) {
 /// [`PROFILE`] states them and `--release` is gone from this build system, so
 /// the way they can still be lost is somebody editing `[profile.toyos]`. This
 /// asks the artifact rather than the manifest, which is the only question worth
-/// asking: `specs/issues/`'s two crafted-ELF kernel panics were both
+/// asking: `issues/`'s two crafted-ELF kernel panics were both
 /// *found* by an overflow check, and one of them had no configuration in which
 /// it was an error return.
 fn assert_overflow_checked(what: &str, image: &[u8]) {
@@ -1143,10 +1143,9 @@ pub fn designate_for_format(path: &Path, len: u64) {
 ///
 /// A `cargo test` run boots ~76 machines, and most of those boots ask for an
 /// image some earlier boot already built; the three `cargo` invocations then
-/// take ~1.4 s between them to answer "nothing changed"
-/// (`specs/assessments/test-cost-audit.md` §1.4). In memory and never on disk, so a run gets
-/// one answer for the tree it started against and the next run asks cargo
-/// again.
+/// take ~1.4 s between them to answer "nothing changed". In memory and never on
+/// disk, so a run gets one answer for the tree it started against and the next
+/// run asks cargo again.
 ///
 /// Per part rather than per image, because a part is what a key can be true of:
 /// the kernel is its feature set, the bootloader is its init list, the initrd is
@@ -1605,9 +1604,9 @@ mod tests {
     ///
     /// A name that reappears in `kernel/Cargo.toml` is a 46th kernel, and the
     /// suite would build it without anything saying so — which is the state
-    /// `specs/assessments/test-cost-audit.md` §5.9.7 replaced. The two lists are read from
-    /// the two files that declare them, so neither can be satisfied by editing
-    /// this test.
+    /// collapsing seven per-actuator features into `test-actuators` got out of.
+    /// The two lists are read from the two files that declare them, so neither
+    /// can be satisfied by editing this test.
     #[test]
     fn no_actuator_is_also_a_cargo_feature() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1623,10 +1622,10 @@ mod tests {
 
     /// The features a kernel build may still carry, and the whole list.
     ///
-    /// **The gate on the count this landing is about.** Each name here is a
-    /// kernel `cargo test` may build beside the two, so adding one is a
-    /// decision to pay ~6.9 s of wall clock and ~29.6 s of CPU per full run
-    /// after any kernel edit (§5.9.2) — and `boot-actuators` exists so that
+    /// **The gate on the count.** Each name here is a kernel `cargo test` may
+    /// build beside the two, so adding one is a decision to pay the ~6.9 s of
+    /// wall clock and ~29.6 s of CPU measured for one extra kernel build per
+    /// full run after any kernel edit — and `boot-actuators` exists so that
     /// the answer is almost always a parameter instead.
     #[test]
     fn the_kernel_declares_only_the_builds_that_earned_one() {
@@ -1644,11 +1643,11 @@ mod tests {
                 "test-actuators",
                 // Costs no kernel build at all, for `loom`'s reason: declared
                 // so `cfg` checking knows the name, and turned on only by
-                // `kernel-loom` — to remove §2.6a's two `SeqCst` fences and
-                // prove `log_wake` reds without them.
+                // `kernel-loom` — to remove the log wake path's two `SeqCst`
+                // fences and prove `log_wake` reds without them.
                 "wake-fence-off",
             ],
-            "the kernel declares a feature `specs/assessments/test-cost-audit.md` §5.9.7 does not account for"
+            "the kernel declares a feature this list does not account for"
         );
     }
 
@@ -1695,9 +1694,9 @@ mod tests {
     /// **Every config with a `[boot] start` runs `/bin/logd`, and `logread` is
     /// held by exactly the programs that read a cursor.**
     ///
-    /// `specs/log-architecture-spec.md` §5.1a and §9.5. The kernel stopped
-    /// writing `/log` at L6, so a boot config that does not start `logd` is an
-    /// image whose log partition stays empty for the whole of that boot — and on
+    /// The kernel writes no file — `/bin/logd` owns `/log` and reads records off
+    /// a cursor — so a boot config that does not start `logd` is an image whose
+    /// log partition stays empty for the whole of that boot — and on
     /// the machine this subsystem exists for, a T14 with no serial port, that is
     /// the boot with no record of itself anywhere. A thirteenth config added
     /// later fails the first clause **by default**, which is the direction this
@@ -1709,14 +1708,13 @@ mod tests {
     /// capability handed out for a plan. Two programs read a cursor —
     /// `/bin/logd`, which writes the file, and `test-runner`, which runs the
     /// conservation gates inside itself — so those two carry it and nothing
-    /// else may. `/bin/console` is the near miss the spec argues about: it
-    /// *could* show this boot's records live off a cursor instead of seeding
-    /// from the previous boot's files, and it does not hold the right until
-    /// something in it reads one.
+    /// else may. `/bin/console` is the near miss: it *could* show this boot's
+    /// records live off a cursor instead of seeding from the previous boot's
+    /// files, and it does not hold the right until something in it reads one.
     ///
-    /// It reads the **parsed** `ProgramConfig` and never the file text (§3.2):
-    /// a grep over the TOML would pass on a row that is commented out and on a
-    /// key `serde` never saw.
+    /// It reads the **parsed** `ProgramConfig` and never the file text: a grep
+    /// over the TOML would pass on a row that is commented out and on a key
+    /// `serde` never saw.
     #[test]
     fn every_boot_config_runs_logd() {
         const READERS: &[&str] = &["logd", "test-runner"];

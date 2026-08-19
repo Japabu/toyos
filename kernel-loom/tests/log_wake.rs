@@ -32,8 +32,6 @@
 //!
 //! removes both fences from `shard.rs` and this file must red. A model that has
 //! never failed proves nothing.
-//!
-//! `specs/log-architecture-spec.md` §2.5's W3 and §2.6a.
 
 #![cfg(feature = "loom")]
 
@@ -105,7 +103,7 @@ fn a_commit_and_an_arm_cannot_both_miss() {
 /// This is what the `swap` in `signal_after_commit` buys, and it is why the
 /// flag is *loaded* first — a producer that finds it clear pays no
 /// read-modify-write at all, which is the whole reason the record path has none
-/// on it (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`).
+/// on it (`issues/hardware/one-rmw-per-log-line-cost-350ms.md`).
 #[test]
 fn exactly_one_producer_owns_a_park() {
     loom::model(|| {

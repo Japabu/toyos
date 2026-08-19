@@ -4,8 +4,6 @@
 //! and to say it in a form a later pass can compare an arriving event against.
 //! That is all this is: what ends the wait, when the wait stops being worth
 //! having, and the answer once one arrives.
-//!
-//! `specs/plans/xhci-port-machine-plan.md` X2 is the design.
 
 use crate::port::Nanos;
 

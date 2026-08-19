@@ -302,7 +302,7 @@ fn free_page(phys: u64) {
 
 /// One past the highest physical frame this kernel manages.
 ///
-/// The extent the IOMMU's identity domain covers (`specs/iommu-spec.md` §5.7):
+/// The extent the IOMMU's identity domain covers:
 /// every address a driver can hand a device comes out of here, so `[0, top)`
 /// is exactly what a device could reach on a machine with no unit at all.
 /// Taken from the bitmap rather than from the firmware memory map, whose own

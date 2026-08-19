@@ -9,7 +9,7 @@
 //!
 //! It is deliberately stronger than the host `fsck_msdos` it stands in for, in
 //! two places where that binary is silent and each of which cost this project a
-//! defect every other gate passed (`specs/issues/`): a **stale FAT
+//! defect every other gate passed (`issues/`): a **stale FAT
 //! mirror**, which fsck does not compare and a mount never reads, and
 //! **duplicate 8.3 short names**, which neither fsck nor a mount looks at
 //! because both use the long names.

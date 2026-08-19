@@ -1,18 +1,19 @@
 name: ci
 
-# The guest suite: twelve KVM shards on Linux x86_64 (specs/testing-strategy.md
-# §4). `ci/**` is where throwaway probe branches live; they trigger their own
-# workflows and not this one.
+# The guest suite: twelve KVM shards on Linux x86_64, which own the booted
+# kernel on native silicon and run exactly the Fast tier as a partition — every
+# Fast test runs exactly once per run. `ci/**` is where throwaway probe branches
+# live; they trigger their own workflows and not this one.
 #
-# `main` moves only through a merged pull request (specs/worktrees.md §5), so a
-# branch push and the pull request on it are two runs of the same twelve
-# shards. `main`'s own run is what `landing.yml`'s `gate-stage` reads, and its
-# `actions/cache` entries are the only ones every branch can restore.
+# `main` moves only through a merged pull request, so a branch push and the pull
+# request on it are two runs of the same twelve shards. `main`'s own run is what
+# `landing.yml`'s `gate-stage` reads, and its `actions/cache` entries are the
+# only ones every branch can restore.
 #
-# `schedule` runs the tier the fast shards withhold (specs/testing-strategy.md
-# §5) by widening `SUITE_TIER_ARGS`, the same way `workflow_dispatch` already
-# could. `schedule` always runs the default branch's copy of this file against
-# its own tip, so a nightly red is about `main`, never about a branch.
+# `schedule` runs the tier the fast shards withhold by widening
+# `SUITE_TIER_ARGS`, the same way `workflow_dispatch` already could. `schedule`
+# always runs the default branch's copy of this file against its own tip, so a
+# nightly red is about `main`, never about a branch.
 
 on:
   push:
@@ -37,8 +38,7 @@ jobs:
   # (an hour-long bootstrap thrown away by the next push starts from nothing),
   # and `needs:` does not reach across workflows — so this job waits for the
   # release instead of depending on it directly, once, so a broken toolchain
-  # strands one runner rather than every shard
-  # (specs/assessments/ci-plan-assessment-2026-08.md §5).
+  # strands one runner rather than every shard.
   toolchain-ready:
     runs-on: ubuntu-latest
     timeout-minutes: 150
@@ -58,9 +58,9 @@ jobs:
           sha="${{ github.event.pull_request.head.sha || github.sha }}"
           api="https://api.github.com/repos/${GITHUB_REPOSITORY}"
           # The asset, not the tag: `gh release create` makes the release
-          # before uploading 401 MiB to it, and publishing is idempotent
-          # (specs/testing-strategy.md §9), so a tag answering 200 does not
-          # mean the asset is there yet.
+          # before uploading 401 MiB to it, and publishing is idempotent — the
+          # release is keyed on the content that compiles into it — so a tag
+          # answering 200 does not mean the asset is there yet.
           published() {
             curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api/releases/tags/$tag" \
               | jq -e '.assets[]? | select(.name=="toyos-toolchain.tar.zst")' >/dev/null
@@ -104,17 +104,16 @@ jobs:
     needs: [toolchain-ready]
     runs-on: ubuntu-24.04
     # A wedge guard, not a budget: the harness answers a dead shared boot with
-    # a new one (specs/assessments/ci-plan-assessment-2026-08.md §7.3), so a
-    # shard that cannot finish inside this ceiling measures nothing.
+    # a new one, so a shard that cannot finish inside this ceiling measures
+    # nothing.
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     # `debian:sid` ships the QEMU `.github/qemu-version` declares, the dev
-    # host's version too; `ubuntu-24.04` ships 8.2.2 and the two
-    # disagree about test outcomes
-    # (specs/assessments/ci-plan-assessment-2026-08.md §7.3). The firmware, boot
+    # host's version too; `ubuntu-24.04` ships 8.2.2 and the two were measured
+    # disagreeing about test outcomes on the same tree. The firmware, boot
     # image and host CPU are unchanged from a bare runner — only the QEMU
     # binary and libraries under it differ.
     #
@@ -187,15 +186,15 @@ jobs:
       # cache eliminates third-party crate compiles; `actions/checkout` writes
       # every source with the current time, so our own crates rebuild
       # regardless — the direction of error a restore can cause is always more
-      # rebuilding, never a false green
-      # (specs/assessments/ci-plan-assessment-2026-08.md §12.5).
+      # rebuilding, never a false green — a warm build measured 10 crate
+      # compiles against a cold one's 177, and all 167 of the difference are
+      # third-party.
       #
-      # `cache-writer` is the single writer; the twelve shards only read.
-      # `actions/cache/save` never overwrites an existing key, so a second
+      # `cache-writer` is the single writer, one per run; the twelve shards only
+      # read. `actions/cache/save` never overwrites an existing key, so a second
       # writer could not benefit a sibling and a nightly writer could
-      # permanently win the key with a tree several merges behind
-      # (specs/testing-strategy.md §4). A cache written on `main` is the one
-      # every branch can restore.
+      # permanently win the key with a tree several merges behind. A cache
+      # written on `main` is the one every branch can restore.
       #
       # `toyos-ld/target` and `toyos-cc/target` used to be on this list and are
       # not directories any more: both crates are members of the host workspace
@@ -222,14 +221,13 @@ jobs:
       #
       # `--jobs 1`, and the shard count replaces the width: a lane whose guest
       # shares cores with a sibling pays lock-holder preemption a solo guest
-      # does not, which is the `ALONE: GREEN` class
-      # (specs/assessments/ci-plan-assessment-2026-08.md §7.2). One lane
-      # removes it by construction, at no cost — this repository is
-      # public, so minutes are unmetered.
+      # does not, which is the `ALONE: GREEN` class. One lane removes it by
+      # construction, at no cost — this repository is public, so minutes are
+      # unmetered.
       #
       # `--nightly` widens the selection to the withheld tier, on the schedule
       # and on a manual dispatch alike, without putting it back into every
-      # pull request (specs/testing-strategy.md §5).
+      # pull request.
       - name: suite
         env:
           SUITE_TIER_ARGS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '--nightly' || '' }}
@@ -264,11 +262,12 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      # Always, not only on a red: a shard may not write the profile it
-      # partitioned on (specs/testing-strategy.md §9), so this writes
+      # Always, not only on a red: a shard writes only its own measurements and
+      # never the profile it partitioned on, so this writes
       # `test-durations.shard-<i>-of-<n>`, which `load_durations` never reads.
-      # `--merge-durations` is the deliberate act that turns the twelve into
-      # `tests/test-durations`.
+      # `--merge-durations` is the one step per run that writes
+      # `tests/test-durations`, and the deliberate act that turns the twelve
+      # into it.
       - name: shard durations
         if: always()
         uses: actions/upload-artifact@v4
@@ -295,15 +294,16 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-  # The TCG shard (specs/testing-strategy.md §2): no `/dev/kvm` in the
-  # container, so `kvm_usable` says no and the guest runs emulated on an x86
-  # host. One test, since this is a canary and not a measurement — and the
-  # only place in CI that boots `-cpu qemu64`, since the shards ask for `-cpu
-  # host`.
+  # The TCG shard, which owns ISA breadth — the instruction paths the KVM
+  # hosts' CPUs never decode, and it is blind to vendor-real semantics and to
+  # realistic instruction cost: no `/dev/kvm` in the container, so `kvm_usable`
+  # says no and the guest runs emulated on an x86 host. One test, since this is
+  # a canary and not a measurement — and the only place in CI that boots `-cpu
+  # qemu64`, since the shards ask for `-cpu host`.
   #
   # Nightly and dispatch only: across its history as a required check this job
   # never named a tree defect, so the class moved to a whole TCG shard in the
-  # nightly tier instead (§5). It no longer writes the cache the twelve shards
+  # nightly tier instead. It no longer writes the cache the twelve shards
   # read — that write must happen on every run, so it is `cache-writer`, below.
   #
   # `if: always()` and a guard step, kept from when this was required: a
@@ -391,8 +391,9 @@ jobs:
       - name: one test, emulated
         run: cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats
 
-  # The cache's single writer (specs/testing-strategy.md §4): it runs on every
-  # non-nightly run, and `if:` is that rule written as code rather than only as
+  # The cache's single writer — exactly one job per run writes the shared build
+  # cache, and it must run on every pull-request run, so it runs on every
+  # non-nightly one. `if:` is that rule written as code rather than only as
   # prose beside `guest`'s restore step. Same build and the same one fast test
   # as a shard, under KVM rather than TCG — what gets cached does not depend on
   # which accelerator produced it, and KVM is the accelerator every reader of
@@ -487,11 +488,14 @@ jobs:
             tests/toyos-rust-tests/*/target
           key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
 
-  # The `durations` verdict (specs/testing-strategy.md §3): every test selected
-  # for Fast CI must measure at or under the ten-second ceiling, and this job
-  # is what enforces the tier declaration against the profile rather than
-  # letting it go stale. It also refuses any duplicate execution label, which
-  # catches a cross-shard partition defect (§4) as much as a same-shard one.
+  # The `durations` verdict. A guest test is Fast iff its verdict and its
+  # duration are invariant under machine speed, and the Fast ceiling is
+  # 10,000 ms measured on this instrument, with no tolerance band. Every test
+  # selected for Fast CI must measure at or under it, and this job is what
+  # enforces the tier declaration against the profile rather than letting it go
+  # stale. It also refuses any duplicate execution label: the twelve shards are
+  # a partition, so a duplicate is a cross-shard partition defect as much as a
+  # same-shard one.
   #
   # `guest`'s `SUITE_TIER_ARGS` widens the twelve shards to include `RELEGATED`
   # on a nightly run, so their `test-durations.shard-*` files carry fresh
@@ -609,8 +613,8 @@ jobs:
             exit 1
           fi
           # `cache-writer` is `if: github.event_name != 'schedule'`, so a
-          # nightly run reports it `skipped` by design (specs/testing-strategy.md
-          # §4); anything else means the write itself failed.
+          # nightly run reports it `skipped` by design; anything else means the
+          # write itself failed.
           if [ "${{ needs.cache-writer.result }}" != success ] \
              && [ "${{ needs.cache-writer.result }}" != skipped ]; then
             echo "::error::cache-writer reported ${{ needs.cache-writer.result }}. Its build is"
@@ -619,9 +623,9 @@ jobs:
             exit 1
           fi
 
-  # Files or updates the standing "nightly is red" issue (specs/testing-strategy.md
-  # §5). Only on `schedule` — a `workflow_dispatch` of the nightly tier is
-  # somebody watching the run directly, so an issue comment would be noise.
+  # Files or updates the standing "nightly is red" issue. Only on `schedule` —
+  # a `workflow_dispatch` of the nightly tier is somebody watching the run
+  # directly, so an issue comment would be noise.
   # `tcg` and `guest-suite` are enough: `guest-suite` already reds if
   # `toolchain-ready`, `guest` or `durations` did.
   nightly-red:

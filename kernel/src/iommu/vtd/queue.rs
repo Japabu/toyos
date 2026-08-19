@@ -1,19 +1,18 @@
 //! Queued invalidation: telling the unit that what it cached is no longer what
 //! memory says.
 //!
-//! `specs/iommu-spec.md` §5.5 requires this to be **synchronous** — a
-//! descriptor followed by an Invalidation Wait descriptor with a status write,
-//! polled to completion — and requires the wait to be bounded by a named
-//! constant whose expiry is a panic. A unit that will not acknowledge an
-//! invalidation has left the kernel unable to say what a device can reach, and
-//! there is no safe way to continue from that.
+//! **This is synchronous** — a descriptor followed by an Invalidation Wait
+//! descriptor with a status write, polled to completion — and the wait is
+//! bounded by a named constant whose expiry is a panic. A unit that will not
+//! acknowledge an invalidation has left the kernel unable to say what a device
+//! can reach, and there is no safe way to continue from that.
 //!
-//! §4.2 allows a unit without `ECAP.QI` to be served through `CCMD_REG` and
+//! A unit without `ECAP.QI` could be served through `CCMD_REG` and
 //! `IOTLB_REG` instead, which is correct and slower. No such register path is
 //! written here: every unit anyone can boot has queued invalidation, so that
-//! path would be the untested arm §5.2 refuses to build. A unit that lacks it
-//! is left unprogrammed and says so, which is I5's refusal one stage early and
-//! costs that machine nothing it has today.
+//! path would be an arm no machine in reach executes. A unit that lacks it
+//! is left unprogrammed and says so, which is the eventual refusal one stage
+//! early and costs that machine nothing it has today.
 
 use crate::mm::Mmio;
 
