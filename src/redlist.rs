@@ -1940,6 +1940,53 @@ pub const KNOWN_RED: &[Red] = &[
         source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-18",
     },
+    // ---------------------------------------------------------------------
+    // `wt/toyos-spawnrule`, dev host, 2026-08-19: three full `cargo test` runs
+    // in one session on a branch whose whole behaviour change is one line of
+    // `SYS_SPAWN`'s slot-map resolution. **Two kernel deaths and one clean
+    // run**, at three different host widths: 1.02x red, 1.07x green 268 of 268,
+    // 1.41x red — and the kernel source under the first and third differs from
+    // the green one's by comments alone, so no statement compiled differently
+    // between them. Both names answered `NOT ON THE LIST` when they were asked,
+    // and both re-ran `ALONE … GREEN`; adjudicated here rather than re-run
+    // away, per the root CLAUDE.md.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "process_lifecycle",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 3),
+        standing: Standing::Stands,
+        what: "`kernel panic: KERNEL PANIC: execute unmapped address at 0x0` — a Ring 0 \
+               instruction fetch at zero (`cs=0x0008`, `user=false`, `err=0x10`) inside \
+               `SYS_READ`, on cpu1, 15 s against the 491 ms the same name took passing alone \
+               straight after. **A kernel death and not a verdict**, and the fourth of its \
+               class: the first report to arrive with a syscall number under it, and the first \
+               whose restored frame is not all zeros — so the reissued-kernel-stack reading of \
+               the 2026-08-09 sighting does not carry over to it",
+        evidence: "the session's first run, twelve wide, contended with another worktree's \
+                   suite holding all twelve guest slots; `fastest boot 1341 ms against the \
+                   reference 1320 ms`, and `ALONE process_lifecycle: GREEN`",
+        source: "issues/kernel/a-ring-0-fetch-at-zero-inside-sys-read.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "sched_stress",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 3),
+        standing: Standing::Stands,
+        what: "`QEMU disconnected` — the kernel panicked at \
+               `alloc/src/collections/btree/navigate.rs:161`, `Option::unwrap()` on `None` \
+               **inside `BTreeMap`'s own immutable iterator**, walking a CPU's `parked` map \
+               from `SchedPass::apply_timer`. A map whose length disagrees with its nodes, not \
+               an absent deadline. It took the shared boot with it: 129 further names in the \
+               same run answered `Failed to flush QEMU stdin: … BrokenPipe`, so 130 of that \
+               run's reds are one event and only this one is a measurement",
+        evidence: "the same session's third run and the most loaded of the three, `fastest boot \
+                   1867 ms against the reference 1320 ms`; `ALONE sched_stress: GREEN` and \
+                   `PASS (2s)` in the same run",
+        source: "issues/kernel/a-btreemap-panicked-inside-its-own-navigation-in-a-scheduler-pass.md",
+        measured: "2026-08-19",
+    },
 ];
 
 // ---------------------------------------------------------------------------
