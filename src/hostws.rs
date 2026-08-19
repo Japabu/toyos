@@ -108,6 +108,14 @@ pub fn is_member(root: &Path, crate_dir: &Path) -> bool {
 /// Everything else this is asked about — `kernel/`, `bootloader/`, `userland/`,
 /// the guest crates under `tests/` — is excluded from the workspace and keeps
 /// its own.
+///
+/// **One target directory per checkout, and never one across them.** Cargo's
+/// freshness for a path package is mtime rather than content, and `-C metadata`
+/// carries no checkout path, so two worktrees aimed at one directory contend for
+/// one artifact under one name: the tree whose sources are merely *older* is
+/// declared fresh, compiles nothing, and links the other branch's code, with no
+/// diagnostic anywhere. Measured — and `toyos-ld` is a member here, so what it
+/// would swap is the linker every guest binary is built with.
 pub fn target_dir(root: &Path, crate_dir: &Path) -> PathBuf {
     if is_member(root, crate_dir) {
         root.join("target")
