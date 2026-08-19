@@ -1841,7 +1841,18 @@ pub const KNOWN_RED: &[Red] = &[
         test: "i8042_keyboard",
         instrument: Instrument::Ci,
         finding: Finding::Seen,
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the script outran QEMU's sixteen-byte PS/2 queue. 26 set-1 bytes went out on a \
+             `thread::sleep` clock, so the bound held only while the guest kept draining, and \
+             past the queue `ps2_queue()` drops one byte at a time and says nothing — a lost \
+             make takes its break with it (`handle_key` queues nothing for a usage nothing \
+             holds), which is exactly `0x29` missing entirely, and a lost `0xE0` leaves a press \
+             with no release, which is exactly the `usage 0x50: 1 presses, 0 releases` the \
+             isolated re-run produced. Reproduced deterministically by putting the same 26 bytes \
+             into one `input-send-event`: `i8042: drain bytes=16 keys=15` and `0 dropped, 0 \
+             overruns, 0 lost edges`. The test is paced against the guest's own `kev` lines now \
+             — one group outstanding, four bytes at most",
+        ),
         what: "`no event for HID usage 0x29 in [KeyLine { usage: 11, modifiers: 0, translated: \
                \"h\" }, …]` — twenty `KeyLine`s carrying the rest of the scripted sequence and \
                translating it: `h e l l o`, shift-`B` (`usage: 5`, `modifiers: 1`, `\"B\"`), then \
@@ -1855,14 +1866,22 @@ pub const KNOWN_RED: &[Red] = &[
                    phase `i8042_mouse` passed with `0 keys, 0 undecoded` in its tally where both \
                    re-run boots reported `28 keys, 12 undecoded` — three separate boots, so an \
                    accompanying observation and not a shared-guest claim",
-        source: "issues/kernel/two-i8042-verdicts-red-together-on-one-ci-shard.md",
+        source: "tests/toyos.rs QEMU_PS2_QUEUE",
         measured: "2026-08-19",
     },
     Red {
         test: "i8042_no_spurious_wake",
         instrument: Instrument::Ci,
         finding: Finding::Seen,
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the same over-subscription — twenty bytes against a sixteen-byte queue — and the \
+             same missing bound. What a drain carries is whatever the ISR found in the ring, so \
+             a host injecting on a wall clock was asserting on a batching it did not control: \
+             the capture's own `bytes=8 keys=2` is the Pause and the key that followed it 50 ms \
+             later taken together, which is a guest that did not drain for 50 ms. Each piece is \
+             paid for now before the next goes out — a Pause by a drain the driver logged, a key \
+             by its two `kev` lines — so the zero-event drain is arranged rather than hoped for",
+        ),
         what: "`no drain produced zero events — the stimulus never landed` — **and the capture it \
                prints contradicts its second clause**: the kernel names all six bytes of the \
                test's own Pause, `no event from [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5]`, so the \
@@ -1875,7 +1894,7 @@ pub const KNOWN_RED: &[Red] = &[
         evidence: "PR #128 run 32249152467, job `guest (2)`, the same shard and phase as this \
                    run's `i8042_keyboard` row; re-run as its group twice in the same job, \
                    `PASS (227ms)` and `PASS (222ms)`",
-        source: "issues/kernel/two-i8042-verdicts-red-together-on-one-ci-shard.md",
+        source: "tests/toyos.rs QEMU_PS2_QUEUE",
         measured: "2026-08-19",
     },
     // ---------------------------------------------------------------------
@@ -1939,6 +1958,62 @@ pub const KNOWN_RED: &[Red] = &[
         evidence: "the same session's first run, twelve wide",
         source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-18",
+    },
+    // ---------------------------------------------------------------------
+    // `wt/toyos-i8042deep`, dev host, 2026-08-19. Adjudicated here rather than
+    // re-run away: each answered `NOT ON THE LIST` when it was asked, and the
+    // branch they appeared on touches no kernel file at all — its whole delta
+    // is `tests/toyos.rs` and this file.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "i8042_budget_expiry",
+        instrument: Instrument::DevHostAlone,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`[qemu] Init process crashed during boot: KERNEL PANIC: execute unmapped address \
+               at 0x1b`, `cs=0x0008` with `rsp` in the direct map, on `num=90` from \
+               `<std::sys::process::toyos::Command>::spawn`. **The name is the workload and not \
+               the cause** — a machine-wide kernel death reds whichever test was booting. Third \
+               sighting of a filed class and the second of its *shifted*-frame half: `rbp` is \
+               `0x10246` (RFLAGS with RF set) and `rax`/`rbx`/`rflags`/`rsp` are identical to \
+               the 2026-08-15 one. `ALONE: GREEN`",
+        evidence: "`cargo test --test toyos-build -- i8042_ --jobs 1 --host-slots 0`, one guest \
+                   on the machine and no other suite on the host — so this row is the first of \
+                   its class taken with nothing to blame contention for. The run's other eight \
+                   guests were green",
+        source: "issues/kernel/a-ring-0-fetch-at-0x1b-during-a-loaded-boot.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "nvme_large_device",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`[qemu] Init process crashed during boot: KERNEL PANIC: execute unmapped address \
+               at 0x1b`, ring 0, on `num=90` — **the name is the workload and not the cause**. \
+               Fourth sighting of the same filed class and the third of its shifted-frame half, \
+               and the one that ties them together: `user_rip=0x1000003d598` is the same \
+               instruction as the `i8042_budget_expiry` row above, in a different guest booting \
+               a different configuration, with `rax` and `rbx` identical again. `ALONE: GREEN`",
+        evidence: "one full `cargo test` twelve wide, 79 guests, `fastest boot 1356 ms against \
+                   the reference 1320 ms`, with `toyos-spawnrule`'s suite holding guest slots \
+                   throughout — named in the run's own `[host-slots]` lines",
+        source: "issues/kernel/a-ring-0-fetch-at-0x1b-during-a-loaded-boot.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "diskless_boot",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`[qemu] QEMU died before ===READY=== (status: Ok(ExitStatus(unix_wait_status(0))))`. \
+               **QEMU exited zero**, so this is neither a panicked guest nor a wall-clock guard \
+               reporting the content it meant to assert — the process went away cleanly before \
+               the guest was ready, which nothing in the register explains. 7 s under load \
+               against 3 s alone; `ALONE: GREEN`. Not investigated",
+        evidence: "the same run as this session's `nvme_large_device` row",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-19",
     },
 ];
 
