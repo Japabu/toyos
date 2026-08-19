@@ -70,6 +70,10 @@ const UNHELD_SLOT: u32 = 3000;
 /// enough that one leaked object per round is a number no drain lag can hide.
 const CHURN_ROUNDS: usize = 16;
 
+/// The most 10 ms census samples `settled_census` takes before answering with
+/// what it last saw. `fd_lifetime`'s bound, for the same deferred queues.
+const SETTLE_SAMPLES: usize = 100;
+
 /// The three kinds that end the caller. Each is a role this binary runs as, and
 /// the description is what the kernel is being asked to refuse.
 const FATAL: &[(&str, &str)] = &[
@@ -243,6 +247,16 @@ fn a_full_table_is_a_word() {
 /// lag — it accumulates — so no *kind* may be higher after the second round of
 /// rounds than after the first. Per kind and not in total, because a total
 /// hides a leak of one kind behind churn in another.
+///
+/// And each sample is a *settled* census, because the two-sample design alone
+/// still loses to the lag it describes: on a loaded CI shard the last corpse's
+/// own `Process` object outlived the parent's `wait` into the second census —
+/// `[("Process", 6, 7)]`, twice on one shard, green alone both times (PR #141
+/// run 32307331537, the same deferral `fd_lifetime` measured decaying across
+/// eight back-to-back reads). The kernel half is
+/// `issues/kernel/deferred-release-outlives-its-syscall.md`; here it is a lag
+/// and not a leak exactly when settling converges, which is what
+/// `settled_census` requires before it answers.
 fn the_kills_release_what_they_held() {
     let after_first = churn(CHURN_ROUNDS);
     let after_second = churn(CHURN_ROUNDS);
@@ -266,7 +280,26 @@ fn churn(rounds: usize) -> Census {
             .expect("spawn a holder");
         assert_eq!(status.code(), Some(HANDLE_FAULT), "a holder did not die on its bad handle");
     }
-    Census::now()
+    settled_census()
+}
+
+/// The census once the deferred queues have finished giving back what the
+/// kills released. `fd_lifetime`'s `settled_free_bytes`, for object counts:
+/// sample until two readings ten milliseconds apart agree, which is the
+/// machine saying it has finished. **A liveness bound and not a margin** — a
+/// kernel that leaks holds a stable, elevated census, is quiescent on the
+/// first pair, and the grown-kinds assertion above reds exactly as before.
+fn settled_census() -> Census {
+    let mut last = Census::now();
+    for _ in 0..SETTLE_SAMPLES {
+        std::thread::sleep(Duration::from_millis(10));
+        let next = Census::now();
+        if next == last {
+            return next;
+        }
+        last = next;
+    }
+    last
 }
 
 /// Fill every slot and require the refusal to be a word. Exits 0, which is the

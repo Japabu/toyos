@@ -1897,6 +1897,43 @@ pub const KNOWN_RED: &[Red] = &[
         source: "tests/toyos.rs QEMU_PS2_QUEUE",
         measured: "2026-08-19",
     },
+    Red {
+        test: "screen_console_panic",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`the fatal report never took the screen back from the console — which would make \
+               /bin/console a downgrade on the machine it is for`, at 96 s against the suite's \
+               usual seconds, so the shape is a handoff waited for and never observed. First \
+               sighting: `--known-red` answered `NOT ON THE LIST`. **Not about the diff it was \
+               found on**, which is PR #141's merge-queue package — workflow triggers and \
+               CLAUDE.md prose, no kernel byte. `ALONE: GREEN, and it was alone both times — \
+               nothing the harness controls differed, so it failed once and passed once. That is \
+               a rate and not a classification`",
+        evidence: "PR #141 run 32306139422, job 96239259411 (`guest (3)`), 2026-08-19; the \
+                   isolated re-run in the same job was green",
+        source: "issues/panic-path/the-fatal-report-once-left-the-screen-to-the-console.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "log_poll_outlives_a_close",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`kernel panic: DOUBLE PANIC — the guest went quiet because every CPU is halted, \
+               not because it was still working. The panic is the finding and the guard never \
+               got to be one`. The kernel's complete last words were `[kernel 0.991 cpu0] DOUBLE \
+               PANIC` — no first-panic text, no location, which is the second finding. `ALONE: \
+               GREEN — it fails only beside other guests`; the load was two worktrees' full \
+               suites interleaved over the shared twelve guest slots. **Not about the diff it \
+               was found on**, a census-settling change inside `handle_kill_policy`'s own guest \
+               binary",
+        evidence: "dev host, 2026-08-19 22:21 UTC, `cargo test` in wt/toyos-hkpfix beside \
+                   wt/toyos-freshness's suite; 267 of 268 passed, this one red at 25 s in the \
+                   parallel phase, green alone in the same run",
+        source: "issues/panic-path/a-double-panic-at-boots-edge-says-nothing-but-its-name.md",
+        measured: "2026-08-19",
+    },
     // ---------------------------------------------------------------------
     // `wt/toyos-purecrates`, dev host, 2026-08-18: three full `cargo test` runs
     // in one session, on a branch whose whole delta is three kernel files
