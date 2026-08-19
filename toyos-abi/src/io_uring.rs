@@ -52,6 +52,10 @@ pub struct IoUringCqe {
     pub flags: u32,
 }
 
+// Spelled out rather than derived, as `IoUringParams` below is: `IoUringSqe`
+// above cannot derive one — `RawHandle` has no `Default` — so a derive here
+// would split one family of ABI structs across two idioms.
+#[allow(clippy::derivable_impls)]
 impl Default for IoUringCqe {
     fn default() -> Self {
         Self { user_data: 0, result: 0, flags: 0 }
@@ -94,6 +98,8 @@ pub struct IoUringParams {
     pub _pad: u32,
 }
 
+// Spelled out for the reason `IoUringCqe`'s is.
+#[allow(clippy::derivable_impls)]
 impl Default for IoUringParams {
     fn default() -> Self {
         Self { sq_off: 0, cq_off: 0, sqes_off: 0, sq_ring_size: 0, cq_ring_size: 0, features: 0, _pad: 0 }
