@@ -127,3 +127,34 @@ worth pulling, in order of what the log already supports:
 `issues/build/i8042-keyboard-pays-a-lost-sentinel-and-reds-the-durations-gate.md`
 is a different failure of the same binary — a `durations` red, not a lost
 event — and is not merged with this one.
+
+## 2026-08-19, later the same day: the alone re-run reproduced — on a different assertion
+
+On PR #120's CI run, `i8042_keyboard` red on shard 2 again and the harness's
+isolated re-run **red both times, on two different assertions**: first the
+listed `no event for HID usage 0x29`, then
+
+```
+usage 0x50: 1 presses, 0 releases
+```
+
+with the harness's own sentence carrying the classification: *"red again on a
+DIFFERENT failure — it failed twice, on two assertions, so this is not one
+defect reproduced and the divergence is itself the finding."* On PR #122's run
+the same day, the same shard red with the listed `0x29` signature and the
+alone re-run was GREEN — the recorded shape.
+
+Two things this changes about the sections above:
+
+- **"A rate and not a classification" now has a counter-case.** The alone
+  re-run is not always green, so contention cannot be the whole story, and any
+  future characterisation of this red as parallel-only would be false.
+- **A missing *release* is a different mechanism from a missing *press*.**
+  `0x29` absent is an event that never decoded; `1 presses, 0 releases` is a
+  transition pair broken in half. One cause producing both would have to sit
+  below decoding — in the byte stream the ISR drains — which is where the
+  batching observation above already points.
+
+Neither PR's diff touches the i8042 driver, and shard composition was checked
+rather than assumed: the new keyboard-claim test is not in shard 2 on either
+PR. The evidence is the 2026-08-19 CI runs on PRs #120 and #122.
