@@ -1,30 +1,33 @@
 //! The unit that decides what a device may reach.
 //!
-//! `specs/iommu-spec.md` is the design and `specs/plans/iommu-plan.md` the
-//! stages. This module is the built half: the machine's units are inventoried,
+//! **This module is the built half**: the machine's units are inventoried,
 //! every enumerated PCI function is given a context entry naming one
-//! identity-mapped domain, and translation is turned on. Interrupt remapping is
-//! I3, per-driver domains and mapping I4, and refusing a machine with no usable
-//! unit is I5 — sequenced last on purpose, because a refusal landed before the
-//! first userspace driver has moved costs every machine and protects nothing.
+//! identity-mapped domain, and translation is turned on. Interrupt remapping,
+//! per-driver domains and mapping, and refusing a machine with no usable unit
+//! are not built — `issues/kernel/the-iommu-stops-at-translation.md` is the
+//! entry. The refusal is sequenced last on purpose, because one landed before
+//! the first userspace driver has moved costs every machine and protects
+//! nothing.
 //!
-//! So this module *refuses nothing*. Every case §2.2 gives a refusal message
-//! for is reported here as a line naming the register it decided on, and the
-//! boot continues — a unit this kernel cannot program is left off rather than
-//! made into a halt. The messages themselves are not written yet either: a
-//! line saying "ToyOS requires one" on a kernel that boots happily without one
-//! is a comment that lies about its own code.
+//! So this module *refuses nothing*. Every condition that a machine with no
+//! usable unit would one day be refused on — no unit declared by firmware or
+//! none decodable, no interrupt remapping, no implemented address width, no
+//! 2 MiB pages, no queued invalidation — is reported here as a line naming the
+//! register it decided on, and the boot continues: a unit this kernel cannot
+//! program is left off rather than made into a halt. The messages themselves
+//! are not written yet either: a line saying "ToyOS requires one" on a kernel
+//! that boots happily without one is a comment that lies about its own code.
 //!
-//! §3 requires that Intel's register layout not leak into the names above
-//! `vtd/`. Everything in this file is stated in terms an ARM SMMU also
-//! answers, so a second backend drops in without the seam moving; nothing here
-//! says `Dmar`, `Sagaw` or `SourceId`.
+//! **Intel's register layout may not leak into the names above `vtd/`.**
+//! Everything in this file is stated in terms an ARM SMMU also answers, so a
+//! second backend drops in without the seam moving; nothing here says `Dmar`,
+//! `Sagaw` or `SourceId`.
 //!
-//! What I2 deliberately does *not* add, so I4 does not have to unpick it:
-//! `DomainId`, `DmaPerm`, `IommuError` and `trait Iommu` from §3. There is one
-//! domain on this machine and one backend, so each would be a type with a
-//! single value and a single implementor — the dead abstraction I1 argued
-//! against, and the seam is not the code that would name it.
+//! What this stage deliberately does *not* add, so the per-driver domain work
+//! does not have to unpick it: a `DomainId`, a `DmaPerm`, an `IommuError` and a
+//! `trait Iommu`. There is one domain on this machine and one backend, so each
+//! would be a type with a single value and a single implementor — a dead
+//! abstraction, and the seam is not the code that would name it.
 
 pub mod vtd;
 
@@ -32,13 +35,14 @@ pub mod vtd;
 ///
 /// A closed enum rather than a number, so `39` cannot be passed where a page
 /// table level count is wanted. VT-d's AGAW encoding and an SMMU's `T0SZ` are
-/// both derived from it inside their own backends, and `specs/iommu-spec.md`
-/// §5.3's IOVA base is derived from it in the portable half.
+/// both derived from it inside their own backends, and the IOVA base — which
+/// starts above the top of physical memory, so a device address is never a
+/// valid physical address — is derived from it in the portable half.
 ///
-/// Two variants and not the three §3 sketches. §5.3 and §10.5 both rule 57-bit
-/// out — a fifth level of page tables for an address space nothing here needs
-/// — so a `Bits57` would be a variant with no producer and no consumer, which
-/// is the untested arm §5.2 spends a section arguing against.
+/// Two variants and not three: 57-bit is out even on a unit that advertises it,
+/// because it is a fifth level of page tables for an address space nothing here
+/// needs — so a `Bits57` would be a variant with no producer and no consumer,
+/// which is an arm no machine in reach would ever execute.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum AddressWidth {
     Bits39,

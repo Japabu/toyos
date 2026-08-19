@@ -23,8 +23,6 @@
 //! linear addresses, [`PAGE_2M`] is the kernel's one user page size, and a
 //! [`Ring`] comes out of a code segment selector's RPL field. A second
 //! architecture brings its own three; nothing else here changes.
-//!
-//! `specs/plans/memory-boundary-spec.md` is the argument behind [`span`].
 
 #![no_std]
 #![forbid(unsafe_code)]

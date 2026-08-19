@@ -10,9 +10,9 @@
 //! measured 1 run in 10 for `desktop_audio_client` on CI;
 //! `src/redlist.rs`'s retired rows keep both measurements, because the
 //! issue file that held them is closed and its numbers are still numbers.
-//! `ConsoleObject`'s line buffer is what closes it
-//! and the buffer is per holder — so
-//! two *processes* is the shape that tests it and two threads would not.
+//! `ConsoleObject`'s line buffer is what closes it, and the buffer is per
+//! holder — so two *processes* is the shape that tests it and two threads
+//! would not.
 //!
 //! The two writes are made by hand rather than through `println!` because the
 //! split has to be the subject rather than an implementation detail of `std`:

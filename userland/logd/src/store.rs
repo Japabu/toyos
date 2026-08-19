@@ -1,12 +1,11 @@
 //! `/log` as this program's policy: one file per boot, continuations, and
 //! retention.
 //!
-//! Moved out of `kernel/src/log_file.rs` unchanged in behaviour
-//! — the constants keep their values
-//! and their reasons, the names keep their shape, and [`classify`] keeps being
-//! strict. What changed is who runs it: a userland process with an ordinary
-//! `File`, so every byte goes through `SYS_WRITE` and `SYS_FSYNC` exactly as
-//! any other program's would.
+//! Moved out of `kernel/src/log_file.rs` unchanged in behaviour — the constants
+//! keep their values and their reasons, the names keep their shape, and
+//! [`classify`] keeps being strict. What changed is who runs it: a userland
+//! process with an ordinary `File`, so every byte goes through `SYS_WRITE` and
+//! `SYS_FSYNC` exactly as any other program's would.
 //!
 //! **[`classify`] is more necessary here than it was in the kernel, not less.**
 //! `/log` is userland-writable and `toybox` writes there; this program is

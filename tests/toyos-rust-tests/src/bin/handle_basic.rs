@@ -1,8 +1,7 @@
 //! What a handle is, before anything is done with one.
 //!
-//! `specs/capability-endowment-spec.md` §8 requires this gate and nothing in
-//! the tree was it. Four properties of `HandleTable` that every other gate
-//! assumes and none of them exercises:
+//! Nothing in the tree was this gate. Four properties of `HandleTable` that
+//! every other gate assumes and none of them exercises:
 //!
 //! 1. **A closed slot is reissued at the next generation**, so a handle number
 //!    a process is still holding names *nothing* rather than whatever landed

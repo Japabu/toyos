@@ -56,7 +56,7 @@ pub enum Died {
     /// business, and not even always the boot's: `sshd` loses a race with
     /// `netd`'s teardown on a NIC-less machine and panics across boots that
     /// then come up perfectly
-    /// (`specs/issues/build/sshd-panics-when-netd-exits-before-it-binds.md`),
+    /// (`issues/build/sshd-panics-when-netd-exits-before-it-binds.md`),
     /// which is why a boot wait must not end on one.
     Panicked,
 }
@@ -198,7 +198,7 @@ impl Serial {
     /// A line carrying a kernel prefix somewhere other than its start, which
     /// is the virtio-console's missing line atomicity showing up in the
     /// capture: `log!` and a userspace `println!` interleave mid-word (see
-    /// `specs/issues/`). Reported rather than repaired — a needle that went
+    /// `issues/`). Reported rather than repaired — a needle that went
     /// missing because it was split in half should say so instead of looking
     /// like the guest never said it.
     pub fn interleaved(&self) -> Option<&str> {
@@ -247,7 +247,7 @@ impl Serial {
     /// then read the first `nothing decoded` line in its capture as the answer;
     /// the driver's own bring-up produces one before that marker, and on a
     /// laptop a real spurious interrupt can too
-    /// (`specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`).
+    /// (`issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`).
     ///
     /// The marker is what the injection was timed off, so it is the boundary the
     /// test actually knows — no host clock is involved, and a stranger line

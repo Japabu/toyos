@@ -1,11 +1,11 @@
 //! What the kernel's HDA stub hands its driver.
 //!
-//! `specs/plans/hda-driver-plan.md` §4.1 is the design. The line through the device
-//! is **who touches a register**: the kernel programs every register whose
-//! value is an address or indexes a structure it allocated, and the driver
-//! reaches the rest through [`syscall::device_reg_read`] and
-//! [`syscall::device_reg_write`], each checked against an allow-list and
-//! refused by name. Nothing here names a physical address.
+//! The line through the device is **who touches a register**: the kernel
+//! programs every register whose value is an address or indexes a structure it
+//! allocated, and the driver reaches the rest through
+//! [`syscall::device_reg_read`] and [`syscall::device_reg_write`], each checked
+//! against an allow-list and refused by name. Nothing here names a physical
+//! address.
 //!
 //! [`RegWidth`](crate::syscall::RegWidth) is those calls' and not this device's,
 //! since virtio-sound's stub reaches its notification registers the same way.

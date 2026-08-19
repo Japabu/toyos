@@ -1,3 +1,52 @@
+//! The QEMU launch: what machine a `cargo run` boots, and what a debugger can
+//! get out of it.
+//!
+//! # Reading a backtrace
+//!
+//! A backtrace is named from the binary's own file — `.symtab`/`.strtab` are
+//! read off whatever backs the executable, so a program run from a disk gets
+//! the same report as one from the initrd. **There is no DWARF**: `toyos-ld`
+//! drops every debug section, so a frame carries a name and never a line
+//! number.
+//!
+//! # LLDB
+//!
+//! [`launch`] always passes `-s`, so the gdb stub is on port 1234 and
+//! `gdb-remote 1234` attaches to it.
+//! Every binary in this project is PIE, so addresses change every boot: parse
+//! the serial output for `Kernel memory located at: 0x...` and load the kernel's
+//! symbols with `--slide`, and take a userland program's pid and base address
+//! from the `spawn:` line it logs. Set breakpoints with
+//! `breakpoint set -r <pattern>` — `-n` fails on Rust `::` paths.
+//!
+//! [`Options::debug`] pauses the kernel before it enters userland (the
+//! `DEBUG_WAIT` build), turns on QEMU's `-d int,cpu_reset` log at
+//! `/tmp/toyos-qemu-debug.log`, and parks QEMU on a triple fault instead of
+//! letting it exit, so the faulting CPU state stays inspectable.
+//!
+//! # QMP, and the machine that has already stopped
+//!
+//! The socket is `/tmp/toyos-qmp.sock`. A harness test booted with
+//! `BootOptions { qmp: true }` leaves one under
+//! `$TMPDIR/toyos-tests-<pid>/lane-<n>/`, which is how a frozen guest is read
+//! without a `cargo run` at all: `human-monitor-command` with `info registers
+//! -a` gives every vCPU's `RIP`, `RFL` and `HLT`, and that is what tells a
+//! halted-awaiting-interrupt machine from a wedged one.
+//!
+//! **Take that capture before injecting anything.** A keystroke revives a
+//! halted CPU, so Ctrl+Alt+D over the same socket both confirms the diagnosis
+//! and destroys the evidence for it.
+//!
+//! # Audio
+//!
+//! [`Options::dump_audio`] writes the device's output to
+//! `/tmp/toyos-audio.wav` (parse it to EOF — the RIFF sizes stay 0 unless the
+//! guest shuts down cleanly). **Audio that sounds wrong is read from soundd's
+//! and doom's printed numbers, never from the ear**: a starved synthesizer and
+//! a wrong playback clock are indistinguishable to a listener, and doom's
+//! real-time factor is what separates them — RTF near 1.0 with playback still
+//! slow is the clock, RTF well below 1.0 is synthesis not keeping up.
+
 use std::fs::File;
 use std::path::PathBuf;
 use std::process::Command;
@@ -36,7 +85,7 @@ struct Shape {
     /// A USB HID on the xHCI. The T14's keyboard is PS/2 and its touchpad
     /// I2C-HID; it has no USB HID at all.
     usb_hid: bool,
-    /// A vIOMMU, in the configuration `specs/iommu-spec.md` §8 names:
+    /// A vIOMMU, in the one configuration this project builds against:
     /// interrupt remapping on, caching mode on, 48-bit addresses. Every
     /// interactive profile has one, because the machine this project targets
     /// has one and a development shape without it is a shape where the

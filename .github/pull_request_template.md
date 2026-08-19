@@ -26,6 +26,7 @@ command. An estimate says it is one. -->
 
 ## Anything a reader of `main` must not miss
 <!--
-A known red this leaves behind, an `EXPECTED_FAILURES` entry it adds, a spec it
-invalidates, an `Abi-Inseparable:` trailer and why the split could not be made.
+A known red this leaves behind, an `EXPECTED_FAILURES` entry it adds, an
+`issues/` file it closes or invalidates, an `Abi-Inseparable:` trailer and why
+the split could not be made.
 -->

@@ -383,8 +383,8 @@ enum Standing {
 /// because the claim was held for the whole task. It does not have to be: the
 /// ABI half of a change is usually a few lines that compile on their own, and
 /// landing it by itself makes the window one landing instead. Applied once that
-/// day, successfully. Said here rather than only in the spec, because the
-/// refusal is what an agent in this situation is actually reading.
+/// day, successfully. Said at the refusal itself, because the refusal is what an
+/// agent in this situation is actually reading.
 const CLAIM_WINDOW: &str = "\
     The window is yours to make small: land the toyos-abi/toyos change on its own commit \
     first, before the work that depends on it. Every other worktree is refused for as long \
@@ -950,7 +950,7 @@ fn assert_toolchain_is_honest(stage2: &Path) {
 /// serialisation, and two agents cannot both conclude the toolchain is stale
 /// and both start `x.py build` in the same directory. That pair is what left a
 /// half-written `librustc_driver` for cargo to probe, and cargo memoises a
-/// failed probe (`specs/issues/build/`).
+/// failed probe (`issues/build/`).
 ///
 /// The steps are ordered, and each invalidates what it makes stale rather than
 /// threading a `rebuilt` flag through: a step that decides for itself still

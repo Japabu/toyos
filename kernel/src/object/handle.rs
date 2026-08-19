@@ -324,7 +324,7 @@ impl HandleTable {
     /// kernel: cloning the `Arc` out would put one atomic read-modify-write on
     /// each of them, which is the operation TCG runs a translation block
     /// exclusively for
-    /// (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`). Nothing escapes —
+    /// (`issues/hardware/one-rmw-per-log-line-cost-350ms.md`). Nothing escapes —
     /// the lifetime is `&self`'s, so the compiler refuses a borrow that
     /// outlives the table.
     pub fn get_ref(&self, h: RawHandle, need: Rights) -> Result<&KObjectRef, HandleError> {

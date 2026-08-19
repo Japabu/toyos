@@ -1,9 +1,13 @@
 //! Choosing the converter and pins that carry sound to a speaker.
 //!
-//! `specs/plans/hda-driver-plan.md` §2.3 is the algorithm and §5.2 is why it lives
-//! here: it is the least-covered code in that plan, and the one real machine
-//! walks only its shallowest case. Everything below the depth-1 case is
-//! covered by synthetic graphs and by nothing else.
+//! The algorithm: walk *backwards* from every candidate pin along its
+//! connection list, depth-first, bounded by the widget count and refusing a
+//! node already on the current path, and stop at an output converter; then take
+//! the pin the preference order below ranks first.
+//!
+//! It lives here, pure, because it is the least-covered code in the driver: the
+//! one real machine walks only its shallowest case, and everything below the
+//! depth-1 case is covered by synthetic graphs and by nothing else.
 
 use alloc::vec::Vec;
 
@@ -47,8 +51,8 @@ pub struct PinSetup {
 /// comes first.
 ///
 /// Digital outputs are absent deliberately. Display audio's pin is
-/// `DigitalOtherOut`, and binding it is the defect `specs/plans/hda-driver-plan.md`
-/// §2.3 exists to prevent — a perfectly valid path with no speaker behind it.
+/// `DigitalOtherOut`, and binding it is the defect this whole traversal exists
+/// to prevent — a perfectly valid path with no speaker behind it.
 pub const OUTPUT_PREFERENCE: [DefaultDevice; 3] =
     [DefaultDevice::Speaker, DefaultDevice::HeadphoneOut, DefaultDevice::LineOut];
 
