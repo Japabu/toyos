@@ -297,61 +297,6 @@ fn create_log_volume() -> Vec<u8> {
     volume
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The two volumes this build writes break no rule of the format, and the
-    /// gate is silence rather than sameness.
-    ///
-    /// The ESP did break some, from the first image this project ever built
-    /// until [`populate`] stopped writing it with `fatfs` — twelve complaints,
-    /// before any guest ran, from two format violations that crate's
-    /// `create_dir` has. The consequence was not only a dirty volume:
-    /// `esp_filesystem` could only ask that the guest add no *new* complaint,
-    /// so a complaint the guest produced for its own reason would have hidden
-    /// inside the twelve.
-    ///
-    /// Here rather than in the boot suite because it needs no guest, no QEMU
-    /// and no kernel: it is a claim about the writer, and it fails in seconds
-    /// on `cargo test --lib`.
-    #[test]
-    fn the_volumes_this_build_writes_break_no_format_rule() {
-        for (what, volume) in [
-            ("ESP", create_esp_volume(b"kernel", b"bootloader", b"initrd", uuid::Uuid::new_v4(), "")),
-            ("log volume", create_log_volume()),
-        ] {
-            let complaints = toyos_fat32_check::check(&volume);
-            assert!(
-                complaints.is_empty(),
-                "the {what} this build writes is not a clean FAT32 volume:\n{}",
-                toyos_fat32_check::describe(&complaints)
-            );
-        }
-    }
-
-    /// And it is clean because it is right, not because it is empty: a
-    /// `populate` that wrote nothing at all would satisfy the gate above.
-    #[test]
-    fn the_esp_carries_what_the_bootloader_looks_for() {
-        let mut esp =
-            create_esp_volume(b"kernel", b"bootloader", b"initrd", uuid::Uuid::new_v4(), "");
-        let mut fs = Fat32::mount(VolumeIo(&mut esp)).expect("mount the ESP we just built");
-        let found: Vec<String> =
-            fs.walk(64).expect("walk the ESP").into_iter().map(|(path, _)| path).collect();
-        for want in [
-            "EFI/BOOT/BOOTx64.EFI",
-            "toyos/kernel.elf",
-            "toyos/initrd.img",
-            "toyos/log.guid",
-            "toyos/cmdline",
-        ]
-        {
-            assert!(found.iter().any(|p| p.trim_start_matches('/') == want), "{want} is not on the ESP; it holds {found:?}");
-        }
-    }
-}
-
 fn create_gpt_disk(esp_volume: Vec<u8>, log_volume: Vec<u8>, log_guid: uuid::Uuid) -> Vec<u8> {
     // `add_partition` places each partition itself; this is the size the disk
     // has to be for it to have somewhere to put them — an aligned gap before
@@ -442,4 +387,59 @@ fn create_gpt_disk(esp_volume: Vec<u8>, log_volume: Vec<u8>, log_guid: uuid::Uui
     final_bytes[log_start..log_start + log_volume.len()].copy_from_slice(&log_volume);
 
     final_bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two volumes this build writes break no rule of the format, and the
+    /// gate is silence rather than sameness.
+    ///
+    /// The ESP did break some, from the first image this project ever built
+    /// until [`populate`] stopped writing it with `fatfs` — twelve complaints,
+    /// before any guest ran, from two format violations that crate's
+    /// `create_dir` has. The consequence was not only a dirty volume:
+    /// `esp_filesystem` could only ask that the guest add no *new* complaint,
+    /// so a complaint the guest produced for its own reason would have hidden
+    /// inside the twelve.
+    ///
+    /// Here rather than in the boot suite because it needs no guest, no QEMU
+    /// and no kernel: it is a claim about the writer, and it fails in seconds
+    /// on `cargo test --lib`.
+    #[test]
+    fn the_volumes_this_build_writes_break_no_format_rule() {
+        for (what, volume) in [
+            ("ESP", create_esp_volume(b"kernel", b"bootloader", b"initrd", uuid::Uuid::new_v4(), "")),
+            ("log volume", create_log_volume()),
+        ] {
+            let complaints = toyos_fat32_check::check(&volume);
+            assert!(
+                complaints.is_empty(),
+                "the {what} this build writes is not a clean FAT32 volume:\n{}",
+                toyos_fat32_check::describe(&complaints)
+            );
+        }
+    }
+
+    /// And it is clean because it is right, not because it is empty: a
+    /// `populate` that wrote nothing at all would satisfy the gate above.
+    #[test]
+    fn the_esp_carries_what_the_bootloader_looks_for() {
+        let mut esp =
+            create_esp_volume(b"kernel", b"bootloader", b"initrd", uuid::Uuid::new_v4(), "");
+        let mut fs = Fat32::mount(VolumeIo(&mut esp)).expect("mount the ESP we just built");
+        let found: Vec<String> =
+            fs.walk(64).expect("walk the ESP").into_iter().map(|(path, _)| path).collect();
+        for want in [
+            "EFI/BOOT/BOOTx64.EFI",
+            "toyos/kernel.elf",
+            "toyos/initrd.img",
+            "toyos/log.guid",
+            "toyos/cmdline",
+        ]
+        {
+            assert!(found.iter().any(|p| p.trim_start_matches('/') == want), "{want} is not on the ESP; it holds {found:?}");
+        }
+    }
 }

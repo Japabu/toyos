@@ -295,6 +295,22 @@ fn report(
     }
 }
 
+fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect(&path, out);
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(SHARD_PREFIX))
+        {
+            out.push(path);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,21 +442,5 @@ mod tests {
         assert_eq!(after.get("audio_tone_load (smp=8)"), Some(&11_121));
         assert_eq!(after.get("audio_tone (smp=1)"), Some(&7_000));
         assert_eq!(after.get("not_audio (smp=8)"), Some(&8_000));
-    }
-}
-
-fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect(&path, out);
-        } else if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(SHARD_PREFIX))
-        {
-            out.push(path);
-        }
     }
 }

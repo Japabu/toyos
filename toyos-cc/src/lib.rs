@@ -10,24 +10,13 @@ mod types;
 
 use std::path::{Path, PathBuf};
 
+#[derive(Default)]
 pub struct CompileOptions {
     pub include_paths: Vec<PathBuf>,
     pub defines: Vec<(String, String)>,
     pub target: Option<String>,
     pub opt_level: u8,
     pub force_includes: Vec<PathBuf>,
-}
-
-impl Default for CompileOptions {
-    fn default() -> Self {
-        Self {
-            include_paths: Vec::new(),
-            defines: Vec::new(),
-            target: None,
-            opt_level: 0,
-            force_includes: Vec::new(),
-        }
-    }
 }
 
 fn make_preprocessor(options: &CompileOptions, suppress_line_markers: bool) -> preprocess::Preprocessor {

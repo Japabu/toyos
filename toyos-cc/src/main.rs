@@ -7,7 +7,7 @@ fn main() {
     // TCC has deeply nested expressions; use a larger stack
     std::thread::Builder::new()
         .stack_size(128 * 1024 * 1024)
-        .spawn(|| run())
+        .spawn(run)
         .unwrap()
         .join()
         .unwrap();
