@@ -383,8 +383,8 @@ enum Standing {
 /// because the claim was held for the whole task. It does not have to be: the
 /// ABI half of a change is usually a few lines that compile on their own, and
 /// landing it by itself makes the window one landing instead. Applied once that
-/// day, successfully. Said here rather than only in the spec, because the
-/// refusal is what an agent in this situation is actually reading.
+/// day, successfully. Said at the refusal itself, because the refusal is what an
+/// agent in this situation is actually reading.
 const CLAIM_WINDOW: &str = "\
     The window is yours to make small: land the toyos-abi/toyos change on its own commit \
     first, before the work that depends on it. Every other worktree is refused for as long \
