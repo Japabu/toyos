@@ -1143,7 +1143,26 @@ pub const KNOWN_RED: &[Red] = &[
         test: "fd_lifetime",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(4, 7),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the reading was early, not polluted — 2026-08-19, and both halves of this row's \
+             argument are withdrawn. CI run 32237424649 put it red on `Instrument::Ci`, where \
+             there is one guest per machine, and the harness's `ALONE` re-run — a fresh boot \
+             carrying that binary and nothing else — was red again on the same failure. So \
+             `ALONE … GREEN every time` is false and the neighbours are not what this is. \
+             Twenty kill rounds alone in the guest at `8e9f851` say what it is: in ten of them \
+             the deficit after `wait` decays **two megabytes at a time** across eight \
+             back-to-back `SYS_SYSINFO` calls — `[12, 10, 10, 10, 8, 6, 4, 2]` MiB — and free \
+             memory returns to its baseline every single round, drift zero. Nothing leaks; the \
+             test reads before the release has run. `object::drain_zero_handles` clears \
+             `ZERO_PENDING` before it runs a hook, so a batch another CPU took is \
+             indistinguishable from an empty queue and the killing syscall returns with its \
+             objects unreleased — caught in a kernel trace as eight `RingRef` frees landing \
+             after `kill_process` returned, and as a second CPU taking a batch mid-kill. Both \
+             binaries now settle before reading (`specs/issues/build/free-memory-verdicts-share-a-boot.md`), \
+             and the kernel half is `specs/issues/kernel/deferred-release-outlives-its-syscall.md`. \
+             **`Sched::Serial` would have retired nothing**, which is why that proposal is \
+             recorded as ruled out rather than left standing",
+        ),
         what: "`a killed process kept 16777216 bytes of its io_urings`, `ALONE … GREEN` every \
                time. `kill_releases_ring` asks `SYS_SYSINFO` for the **machine's** free memory \
                either side of a kill, and it shares the `tests/testcases` boot with every other \
@@ -1160,6 +1179,51 @@ pub const KNOWN_RED: &[Red] = &[
         source: "specs/issues/build/free-memory-verdicts-share-a-boot.md",
         measured: "2026-08-15",
     },
+    // ---------------------------------------------------------------------
+    // `wt/toyos-fdleak`, 2026-08-19, at `8e9f851`. The run that broke the row
+    // above it out of its explanation, and the two dev-host readings taken
+    // against it. Kept as three rows because they are three measurements on
+    // three instruments and no one of them says what the others do.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "fd_lifetime",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Retired(
+            "the settle landed: both free-memory verdicts read once the machine has stopped \
+             giving memory back — samples 10 ms apart until two agree, bounded at a hundred, \
+             the last reading handed back either way. A liveness bound and not a margin, so a \
+             kernel that frees nothing is quiescent on the first pair and reds at once",
+        ),
+        what: "`a killed process kept 16777216 bytes of its io_urings` — the **whole** 16 MiB \
+               the holder allocated, against a 6 MiB threshold, so the release had made no \
+               progress at all when the reading was taken. `ALONE fd_lifetime: red again, the \
+               same failure both times`, which on a shared-block name is a fresh boot carrying \
+               that binary and nothing else",
+        evidence: "CI run 32237424649 (PR #126, job `guest (1)`); `main` red at `8e9f851` on \
+                   `ci` and on `gate A, thorough` the same day",
+        source: "specs/issues/build/free-memory-verdicts-share-a-boot.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "fd_lifetime",
+        instrument: Instrument::DevHostAlone,
+        finding: Finding::quiet(20),
+        standing: Standing::Stands,
+        what: "twenty consecutive filtered runs of the unmodified binary, all green — which is \
+               why every dev-host sighting of this name had said `ALONE … GREEN` and why the \
+               defect was read as its neighbours' page churn. The dev host is two CPUs under \
+               TCG; CI is four under KVM, and the race widens with the CPU count",
+        evidence: "20 × `cargo test --test toyos-build -- fd_lifetime` on one quiet dev host, \
+                   `wt/toyos-fdleak` at `8e9f851`",
+        source: "specs/issues/build/free-memory-verdicts-share-a-boot.md",
+        measured: "2026-08-19",
+    },
+    // `shm_release_reclaims` gets no row: it has the same instrument with the
+    // same hole and it took the same settle, but nothing here measured it red,
+    // and a `Seen` written from an argument rather than a run is exactly the
+    // overstatement this index refuses. `specs/issues/build/free-memory-verdicts-share-a-boot.md`
+    // carries it.
     Red {
         test: "screen_console_scroll",
         instrument: Instrument::DevHostLoaded,
