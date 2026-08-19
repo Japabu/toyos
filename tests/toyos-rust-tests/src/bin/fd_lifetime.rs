@@ -173,6 +173,10 @@ fn kill_releases_acceptor() {
 /// A ring's pages are its own and no second name reaches them, so the witness
 /// is the machine's free memory rather than a token this process could try to
 /// map. The holder makes [`HOLDER_RINGS`] of them, which is 16 MiB.
+///
+/// **The reading after the kill is [`settled_free_bytes`] and not
+/// [`free_bytes`], because the release does not finish inside the killing
+/// syscall** — see that function.
 fn kill_releases_ring() {
     let before = free_bytes();
     let (mut child, _) = spawn_holder("ring");
@@ -188,7 +192,7 @@ fn kill_releases_ring() {
     );
 
     kill_and_reap(&mut child);
-    let leaked = before.saturating_sub(free_bytes());
+    let leaked = before.saturating_sub(settled_free_bytes());
     assert!(
         leaked < 6 * 1024 * 1024,
         "a killed process kept {leaked} bytes of its io_urings"
@@ -202,6 +206,48 @@ fn free_bytes() -> u64 {
     let total = u64::from_le_bytes(buf[0..8].try_into().unwrap());
     let used = u64::from_le_bytes(buf[8..16].try_into().unwrap());
     total - used
+}
+
+/// How many 10 ms samples [`settled_free_bytes`] will take before it stops
+/// asking. Reaching it is not a failure — the last reading is handed back and
+/// the caller's assertion is still the whole verdict.
+const SETTLE_SAMPLES: usize = 100;
+
+/// Free memory once the machine has stopped giving it back.
+///
+/// **A killed process's rings are not released by the syscall that killed it,
+/// and the first reading after `wait` is therefore not the reading this test
+/// is about.** The kill drains the victim's handle table on the killer's CPU,
+/// which drops each ring's last handle onto the object layer's zero-handle
+/// queue; the *release* happens when some CPU drains that queue.
+/// `object::drain_zero_handles` clears its pending flag before it runs the
+/// hooks, so the killer's own drain site — its syscall exit — can find the
+/// queue empty while another CPU is still working through the batch, and every
+/// ring still unreleased at that moment is released outside the killing
+/// syscall altogether.
+///
+/// Measured on this tree, 2026-08-19, alone in the guest: the deficit after
+/// `wait` decays 2 MiB at a time across consecutive `SYS_SYSINFO` calls —
+/// `[12, 10, 10, 10, 8, 6, 4, 2]` MiB over eight back-to-back reads — and over
+/// twenty kill rounds free memory returned to its starting value every single
+/// time. Nothing is lost; the first reading is simply early. The kernel half is
+/// `specs/issues/kernel/deferred-release-outlives-its-syscall.md`.
+///
+/// So this samples until two readings ten milliseconds apart agree, which is
+/// the machine saying it has finished. **It is a liveness bound and not a
+/// margin**: a kernel that frees nothing is quiescent on the first pair and
+/// reds immediately, so nothing here weakens the assertion above.
+fn settled_free_bytes() -> u64 {
+    let mut last = free_bytes();
+    for _ in 0..SETTLE_SAMPLES {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let next = free_bytes();
+        if next == last {
+            return next;
+        }
+        last = next;
+    }
+    last
 }
 
 /// A killed process's dirty file must still reach the filesystem: that flush

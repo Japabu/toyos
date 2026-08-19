@@ -38,6 +38,38 @@ fn free_bytes() -> u64 {
     total - used
 }
 
+/// How many 10 ms samples [`settled_free_bytes`] takes before it stops asking.
+/// Reaching it is not a failure — the last reading is handed back and the
+/// caller's assertion is still the whole verdict.
+const SETTLE_SAMPLES: usize = 100;
+
+/// Free memory once the machine has stopped giving it back.
+///
+/// **A region's pages are not released by the `close` that dropped its last
+/// handle.** The drop queues the region on the object layer's zero-handle
+/// queue and the release happens when some CPU drains that queue;
+/// `object::drain_zero_handles` clears its pending flag before it runs the
+/// hooks, so the CPU that queued them can find the queue empty while another
+/// CPU is still working through the batch, and the release then escapes the
+/// syscall that caused it. `fd_lifetime` carries the measurement and
+/// `specs/issues/kernel/deferred-release-outlives-its-syscall.md` the kernel
+/// half.
+///
+/// **A liveness bound and not a margin**: a kernel that frees nothing is
+/// quiescent on the first pair of samples and reds immediately.
+fn settled_free_bytes() -> u64 {
+    let mut last = free_bytes();
+    for _ in 0..SETTLE_SAMPLES {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let next = free_bytes();
+        if next == last {
+            return next;
+        }
+        last = next;
+    }
+    last
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("donor") {
         return donor();
@@ -64,7 +96,7 @@ fn main() {
     );
 
     drop(regions);
-    let after = free_bytes();
+    let after = settled_free_bytes();
 
     let leaked = start.saturating_sub(after);
     assert!(
