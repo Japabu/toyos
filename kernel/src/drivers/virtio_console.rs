@@ -133,6 +133,13 @@ pub fn try_read_byte_locked() -> Option<u8> {
     if !is_ready() { return None; }
     let c = unsafe { console_mut() };
     if c.rx_pending.is_none() {
+        // Both numbers are bounded by `poll_used`: the id indexes `desc_to_rx`,
+        // which is exactly `QUEUE_SIZE` long, and `len` is at most the
+        // `RX_BUF_SIZE` this driver posted, so the walk below stays inside the
+        // buffer it started in. Neither was checked before, and the read at the
+        // bottom of this function is `unsafe` and inside the direct map, so an
+        // over-long `len` used to hand kernel memory to the console as typed
+        // input.
         let (slot, len) = c.rx.poll_used()?;
         let buf_idx = c.desc_to_rx[slot.id() as usize] as usize;
         c.rx_pending = Some(RxPending { buf_idx, slot, len, pos: 0 });

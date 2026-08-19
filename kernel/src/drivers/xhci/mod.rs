@@ -21,6 +21,7 @@ use crate::log;
 use super::pci::PciDevice;
 use super::DmaPool;
 use crate::sync::Lock;
+use toyos_untrusted::Untrusted;
 use toyos_xhci::job::{Await, Outcome, Outstanding, Stages};
 use toyos_xhci::port::{self as portmachine, GaveUp, Gone, PortState, Reset, Step};
 use toyos_xhci::recovery::{self, Act, EndpointState, NeedsConfigure, Recovery};
@@ -747,9 +748,19 @@ impl Layout {
 
     /// The block belonging to a 1-based slot id, or `None` when the controller
     /// handed back a slot the pool has no room for.
+    ///
+    /// `slot_id` is the controller's own answer to Enable Slot, not this
+    /// driver's — `issues/isolation/untrusted-sites-not-yet-adopted.md`
+    /// named this hand-rolled `checked_sub` + bound compare as exactly the
+    /// shape [`Untrusted::index`] replaces. `wrapping_sub` rather than
+    /// `checked_sub` is sound here only because `index` is the exit: slot 0
+    /// (xHCI 1.2 §4.5.1 — valid Device Slots start at 1) wraps to `u8::MAX`,
+    /// which is never `< dev_blocks` for a pool this small, so it is refused
+    /// by the same comparison that refuses every slot past the pool rather
+    /// than by a separate one.
     fn device(&self, slot_id: u8) -> Option<usize> {
-        let index = (slot_id as usize).checked_sub(1)?;
-        (index < self.dev_blocks).then(|| self.dev_base + index * DEV_STRIDE)
+        let index = Untrusted::new(slot_id).map(|v| v.wrapping_sub(1)).index(self.dev_blocks).ok()?;
+        Some(self.dev_base + index * DEV_STRIDE)
     }
 
     /// The `index`-th mass-storage block.
