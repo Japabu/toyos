@@ -6,19 +6,19 @@ opened: 2026-08-18
 
 # Comments across the tree cite section numbers of documents that no longer exist
 
-This began as a log-subsystem finding: `specs/log-architecture-spec.md` was
+This began as a log-subsystem finding: the log architecture document was
 deleted, every citation of it by path went with it, but two vocabularies it left
 behind did not, because removing them is a judgement at each site rather than a
 substitution.
 
-**The whole of `specs/` has since been deleted, so the class is now tree-wide
+**The whole document tree has since been deleted, so the class is now tree-wide
 and it is a defect rather than a finding.** Every `§N.N` in a ToyOS comment now
 points at nothing. Nothing greps it: a path citation is findable and a bare
 section mark is not, which is why this one outlived the sweep that removed the
 paths.
 
-Measured with `git grep -c '§' -- '*.rs' '*.toml' '*.yml' ':!specs/' ':!rust'`
-on 2026-08-19: **581 lines**, by area —
+Measured with `git grep -c '§' -- '*.rs' '*.toml' '*.yml' ':!rust'` on
+2026-08-19: **581 lines**, by area —
 
 | area | lines | the document it pointed at |
 |---|---|---|
