@@ -1878,6 +1878,26 @@ pub const KNOWN_RED: &[Red] = &[
         source: "issues/kernel/two-i8042-verdicts-red-together-on-one-ci-shard.md",
         measured: "2026-08-19",
     },
+    Red {
+        test: "screen_console_clear",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`the graffiti actuator did not reach the panel: 0 of 2073600 pixels are \
+               [0, 192, 0] and the 8px strip below the cells is not`, at 127 s against a \
+               fast-tier price — a panel that never received the write inside a window two \
+               orders above its cost, not a wrong pixel. The same run's `durations` job then \
+               refused the 126,762 ms reading against the 10,000 ms line, correctly: that \
+               number is this stall and must never be committed as a price. First sighting; \
+               same evening and same shape as `screen_console_panic`'s row — composition \
+               under a loaded host loses the panel's update. **Not about the diff it was \
+               found on**, a tier declaration and a duration table (PR #135). `ALONE: GREEN, \
+               and it was alone both times`",
+        evidence: "PR #135 run 32303408773, job 96231120463 (`guest (11)`), 2026-08-19; the \
+                   isolated re-run in the same job was green",
+        source: "issues/diagnostics/the-panel-once-took-no-pixels-for-two-minutes-under-load.md",
+        measured: "2026-08-19",
+    },
     // ---------------------------------------------------------------------
     // `wt/toyos-purecrates`, dev host, 2026-08-18: three full `cargo test` runs
     // in one session, on a branch whose whole delta is three kernel files
