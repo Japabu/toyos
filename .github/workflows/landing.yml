@@ -1,9 +1,8 @@
 name: landing
 
 # The two checks about the landing protocol rather than about the code — rules
-# `cargo run -- --land` used to enforce on the dev host, now retired
-# (specs/worktrees.md §5), so CI is the only thing left between a branch and
-# `main`.
+# `cargo run -- --land` used to enforce on the dev host, now retired, so CI is
+# the only thing left between a branch and `main`.
 
 on:
   push:
@@ -16,12 +15,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # A sysroot change may not be merged with the work that depends on it
-  # (specs/worktrees.md §3.2): `toyos-abi/src`, `toyos/src` and
-  # `userland/libc/src` compile into the one sysroot every worktree builds
-  # against, so the sysroot half must land first. The same function answers
-  # here and at `cargo run -- --pr`, so a branch that skipped the preflight
-  # gets the identical refusal from this check.
+  # A sysroot change may not be merged with the work that depends on it:
+  # `toyos-abi/src`, `toyos/src` and `userland/libc/src` compile into the one
+  # sysroot every worktree builds against, so the sysroot half must land first.
+  # The same function answers here and at `cargo run -- --pr`, so a branch that
+  # skipped the preflight gets the identical refusal from this check.
   abi-split:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -61,7 +59,7 @@ jobs:
 
   # What protects `main` is configured outside the repository, and this job
   # reads it back into VCS: half of it is readable from an endpoint that needs
-  # no token (specs/assessments/ci-plan-assessment-2026-08.md §10.5).
+  # no token.
   #
   # The name is fixed: a required-check context is matched by job name, and
   # renaming it is a ruleset change with a window in which a required check
@@ -90,7 +88,7 @@ jobs:
           curl -sSL --fail -H "Authorization: Bearer $GH_TOKEN" "$api" -o /tmp/rules.json
           jq . /tmp/rules.json
 
-          # Five (specs/testing-strategy.md §4); `tcg` is not one of them —
+          # The five required checks, and `tcg` is not one of them —
           # it moved to the nightly schedule (`ci.yml`) and the loop below is
           # a minimum, not an equality, so a `tcg` still required at GitHub is
           # reported rather than refused.
@@ -120,8 +118,8 @@ jobs:
             esac
           done
           # Strict is what makes a check on this head a check on the merged
-          # result — specs/assessments/ci-plan-assessment-2026-08.md §10.2, and
-          # the property `--land`'s `git merge --no-ff main` used to carry.
+          # result — the property `--land`'s `git merge --no-ff main` used to
+          # carry.
           if [ "$strict" != true ]; then
             echo "::error::required checks are not strict, so a branch could merge without"
             echo "::error::containing main and its checks would not be about the merged result"
@@ -147,4 +145,5 @@ jobs:
           done
 
           test "$bad" = 0
-          echo "main is protected the way specs/assessments/ci-plan-assessment-2026-08.md §10.4 and §10.5 say it is."
+          echo "main is protected: the five checks above are required and strict,"
+          echo "merge is the only method, and neither deletion nor a force-push is allowed."

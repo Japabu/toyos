@@ -231,7 +231,7 @@ const SETTLE_SAMPLES: usize = 100;
 /// `[12, 10, 10, 10, 8, 6, 4, 2]` MiB over eight back-to-back reads — and over
 /// twenty kill rounds free memory returned to its starting value every single
 /// time. Nothing is lost; the first reading is simply early. The kernel half is
-/// `specs/issues/kernel/deferred-release-outlives-its-syscall.md`.
+/// `issues/kernel/deferred-release-outlives-its-syscall.md`.
 ///
 /// So this samples until two readings ten milliseconds apart agree, which is
 /// the machine saying it has finished. **It is a liveness bound and not a

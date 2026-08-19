@@ -1,8 +1,9 @@
 //! Kernel threads: a task with no address space of its own, and the one place
 //! that says what a panic inside one means.
 //!
-//! There is one today, `klogd`; the completion branch's C6 spawns `usbd` and
-//! `iod` on it and adds their two rows to [`ROWS`].
+//! There is one today, `klogd`, the kernel's console drainer; the `usbd` and
+//! `iod` threads the completion work owes are spawned on the same machinery and
+//! add their two rows to [`ROWS`].
 //!
 //! **A kernel thread is not a special kind of task.** It is an ordinary task
 //! whose `NewTask::address_space` is `None` — `driver::spawn` then names the
@@ -65,7 +66,7 @@ const CLAIMING: u64 = u64::MAX - 1;
 /// a kernel thread, it is nondeterministic.** `main.rs`'s panic handler
 /// recovers when `percpu::syscall_rip() != 0 && percpu::current_tid().is_some()`
 /// — and `syscall_rip` is *never cleared*
-/// (`specs/issues/panic-path/syscall-rip-never-cleared.md`, and
+/// (`issues/panic-path/syscall-rip-never-cleared.md`, and
 /// `arch/idt/exceptions.rs` says so in its own comment). A kernel thread has a
 /// tid, so the second clause holds; the first reads whatever user thread last
 /// ran on *this* CPU left behind. The same panic on the same build therefore
@@ -201,7 +202,7 @@ pub fn spawn(name: &str, body: extern "C" fn(u64) -> !, arg: u64, on_panic: OnPa
 
     // **Reserved here, before the table lock, and published before
     // `enqueue_new`.** Its refusal is a panic, and a panic holding the process
-    // table is `specs/issues/panic-path/panic-holding-process-table-hangs.md`.
+    // table is `issues/panic-path/panic-holding-process-table-hangs.md`.
     let claim = Claim::take(name);
 
     let mut short = [0u8; THREAD_NAME_LEN];

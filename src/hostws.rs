@@ -8,7 +8,7 @@
 //! three times: four pure crates until 2026-08-08, `toyos-keymap` and
 //! `bcachefs` until 2026-08-14, and `toyos-abi` and `toyos-manifest` — 23 tests
 //! between them — which reached no workflow at all
-//! (`specs/issues/build/three-host-crates-are-tested-nowhere.md`, closed by the
+//! (`issues/build/three-host-crates-are-tested-nowhere.md`, closed by the
 //! commit that added this file).
 //!
 //! A third copy of the list would restore the defect, so there is exactly one:
@@ -301,7 +301,7 @@ mod tests {
     /// **The gate.** A crate added to this repository joins the host workspace
     /// or is excluded from it with a reason, and there is no third option.
     ///
-    /// This is the defect `specs/issues/build/three-host-crates-are-tested-nowhere.md`
+    /// This is the defect `issues/build/three-host-crates-are-tested-nowhere.md`
     /// recorded, and it had already recurred twice before that: a host-testable
     /// crate arrives, nobody adds it to the workflow's loop, and its tests run
     /// nowhere while reading as though they run everywhere. There is one list
@@ -424,7 +424,7 @@ mod tests {
     /// reads on a green build. For `toyos-ld` and `toyos-cc` that is not
     /// cosmetic: each is a `[programs]` guest binary as well as a host tool, and
     /// the `[profile.toyos]` they used to declare is what puts `overflow-checks`
-    /// into the image. Both crafted-ELF kernel panics in `specs/issues/` were
+    /// into the image. Both crafted-ELF kernel panics in `issues/` were
     /// *found* by an overflow check.
     #[test]
     fn no_member_declares_a_profile_or_a_patch_cargo_would_ignore() {
@@ -488,7 +488,7 @@ mod tests {
     ///
     /// The files scanned are the ones that *act* on a path: the workflows, this
     /// build system, and every `build.rs` in the tree. Prose is left alone —
-    /// `specs/issues/hardware/pre-flash-gate-missed-the-milestone.md` records a
+    /// `issues/hardware/pre-flash-gate-missed-the-milestone.md` records a
     /// flashed artifact built when `toyos-ld/target` was a real directory, and
     /// that record is not made truer by editing it.
     #[test]

@@ -30,5 +30,5 @@ Loads when you read a file under `src/` — the root cargo project, package name
 
 ## Caveats that bite every agent
 
-- **Documentation carries no gates** — `src/docs.rs` and every test over `specs/` prose were deleted by owner ruling (`8d0db10`); `src/redlist.rs` resolves doc paths only because it gates a Rust table, not a corpus.
+- **Documentation carries no gates** — `src/docs.rs` and every test over spec prose were deleted by owner ruling (`8d0db10`), and the spec corpus itself followed on 2026-08-19; `src/redlist.rs` resolves doc paths only because it gates a Rust table, not a corpus.
 - **A red build may be the build system — re-run in isolation before believing any single red.** A `stage1-std/<target>/dist/deps` temp-dir error means a concurrent build, never a broken checkout; never repair or force-rebuild the toolchain. A refusal that your worktree and the shared sysroot disagree about `toyos-abi/src` is correct — the build it stops links against another checkout's struct layouts and no test catches that.

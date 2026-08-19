@@ -14,8 +14,6 @@
 //! lifecycle event rides `handle_count`, which process teardown drains on the
 //! killer's CPU. The stranded `Arc` leaks memory: bounded, visible in the
 //! [`census`], and unable to delay a semantic event.
-//!
-//! `specs/capability-endowment-spec.md` §2.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -326,7 +324,7 @@ static ZERO_QUEUE: Lock<Vec<KObjectRef>> = Lock::new(Vec::new());
 /// The drain runs at every syscall exit and every scheduler pass, and
 /// `Lock::lock` is a `fetch_add` — the one operation TCG cannot emit inline,
 /// and a few hundred a boot of it cost 350 ms of boot
-/// (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`). Written under the lock at
+/// (`issues/hardware/one-rmw-per-log-line-cost-350ms.md`). Written under the lock at
 /// both ends, so it never says "empty" over a queued object; a stale
 /// "non-empty" costs one drain that finds nothing.
 static ZERO_PENDING: AtomicBool = AtomicBool::new(false);
@@ -354,9 +352,12 @@ pub(crate) fn enqueue_zero_handles(object: KObjectRef) {
 /// after a kill, which is one ring page at a time on the other CPU. Nothing is
 /// lost — a killed process's pages do all come back, sub-millisecond — but
 /// nothing may be written that assumes a release has happened because the call
-/// that caused it has returned. `specs/issues/kernel/deferred-release-outlives-its-syscall.md`
+/// that caused it has returned. `issues/kernel/deferred-release-outlives-its-syscall.md`
 /// carries the measurement and the two shapes a fix could take; the release
-/// protocol itself is `specs/completion-architecture-spec.md` §21 row 9's.
+/// protocol itself belongs to the track in
+/// `issues/kernel/every-wait-in-this-kernel-is-a-spin.md`, whose sleep lock is
+/// what decides what a hook released from here may do — **none of these three
+/// drain sites can park, so no `on_zero_handles` hook may take a sleep lock.**
 pub fn drain_zero_handles() {
     while ZERO_PENDING.load(Ordering::Acquire) {
         // A hook may retire further objects — dropping a connection drops the

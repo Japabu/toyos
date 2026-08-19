@@ -1,10 +1,10 @@
 //! Stream format, the cyclic buffer descriptor list, and which periods played.
 //!
 //! Boundary contract: `SDnFMT`'s field layout and the descriptor's shape come
-//! from the Intel High Definition Audio specification. `specs/plans/hda-driver-plan.md`
-//! §2.4 is the design — one descriptor per period, no submit in steady state,
-//! and the completion mask derived from a position read rather than from
-//! counting interrupts.
+//! from the Intel High Definition Audio specification. The list is cyclic with
+//! one descriptor per period, so there is no submit in steady state, and the
+//! completion mask is derived from a position read rather than from counting
+//! interrupts.
 
 use alloc::vec::Vec;
 

@@ -2,8 +2,16 @@
 //! alignment a type needs, and whether a value the kernel is about to
 //! dereference lies inside one mapping.
 //!
-//! Every refusal here is argued in `specs/plans/memory-boundary-spec.md`. The
-//! bound is also the one [`crate::fault`] classifies a trap against — one
+//! **Three refusals, and each has a way of being wrong the others do not
+//! catch.** An address in the kernel half is refused outright. An object whose
+//! address is userland's but whose alignment is wrong is refused, because a
+//! misaligned read of a wider type reads bytes the caller never proved were
+//! mapped. An object that starts inside one 2 MiB page and ends in the next is
+//! refused, because only the first page was established — a straddling read
+//! takes its tail out of whatever the neighbouring frame happens to hold, and a
+//! futex word is dereferenced on every wake check.
+//!
+//! The bound is also the one [`crate::fault`] classifies a trap against — one
 //! constant, read by the check before an access and by the verdict after it.
 
 /// One past the highest address userland can name.

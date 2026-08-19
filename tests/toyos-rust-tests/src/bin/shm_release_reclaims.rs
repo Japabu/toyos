@@ -52,7 +52,7 @@ const SETTLE_SAMPLES: usize = 100;
 /// hooks, so the CPU that queued them can find the queue empty while another
 /// CPU is still working through the batch, and the release then escapes the
 /// syscall that caused it. `fd_lifetime` carries the measurement and
-/// `specs/issues/kernel/deferred-release-outlives-its-syscall.md` the kernel
+/// `issues/kernel/deferred-release-outlives-its-syscall.md` the kernel
 /// half.
 ///
 /// **A liveness bound and not a margin**: a kernel that frees nothing is

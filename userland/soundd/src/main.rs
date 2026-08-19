@@ -29,10 +29,9 @@ use std::sync::Arc;
 /// collision is systematic and not unlucky: this daemon prints a client's
 /// removal exactly when the kernel is printing that client's exit.
 ///
-/// **Fixed for everyone at the kernel since L5**: a `ConsoleObject` per holder
-/// buffers a line and emits it whole under one `BackendGuard`, so this macro
-/// is about the *count*
-/// of syscalls now rather than about atomicity.
+/// **Fixed for everyone at the kernel now**: a `ConsoleObject` per holder
+/// buffers a line and emits it whole under one `BackendGuard`, so this macro is
+/// about the *count* of syscalls now rather than about atomicity.
 macro_rules! say {
     ($($arg:tt)*) => {{
         use std::io::Write as _;
@@ -49,9 +48,9 @@ mod virtio;
 ///
 /// The mix loop's free list was written for [`Pipeline::Queue`] throughout, and
 /// three of its rules are that model showing: it holds a period back while a
-/// client is mid-refill (§5.10), it drains by not submitting (§5.8), and it
-/// takes the lowest free index first because the device plays what it is given
-/// in the order it is given.
+/// client is mid-refill, it drains by not submitting, and it takes the lowest
+/// free index first because the device plays what it is given in the order it
+/// is given.
 ///
 /// [`Pipeline::Ring`] breaks all three, which is what killed soundd on the T14.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -71,8 +70,8 @@ enum Pipeline {
 
 /// The device half of the mix loop.
 ///
-/// Two implementations and no more: `specs/plans/hda-driver-plan.md` §8 item 10
-/// forbids a framework before there are three. Both are drivers in this process
+/// Two implementations and no more: a framework before there are three is an
+/// abstraction with no evidence behind it. Both are drivers in this process
 /// now, and what differs between the two devices is exactly the methods below;
 /// the mixer, the ramps, the DLL, the underrun accounting and the
 /// suspend/resume structure are one body of code either way, which is what

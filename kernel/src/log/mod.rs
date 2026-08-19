@@ -211,7 +211,7 @@ fn reserve(guard: &crate::arch::LogCommitGuard) -> (Origin, u64) {
 ///
 /// It costs the tid of a process's *first* thread, which is `Tid(0)` and
 /// therefore also renders as absent:
-/// `specs/issues/diagnostics/a-record-cannot-name-thread-zero.md` is the entry,
+/// `issues/diagnostics/a-record-cannot-name-thread-zero.md` is the entry,
 /// and its fix is in the ABI's formatter rather than here.
 fn on_a_thread(id: u32) -> u32 {
     if id == u32::MAX { 0 } else { id }
