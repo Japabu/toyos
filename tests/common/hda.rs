@@ -44,7 +44,7 @@ pub fn hda_tone(
 
     let result = qemu.run_test("test_rs_audio_tone", Duration::from_secs(30));
     if let Some(err) = &result.error {
-        return Err(err.clone());
+        return Err(err.to_string());
     }
     if result.exit_code != Some(0) {
         return Err(format!("the tone did not play: {:?}\n{}", result.exit_code, result.stdout));
