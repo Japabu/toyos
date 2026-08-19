@@ -17,24 +17,23 @@
 #
 # **Two programs now, and the guarantee is restated rather than assumed.** It
 # used to be "nothing here can claim the framebuffer, because the compositor is
-# not built into this image at all". `logd` is in this image since L6 of
-# `specs/log-architecture-spec.md`, because the kernel stopped writing `/log`
-# and an unchanged config here would flash a T14 that logs to a panel and
-# nowhere else. The argument survives verbatim: `logd` declares no `devices` at
-# all — its whole row is `syscap = ["logread"]` — so the reachable set is
-# unchanged and `no_diag_program_claims_the_screen` still checks it before the
-# image is written.
+# not built into this image at all". `logd` is in this image because the kernel
+# stopped writing `/log` and an unchanged config here would flash a T14 that
+# logs to a panel and nowhere else. The argument survives verbatim: `logd`
+# declares no `devices` at all — its whole row is `syscap = ["logread"]` — so
+# the reachable set is unchanged and `no_diag_program_claims_the_screen` still
+# checks it before the image is written.
 #
 # The other program it starts prints the cwd and exits.
 [boot]
 start = ["logd", "toybox"]
 
 # **Every image that carries a `TOYOS-LOG` partition runs this**, and every
-# image does. The kernel stopped writing files at L6 of
-# `specs/log-architecture-spec.md`, so a boot config without `logd` is a boot
-# whose `/log` is empty — `every_boot_config_runs_logd` is what refuses one.
-# It claims no device and serves no port yet (§5.1, §5.2): its whole authority
-# is `logread`, which is `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
+# image does. The kernel keeps the record ring and the console and writes no
+# file, so a boot config without `logd` is a boot whose `/log` is empty —
+# `every_boot_config_runs_logd` is what refuses one. It claims no device and
+# serves no port yet: its whole authority is `logread`, which is
+# `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
 [programs.logd]
 syscap = ["logread"]
 

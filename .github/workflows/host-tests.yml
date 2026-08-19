@@ -1,8 +1,10 @@
 name: host tests
 
-# The host suites (specs/testing-strategy.md §2): everything that needs no
-# ToyOS toolchain and boots no guest, so it answers before the toolchain job
-# has finished restoring one.
+# The host suites, which own pure logic — decoders, validators, layouts, the
+# build system's own gates, and the memory orderings x86 TSO hides
+# (kernel-loom) — and are blind to everything that requires a booted kernel:
+# everything that needs no ToyOS toolchain and boots no guest, so it answers
+# before the toolchain job has finished restoring one.
 #
 # macOS because the dev host is macOS and `toyos-fat32` still builds its
 # volumes with `newfs_msdos` and `hdiutil` — the judge is ours now
@@ -121,12 +123,14 @@ jobs:
           cargo test --manifest-path kernel-loom/Cargo.toml --no-default-features \
             --test log_zeroed_init --test log_body_words 2>&1 | tee -a /tmp/host.log
 
-      # **W3's teeth, run rather than recorded.** `wake-fence-off` removes the
-      # two `SeqCst` fences from `shard.rs`'s wake pair and `log_wake` must red
-      # under it; a model that has never failed proves nothing, and this is the
-      # only obligation in the tree whose *negative* no guest test can express —
-      # on x86 a build with either fence gone behaves identically, which is the
-      # whole reason it is a model. `specs/log-architecture-spec.md` §2.5.
+      # **The wake edge's teeth, run rather than recorded.** The obligation is
+      # that no committed record is ever left with a parked reader, and it is
+      # store-buffer shaped: `wake-fence-off` removes the two `SeqCst` fences
+      # from `shard.rs`'s wake pair and `log_wake` must red under it; a model
+      # that has never failed proves nothing, and this is the only obligation in
+      # the tree whose *negative* no guest test can express — on x86 a build
+      # with either fence gone behaves identically, which is the whole reason it
+      # is a model.
       #
       # **A non-zero exit is not the check, and until 2026-08-15 it was the
       # whole of it.** Anything that stops `cargo test` before a model runs — a
