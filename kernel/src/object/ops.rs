@@ -580,8 +580,8 @@ pub fn fstat(object: &KObjectRef) -> Stat {
 /// `SYS_FSYNC`: the file's bytes on the device, **and the device told to commit
 /// them**.
 ///
-/// **The second step is L6's, and it is a change to a shipped syscall's
-/// semantics rather than an implementation detail** (§12.4). This used to be
+/// **The second step is a change to a shipped syscall's semantics rather than
+/// an implementation detail**, and it arrived with `/bin/logd`. This used to be
 /// `flush_file` alone, which puts the data, the FAT and the directory entry on
 /// the volume and stops there — the stick's own write cache still holds them,
 /// so a power cut after a successful `fsync` could lose what it returned `Ok`
@@ -595,7 +595,13 @@ pub fn fstat(object: &KObjectRef) -> Stat {
 /// alternative considered and rejected was a second syscall for logd alone,
 /// which needs a number, needs discussion, and would make every *other*
 /// `fsync` in the machine quietly weaker than the one program that noticed.
-/// `log_is_durable_after_fsync` is the gate, and it reds on the old behaviour.
+///
+/// **What guards it is `usb_flush_optional`**, whose whole subject is a device
+/// that refuses SYNCHRONIZE CACHE: it reds the moment this call stops issuing
+/// one. `kernel_log_file`'s mid-run read of the image is the positive half.
+/// Neither separates *which* level a flush reached, so an `fsync` that went
+/// back to stopping at the page cache would still pass a clean shutdown — the
+/// refusing device is the only instrument that sees it.
 pub fn fsync(object: &KObjectRef) -> u64 {
     let KObjectRef::File(file) = object else {
         return SyscallError::PermissionDenied.to_u64();

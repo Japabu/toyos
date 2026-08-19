@@ -17,8 +17,7 @@
 //! A MUS lump names its instruments in its own header, so what doom needs is
 //! read rather than guessed, and one function answers it for both the producer
 //! and the gate. Deleting a preset doom never selects costs nothing audible:
-//! all 13 tracks render bit-exact against the full bank
-//! (`specs/assessments/doom-music-soundfont.md` §4).
+//! all 13 tracks render bit-exact against the full bank.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

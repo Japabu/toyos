@@ -643,7 +643,7 @@ fn process_sqe(ring_id: RingId, sqe: &IoUringSqe) {
 /// made a mistake.
 ///
 /// The handle is resolved by [`super::object::HandleError`]'s own rule and not
-/// by one invented here (`specs/capability-endowment-spec.md` §1.2): a handle
+/// by one invented here (`kernel/src/object/handle.rs`): a handle
 /// the process does not hold, one it closed, or one of the wrong type ends it,
 /// and a right it does not carry is a word it may see. The three fatal kinds
 /// are refused *outside* the table's guard, which is what `refuse_as_error`

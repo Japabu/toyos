@@ -5,7 +5,7 @@
 //! the kernel happens to log, which is a handful of lines a second and cannot
 //! be made to saturate a shard however long a test waits — and the property
 //! under test is exactly what happens when producers outrun the one reader and
-//! the ring starts dropping. `specs/log-architecture-spec.md` §9.1.
+//! the ring starts dropping.
 //!
 //! **Kernel threads at preempt depth 0 with `IF` set, one per shard**, so the
 //! records really are written by every CPU at once and through the shipped
@@ -21,7 +21,7 @@
 //! measured on 2026-08-15 at `--smp 8`: one thread per shard, two threads per
 //! shard with an explicit `yield_now` every sixteen records, and two per shard
 //! parking for 50 µs every sixteen. All three reported **0 of 8 (and 0 of 16)
-//! producers with records on a second shard**. §9.2's nesting gate is what
+//! producers with records on a second shard**. `log-nested-emit`'s gate is what
 //! reaches the reservation race instead, on one CPU, where an interrupt is a
 //! stimulus a test can actually aim.
 //!
@@ -136,9 +136,9 @@ extern "C" fn body(thread: u64) -> ! {
     // `done` past every patterned record was tried and hung a 12-wide suite;
     // the reader was rewritten instead to decide from its own cursor, which
     // removes the class rather than this instance
-    // (`userland/test-runner/src/log_gate.rs`, `specs/log-architecture-spec.md`
-    // §9.1). The record still declares what this producer emitted and the
-    // reader cross-checks it wherever it survives.
+    // (`userland/test-runner/src/log_gate.rs`). The record still declares what
+    // this producer emitted and the reader cross-checks it wherever it
+    // survives.
     crate::log!("logstorm done t={thread} emitted={STORM_RECORDS}");
 
     // **It parks rather than exiting**, because `sched::kthread`'s rows are

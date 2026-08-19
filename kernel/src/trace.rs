@@ -103,7 +103,7 @@ pub enum Kind {
 /// true: the only reader is an LLDB hexdump, which sees a `u16` and has no
 /// symbol to check it against, so a variant inserted mid-list renames every
 /// event after it in every capture ever taken — including the ones already
-/// written down in `specs/assessments/metal-logs/`, which cannot be re-read.
+/// captured off metal, which cannot be re-read.
 /// The failure is silent, retroactive and unrecoverable, which is exactly the
 /// shape that belongs in a compile-time assertion rather than a test.
 ///

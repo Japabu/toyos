@@ -129,7 +129,7 @@ impl PageAlloc {
 /// `PageAlloc`'s Drop returns the pages to the PMM and reaches no address
 /// space, so pages and mapping cannot be dropped as one. Holding the two
 /// together is what makes the unmap expressible at all; enforcing it is the
-/// `SharedToken`/RAII item in `specs/issues/`.
+/// `SharedToken`/RAII item in `issues/`.
 ///
 /// Dropping without unmapping is only sound when the address space itself is
 /// being destroyed (process teardown).
@@ -1768,7 +1768,7 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
 /// the same bare number for both. A fault report that says `0x10000004cbb`
 /// where the backtrace three lines below says `fault_gate_child::main+0x136`
 /// has told the reader something false about the binary
-/// (`specs/issues/panic-path/`, 2026-08-14).
+/// (`issues/panic-path/`, 2026-08-14).
 #[must_use = "an address with no symbol line still has to be printed"]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SymbolLookup {

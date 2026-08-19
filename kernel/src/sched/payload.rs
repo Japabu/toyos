@@ -75,7 +75,7 @@ pub struct KernelCtx {
 }
 
 /// Everything the kernel owns per task and must release exactly once. The
-/// address-space `Arc` in here is the crash.md double-drop: it is handed back
+/// address-space `Arc` in here is the double-drop hazard: it is handed back
 /// by `DeadTask::finalize`, which consumes the only owner, so it cannot be
 /// released twice.
 pub struct KernelPayload {

@@ -12,10 +12,9 @@ use toyos::ipc::{Connection, IpcPayload, RxStep};
 /// line lands inside this daemon's. `netd: ready, at most ` and
 /// `init: started test-runner` arrived interleaved and the harness parsed a cap
 /// out of the wrong number. `userland/soundd` has the same macro for the same
-/// reason. **The class is closed at the kernel since L5** — a `ConsoleObject`
-/// per holder buffers a line and emits it whole under one `BackendGuard`
-/// (`specs/log-architecture-spec.md` §4.4) — so what this still buys is one
-/// syscall per line instead of one per fragment.
+/// reason. **The class is closed at the kernel now** — a `ConsoleObject` per
+/// holder buffers a line and emits it whole under one `BackendGuard` — so what
+/// this still buys is one syscall per line instead of one per fragment.
 macro_rules! say {
     ($($arg:tt)*) => {{
         use std::io::Write;
@@ -439,7 +438,7 @@ const PIPE_BUDGET_SHARE: u64 = 8;
 ///
 /// **A mitigation, not a policy anyone chose.** A piped connection's 4 MiB is
 /// charged to nobody — no per-process limit, no pressure signal, no OOM killer
-/// (`specs/issues/isolation/`) — so without a cap a client that opens sockets
+/// (`issues/isolation/`) — so without a cap a client that opens sockets
 /// in a loop walks the machine into exhaustion, and netd has no way to tell
 /// that from ordinary use. Delete this in favour of a kernel memory limit, not
 /// in favour of a bigger number.

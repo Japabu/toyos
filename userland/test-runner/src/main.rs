@@ -14,9 +14,9 @@ use toyos::syscap::SysCap;
 /// **Not a shortcut: a spawned binary cannot hold what these need.** This
 /// process passes its whole namespace to every child, and a `SysCap` dup is not
 /// a namespace entry — so a gate whose subject is a right on this program's own
-/// capability has nowhere else to run (`specs/capability-endowment-spec.md`
-/// §6.7a). They answer the same `===TEST_START===`/`===TEST_END===` protocol as
-/// a binary, so the host cannot tell the difference and does not have to.
+/// capability has nowhere else to run. They answer the same
+/// `===TEST_START===`/`===TEST_END===` protocol as a binary, so the host cannot
+/// tell the difference and does not have to.
 ///
 /// `kbd-close` is here for a second reason as well as that one: its subject is a
 /// pending poll on **this process's own stdin**, which is a `Console`. A spawned
@@ -30,9 +30,9 @@ const BUILTINS: &[(&str, fn(Option<&SysCap>) -> i32)] = &[
 
 fn main() {
     // **The test estate's authority, and the one place least authority is not
-    // enforced** (`specs/capability-endowment-spec.md` §4). The guest
-    // binaries are not `[programs]` keys, so no manifest row can name what any
-    // of them holds: a test binary holds what test-runner holds. The namespace
+    // enforced.** The guest binaries are not `[programs]` keys, so no manifest
+    // row can name what any of them holds: a test binary holds what test-runner
+    // holds. The namespace
     // travels by inheritance; this capability is handed over explicitly, as a
     // duplicate rather than the cap itself, because one boot runs several
     // binaries that each need the keyboard and a device claim moves.
@@ -86,8 +86,7 @@ fn main() {
         // manifest grants by name, so `PermissionDenied` says this cap is one
         // the program holds *for itself* and the child gets the namespace and
         // no capability at all. `logread` is exactly such a cap, as `realtime`
-        // is: the estate does not hand either down
-        // (`specs/capability-endowment-spec.md` §6.7a). The `expect` here
+        // is: the estate does not hand either down. The `expect` here
         // assumed every cap was dup-able and took the whole boot down on the
         // first config that endowed one without `dup`.
         //

@@ -6,7 +6,6 @@
 //! entry — it is a `SysCap` dup, exactly like `realtime`, which the estate does
 //! not hand down either. So the gate that reads the machine's log is the one
 //! process in a test image that holds the right from its own manifest row.
-//! `specs/log-architecture-spec.md` §3.2, §9.5.
 //!
 //! **The verdict is exact, not statistical.** Every sequence number a shard
 //! ever issued is either a record this reader took or one the kernel counted as
@@ -28,7 +27,6 @@
 //! of the nesting burst's own `done`. **The rule this shape exists to keep is
 //! general**: a workload whose liveness depends on a record the ring is allowed
 //! to drop is the same mistake wherever it appears.
-//! `specs/log-architecture-spec.md` §9.1 carries the measurement.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};

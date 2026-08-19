@@ -34,9 +34,10 @@ impl core::fmt::Display for Address {
 
 /// Every codec address `statests` reports, lowest first.
 ///
-/// The whole of codec presence detection. Returned as an iterator over *all*
-/// of them because `specs/plans/hda-driver-plan.md` §2.3 forbids taking the first:
-/// display audio answers here beside the analogue codec.
+/// The whole of codec presence detection. Returned as an iterator over *all* of
+/// them because there is no first match anywhere in this driver: display audio
+/// answers here beside the analogue codec, and a driver that bound the first to
+/// answer would configure a perfectly valid path with no speaker behind it.
 pub fn present(statests: u16) -> impl Iterator<Item = Address> {
     (0..=Address::MAX).filter(move |bit| statests & (1 << bit) != 0).map(Address)
 }

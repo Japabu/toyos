@@ -1,10 +1,9 @@
 //! A batch of handles crossing a connection, and what happens at each point a
 //! peer can die.
 //!
-//! `specs/capability-endowment-spec.md` §8 requires this gate and nothing in
-//! the tree was it: the only two `handle_send` call sites in the whole test
-//! estate sent a `SharedMem`, which is why three of this branch's defects lived
-//! here unseen.
+//! Nothing in the tree was this gate: the only two `handle_send` call sites in
+//! the whole test estate sent a `SharedMem`, which is why three of this
+//! branch's defects lived here unseen.
 //!
 //! Five arms, one per point a batch can be at.
 //!
@@ -229,7 +228,7 @@ fn a_senders_exit_does_not_retract_what_it_sent() {
     // **The handle resolves, which is the whole assertion.** The child made both
     // ends of the pipe and both went with it, so the write itself is refused for
     // the reader rather than for the handle — `NotFound`, which
-    // `specs/issues/isolation/a-broken-pipe-answers-not-found.md` is about and
+    // `issues/isolation/a-broken-pipe-answers-not-found.md` is about and
     // which `connect_before_serve` asserts too. A handle a dead sender's batch
     // no longer backed would instead end this process on `Stale`, so reaching
     // the next statement at all is the verdict.
