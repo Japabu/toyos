@@ -362,6 +362,13 @@ fn merge_base_into_branch(root: &Path, branch: &str) -> Result<String, String> {
 /// Merges are skipped: a branch's own update merges touch nothing of their own,
 /// and counting them as unrelated work would refuse a branch whose only commit
 /// is the ABI change.
+///
+/// **This reads history, not the tree — so the split is decided at the first
+/// commit, not fixed later.** A branch that will touch `toyos-abi/src`,
+/// `toyos/src` or `userland/libc/src` puts that change in its first commit or
+/// on its own branch from the start; a later revert leaves the commit in
+/// history and the only remedy is rebuilding the branch. Cost one full rebuild
+/// on 2026-08-19 (`issues/build/abi-split-reads-commits-not-the-tree.md`).
 pub fn abi_lands_alone(root: &Path, base: &str) -> Result<(), String> {
     let commits = branch_commits(root, base)?;
     if commits.iter().any(|c| c.declares_inseparable) {
