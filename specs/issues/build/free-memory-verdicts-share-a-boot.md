@@ -9,9 +9,11 @@ opened: 2026-08-10
 > **The diagnosis this heading carries was wrong, and the section
 > *"It is not the neighbours: the release outlives the syscall that caused it"*
 > is what replaced it.** The two binaries do share a boot with page churn and
-> that is still true; it is not what was making them red. The 2026-08-10 and
-> 2026-08-15 readings are kept as what was believed and on what evidence,
-> because the new one has to account for the same measurements.
+> that is still true; it is not what was making them red, and neither is a leak
+> in the kill path. The 2026-08-10 and 2026-08-15 readings, and the 2026-08-19
+> run that broke both of their escape clauses, are all kept as what was believed
+> and on what evidence — the new reading has to account for the same
+> measurements, and it does.
 
 `fd_lifetime`'s `kill_releases_ring` takes `free_bytes()` before spawning a
 holder, kills it, and requires free memory to come back within 6 MiB
@@ -85,41 +87,69 @@ this branch has no standing to pick between them for a defect it only made
 louder. **`Instrument::Ci` cannot see any of this** — one guest per machine,
 `--jobs 1` — so nothing here is a claim about a CI red.
 
-## What was proposed on that reading
+## 2026-08-19: CI saw it, and ALONE was RED — both of this entry's escape clauses failed
 
-Recorded because the section *"It is not the neighbours: the release outlives
-the syscall that caused it"* rules the first of the two out on evidence, and it
-should not be re-proposed:
+> Answered the same day by the section *"It is not the neighbours: the release
+> outlives the syscall that caused it"*, which is where the two readings this
+> one puts back on the table are decided between. Kept as written, because the
+> question it asks is the right one and the evidence it cites is the run.
 
-- **Give the two memory-verdict binaries a boot of their own** (`Sched::Serial`
-  one level up, `RUST_SKIP` plus a `MACHINE_TESTS` entry). **This would not have
-  worked**: the failure reproduces in a guest running one binary, so a boot of
-  its own is the condition it fails under.
-- **Or make the verdict per-process rather than machine-wide**, through the
-  object census or `SYS_PROCESS_STATS`. Still a better instrument for what these
-  two want to say, and still not built — but it would not have fixed this
-  either, because a per-process page count read at the same moment is early for
-  the same reason a machine-wide one is.
+Everything the 2026-08-10 and 2026-08-15 readings rest on comes down to two
+claims, and one CI run broke both.
 
-Neither is "make the margin bigger", which stays wrong for the reason it always
-was: a margin that absorbs another binary's working set absorbs a leak too, and
-the non-vacuity arm (*"an instrument that cannot see 16 MiB leave cannot see it
-come back"*) is why it cannot simply grow.
+**"`Instrument::Ci` cannot see any of this — one guest per machine, `--jobs 1`."**
+It saw it. `guest (1)` on PR #126, run `32237424649` — a pull request whose
+entire diff is two new markdown files. `main` is red at the same commit
+(`8e9f851`): the `ci` and `gate A, thorough` workflows both failed on
+2026-08-19, at 03:40Z and 03:56Z.
+
+**"green alone both times", "every one ALONE GREEN".** Not this time. The
+harness re-ran it by itself and printed:
+
+```
+ALONE fd_lifetime: red again, the same failure both times — the defect is real.
+```
+
+The number is `16777216` — **exactly 16 MiB, the whole of what the holder took**,
+against a 6 MiB threshold. Not a margin missed by a page: nothing came back.
+
+This does not overturn the shared-boot analysis, which stands on its own
+evidence. It says that analysis is **not the whole story**, and that the reading
+it was built to rule out — a real leak in the kill path — is back on the table,
+because the one discriminator used to separate the two has now answered the
+other way. A shared-boot artefact does not reproduce in a single guest at
+`--jobs 1`, and this did.
+
+Whoever picks this up starts by deciding which of the two it is, and the
+existing instrument can no longer make that call. `SYS_PROCESS_STATS` — the
+per-process measurement this entry already recommends — is now the prerequisite
+for reading this entry at all, rather than an improvement to it.
+
+> Overtaken the same day, on both counts. It is neither of the two readings —
+> nothing leaks, and the neighbours are not the cause. And `SYS_PROCESS_STATS`
+> was not the prerequisite: a per-process page count read at the same moment is
+> early for the same reason a machine-wide one is. What decided it was
+> repetition — twenty kill rounds, which turn a leak into a slope and a race
+> into noise around zero.
+
+The redlist row for `fd_lifetime` still says `ALONE … GREEN` every time. That
+sentence is false as of this run, and the row needs the same correction this
+section is.
+
+> Done — `src/redlist.rs`'s row is retired with what contradicted it, and two
+> rows measured on 2026-08-19 stand in its place.
 
 ## It is not the neighbours: the release outlives the syscall that caused it
 
-**2026-08-19, on `wt/toyos-fdleak` at `8e9f851`.** CI run `32237424649` put both
-of this entry's discriminators out of reach: `fd_lifetime` went red on
-`Instrument::Ci` — one guest per machine, `--jobs 1` — and the harness's own
-`ALONE` re-run, which is a fresh boot carrying that binary and nothing else,
-was **red again on the same failure**. `main` itself was red at `8e9f851` on
-`ci` and on `gate A, thorough`. A shared-boot artifact cannot do that.
+**2026-08-19, on `wt/toyos-fdleak` at `8e9f851`** — the same day as the section
+*"CI saw it, and ALONE was RED"*, and against the run it cites.
 
 What the 2026-08-10 and 2026-08-15 readings got wrong is narrower than it looks.
 The mechanism they named was never host contention — this entry's own opening
-says *"in one guest, beside every other Rust guest binary"* — so `Instrument::Ci`'s inability
-to see contention was never the right shield, and the sentence claiming it was
-is withdrawn. But the neighbours are not the cause either.
+says *"in one guest, beside every other Rust guest binary"* — so `Instrument::Ci`'s
+inability to see contention was never the right shield, and the sentence
+claiming it was is withdrawn. But the neighbours are not the cause either, and
+neither is a leak.
 
 **Twenty kill rounds, alone in the guest, two CPUs, TCG.** The one binary in the
 boot, `kill_releases_ring` looped, reading `SYS_SYSINFO` eight times back to back
@@ -168,3 +198,24 @@ has measured how much of the 2026-08-15 four-in-seven was this race and how much
 was the neighbours, and the settle makes both quieter at once, so that split is
 now unmeasurable on this instrument. The per-process measurement stays the
 better instrument and stays unbuilt.
+
+## What was proposed on the shared-boot reading
+
+Recorded because the section *"It is not the neighbours: the release outlives
+the syscall that caused it"* rules the first of the two out on evidence, and it
+should not be re-proposed:
+
+- **Give the two memory-verdict binaries a boot of their own** (`Sched::Serial`
+  one level up, `RUST_SKIP` plus a `MACHINE_TESTS` entry). **This would not have
+  worked**: the failure reproduces in a guest running one binary, so a boot of
+  its own is the condition it fails under.
+- **Or make the verdict per-process rather than machine-wide**, through the
+  object census or `SYS_PROCESS_STATS`. Still a better instrument for what these
+  two want to say, and still not built — but it would not have fixed this
+  either, because a per-process page count read at the same moment is early for
+  the same reason a machine-wide one is.
+
+Neither is "make the margin bigger", which stays wrong for the reason it always
+was: a margin that absorbs another binary's working set absorbs a leak too, and
+the non-vacuity arm (*"an instrument that cannot see 16 MiB leave cannot see it
+come back"*) is why it cannot simply grow.
