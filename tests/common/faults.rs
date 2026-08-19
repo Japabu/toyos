@@ -54,6 +54,31 @@ pub fn double_fault_stack(
     if !log.contains("DOUBLE FAULT") {
         return Err(format!("no double fault was taken — the trigger did not work\n{log}"));
     }
+
+    // **And the harness's own claim about a capture like this one, asked of the
+    // only real one the suite produces.** `serial::death_report` is what a
+    // failure verdict now carries, and it is staged against transcribed lines
+    // everywhere else; a #DF is on the wire here already, so checking it costs
+    // nothing and is the difference between a recovery gated on a guess about
+    // the kernel's output and one gated on the output. It is a claim about the
+    // report and not about IST1, which is why it sits above every assertion
+    // that is.
+    let report = super::serial::death_report(&log).ok_or_else(|| {
+        format!("a capture carrying a real #DF yields no death report at all\n{log}")
+    })?;
+    let head = report.lines().next().unwrap_or_default();
+    if !head.contains("DOUBLE FAULT") {
+        return Err(format!("the report starts at {head:?} and not at the death\n{log}"));
+    }
+    // The body. The header alone is what the arm that lost this report already
+    // printed, so the assertion is on the lines under it: the address that
+    // started the chain, and the backtrace `double_fault_handler` writes after
+    // the page walk.
+    for want in ["cr2=", "Kernel backtrace:", MARKER] {
+        if !report.contains(want) {
+            return Err(format!("the report drops {want:?}:\n{report}"));
+        }
+    }
     let Some(line) = log.lines().find(|l| l.contains(MARKER)) else {
         return Err(format!(
             "the kernel never reported its IST1 usage; the report cannot have run to the \
