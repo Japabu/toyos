@@ -18,6 +18,14 @@
 //! exactly the failure this has already produced: three shards of `nvme_` where
 //! one test ran twice and one ran nowhere, and all three reported green. A
 //! concatenation cannot see it; this refuses it by name.
+//!
+//! **A `durations` red is never ignorable on a PR**: the required `guest-suite`
+//! check aggregates it, so a red here fails a required check transitively even
+//! though `durations` itself is not on the required list. The usual cause is a
+//! committed `UNMEASURED` marker past its one bought run — the cure is the
+//! measured value from that run's own `test-durations-merged` artifact, never a
+//! re-run. Learned on 2026-08-19, when three PRs stalled on exactly this while
+//! everyone read the red as stale noise.
 
 use std::collections::BTreeMap;
 use std::fs;
