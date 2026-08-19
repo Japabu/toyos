@@ -8,6 +8,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -117,12 +118,16 @@ jobs:
               *) echo "::error::main has no \`$want\` rule"; bad=1 ;;
             esac
           done
-          # Strict is what makes a check on this head a check on the merged
-          # result — the property `--land`'s `git merge --no-ff main` used to
-          # carry.
-          if [ "$strict" != true ]; then
-            echo "::error::required checks are not strict, so a branch could merge without"
-            echo "::error::containing main and its checks would not be about the merged result"
+          # The law is that a merge's checks are about the merged result — the
+          # property `--land`'s `git merge --no-ff main` used to carry. Two
+          # configurations provide it: strict required checks (every branch
+          # current with main), or a required merge queue (GitHub builds the
+          # merged result itself and runs the checks on it). One of the two
+          # must hold; a settings change that provides neither reds every PR.
+          queued=$(case " $rules " in *" merge_queue "*) echo true;; *) echo false;; esac)
+          if [ "$strict" != true ] && [ "$queued" != true ]; then
+            echo "::error::required checks are neither strict nor behind a merge queue, so a"
+            echo "::error::branch could merge with checks that are not about the merged result"
             bad=1
           fi
           # CLAUDE.md's "never rewrite history", said at the remote.
@@ -134,7 +139,7 @@ jobs:
             echo ""
             echo "- rules: \`$rules\`"
             echo "- required checks: \`$live\`"
-            echo "- strict: \`$strict\`, merge methods: \`$methods\`"
+            echo "- strict: \`$strict\`, merge queue: \`$queued\`, merge methods: \`$methods\`"
           } >> "$GITHUB_STEP_SUMMARY"
           for have in $live; do
             case " $required " in
@@ -145,5 +150,6 @@ jobs:
           done
 
           test "$bad" = 0
-          echo "main is protected: the five checks above are required and strict,"
-          echo "merge is the only method, and neither deletion nor a force-push is allowed."
+          echo "main is protected: the five checks above are required and their verdicts"
+          echo "are about the merged result (strict=$strict, queue=$queued); merge is the"
+          echo "only method, and neither deletion nor a force-push is allowed."
