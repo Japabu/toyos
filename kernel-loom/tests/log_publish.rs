@@ -18,8 +18,6 @@
 //! — loom answers `Causality violation: Concurrent load and mut accesses`,
 //! which is the reader reaching the shard's own words while the publisher is
 //! still building them. Verified 2026-08-17, both ways round.
-//!
-//! `specs/log-architecture-spec.md` §2.2.
 
 #![cfg(feature = "loom")]
 

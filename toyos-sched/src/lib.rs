@@ -1,6 +1,8 @@
-//! ToyOS scheduler core — a sans-IO state machine driven by both the kernel
-//! and the host simulator through one [`hw::Hw`] boundary. The authoritative
-//! design is `specs/scheduler-core-spec.md`.
+//! ToyOS scheduler core — a sans-IO state machine driven by both the kernel and
+//! the host simulator through one [`hw::Hw`] boundary. Nothing here reads a
+//! clock, sends an IPI or touches a register: every effect is a value the caller
+//! is handed and has to perform, which is what lets the same sources run under a
+//! simulator and under loom.
 //!
 //! Two host-side harnesses compile against these same sources: the simulator
 //! (`toyos-sched/sim/`), which explores the protocol against invariants

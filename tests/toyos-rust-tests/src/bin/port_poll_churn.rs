@@ -1,4 +1,4 @@
-//! The window `specs/issues/kernel/ring0-jump-to-zero-under-port-polls.md`
+//! The window `issues/kernel/ring0-jump-to-zero-under-port-polls.md`
 //! names: the last `Acceptor` handle going while an `io_uring` poll still
 //! references the port.
 //!

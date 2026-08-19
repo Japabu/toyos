@@ -30,16 +30,124 @@ pub fn live_instances() -> u32 {
     LIVE.load(Ordering::SeqCst)
 }
 
+/// The NVMe backing files live guests are holding open.
+///
+/// A lane reuses one image across its boots on purpose ([`super::lane`]), so
+/// "one image, one guest" is an invariant this harness already believed and
+/// nothing checked. QEMU checks it — it takes an exclusive `write` lock and the
+/// second process exits 1 — but it checks it *after* the first one is unusable,
+/// on stderr, in a sentence about locks that says nothing about which two boots
+/// overlapped. This is the same claim, made before anything spawns and in the
+/// harness's own words.
+static NVME_HELD: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// One live guest's hold on the NVMe image it was given.
+///
+/// Taken before the QEMU process is spawned and released when the
+/// [`QemuInstance`] is dropped — including when `wait_for_ready` panics on its
+/// way out, which builds no instance to drop and so must not leave a hold
+/// behind either.
+pub struct NvmeClaim {
+    path: PathBuf,
+    /// A profile declaring no NVMe controller is handed no image: the path is
+    /// `no-nvme`, it never reaches QEMU's argv, and every lane's is the same
+    /// name. There is nothing to hold and nothing to conflict with.
+    held: bool,
+}
+
+impl NvmeClaim {
+    /// Hold `path` for a guest that is about to be launched with it.
+    ///
+    /// The refusal is returned rather than raised because it is what
+    /// `nvme_image_is_held_by_one_guest` stages: [`QemuInstance::boot_with_options`]
+    /// panics on it, since a lane whose image is already open cannot boot and
+    /// there is nothing else to do about that.
+    pub fn take(path: &Path) -> Result<Self, String> {
+        // Decided under the lock and raised after it: a panic with the guard
+        // held poisons the mutex, and one refusal would then become a refusal
+        // on every later boot in the process — the shape this whole entry is
+        // about.
+        let refusal = {
+            let mut held = NVME_HELD.lock().unwrap_or_else(|e| e.into_inner());
+            match nvme_conflict(&held, path) {
+                Some(why) => Some(why),
+                None => {
+                    held.insert(path.to_path_buf());
+                    None
+                }
+            }
+        };
+        match refusal {
+            Some(why) => Err(why),
+            None => Ok(Self { path: path.to_path_buf(), held: true }),
+        }
+    }
+
+    /// The image a profile with no controller names and never uses.
+    pub fn unattached(path: &Path) -> Self {
+        Self { path: path.to_path_buf(), held: false }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for NvmeClaim {
+    fn drop(&mut self) {
+        if self.held {
+            NVME_HELD.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.path);
+        }
+    }
+}
+
+/// Why a boot may not open `want`, given what live guests are already holding.
+///
+/// Pure, and every input a parameter, so both directions can be staged without
+/// a guest.
+pub fn nvme_conflict(held: &std::collections::BTreeSet<PathBuf>, want: &Path) -> Option<String> {
+    held.contains(want).then(|| {
+        format!(
+            "a live guest is still holding {}. QEMU takes an exclusive write lock on the image \
+             it is given, so the second process exits 1 before it says anything and the boot \
+             that waited on it panics — which is how one lost guest reported 129 tests red on \
+             2026-08-17. A guest that replaces another must be built from that one's \
+             `QemuInstance::shutdown`, which takes it by value; `qemu = boot()` evaluates its \
+             right-hand side first and launches the replacement while the old guest is up.",
+            want.display()
+        )
+    })
+}
+
+/// Proof that no guest is holding a lane's images.
+///
+/// There are two ways to have one and there is no third: a lane that has not
+/// booted anything yet ([`LaneFree::no_guest_yet`]), and a guest that has been
+/// ended ([`QemuInstance::shutdown`], which takes `self`). A boot that takes
+/// this by value therefore *cannot be written* before the guest it replaces is
+/// gone — which is the mistake `qemu = boot()` makes, because Rust evaluates
+/// the right-hand side first.
+#[must_use]
+pub struct LaneFree(());
+
+impl LaneFree {
+    /// Before a lane's first boot, where there is no guest to end.
+    pub fn no_guest_yet() -> Self {
+        Self(())
+    }
+}
+
 /// Guests this run has started, how many of them were not the shipping kernel,
 /// and every distinct kernel build it asked cargo for.
 ///
 /// A registration is not a boot — several tests boot two machines and one boots
 /// four — so the count that decides whether a scheduling or build change worked
-/// cannot be read off the test lists. It was static analysis until now, and
-/// `specs/assessments/test-cost-audit.md` §6 records that as a lower bound.
+/// cannot be read off the test lists. It was static analysis until now, which
+/// only ever gave a lower bound.
 ///
 /// **The third is the one this run is judged on.** A kernel build is ~6.9 s of
-/// wall clock and ~29.6 s of CPU after any edit to `kernel/` (§5.9.2), and
+/// wall clock and ~29.6 s of CPU after any edit to `kernel/`, and
 /// until 2026-08-10 a full run made 45 of them. The set is what a run reports
 /// and what [`declared_kernel_builds`] refuses an addition to.
 static BOOTS: AtomicU32 = AtomicU32::new(0);
@@ -63,7 +171,7 @@ pub fn boot_census() -> (u32, u32, Vec<String>) {
 /// actuator compiled in, armed by boot parameter. `fpu-save-nothing` is the one
 /// actuator that could not become a parameter — it takes the `fxsave64` out of
 /// `arch::entry`'s `naked_asm!` bracket, which is the path its own gate is
-/// about — and `specs/assessments/test-cost-audit.md` §5.9.7 is where that is argued.
+/// about.
 ///
 /// [`toyos_build::build::SCHED_CHECK_KERNEL`] is the fourth, and it is the one
 /// this list's own warning was written about: an entry here is a decision to pay
@@ -146,9 +254,8 @@ fn record_boot(took: Duration) {
 /// corrected for how fast the machine *is*, and that is the other half of the
 /// same mistake: a number reasoned about on an M4 Pro is not a liveness ceiling
 /// on a four-core Azure vCPU, it is a verdict about which of the two is running
-/// the test. `specs/assessments/ci-plan-assessment-2026-08.md` §7.1 counted
-/// 307 bare timeouts in one CI run and
-/// every one of them was that.
+/// the test. 307 bare timeouts were counted in one CI run and every one of
+/// them was that.
 ///
 /// **Only ever upward.** On a faster host the number in the source stands,
 /// because it is the number its author reasoned about, and a ceiling that shrank
@@ -180,7 +287,7 @@ pub fn host_speed() -> (Option<u32>, u32, u32, u32) {
 /// is the part of "how fast is the host today" the harness knows. It does not
 /// know the rest, and a retry loop bounded by elapsed time has that ceiling for
 /// a *verdict* the moment the rest moves: a guest that is merely late reports
-/// exactly what a wedged one reports. `specs/issues/design-debt/` is the bill —
+/// exactly what a wedged one reports. `issues/design-debt/` is the bill —
 /// `desktop_audio_client` 385 s wide against 13 s alone, a landing gate that is
 /// a coin toss, and six reds in four suites every one of which was
 /// `ALONE: GREEN`.
@@ -608,8 +715,7 @@ pub enum Profile {
     Diskless,
     /// metal-sim with a namespace formatted in 8 KiB logical blocks.
     ///
-    /// Sector size is a shape dimension in exactly the sense
-    /// `specs/device-test-strategy.md` means, and it was one the harness could
+    /// Sector size is a shape dimension, and it was one the harness could
     /// not express: every profile got QEMU's implicit 512-byte namespace, so
     /// nothing asked the driver what it does with a device it cannot address.
     /// The answer was `4096 / sector_size == 0` and then a divide by zero, at
@@ -747,8 +853,8 @@ pub enum Profile {
     /// Two controllers, and every input device arrives *after* the boot.
     ///
     /// The T14's shape for the one thing no profile stages: its Thunderbolt
-    /// xHCI at 00:0d.0 has five ports and has never had a device on them
-    /// (`specs/reference/metal-hardware-inventory.md`), so the controller a user plugs
+    /// xHCI at 00:0d.0 has five ports and has never had a device on them, so
+    /// the controller a user plugs
     /// into is the one that enumerated nothing at boot. Here the second
     /// controller is that one and the boot stick is on the first.
     ///
@@ -766,8 +872,8 @@ pub enum Profile {
     ///
     /// Presence of the unit is the shape dimension, and it is the one QEMU
     /// gives for free that no real machine gives at all: on hardware, "no
-    /// DMAR" and "VT-d disabled in firmware setup" are the same observation
-    /// (`specs/iommu-spec.md` §2.2). This is the machine where the kernel has
+    /// DMAR" and "VT-d disabled in firmware setup" are the same observation.
+    /// This is the machine where the kernel has
     /// to say which of the two it cannot tell apart.
     NoIommu,
     /// metal-sim whose unit advertises a 39-bit address width instead of 48.
@@ -775,12 +881,12 @@ pub enum Profile {
     /// `CAP.SAGAW` is a register the guest decodes into a page-table depth,
     /// and a suite with one value of it cannot tell a decode from a constant.
     /// Both widths are real: 39-bit units ship, and the IOVA base every domain
-    /// gets is derived from this number (`specs/iommu-spec.md` §5.3).
+    /// gets is derived from this number.
     IommuNarrow,
     /// metal-sim whose unit cannot remap interrupts.
     ///
     /// Two registers move together — the DMAR's own `INTR_REMAP` flag and the
-    /// unit's `ECAP.IR` — and `specs/iommu-spec.md` §2.2 gives them separate
+    /// unit's `ECAP.IR` — and the kernel gives them separate
     /// refusals, because a platform that declares it cannot remap and a unit
     /// that cannot are different facts a user can act on differently.
     IommuNoIntremap,
@@ -792,8 +898,8 @@ pub enum Profile {
     /// differs from the machine gate A's four recorded configs run on is the
     /// sound card, so a difference in the capture is a difference in the audio
     /// path. It is not the T14's literal shape and does not try to be — this is
-    /// the audio arm, not a PCI-topology one. `specs/plans/hda-driver-plan.md`
-    /// H0's diagnostic staged that comparison and is deleted now that the
+    /// the audio arm, not a PCI-topology one. H0's diagnostic staged that
+    /// comparison and is deleted now that the
     /// driver above answers every question it was asked for.
     Hda,
     /// [`Profile::Hda`] with a second controller that also has a codec.
@@ -815,8 +921,8 @@ pub enum Profile {
 /// registers from one that prints what it expected to find.
 ///
 /// `caching-mode` is deliberately not a field. It is on everywhere: it is the
-/// stricter configuration, it is the only one QEMU can stage, and
-/// `specs/iommu-spec.md` §5.5 refuses to branch on it — so a profile that
+/// stricter configuration, it is the only one QEMU can stage, and the kernel
+/// refuses to branch on it — so a profile that
 /// turned it off would be staging a machine no code here distinguishes.
 #[derive(Clone, Copy, PartialEq)]
 pub struct Iommu {
@@ -827,8 +933,7 @@ pub struct Iommu {
 }
 
 /// What every profile but the three that vary it declares: the widest address
-/// width QEMU offers and interrupt remapping on, which is
-/// `specs/iommu-spec.md` §8's configuration.
+/// width QEMU offers and interrupt remapping on.
 pub const IOMMU_DEFAULT: Iommu = Iommu { aw_bits: 48, intremap: true };
 
 /// The controller every profile but [`Profile::MetalUsb`] gets. `nec-usb-xhci`
@@ -984,7 +1089,7 @@ struct Shape {
     ///
     /// Presence of a class-0403 *function* is the shape dimension, and it is
     /// separate from whether anything answers on the link behind it — which is
-    /// `specs/plans/hda-driver-plan.md` H0's question (b), and what the codec
+    /// H0's question (b), and what the codec
     /// arguments in this list decide per controller.
     hda: &'static [&'static str],
     /// The unit that decodes this machine's DMA, or its absence. Stated per
@@ -1616,7 +1721,7 @@ pub struct QemuInstance {
     _reader_thread: thread::JoinHandle<String>,
     audio_wav: PathBuf,
     uart_log: PathBuf,
-    nvme_image: PathBuf,
+    nvme: NvmeClaim,
     usb_images: Vec<PathBuf>,
     qmp_socket: Option<PathBuf>,
     screendump: PathBuf,
@@ -1832,6 +1937,10 @@ impl QemuInstance {
         // not hand each other a filesystem formatted for the wrong one. Reused
         // across the boots of one lane and shared with no other — which is what
         // `super::lane` is for, and why this is not a per-boot name.
+        //
+        // One live guest per image, claimed here rather than discovered from
+        // QEMU's stderr after the second process has already exited — see
+        // [`NvmeClaim`].
         let nvme_bytes = options.profile.shape().nvme_bytes;
         let nvme_image = match &options.nvme_image {
             Some(path) => path.clone(),
@@ -1845,6 +1954,11 @@ impl QemuInstance {
                 }
                 path
             }
+        };
+        let nvme = if nvme_bytes == 0 {
+            NvmeClaim::unattached(&nvme_image)
+        } else {
+            NvmeClaim::take(&nvme_image).unwrap_or_else(|why| panic!("[qemu] {why}"))
         };
 
         // Named by size and block size for the same reason the namespace is:
@@ -1887,7 +2001,7 @@ impl QemuInstance {
 
         let qemu = qemu_command(
             &boot_image,
-            &nvme_image,
+            nvme.path(),
             &usb_images,
             &audio_wav,
             &uart_log,
@@ -1901,7 +2015,7 @@ impl QemuInstance {
                 seq,
                 audio_wav,
                 uart_log,
-                nvme_image,
+                nvme,
                 usb_images,
                 qmp_socket,
                 screendump,
@@ -2011,7 +2125,24 @@ impl QemuInstance {
     /// only place a storage assertion can stand outside the guest's own
     /// account of itself.
     pub fn nvme_image(&self) -> &Path {
-        &self.nvme_image
+        self.nvme.path()
+    }
+
+    /// End this guest and hand back the proof its lane is free.
+    ///
+    /// **This is the only way to boot a replacement**, because [`LaneFree`] is
+    /// the only thing a replacement can be built from and this is the only
+    /// thing that makes one out of a guest. Taking `self` is the whole of it:
+    /// `qemu = boot()` launched the new QEMU while the old instance still held
+    /// the lane's `test-nvme-*.img` open for write, the new one exited 1 on
+    /// QEMU's own lock, and `wait_for_ready`'s panic escaped the shared block —
+    /// 129 of one run's 131 reds carried that one sentence on 2026-08-17.
+    /// Deterministic, not a race in the sense of a window: the old guest is
+    /// always still alive at that point, so every shared-boot reboot since the
+    /// mechanism landed on 2026-08-08 died this way.
+    pub fn shutdown(self) -> LaneFree {
+        drop(self);
+        LaneFree(())
     }
 
     /// The data disks' backing files, which is what the *devices* received.
@@ -2228,7 +2359,7 @@ impl QemuInstance {
                         let rest = rest.split_once("===").map_or(rest, |(head, _)| head);
                         let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                         // **A marker naming another test is the previous one's**,
-                        // and taking it was `specs/issues/build/`'s cascade:
+                        // and taking it was `issues/build/`'s cascade:
                         // one timed-out test left the guest still producing its
                         // output, every later member of the block read a window
                         // that opened on it, and 110 of 238 went red on an
@@ -2314,13 +2445,17 @@ impl Drop for QemuInstance {
         let _ = writeln!(self.stdin, "quit");
         let _ = self.stdin.flush();
         let _ = self.child.kill();
+        // **Reaped, not merely signalled.** The `NvmeClaim` field is released
+        // after this body returns, and what makes that release true rather than
+        // hopeful is that the process whose descriptors hold QEMU's write lock
+        // on the image is gone by the time it happens.
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.audio_wav);
         // **The 16550's log outlives the guest, because it is the one channel
         // that exists before the console does.** Firmware, the bootloader and
         // the kernel up to the backend switch write here and nowhere else, so a
         // boot that dies before virtio-console comes up leaves this file and an
-        // empty capture — which is exactly the shape `specs/issues/diagnostics/`
+        // empty capture — which is exactly the shape `issues/diagnostics/`
         // records as looking like a kernel that never started. 1.4 KB on a
         // healthy `tests/testcases` boot, measured, against the hundreds of
         // megabytes of per-boot image beside it.
@@ -2728,8 +2863,7 @@ fn qemu_command(
     // Ahead of every other `-device`: QEMU gives a PCI function the bypassing
     // address space unless the unit exists when the function is created, so a
     // unit emitted after the devices it is meant to decode is a unit that
-    // decodes nothing — the vacuity trap `specs/plans/userspace-drivers-spec.md` §7.2
-    // is built around, in its harness-side form.
+    // decodes nothing — the vacuity trap, in its harness-side form.
     if let Some(unit) = shape.iommu {
         qemu.arg("-device").arg(format!(
             "intel-iommu,intremap={},caching-mode=on,aw-bits={}",
@@ -2915,7 +3049,7 @@ struct Files {
     seq: u32,
     audio_wav: PathBuf,
     uart_log: PathBuf,
-    nvme_image: PathBuf,
+    nvme: NvmeClaim,
     usb_images: Vec<PathBuf>,
     qmp_socket: Option<PathBuf>,
     screendump: PathBuf,
@@ -2927,7 +3061,7 @@ fn spawn_and_wait_ready(mut qemu: Command, options: &BootOptions, files: Files) 
         seq,
         audio_wav,
         uart_log,
-        nvme_image,
+        nvme,
         usb_images,
         qmp_socket,
         screendump,
@@ -2990,7 +3124,7 @@ fn spawn_and_wait_ready(mut qemu: Command, options: &BootOptions, files: Files) 
         _reader_thread: reader_thread,
         audio_wav,
         uart_log,
-        nvme_image,
+        nvme,
         usb_images,
         qmp_socket,
         screendump,
@@ -3010,8 +3144,8 @@ fn wait_for_ready(
     let ready = options.ready_marker;
     let panic_aborts = ready == DEFAULT_READY;
     // Ten seconds per guest this phase may have up, and never fewer than two
-    // guests' worth — the tree runs 15-25 suites a day across several agents
-    // (`specs/assessments/test-cost-audit.md` §4), so one guest on a quiet host stopped being
+    // guests' worth — the tree runs 15-25 suites a day across several agents,
+    // so one guest on a quiet host stopped being
     // the regime some time before this did. Measured on 2026-08-03 with other
     // agents building: two boots exceeded the flat ten seconds, one of them in a
     // phase running a single guest.
@@ -3060,7 +3194,7 @@ fn wait_for_ready(
             // A process that ended *itself* is not on that list, and the
             // difference is not academic: `sshd` panics across boots that then
             // come up perfectly
-            // (`specs/issues/build/sshd-panics-when-netd-exits-before-it-binds.md`).
+            // (`issues/build/sshd-panics-when-netd-exits-before-it-binds.md`).
             // The words are the same words — `panicked at` — and who wrote the
             // line is the whole of what tells them apart. `super::serial::died`
             // is where that is decided, for this wait and for [`await_guest`]

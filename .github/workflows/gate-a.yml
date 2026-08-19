@@ -6,11 +6,10 @@ name: gate A, thorough
 #
 # Same `debian:sid`/QEMU 11.1.0 container the twelve shards run, since a QEMU
 # version this job does not share with the rest of CI and the dev host would
-# make the one arm that exists to be compared a third instrument
-# (specs/assessments/ci-plan-assessment-2026-08.md §7.3, §12.1). What still
+# make the one arm that exists to be compared a third instrument. What still
 # differs from the dev host, deliberately, is the accelerator (KVM against
 # cross-arch TCG) and the host CPU — the axis this configuration is arranged
-# to isolate (specs/testing-strategy.md §2).
+# to isolate.
 
 on:
   workflow_dispatch:
@@ -22,10 +21,9 @@ on:
       ref:
         description: branch to run against
         required: false
-  # `03:10 UTC`, clear of `ci.yml`'s `03:00` and `host-tests.yml`'s `03:05`
-  # (specs/testing-strategy.md §5). A `schedule` event carries no `inputs`, so
-  # `iterations` below falls back to the same N=30 `workflow_dispatch` defaults
-  # to.
+  # `03:10 UTC`, clear of `ci.yml`'s `03:00` and `host-tests.yml`'s `03:05`. A
+  # `schedule` event carries no `inputs`, so `iterations` below falls back to
+  # the same N=30 `workflow_dispatch` defaults to.
   schedule:
     - cron: '10 3 * * *'
 

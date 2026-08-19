@@ -1,7 +1,6 @@
 //! The Intel HDA stub: bring-up, one output stream, and the allow-list.
 //!
-//! `specs/plans/hda-driver-plan.md` §4.1 is the design and §4.1.6 is the shape this
-//! file implements. **The line is who touches a register.** The kernel resets
+//! **The line is who touches a register.** The kernel resets
 //! the controller, allocates the PCM ring and the buffer descriptor list,
 //! programs every register whose value is an address or indexes one of those
 //! structures, acknowledges the interrupt and derives the completion mask from
@@ -12,7 +11,7 @@
 //! refused by name.
 //!
 //! Nothing here decides. The moment this file has to know which codec or which
-//! pin, the line has moved and §4.1.5's last bullet has fired.
+//! pin, the line has moved and this stub has become a driver.
 //!
 //! Register offsets, bit positions and the descriptor layout come from the
 //! Intel High Definition Audio specification.
@@ -327,10 +326,7 @@ fn read_permit(offset: u64, width: RegWidth) -> Result<&'static str, ()> {
 
 fn refuse(what: &str, offset: u64, width: RegWidth) -> SyscallError {
     if REFUSALS.fetch_add(1, Ordering::Relaxed) < MAX_NAMED_REFUSALS {
-        log!(
-            "hda: refused a {width:?} {what} of {offset:#x} — not on the allow-list \
-             (hda-driver-plan.md §4.1.3)"
-        );
+        log!("hda: refused a {width:?} {what} of {offset:#x} — not on the allow-list");
     }
     SyscallError::PermissionDenied
 }
@@ -390,7 +386,7 @@ fn start_stop(controller: &HdaController, value: u8) -> Result<(), SyscallError>
         if REFUSALS.fetch_add(1, Ordering::Relaxed) < MAX_NAMED_REFUSALS {
             log!(
                 "hda: refused SDnCTL {value:#04x} — stream reset clears the buffer descriptor \
-                 address, which is the kernel's (hda-driver-plan.md §4.1.3)"
+                 address, which is the kernel's"
             );
         }
         return Err(SyscallError::PermissionDenied);

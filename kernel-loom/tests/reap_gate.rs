@@ -4,7 +4,7 @@
 //! `PROCESS_TABLE` on every trip round the idle loop — the standing aggressor
 //! against the crash report's `try_lock`, which is the whole reason a fault
 //! report could print a bare address for a symbol that was right there
-//! (`specs/issues/panic-path/`). Gating housekeeping on a flag is only sound if
+//! (`issues/panic-path/`). Gating housekeeping on a flag is only sound if
 //! the flag cannot lose a raise, and that is what these models are for: a raise
 //! concurrent with a claim, from every interleaving loom can build.
 //!

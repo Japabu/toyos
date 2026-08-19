@@ -15,9 +15,8 @@
 //!
 //! **Minting is a capability now, and this binary holds one.** `SYS_OPEN_DEVICE`
 //! was first-come and ungated; `SYS_DEVICE_CLAIM` needs a `SysCap` carrying
-//! `Rights::DEVICE`, which reaches the test estate through test-runner
-//! (`specs/capability-endowment-spec.md` §4) and reaches this binary's own
-//! children because it also carries `Rights::DUP`.
+//! `Rights::DEVICE`, which reaches the test estate through test-runner and
+//! reaches this binary's own children because it also carries `Rights::DUP`.
 //!
 //! Roles: no argument is the test; `claimer` tries to take the mouse and
 //! reports what it got; `holder` takes it, says so, and waits to be killed.

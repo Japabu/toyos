@@ -599,7 +599,7 @@ impl XhciController {
         // started from and whatever else is plugged in — and an unnamed
         // `transport broke` cannot be attributed to either, which is how a
         // harness assertion came to count the boot stick's own recovery against
-        // the disk under test (`specs/issues/hardware/`).
+        // the disk under test (`issues/hardware/`).
         let slot = self.slot(dev.slot_id);
         for attempt in 1..=MAX_TRANSPORT_ATTEMPTS {
             match self.bot(dev, cdb, cdb_len, data_phys, data_len, data_in) {
@@ -873,7 +873,7 @@ impl XhciController {
     /// driver sends. That is a second broken transfer out of one fault, and a
     /// caller's write lost with it. Whether the window opens at all is a race
     /// between the guest and the device, which is why the dev host has never
-    /// seen it and CI reproduces it every run (`specs/issues/hardware/`).
+    /// seen it and CI reproduces it every run (`issues/hardware/`).
     ///
     /// [`Owed`](super::Owed) is what keeps that order rather than a comment.
     /// Everything this says to the device is [`Self::reset_the_device`], whose
@@ -993,8 +993,9 @@ pub(in crate::drivers::xhci) fn prepare(
 ///
 /// **The last blocking path a scheduler pass can reach**, and the one door in
 /// the split X2b builds: everything below is Bulk-Only Transport, which is a
-/// machine of its own and `specs/plans/xhci-port-machine-plan.md` X2c is where it
-/// gets one. A hot-plugged disk has to be brought up by *some*body and there is
+/// machine of its own and does not have one yet
+/// (`issues/hardware/the-bot-scsi-machine-is-still-hand-written-in-the-kernel.md`).
+/// A hot-plugged disk has to be brought up by *some*body and there is
 /// no other context that may block, so until then this runs where it always
 /// did.
 ///

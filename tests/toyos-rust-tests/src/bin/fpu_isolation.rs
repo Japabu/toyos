@@ -1,4 +1,4 @@
-//! What a transition out of Ring 3 preserves — `specs/user-machine-state.md`.
+//! What a transition out of Ring 3 preserves.
 //!
 //! Three arms, all positive assertions, and each one fails on the tree that
 //! came before the bracket in `kernel/src/arch/entry.rs`:

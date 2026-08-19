@@ -1,11 +1,11 @@
 //! soundd as the driver of a virtio-sound device.
 //!
-//! `specs/plans/hda-driver-plan.md` §4.1: the kernel negotiated the device's features,
-//! built its virtqueues and owns their descriptors, and answers one register
-//! write per queue doorbell. Everything that is a *decision* is here — which
-//! stream, at what rate and format, when a period goes out and when the stream
-//! runs — and every one of them is a message this process writes into a buffer
-//! of its own and publishes by index.
+//! The kernel negotiated the device's features, built its virtqueues and owns
+//! their descriptors, and answers one register write per queue doorbell.
+//! Everything that is a *decision* is here — which stream, at what rate and
+//! format, when a period goes out and when the stream runs — and every one of
+//! them is a message this process writes into a buffer of its own and publishes
+//! by index.
 //!
 //! There is no descriptor here and no physical address. The chains were built
 //! once, at bind, out of offsets into the region below; what this file writes

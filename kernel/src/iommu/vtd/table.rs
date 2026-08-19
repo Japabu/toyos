@@ -2,19 +2,18 @@
 //! carries a device, and the second-level page tables of the one domain every
 //! kernel-owned device is put in.
 //!
-//! `specs/iommu-spec.md` §5.7 wanted those devices in a *passthrough* domain
-//! and called it "the single largest de-risking decision in the plan". §8.1
-//! measured `ECAP.PT` clear on the only unit anyone here can boot, so that
-//! decision is not available and the fallback it describes — an identity-
-//! mapped translated domain — is the only path. This module therefore never
-//! writes a passthrough context entry, even on a unit that offers one: that
-//! arm would be the one no machine in reach executes, which is what §5.2
-//! spends a section refusing to build.
+//! A *passthrough* domain for those devices was the first design, and the
+//! largest de-risking decision that was available. **`ECAP.PT` is clear on the
+//! only unit anyone here can boot** — measured — so that decision is not
+//! available and the fallback, an identity-mapped translated domain, is the
+//! only path. This module therefore never writes a passthrough context entry,
+//! even on a unit that offers one: that arm would be the one no machine in
+//! reach executes.
 //!
-//! Every write here goes out of the cache before it returns, unconditionally
-//! (§5.2). `ECAP.C` is clear on QEMU — the opposite of what §5.2 assumed and
-//! what §8.1 corrected — so on the machine this suite runs, an entry left in a
-//! dirty line is an entry the unit does not see.
+//! Every write here goes out of the cache before it returns, unconditionally.
+//! `ECAP.C` — page-table walks snoop the CPU cache — is **clear** on QEMU, the
+//! opposite of what the design first assumed, so on the machine this suite runs
+//! an entry left in a dirty line is an entry the unit does not see.
 
 use alloc::vec::Vec;
 
@@ -198,13 +197,13 @@ fn levels(width: AddressWidth) -> u8 {
 /// Build the identity domain's second-level tables over `[0, top)` and return
 /// the root and how many leaves it took.
 ///
-/// One rule, and it is what makes I2 "behaviour unchanged by construction"
-/// (`specs/plans/iommu-plan.md`): every address a kernel driver can hand a
+/// One rule, and it is what makes this stage behaviour-unchanged by
+/// construction: every address a kernel driver can hand a
 /// device today is an address that device could already reach with no unit on
-/// the machine, and `[0, top)` is that set. It is not isolation and does not pretend to be — isolation
-/// arrives with I4's per-driver domains, where an IOVA is *allocated* out of a
-/// space that starts above the top of RAM (§5.3) rather than inherited from a
-/// physical address.
+/// the machine, and `[0, top)` is that set. It is not isolation and does not
+/// pretend to be — isolation arrives with per-driver domains, where an IOVA is
+/// *allocated* out of a space that starts above the top of RAM rather than
+/// inherited from a physical address.
 ///
 /// `top` comes from the memory manager rather than from the firmware map: the
 /// map's own buffer is ordinary free RAM by the time this runs, so reading it
