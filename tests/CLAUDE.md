@@ -1,13 +1,13 @@
 # Tests
 
-The mechanics live where the work is: profiles and shapes in `tests/common/`, registration, tiers and `EXPECTED_FAILURES` in `tests/toyos.rs`, instruments and known reds in `src/redlist.rs`, the relegation record in `src/tiers.rs`, the hardware-boundary track in `issues/hardware/device-shape-and-lifecycle-have-no-coverage.md` — read those, not this file, for how the harness works.
+The mechanics live where the work is: profiles and shapes in `tests/common/`, registration, tiers and `EXPECTED_FAILURES` in `tests/toyos.rs`, instruments and known reds in `src/redlist.rs`, the relegation record in `src/tiers.rs` — read those, not this file, for how the harness works.
 
 ## Caveats that bite every agent
 
 - **The dev host is a laptop that sleeps mid-session, and the suite says so.** A run whose wall clock jumped against the monotonic one reports `INVL` per test and exits 2 — re-run rather than investigate. A wild outlier *not* marked that way is a real finding.
 - **A landing-gate red on a test that is green alone is not therefore the host.** What a duration still decides prints `STALL` — red, and named apart so nobody bisects it. `ALONE: red again` on a loaded host means nothing without a same-session A/B against `main`. None of this re-runs an audio harm verdict away.
 - **The converse holds too**: a machine-wide kernel panic reds whichever test was running — that red's name is the workload, never the cause, even when the isolated re-run reds again.
-- **Gate A reds on `main` itself**: the thorough tier reproducibly, the fast tier intermittently (`issues/audio/thorough-tier-reds-on-unmodified-main.md`). Stash and re-run before believing a red is yours — and note a plain `cargo test` boots no audio config at all; both configs are `Tier::Nightly`.
+- **Gate A reds on `main` itself**: the thorough tier reproducibly, the fast tier intermittently. Stash and re-run before believing a red is yours — and note a plain `cargo test` boots no audio config at all; both configs are `Tier::Nightly`.
 - **A C test's capture has other processes' lines removed from it before comparison**, on the boot config's own list of who may speak (`tests/common/console.rs`); a program whose output has no trailing newline is joined to the next writer's line by the host's splitter, and that is undone there too.
 - **`/bin/init` speaks in every program's name before that program runs** — `init: netd: no nic on this machine` is in the capture before netd exists — so a predicate keyed on a `<program>: ` prefix is satisfied by the wrong speaker. Wait for the whole line, in the constant the assertion also reads.
 - **A guest binary cannot ask what a handle it does not hold does** — the probe ends its caller with exit 139, so it runs in a child, one fault per child, a printed marker proving the child reached the call. `handle_kill_policy` is the pattern.
