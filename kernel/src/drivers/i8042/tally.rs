@@ -8,11 +8,21 @@
 //! **They were two counters and the difference was read torn.** The ISR added
 //! to `IRQS` on entry and to `EMPTY_IRQS` after the drain came back empty, with
 //! the whole port-drain loop between them, and the report computed
-//! `carried = IRQS - EMPTY_IRQS`. A reader landing inside that window attributed
-//! an empty interrupt to `carried` and printed a verdict about bytes that never
-//! arrived. Widening the window was not the defect and narrowing it was not the
-//! fix: *any* window is one, because the report is a statement about a completed
-//! observation and the ISR had not finished making it.
+//! `carried = IRQS - EMPTY_IRQS`. A reader landing inside that window would
+//! attribute an empty interrupt to `carried` and say something about bytes that
+//! never arrived. Widening the window was not the defect and narrowing it was
+//! not the fix: *any* window is one, because the report is a statement about a
+//! completed observation and the ISR had not finished making it.
+//!
+//! **A second window, and it is the one the observed line came from.** `IRQS`
+//! moved on the way *in*, before the burst had read anything, so a reader
+//! between the pin asserting and the first `push_isr` held a count of arrived
+//! bytes with no byte anywhere — no subtraction involved, and true of the very
+//! first interrupt a machine takes. Both windows have the same shape and the
+//! same cure, which is why one change closes both; the write-up
+//! (`issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`)
+//! records which was which, because a torn read that was proved to exist got
+//! blamed for a line it could not have printed.
 //!
 //! So the pair is one `u64` and the ISR writes it once, after the burst, when
 //! what it says is settled: the low half counts the interrupts that put a byte

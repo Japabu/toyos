@@ -1,0 +1,17 @@
+# A member of the host workspace (root `Cargo.toml`), like toyos-pci, toyos-gpt
+# and toyos-hda: it is pure, it has no dependencies, and its tests run on the
+# host.
+#
+# What lives here is one type. Every other pure crate in this tree decodes one
+# *format* a device or a peer published — a capability structure, a GPT header,
+# an ELF file — and each of them reaches, at the bottom, for the same sentence:
+# this number crossed a trust boundary, so it is not an index until something
+# compared it with the table. That sentence had no type, so it was written by
+# hand where somebody remembered to and not written where nobody did.
+
+[package]
+name = "toyos-untrusted"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false

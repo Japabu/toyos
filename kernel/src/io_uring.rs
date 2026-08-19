@@ -88,7 +88,7 @@ impl Drop for RingRef {
         };
         if let Some(mut instance) = instance {
             for poll in instance.pending_polls.drain(..) {
-                for source in [poll.read_source, poll.write_source].into_iter().flatten() {
+                for source in poll.sources.iter() {
                     source.remove_watcher(self.0);
                 }
             }
@@ -170,6 +170,71 @@ pub enum Source {
     Log,
 }
 
+/// A source whose whole lifetime is one object's.
+///
+/// **[`remove_fd`] takes only these, and that is what makes the mistake it
+/// exists to stop a compile error rather than a review note.** Cancellation is
+/// by source across every ring in the machine, which is what a pipe needs — a
+/// client closing its end must complete the server's poll on the other, and an
+/// fd number means nothing outside the process that owns it. Handing it a
+/// source the closing object does *not* own cancels polls that belong to
+/// processes which were never consulted, and there is now no way to write that:
+/// [`Source::ended_by_its_last_handle`] is the only constructor.
+pub struct EndedSource(Source);
+
+impl Source {
+    /// This source, if the last handle to the object naming it is what ends it.
+    ///
+    /// **Two sources answer `None`, and both are the machine's rather than any
+    /// holder's.** [`Source::Log`] is named by every `SysCap`, and the machine's
+    /// log is not something a capability going away ends: closing one is a
+    /// process putting down its authority to read a stream that outlives every
+    /// handle, and `/bin/logd`'s whole loop is read-then-park, so that was a
+    /// daemon which stopped reading the moment anything anywhere closed a
+    /// capability. [`Source::Keyboard`] is the machine's one keyboard, which no
+    /// claim and no console creates or destroys: the `Device(Keyboard)` claim
+    /// names it *and* so does every `Console` (`object::ops::read_source`), so
+    /// the claim's holder closing its handle posted `-NotFound` into every
+    /// pending poll on stdin in the machine — which is what libc's terminal read
+    /// arms — for processes that hold no device. It stayed quiet only because
+    /// the compositor takes the claim at boot and holds it until the machine
+    /// stops; a restart, a handoff or a rearm would have cancelled every
+    /// terminal read on the machine in between.
+    ///
+    /// **The question is the source's and asking the object was the defect.**
+    /// What makes cancelling safe is that no *other kind* of object names the
+    /// same source, and an exhaustive match over `KObjectRef` cannot state that
+    /// — `object::ops` had one, and its argument was "a claim admits exactly one
+    /// handle by construction, so every ring watching it is the one holder's",
+    /// which is true of the claim and false of the source. The match is here
+    /// because the fact is here, beside [`Source::is_ready`] and
+    /// [`Source::watchers`], and a source added to this enum has to answer it.
+    ///
+    /// Every other source really is its object's: a pipe end, a connection, a
+    /// port and the four remaining device classes each go away with their last
+    /// handle, and nothing else in the kernel names any of them.
+    pub fn ended_by_its_last_handle(self) -> Option<EndedSource> {
+        // The negative controls restore the prior behaviour for one source
+        // each, so the gate covering it reds on the tree that had it.
+        // `log-close-cancels-any-syscap` covered both while the question was
+        // asked of the object; the keyboard half has its own name now, because
+        // a keyboard *claim* closing is the reachable stimulus for it and no
+        // `SysCap` is involved.
+        let ends = match self {
+            Self::Log => crate::actuator::log_close_cancels_any_syscap(),
+            Self::Keyboard => crate::actuator::keyboard_close_cancels_every_console(),
+            Self::Mouse
+            | Self::Network
+            | Self::VirtioSound
+            | Self::Hda
+            | Self::Port(_)
+            | Self::PipeReadable(_)
+            | Self::PipeWritable(_) => true,
+        };
+        ends.then_some(EndedSource(self))
+    }
+}
+
 impl PartialEq for Source {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -189,6 +254,43 @@ impl PartialEq for Source {
 
 // PendingPoll — a POLL_ADD that hasn't fired yet
 
+/// The sources a pending poll is registered on — **never both `None`**.
+///
+/// A `PendingPoll` *is* its registration: the only thing that can complete one
+/// is an event site walking a source's watcher list and finding this ring. A
+/// poll holding no source is therefore a poll nothing in the machine can ever
+/// complete, and the submitter learns nothing — it blocks until an unrelated
+/// wake and its own recheck finds nothing. That is what this type removes:
+/// [`Watched::of`] is the only constructor, it is the one place the emptiness
+/// is decided, and past it no code path can push an unwakeable poll.
+struct Watched {
+    read: Option<Source>,
+    write: Option<Source>,
+}
+
+impl Watched {
+    /// The sources the requested directions name, or `None` when the object has
+    /// no readiness to watch in either of them — a file, a namespace, a shared
+    /// region, or a console asked only about writability. Its caller answers
+    /// that with a CQE, because a poll is not something the kernel may accept
+    /// and then never speak of again.
+    fn of(read: Option<Source>, write: Option<Source>) -> Option<Self> {
+        (read.is_some() || write.is_some()).then_some(Self { read, write })
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &Source> {
+        [&self.read, &self.write].into_iter().flatten()
+    }
+
+    fn is_ready(&self) -> bool {
+        self.iter().any(Source::is_ready)
+    }
+
+    fn watches(&self, source: &Source) -> bool {
+        self.iter().any(|s| s == source)
+    }
+}
+
 struct PendingPoll {
     user_data: u64,
     /// The handle the poll was submitted against, and the dedup key. A handle
@@ -196,13 +298,12 @@ struct PendingPoll {
     /// another poll on the same ring — which is the whole of what dedup needs.
     handle: RawHandle,
     flags: PollFlags,
-    read_source: Option<Source>,
-    write_source: Option<Source>,
+    sources: Watched,
 }
 
 impl PendingPoll {
     fn watches(&self, source: &Source) -> bool {
-        self.read_source.as_ref() == Some(source) || self.write_source.as_ref() == Some(source)
+        self.sources.watches(source)
     }
 }
 
@@ -219,7 +320,7 @@ impl PendingPoll {
 /// property of the ring and not of the poll.
 fn take_poll(instance: &mut IoUringInstance, index: usize) -> PendingPoll {
     let poll = instance.pending_polls.swap_remove(index);
-    for source in [&poll.read_source, &poll.write_source].into_iter().flatten() {
+    for source in poll.sources.iter() {
         if !instance.pending_polls.iter().any(|p| p.watches(source)) {
             source.remove_watcher(instance.id);
         }
@@ -536,24 +637,44 @@ fn process_sqe(ring_id: RingId, sqe: &IoUringSqe) {
     }
 }
 
+/// Register a `POLL_ADD`, or answer it.
+///
+/// **A submission has an error channel, and it is the CQE.** Every way this can
+/// refuse posts one, because the alternative is what this call used to do: a
+/// `PendingPoll` carrying no source, which no event site can reach and no
+/// recheck can complete, so the submitter went quiet instead of learning it had
+/// made a mistake.
+///
+/// The handle is resolved by [`super::object::HandleError`]'s own rule and not
+/// by one invented here (`kernel/src/object/handle.rs`): a handle
+/// the process does not hold, one it closed, or one of the wrong type ends it,
+/// and a right it does not carry is a word it may see. The three fatal kinds
+/// are refused *outside* the table's guard, which is what `refuse_as_error`
+/// requires — it does not come back.
 fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
     let handle = sqe.fd;
     let flags = PollFlags::from_raw(sqe.op_flags);
     let user_data = sqe.user_data;
 
     // Readiness first, on the process's table rather than the thread's: a ring
-    // is process-wide. A handle without `WAIT` is not watchable, and answers as
-    // if it were not there.
-    let (ready, read_source, write_source) = process::with_fd_owner_data(|data| {
-        let Ok(object) = data.handles.get_ref(handle, Rights::WAIT) else {
-            return (false, None, None);
-        };
+    // is process-wide.
+    let resolved = process::with_fd_owner_data(|data| {
+        let object = data.handles.get_ref(handle, Rights::WAIT)?;
         let readable = flags.readable() && ops::has_data(object);
         let writable = flags.writable() && ops::has_space(object);
         let rsrc = if flags.readable() { ops::read_source(object) } else { None };
         let wsrc = if flags.writable() { ops::write_source(object) } else { None };
-        (readable || writable, rsrc, wsrc)
+        Ok::<_, crate::object::HandleError>((readable || writable, rsrc, wsrc))
     });
+    let (ready, read_source, write_source) = match resolved {
+        Ok(seen) => seen,
+        // Nothing is held here: `with_fd_owner_data` has given the guard up.
+        Err(e) => {
+            let refusal = e.refuse_as_error();
+            post_cqe_locked(ring_id, user_data, -(refusal as i32), 0);
+            return;
+        }
+    };
 
     if ready {
         // Already ready — post CQE immediately (one-shot: consumed)
@@ -563,6 +684,17 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
         post_cqe_locked(ring_id, user_data, result_flags as i32, 0);
         return;
     }
+
+    // Not ready, and not watchable either: the object has no readiness in the
+    // directions asked for, so there is no registration to make and nothing
+    // would ever complete this poll. `Poller::wait` treats a negative result as
+    // "this registration is over, look at the handle again", which is the
+    // honest answer for a file — always ready — and for a region, a namespace
+    // or a ring, which are never ready at all.
+    let Some(sources) = Watched::of(read_source, write_source) else {
+        post_cqe_locked(ring_id, user_data, -(SyscallError::NotSupported as i32), 0);
+        return;
+    };
 
     // Not ready — insert pending poll.
     // The old poll on this handle goes first, so its unregistration cannot
@@ -575,21 +707,11 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
             take_poll(instance, pos);
         }
 
-        for src in [&read_source, &write_source].into_iter().flatten() {
-            src.add_watcher(ring_id);
-        }
-
-        let new_pp = PendingPoll {
-            user_data,
-            handle,
-            flags,
-            read_source: read_source.clone(),
-            write_source: write_source.clone(),
-        };
-
-        if instance.pending_polls.len() < MAX_PENDING_POLLS {
-            instance.pending_polls.push(new_pp);
-        } else {
+        // The cap is answered before anything is registered. Registering first
+        // left the ring on every one of this poll's watcher lists with no poll
+        // behind it, so a later event scanned a ring that had told the caller
+        // it was full.
+        if instance.pending_polls.len() >= MAX_PENDING_POLLS {
             instance.post_cqe(user_data, -(SyscallError::ResourceExhausted as i32), 0);
             let queue = instance.waiters.clone();
             drop(guard);
@@ -597,12 +719,17 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
             return;
         }
 
+        for src in sources.iter() {
+            src.add_watcher(ring_id);
+        }
+        instance.pending_polls.push(PendingPoll { user_data, handle, flags, sources });
+
         // Recheck: close TOCTOU window between readiness check and PendingPoll
         // insertion. A concurrent wake (complete_pending_for_event) either already
         // ran and found no PendingPoll (recheck catches the data it left behind),
         // or is blocked on IO_URINGS and will find the PendingPoll after we release.
-        let became_ready = read_source.as_ref().is_some_and(Source::is_ready)
-            || write_source.as_ref().is_some_and(Source::is_ready);
+        let became_ready =
+            instance.pending_polls.last().expect("the poll just pushed").sources.is_ready();
         if became_ready {
             if let Some(pos) = instance.pending_polls.iter().position(|pp| pp.handle == handle) {
                 let pp = take_poll(instance, pos);
@@ -620,19 +747,28 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
     }
 }
 
+/// The same rule as `SYS_ACCEPT`, which this is the submission form of.
+///
+/// It used to fold five refusals into one `-InvalidArgument` CQE, so a program
+/// that submitted an `ACCEPT` on a handle it had closed learned only that its
+/// argument was "nonsense" — where the syscall form of the same mistake ends
+/// the process. `get` answers `WrongType` for a pipe presented as an acceptor,
+/// which is why the type is asked of it rather than matched here.
 fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
     let user_data = sqe.user_data;
 
     let acceptor = process::with_fd_owner_data(|data| {
-        match data.handles.get_ref(sqe.fd, Rights::READ) {
-            Ok(KObjectRef::Acceptor(a)) => Some(a.clone()),
-            _ => None,
-        }
+        data.handles.get::<crate::object::port::Acceptor>(sqe.fd, Rights::READ)
     });
 
-    let Some(acceptor) = acceptor else {
-        post_cqe_locked(ring_id, user_data, -(SyscallError::InvalidArgument as i32), 0);
-        return;
+    let acceptor = match acceptor {
+        Ok(a) => a,
+        // Nothing held: `with_fd_owner_data` has given the guard up.
+        Err(e) => {
+            let refusal = e.refuse_as_error();
+            post_cqe_locked(ring_id, user_data, -(refusal as i32), 0);
+            return;
+        }
     };
 
     match acceptor.pop() {
@@ -735,9 +871,9 @@ fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPol
 /// `enter` on it — that is what a pending `POLL_ADD` means — and nothing else
 /// can end that park: the poll is gone, so the source's own close-path wake
 /// finds no watcher for it, and a `u64::MAX` wait never returns.
-pub fn remove_fd(sources: &[Option<Source>]) {
+pub fn remove_fd(sources: &[Option<EndedSource>]) {
     let mut affected: Vec<RingId> = Vec::new();
-    for source in sources.iter().flatten() {
+    for EndedSource(source) in sources.iter().flatten() {
         for &id in source.watchers().iter() {
             if !affected.contains(&id) {
                 affected.push(id);
@@ -748,7 +884,7 @@ pub fn remove_fd(sources: &[Option<Source>]) {
     if affected.is_empty() { return; }
 
     let watches_a_closing_source =
-        |pp: &PendingPoll| sources.iter().flatten().any(|s| pp.watches(s));
+        |pp: &PendingPoll| sources.iter().flatten().any(|EndedSource(s)| pp.watches(s));
 
     let mut to_wake: Vec<Arc<KWaitQueue>> = Vec::new();
     let mut guard = IO_URINGS.lock();

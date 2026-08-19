@@ -640,3 +640,85 @@ pub fn c_capture_ignores_daemon_lines(
     );
     Ok(())
 }
+
+/// A pending poll on stdin is not something the keyboard *claim* closing can
+/// cancel.
+///
+/// **`Source::Keyboard` is named by two kinds of object and only one of them
+/// can end it.** `io_uring::remove_fd` cancels by source across every ring in
+/// the machine, and `object::ops::close` used to decide whether to call it by
+/// asking the object: `Device(_)` answered yes, on the argument that a claim
+/// admits exactly one handle so every ring watching it is the one holder's. The
+/// condition it needed was about the *source* — that no other **kind** of object
+/// names it — and every `Console` names `Source::Keyboard` too. So the one
+/// process holding the keyboard claim closing its handle posted `-NotFound` into
+/// every pending `POLL_ADD` on stdin in the machine, which is what libc's
+/// terminal read arms.
+///
+/// The guest half is `userland/test-runner/src/kbd_close.rs` and it carries all
+/// three verdicts; the host owes it one keystroke, which is the only thing that
+/// can complete a poll on `Source::Keyboard` and therefore the only way to show
+/// that what survived the close was a live registration.
+///
+/// **`Profile::Metal` because the keystroke has to arrive.** Its i8042 is the
+/// only keyboard on the machine — no USB HID, no virtio — which is the shape
+/// `i8042_keyboard` and `swiss_german_layout` already inject through, and the
+/// mouse the middle arm claims is the PS/2 one beside it.
+pub fn keyboard_claim_close_spares_stdin(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    kbd_close_probe(test_config, c_bins, rust_bins, &[])
+}
+
+/// The gate's body, parameterised on the boot's actuators so its negative
+/// control is one argument rather than a second copy of it.
+///
+/// `keyboard-close-cancels-every-console` restores what the tree had — every
+/// object naming `Source::Keyboard` ending it on close — and this must red on a
+/// boot carrying it. The measurement is in the commit that took the actuator's
+/// name.
+fn kbd_close_probe(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+    params: &'static [&'static str],
+) -> Result<(), String> {
+    /// What the guest prints once both claim arms have run.
+    const READY: &str = "===KBD_CLOSE_READY===";
+
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            profile: super::qemu::Profile::Metal,
+            qmp: true,
+            kernel_params: params,
+            ..Default::default()
+        },
+    );
+    // One tap, injected only after the guest says it is armed. The hook runs
+    // inside the console read loop, which is the one place "the poll is
+    // registered" and "the host has not injected yet" are both true.
+    let result = qemu.run_test_hooked("kbd-close", CEILING, READY, |socket| {
+        super::qemu::qmp_send_keys(socket, &[("a", true), ("a", false)]);
+    });
+    if let Some(err) = &result.error {
+        return Err(format!("{err}\nstdout:\n{}", result.stdout));
+    }
+    if result.exit_code != Some(0) || !result.stdout.contains("kbd-close: OK") {
+        return Err(format!(
+            "the keyboard-close probe exited {:?}\n{}",
+            result.exit_code, result.stdout
+        ));
+    }
+    let survived = result
+        .stdout
+        .lines()
+        .find(|l| l.contains("kbd-close: survived="))
+        .ok_or_else(|| format!("the guest never said what it saw\n{}", result.stdout))?;
+    eprintln!("  [console] {}", survived.trim());
+    Ok(())
+}

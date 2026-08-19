@@ -1,5 +1,6 @@
 use core::ptr::{read_volatile, write_volatile, write_bytes, copy_nonoverlapping};
 use core::sync::atomic::{fence, Ordering};
+use toyos_untrusted::{Refused, Untrusted};
 use crate::mm::Mmio;
 use super::pci::PciDevice;
 use super::DmaPool;
@@ -103,25 +104,41 @@ impl NvmeQueue {
         bar.write_u32(self.sq_doorbell, self.sq_tail as u32);
     }
 
-    fn wait_completion(&mut self, bar: &Mmio) -> u16 {
+    /// Wait for the completion at the head of the queue, and refuse it unless
+    /// its `cid` is `expected`.
+    ///
+    /// `cid` is the one number this driver chose for the command it
+    /// submitted and the device must echo back unchanged (NVMe 2.0
+    /// §3.3.3.2.1); nothing compared it against anything until now. Sound
+    /// today only because every submission on this queue is synchronous —
+    /// one command outstanding at a time is a property of the caller, not of
+    /// this parse, which is exactly why the comparison belongs here rather
+    /// than staying an invariant nobody checks.
+    fn wait_completion(&mut self, bar: &Mmio, expected: u16) -> Result<u16, Refused> {
         loop {
             let cq = unsafe { read_volatile(self.cq.add(self.cq_head as usize)) };
             if ((cq.status & 1) != 0) == self.phase {
                 let status = cq.status >> 1;
+                let cid = Untrusted::new(cq.cid);
                 self.cq_head = (self.cq_head + 1) % QUEUE_DEPTH as u16;
                 if self.cq_head == 0 {
                     self.phase = !self.phase;
                 }
                 bar.write_u32(self.cq_doorbell, self.cq_head as u32);
-                return status;
+                return cid.exactly(expected).map(|_| status);
             }
             core::hint::spin_loop();
         }
     }
 
-    fn submit_and_wait(&mut self, bar: &Mmio, cmd: SqEntry) -> u16 {
+    fn submit_and_wait(&mut self, bar: &Mmio, cmd: SqEntry) -> Result<u16, Refused> {
+        // The cid this driver chose for `cmd` is already packed into its own
+        // dword, which is why `wait_completion` needs no argument beyond it:
+        // reading it back out is not trusting `cmd` again, it is naming what
+        // this call itself just wrote.
+        let expected = (cmd.cdw0 >> 16) as u16;
         self.submit(bar, cmd);
-        self.wait_completion(bar)
+        self.wait_completion(bar, expected)
     }
 }
 
@@ -163,7 +180,13 @@ impl NvmeController {
     /// identify itself or to create a queue produced a driver that went on to
     /// read whatever the DMA buffer held and derive a geometry from it.
     fn admin(&mut self, cmd: SqEntry, what: &str) -> bool {
-        let status = self.admin.submit_and_wait(&self.bar, cmd);
+        let status = match self.admin.submit_and_wait(&self.bar, cmd) {
+            Ok(status) => status,
+            Err(refused) => {
+                log!("NVMe: {what}: the completion queue answered a different command ({refused})");
+                return false;
+            }
+        };
         if status != 0 {
             log!("NVMe: {what} failed, status={status:#x}");
             return false;
@@ -275,7 +298,14 @@ impl NvmeController {
             cmd.prp2 = dma.phys() + OFF_PRP_LIST as u64;
         }
 
-        let status = self.io.submit_and_wait(&self.bar, cmd);
+        let status = match self.io.submit_and_wait(&self.bar, cmd) {
+            Ok(status) => status,
+            Err(refused) => {
+                log!("NVMe: read of {sector_count} sectors at {lba}: the completion queue \
+                     answered a different command ({refused})");
+                return Err(BlockError);
+            }
+        };
         if status != 0 {
             log!("NVMe: read of {sector_count} sectors at {lba} failed, status={status:#x}");
             return Err(BlockError);
@@ -315,7 +345,14 @@ impl NvmeController {
             cmd.prp2 = dma.phys() + OFF_PRP_LIST as u64;
         }
 
-        let status = self.io.submit_and_wait(&self.bar, cmd);
+        let status = match self.io.submit_and_wait(&self.bar, cmd) {
+            Ok(status) => status,
+            Err(refused) => {
+                log!("NVMe: write of {sector_count} sectors at {lba}: the completion queue \
+                     answered a different command ({refused})");
+                return Err(BlockError);
+            }
+        };
         if status != 0 {
             log!("NVMe: write of {sector_count} sectors at {lba} failed, status={status:#x}");
             return Err(BlockError);
@@ -420,7 +457,19 @@ pub fn init(devices: &[PciDevice]) -> Option<NvmeBlockDevice> {
     log!("NVMe: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
     *DMA_POOL.lock() = Some(DmaPool::alloc(DMA_SIZE));
 
-    let bar_addr = pci_dev.read_bar_64(0);
+    // A refusal rather than a panic, like this driver's existing one for a
+    // sector size it cannot serve: a machine whose NVMe function publishes
+    // something other than a memory BAR 0 has no disk this driver can drive,
+    // and it still boots and still says why. NVMe 2.0 §3.1 requires BAR 0 to be
+    // memory, so this is a controller disagreeing with its own specification.
+    let bar_addr = match pci_dev.memory_bar(0) {
+        Ok(memory) => memory.address(),
+        Err(why) => {
+            log!("NVMe: NOT INITIALISED at PCI {:02x}:{:02x}.{} — its registers are in BAR 0 and \
+                 {}", pci_dev.bus, pci_dev.dev, pci_dev.func, why);
+            return None;
+        }
+    };
     pci_dev.enable_bus_master();
     log!("NVMe: BAR0={:#x}", bar_addr);
 

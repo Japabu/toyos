@@ -899,14 +899,17 @@ pub const KNOWN_RED: &[Red] = &[
         standing: Standing::Retired(
             "the assert is gone. Elapsed time across a pass is wall clock and a guest's wall \
              clock advances while the hypervisor has its vCPU, so the quantity carried a term \
-             the kernel neither observes nor controls; `toyos-sched` now records the \
-             distribution and `tests/common/passcost.rs` gates it at `MAX_PASS_NS` on the 90th \
-             percentile. **What retires this row is the same 91-run record that produced it**: \
-             invariant P asserted *every* pass under 200 000 ns and was green on 89 of those \
-             91 runs, so in each of the 89 the 90th percentile was under the budget too, and \
-             one crossing cannot move the 90th percentile of ~150 samples in the other two. \
-             The gate is green wherever the assert was, and green on the two runs the assert \
-             killed the machine on",
+             the kernel neither observes nor controls; `toyos-sched` records the distribution \
+             and `tests/common/passcost.rs` judges it. **What retires this row is the panic, \
+             which cannot happen again.** The replacement's first shape gated the 90th \
+             percentile at `MAX_PASS_NS` on the argument that a busy host moves the maximum \
+             and not the mass — an observed rate rather than a bound, and **measured false on \
+             2026-08-18**: host load moves every order statistic, median as much as tail. So \
+             the line is now the accelerator's own recorded sample, and for this instrument \
+             that sample is sixteen CI runs and 7 612 passes with **zero over 200 000 ns**, \
+             largest single pass 173 906 ns, 90th percentile 32 768 ns. The gate on this \
+             instrument is therefore *tighter* than the number this row's assert stood over, \
+             and a red under it is a fresh measurement rather than this one returning",
         ),
         what: "`invariant P: a scheduler pass took 200569 ns, budget 200000 ns` — the assert \
                firing on native x86-64 under KVM, in `timer_handler` -> `driver::pass` -> \
@@ -965,7 +968,22 @@ pub const KNOWN_RED: &[Red] = &[
         test: "sched_check_build",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(6, 10),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the dev host takes no verdict on pass cost any more, so this red cannot be \
+             produced. What retired it is the experiment this row's own last paragraph asked \
+             for: 2026-08-18, six repetitions an arm, quiet and loaded interleaved in one \
+             session, twelve CPU-runs each. **0 of 12 quiet CPU-runs over the budget at the \
+             90th percentile against 9 of 12 loaded; 6 of 6 runs green against 6 of 6 red**, \
+             with the arms separated by boot width 1.74x-2.34x against 2.66x-2.78x and \
+             nothing else. The whole distribution translates one power-of-two bucket under \
+             host load — median 65 536 -> 131 072 ns, p90 131 072 -> 262 144 ns — and 200 000 \
+             sits between the two, which is the entirety of why the verdict flipped. So \
+             `tests/common/passcost.rs` records that sample and, because it spans four buckets \
+             on one unchanged tree, has cross-arch TCG report its distribution and judge no \
+             magnitude at all. `sched_check_build` still gates the clean boot, the three \
+             check-build asserts and `sched_stress` on this instrument; only the cost half is \
+             now CI's alone",
+        ),
         what: "`this distribution has mass over the budget: nine passes in ten must be provably \
                under 200000 ns and it cannot show that` — the harness's pass-cost gate, which \
                replaced the panic, refusing a distribution the *host* inflated. The guest is \
@@ -977,7 +995,11 @@ pub const KNOWN_RED: &[Red] = &[
                p90 < 262144 ns, max 1745977 ns, 14 over` and it reds. **Note the maxima on the \
                green side**: 1974235 ns and 2543303 ns in the serial tail of the run that ended \
                263 of 263 green — nine and twelve times the budget, refused by nothing, where \
-               the assert this replaced would have halted the machine on any one of them",
+               the assert this replaced would have halted the machine on any one of them. \
+               Every red measured carried `p50 < 131072 ns` against `p50 < 16384` or `< 32768 \
+               ns` on every green — the median moving with the 90th percentile, which is the \
+               observation the controlled experiment then confirmed and which is why no line \
+               over this distribution survives on this instrument",
         evidence: "`cargo test` on `wt/toyos-invariantp`, 2026-08-17, ten CPU-runs over three \
                    sessions. Every one of the six reds was taken beside other guests: four \
                    under another agent's suite on the shared host (`fastest boot 2330 ms \
@@ -986,7 +1008,12 @@ pub const KNOWN_RED: &[Red] = &[
                    at 1.02x and the serial tail at 1.05x. `sched_check_build` is `Sched::Serial` \
                    since the same day, on this measurement, which removes the second half of \
                    this row's own cause. Not evidence about KVM in either direction — the dev \
-                   host boots no KVM guest",
+                   host boots no KVM guest. **This row is also the counter-evidence to the \
+                   gate's own warrant**: 14 of 134 and 19 of 140 passes over budget is 10–13 %, \
+                   which is correlated inflation with mass in it rather than the handful of \
+                   samples the gate's argument assumed a busy machine produces. The controlled \
+                   experiment that turned that counter-evidence into the retirement above is in \
+                   `tests/common/passcost.rs`",
         source: "issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
         measured: "2026-08-17",
     },
@@ -1443,12 +1470,24 @@ pub const KNOWN_RED: &[Red] = &[
                only after draining and finding nothing (`:693`), with the port-drain loop between \
                them, while `report_health` computes `carried = IRQS - EMPTY_IRQS` (`:390`) and \
                prints whenever `carried > 0`. A reader landing inside that window sees \
-               `carried = 1` for an interrupt that carried nothing, and prints this row's line \
-               exactly. The window is the bring-up polling init this row always named. Observed \
+               `carried = 1` for an interrupt that carried nothing. Observed \
                again 2 of 6 full suites on 2026-08-17 (`1 interrupts and 0 bytes … first seen at \
                449ms`, PR #106's author, on a tree containing the fix). Whether the test half — \
                anchoring on `===I8042_READY===` — holds is a separate question and is not decided \
-               here",
+               here. \
+               \n\n**The withdrawal above went on to say the torn read `prints this row's line \
+               exactly`, and that clause was wrong** (corrected 2026-08-17, PR #114). The torn \
+               read is real and is fixed, but it is not what produced this line, and the boot \
+               order says so: the reporting CPU is `cpu1`, an AP, and `i8042::init` runs on the \
+               BSP *before* `smp::boot_aps` — so at the bring-up interrupt this row always named \
+               there is no second CPU in existence to land inside the ISR's window. What did \
+               produce it is a different window in the same handler: `IRQS` was incremented on \
+               **entry**, ahead of the first `push_isr`, so a reader between the pin asserting and \
+               the first byte reaching the ring held a count of arrived bytes with no byte \
+               anywhere — `carried = 1`, `RX_BYTES = 0`, `has_bytes()` false, which is this line. \
+               Both windows close the same way and did, in PR #111. **The withdrawal itself \
+               stands**: retiring on reasoning alone was wrong whichever mechanism the reasoning \
+               named, and that is the half worth keeping",
         evidence: "fourteen full `cargo test` suites in one session on `wt/toyos-logd`: 2 of the 9 \
                    with the window bounded and 1 of the 5 without; `main` (4d8c2e9) 0 of 7 and \
                    this branch 0 of 5 before the byte ring went, both recorded in the source below",
@@ -1510,8 +1549,12 @@ pub const KNOWN_RED: &[Red] = &[
                exactly that. A bring-up race whose window is the driver's own polling init is what \
                a rate that moves with the host looks like; a defect in what this branch changed is \
                not. **Retired with the row above on 2026-08-16 and withdrawn with it on \
-               2026-08-17** — the torn read that row records is what this rate is a rate of, and a \
-               rate cannot be retired by a fix that does not reach its cause",
+               2026-08-17** — a rate cannot be retired by a fix that does not reach its cause. \
+               The withdrawal named the torn read as that cause and **that attribution was wrong** \
+               (corrected 2026-08-17, PR #114): this is a rate of the entry-time increment, not of \
+               the subtraction, for the reason the row above sets out — no AP exists to read \
+               anything at the bring-up interrupt. The withdrawal was still right to be made, \
+               which is the durable half of it",
         evidence: "ten consecutive full `cargo test` suites on `wt/toyos-logd`'s tip, loads \
                    6.4-9.7, immediately after the fourteen above",
         source: "issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md",
@@ -1618,6 +1661,64 @@ pub const KNOWN_RED: &[Red] = &[
                    image",
         source: "issues/build/sshd-panics-when-netd-exits-before-it-binds.md",
         measured: "2026-08-15",
+    },
+    Red {
+        test: "boot_partition_identity",
+        instrument: Instrument::Ci,
+        finding: Finding::fires(1, 4),
+        standing: Standing::Stands,
+        what: "**the same signature, and the producer is not established** — `sshd: cannot bind \
+               0.0.0.0:22: netd error` at `sshd/src/main.rs:359:23`, the identical bytes to the \
+               row above. That is as far as the message goes and this row goes no further: the \
+               write-up's own finding is that the std fork flattens every `io::Error` kind to \
+               the string `netd error`, so four candidate paths print this line and no capture \
+               of it can say which one ran. **What matches beyond the message is the timing \
+               shape**, which is the part worth recording: `spawn: /bin/sshd pid=6` at 0.559 s \
+               and `exit: netd pid=5 code=0` at 0.566 s, so the bind went into a teardown \
+               already in progress — the same direction as the earlier CI capture, where the \
+               gap was 23 ms, and the opposite of the clean-exit arm in the same write-up, \
+               where sshd started after netd was gone. `ALONE: GREEN, and it was alone both \
+               times — nothing the harness controls differed, so it failed once and passed \
+               once. That is a rate and not a classification`. Shard 1's other 173 names passed",
+        evidence: "run 32044008591, job 95428160739 (`guest (1)`), PR #116 on \
+                   `wt/toyos-invariantp` — a diff of documentation and `src/redlist.rs` strings \
+                   with no code in it at all, which is what says the race is not the branch's. \
+                   The denominator is this branch's four CI runs that reached a verdict — \
+                   32043101865, 32044008591, 32044756253 and 32047352064 — of which only the \
+                   second was red under this name; a fifth (32044676027) was cancelled and says \
+                   nothing",
+        source: "issues/build/sshd-panics-when-netd-exits-before-it-binds.md",
+        measured: "2026-08-17",
+    },
+    Red {
+        test: "handle_kill_policy",
+        instrument: Instrument::Ci,
+        finding: Finding::fires(1, 4),
+        standing: Standing::Stands,
+        what: "`16 more killed processes left more live objects behind: [(\"Process\", 6, 7)]` — \
+               `the_kills_release_what_they_held`'s machine-wide live-object census, one \
+               `Process` higher on the second sample than the first. `ALONE: GREEN, and it was \
+               alone both times — nothing the harness controls differed, so it failed once and \
+               passed once. That is a rate and not a classification`; shard 2's other twelve \
+               names passed. **The first CI sighting of a signature recorded so far only on the \
+               dev host**, where the write-up added it the same day at 1 of 6 and recorded it \
+               green on all twelve KVM shards of that tree. That bears on its explanation \
+               rather than its severity: the dev-host bullet leans partly on other *suites* \
+               sharing the machine, and a CI shard is one guest per machine with `--jobs 1`, so \
+               what survives here is the other half of it — a machine-wide census taken on a \
+               shared boot, perturbed by a co-resident test's reap that had not landed yet. \
+               **Consistent with that mechanism, not established as it**: nothing in this \
+               capture identifies which process the extra `Process` object belonged to",
+        evidence: "run 32047352064, job 95438242676 (`guest (2)`), `wt/toyos-invariantp` at its \
+                   merge of `origin/main`, so the tree carries main's own commits as well as \
+                   this branch's. **Not this branch's code, and that is checkable rather than \
+                   asserted**: the only kernel code this branch adds is behind `sched-check` \
+                   (forwarding to `toyos-sched/check`), `handle_kill_policy` boots no such \
+                   kernel, and `src/build.rs`'s artifact gate measures 0 of 3 check-build \
+                   literals in the shipping image on every build. Same denominator as the row \
+                   above: this branch's four CI runs that reached a verdict, red in one",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-17",
     },
     Red {
         test: "usb_boot_stick_pulled",
