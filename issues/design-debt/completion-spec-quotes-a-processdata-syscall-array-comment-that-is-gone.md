@@ -6,7 +6,7 @@ opened: 2026-08-17
 
 # `completion-architecture-spec.md` §14.2 quotes a `[u32; 64]` comment in `toyos-abi/src/syscall.rs`; it is not there
 
-`specs/completion-architecture-spec.md` §14.2 says `ProcessData`'s syscall
+`completion-architecture-spec.md` §14.2 says `ProcessData`'s syscall
 profile array "is sized from the ABI rather than at `[u32; 64]` — its own
 comment records *'It was `[u32; 64]` while the ABI reached 98'*", citing
 `toyos-abi/src/syscall.rs`.
@@ -34,4 +34,4 @@ planning document's description of a data layout that needs reconciling with
 the field's current shape.
 
 Found 2026-08-17 during a citation-accuracy pass over
-`specs/completion-architecture-spec.md`; verified at the tree's tip that day.
+`completion-architecture-spec.md`; verified at the tree's tip that day.

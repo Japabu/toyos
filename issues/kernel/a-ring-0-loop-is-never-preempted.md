@@ -37,12 +37,12 @@ task still came back to the CPU it left — so on this tree a woken kernel threa
 is placed where it was, and the load imbalance that would make a sibling steal
 it never arises while every CPU has work.
 
-**What it cost.** `specs/log-architecture-spec.md` §9.5's `log_migration_storm`
-was written as "`log-storm` from kernel threads … at `--smp 8` with stealing on,
-so a producer is preempted and re-runs on a sibling". No workload of that shape
-exists on this tree, so the gate was not built; §9.2's nesting gate — an
-interrupt that logs, on one CPU — is what reaches the reservation race instead,
-and both of §9.4's reservation controls are demonstrated through it.
+**What it cost.** A planned `log_migration_storm` gate was written as
+"`log-storm` from kernel threads … at `--smp 8` with stealing on, so a producer
+is preempted and re-runs on a sibling". No workload of that shape exists on this
+tree, so the gate was not built; the nesting gate — an interrupt that logs, on
+one CPU — is what reaches the reservation race instead, and both reservation
+controls are demonstrated through it.
 
 **A second, smaller fact found with it.** `scheduler::yield_now` asserts
 `BASELINE_TRAP`, which is the depth a *syscall* reaches it at; a kernel thread's

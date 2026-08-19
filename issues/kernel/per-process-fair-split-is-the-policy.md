@@ -44,11 +44,11 @@ chosen interleavings, seeded and PCT — not the split hardware would show on an
 average schedule. **The mechanism and the scaling are the policy's; the magnitude
 is a worst case.** Do not quote these numbers as expected behaviour.
 
-**Connected to §9.2's tie-break, and that is why this is hard.** Threads of a
-process sharing one vruntime is *why* the insertion sequence exists
-(`specs/scheduler-core-spec.md` §9.2, `queue.rs:18-22`). The degradation here and
-sibling starvation are two faces of one decision: **per-process accounting with
-per-thread queueing.** Anything that fixes one has to answer for the other.
+**Connected to the queue's tie-break, and that is why this is hard.** Threads of
+a process sharing one vruntime is *why* the insertion sequence exists
+(`queue.rs:18-22`). The degradation here and sibling starvation are two faces of
+one decision: **per-process accounting with per-thread queueing.** Anything that
+fixes one has to answer for the other.
 
 **But only the per-process face degrades, and that is now measured.** Simulator
 invariant I13 measures service per *thread* inside a share over the same
@@ -104,16 +104,17 @@ trusting the answer, this one is a hole where the answer would be.
    I13 had a comparison open for, `invariant_i13_is_measured_and_holds` gates on
    it against 96% / 69% / 99%, and forcing the balance condition false takes it
    to 0% and reds the test. **A/B that number across the redesign; a collapse is
-   as loud as a violation.** Named as the third gate-failure shape in
-   `specs/README.md`'s spec-checking method, with the evidence in
-   `specs/assessments/metal-track-history.md`.
+   as loud as a violation.** This is the gate that goes quiet — the change under
+   test narrowing the gate's own coverage rather than violating it — with the
+   evidence in `specs/assessments/metal-track-history.md`.
 3. **The margin at 32 CPUs is 1.2× and trending up** — 10 ms at one CPU to
    50 ms at 32 against a 60 ms bound — with nothing measured above 32, while
-   spec §11 Stage 9 gates on 1–128. Measure 64 and 128 first, or a red at high
-   width cannot be attributed to the redesign rather than to the width.
+   the scheduler's own staged target is 1–128. Measure 64 and 128 first, or a
+   red at high width cannot be attributed to the redesign rather than to the
+   width.
    Compounded by the reach falling with width for an unrelated reason — 55% at
    four CPUs, 45% at eight, because threads exit at slightly different moments
-   and unbalance a wide machine sooner. **At the widths Stage 9 targets, I13
+   and unbalance a wide machine sooner. **At the widths that target reaches, I13
    certifies less than half the run**, which is a limit on the invariant and not
    a defect in it.
 
@@ -121,4 +122,4 @@ Found only because I5 measures *service* — nanoseconds actually delivered — 
 than checking vruntime bookkeeping against itself, which would have been true by
 construction. The dead-gate lesson from the other side: the first question about a
 gate is not whether it passes, but whether it measures the quantity you care
-about (`specs/README.md`).
+about.

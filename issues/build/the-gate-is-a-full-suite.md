@@ -8,8 +8,7 @@ opened: 2026-08-03
 
 `cargo run -- --land` runs `cargo test` inside the integration lock, so a
 landing is a 14-minute suite. Nothing serialises it against a suite in *another*
-worktree — the lock only serialises landings, and worktrees.md §6 is explicit
-that the host is still one host.
+worktree — the lock only serialises landings, and the host is still one host.
 
 Measured 2026-08-03, `--land`'s own landing, with another agent's suite running:
 `screen_fatal_halt` failed with `[qemu] Boot timed out waiting for ===READY===`

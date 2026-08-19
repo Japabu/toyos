@@ -15,5 +15,6 @@ client stalls.
 
 A `the engine completed 0x.., which is no walk of an 8-period ring` panic would
 be **new**, and would be the first evidence that `SDnLPIB` is the wrong position
-source there — `specs/plans/hda-driver-plan.md` §2.4's `position_fix` paragraph is
-what it would put in question.
+source there. The driver reads `SDnLPIB` and nothing else: the DMA position
+buffer is deliberately out of scope, and the answer to an untrustworthy
+`SDnLPIB` on the T14 is to say so and switch sources, never to carry both.

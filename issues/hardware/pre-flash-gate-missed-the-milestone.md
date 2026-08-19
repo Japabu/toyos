@@ -8,12 +8,13 @@ opened: 2026-08-01
 
 `specs/assessments/pre-flash-gate-2026-08-01.md` §7 records **GO** at
 `b82fc4a` with a 182/182 guest suite, against the checklist now in
-`specs/plans/metal-boot-plan.md`. Its six sections are storage safety, image
-well-formedness, boot-time panics, the on-screen console, and two sections of
-"recent changes do not alter boot". **There is no input section**, and the
-seventeen-row verdict table has no
-input row. Input — the thing M2 exists for and the reason the stick was flashed
-— appears only as items 1 and 2 of "What this gate does NOT cover".
+`issues/hardware/a-metal-session-runs-a-pre-flash-gate-first.md`. Its six
+sections are storage safety, image well-formedness, boot-time panics, the
+on-screen console, and two sections of "recent changes do not alter boot".
+**There is no input section**, and the seventeen-row verdict table has no
+input row. Input — the thing the metal input milestone exists for and the reason
+the stick was flashed — appears only as items 1 and 2 of "What this gate does
+NOT cover".
 
 That is the hole, and it is not "the gate ran the wrong test". The gate's own
 method is to ask a false-pass question per item, and it asks it well for the two

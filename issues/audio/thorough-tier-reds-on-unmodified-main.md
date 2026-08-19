@@ -34,10 +34,10 @@ signature as `audio-tone-load-fast-tier-intermittent` and `one-boot-put-142ms-of
 
 What this changes for anyone reading them: the intermittency is not a property
 of one config, and it is **large enough to fail the thorough tier's own pooled
-test on a clean tree**. Anything that gates on this tier
-(`specs/testing-strategy.md` §5, and H3 itself) cannot presently tell its
-own change from this. H3 therefore compared its two arms against *each other*
-rather than against the recorded sample, and said so.
+test on a clean tree**. Anything that gates on this tier — the nightly run, and
+H3 itself — cannot presently tell its own change from this. H3 therefore
+compared its two arms against *each other* rather than against the recorded
+sample, and said so.
 
 The recorded sample in `tests/audio-baseline.toml` is 0/120 and was taken in a
 session this host no longer resembles. **Re-recording it is not licensed by this

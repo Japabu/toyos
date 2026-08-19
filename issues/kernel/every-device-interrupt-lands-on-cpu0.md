@@ -36,15 +36,15 @@ needs exactly one reader, input is ~100 Hz, and there is no load
 argument for spreading it. Nothing here touches it.
 
 **Why this is not taken as standalone work**: distributing interrupts
-twice is churn. The completion architecture
-(`specs/completion-architecture-spec.md`, pipeline 2) decides where a
+twice is churn. The completion architecture's pipeline 2 decides where a
 completion should be *processed* — and the delivery target that makes
 that efficient (per-queue MSI-X vectors aimed at the CPU that consumes
 the queue) falls out of that design, not out of a round-robin patch
 applied before it. Interrupt remapping under the IOMMU track
-(`specs/iommu-spec.md`) changes what destinations are even expressible
-— `drivers/ioapic.rs` already notes the 8-bit physical-destination
-limit without it — and the userspace-driver track moves some vector
+(`issues/kernel/the-iommu-stops-at-translation.md`) changes what
+destinations are even expressible — `drivers/ioapic.rs` already notes
+the 8-bit physical-destination limit without it — and the
+userspace-driver track moves some vector
 ownership out of the kernel entirely. The distribution question is
 those tracks' question, and it should be answered once, there.
 

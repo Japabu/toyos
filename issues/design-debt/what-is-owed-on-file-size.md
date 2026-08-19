@@ -19,9 +19,8 @@ Full verdicts and target shapes: `specs/assessments/code-quality-review-2026-08.
   effects shell is `userland/compositor/` at 2,085 over five files with a
   68-line `main.rs`, `72705d9`.
 - `xhci/mod.rs` → the port machine is `toyos-xhci/` (2,082 lines with a host
-  simulator), `2e81ae8`, with `specs/plans/xhci-port-machine-plan.md` as the plan of
-  record. `xhci/mod.rs` is still 1,825 lines, so the shell has not shrunk to
-  match.
+  simulator), `2e81ae8`. `xhci/mod.rs` is still 1,825 lines, so the shell has
+  not shrunk to match.
 - `loader.rs` → `kernel/src/loader/` (1,397 over four files), `42b29c9`, with
   the pure decisions in `toyos-elf`. The plan/execute split — a `LoadPlan` an
   executor applies — is **not** built, and #159 changes what a mapping's

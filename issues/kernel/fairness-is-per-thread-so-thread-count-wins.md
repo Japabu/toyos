@@ -16,9 +16,8 @@ hierarchical: groups first, threads within their group.
 ToyOS has a better grouping handle than Unix's cgroups bolt-on ever was: the
 capability domain. A process's share can hang off what its parent endowed it
 with, in the same `system.toml` that endows everything else — hierarchical
-reservations, since reservations nest naturally. The reservation model from
-`specs/scheduling-reservations-spec.md` is the substrate; this issue is the
-hierarchy on top of it.
+reservations, since reservations nest naturally. The reservation model is the
+substrate; this issue is the hierarchy on top of it.
 
 Blocked on: the reservations implementation. Design question to settle at pick-up:
 whether the hierarchy's nodes are processes, endowment parents, or named domains

@@ -17,5 +17,6 @@ new one whenever the next field would not fit. `codegen/bitfield.rs` loads and
 stores through `clif_type(storage_ty)` at the field's byte offset, which a
 straddling field has no single unit for.
 
-`specs/plans/wlan-plan.md` §10 counts 635 `__packed` uses in the AX210 subset. However
-many of those carry bitfields is how much of this W6 needs.
+The AX210 driver subset carries 635 `__packed` uses
+(`issues/hardware/there-is-no-wifi.md`). However many of those hold bitfields is
+how much of this a wifi track needs.

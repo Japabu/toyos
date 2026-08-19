@@ -9,10 +9,9 @@ closed: 2026-08-15
 
 `Source::Log` — the io_uring readiness a reader of `SYS_LOG_READ` arms on — is
 posted by `klogd` after each drain batch, and by nothing else
-(`kernel/src/log/console.rs`, `specs/log-architecture-spec.md` §3.2). That is
-the right context and the right cost: it is the one place in the machine that
-has just observed committed records and may take a lock, and it costs one wake
-per batch rather than one per record.
+(`kernel/src/log/console.rs`). That is the right context and the right cost: it
+is the one place in the machine that has just observed committed records and may
+take a lock, and it costs one wake per batch rather than one per record.
 
 **But `klogd` did not run at all on a machine with no console.** Its body
 drained, then armed its waiter *only* while `serial::has_console()` — with no
@@ -22,11 +21,11 @@ kernel thread spinning for the life of a T14. So it parked unarmed, no producer
 paid a post, and nothing woke it until a console arrived.
 
 The consequence for a log *reader* is that it parks on a source that will never
-fire. Nothing hit it at L4: the one caller was that chunk's gate, which runs on
-a profile that has a console. It became real at L6, when `/bin/logd` is the
-program whose whole loop is read-then-park and `/log` is a file a machine with
-no serial port still has to fill — the `--diag-boot` shape, and the T14 under
-`--mute`.
+fire. Nothing hit it when the syscall first landed: its one caller was that
+work's own gate, which runs on a profile that has a console. It became real
+with `/bin/logd`, the program whose whole loop is read-then-park, and `/log` a
+file a machine with no serial port still has to fill — the `--diag-boot` shape,
+and the T14 under `--mute`.
 
 ## Closed, and by the shape this entry did not name
 
@@ -54,11 +53,12 @@ is now a reader without one.
 
 The discard is deliberately **not** in `drain_inline`, whose other two callers
 are a producer mid-`emit` and a panicking machine: a `Drain::Inline` boot with
-no console would then walk every shard per record, which is the cost §4.2 gates
-that mode on `has_console()` to avoid.
+no console would then walk every shard per record, which is the cost that mode
+is gated on `has_console()` to avoid.
 
 **What is not closed with it.** Nothing here says a userland reader on a
 console-less machine has been *observed* keeping up — the shipped reader is
 `/bin/logd` and the machine shapes that have no console are the `--diag-boot`
 image and the T14 under `--mute`, neither of which is a gate on this host. That
-is the metal session's, beside the rest of `specs/plans/metal-boot-plan.md`.
+is the metal session's
+(`issues/hardware/a-metal-session-runs-a-pre-flash-gate-first.md`).

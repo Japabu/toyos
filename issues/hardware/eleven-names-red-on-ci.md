@@ -23,7 +23,7 @@ all five.** `specs/assessments/ci-plan-assessment-2026-08.md` §9.1 has the per-
 | test | red | shard | `Sched` | what it says |
 |---|---|---|---|---|
 | ~~`usb_transport_break`~~ | ~~**5/5**~~ | 6 | Serial | **CLOSED** — `issues/hardware/`, a Bulk-Only Reset that raced the transfer it was recovering from |
-| `std_unwind` | **5/5** | 10 | shared block | `exit code Some(-1)` — the #MF of `specs/user-machine-state.md` §2, whose fix landed after this probe and has not been re-measured on CI |
+| `std_unwind` | **5/5** | 10 | shared block | `exit code Some(-1)` — the #MF a waiting FP save raised from a pending x87 exception, whose fix landed after this probe and has not been re-measured on CI |
 | `std_unwind_so` | **5/5** | 10 | shared block | the same |
 | `metal_sim_null_audio` | **5/5** | 11 | Serial | soundd did not present a null sink on a device-less machine — **closed**: it always did, and the test read the line through a span of host wall clock |
 | `hda_tone` | **4/5** | 4 | Serial | 1 mid-tone silence in the capture (`issues/audio/`) |

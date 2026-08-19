@@ -6,9 +6,10 @@ opened: 2026-07-31
 
 # On an idle machine the log ring flushes one line behind
 
-Measured while building M2's i8042 tests. With no userland process doing
-anything, a `log!` line reaches the console only when the *next* piece of work
-wakes a CPU — so the most recent line is always still in the ring. Injecting
+Measured while building the metal input milestone's i8042 tests. With no
+userland process doing anything, a `log!` line reaches the console only when the
+*next* piece of work wakes a CPU — so the most recent line is always still in
+the ring. Injecting
 keystrokes 200 ms apart into an otherwise idle guest and watching serial:
 
 ```

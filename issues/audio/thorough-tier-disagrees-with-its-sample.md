@@ -11,8 +11,8 @@ Measured 2026-08-07 on `main` at `c0365ea`, in one session, three arms:
 | tree | dropout runs | measured runs | verdict |
 |---|---|---|---|
 | `main` | 7 | 28 | `pooled dropout rate: 7 of 40 vs recorded 0 of 120 (Fisher p=4.00e-5)` |
-| `wt/toyos-m3` (M3) | 5 | 12 | `5 of 40 … (p=8.02e-4)` |
-| M3 with its one new wait deleted | 5 | 40 | `5 of 40 … (p=8.02e-4)` |
+| `wt/toyos-m3` | 5 | 12 | `5 of 40 … (p=8.02e-4)` |
+| the same branch with its one new wait deleted | 5 | 40 | `5 of 40 … (p=8.02e-4)` |
 
 The denominators differ because the gate stops as soon as the remaining runs
 cannot change the verdict, so each arm ran until it was decided. **All three
@@ -46,5 +46,5 @@ owner's 2026-08-04 ruling stands, and the three arms ran back to back on the sam
 host anyway, which is what makes them comparable to each other.
 
 **Consequence for anything landing while this is open:** the thorough tier cannot
-serve as a pass/fail gate. M3 used it as an A/B instead, which is what it could
+serve as a pass/fail gate. That branch used it as an A/B instead, which is what it could
 still answer, and landed on the fast tier plus the full suite.

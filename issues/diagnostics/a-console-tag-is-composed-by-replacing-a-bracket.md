@@ -6,10 +6,9 @@ opened: 2026-08-15
 
 # The kernel's console tag is composed by replacing the ABI formatter's first byte
 
-`specs/log-architecture-spec.md` §3.3 puts one formatter in `toyos-abi`, beside
-the record, so the kernel's console sink, the panel, `logd` and any diagnostic
-tool produce byte-identical text from one implementation. `Display for
-LogRecord` renders
+One formatter lives in `toyos-abi`, beside the record, so the kernel's console
+sink, the panel, `logd` and any diagnostic tool produce byte-identical text from
+one implementation. `Display for LogRecord` renders
 
 ```
 [0.123 cpu0 tid=3] the message
@@ -31,10 +30,10 @@ from the first fragment and writes `[kernel ` in its place.
 **`toyos-abi/src` is sysroot source** (`src/toolchain.rs`'s `SYSROOT_SOURCES`),
 so a branch that touches it claims the shared sysroot from its first build until
 it lands, and `pr::abi_lands_alone` refuses a branch that mixes an ABI commit
-with work that depends on it. The log architecture's ABI landed as chunk zero
-(§11) and this branch may not reopen it. Re-deriving the fields kernel-side was
-the alternative and is the thing §3.3 exists to prevent — two implementations of
-one line, and the panel is the one that would drift.
+with work that depends on it. The log architecture's ABI landed as its own first
+commit and this branch may not reopen it. Re-deriving the fields kernel-side was
+the alternative and is the thing the single formatter exists to prevent — two
+implementations of one line, and the panel is the one that would drift.
 
 ## The fix, for whoever opens the ABI next
 
@@ -48,7 +47,7 @@ impl LogRecord {
 `Display` becomes `self.tagged("")` over one private `fmt_with_tag`, so there is
 still exactly one implementation, and `log::console::write_line` loses its
 `strip_prefix` and its `tagged` flag. `logd` wants the same wrapper for its own
-wall-clock prefix (§5), so the next ABI landing has two callers for it.
+wall-clock prefix, so the next ABI landing has two callers for it.
 
 ## What it is not
 

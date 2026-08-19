@@ -17,8 +17,8 @@ and the panic handler call `serial::panic_flush` and `acpi`'s power path calls
 `serial::flush_final`.
 
 A wedge with no panic therefore looks identical to a kernel that never started.
-Found at IOMMU stage I2, from a deliberately mis-programmed unit that stopped
-NVMe mid-`init`: the guest had logged sixty lines and the harness saw the
+Found while bringing the IOMMU up, from a deliberately mis-programmed unit that
+stopped NVMe mid-`init`: the guest had logged sixty lines and the harness saw the
 bootloader's output and then a ten-second timeout. It costs an hour the first
 time and it will cost it again — a wedged boot is exactly the case where the log
 matters most.

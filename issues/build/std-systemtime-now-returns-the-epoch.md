@@ -40,8 +40,7 @@ sourced. Only `SystemTime::now` is wrong, and it is wrong by omission — the
 syscall it needs exists, is stable, and has a caller two directories away.
 
 Verified at rust submodule `87971e6d0ed0`; the file is
-`rust/library/std/src/sys/time/toyos.rs`, and the fork rules are
-`specs/forks.md`.
+`rust/library/std/src/sys/time/toyos.rs`.
 
 ## What a fix owes
 

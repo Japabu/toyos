@@ -23,8 +23,9 @@ and it makes the compositor scale a 1920x1080 wallpaper to a square. It is also
 16 MiB of framebuffer, which is what makes a panic-console repaint cost ~13 ms.
 "Largest wins" is not a mode policy; a real one would prefer the firmware's
 current mode, or the largest 16:9/16:10 mode, and only then fall back. Harmless
-for M0, wrong for M1 — and M1 shipped without fixing it, so the compositor
-scales a 1920x1080 wallpaper onto a 2048x2048 square on every metal-sim boot
+for a first boot, wrong once the compositor owns the screen — and that shipped
+without fixing it, so the compositor scales a 1920x1080 wallpaper onto a
+2048x2048 square on every metal-sim boot
 and each panic screendump is 12 MiB. On the T14 the firmware will offer the
 panel's own mode and "largest wins" may or may not pick it; that is the part
 nothing here can answer.

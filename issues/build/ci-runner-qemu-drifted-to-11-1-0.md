@@ -15,10 +15,10 @@ tripwire working exactly as designed, not a defect in either branch:
 
 ```
 this job runs QEMU '11.1.0' and .github/qemu-version declares 11.0.3.
-specs/ci-plan.md 7.3: the QEMU version decides test outcomes, so a number
-taken on one is not a number about the other, and the dev host's baseline is
-recorded on 11.0.3. debian:sid is a rolling release and this is what it
-moving looks like — nothing here is about the tree.
+The QEMU version decides test outcomes, so a number taken on one is not a
+number about the other, and the dev host's baseline is recorded on 11.0.3.
+debian:sid is a rolling release and this is what it moving looks like —
+nothing here is about the tree.
 ```
 
 This commit is the deliberate act

@@ -51,9 +51,9 @@ bounded by exactly the window `find_gap` searches, the collision is not a corner
 case: a fixed mapping placed just under the topmost live region is handed back by
 the very next anonymous `mmap`.
 
-This violates CLAUDE.md's *"the kernel never crashes from userland"*, and the
-assert is a kernel-bug fail-fast reached from a syscall argument, which is the
-shape `specs/capability-endowment-spec.md` refuses.
+This violates CLAUDE.md's *"the kernel never crashes from userland"*: the assert
+is a kernel-bug fail-fast reached from a syscall argument, which is exactly what
+a trust boundary has to refuse instead.
 
 ## Why no gate catches it
 

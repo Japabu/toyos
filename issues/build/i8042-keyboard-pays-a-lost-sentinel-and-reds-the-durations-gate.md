@@ -52,9 +52,9 @@ way and only the clock notices.
 was always wrong: `main`'s own pushes `31901526246` and `31902837318`, an hour
 before, both passed `durations`.
 
-The strategy leaves two honest answers and neither is a tolerance band
-(`specs/testing-strategy.md` §3: "There is no tolerance band"; §1.2: a gate that
-reds at a rate independent of the diff is itself the defect):
+Two honest answers remain and neither is a tolerance band, because there is no
+tolerance band on the Fast ceiling and a gate that reds at a rate independent of
+the diff is itself the defect:
 
 - **Find the six seconds.** If it is the lost sentinel, then either the host's
   injection or the guest's read can drop it, and that is a defect in a delivery

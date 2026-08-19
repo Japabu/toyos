@@ -121,8 +121,8 @@ Audited in code, not assumed.
   then set it and drain, and the connect's `push_back` landed in a queue whose
   one hook had already run. So a connection could be queued onto a closing port,
   the cascade was reachable rather than unreachable, and the connection itself
-  was orphaned — nothing closed its inbox, so the client's read blocked for ever
-  against §0's promise that the bound on failure is a process lifetime. Filed as
+  was orphaned — nothing closed its inbox, so the client's read blocked for ever,
+  against the promise that the bound on failure is a process lifetime. Filed as
   `a-connect-can-queue-onto-a-closing-port` and fixed on the same branch: the
   flag now lives *inside* the queue's lock (`PortQueue`), so `push` asks and
   inserts in one acquisition and the hook closes and drains in one. The argument

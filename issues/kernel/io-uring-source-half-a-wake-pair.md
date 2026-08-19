@@ -36,7 +36,6 @@ wake; that never surfaced because no test drives netd, and interactive use
 always has something else waking it. The 7c review compared two post-7a trees,
 found them identical, and concluded there was nothing there.
 
-The durable fix is `specs/completion-architecture-spec.md`'s single `post()`,
-where a source
+The durable fix is one `post()` primitive for every source, where a source
 cannot have one half of the pair, and a fan-out cannot be deleted without
 deleting the wake.

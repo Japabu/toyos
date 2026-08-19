@@ -25,11 +25,6 @@ Two residuals:
   (`grep -rn "percpu: BSP" tests/` → nothing), so deleting the argument, or
   breaking the CPUID gate in `enable_smep`, reds nothing. Nor does any test
   execute a user page from ring 0 — and such a test would be a weak instrument
-  anyway, because the kernel executes out of the direct map, which has no U bit
-  (`specs/plans/memory-boundary-spec.md` §2.1), so SMEP does not cover the kernel's own
-  alias of a user page. That is #159/#166 territory, not this.
-
-The two spec paragraphs that still described the pre-`5d53aa0` state are
-corrected in this commit (`specs/plans/memory-boundary-spec.md` §2.1 and §3.2); §8 of
-that spec is a dated record of the discovery run and its line citation is left
-alone.
+  anyway, because the kernel executes out of the direct map, which has no U bit,
+  so SMEP does not cover the kernel's own alias of a user page. That is
+  #159/#166 territory, not this.

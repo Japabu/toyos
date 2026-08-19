@@ -42,8 +42,8 @@ in front of it, on every non-main thread exit, racing a kill.
 
 ## Related, and not to be conflated
 
-`specs/plans/kernel-slimming-roadmap.md` proposes deleting the main-thread-exit
-policy itself (*"a process ends when its last thread does, or only by explicit
+There is a standing proposal to delete the main-thread-exit policy itself
+(*"a process ends when its last thread does, or only by explicit
 `SYS_EXIT`"*). That is a design change with its own cost — the survivor needs a
 last-thread-exit teardown trigger, or a raw `SYS_THREAD_EXIT` from tid 0 leaks
 the main thread's 8 MB stack and never publishes an exit, so every

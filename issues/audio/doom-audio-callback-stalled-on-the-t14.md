@@ -15,8 +15,8 @@ one that died.
 
 An audio client's RT standing is *lent*, not held: soundd claims the audio
 device, takes the RT band with it (`main.rs:705`), and every pipe write it
-makes lends the woken reader a one-quantum window (`wake_pipe_readers`, spec
-§8.5). **On a machine with no audio device none of that happens.** The null
+makes lends the woken reader a one-quantum window (`wake_pipe_readers`).
+**On a machine with no audio device none of that happens.** The null
 sink deliberately does not request the band — it protects no audible output —
 so `driver::current_is_rt()` is false at its `signal_clients` write and the
 client's callback thread is woken as an ordinary thread. The T14 has no audio

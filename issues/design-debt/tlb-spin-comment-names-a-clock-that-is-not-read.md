@@ -29,10 +29,10 @@ machine. There is no fallback path and no "machines that have no invariant TSC"
 branch — `issues/kernel/ap-tsc-trail-is-assumed-and-never-checked.md` is
 the entry for the fact that nothing even measures the assumption.
 
-`specs/README.md`'s method names this case: *"A comment's stated reason is a
-claim too, separable from the rule it defends: the rule can be right while the
-reason given for it is false."* 1024 spins between deadline checks may well be
-the right number. The reason given for it is not a fact about this kernel.
+A comment's stated reason is a claim too, separable from the rule it defends:
+the rule can be right while the reason given for it is false. 1024 spins
+between deadline checks may well be the right number. The reason given for it
+is not a fact about this kernel.
 
 There *is* a real cost that would justify a batching constant, and it is written
 down 15 lines below the false one — `clock.rs:108-113` records that

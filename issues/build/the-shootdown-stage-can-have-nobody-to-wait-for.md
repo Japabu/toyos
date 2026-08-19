@@ -59,5 +59,5 @@ red into a skip with a reason.
 Found adjudicating the landing gate of PR #82 (the log architecture branch).
 **Nothing on that branch touches the memory boundary, `SYS_DEBUG`, the
 scheduler's placement or `munmap`**, and the red is not that branch's. Filed
-rather than fixed for the same reason: `specs/plans/memory-boundary-spec.md`
-§3.3 owns the reasoning this stage implements.
+rather than fixed for the same reason: the reasoning this stage implements
+belongs to the memory-safety track.

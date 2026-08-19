@@ -37,9 +37,9 @@ legacy handoff is bounded by `HANDOFF_TIMEOUT_NS` = 1 s (`xhci/legacy.rs:55`,
 `xhci/wait/mod.rs:126`, `hda.rs:758` — plus `scheduler.rs:190`'s `wait_until`,
 plus an IOMMU variant that `assert!`s where the others return
 (`iommu/vtd/queue.rs:125-130`, `iommu/vtd/mod.rs:271-276`). A third copy lived
-in `kernel/src/drivers/hda_probe.rs` (`:979`, `:990`), deleted with H0's whole
-diagnostic once the HDA driver above it answered every question H0 was asked
-for.
+in `kernel/src/drivers/hda_probe.rs` (`:979`, `:990`), deleted with the HDA
+probe's whole diagnostic once the driver above it answered every question that
+probe was asked for.
 
 **Standing.** `specs/assessments/type-safety-audit/kernel-drivers.md` F10 (`:928`, deadlines
 and durations as bare `u64` in two different units, so `wait_writable(500)`
@@ -48,6 +48,6 @@ compiles and means "expired at boot") and F11 (`:987`, the
 are the design; F11's own closing line is "**Standing.** Not filed." Two
 corrections to it: its count of eight unbounded MMIO polls is **five** today,
 because the xHCI sites it named are the ones that closed; and `CAP.TO` appears
-nowhere in it. **Not** `specs/completion-architecture-spec.md` — that spec owns the
-*park* deadline (§9.1–9.2, `Instant`/`Duration`/`Deadline`, "no `0 = forever`"),
-never a driver register poll, and does not mention NVMe at all.
+nowhere in it. **Not** the completion track — that owns the *park* deadline
+(`Instant`/`Duration`/`Deadline`, "no `0 = forever`"), never a driver register
+poll, and it does not touch NVMe at all.

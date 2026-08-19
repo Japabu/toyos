@@ -6,9 +6,9 @@ opened: 2026-08-14
 
 # `klogd`'s drain has no in-guest gate, and Ctrl+Alt+D cannot be one on a headless guest
 
-`specs/log-architecture-spec.md` L3 gives the machine a kernel thread, `klogd`,
-made runnable at the commit of the record it will drain (§2.6a). The *ordering*
-of that wake is modelled — `kernel-loom/tests/log_wake.rs`, with its
+The machine has a kernel thread, `klogd`, made runnable at the commit of the
+record it will drain. The *ordering* of that wake is modelled —
+`kernel-loom/tests/log_wake.rs`, with its
 `wake-fence-off` negative control — and the thread's *hosting* is gated by
 `klogd_hosted`. **What no test asserts is that the wake fires in a guest**: that
 a booted machine's records actually reach `klogd`.
@@ -38,9 +38,10 @@ QEMU picks is not a gate.
 
 Either a profile whose keyboard is real — `blocked_dump` presses the same chord
 on `Profile::Metal` and already holds the report, so one assertion there costs
-nothing but adds it to a name `--known-red` already tracks — or L4's
-`SYS_LOG_READ`, at which point `test-runner` reads the records itself and
-§9.1's `log_conservation` subsumes this entirely.
+nothing but adds it to a name `--known-red` already tracks — or `SYS_LOG_READ`,
+at which point `test-runner` reads the records itself and the
+`log_conservation` gates subsume this entirely.
 
-**L4 is the answer and this entry closes with it.** It is filed rather than
-fixed because L3 must not grow a gate that L4 deletes.
+**`SYS_LOG_READ` is the answer and this entry closes with it.** It is filed
+rather than fixed because the kernel-thread work must not grow a gate the
+syscall then deletes.

@@ -22,11 +22,10 @@ block covers only the third: *"A handle without `WAIT` is not watchable, and
 answers as if it were not there."* That is a deliberate policy and is not what
 this entry is about.
 
-The first two are not. `specs/capability-endowment-spec.md` and
-`kernel/src/object/handle.rs:57-69` state one rule for them — `refuse_as_error`
-sends `Rights` to `PermissionDenied`, `TableFull` to `ResourceExhausted`, and
-everything else to `process::handle_fault`, because naming a handle you do not
-hold is a bug in the caller and the kernel ends it.
+The first two are not. `kernel/src/object/handle.rs:57-69` states one rule for
+them — `refuse_as_error` sends `Rights` to `PermissionDenied`, `TableFull` to
+`ResourceExhausted`, and everything else to `process::handle_fault`, because
+naming a handle you do not hold is a bug in the caller and the kernel ends it.
 `rg -n 'handle_fault' kernel/src` returns exactly two lines, the definition and
 that one call, so there is otherwise no second way to answer this question. This
 site is a third answer the doctrine does not have.
@@ -71,8 +70,7 @@ answering `-InvalidArgument` in a CQE for a bad, stale or wrong-typed handle
 `handle_fault`; `SYS_DEVICE_REG` answering `NotFound` for an unheld handle
 (`kernel/src/arch/syscall.rs:985-992`) where its sibling `holds_claim` does it
 correctly; and `kernel/src/loader/start.rs:284`'s `let Ok(rights) = … else { continue }`,
-which is argued at the site but is not one of the exceptions
-`specs/capability-endowment-spec.md` §1.2 names.
+which is argued at the site but is not one of the sanctioned exceptions.
 
 ## What a fix has to decide
 
@@ -80,5 +78,5 @@ Separating the arms is the easy half. The hard half is that the rights case and
 the bad-handle case want different answers *at a submission point that has no
 error channel until a CQE exists* — which is why they were folded. Deciding
 whether a refused `POLL_ADD` posts a CQE carrying the refusal or kills the caller
-outright is the question, and §1.2 of the endowment spec is where the answer
-belongs once it is made.
+outright is the question, and the answer belongs beside the refusal rule itself
+once it is made.

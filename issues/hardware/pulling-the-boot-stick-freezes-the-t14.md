@@ -46,12 +46,12 @@ aims all of them at a dead device on one event.
 
 **What it does not close, stated so a green suite does not imply otherwise:**
 
-- ~~Teardown and `recover_endpoints` still block a pass~~ — **closed by X2a**
-  (`specs/plans/xhci-port-machine-plan.md`). Both are submit-and-return against one
-  outstanding operation per controller: the pass that starts one gives itself
-  back, and the completion arrives through the event ring the poll already
-  drains. What is left on that path is `device::configure`, which is X2b; the
-  type split that would make a wait there a compile error belongs with it,
+- ~~Teardown and `recover_endpoints` still block a pass~~ — **closed with the
+  port machine**. Both are submit-and-return against one outstanding operation
+  per controller: the pass that starts one gives itself back, and the completion
+  arrives through the event ring the poll already drains. What is left on that
+  path is `device::configure`; the type split that would make a wait there a
+  compile error belongs with it,
   because a view that still has to hand `poll` a route to `configure` is a
   signature promising a check it does not perform. Two costs moved rather than
   going away, and neither is a defect: `PORT_WORK_AT` carries the outstanding
@@ -127,9 +127,10 @@ every link is checkable by reading.
    `storage_write`/`storage_flush` take it from whatever thread is writing — the
    idle loop's `log_file::poll`, a page-cache fill, a syscall.
 2. **`poll_if_pending` takes the same lock at the top of every scheduler pass.**
-   X2a made the *work* behind it submit-and-return; the *acquisition* is still a
-   blocking spin against whoever holds it. A stick that has gone leaves port work
-   pending, so every CPU entering `drain_irqs` reaches that `XHCI.lock()`.
+   The port machine made the *work* behind it submit-and-return; the
+   *acquisition* is still a blocking spin against whoever holds it. A stick that
+   has gone leaves port work pending, so every CPU entering `drain_irqs` reaches
+   that `XHCI.lock()`.
 3. **`Lock::lock` spins with interrupts enabled.** `preempt::disable()` is a
    per-CPU counter and touches nothing in `RFLAGS`. A convoy on this lock
    therefore reads `HLT=0` with `IF` **set** — neither of the two answers the
@@ -192,11 +193,12 @@ that took its record and then declined would have dropped a wake.
 
 #### 2026-08-07: the metal result, and what it eliminates
 
-The owner built at `8cfb6d8` — a clean tree carrying **X2a and X2b both** — and
+The owner built at `8cfb6d8` — a clean tree carrying **both halves of the port
+machine's submit-and-return conversion** — and
 pulled the stick. **Froze. Ctrl+Alt+D nothing. He then sat untouched for a full
 minute and the panel did not change at all**; the desktop image stayed as it was.
 
-**X2a and X2b are eliminated as the fix and are not eliminated as correct work.**
+**Both are eliminated as the fix and are not eliminated as correct work.**
 They removed real unbounded waits from the scheduler pass, their gates stand, and
 the freeze is unchanged across them. What that buys is a clean narrowing: the
 remaining xHCI candidate is the **acquisition** of the one controller lock rather
@@ -421,10 +423,10 @@ absent from QEMU by construction, and can produce the observed state without
 reaching any software error path.
 
 **Corroborated independently, and the other reading goes further — read it
-before touching any of this.** `specs/plans/memory-boundary-spec.md` §2.3 reached the
-same conclusion from the memory-safety track on the same day, and it is the
-authority for the fix: it names the same `ipi_all_excluding_self` one-ICR-write,
-states that **the six existing call sites are therefore already wrong** rather
+before touching any of this.** The memory-safety track reached the same
+conclusion on the same day, and it is the authority for the fix: it names the
+same `ipi_all_excluding_self` one-ICR-write, states that **the six existing call
+sites are therefore already wrong** rather
 than merely incomplete — `MappedPages::release` (`process.rs:159-163`) drops the
 pages after a shootdown nobody waited for — and enumerates four more sites that
 free pages with no shootdown at all (`sys_munmap`, `shared_memory::{release,
@@ -435,7 +437,7 @@ entirely: `invlpg` reads the *current* CR3's PCID (`paging.rs:196`), so
 metal and merely the wrong CPU under QEMU.
 
 **And it prices the fix, including a deadlock class this entry did not see.**
-§3.3 is stage M3: an acknowledged shootdown with a per-CPU generation counter,
+The priced fix is an acknowledged shootdown with a per-CPU generation counter,
 invalidation against the *target* address space's PCID, and the shootdown moved
 ahead of every free. Its stated rule matters to anyone who reads the ninth-boot
 experiment below as an invitation to write one: **the initiator must not wait
@@ -446,9 +448,9 @@ shootdown and collecting its acks. That is the same `BackendGuard` this entry's
 own audit flagged as an unbounded `IF`-clear spin, arriving from the other
 direction.
 
-**M3 is memsec2's, not this task's.** The experiment below is an A/B on a
+**That fix is memsec2's, not this task's.** The experiment below is an A/B on a
 throwaway build to test a hypothesis about the freeze; it is not the fix, and it
-must not be confused for the start of M3.
+must not be confused for the start of one.
 
 #### What a ninth boot should carry
 
@@ -465,11 +467,11 @@ inside the bound is a CPU that is already `IF`-clear and unreachable, and saying
 so *by name* turns the freeze's own precondition into a printed line — on a
 machine where, as of the probe, a fatal report reaches the panel.
 
-That change is not made here, and it is **not** M3 being started early: M3 is
-`specs/plans/memory-boundary-spec.md` §3.3 and it belongs to the memory-safety track,
-which has already priced it, enumerated the sites and written the deadlock rule.
+That change is not made here, and it is **not** the acknowledged shootdown being
+started early: that belongs to the memory-safety track, which has already priced
+it, enumerated the sites and written the deadlock rule.
 Whoever builds this A/B builds a throwaway to test a hypothesis about the
-freeze, obeys §3.3's rule about `log!` between issue and ack, and lands nothing.
+freeze, obeys the rule about `log!` between issue and ack, and lands nothing.
 
 **Cheaper still, and it should be tried first**: the heartbeat's `mask=` field
 answers a question this experiment would answer expensively. A machine dying to
@@ -595,7 +597,7 @@ readable**, which is the whole change:
 - **`alive=` falls one CPU at a time over several lines**, each named by a
   `heartbeat: cpuN last reached one …s ago` → a local cause spreading, which is
   what a stale translation looks like: CPUs die in the order they touch the bad
-  page. This is the reading §3.3's shootdown hypothesis is waiting on.
+  page. This is the reading the shootdown hypothesis is waiting on.
 - **`alive=` goes from `8/8` to nothing between two lines** → a global cause,
   below the software layer, and the shootdown hypothesis loses its best
   evidence.
@@ -701,8 +703,9 @@ the i8042 counter line, which says whether input was arriving meanwhile.
 #### The third freeze — the first audio period, and why one signature was not enough
 
 `hda-metal/2026-08-07-183104.log`, 236 lines. **An older image**: flashed after
-H2/H4 landed and *before* M3's shootdown, so the defect it shows may already be
-closed, and it is evidence about the shape rather than about the current tree.
+the HDA driver landed and *before* the acknowledged shootdown, so the defect it
+shows may already be closed, and it is evidence about the shape rather than
+about the current tree.
 The HDA driver bound on the T14 — ALC257 found, both codecs walked, speaker pin
 selected, path configured — then `spawn: /bin/tone pid=6` at 3.799 s, `soundd:
 opening stream: 44100Hz 2ch`, `client 0 connected`, `soundd: resumed`, `tone:

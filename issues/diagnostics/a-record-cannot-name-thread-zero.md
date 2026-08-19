@@ -6,9 +6,8 @@ opened: 2026-08-14
 
 # A record's one formatter drops `tid=0`, and the first thread of every process is `Tid(0)`
 
-`toyos_abi::log::LogRecord`'s `Display` — the one formatter §3.3 of
-`specs/log-architecture-spec.md` says every consumer renders through — writes
-the thread only when it is non-zero:
+`toyos_abi::log::LogRecord`'s `Display` — the one formatter every consumer
+renders through — writes the thread only when it is non-zero:
 
 ```rust
 if self.tid != 0 {
@@ -30,19 +29,19 @@ formatter would render as `tid=4294967295` on every line a kernel thread logs.
 
 ## What is in the tree now
 
-L2 translates at the boundary: `kernel/src/log/mod.rs`'s `on_a_thread` maps
-`u32::MAX` to zero, so the panel never prints the raw sentinel. That closes the
-loud half and leaves the quiet one — a main thread and a kernel thread now
+The kernel translates at the boundary: `kernel/src/log/mod.rs`'s `on_a_thread`
+maps `u32::MAX` to zero, so the panel never prints the raw sentinel. That closes
+the loud half and leaves the quiet one — a main thread and a kernel thread now
 render identically, where the byte ring's prefix distinguished them (`[kernel
 0.123 cpu0 tid=0]` against `[kernel 0.123 cpu0]`). The byte ring still carries
 the old prefix, so today the distinction survives on serial and is lost only on
-the panel; **L3 deletes the byte ring** and the distinction goes with it.
+the panel; **deleting the byte ring** takes the distinction with it.
 
 ## Why it was not fixed there
 
 `toyos-abi/src/log.rs` is a sysroot source (`src/toolchain.rs`'s
-`SYSROOT_SOURCES`), so an ABI change lands on its own pull request and L2 cannot
-carry one.
+`SYSROOT_SOURCES`), so an ABI change lands on its own pull request and the
+kernel-side commit could not carry one.
 
 ## The options
 
@@ -57,4 +56,4 @@ carry one.
 3. **Renumber tids from one.** Cheapest to render and the worst of the three —
    it puts an ABI rendering decision inside the process table.
 
-Option 1 or 2, on the ABI-only landing that L3 or L4 already needs.
+Option 1 or 2, on the next ABI-only landing.

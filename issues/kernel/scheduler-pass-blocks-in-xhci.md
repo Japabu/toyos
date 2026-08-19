@@ -32,8 +32,8 @@ retire_task: task not released after 1s: InTransit(CpuId(1))
 ```
 
 That panic fired on the owner's T14 at 949.792 s of uptime with doom exiting. The
-*balance*-path half of it is fixed (spec §7.6.4: `hand_off` reaps a killed task
-rather than handing it on, gated by simulator invariant I14). This half is not,
+*balance*-path half of it is fixed: `hand_off` reaps a killed task rather than
+handing it on, gated by simulator invariant I14. This half is not,
 and it would produce the same panic with `Blocked(CpuId(n))` in the message
 instead — the guard cannot tell a lost message from a busy CPU, which is what it
 is written as if it could.

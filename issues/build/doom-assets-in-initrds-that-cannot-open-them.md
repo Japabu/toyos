@@ -9,10 +9,10 @@ opened: 2026-08-08
 `assets = ["assets"]` sweeps the directory whole and there is no way to name
 part of it, so `console/`, `tests/desktopcase`, `tests/desktopaudiocase` and
 `tests/metalcase` each carry `DOOM1.WAD` (4,196,020 B) and now
-`soundfont.sf2` (15,546,764 B) into an image with no doom in it. This is
-`specs/plans/boot-image-split.md` §5's shape, four times bigger: that section records
-the same four configs paying 5,994,284 B for TimGM6mb when
-`untracked-assets` declared it in configs that did not build doom.
+`soundfont.sf2` (15,546,764 B) into an image with no doom in it. It is a shape
+this tree has already paid for, four times bigger: the same four configs once
+carried 5,994,284 B of TimGM6mb because `untracked-assets` declared it in
+configs that did not build doom.
 
 **Measured before it was left alone**, 2026-08-08, one session, same worktree:
 `metal_sim_compositor` is 8 s either way, and the harness's own boot probe moves

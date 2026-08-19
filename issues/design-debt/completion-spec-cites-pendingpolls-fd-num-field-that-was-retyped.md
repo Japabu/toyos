@@ -6,7 +6,7 @@ opened: 2026-08-17
 
 # `completion-architecture-spec.md` §19 says `PendingPoll` still carries `fd_num: u32`; the field is now `handle: RawHandle`
 
-`specs/completion-architecture-spec.md` §19 records `kernel/src/listener.rs`
+`completion-architecture-spec.md` §19 records `kernel/src/listener.rs`
 and `wake_poll_waiters` as already deleted by the endowment branch, and adds:
 "`PendingPoll` survives … and still carries its own `fd_num: u32` field, which
 no spec ever named."
@@ -30,8 +30,8 @@ model, but the specific claim in §19 is now false rather than merely
 line-rotted: the field's *name and type* changed, not just its position.
 
 Filed as a finding rather than a defect because nothing misbehaves; it is
-`specs/completion-architecture-spec.md`'s own accounting of "what C3 owns"
+`completion-architecture-spec.md`'s own accounting of "what C3 owns"
 that needs reconciling with the field's current shape.
 
 Found 2026-08-17 during a citation-accuracy pass over
-`specs/completion-architecture-spec.md`; verified at the tree's tip that day.
+`completion-architecture-spec.md`; verified at the tree's tip that day.

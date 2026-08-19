@@ -6,7 +6,7 @@ opened: 2026-08-17
 
 # `completion-architecture-spec.md` cites `log::console::pending()` as dead code still to delete; it is already gone
 
-`specs/completion-architecture-spec.md` (§11 and §19) describes
+`completion-architecture-spec.md` (§11 and §19) describes
 `log::console::pending()` in `kernel/src/log/console.rs` as an *uncalled*
 function — `serial::has_console() && DRAINED.any_pending()` — with zero callers
 repo-wide, and says the ledger entry owed is "delete the function, not a
@@ -31,4 +31,4 @@ Filed as a finding rather than a defect because nothing misbehaves; the
 document's own accounting of what C13 owes is what needs reconciling.
 
 Found 2026-08-17 during a citation-accuracy pass over
-`specs/completion-architecture-spec.md`; verified at the tree's tip that day.
+`completion-architecture-spec.md`; verified at the tree's tip that day.

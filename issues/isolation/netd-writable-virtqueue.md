@@ -37,7 +37,8 @@ told.
    closes nothing: the device's write happens first, and the frame contents are
    the attacker's too. Nothing else stands in the way — `kernel/src/iommu/mod.rs:11`
    says of itself that "this module *refuses nothing*", every function is in one
-   identity-mapped domain, and stages I0–I2 are all that is built.
+   identity-mapped domain, and the subsystem stops at translation
+   (`issues/kernel/the-iommu-stops-at-translation.md`).
 2. **Kernel memory onto the wire.** The TX descriptor at `0x3000` is written by
    `submit()` and read by the device. Same window, opposite direction: a
    rewritten `addr`/`len` reads arbitrary physical memory out through the NIC.

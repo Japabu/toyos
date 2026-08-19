@@ -10,9 +10,9 @@ Found 2026-08-05 while giving `--claim-sysroot` its arbitration; not fixed.
 
 A linked worktree whose `toyos-abi` differs from the sysroot's must pass
 `--claim-sysroot`, which now announces itself and queues behind every run in
-flight (`specs/worktrees.md` §3.1). **The primary checkout does the same thing
-on any ordinary build and says nothing.** `toolchain::ensure` reaches
-`std_sources_stale` for `Owner::Us`, which compares the witness against the
+flight. **The primary checkout does the same thing on any ordinary build and
+says nothing.** `toolchain::ensure` reaches `std_sources_stale` for
+`Owner::Us`, which compares the witness against the
 primary's own sources; a worktree's claim makes that comparison stale, so the
 next `cargo run -- --build-only` in the primary rebuilds std from main's
 sources, rewrites the witness, and the claiming worktree refuses from then on.

@@ -19,14 +19,14 @@ whole life:
 - `wait_command()` and `wait_transfer()` — every command and every transfer.
   Same bound.
 
-**X2a took the two that ran inside a scheduler pass out of that list.** A
-teardown's Disable Slot and an endpoint recovery's three-in-a-row (Reset or
-Stop Endpoint, Set TR Dequeue, CLEAR_FEATURE(HALT)) are submit-and-return now,
-so the six seconds above are reachable only from the boot path and from
-`storage_read`/`storage_write` — the first has no scheduler to give a pass back
-to, and the second is the case named below that this conversion does not fix.
-`device::configure` is the one blocking caller `poll_if_pending` still reaches
-and it is X2b's.
+**The port machine took the two that ran inside a scheduler pass out of that
+list.** A teardown's Disable Slot and an endpoint recovery's three-in-a-row
+(Reset or Stop Endpoint, Set TR Dequeue, CLEAR_FEATURE(HALT)) are
+submit-and-return now, so the six seconds above are reachable only from the boot
+path and from `storage_read`/`storage_write` — the first has no scheduler to
+give a pass back to, and the second is the case named below that this conversion
+does not fix. `device::configure` is the one blocking caller `poll_if_pending`
+still reaches, and it is the piece still owed.
 
 So a worst case is a CPU that does not reschedule for **six seconds**, and an
 ordinary hot-plug enumeration on the T14 is ~14 ms of it (`hotplug-blocks-a-scheduler-pass`).

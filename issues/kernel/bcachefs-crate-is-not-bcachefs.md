@@ -40,8 +40,9 @@ Two facts about the tree that a real-bcachefs track inherits whichever way it is
 sequenced, both measured on 2026-08-15 and recorded in
 `specs/assessments/2026-08-15-mechanism-consolidation-audit.md` §1.4: the kernel
 must parse the root format to reach `/bin/init` at all (`kernel/src/main.rs:591`,
-and `kernel/src/bcachefs_adapter.rs:543` `.expect()`s the mount), and
-`specs/plans/boot-image-split.md` stage 2 is not done. That same section carries
+and `kernel/src/bcachefs_adapter.rs:543` `.expect()`s the mount), and the
+bcachefs root partition on the boot medium is still unbuilt
+(`issues/build/the-initrd-is-still-the-root-filesystem.md`). That same section carries
 the defect history of the current format and the observation the ruling inverts —
 a home-grown format has no second implementation to be judged against, and
 upstream bcachefs is exactly such a judge.

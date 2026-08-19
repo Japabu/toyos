@@ -8,7 +8,7 @@ opened: 2026-08-13
 
 `kernel/src/drivers/xhci/mod.rs:359` (added `17a6b17`, 2026-08-08): "*... and
 that is the whole of what the T14's audio pops are made of
-(`specs/known-issues.md` §4).*" `specs/known-issues.md` is the monolithic file
+(`specs/known-issues.md` §4).*" That file is the monolithic one
 `issues/` replaced (`issues/README.md`'s `opened` field still
 explains the split); it does not exist on any branch found by
 `git log --all --diff-filter=A -- '**/known-issues.md'`'s single hit, which

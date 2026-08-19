@@ -21,9 +21,10 @@ storage comes up and there is no second handle to it". `/boot` and `/log` work
 on the T14 and in QEMU only because the boot medium is USB, and
 `usb_storage::open` mints a fresh handle per call.
 
-This is the real cost of `specs/plans/boot-image-split.md` stage 2: a bcachefs root on
+This is the real cost of the root partition that never landed
+(`issues/build/the-initrd-is-still-the-root-filesystem.md`): a bcachefs root on
 the boot medium needs a `BlockIO` over an arbitrary `BlockDevice` at a partition
 offset with a cache of its own, where `PageCacheBlockIO` *is* the NVMe device by
-construction. Found 2026-08-07 while pricing that stage — the 2026-07-29 version
-of that document listed this as one of eight items a USB storage driver would
-have to bring, and it is the one that did not arrive with it.
+construction. Found 2026-08-07 while pricing that work — it was one of eight
+items a USB storage driver was expected to bring, and the one that did not
+arrive with it.

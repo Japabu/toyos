@@ -6,7 +6,7 @@ opened: 2026-08-17
 
 # `completion-architecture-spec.md` §4.3 describes `hda_probe.rs` as live; the whole file is gone
 
-`specs/completion-architecture-spec.md` §4.3 names three files that each hold a
+`completion-architecture-spec.md` §4.3 names three files that each hold a
 byte-for-byte duplicate of a `settles` busy-wait — `xhci/wait/mod.rs`,
 `hda.rs` and `hda_probe.rs` — and separately names `hda_probe.rs`'s
 `spin_until_ns` as one of two Class S sites whose enclosing function name is not
@@ -39,4 +39,4 @@ planning document's premise that has been overtaken by cleanup work landed
 after the document was last checked against the tree.
 
 Found 2026-08-17 during a citation-accuracy pass over
-`specs/completion-architecture-spec.md`; verified at the tree's tip that day.
+`completion-architecture-spec.md`; verified at the tree's tip that day.

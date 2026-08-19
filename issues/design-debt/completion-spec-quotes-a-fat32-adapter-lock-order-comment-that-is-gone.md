@@ -6,7 +6,7 @@ opened: 2026-08-17
 
 # `completion-architecture-spec.md` §21.1 quotes a "Lock order is VFS → here → XHCI" comment in `fat32_adapter.rs`; it is not there
 
-`specs/completion-architecture-spec.md` §21.1 traces the disk lock path and
+`completion-architecture-spec.md` §21.1 traces the disk lock path and
 says the source itself states the order, quoting `fat32_adapter.rs`: *"Lock
 order is VFS → here → `XHCI`"*.
 
@@ -36,4 +36,4 @@ reworded, moved, or the claim was never literally quoted from a single
 comment).
 
 Found 2026-08-17 during a citation-accuracy pass over
-`specs/completion-architecture-spec.md`; verified at the tree's tip that day.
+`completion-architecture-spec.md`; verified at the tree's tip that day.

@@ -21,10 +21,9 @@ gone"*. `SYS_NAMESPACE_OPEN` answers it for a port whose acceptor has been
 dropped; a connection whose peer end has been dropped answers `NotFound` for the
 same fact.
 
-`specs/capability-endowment-spec.md` §8 specifies the second arm of
-`connect_before_serve` as *"the client's write must return `Gone`"*. It returns
-`NotFound`, and the test asserts what the kernel says with this file named beside
-it.
+The second arm of `connect_before_serve` is specified as *"the client's write
+must return `Gone`"*. It returns `NotFound`, and the test asserts what the kernel
+says rather than what was asked for.
 
 ## What changing it touches
 

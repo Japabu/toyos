@@ -6,10 +6,6 @@ opened: 2026-08-08
 
 # The audio pops are four spinlocks, not one spinning driver
 
-**`specs/completion-architecture-spec.md` is the finding, the evidence and the
-wave that closes it** — it supersedes `blocking-io-plan.md`, which is deleted.
-What belongs here is the sentence an agent must not miss and the two commands.
-
 Measured 2026-08-08 on `wt/toyos-asyncusb` at `87835d1`: at the moment a disk
 transfer is waited for, an ordinary guest is **four ticket spinlocks deep** —
 `log_file::SINK`, `vfs::VFS`, `fat32_adapter::VOLUMES` and `xhci::XHCI` — and

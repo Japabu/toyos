@@ -46,9 +46,10 @@ way invariant I5's bound takes the runnable thread count. A wall clock in the
 kernel has nothing to read it off.
 
 **This predates bounded deferral and is not caused by it.** The
-`(1 + peers) × UNWIND_NS` term entered the sim's I14 at C3+C4's first wave and
-the kernel-side derivation never priced `peers` at all until the second. Aging
-multiplies the term by 11 under a saturated RT band, which makes the crossing
+`(1 + peers) × UNWIND_NS` term entered the sim's I14 in the completion work's
+first wave and the kernel-side derivation never priced `peers` at all until the
+second. Aging multiplies the term by 11 under a saturated RT band, which makes
+the crossing
 point closer but does not create it.
 
 Three shapes have been considered and none is this chunk's to choose:
@@ -62,11 +63,11 @@ Three shapes have been considered and none is this chunk's to choose:
    `Tripwire` into something `kernel/src/time.rs` has no kind for — the type
    deliberately forbids a magnitude with a derivation attached.
 3. **Stop waiting.** The wait exists because process teardown frees memory the
-   dead thread's page tables still map. `specs/completion-architecture-spec.md`
-   §7.4 is where that would be revisited.
+   dead thread's page tables still map. Revisiting that belongs to the
+   completion architecture, which kills every wait.
 
 **Remedy 2 was chosen, then withdrawn, and what replaced it was withdrawn
-too.** The 2026-08-16 five-lens review of `specs/scheduling-reservations-spec.md`
+too.** The 2026-08-16 five-lens review of the reservation design
 proved the arm-time depth read is the same defect again: the snapshot is taken
 before the victim reaches the queue, so k concurrent retirers all read a depth of
 zero and the k-th victim legally outlives a deadline whose expiry was a panic —
@@ -74,13 +75,13 @@ and the read itself is one scheduler-core invariant 2 forbids. The revision put
 two assertions on the victim's CPU in its place; the 2026-08-17 second pass
 proved both reachable from legal userland (a corpse parked in a 2 s transfer
 against a queue-occupancy condition, and a 32 MiB dirty file against a progress
-cadence), and §8 now asserts **nothing** at the victim's end. What the wait rests
-on instead is the dying server's admitted reservation — one entity, one
-invariant, no term any workload scales — plus a report when a corpse's tenure
+cadence), and the design now asserts **nothing** at the victim's end. What the
+wait rests on instead is the dying server's admitted reservation — one entity,
+one invariant, no term any workload scales — plus a report when a corpse's tenure
 exceeds a derived expectation, which is loud and never fatal. None of the three
-remedies above is the shape that landed. **This file closes at R7 for the
-strongest reason available: the constant is deleted and nothing was put in its
-place.**
+remedies above is the shape that landed. **This file closes when that change
+lands, for the strongest reason available: the constant is deleted and nothing
+was put in its place.**
 
 Until then the constant is honest about what it does not cover, which is the
 whole of what this file records.

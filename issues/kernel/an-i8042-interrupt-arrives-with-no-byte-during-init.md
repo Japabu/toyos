@@ -54,17 +54,18 @@ guests. Both rows are on `src/redlist.rs`, deliberately as two rows.
 ## The blame, and it named one aggressor when there were two
 
 **The first four rows above were read as "the drain masks interrupts and
-bounding it halves the rate", and that account was incomplete.** L3's review
-found a second holder of the same lock with a worse shape: `write_console` took
-`BackendGuard` — `cli` plus a global spinlock, with the device write inside it —
-once for a **userland-chosen** length, because `SYS_WRITE`'s buffer has no cap
+bounding it halves the rate", and that account was incomplete.** The log
+rework's review found a second holder of the same lock with a worse shape:
+`write_console` took `BackendGuard` — `cli` plus a global spinlock, with the
+device write inside it — once for a **userland-chosen** length, because
+`SYS_WRITE`'s buffer has no cap
 and the byte ring this branch deleted had never held that lock at all. So a
 guest doing ordinary console output could mask interrupts for as long as it
 liked, on the same machine whose i8042 was being brought up, and that window was
 live for every measurement in the table's third and fourth rows.
-`specs/log-architecture-spec.md` §8.1 carries the fix; the drain's eight-record
-bound and this one are the two halves of what `kernel/CLAUDE.md`'s
-`BackendGuard` caveat asks for.
+The fix is that `write_console` takes the backend once per `MAX_CONSOLE_LINE`
+and never for a userland length; the drain's eight-record bound and this one are
+the two halves of what `kernel/CLAUDE.md`'s `BackendGuard` caveat asks for.
 
 **Bounding it does not move the rate, and that is what settles the blame.** The
 last two rows are one session — an interleaved A/B of five suites per arm,

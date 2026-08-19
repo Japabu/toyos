@@ -31,4 +31,4 @@ Nothing in the ToyOS repository runs `x fmt`, so the debt is invisible from
 here. It cannot be paid inside a defect fix without burying the fix: formatting
 `sys/fs/toyos.rs` rewrites most of the file. It wants a commit of its own, which
 is cheap now that a `rust/library` edit is picked up by an ordinary worktree
-build (`specs/worktrees.md` §3.3) and needs no sysroot claim.
+build and needs no sysroot claim.

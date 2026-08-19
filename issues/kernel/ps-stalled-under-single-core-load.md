@@ -13,5 +13,5 @@ This file used to carry a second observation, Doom's music heard once at
 roughly half speed. That one is retired: it never reproduced at HEAD with or
 without `-nodefaults`, its wav capture measured 1.00x, and the owner reports
 (2026-08-15) Doom running well on the T14. The instrument it argued for outlived
-it and lives in `specs/debugging.md`: audio that sounds wrong is read from
-doom's real-time factor and soundd's stats, never from the ear.
+it: audio that sounds wrong is read from doom's real-time factor and soundd's
+stats, never from the ear.

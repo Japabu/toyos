@@ -24,10 +24,11 @@ wire; something between soundd's buffer and the wav file did not carry it.
 The instrument is new and calibrated: `audio::phase_breaks` tests the recurrence
 `x[n+1] = 2·cos(ω)·x[n] − x[n−1]` that a sampled sinusoid obeys exactly, and it
 reads **0 on all four recorded virtio configs** (`audio_tone` and
-`audio_tone_load`, smp 1 and 8). It is `specs/plans/hda-driver-plan.md` §5.3 item 5's
-second guard, built because `specs/plans/hda-driver-plan.md` §2.4's zero-on-complete rule — the thing that keeps
-one gap detector valid for both backends — is a design promise with no
-measurement behind it (risk 7).
+`audio_tone_load`, smp 1 and 8). It is the second of two guards on the same
+property, built because the first — the driver zeroing a period's buffer once
+that period has played, so an unfilled period sounds like silence on both
+backends and one gap detector stays valid for each — is a design promise with
+no measurement behind it.
 
 Evidence, and why it does not yet name a cause:
 
