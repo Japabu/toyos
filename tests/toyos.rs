@@ -544,6 +544,13 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // microseconds, and a completion afterwards bounded far above the two
     // scheduler passes it needs.
     ("log_poll_outlives_a_close", Sched::Parallel, Tier::Fast),
+    // The same question asked of the keyboard, where two *kinds* of object name
+    // one source: a poll on stdin against the keyboard claim going away, a poll
+    // on the mouse claim against its own, and an injected keystroke to show the
+    // first was still armed. Parallel and Fast: two of the three verdicts are
+    // counts the guest takes immediately after a close on its own thread, and
+    // the third is bounded far above the one interrupt it waits for.
+    ("keyboard_claim_close_spares_stdin", Sched::Parallel, Tier::Fast),
     // One boot that stops dead in phase 3, read for what it managed to say.
     ("pre_idle_wedge_speaks", Sched::Parallel, Tier::Fast),
     ("i8042_health", Sched::Parallel, Tier::Nightly),
@@ -7283,6 +7290,9 @@ fn run_machine_test(
         }
         "console_line_atomicity" => {
             common::console::console_line_atomicity(test_config, c_bins, rust_bins)
+        }
+        "keyboard_claim_close_spares_stdin" => {
+            common::console::keyboard_claim_close_spares_stdin(test_config, c_bins, rust_bins)
         }
         "iommu_context_absent" => common::iommu::iommu_context_absent(test_config, c_bins, rust_bins),
         "iommu_empty_domain" => common::iommu::iommu_empty_domain(test_config, c_bins, rust_bins),

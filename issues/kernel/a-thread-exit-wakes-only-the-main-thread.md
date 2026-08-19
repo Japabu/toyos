@@ -1,10 +1,29 @@
 ---
-status: open
+status: assigned
 kind: defect
 opened: 2026-08-14
+task: 91
 ---
 
 # A thread's exit wakes only the main thread, so a join by any other thread waits for nothing
+
+**Held by the completion pipeline, and already written there.** The completion
+architecture assigns `sys_thread_join` to C3+C4 — *"park on the
+`ThreadObject`"* — which is the shape "What a fix has to decide" below asks for,
+and deletes `park_lot`, `PARK_BUCKETS` and `wake_task(TaskId)` with it. That
+assignment was §4.1 row P8 of the design #127 removed; recover it with
+`git show b27b947:specs/completion-architecture-spec.md`, line 386.
+
+It is implemented on `wt/toyos-p2impl` (PR #91) at
+`1bfe4e5`, *"completion: fifteen park sites become one"*, where `sys_thread_join`
+resolves the target once, arms on `completion::Subject::of(sched.handle.watch())`
+and rechecks `wait_thread_zombie` — so the joiner is registered on the thread it
+waits for instead of hoping for a wake addressed to somebody else.
+
+Still real on `main` at `ad475ab`, re-verified 2026-08-18: `process::thread_exit`
+still calls `scheduler::wake_task(TaskId(process_pid, parent_main_tid))` and
+`release_thread` still returns `proc.main_tid`. **Do not build a second
+mechanism** — a per-thread wait queue added here is deleted by C3+C4 on arrival.
 
 `process::thread_exit` posts exactly one wake, and it is always to the same
 thread:
