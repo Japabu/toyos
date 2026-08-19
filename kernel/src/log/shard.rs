@@ -23,7 +23,7 @@ use toyos_abi::log::RECORD_BYTES;
 
 /// Slots per CPU: 512 KiB at `RECORD_BYTES` of 1024, and 4 MiB at the shipped
 /// eight — bought deliberately when the record was widened to hold a demangled
-/// backtrace frame.
+/// backtrace frame, and the owner accepted it with that arithmetic in hand.
 ///
 /// **Sized by records emitted before a reader exists**, which is the only
 /// quantity this bound has to cover — after that `klogd` and `/bin/logd` are

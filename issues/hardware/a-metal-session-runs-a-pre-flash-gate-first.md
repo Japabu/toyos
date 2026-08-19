@@ -58,5 +58,16 @@ carried here too:
 | one boot with AP control-register inheritance armed against one without, same image, same session; record the delta | `issues/kernel/ap-control-registers-inherit-init.md` |
 | transcribe the 16550 loopback line, and the boot's own completion time beside the last metal-sim reading of the same image | the T14 half of the console-drain question |
 
+**That second row closes half an obligation, not the whole of it.** What is owed
+is what an inline drain costs when every boot record goes synchronously to a
+115200-baud port. QEMU answers instantly and cannot price it, and **the T14
+cannot price it either** — it has no SuperIO, so the loopback probe reads `0xFF`,
+`has_console()` is false, and the mode is a branch not taken. What a metal
+session *can* close is exactly that: the probe byte is the evidence that the T14
+pays nothing, which is what `kernel/src/log/console.rs` claims about this machine
+and what a flashed image depends on. The 115200-baud arm needs a machine with a
+real port and stays open until there is one; the arithmetic for it — ~40 KB at
+~87 µs/byte, so seconds — is a prediction and says so.
+
 `issues/hardware/pre-flash-gate-missed-the-milestone.md` records that the last
 verdict certified everything except input.

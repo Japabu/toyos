@@ -1,12 +1,10 @@
 # The rotation boot: `tests/metalcase`'s machine shape with `/bin/logd` writing
 # 256-byte files instead of mebibyte ones.
 #
-# **A config and not a boot parameter, and that is what L6 changed about it.**
-# `log-rotate-fast` was a kernel actuator armed from the command line, because
-# the rotation bound lived in `kernel/src/log_file.rs`. It lives in `/bin/logd`
-# now: the fast value is a logd argument rather than a kernel actuator, and
-# the way a program gets an argument in this system is its manifest row — so
-# the arming moves from a
+# **A config and not a boot parameter.** `log-rotate-fast` was a kernel actuator
+# armed from the command line, because the rotation bound lived in the kernel's
+# own file sink. It lives in `/bin/logd` now, and the way a program gets an
+# argument in this system is its manifest row — so the arming moves from a
 # cmdline the kernel parses into a config the image is built from, which is a
 # capability-shaped answer rather than a global one.
 #
@@ -28,11 +26,11 @@ assets = ["assets"]
 start = ["logd", "compositor", "soundd", "netd", "sshd", "test-runner"]
 
 # **Every image that carries a `TOYOS-LOG` partition runs this**, and every
-# image does. The kernel keeps the record ring and writes no file, so a boot
-# config without `logd` is a boot whose `/log` is empty —
-# `every_boot_config_runs_logd` is what refuses one. It claims no device and
-# serves no port yet: its whole authority is `logread`, which is
-# `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
+# image does. The kernel keeps the record ring and writes no file at all, so a
+# boot config without `logd` is a boot whose `/log` is empty —
+# `every_boot_config_runs_logd` is what refuses one.
+# It claims no device and serves no port: its whole authority
+# is `logread`, which is `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
 [programs.logd]
 args = ["--rotate-fast"]
 syscap = ["logread"]

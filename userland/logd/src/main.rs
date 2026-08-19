@@ -1,13 +1,13 @@
 //! `/bin/logd` — the machine's log, written to a file by a process that can be
 //! killed without taking the kernel with it.
 //!
-//! What this program replaces is `kernel/src/log_file.rs`: a kernel module that
-//! appended the log ring to a FAT volume **from the idle loop**, which is why an
-//! idle CPU on this machine could be found four spinlocks deep inside a USB
-//! transfer with a userland `println!` behind it. The kernel keeps the record
-//! ring and the console; every policy about files — where they go, what they
-//! are called, how many there are, what happens when the stick stops answering
-//! — is here.
+//! What this program replaces is the kernel's own file sink,
+//! `kernel/src/log_file.rs`: a kernel module that appended the log ring to a
+//! FAT volume **from the idle loop**, which is why an idle CPU on this machine
+//! could be found four spinlocks deep inside a USB transfer with a userland
+//! `println!` behind it. The kernel keeps the record ring and the console;
+//! every policy about files — where they go, what they are called, how many
+//! there are, what happens when the stick stops answering — is here.
 //!
 //! # Its whole authority
 //!

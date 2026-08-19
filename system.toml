@@ -32,9 +32,9 @@ toyos-cc = { path = "toyos-cc" }
 
 # **Every image that carries a `TOYOS-LOG` partition runs this**, and every
 # image does. The kernel keeps the record ring and the console and writes no
-# file, so a boot config without `logd` is a boot whose `/log` is empty —
+# file at all, so a boot config without `logd` is a boot whose `/log` is empty —
 # `every_boot_config_runs_logd` is what refuses one. It claims no device and
-# serves no port yet: its whole authority is `logread`, which is
+# serves no port: its whole authority is `logread`, which is
 # `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
 [programs.logd]
 syscap = ["logread"]

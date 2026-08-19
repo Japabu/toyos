@@ -44,5 +44,5 @@ is `cargo run -- --known-red metal_sim_pointer_churn`, which prints this row
 beside the two that retired it.
 
 What would settle it is `probe-green.yml`'s shape aimed at this one name — ten
-reps, one job per rep — since that is what turned each of §10.9's four names from
-a run into a number.
+reps, one job per rep — since that is what turned each of the four names behind
+four consecutive red runs on `main` from a run into a number.

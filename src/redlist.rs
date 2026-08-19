@@ -1661,6 +1661,64 @@ pub const KNOWN_RED: &[Red] = &[
         source: "issues/diagnostics/console-scrollback-can-sit-at-the-head-of-the-seeded-log.md",
         measured: "2026-08-17",
     },
+    // ---------------------------------------------------------------------
+    // `wt/toyos-purecrates`, dev host, 2026-08-18: three full `cargo test` runs
+    // in one session, on a branch whose whole delta is three kernel files
+    // moving into two pure crates with no line of their logic changed — every
+    // moved file `diff`s against its original as doc comments, one `use` path
+    // and two test paths. All twelve KVM shards of that commit are green
+    // (PR #124). Three runs, three different names red, each `ALONE … GREEN`,
+    // and each red twice over on the second and third: this is the dev-host
+    // load family and the rows say so. Adjudicated here rather than re-run
+    // away, per the root CLAUDE.md — each of these answered `NOT ON THE LIST`
+    // when it was asked, which is the gap this campaign closes.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "console_line_atomicity",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 3),
+        standing: Standing::Stands,
+        what: "`kernel panic: DOUBLE FAULT on CPU 1 (pid=Some(Pid(2)) tid=Some(Tid(0)))`, 21 s \
+               against the 9 s it passed in the run before. **A kernel death and not a verdict**, \
+               and the first dev-host one the panic vocabulary has named rather than reported as \
+               silence. `ALONE … GREEN`, which that vocabulary's own write-up says is not evidence \
+               against a panic — one reached under contention does not reproduce alone either. \
+               The kernel's report is not in the record: this test's failure arm prints \
+               `tail(&result.stdout)` and never `TestResult::serial`",
+        evidence: "three full `cargo test` runs in one session on `wt/toyos-purecrates`, twelve \
+                   wide, `fastest boot 1522 ms against the reference 1320 ms` on the run that \
+                   red",
+        source: "issues/kernel/a-double-fault-on-cpu-1-under-a-wide-suite.md",
+        measured: "2026-08-18",
+    },
+    Red {
+        test: "console_line_atomicity",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 3),
+        standing: Standing::Stands,
+        what: "`writer A declared 1000 whole lines and the capture carries 798` — the \
+               non-vacuity count, not the atomicity assertion, and the filed reading of this \
+               message holds: **`0 mixed` means the mechanism held**. A second sighting of the \
+               2026-08-15 defect with the other writer and a different count, `ALONE … GREEN`",
+        evidence: "the same session's third run, twelve wide, `fastest boot 1381 ms against the \
+                   reference 1320 ms`",
+        source: "issues/build/console-line-atomicity-reds-on-a-short-capture.md",
+        measured: "2026-08-18",
+    },
+    Red {
+        test: "handle_kill_policy",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 3),
+        standing: Standing::Stands,
+        what: "`16 more killed processes left more live objects behind: [(\"Process\", 6, 7)]` — \
+               byte-identical to the 2026-08-17 sighting on an unrelated branch, numbers \
+               included, which is what a machine-wide census either side of a kill on a shared \
+               boot is expected to do. `cargo test --test toyos-build -- handle_kill_policy` on \
+               the same tree straight afterwards: `PASS handle_kill_policy (615ms)`",
+        evidence: "the same session's first run, twelve wide",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-18",
+    },
 ];
 
 // ---------------------------------------------------------------------------

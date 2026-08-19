@@ -1,9 +1,9 @@
 //! Kernel threads: a task with no address space of its own, and the one place
 //! that says what a panic inside one means.
 //!
-//! Built for one thread, `klogd`, which is the kernel's console drainer; the
-//! `usbd` and `iod` threads the completion work owes are spawned on the same
-//! machinery and add their two rows to [`ROWS`].
+//! There is one today, `klogd`, the kernel's console drainer; the `usbd` and
+//! `iod` threads the completion work owes are spawned on the same machinery and
+//! add their two rows to [`ROWS`].
 //!
 //! **A kernel thread is not a special kind of task.** It is an ordinary task
 //! whose `NewTask::address_space` is `None` — `driver::spawn` then names the

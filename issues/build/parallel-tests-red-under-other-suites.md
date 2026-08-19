@@ -147,6 +147,15 @@ changes.
   reaping processes. One extra `Process` between two samples is another test's
   reap that had not landed yet, and nothing in that boot arranges for it not to
   be. Still `Sched::Parallel`.
+  **Seen again 2026-08-18** on `wt/toyos-purecrates`, whose whole delta is three
+  kernel files moving into two pure crates with no line of their logic changed —
+  and the message is byte-identical to the one above, numbers included: `16 more
+  killed processes left more live objects behind: [("Process", 6, 7)]`.
+  `cargo test --test toyos-build -- handle_kill_policy` on the same tree
+  immediately afterwards: `PASS handle_kill_policy (615ms)`. A second sighting
+  of the same census on an unrelated branch is what the mechanism above
+  predicts. `cargo run -- --known-red handle_kill_policy` still answers `NOT ON
+  THE LIST`, so this entry remains the whole record of it.
 - **`wall_clock_file`** — added 2026-08-17, same session, **1 of 6**,
   `ALONE … GREEN`, green on all twelve shards of the same tree. Not
   investigated further.

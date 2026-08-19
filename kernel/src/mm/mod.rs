@@ -1,6 +1,5 @@
 pub mod pmm;
 pub mod paging;
-pub mod user_span;
 mod alloc;
 mod mmio;
 mod region;
@@ -16,7 +15,10 @@ pub use pmm::Region;
 /// All physical memory is mapped at this virtual offset.
 pub const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
-pub use user_span::PAGE_2M;
+/// The kernel's one user page size, and the granularity a translation answers
+/// at. It lives in `toyos-userbound` with every refusal that turns on it; the
+/// rest of the kernel names it `mm::PAGE_2M`.
+pub use toyos_userbound::PAGE_2M;
 
 /// Round `size` up to the next 2MB boundary.
 ///
@@ -84,7 +86,7 @@ impl UserAddr {
     /// The type's name is a claim, and this is the only constructor that makes
     /// it true of a number userland chose.
     pub fn checked(v: u64) -> Option<Self> {
-        user_span::is_user_addr(v).then_some(Self(v))
+        toyos_userbound::is_user_addr(v).then_some(Self(v))
     }
 
     pub const fn raw(self) -> u64 { self.0 }

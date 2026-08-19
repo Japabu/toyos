@@ -14,4 +14,5 @@ CLEAR_FEATURE(HALT)s (2 s each) — about 10 s of the boot for one device
 against a 500 ms budget, times however many such devices are on the bus.
 `Profile::MetalUsb` puts six on one controller. The honest statement is that
 `READY_BUDGET_NS` bounds the retries and `USB_TIMEOUT_NS` times what each
-costs, and the *product* is the boot-time figure. `usb-storage.md` F11.
+costs, and the *product* is the boot-time figure. The USB storage type-safety
+audit's finding F11.

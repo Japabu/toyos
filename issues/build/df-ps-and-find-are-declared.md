@@ -6,7 +6,7 @@ opened: 2026-08-08
 
 # `df`, `ps` and `find` are external binaries the bar does not allow
 
-Three more, none of which comes with Rust or QEMU. Audit §5.
+Three more, none of which comes with Rust or QEMU.
 
 All three are in the preflight's `ALSO_USED` list since 2026-08-08, so a machine
 without one is told which and what it costs. **That is a declaration and not the

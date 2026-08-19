@@ -1274,10 +1274,10 @@ pub fn xhci_slow_connect(
     verify(&image, bytes, nonce)?;
     // The guest's own boot stamp, printed rather than asserted on.
     //
-    // **This is the named instrument for the log producer path's cost, and
-    // until 2026-08-15 it could not be read off the test that
-    // *is* it.** The obligation is an interleaved A/B of that cost against this
-    // boot's `Boot: complete`, and the stamp reached only the
+    // **This is the log architecture's own named boot instrument for the
+    // producer path's cost, and until 2026-08-15 it could not be read off the
+    // test that *is* it.** What it is for is an interleaved A/B of that cost
+    // against this boot's `Boot: complete`, and the stamp reached only the
     // per-run UART file, which goes when the guest does. So the measurement had
     // to instrument something — and the lesson
     // `issues/hardware/one-rmw-per-log-line-cost-350ms.md` leaves is that

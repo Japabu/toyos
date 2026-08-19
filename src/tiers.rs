@@ -420,7 +420,7 @@ pub const RELEGATED: &[Relegated] = &[
         guards: "A device that rejects the optional flush command remains usable, while a \
                  real write failure still propagates. Treating every command error alike \
                  either loses compatible disks or hides failed writes. **The cost this \
-                 relegation is about was cut about sevenfold at L6 of the log architecture** — \
+                 relegation is about was cut about sevenfold when `/bin/logd` took the file** — \
                  `/bin/logd` ends on an error instead of retrying inside a budget, which is what \
                  turned 1,737 failing flushes over six seconds into the handful a single refusal \
                  costs — and `ci_ms` above is untouched \

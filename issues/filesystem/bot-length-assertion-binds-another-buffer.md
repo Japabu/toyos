@@ -13,4 +13,5 @@ largest is 36 (INQUIRY) so there is no live bug; the next command added is
 where it becomes one, and the assertion is what the person adding it will read
 to decide the buffer is big enough. Same shape as `IpcPayload`: a bound in the
 right place with the wrong operand. The fix is to give `bot` the *region*
-rather than a physical address it cannot reason about. `usb-storage.md` F6.
+rather than a physical address it cannot reason about. The USB storage
+type-safety audit's finding F6.

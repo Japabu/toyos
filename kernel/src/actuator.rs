@@ -490,8 +490,8 @@ actuators! {
     /// What it drives is the partial write an appender makes into an evicted
     /// page — `log_file`'s until L6 and `/bin/logd`'s since, which is the same
     /// path through the page cache and a *more* reachable one, because a
-    /// userland writer's tail page is ordinary evictable cache. See
-    /// `fat32_adapter.rs`'s `fat_backing_reads`.
+    /// userland writer's tail page is ordinary evictable cache.
+    /// See `fat32_adapter.rs`'s `fat_backing_reads`.
     fat_backing_read_fails = "fat-backing-read-fails";
 
     /// Fail every *filesystem* read of the boot volume once it is mounted, with

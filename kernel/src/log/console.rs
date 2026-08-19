@@ -361,8 +361,10 @@ impl<F: FnMut(&[u8])> core::fmt::Write for Line<F> {
 ///
 /// **Public because `/log`'s sink renders the same line**, and a second
 /// implementation of it there would be a second thing to keep agreeing with the
-/// panel. It goes when `logd` does the rendering (L6), which is also when the
-/// wall-clock prefix stops being this one.
+/// panel. An earlier note here predicted it would go when `logd` took over the
+/// rendering; it did not, because `logd` renders the same record through the
+/// same `Display` and writes a *wall-clock* prefix in front of it. One
+/// implementation of everything that varies, two prefixes over it.
 pub fn write_line(record: &LogRecord, emit: impl FnMut(&[u8])) {
     use core::fmt::Write;
     let mut line = Line::new(emit);
@@ -437,11 +439,10 @@ extern "C" fn body(_arg: u64) -> ! {
 
         // **The one context in the machine that has just observed committed
         // records and may take a lock**, which is why the readiness post is
-        // here and not in `emit`: each per-source watcher list is a `Lock<Vec<_>>`
-        // the post clones under the lock, and taking a lock is the one thing
-        // `emit` may not do. One
-        // post per batch rather than one per record, and none at all while
-        // nothing is watching.
+        // here and not in `emit`: each per-source watcher list is a
+        // `Lock<Vec<_>>` the post clones under the lock, and taking a lock is
+        // the one thing `emit` may not do. One post per batch rather than one
+        // per record, and none at all while nothing is watching.
         //
         // It is outside `drain_inline` deliberately: that function's other two
         // callers are a producer mid-`emit` and a panicking machine, and

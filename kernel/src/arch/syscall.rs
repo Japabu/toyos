@@ -2070,7 +2070,7 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
         if req_addr & (crate::mm::PAGE_2M - 1) != 0
             || req_addr < crate::vma::alloc_floor()
             || end > crate::vma::ALLOC_CEILING
-            || !crate::mm::user_span::in_user_half(req_addr, aligned as u64)
+            || !toyos_userbound::in_user_half(req_addr, aligned as u64)
         {
             return SyscallError::InvalidArgument.to_u64();
         }

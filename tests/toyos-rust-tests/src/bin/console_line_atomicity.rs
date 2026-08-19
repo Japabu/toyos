@@ -7,7 +7,9 @@
 //! arbitrary gap between them, and anything else writing the console in that
 //! gap lands inside the line.
 //! Two splices were recorded against it before it was closed, one of them a
-//! measured 1 run in 10 for `desktop_audio_client` on CI.
+//! measured 1 run in 10 for `desktop_audio_client` on CI;
+//! `src/redlist.rs`'s retired rows keep both measurements, because the
+//! issue file that held them is closed and its numbers are still numbers.
 //! `ConsoleObject`'s line buffer is what closes it, and the buffer is per
 //! holder — so two *processes* is the shape that tests it and two threads
 //! would not.

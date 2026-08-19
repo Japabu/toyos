@@ -137,8 +137,8 @@ extern "C" fn body(thread: u64) -> ! {
     // the reader was rewritten instead to decide from its own cursor, which
     // removes the class rather than this instance
     // (`userland/test-runner/src/log_gate.rs`). The record still declares what
-    // this producer emitted and the
-    // reader cross-checks it wherever it survives.
+    // this producer emitted and the reader cross-checks it wherever it
+    // survives.
     crate::log!("logstorm done t={thread} emitted={STORM_RECORDS}");
 
     // **It parks rather than exiting**, because `sched::kthread`'s rows are

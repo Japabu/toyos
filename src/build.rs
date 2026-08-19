@@ -1694,9 +1694,9 @@ mod tests {
     /// **Every config with a `[boot] start` runs `/bin/logd`, and `logread` is
     /// held by exactly the programs that read a cursor.**
     ///
-    /// The kernel does not write `/log` — `/bin/logd` does, off a cursor — so a
-    /// boot config that does not start `logd` is an image whose log partition
-    /// stays empty for the whole of that boot — and on
+    /// The kernel writes no file — `/bin/logd` owns `/log` and reads records off
+    /// a cursor — so a boot config that does not start `logd` is an image whose
+    /// log partition stays empty for the whole of that boot — and on
     /// the machine this subsystem exists for, a T14 with no serial port, that is
     /// the boot with no record of itself anywhere. A thirteenth config added
     /// later fails the first clause **by default**, which is the direction this

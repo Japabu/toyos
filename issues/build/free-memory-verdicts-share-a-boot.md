@@ -37,7 +37,8 @@ a whole-machine measurement is wrong to be a verdict beside them.
 
 ## It fires more often since `/bin/logd`, and the mechanism is the entry's own
 
-**2026-08-15, `wt/toyos-logd56`, the branch that added `/bin/logd`.** The
+**2026-08-15, on `wt/toyos-logd56`, the branch that moved `/log` to userland by
+adding `/bin/logd`.** The
 shared boot gained one more process — `logd`, which every image now starts — and
 this went from "red once in three full runs" to red in the parallel phase of
 **two of two** twelve-wide dev-host runs, green alone both times with the same

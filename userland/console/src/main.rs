@@ -294,7 +294,7 @@ fn newest_kernel_logs() -> Vec<std::path::PathBuf> {
 /// anything logged after this program read it — for that the owner has a shell
 /// and `cat` on the file this names. Reading the cursor directly would show this
 /// boot live and with no file in the path, and it needs `logread` on this
-/// program's manifest row — which is not granted until something here asks for
+/// program's manifest row — which it is not given until something here asks for
 /// it, because a right with no caller is a capability handed out for a plan.
 fn seed_kernel_log(console: &mut Console) -> usize {
     let mut log = Vec::new();
