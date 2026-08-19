@@ -151,6 +151,55 @@ pub fn kernel_death(capture: &str) -> Option<&str> {
     capture.lines().find(|l| died(l) == Some(Died::Kernel))
 }
 
+/// How much of a dying kernel's own account a verdict carries.
+///
+/// A fatal report is a header, a register dump, a page walk and a bounded
+/// backtrace, and every CPU is being halted around it, so very little else
+/// reaches the console after it. Eighty lines holds one whole report with room
+/// to spare. The *first* eighty, where `kernel_account` in `tests/toyos.rs`
+/// keeps the *last* sixty of what a killed process left behind: that one reads
+/// a machine that is still running and its tail says how the process ended,
+/// this one starts at the end and the head is the whole of what says why.
+const REPORT_LINES: usize = 80;
+
+/// Everything the guest said from the line the kernel announced its own death.
+///
+/// **The artefact, and a verdict that named the death used to throw it away.**
+/// On 2026-08-18 a `DOUBLE FAULT on CPU 1` took a twelve-wide suite's guest
+/// down; `double_fault_handler` writes its whole report on IST1 — the header,
+/// `cr2`, the `#DF` frame, a page walk, a kernel backtrace and a scan of the
+/// original stack for the frame that started the chain — and the failing test's
+/// arm printed `result.stdout`, which is the *userland* half of the capture and
+/// carried two daemon lines. The report was in `result.serial` and nothing read
+/// it (`issues/kernel/a-double-fault-on-cpu-1-under-a-wide-suite.md`).
+///
+/// The death line is where it starts, because everything before it is the run
+/// going normally and the point of a bound is that the report survives it.
+/// Truncation says how much it dropped rather than dropping it in silence.
+///
+/// One capture, taken in the order the guest wrote it: [`super::qemu::WaitVerdict`]
+/// hands the halves of a test's window over in that order, so the first kernel
+/// death in the window is the one reported on.
+pub fn death_report(capture: &str) -> Option<String> {
+    // `split_inclusive` rather than `lines`, because the offset of the line is
+    // what the report starts at and `lines` throws it away.
+    let mut at = 0;
+    for line in capture.split_inclusive('\n') {
+        if died(line) == Some(Died::Kernel) {
+            let all: Vec<&str> = capture[at..].lines().collect();
+            let kept = all.len().min(REPORT_LINES);
+            let head = if all.len() > kept {
+                format!("(the first {kept} of the {} lines that followed)\n", all.len())
+            } else {
+                String::new()
+            };
+            return Some(format!("{head}{}", all[..kept].join("\n")));
+        }
+        at += line.len();
+    }
+    None
+}
+
 /// What the one answer is made of, for the gate that keeps it the only one.
 ///
 /// `one_vocabulary` in `tests/toyos.rs` refuses a wait that hands any of these
@@ -479,11 +528,90 @@ pub fn self_check() -> Result<(), String> {
         }
     }
 
+    // **The report, which is the artefact a verdict used to drop.** Staged as
+    // the lines `double_fault_handler` really writes
+    // (`kernel/src/arch/idt/exceptions.rs`), with the ordinary run in front of
+    // it and a daemon still talking after the header — a capture that begins at
+    // the death would be a capture nobody has.
+    const DF_HEADER: &str =
+        "[kernel 6.204 cpu1] DOUBLE FAULT on CPU 1 (pid=Some(Pid(2)) tid=Some(Tid(0)))";
+    let staged_df = format!(
+        "[kernel 6.201 cpu0] spawn: /bin/test_rs_console_line_atomicity pid=41\n\
+         AAAAAAAA\n\
+         {DF_HEADER}\n\
+         [kernel 6.204 cpu1]   cr2=0xffff800002672ff8 (address that caused the fault chain)\n\
+         [kernel 6.204 cpu1]   rip=0xffffffff80121a40  rsp=0xffff800002673000  rbp=0x0\n\
+         [kernel 6.204 cpu1]   Kernel backtrace:\n\
+         soundd: suspended\n\
+         [kernel 6.205 cpu1]   Found interrupt frame at stack offset +0x18:\n"
+    );
+    let Some(report) = death_report(&staged_df) else {
+        return Err(String::from(
+            "a capture carrying a whole double-fault report has no report in it, which is the \
+             verdict that threw one away",
+        ));
+    };
+    if !report.starts_with(DF_HEADER) {
+        return Err(format!("the report does not start at the death line:\n{report}"));
+    }
+    // The body, and not merely the header: quoting the sentence again is what
+    // the old arms already did.
+    for want in ["cr2=0xffff800002672ff8", "rip=0xffffffff80121a40", "Found interrupt frame"] {
+        if !report.contains(want) {
+            return Err(format!("the report drops {want:?}:\n{report}"));
+        }
+    }
+    // Nothing from before the death, because that is the run going normally and
+    // a bound spent on it is a bound not spent on the report.
+    if report.contains("spawn: /bin/test_rs_console_line_atomicity") {
+        return Err(format!("the report starts before the death:\n{report}"));
+    }
+    // A line another process wrote *after* the header stays: the console is not
+    // line-atomic and a report with holes cut in it is worse than one with a
+    // daemon's line in the middle.
+    if !report.contains("soundd: suspended") {
+        return Err(format!("the report drops the lines it did not recognise:\n{report}"));
+    }
+    // The other direction, and the one that keeps this out of everybody's
+    // terminal: a capture nothing died in has no report at all.
+    let healthy = "[kernel 0.377 cpu0] NVMe: found\nBoot: complete\n";
+    if death_report(healthy).is_some() {
+        return Err(String::from("a clean capture produced a death report"));
+    }
+    // A *program* dying is not the machine's account either — the same
+    // discrimination `died` makes, asked of the thing that quotes a capture.
+    let program = format!("[kernel 0.001 cpu0] up\n{USER_PANIC_LINE}\nmore output\n");
+    if death_report(&program).is_some() {
+        return Err(format!("a program's own panic reads as the kernel's death:\n{program}"));
+    }
+    // Bounded, and it says by how much rather than trailing off. 400 lines of
+    // report is four times what the deepest one in this tree writes.
+    let flood: String = std::iter::once(DF_HEADER.to_string())
+        .chain((0..400).map(|i| format!("[kernel 6.204 cpu1]   line {i}")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let bounded = death_report(&flood).ok_or("a 401-line report vanished")?;
+    if bounded.lines().count() > REPORT_LINES + 1 {
+        return Err(format!(
+            "the report is unbounded: {} lines of a {}-line capture",
+            bounded.lines().count(),
+            flood.lines().count()
+        ));
+    }
+    if !bounded.contains("of the 401 lines that followed") {
+        return Err(format!(
+            "a truncated report does not say how much it dropped:\n{}",
+            bounded.lines().next().unwrap_or_default()
+        ));
+    }
+
     eprintln!(
         "  [serial] {} vocabulary cases, both directions, plus the anchored scan against a \
-         stranger line and {} lines classified by who said them",
+         stranger line, {} lines classified by who said them, and a {}-line double-fault report \
+         recovered from a capture that also carried a daemon and a program's panic",
         cases.len(),
-        whose.len()
+        whose.len(),
+        report.lines().count(),
     );
     Ok(())
 }
