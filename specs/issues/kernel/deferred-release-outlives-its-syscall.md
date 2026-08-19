@@ -58,6 +58,31 @@ returned, and a second CPU was caught taking a batch mid-kill —
 [cpu0] KILLPROBE done  target=15 t=554353621
 ```
 
+## A third witness, and it is not a free-memory verdict
+
+`handle_kill_policy` reds on the same mechanism through a completely different
+instrument — the per-kind object census, not `SYS_SYSINFO`. Seen on this branch
+in a full twelve-wide suite, 2026-08-19, at `bb6893c`:
+
+```
+16 more killed processes left more live objects behind:
+  [("SharedMem", 5, 6), ("Process", 6, 7)]
+```
+
+One `SharedMem` and one `Process` still alive at the closing reading. That is
+the same "the release has not run yet" and not a leak: `SharedMem` is a
+`deferred` row released from `ZERO_QUEUE`, and a `ProcessObject` outlives its
+table entry until `reap_finished` takes it — which runs from the idle loop
+under `IdleProof`, so it is a second asynchrony of the same class with a longer
+tail. The census is immune to *another binary's churn*, which is what the
+free-memory verdicts are not, and it reds anyway. So the shared boot was never
+the common factor between these three names; the release latency is.
+
+`handle_kill_policy` is on the redlist already (`src/redlist.rs`, dev host
+loaded, 1 of 3, 2026-08-18) with a contention reading, and it is **not touched
+here** — this entry records the mechanism, and re-adjudicating that row is its
+owner's to do with a measurement rather than with this argument.
+
 ## Why it matters beyond a test
 
 The visible consequence today is only that two harness binaries had to learn to
