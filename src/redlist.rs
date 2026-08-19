@@ -1878,6 +1878,24 @@ pub const KNOWN_RED: &[Red] = &[
         source: "issues/kernel/two-i8042-verdicts-red-together-on-one-ci-shard.md",
         measured: "2026-08-19",
     },
+    Red {
+        test: "screen_console_panic",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`the fatal report never took the screen back from the console — which would make \
+               /bin/console a downgrade on the machine it is for`, at 96 s against the suite's \
+               usual seconds, so the shape is a handoff waited for and never observed. First \
+               sighting: `--known-red` answered `NOT ON THE LIST`. **Not about the diff it was \
+               found on**, which is PR #141's merge-queue package — workflow triggers and \
+               CLAUDE.md prose, no kernel byte. `ALONE: GREEN, and it was alone both times — \
+               nothing the harness controls differed, so it failed once and passed once. That is \
+               a rate and not a classification`",
+        evidence: "PR #141 run 32306139422, job 96239259411 (`guest (3)`), 2026-08-19; the \
+                   isolated re-run in the same job was green",
+        source: "issues/panic-path/the-fatal-report-once-left-the-screen-to-the-console.md",
+        measured: "2026-08-19",
+    },
     // ---------------------------------------------------------------------
     // `wt/toyos-purecrates`, dev host, 2026-08-18: three full `cargo test` runs
     // in one session, on a branch whose whole delta is three kernel files
