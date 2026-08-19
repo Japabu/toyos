@@ -75,7 +75,7 @@ impl Ring0Entry {
 // The bracket reserves `fp_bytes + fp_align` and aligns down, so the area fits
 // whatever the entry's incoming alignment was, and stashes the caller's `rsp`
 // in the slack immediately above it.
-const _: () = assert!(size_of::<UserFpState>() % align_of::<UserFpState>() == 0);
+const _: () = assert!(size_of::<UserFpState>().is_multiple_of(align_of::<UserFpState>()));
 const _: () = assert!(align_of::<UserFpState>() >= 8);
 
 /// `naked_asm!` for an entry that can reach another task, with the save area's

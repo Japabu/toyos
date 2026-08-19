@@ -209,7 +209,7 @@ pub fn block_on(ticket: Ticket<'_>, deadline: u64) {
     // registration window's own level since `prepare_wait`, and `pass_block`
     // inherits it.
     assert_baseline(blocking_baseline() + 1);
-    driver::pass_block(ticket, (deadline > 0).then(|| Nanos(deadline)));
+    driver::pass_block(ticket, (deadline > 0).then_some(Nanos(deadline)));
 }
 
 /// Register, re-check, park — for a site whose condition is exactly `ready` —

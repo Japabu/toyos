@@ -98,6 +98,10 @@ pub const MAX_SYMBOL_BYTES: usize = 16 * 1024 * 1024;
 /// [`crate::mm::MAX_HEAP_ALLOC`] is under 2 MiB and two of the binaries this
 /// tree ships have larger tables than that. The pages are the process's; the
 /// resolve path still reads raw pointers and still allocates nothing.
+// Eight arguments, for the reason `symbols::SymbolTable::from_pages` takes
+// eight: four of them are the two address ranges a backtrace is checked
+// against, and this is the call that hands them over.
+#[allow(clippy::too_many_arguments)]
 pub fn read_backtrace_table(
     backing: &dyn FileBacking,
     layout: &Layout,

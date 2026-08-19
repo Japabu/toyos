@@ -140,6 +140,10 @@ impl SymbolTable {
     /// Laid out by one caller, [`crate::loader::symbols::read_backtrace_table`],
     /// which is also what read them — so the two halves cannot be given
     /// separately and cannot disagree about where the second one starts.
+    // Eight arguments, and the paragraph above is why: four are the two address
+    // ranges a backtrace is checked against, and every one arrives from the one
+    // caller that already holds it.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_pages(
         pages: PageAlloc,
         symtab_len: usize,

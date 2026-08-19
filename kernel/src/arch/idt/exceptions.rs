@@ -10,7 +10,7 @@ use super::{Vector, TrapFrame, PF_PRESENT, PF_WRITE, PF_INSTRUCTION_FETCH};
 pub(crate) fn kernel_backtrace(start_rbp: u64, max_frames: usize) {
     let mut rbp = start_rbp;
     for _ in 0..max_frames {
-        if rbp == 0 || rbp % 8 != 0 || !mm::is_kernel_addr(rbp) { break; }
+        if rbp == 0 || !rbp.is_multiple_of(8) || !mm::is_kernel_addr(rbp) { break; }
         let saved_rbp = unsafe { *(rbp as *const u64) };
         let return_addr = unsafe { *((rbp + 8) as *const u64) };
         if return_addr == 0 || !mm::is_kernel_addr(return_addr) { break; }
@@ -23,7 +23,7 @@ pub(crate) fn kernel_backtrace(start_rbp: u64, max_frames: usize) {
 fn user_backtrace(pid: crate::process::Pid, start_rbp: u64, pml4: *const u64, max_frames: usize) {
     let mut rbp = start_rbp;
     for _ in 0..max_frames {
-        if rbp == 0 || rbp % 8 != 0 { break; }
+        if rbp == 0 || !rbp.is_multiple_of(8) { break; }
         let Some(saved_rbp) = safe_read_u64(rbp, pml4) else { break };
         let Some(return_addr) = safe_read_u64(rbp + 8, pml4) else { break };
         if return_addr == 0 { break; }
@@ -48,7 +48,7 @@ fn kernel_backtrace_safe(start_rbp: u64, max_frames: usize) {
 
 /// Safe kernel memory read. Only reads kernel direct-map addresses.
 fn safe_read_kernel(addr: u64) -> Option<u64> {
-    if addr % 8 != 0 || !mm::is_kernel_addr(addr) {
+    if !addr.is_multiple_of(8) || !mm::is_kernel_addr(addr) {
         return None;
     }
     Some(unsafe { core::ptr::read_volatile(addr as *const u64) })
@@ -57,7 +57,7 @@ fn safe_read_kernel(addr: u64) -> Option<u64> {
 /// Safely read a u64 from memory. For user addresses, translates through page
 /// tables to avoid triggering demand-paging faults inside exception handlers.
 fn safe_read_u64(addr: u64, user_pml4: *const u64) -> Option<u64> {
-    if addr % 8 != 0 || addr == 0 {
+    if !addr.is_multiple_of(8) || addr == 0 {
         return None;
     }
     if !user_pml4.is_null() {
@@ -159,7 +159,7 @@ fn crash_report_exception(ctx: &ExceptionContext) {
     let ring3 = ctx.ring().is_user();
     let tid = percpu::current_tid().unwrap_or(crate::process::Tid(0));
     let pid = percpu::current_pid();
-    let pml4 = if ring3 { crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64 } else { core::ptr::null() };
+    let pml4 = if ring3 { crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() } else { core::ptr::null() };
 
     let (pf_action, pf_cause) = if ctx.vector() == Vector::PageFault {
         let action = if ctx.frame.error_code & PF_INSTRUCTION_FETCH != 0 { "execute" }
@@ -265,7 +265,7 @@ fn crash_report_exception(ctx: &ExceptionContext) {
                     percpu::syscall_num(), user_rip, percpu::user_rsp());
                 log!("  User backtrace:");
                 process::resolve_user_symbol(pid, user_rip).log_bare(user_rip);
-                let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64;
+                let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>();
                 user_backtrace(pid, percpu::syscall_rbp(), pml4, 20);
             }
         }
@@ -310,7 +310,7 @@ fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
                 percpu::syscall_num(), user_rip, percpu::user_rsp());
             log!("  User backtrace:");
             process::resolve_user_symbol(pid, user_rip).log_bare(user_rip);
-            let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64;
+            let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>();
             user_backtrace(pid, percpu::syscall_rbp(), pml4, 20);
         }
     }
@@ -405,7 +405,7 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
 
     log!("  Backtrace:");
     if is_user {
-        let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64;
+        let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>();
         if let Some(pid) = pid {
             user_backtrace(pid, frame.rbp, pml4, 20);
         }
@@ -415,7 +415,7 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
 
     let watched_addr: u64;
     unsafe { core::arch::asm!("mov {}, dr0", out(reg) watched_addr); }
-    if mm::is_kernel_addr(watched_addr) && watched_addr % 8 == 0 {
+    if mm::is_kernel_addr(watched_addr) && watched_addr.is_multiple_of(8) {
         let val = unsafe { *(watched_addr as *const u64) };
         log!("  Value at watched addr {:#x} = {:#018x}", watched_addr, val);
     }

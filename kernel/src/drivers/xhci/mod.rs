@@ -560,8 +560,12 @@ impl TrbRing {
     }
 
     /// Where the controller should resume, with the cycle state it must expect.
+    ///
+    /// A TRB is 16 bytes, so the address is 16-byte aligned and bit 0 is free
+    /// for the cycle state. Parenthesised because `+` and `*` both bind tighter
+    /// than `|`, and this should not need that table to read.
     fn dequeue(&self) -> u64 {
-        self.base_phys + (self.tail as u64) * 16 | (self.cycle as u64)
+        (self.base_phys + (self.tail as u64) * 16) | (self.cycle as u64)
     }
 
     /// Put `trb` on the ring and answer with **where it landed**, which for the
@@ -600,7 +604,11 @@ const PAGE: usize = 0x1000;
 // The pool's fixed head. Everything here is either the controller's own state
 // or enumeration scratch, and there is exactly one of each because enumeration
 // is serial — see `device::init_device`.
+// The whole table is `N * PAGE` and reads as one column of page numbers; the
+// two that reduce are not written differently from the four that do not.
+#[allow(clippy::erasing_op)]
 const OFF_DCBAA: usize     = 0 * PAGE; // (max_slots + 1) * 8, 2 KiB at most
+#[allow(clippy::identity_op)]
 const OFF_CMD_RING: usize  = 1 * PAGE;
 const OFF_ERST: usize      = 2 * PAGE;
 const OFF_EVT_RING: usize  = 3 * PAGE;

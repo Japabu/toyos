@@ -191,6 +191,9 @@ pub fn request() {
     let from = crate::clock::nanos_since_boot();
     log!("=== blocked-task dump: {cpus} cpu(s), and this report takes the screen ===");
 
+    // A CPU number, not a walk of `OWES`: it is compared against `me`, and
+    // `OWES` is `MAX_CPUS` long whatever `cpus` is.
+    #[allow(clippy::needless_range_loop)]
     for cpu in 0..cpus {
         if cpu != me {
             OWES[cpu].store(true, Ordering::Release);
@@ -261,6 +264,8 @@ fn probe_silent(asked: &[bool; MAX_CPUS], cpus: usize) {
     }
     // Every flag set before any NMI goes out, for the same reason the kicks are
     // batched above: an instant answer must not find its own flag unwritten.
+    // A CPU number, not a walk of `asked`: it is the APIC id the NMI goes to.
+    #[allow(clippy::needless_range_loop)]
     for cpu in 0..cpus {
         if asked[cpu] {
             apic::send_nmi(cpu as u32);

@@ -267,9 +267,12 @@ impl IoUringInstance {
         unsafe { &*(ptr.add(SQES_OFF as usize + index as usize * core::mem::size_of::<IoUringSqe>()) as *const IoUringSqe) }
     }
 
-    fn cqe_at_mut(&self, index: u32) -> &mut IoUringCqe {
+    /// The address of one completion entry. A pointer and not a `&mut`: this
+    /// takes `&self`, and a `&mut` minted from a shared borrow is one two
+    /// callers could hold at once over a page the process also maps.
+    fn cqe_at(&self, index: u32) -> *mut IoUringCqe {
         let ptr = self.shm_phys.as_mut_ptr::<u8>();
-        unsafe { &mut *(ptr.add(CQ_RING_OFF as usize + 16 + index as usize * core::mem::size_of::<IoUringCqe>()) as *mut IoUringCqe) }
+        unsafe { ptr.add(CQ_RING_OFF as usize + 16 + index as usize * core::mem::size_of::<IoUringCqe>()) as *mut IoUringCqe }
     }
 
     /// Post a CQE, or record a drop if the ring reports itself full.
@@ -287,10 +290,10 @@ impl IoUringInstance {
             return;
         }
         let idx = tail & (self.cq_size - 1);
-        let cqe = self.cqe_at_mut(idx);
-        cqe.user_data = user_data;
-        cqe.result = result;
-        cqe.flags = flags;
+        // One write of the whole entry, before the tail below publishes it.
+        // SAFETY: `idx` is masked to the ring's size, and the whole instance is
+        // touched under the `IO_URINGS` lock, so nothing else is writing here.
+        unsafe { self.cqe_at(idx).write(IoUringCqe { user_data, result, flags }) };
         self.cq_tail.set(tail.wrapping_add(1));
         cq.tail.store(tail.wrapping_add(1), Ordering::Release);
     }

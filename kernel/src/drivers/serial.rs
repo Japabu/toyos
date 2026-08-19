@@ -36,6 +36,10 @@ const PORT: u16 = 0x3f8; // COM1
 /// here and every UART access is gated on it.
 static UART_PRESENT: AtomicBool = AtomicBool::new(false);
 
+// Every line is `PORT + <register number>`, which is how a 16550's registers
+// are named; writing the data register as bare `PORT` would make three of these
+// lines a different kind of statement from the other eight.
+#[allow(clippy::identity_op)]
 pub fn init() {
     outb(PORT + 1, 0x00); // Disable all interrupts
     outb(PORT + 3, 0x80); // Enable DLAB (set baud rate divisor)

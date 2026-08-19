@@ -221,7 +221,7 @@ impl NvmeController {
 
         let ns = unsafe { &*(identify_ptr as *const IdentifyNamespace) };
         let fmt_idx = (ns.flbas & 0x0F) as usize;
-        let lba_ds = ((ns.lba_formats[fmt_idx] >> 16) & 0xFF) as u32;
+        let lba_ds = (ns.lba_formats[fmt_idx] >> 16) & 0xFF;
         // `lba_ds` is an 8-bit device-reported shift, and it reaches both a
         // shift and a divisor: `1 << lba_ds` overflows above 31, and above 12
         // `4096 / sector_size` is zero, which `NvmeBlockDevice::new` then
@@ -253,7 +253,7 @@ impl NvmeController {
         assert!(total_bytes <= MAX_DATA_PAGES * 4096);
 
         let dma = dma();
-        let pages = (total_bytes + 4095) / 4096;
+        let pages = total_bytes.div_ceil(4096);
         let data_phys = dma.phys() + OFF_DATA as u64;
 
         let cid = self.alloc_cid();
@@ -291,7 +291,7 @@ impl NvmeController {
         assert!(total_bytes <= MAX_DATA_PAGES * 4096);
 
         let dma = dma();
-        let pages = (total_bytes + 4095) / 4096;
+        let pages = total_bytes.div_ceil(4096);
         let data_phys = dma.phys() + OFF_DATA as u64;
 
         unsafe { copy_nonoverlapping(buf.as_ptr(), dma.ptr_at(OFF_DATA), total_bytes); }

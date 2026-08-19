@@ -1072,8 +1072,7 @@ fn paint(fill: Fill, view: View, page: Page, watch: Watch) {
 
     let mut inked = 0usize;
     let mut probes = 0usize;
-    for r in 0..draw {
-        let row = row_start[r];
+    for (r, row) in row_start[..draw].iter().enumerate() {
         // **The colour comes from the record's `Level`**, so it holds for every
         // display row a wrapped line occupies rather than only the one the
         // marker happened to land on.
@@ -1088,7 +1087,7 @@ fn paint(fill: Fill, view: View, page: Page, watch: Watch) {
             draw_glyph(&fb, c, r, byte, color);
             if watch == Watch::Yes {
                 if let Some((bx, by)) = glyph_ink(byte) {
-                    if inked % PROBE_STRIDE == 0 && probes < PROBES - GRID_PROBES {
+                    if inked.is_multiple_of(PROBE_STRIDE) && probes < PROBES - GRID_PROBES {
                         let (x, y) = (c * GLYPH_W + bx, r * GLYPH_H + by);
                         PROBE_AT[probes].store(((y as u32) << 16) | x as u32, Ordering::Relaxed);
                         probes += 1;
@@ -1180,8 +1179,8 @@ fn draw_footer(fb: &Fb, cols: usize, row: usize, page: usize, pages: usize, colo
     n += write_num(&mut buf[n..], pages);
     buf[n] = b']';
     n += 1;
-    for c in 0..n.min(cols) {
-        draw_glyph(fb, c, row, buf[c], color);
+    for (c, &byte) in buf[..n.min(cols)].iter().enumerate() {
+        draw_glyph(fb, c, row, byte, color);
     }
 }
 

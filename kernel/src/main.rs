@@ -256,6 +256,15 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 /// Kernel entry point. Called by bootloader with rdi = &KernelArgs.
 /// Switches to the kernel's own stack, then falls through to init.
+///
+/// # Safety
+///
+/// Nothing in this kernel may call it, and the bar is the machine rather than
+/// the argument: it is the bootloader's jump target on a CPU that has just left
+/// firmware — one CPU running, interrupts off, the bootloader's page tables
+/// still live, and `rdi` holding a [`KernelArgs`] the bootloader wrote and keeps
+/// mapped. The body's first act is to move `rsp` to the kernel's own stack, so a
+/// Rust caller would be moved off the stack it is standing on.
 #[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "sysv64" fn _start(_kernel_args: &KernelArgs) -> ! {

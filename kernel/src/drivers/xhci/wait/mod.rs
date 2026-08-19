@@ -368,6 +368,10 @@ impl XhciController {
 
     /// One control transfer on `ring`, which must be the EP0 ring named by
     /// `slot`'s device context.
+    // Nine arguments because a USB setup packet has five fields and those are
+    // what a caller varies; a struct for them would name the wire format a
+    // second time (xHCI 1.2 §6.4.1.2.1).
+    #[allow(clippy::too_many_arguments)]
     fn control_transfer(
         &mut self,
         slot: u8,
