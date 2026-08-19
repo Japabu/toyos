@@ -108,3 +108,127 @@ it that does not set `target-dir` inherits it, so `kernel/`, `bootloader/`,
 invocation in the build system passes `--target-dir` explicitly. `cargo clean`
 follows it as well, so a hand-typed clean in one worktree would empty the
 directory every worktree shares.
+
+## The owner ruled: try it — and the mechanism holds
+
+2026-08-19, on the section above: *"an experimental feature is not a workaround
+— try it."* So it was tried, on this repository rather than on a two-file
+fixture, and the mechanism is sound. What stops it is not the feature.
+
+Two APFS clones of a worktree, `toyos-fat32/src/lib.rs` and `src/redlist.rs`
+edited in one of them, one shared `CARGO_TARGET_DIR`, `cargo build --workspace`
+alternating. The marker is `pub static SHARED_TARGET_MARKER` in `toyos-fat32`,
+read back out of the rlib with `strings`. B's two edited files are stamped
+2020-01-01, which is what a worktree cut before another checkout's build looks
+like to cargo.
+
+Plain cargo 1.97.1, the default toolchain — **the hazard, reproduced**:
+
+| | crates compiled | wall clock | the shared rlib holds |
+|---|---:|---:|---|
+| A into an empty shared dir | 140 | 30.55 s | A |
+| B | **0** | 0.09 s | **A** |
+| A | 0 | 0.08 s | A |
+| B | **0** | 0.08 s | **A** |
+
+B printed `Finished` twice and never once held its own code.
+
+`RUSTC_BOOTSTRAP=1 CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true`, same trees, same
+directory — **the hazard, gone**:
+
+| | crates compiled | wall clock | the shared rlib holds |
+|---|---:|---:|---|
+| A into an empty shared dir | 140 | 30.38 s | A |
+| B | 2 | 3.69 s | **B** |
+| A | 2 | 3.71 s | **A** |
+| B | 2 | 3.69 s | **B** |
+| A | 2 | 3.72 s | **A** |
+
+Every alternation recompiled exactly the two crates that differ, and the marker
+followed the last builder every time and never leaked across. 1.6 GB for both
+trees. The artifact both trees contend for is
+`debug/deps/libtoyos_fat32-78eb18c4401b513b.rlib` — byte-for-byte the same name
+this entry reported before, from a different pair of checkouts, which is the
+collision restated.
+
+The lock behaves the same under the flag as without it. A 30 s test *run* phase
+in one checkout, a second checkout's `cargo build` on the same directory at
+t=+5 s: **0.134 s**, no `Blocking` line. Positive control, the same probe
+against a 15 s build script: **12.655 s** and `Blocking waiting for file lock on
+build directory`. The compile phase is what a shared directory serialises, and
+nothing else.
+
+## Where it stops: nothing can turn the flag on for a hand-typed cargo
+
+`-Z checksum-freshness` is honoured when the cargo that runs is nightly-capable
+and ignored when it is not — and **ignored silently**. The probe is a `touch`
+that changes no content: an mtime cargo recompiles, a checksum cargo does not.
+
+| how it was asked for | verdict |
+|---|---|
+| stable cargo 1.97.1, `[unstable] checksum-freshness = true` in `.cargo/config.toml` | **mtime.** No warning, exit 0 |
+| stable cargo, `CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true` | **mtime.** Ignored |
+| stable cargo, `[env] RUSTC_BOOTSTRAP = "1"` in `.cargo/config.toml` | **mtime.** `[env]` reaches what cargo spawns, not cargo |
+| stable cargo, `-Z checksum-freshness` on the command line | error, exit 101 — loud, but only the build system types a flag |
+| stable cargo, `RUSTC_BOOTSTRAP=1` + either of the first two | checksum |
+| nightly cargo, `[unstable]` table | checksum |
+
+So the only channel-independent switch is `RUSTC_BOOTSTRAP=1` **in the process
+environment**, and no file in the tree can put it there. A `.cargo/config.toml`
+carries the shared `target-dir` to a hand-typed cargo perfectly well; it cannot
+carry the freshness mode with it. That pair — sharing on, freshness off, no
+diagnostic — is exactly the mis-link in the first table.
+
+**And the fork does not supply the nightly cargo.** `rustup run toyos cargo
+--version` answers `cargo 1.96.0-nightly (f298b8c82 2026-02-24)`, but
+`toolchain::host_cargo` is why: it symlinks `stage2/bin/cargo` to
+`~/.rustup/toolchains/nightly-<host>/bin/cargo` **if this machine has one**, and
+to the host's stable cargo otherwise. Every CI runner installs `--profile
+minimal --default-toolchain stable`, so there the `toyos` toolchain's cargo *is*
+stable's. The nightly is the dev host's, not the fork's.
+
+This host's rustup default is `stable-aarch64-apple-darwin`. A hand-typed `cargo
+test --workspace --exclude toyos-build` here is an mtime cargo, and that is the
+command agents type most.
+
+The two ways to make the invoking cargo nightly-capable both cost more than the
+directory is worth, and neither is an agent's to choose:
+
+- **a generated `rust-toolchain.toml`** (channel `nightly`, or `toyos`) — needs
+  `/rust-toolchain.toml` added to `.gitignore` to stay untracked, and makes the
+  host crates compile with a different compiler locally than in CI, which
+  installs stable. With `channel = "toyos"` the guarantee is only as good as the
+  machine having a rustup nightly, which is the assumption that just failed.
+- **a sentinel that makes a stable cargo refuse** — `-Zunstable-options` in the
+  generated config's host-triple `rustflags` errors on a stable rustc and is a
+  no-op on a nightly one, so it tracks the freshness predicate exactly. It also
+  makes the worktree unbuildable with this machine's default toolchain, which is
+  the ergonomics the sharing was for.
+
+Mixing is not a third hazard, and that is worth recording: a directory whose
+fingerprints were written under checksum-freshness makes an mtime cargo
+*recompile* rather than reuse (measured with one rustc, `RUSTC_BOOTSTRAP` the
+only difference), so a stray stable build costs a rebuild and not a wrong link.
+But two stable builds in one directory mis-link each other exactly as the
+control does. "Usually nightly" is not a safety property.
+
+## What is left
+
+The feature works, the numbers are good, and 76 GB is what the checkouts hold
+today (`du -sch` over every `target`, `kernel/target`, `bootloader/target` and
+`userland/target`, 2026-08-19). **One decision unblocks it and it is the
+owner's**: what compiler a hand-typed `cargo` runs in a worktree. Make this
+host's rustup default nightly-capable and the design is a generated
+`.cargo/config.toml` carrying the absolute `build.target-dir` and the
+`[unstable]` table, plus `target-dir = "target"` in `kernel/`, `bootloader/` and
+`userland/`'s committed `.cargo/config.toml` to stop the inheritance measured
+above — nothing else is needed, and CI, which has no worktrees, keeps
+`<root>/target` and stable cargo untouched.
+
+Two measurements that removed doubts and are not worth re-running: a nested
+workspace's `target-dir = "target"` resolves to `<nested>/target` and stops the
+inherited redirect (`cargo config get -Z unstable-options --show-origin`, and
+the build landed there); and `build.rustflags` is replaced by the nearest
+config rather than merged. `cargo +toyos build --workspace` finishes exit 0 in
+53.03 s, so the host workspace under the fork toolchain is a policy question and
+not a compile blocker.
