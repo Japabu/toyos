@@ -19,8 +19,7 @@
 //! 1,755.2 s of the 2,135.0 s the committed profile prices across 317 labels,
 //! and none is
 //! gated per pull request. `guards` on every row says what stopped being gated,
-//! because a run that quietly does less is the whole failure mode here —
-//! `specs/assessments/test-cost-audit.md` §7 is the long form.
+//! because a run that quietly does less is the whole failure mode here.
 //!
 //! **Nothing here is an optimisation and nothing here changes an assertion.**
 //! A relegated test measures exactly what it measured; the manual nightly
@@ -31,8 +30,7 @@
 //! fixed fallback deadline nobody had sent the sentinel for, 30 s and 8 s of
 //! host wall clock with no assertion behind either. Both are `Tier::Fast`
 //! again, on run 32023797195's twelve shards rather than on the dev host:
-//! **5,857 ms and 5,441 ms**. `specs/assessments/test-cost-audit.md` §5.10 is
-//! the measurement.
+//! **5,857 ms and 5,441 ms**.
 //!
 //! **CI is the instrument for a per-PR policy.** The effective profile starts
 //! with the last full twelve-shard run and replaces every name measured by the
@@ -56,8 +54,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// verdict or price — belongs Nightly; only a compute-bound verdict stays Fast.
 /// **2026-08-13: the sweep applying this to the rest of the fast tier landed**
 /// — [`Why::TimerAnchored`] is the classification it needed, and every
-/// borderline name `specs/assessments/test-cost-audit.md` §7 raised has one of the three
-/// `Why` rows now.
+/// borderline name the cost audit raised has one of the three `Why` rows now.
 pub const FAST_CEILING_MS: u64 = 10_000;
 
 /// A committed profile row that exists only to put a new registration into one
@@ -115,7 +112,10 @@ pub struct Relegated {
     /// *placement*, never this field against it, so a nightly run refreshing
     /// every Nightly label does not have to reproduce this number. A human
     /// updates it by hand when a "returns to Fast" or "belongs Nightly"
-    /// finding lands a tier correction — `specs/testing-strategy.md` §5.
+    /// finding lands a tier correction. Tier movement is by measurement in both
+    /// directions, and a nightly run's measured profile is what refreshes these
+    /// numbers — validated against the tier rule, never against equality with a
+    /// past measurement.
     pub ci_ms: u64,
     pub why: Why,
     /// **What stops being gated per pull request.** Not what the test does —
@@ -163,8 +163,7 @@ pub const RELEGATED: &[Relegated] = &[
                  spin. A negative gate: without the second boot the first proves only \
                  that the machine works, which it did before the gate existed. What still \
                  runs per pull request: the compute-bound `fault_gates`/`std_unwind`/ \
-                 `std_unwind_so` trio (specs/user-machine-state.md §2, \
-                 specs/assessments/ci-plan-assessment-2026-08.md §9.3), ~51 ms riding an \
+                 `std_unwind_so` trio, ~51 ms riding an \
                  existing shared boot, still catches a pending x87 \
                  control word killing the next process — the one shape that put this \
                  defect on CI in the first place — but proves nothing about a leaked \
@@ -424,7 +423,7 @@ pub const RELEGATED: &[Relegated] = &[
                  relegation is about was cut about sevenfold at L6 of the log architecture** — \
                  `/bin/logd` ends on an error instead of retrying inside a budget, which is what \
                  turned 1,737 failing flushes over six seconds into the handful a single refusal \
-                 costs (`specs/log-architecture-spec.md` §5.4) — and `ci_ms` above is untouched \
+                 costs — and `ci_ms` above is untouched \
                  because it is a CI measurement and the new figure is a dev-host one. A nightly \
                  KVM run is what may bring this name back to Fast.",
     },

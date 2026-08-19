@@ -1,10 +1,9 @@
 //! Which tests are known to go red, on which instrument, at what rate, and on
 //! whose evidence — as data rather than as prose.
 //!
-//! **The failure this exists to stop.** The list used to be paragraphs in
-//! `issues/hardware/eleven-names-red-on-ci.md` and
-//! `specs/assessments/ci-plan-assessment-2026-08.md` §9.2, and a careful
-//! reader can read a paragraph backwards: `rg`ing a test
+//! **The failure this exists to stop.** The list used to be paragraphs — in
+//! `issues/hardware/eleven-names-red-on-ci.md` and in a CI assessment since
+//! deleted — and a careful reader can read a paragraph backwards: `rg`ing a test
 //! name in it hits the sentence that names the twelve tests that came *off* the
 //! list as readily as the table of the eleven that are on it, and the hit looks
 //! the same either way. That happened, and the answer given to the owner was the
@@ -56,10 +55,24 @@ use crate::day::Day;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// Which machine took the measurement. `specs/testing-strategy.md` §2 is the
-/// table of what each one can and cannot answer; a row without this is a row
-/// that will be read as being about whichever machine the reader is standing
-/// at.
+/// Which machine took the measurement. A row without this is a row that will be
+/// read as being about whichever machine the reader is standing at.
+///
+/// **Every defect class has exactly one owning instrument, and the owner's red
+/// is that class's alarm.** Four instruments carry the whole estate, and each is
+/// blind to something another sees: host suites own pure logic — decoders,
+/// validators, layouts, the build system's own gates, and the memory orderings
+/// x86 TSO hides — and are blind to anything needing a booted kernel; KVM guest
+/// shards own the booted kernel on native silicon and audible harm, and are
+/// blind to contention and to whatever the hypervisor absorbs; the TCG shard
+/// owns ISA breadth, the instruction paths the KVM hosts' CPUs never decode, and
+/// is blind to vendor-real semantics and to realistic instruction cost; metal
+/// owns what emulation absorbs — cache and control-register effects, PAT/MTRR,
+/// device timing, real latency — and is blind to anything needing repetition or
+/// isolation, being one manual machine. A defect found by a non-owning
+/// instrument transfers to its owner. Only three of the four can appear below:
+/// **metal is not an instrument here**, because the suite does not run on the
+/// T14.
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
 pub enum Instrument {
     /// A `guest` shard: KVM on four native x86-64 cores, `-cpu host`, **one
@@ -201,8 +214,8 @@ pub struct Red {
 /// `EXPECTED_FAILURES` entries use exactly this interval with exactly this
 /// justification — long enough that a fix already in flight lands first, short
 /// enough that nobody inherits it silently. The tree it is measured against
-/// bears it out: `specs/assessments/ci-plan-assessment-2026-08.md` §10.10 has
-/// nine consecutive `ci` runs on `main`, one of them green.
+/// bears it out: nine consecutive `ci` runs on `main` over that window, one of
+/// them green.
 pub const SHELF_LIFE_DAYS: i64 = 31;
 
 /// Every measurement, grouped by the campaign that took it.
@@ -254,7 +267,7 @@ pub const KNOWN_RED: &[Red] = &[
         instrument: Instrument::Ci,
         finding: Finding::fires(5, 5),
         standing: Standing::Disputed(
-            "`specs/assessments/ci-plan-assessment-2026-08.md` §9.3 says closed by `wt/toyos-fpu` \
+            "a since-deleted CI assessment said closed by `wt/toyos-fpu` \
              — `fxsave64`/`fxrstor64` on \
              all five Ring 3-reachable entries, with `fpu_isolation` as the gate that asks the \
              question on purpose. The write-up this row cites still counts it among the nine \
@@ -274,9 +287,8 @@ pub const KNOWN_RED: &[Red] = &[
         instrument: Instrument::Ci,
         finding: Finding::fires(5, 5),
         standing: Standing::Disputed(
-            "the same disagreement as `std_unwind`: \
-             `specs/assessments/ci-plan-assessment-2026-08.md` §9.3 says closed by \
-             `wt/toyos-fpu`, the cited write-up says not re-measured on CI",
+            "the same disagreement as `std_unwind`: the since-deleted CI assessment said \
+             closed by `wt/toyos-fpu`, the cited write-up says not re-measured on CI",
         ),
         what: "the same #MF, on the same sub-test — the one that panics on a thread",
         evidence: "probe-rate run 31258202923; probe-x87 run 31260763462",
@@ -317,8 +329,7 @@ pub const KNOWN_RED: &[Red] = &[
         finding: Finding::fires(2, 5),
         standing: Standing::Retired(
             "what the actuator stages is an *ordering* — the disk arrives after the scan — so the \
-             scan closes the window now and no host's boot speed can defeat it \
-             (`specs/assessments/ci-plan-assessment-2026-08.md` §10.9)",
+             scan closes the window now and no host's boot speed can defeat it",
         ),
         what: "the boot scan bound a disk, so the port was not held empty",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
@@ -370,9 +381,9 @@ pub const KNOWN_RED: &[Red] = &[
         finding: Finding::fires(1, 5),
         standing: Standing::Disputed(
             "two harness defects were fixed for it (the torn beat/pin pair, and a window that \
-             opens at the first full mask), and \
-             `specs/assessments/ci-plan-assessment-2026-08.md` §10.9's fixed arm was **1 of 10 \
-             again**, on a *different* line — `cpu6 last reached one 0.349s ago`. The \
+             opens at the first full mask), and the probe's fixed arm — run 31283095698, ten \
+             reps — was **1 of 10 again**, on a *different* line: \
+             `cpu6 last reached one 0.349s ago`. The \
              no-CPU-missing-from-two-consecutive-lines rule was written for that line and its rate \
              has not been re-measured",
         ),
@@ -454,8 +465,8 @@ pub const KNOWN_RED: &[Red] = &[
         finding: Finding::quiet(5),
         standing: Standing::Stands,
         what: "came off the list with `wt/toyos-clock`'s waits. Distinct from the QEMU 8.2.2 red \
-               `specs/assessments/ci-plan-assessment-2026-08.md` §8.3 records, which was closed \
-               by putting the dev host's own QEMU in the container",
+               measured earlier in the same campaign, which was closed by putting the dev host's \
+               own QEMU in the container",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
         source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
@@ -665,7 +676,7 @@ pub const KNOWN_RED: &[Red] = &[
                the compositor spawned at 0.347 s, the terminal at 0.349 s, and the terminal exiting \
                at 0.849 s one millisecond before the compositor maps its framebuffer",
         evidence: "probe-green run 31282019974, tree 98e7247, ten reps",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
+        source: "issues/kernel/desktop-window-child-freeze.md",
         measured: "2026-08-09",
     },
     Red {
@@ -677,7 +688,7 @@ pub const KNOWN_RED: &[Red] = &[
         ),
         what: "`compiler_builtins::int::specialized_div_rem::u128_div_rem+0x99`",
         evidence: "probe-green run 31282019974, tree 98e7247, ten reps",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-09",
     },
     Red {
@@ -690,7 +701,7 @@ pub const KNOWN_RED: &[Red] = &[
         ),
         what: "2 of 11 beats dropped a CPU from the mask",
         evidence: "probe-green run 31282019974, tree 98e7247, ten reps",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-09",
     },
     Red {
@@ -711,7 +722,7 @@ pub const KNOWN_RED: &[Red] = &[
                rather than chance — soundd prints a client's removal exactly while the kernel \
                prints that client's exit",
         evidence: "probe-green run 31282019974 rep 10, and run 31271983043 on `main`",
-        source: "specs/log-architecture-spec.md §4.4",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-09",
     },
     // ---------------------------------------------------------------------
@@ -725,7 +736,7 @@ pub const KNOWN_RED: &[Red] = &[
         standing: Standing::Stands,
         what: "0 of 10 against 2 of 10 in the arm before it",
         evidence: "probe-green fixed arm, run 31283095698, ten reps",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-09",
     },
     Red {
@@ -735,7 +746,7 @@ pub const KNOWN_RED: &[Red] = &[
         standing: Standing::Stands,
         what: "0 of 10 against 1 of 10 in the arm before it",
         evidence: "probe-green fixed arm, run 31283095698, ten reps",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-09",
     },
     Red {
@@ -747,12 +758,11 @@ pub const KNOWN_RED: &[Red] = &[
                green. It is the one name left between `main` and §10.4's three-consecutive-greens \
                trigger",
         evidence: "probe-green fixed arm, run 31283095698, ten reps",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
+        source: "issues/kernel/desktop-window-child-freeze.md",
         measured: "2026-08-09",
     },
     // ---------------------------------------------------------------------
-    // Single `ci` runs on `main`, `specs/assessments/ci-plan-assessment-2026-08.md`
-    // §10.9 and §10.10.
+    // Single `ci` runs on `main`, each red once and adjudicated on its own.
     // ---------------------------------------------------------------------
     Red {
         test: "dump_nmi_probe",
@@ -767,7 +777,7 @@ pub const KNOWN_RED: &[Red] = &[
                100 ms for the victim to reach its idle loop and on that runner it took 251 ms. \
                0 of 20 probe reps and 2 of 2 in one shard job",
         evidence: "run 31284962381, `main` at 1ed6f39",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-09",
     },
     Red {
@@ -779,7 +789,7 @@ pub const KNOWN_RED: &[Red] = &[
                into a boot `scan_ports` runs, true at 253 ms on the dev host and false at 407 ms \
                on that runner",
         evidence: "run 31286199802, `main` at 8d3f5b7",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-09",
     },
     Red {
@@ -790,7 +800,7 @@ pub const KNOWN_RED: &[Red] = &[
         what: "keystroke 14 of 30. Bisected on the dev host to `f96d52e`, a merge whose two parents \
                are both green — see `issues/diagnostics/screen-pager-keys-red-on-main.md`",
         evidence: "run 31287853270, `main` at 53d29d5",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.10",
+        source: "issues/diagnostics/screen-pager-keys-red-on-main.md",
         measured: "2026-08-09",
     },
     // ---------------------------------------------------------------------
@@ -1022,7 +1032,7 @@ pub const KNOWN_RED: &[Red] = &[
                it is not the audio path and not load in any way a re-run answers; it is which two \
                writers happen to collide",
         evidence: "landing-1786130703-71774.log, a documentation-only branch",
-        source: "specs/log-architecture-spec.md §4.4",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-07",
     },
     Red {
@@ -1035,7 +1045,7 @@ pub const KNOWN_RED: &[Red] = &[
         ),
         what: "green 3 of 3 alone on a quiet host, against the splice red in the same session",
         evidence: "the same session as the splice above",
-        source: "specs/log-architecture-spec.md §4.4",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-07",
     },
     Red {
@@ -1510,8 +1520,12 @@ pub const KNOWN_RED: &[Red] = &[
             "the string is the whole defect and it is now declared once: \
              `common::volumes::LOG_ON_CONSOLE_AND_FILE` is what the assertion reads, beside \
              `NO_LOG_ALERT`, which its Fast-tier sibling `screen_log_absent` already read that \
-             way, and its doc names `report_log_destination` as the writer. \
-             `specs/testing-strategy.md` §1.3 is the rule the copy broke (2026-08-16)",
+             way, and its doc names `report_log_destination` as the writer. The rule the copy \
+             broke: a test asserting on a kernel or daemon log line reads that line from one \
+             named constant — the writer's own where the crate is reachable, otherwise a single \
+             declaration in `tests/common/` that cites the writer — and never a literal copied \
+             at the assertion, because a copy has nothing holding it to the sentence it copied \
+             and a reworded line then reds a gate that is measuring nothing (2026-08-16)",
         ),
         what: "`\"log: this boot is on the console and in\" is not on screen five seconds after the \
                boot finished`, and `red again` alone in both runs. The mode is not what is broken: \
@@ -2135,7 +2149,7 @@ mod tests {
             ),
             (
                 "a write-up that does not resolve",
-                Red { source: "specs/nowhere-at-all.md", ..ok },
+                Red { source: "nowhere-at-all.md", ..ok },
                 "does not resolve",
             ),
             (
