@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use toyos_pci::{msi, msix};
+use toyos_pci::{bar, msi, msix};
 
 use crate::mm::Mmio;
 use crate::mm::paging::CachePolicy;
@@ -13,7 +13,6 @@ const PROG_IF: u64 = 0x09;
 const SUBCLASS: u64 = 0x0A;
 const CLASS: u64 = 0x0B;
 const HEADER_TYPE: u64 = 0x0E;
-const BAR_BASE: u64 = 0x10;
 const CAPABILITIES_PTR: u64 = 0x34;
 
 const MULTI_FUNCTION: u8 = 0x80;
@@ -102,16 +101,23 @@ impl PciDevice {
         self.mmio.read_u32(offset)
     }
 
-    /// Read a Base Address Register by index (0-5).
-    pub fn read_bar_64(&self, index: u8) -> u64 {
-        let offset = BAR_BASE + index as u64 * 4;
-        let low = self.mmio.read_u32(offset) as u64;
-        let bar_type = (low >> 1) & 0x3;
-        if bar_type == 2 {
-            let high = self.mmio.read_u32(offset + 4) as u64;
-            ((high << 32) | low) & !0xF
-        } else {
-            low & !0xF
+    /// The physical address Memory Space BAR `index` names, or why this
+    /// register describes no memory.
+    ///
+    /// A `Result`, not a `u64`, because there are three answers a BAR can give
+    /// that are not an address and the caller has to say what it does without
+    /// one — `toyos_pci::bar` decodes them and this reads the registers the
+    /// decode asks for, the second one only when the device said it is part of
+    /// this BAR. An index past [`bar::MAX_INDEX`] is a kernel bug rather than a
+    /// device's claim (every caller writes a literal, and `enable_msix`'s comes
+    /// from `msix`, which refuses the reserved indicators first), so it is a
+    /// fail-fast and not a refusal.
+    pub fn memory_bar(&self, index: u8) -> Result<bar::Memory, bar::Unusable> {
+        assert!(index <= bar::MAX_INDEX, "PCI: BAR {index} — a Type 0 header has six");
+        let offset = bar::BASE + index as u64 * 4;
+        match bar::decode(self.mmio.read_u32(offset))? {
+            bar::Width::Narrow(memory) => Ok(memory),
+            bar::Width::Wide(wide) => wide.with_high(self.mmio.read_u32(offset + 4)),
         }
     }
 
@@ -141,9 +147,28 @@ impl PciDevice {
             return false;
         };
         let control = cap.read_u16(msix::MESSAGE_CONTROL);
-        let address = msix::Msix::decode(control, cap.read_u32(msix::TABLE))
-            .and_then(|table| table.table_address(self.read_bar_64(table.bir())));
-        let address = match address {
+        let table = match msix::Msix::decode(control, cap.read_u32(msix::TABLE)) {
+            Ok(table) => table,
+            Err(why) => {
+                log!("PCI {:02x}:{:02x}.{}: MSI-X not armed, {}",
+                    self.bus, self.dev, self.func, why);
+                return false;
+            }
+        };
+        // The BAR the capability named, decoded rather than assumed to be
+        // memory: `msix` refuses a reserved *indicator*, and this is the other
+        // half — a device may name BAR 2 and BAR 2 may be an I/O BAR, which is
+        // the one path in this kernel where a device-supplied index reaches a
+        // BAR decode.
+        let base = match self.memory_bar(table.bir()) {
+            Ok(memory) => memory.address(),
+            Err(why) => {
+                log!("PCI {:02x}:{:02x}.{}: MSI-X not armed, its table names BAR {} and {}",
+                    self.bus, self.dev, self.func, table.bir(), why);
+                return false;
+            }
+        };
+        let address = match table.table_address(base) {
             Ok(address) => address,
             Err(why) => {
                 log!("PCI {:02x}:{:02x}.{}: MSI-X not armed, {}",

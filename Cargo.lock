@@ -1130,6 +1130,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "toyos-untrusted"
+version = "0.1.0"
+
+[[package]]
 name = "toyos-userbound"
 version = "0.1.0"
 

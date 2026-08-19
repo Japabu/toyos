@@ -122,6 +122,7 @@ abuse_pipe_owner 755
 abuse_pipe_ring 17
 abuse_shared_grant 26
 abuse_spawn_argv 75
+abuse_thread_name 13
 abuse_tls_alloc 149
 allocator_stress 1072
 alone_line_reports_the_alone_run 0
@@ -195,6 +196,7 @@ iommu_discovery 17594
 iommu_empty_domain 5681
 kernel_heartbeat 6794
 kernel_log_file 43056
+keyboard_claim_close_spares_stdin 4894
 kill_while_blocked 292
 klogd_hosted 11805
 late_storage_connect 6229
@@ -297,6 +299,7 @@ usb_storage_write_error 4605
 usb_transport_break 5382
 va_exhaustion 5097
 virtio_net_no_msix 1939
+virtio_used_ring 5161
 wall_clock_file 5488
 wall_clock_now 86
 wall_clock_refusals 103987
