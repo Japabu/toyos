@@ -11,6 +11,22 @@
 //! acknowledged shootdown is "cpu 1 can no longer reach the page the initiator
 //! is about to free", and `MAPPED` is the use-after-free this stage removes.
 //!
+//! The edge the property rests on is `serve`'s load of what it owes: it
+//! synchronizes with `issue`'s release, and that is what puts the initiator's
+//! page-table write ahead of the flush. On x86 every load is an acquire, so a
+//! build with it relaxed behaves identically to this one and no guest test can
+//! fail here. The negative case is a cargo feature rather than a comment:
+//!
+//! ```text
+//! cargo test --manifest-path kernel-loom/Cargo.toml --features shootdown-serve-relaxed \
+//!   --test tlb_shootdown
+//! ```
+//!
+//! makes that load relaxed and this file must red — *cpu 1 acknowledged the
+//! shootdown while still holding a translation for the page the initiator is
+//! about to free*, which is the use-after-free this stage removes, stated
+//! exactly. Verified 2026-08-17, both ways round.
+//!
 //! **Every spin is bounded and every assertion is conditional on the ack having
 //! arrived, so [`ACKED`] is what stops the models passing vacuously.** An
 //! unbounded serve loop is the same trap `kernel-loom`'s lock models document:
