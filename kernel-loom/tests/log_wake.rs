@@ -78,6 +78,11 @@ fn a_commit_and_an_arm_cannot_both_miss() {
             // argument in `lib.rs` is the other half).
             let seq = unsafe { producer.shard.reserve(&guard) };
             unsafe { producer.shard.commit(seq, &record(seq), &guard) };
+            // The kernel's `LogCommitGuard` has a `Drop` that reopens interrupts
+            // here; the model's stand-in has nothing to restore, so this reads
+            // as a no-op drop. It stays because the bracket closing before the
+            // wake signal is the edge this model is about.
+            #[allow(clippy::drop_non_drop)]
             drop(guard);
             if signal_after_commit(&producer.waiter) {
                 producer.posted.store(true, Ordering::SeqCst);

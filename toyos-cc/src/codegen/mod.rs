@@ -319,7 +319,7 @@ impl Codegen {
             return;
         }
 
-        for (_, &(stub_id, original_id)) in &self.variadic_stubs {
+        for &(stub_id, original_id) in self.variadic_stubs.values() {
             // mov $8, %al  ; B0 08
             // jmp *sym@GOTPCREL(%rip) ; FF 25 disp32
             let bytes: [u8; 8] = [0xB0, 0x08, 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00];
@@ -696,7 +696,7 @@ impl Codegen {
                     // the element type is aggregate, divide by scalars per element
                     let scalars_per = elem.flat_init_count();
                     let mut n = if scalars_per > 1 && items.iter().all(|it| matches!(&it.initializer, Initializer::Expr(_))) {
-                        (items.len() + scalars_per - 1) / scalars_per
+                        items.len().div_ceil(scalars_per)
                     } else {
                         items.len()
                     };

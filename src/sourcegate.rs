@@ -89,7 +89,7 @@ fn rel(root: &Path, path: &Path) -> String {
     path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
 }
 
-fn rust_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut entries: Vec<_> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
     entries.sort();
@@ -98,7 +98,7 @@ fn rust_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
             if path.file_name().is_some_and(|n| n == "target") {
                 continue;
             }
-            rust_files(root, &path, out);
+            rust_files(&path, out);
         } else if path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
         }
@@ -110,7 +110,7 @@ fn occurrences(needle: &str) -> Vec<(String, usize)> {
     let root = repo_root();
     let mut files = Vec::new();
     for tree in TREES {
-        rust_files(&root, &root.join(tree), &mut files);
+        rust_files(&root.join(tree), &mut files);
     }
     let mut found = Vec::new();
     for path in files {
@@ -207,7 +207,7 @@ fn named_in_code(needle: &str) -> Vec<String> {
     let root = repo_root();
     let mut files = Vec::new();
     for tree in GUEST_TREES {
-        rust_files(&root, &root.join(tree), &mut files);
+        rust_files(&root.join(tree), &mut files);
     }
     let mut found = Vec::new();
     for path in files {
@@ -225,7 +225,7 @@ fn named_in_code(needle: &str) -> Vec<String> {
 fn kernel_lines() -> Vec<(String, usize, String)> {
     let root = repo_root();
     let mut files = Vec::new();
-    rust_files(&root, &root.join("kernel/src"), &mut files);
+    rust_files(&root.join("kernel/src"), &mut files);
     let mut out = Vec::new();
     for path in files {
         let Ok(text) = std::fs::read_to_string(&path) else { continue };
@@ -445,7 +445,7 @@ mod tests {
         let root = repo_root();
         for tree in TREES {
             let mut files = Vec::new();
-            rust_files(&root, &root.join(tree), &mut files);
+            rust_files(&root.join(tree), &mut files);
             assert!(!files.is_empty(), "{tree} has no .rs files — the walk is looking elsewhere");
         }
         assert!(

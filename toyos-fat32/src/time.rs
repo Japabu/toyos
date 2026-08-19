@@ -30,6 +30,10 @@ const MAX_UNIX_SECS: u64 = 4_354_819_198;
 impl FatTime {
     /// The FAT epoch. What an entry gets when the caller has no clock — every
     /// field is in range, so nothing downstream has to special-case it.
+    // Written as the three packed fields `from_unix_secs` below writes —
+    // year-1980, month, day — so the zero year is visibly what makes this the
+    // epoch. Reducing the term away hides which field is which.
+    #[allow(clippy::identity_op)]
     pub const EPOCH: FatTime = FatTime {
         date: (0 << 9) | (1 << 5) | 1,
         time: 0,

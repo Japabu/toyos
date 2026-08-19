@@ -532,7 +532,7 @@ pub fn c_capture_ignores_daemon_lines(
              is the defect this gate exists for:\n{mismatch}"
         ));
     }
-    if !ignored.filtered.iter().any(|l| *l == IMPOSTOR) {
+    if !ignored.filtered.contains(&IMPOSTOR) {
         return Err(format!(
             "the comparison passed without naming {IMPOSTOR:?} among the lines it removed — a \
              capture that silently got shorter is not evidence. It named {:?}",

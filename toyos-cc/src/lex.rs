@@ -324,7 +324,7 @@ impl<'a> Lexer<'a> {
             c @ b'0'..=b'7' => {
                 let mut val = c - b'0';
                 for _ in 0..2 {
-                    if self.peek().is_some_and(|c| c >= b'0' && c <= b'7') {
+                    if self.peek().is_some_and(|c| (b'0'..=b'7').contains(&c)) {
                         val = val.wrapping_mul(8).wrapping_add(self.advance() - b'0');
                     }
                 }
@@ -597,7 +597,7 @@ impl<'a> Lexer<'a> {
 fn parse_hex_float(text: &str) -> f64 {
     // Parse C hex float: 0x1.921fb6p+1
     let s = &text[2..]; // skip "0x"
-    let (mantissa_str, exp_str) = if let Some(p) = s.find(|c: char| c == 'p' || c == 'P') {
+    let (mantissa_str, exp_str) = if let Some(p) = s.find(['p', 'P']) {
         (&s[..p], &s[p+1..])
     } else {
         (s, "0")

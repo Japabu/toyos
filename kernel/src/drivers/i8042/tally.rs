@@ -105,6 +105,9 @@ impl Tally {
         Self { packed: AtomicU64::new(0) }
     }
 
+    // No `Default` beside it: the arm above is the one the kernel builds, it
+    // has to stay `const` for the `static`, and `Default::default` cannot be.
+    #[allow(clippy::new_without_default)]
     #[cfg(feature = "loom")]
     pub fn new() -> Self {
         Self { packed: AtomicU64::new(0) }

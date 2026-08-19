@@ -39,7 +39,7 @@ const ABSENT: [u8; 11] = [0; 11];
 fn short_checksum(name: &[u8; 11]) -> u8 {
     let mut sum: u8 = 0;
     for &c in name {
-        sum = (sum >> 1) | (sum << 7);
+        sum = sum.rotate_right(1);
         sum = sum.wrapping_add(c);
     }
     sum

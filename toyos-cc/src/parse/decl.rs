@@ -481,24 +481,24 @@ impl Parser {
             return ParamList { params, variadic, unspecified_params: false };
         }
 
-        if matches!(self.peek(), TokenKind::Ident(s) if !self.type_env.is_typedef(s)) {
-            if matches!(self.peek2(), TokenKind::Comma | TokenKind::RParen) {
-                loop {
-                    if let TokenKind::Ident(_) = self.peek() {
-                        let name = self.ident();
-                        params.push(ParamDecl {
-                            specifiers: vec![DeclSpecifier::TypeSpec(TypeSpec::Int)],
-                            declarator: Some(Declarator {
-                                pointer: Vec::new(),
-                                direct: DirectDeclarator::Ident(name),
-                            }),
-                        });
-                    }
-                    if !self.eat(&TokenKind::Comma) { break; }
-                    if self.peek() == &TokenKind::Ellipsis { variadic = true; self.advance(); break; }
+        if matches!(self.peek(), TokenKind::Ident(s) if !self.type_env.is_typedef(s))
+            && matches!(self.peek2(), TokenKind::Comma | TokenKind::RParen)
+        {
+            loop {
+                if let TokenKind::Ident(_) = self.peek() {
+                    let name = self.ident();
+                    params.push(ParamDecl {
+                        specifiers: vec![DeclSpecifier::TypeSpec(TypeSpec::Int)],
+                        declarator: Some(Declarator {
+                            pointer: Vec::new(),
+                            direct: DirectDeclarator::Ident(name),
+                        }),
+                    });
                 }
-                return ParamList { params, variadic, unspecified_params: false };
+                if !self.eat(&TokenKind::Comma) { break; }
+                if self.peek() == &TokenKind::Ellipsis { variadic = true; self.advance(); break; }
             }
+            return ParamList { params, variadic, unspecified_params: false };
         }
 
         loop {

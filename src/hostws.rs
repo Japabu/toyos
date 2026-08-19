@@ -275,7 +275,7 @@ fn line_comment(path: &Path) -> Option<&'static str> {
 /// Every `build.rs` under `dir`, wherever it lives — a build script runs, so a
 /// path in one is a path something acts on.
 #[cfg(test)]
-fn build_scripts(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+fn build_scripts(dir: &Path, out: &mut Vec<PathBuf>) {
     let script = dir.join("build.rs");
     if script.is_file() {
         out.push(script);
@@ -286,7 +286,7 @@ fn build_scripts(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
         if name.starts_with('.') || name == "target" || name == "rust" {
             continue;
         }
-        build_scripts(root, &path, out);
+        build_scripts(&path, out);
     }
 }
 
@@ -501,7 +501,7 @@ mod tests {
             files.extend(entries.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_file()));
         }
         let mut scripts = Vec::new();
-        build_scripts(&root, &root, &mut scripts);
+        build_scripts(&root, &mut scripts);
         files.extend(scripts);
         files.sort();
 

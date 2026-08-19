@@ -54,7 +54,7 @@ pub fn is_user_object(ptr: u64, size: u64, align: u64) -> bool {
     if size == 0 || !align.is_power_of_two() {
         return false;
     }
-    if ptr % align != 0 || !in_user_half(ptr, size) {
+    if !ptr.is_multiple_of(align) || !in_user_half(ptr, size) {
         return false;
     }
     ptr & !(PAGE_2M - 1) == (ptr + size - 1) & !(PAGE_2M - 1)
@@ -106,7 +106,7 @@ mod tests {
         for &(name, size, align) in TYPES {
             for last in 1..size {
                 let ptr = 4 * PAGE_2M - last;
-                if ptr % align != 0 {
+                if !ptr.is_multiple_of(align) {
                     continue;
                 }
                 assert!(

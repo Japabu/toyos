@@ -153,11 +153,6 @@ impl Elf {
         self
     }
 
-    pub fn poke(mut self, off: usize, data: &[u8]) -> Elf {
-        self.bytes[off..off + data.len()].copy_from_slice(data);
-        self
-    }
-
     pub fn build(mut self) -> Vec<u8> {
         let written = self.phdrs.len();
         let phnum = self.phnum.unwrap_or(written as u16);

@@ -1395,6 +1395,10 @@ const FORGED: [u8; 16] = [
 /// As `Guid`'s Display prints it: three little-endian fields then raw bytes.
 const FORGED_TEXT: &str = "33221100-5544-7766-8899-AABBCCDDEEFF";
 
+/// An image on disk and the `(offset, len)` of its ESP and its log partition,
+/// in that order.
+pub type ImageWithExtents = (PathBuf, (usize, usize), (usize, usize));
+
 /// A stick as the build made it, with one file changed: the sixteen bytes of
 /// `\toyos\log.guid` now name a partition no machine has.
 ///
@@ -1410,7 +1414,7 @@ pub fn image_with_unnamed_log_partition(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
-) -> Result<(PathBuf, (usize, usize), (usize, usize)), String> {
+) -> Result<ImageWithExtents, String> {
     let image_path = test_dir().join(name);
     let mut image = qemu::build_boot_image(test_config, c_bins, rust_bins, &[]);
     std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;

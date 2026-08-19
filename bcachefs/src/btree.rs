@@ -733,7 +733,7 @@ mod tests {
         // something, or the split makes no progress.
         let tiny = [entry(8), entry(8), entry(8)];
         let mid = split_point(&tiny);
-        assert!(mid >= 1 && mid <= 2, "mid={mid} leaves a side empty");
+        assert!((1..=2).contains(&mid), "mid={mid} leaves a side empty");
     }
 
     #[test]

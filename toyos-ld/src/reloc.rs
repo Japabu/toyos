@@ -480,13 +480,10 @@ pub(crate) fn apply_relocs(
             | RelocType::X86Gotpcrel | RelocType::X86Gotpcrelx
             | RelocType::X86RexGotpcrelx
             | RelocType::X86Tlv => {
-                match apply_one_reloc_x86(data, reloc, sym_addr, reloc_vaddr, params.got, params.dyn_got) {
-                    Ok(is_abs) => {
-                        if is_abs && params.record_relatives {
-                            relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
-                        }
-                    }
-                    Err(e) => return Err(e),
+                let is_abs =
+                    apply_one_reloc_x86(data, reloc, sym_addr, reloc_vaddr, params.got, params.dyn_got)?;
+                if is_abs && params.record_relatives {
+                    relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
                 }
             }
             RelocType::Aarch64Abs64 | RelocType::Aarch64Abs32
@@ -502,13 +499,10 @@ pub(crate) fn apply_relocs(
             | RelocType::Aarch64GotPcrel32
             | RelocType::Aarch64TlvpLoadPage21
             | RelocType::Aarch64TlvpLoadPageoff12 => {
-                match apply_one_reloc_aarch64(data, reloc, sym_addr, reloc_vaddr, params.got) {
-                    Ok(is_abs) => {
-                        if is_abs && params.record_relatives {
-                            relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
-                        }
-                    }
-                    Err(e) => return Err(e),
+                let is_abs =
+                    apply_one_reloc_aarch64(data, reloc, sym_addr, reloc_vaddr, params.got)?;
+                if is_abs && params.record_relatives {
+                    relatives.push((reloc_vaddr, sym_addr as i64 + reloc.addend));
                 }
             }
         }
@@ -614,7 +608,7 @@ fn apply_one_reloc_aarch64(
         RelocType::Aarch64Call26 | RelocType::Aarch64Jump26 => {
             let value = sym_addr as i64 + reloc.addend - reloc_vaddr as i64;
             let imm26 = value >> 2;
-            if imm26 < -(1 << 25) || imm26 >= (1 << 25) {
+            if !(-(1 << 25)..(1 << 25)).contains(&imm26) {
                 return Err(LinkError::RelocationOverflow {
                     reloc_type: reloc.r_type, symbol: reloc.target.name().to_string(), value,
                 });
@@ -646,7 +640,7 @@ fn apply_one_reloc_aarch64(
             let sym_page = (sym_addr as i64 + reloc.addend) & !0xFFF;
             let pc_page = reloc_vaddr as i64 & !0xFFF;
             let page_delta = (sym_page - pc_page) >> 12;
-            if page_delta < -(1 << 20) || page_delta >= (1 << 20) {
+            if !(-(1 << 20)..(1 << 20)).contains(&page_delta) {
                 return Err(LinkError::RelocationOverflow {
                     reloc_type: reloc.r_type, symbol: reloc.target.name().to_string(), value: page_delta,
                 });
@@ -691,7 +685,7 @@ fn apply_one_reloc_aarch64(
             let sym_page = got_slot as i64 & !0xFFF;
             let pc_page = reloc_vaddr as i64 & !0xFFF;
             let page_delta = (sym_page - pc_page) >> 12;
-            if page_delta < -(1 << 20) || page_delta >= (1 << 20) {
+            if !(-(1 << 20)..(1 << 20)).contains(&page_delta) {
                 return Err(LinkError::RelocationOverflow {
                     reloc_type: reloc.r_type, symbol: reloc.target.name().to_string(), value: page_delta,
                 });
@@ -721,7 +715,7 @@ fn apply_one_reloc_aarch64(
             let sym_page = (sym_addr as i64 + reloc.addend) & !0xFFF;
             let pc_page = reloc_vaddr as i64 & !0xFFF;
             let page_delta = (sym_page - pc_page) >> 12;
-            if page_delta < -(1 << 20) || page_delta >= (1 << 20) {
+            if !(-(1 << 20)..(1 << 20)).contains(&page_delta) {
                 return Err(LinkError::RelocationOverflow {
                     reloc_type: reloc.r_type, symbol: reloc.target.name().to_string(), value: page_delta,
                 });
@@ -1036,7 +1030,7 @@ pub(crate) fn apply_relocs_pe(
     }
 
     // Fill GOT entries
-    for (_, &got_vaddr) in &layout.got {
+    for &got_vaddr in layout.got.values() {
         abs_fixups.push(got_vaddr as u32);
     }
 
