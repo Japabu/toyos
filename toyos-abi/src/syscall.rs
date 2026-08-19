@@ -629,10 +629,7 @@ fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 /// Encode an optional timeout for the kernel ABI.
 /// `None` = wait forever (u64::MAX), `Some(n)` = timeout after `n` nanoseconds.
 fn encode_timeout(timeout: Option<u64>) -> u64 {
-    match timeout {
-        None => u64::MAX,
-        Some(n) => n,
-    }
+    timeout.unwrap_or(u64::MAX)
 }
 
 /// Write bytes to a file descriptor. Returns number of bytes written.
@@ -1054,8 +1051,7 @@ pub unsafe fn gpu_set_resolution(
 
 /// Shut down the machine. Does not return.
 pub fn shutdown() -> ! {
-    syscall(SYS_SHUTDOWN, 0, 0, 0, 0);
-    loop {}
+    loop { syscall(SYS_SHUTDOWN, 0, 0, 0, 0); }
 }
 
 /// The device classes, their wire numbers, and the name a `system.toml`
