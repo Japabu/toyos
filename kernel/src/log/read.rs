@@ -16,8 +16,6 @@
 //!
 //! **Two names rather than one with a flag**, because each is correct for its
 //! caller and neither is a mode of the other.
-//!
-//! `specs/log-architecture-spec.md` §3.1.
 
 use toyos_abi::log::{LogRecord, MAX_LOG_SHARDS};
 

@@ -1,7 +1,7 @@
 //! The kernel's console sink, the two drain modes, and `klogd`.
 //!
 //! One thread where every idle CPU used to drain, and that is a reduction this
-//! design accepts and names (`specs/log-architecture-spec.md` §4.3). Three
+//! design accepts and names. Three
 //! things bound it: boot does not need a thread at all, the panic and shutdown
 //! paths drain inline and never depend on `klogd` being schedulable, and
 //! **`klogd`'s own death is not survivable quietly** — its row in
@@ -197,7 +197,7 @@ pub fn drain_locked(guard: &mut BackendGuard) {
 /// `klogd` never wakes, so it never reaches `user::post_readiness`, so **the one
 /// machine shape this whole design exists for posts no log readiness at all**
 /// and `/bin/logd` parks for ever with `/log` unwritten
-/// (`specs/issues/diagnostics/a-console-less-machine-posts-no-log-readiness.md`).
+/// (`issues/diagnostics/a-console-less-machine-posts-no-log-readiness.md`).
 ///
 /// Advancing costs nothing that machine had: the records stay in their shards
 /// for the panel, which reads them through `snapshot_committed` and not through
@@ -342,7 +342,7 @@ impl<F: FnMut(&[u8])> core::fmt::Write for Line<F> {
             // `LogRecord::tagged(&str)` beside `Display` would be tidier and is
             // a *sysroot* change: §11 lands the ABI alone and it has already
             // landed, so this branch composes instead of reopening it.
-            // `specs/issues/diagnostics/a-console-tag-is-composed-by-replacing-a-bracket.md`.
+            // `issues/diagnostics/a-console-tag-is-composed-by-replacing-a-bracket.md`.
             //
             // If that leading bracket ever goes, the fragment passes through
             // whole: a visible `[kernel [0.1 …` beats a line silently missing
@@ -361,8 +361,10 @@ impl<F: FnMut(&[u8])> core::fmt::Write for Line<F> {
 ///
 /// **Public because `/log`'s sink renders the same line**, and a second
 /// implementation of it there would be a second thing to keep agreeing with the
-/// panel. It goes when `logd` does the rendering (L6), which is also when the
-/// wall-clock prefix stops being this one.
+/// panel. An earlier note here predicted it would go when `logd` took over the
+/// rendering; it did not, because `logd` renders the same record through the
+/// same `Display` and writes a *wall-clock* prefix in front of it. One
+/// implementation of everything that varies, two prefixes over it.
 pub fn write_line(record: &LogRecord, emit: impl FnMut(&[u8])) {
     use core::fmt::Write;
     let mut line = Line::new(emit);
@@ -437,9 +439,10 @@ extern "C" fn body(_arg: u64) -> ! {
 
         // **The one context in the machine that has just observed committed
         // records and may take a lock**, which is why the readiness post is
-        // here and not in `emit` (`specs/log-architecture-spec.md` §3.2). One
-        // post per batch rather than one per record, and none at all while
-        // nothing is watching.
+        // here and not in `emit`: each per-source watcher list is a
+        // `Lock<Vec<_>>` the post clones under the lock, and taking a lock is
+        // the one thing `emit` may not do. One post per batch rather than one
+        // per record, and none at all while nothing is watching.
         //
         // It is outside `drain_inline` deliberately: that function's other two
         // callers are a producer mid-`emit` and a panicking machine, and

@@ -8,8 +8,7 @@ use crate::arch::entry::{restore_user_state, ring3_naked_asm, save_user_state};
 /// parked for the Ring 3 epilogue alone, which is the only window here that can
 /// context-switch — a comment used to point at `xhci_entry` for the rationale
 /// and then not follow it, which is how this vector spent its life returning to
-/// userland with another thread's XMM registers
-/// (`specs/user-machine-state.md` §3).
+/// userland with another thread's XMM registers.
 #[unsafe(naked)]
 pub(super) extern "sysv64" fn tlb_flush_entry() {
     ring3_naked_asm!(

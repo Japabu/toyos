@@ -8,9 +8,9 @@ hosted-rustc = false
 
 # `assets/soundfont.sf2` is in here and is doom's music: GeneralUser GS cut down
 # to the 37 melodic programs and 23 percussion keys `assets/DOOM1.WAD`'s own MUS
-# headers select, by `src/soundfont.rs`. `NOTICE` carries its licence and the
-# provenance caveat that comes with it; `specs/assessments/doom-music-soundfont.md` prices
-# the alternatives, including the zero-byte OPL3 path that may one day delete it.
+# headers select, by `src/soundfont.rs`. `NOTICE` carries its licence, the
+# provenance caveat that comes with it, and the zero-byte OPL3 path that may one
+# day delete it.
 assets = ["assets"]
 
 # What `/bin/init` starts at boot. Program keys, not paths, and the order means
@@ -31,11 +31,11 @@ toyos-cc = { path = "toyos-cc" }
 # cargo = { path = "userland/cargo", no-default-features = true }
 
 # **Every image that carries a `TOYOS-LOG` partition runs this**, and every
-# image does. The kernel stopped writing files at L6 of
-# `specs/log-architecture-spec.md`, so a boot config without `logd` is a boot
-# whose `/log` is empty — `every_boot_config_runs_logd` is what refuses one.
-# It claims no device and serves no port yet (§5.1, §5.2): its whole authority
-# is `logread`, which is `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
+# image does. The kernel keeps the record ring and the console and writes no
+# file at all, so a boot config without `logd` is a boot whose `/log` is empty —
+# `every_boot_config_runs_logd` is what refuses one. It claims no device and
+# serves no port: its whole authority is `logread`, which is
+# `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
 [programs.logd]
 syscap = ["logread"]
 

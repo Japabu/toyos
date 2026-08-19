@@ -13,11 +13,11 @@
 //!
 //! # The zone recovery
 //!
-//! [`resolve`] is the whole of `specs/log-architecture-spec.md`'s wall-clock
-//! question, and [`Recovery`] is its honest answer type. The syscall surface
-//! gives userland two readings of one instant — `SYS_CLOCK_EPOCH`, which is UTC
-//! seconds, and `SYS_CLOCK_REALTIME`, which is local `h:m:s` and no date — so
-//! the offset between the zones is a subtraction of seconds-of-day. That
+//! [`resolve`] is the whole of `/log`'s wall-clock question, and [`Recovery`]
+//! is its honest answer type. The syscall surface gives userland two readings
+//! of one instant — `SYS_CLOCK_EPOCH`, which is UTC seconds, and
+//! `SYS_CLOCK_REALTIME`, which is local `h:m:s` and no date — so the offset
+//! between the zones is a subtraction of seconds-of-day. That
 //! subtraction pins the offset **modulo 24 hours**, and the real range of zone
 //! offsets is 26 hours wide (UTC−12:00 to UTC+14:00), so a two-hour band is
 //! genuinely ambiguous: the same pair of readings is UTC+13 on one day and

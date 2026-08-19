@@ -637,7 +637,7 @@ mod tests {
         assert_eq!(grab, Grab::None);
     }
 
-    /// `specs/issues/kernel/compositor-holds-stale-window-index.md`: a client
+    /// `issues/kernel/compositor-holds-stale-window-index.md`: a client
     /// that exits while its window is being dragged must not panic the next
     /// sample and must not let the drag jump to whatever window slid into its
     /// slot. Named by `WindowId`, `hold` finds the window gone and ends the

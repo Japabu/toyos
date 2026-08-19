@@ -1,7 +1,6 @@
 pub(crate) mod exceptions;
 mod device_irq;
 mod dma_fault;
-mod fault_class;
 mod hda;
 mod i8042;
 #[cfg(feature = "boot-actuators")]
@@ -61,9 +60,9 @@ const PF_PRESENT: u64 = 1 << 0;
 const PF_WRITE: u64 = 1 << 1;
 const PF_INSTRUCTION_FETCH: u64 = 1 << 4;
 
-// The ring a `cs` names is `fault_class::Ring`'s to decide and nobody else's:
-// a second reading of the RPL field beside it is a second place the crash path
-// can be told the wrong privilege level.
+// The ring a `cs` names is `toyos_userbound::Ring`'s to decide and nobody
+// else's: a second reading of the RPL field beside it is a second place the
+// crash path can be told the wrong privilege level.
 
 // IDT entry (16 bytes in 64-bit mode)
 #[repr(C)]
@@ -331,7 +330,7 @@ extern "sysv64" fn stub_halt_all() {
 /// fault taken from Ring 3 can return through another task — and until this
 /// bracket existed it did so carrying whatever that task left in the registers.
 /// A demand-paging fault corrupting XMM produces a wrong number rather than a
-/// signal, which is why nothing had noticed (`specs/user-machine-state.md` §3).
+/// signal, which is why nothing had noticed.
 ///
 /// `rdi` is taken before the bracket because the bracket moves `rsp`: the frame
 /// [`trap_dispatch`] is handed is the one the pushes above built, and the CS

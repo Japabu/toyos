@@ -3,8 +3,8 @@
 //! Every scratch file in this harness is named for what it is — `esp-boot.img`,
 //! `usb-gate-512.img`, the size-keyed NVMe image `boot_with_options` makes — and
 //! not for the boot that uses it, because until the suite ran serially there was
-//! only ever one boot. Two guests handed one path is the defect
-//! `specs/assessments/test-cost-audit.md` §5.1 records killing the first consolidation
+//! only ever one boot. Two guests handed one path is the defect that killed the
+//! first consolidation
 //! attempt, and it is not a defect a per-file fix closes: the next test to add a
 //! staged image gets the shared directory by default and nothing says otherwise.
 //!

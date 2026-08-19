@@ -5,7 +5,6 @@
 //! exactly what comes back — then reads PORTSC again before the next step,
 //! because an effect changes the register and a decision taken from a stale
 //! word is a decision about a port that no longer exists.
-//! `specs/plans/xhci-port-machine-plan.md` is the design.
 
 use core::num::NonZeroU8;
 

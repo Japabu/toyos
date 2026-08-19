@@ -228,7 +228,7 @@ pub fn block_on(ticket: Ticket<'_>, deadline: u64) {
 /// what spec §2's invariant 10 requires of one. A site that parks with
 /// `prepare_wait`/`block_on` directly owns that loop itself — `sys_nanosleep`
 /// is the one that does not
-/// (`specs/issues/kernel/nanosleep-ends-early-when-a-sibling-thread-exits.md`).
+/// (`issues/kernel/nanosleep-ends-early-when-a-sibling-thread-exits.md`).
 ///
 /// Looping does not weaken spec §2's no-lost-wake invariant, because each trip
 /// is the whole two-phase handshake again: the re-registration happens *before*

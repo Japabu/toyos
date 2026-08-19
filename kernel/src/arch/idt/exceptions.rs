@@ -2,7 +2,8 @@ use crate::arch::{apic, cpu, debug, syscall, percpu};
 use crate::arch::percpu::CpuFaultState;
 use crate::{alert, log, mm, process, scheduler, symbols};
 
-use super::fault_class::{blame, Blame, Faulted, Ring};
+use toyos_userbound::{blame, Blame, Faulted, Ring};
+
 use super::{Vector, TrapFrame, PF_PRESENT, PF_WRITE, PF_INSTRUCTION_FETCH};
 
 /// Walk RBP chain for kernel backtrace with symbol resolution.
@@ -105,7 +106,7 @@ impl ExceptionContext<'_> {
         }
     }
 
-    /// Whose fault it was. See `super::fault_class`.
+    /// Whose fault it was. See `toyos_userbound::fault`.
     fn blame(&self) -> Blame {
         blame(self.ring(), self.frame.rip, self.faulted(), percpu::current_tid().is_some())
     }
@@ -254,7 +255,7 @@ fn crash_report_exception(ctx: &ExceptionContext) {
 
         // The `Syscall:` line below is the faulting thread's *last* syscall and
         // says nothing about where the fault is: `syscall_rip` is never cleared
-        // (`specs/issues/panic-path/syscall-rip-never-cleared.md`), so it can name a return address
+        // (`issues/panic-path/syscall-rip-never-cleared.md`), so it can name a return address
         // many syscalls old. Reading it as the fault site cost the AMD `#GP`
         // investigation its first day.
         let user_rip = percpu::syscall_rip();

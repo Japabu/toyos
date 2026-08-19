@@ -1,10 +1,10 @@
 //! Graphs to test against: one real machine's, and the states no real machine
 //! in reach constructs.
 //!
-//! The real ones are the H0 probe's own `hda:` lines, committed verbatim. That
-//! is the second life `specs/plans/hda-driver-plan.md` §5.2 designed that format for,
-//! and it outlives the probe: H9 deletes the diagnostic and the fixtures stay
-//! as artifacts.
+//! The real ones are the boot-time codec probe's own `hda:` lines, committed
+//! verbatim — the second life that log format was designed for, and it outlives
+//! the probe: the diagnostic has since been deleted and the fixtures stay as
+//! artifacts.
 
 use alloc::vec;
 use alloc::vec::Vec;

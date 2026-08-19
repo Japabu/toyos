@@ -1,5 +1,4 @@
-//! Stage I1 of `specs/iommu-spec.md`: what the kernel read off the machine's
-//! remapping units.
+//! Stage I1: what the kernel read off the machine's remapping units.
 //!
 //! The trap this gate exists to avoid is the one a discovery test falls into
 //! by default. A kernel that printed a plausible capability line without
@@ -70,7 +69,7 @@ pub fn iommu_discovery(
         // machine declaring 48 bits of host address is the aw-bits the profile
         // asked for. Both halves of the table's own header are asserted:
         // `INTR_REMAP` is a platform-level flag and `ECAP.IR` below is the
-        // unit's, and `specs/iommu-spec.md` §2.2 refuses on them separately.
+        // unit's, and the kernel refuses on them separately.
         log.must_say(&format!("iommu: DMAR haw={}", unit.aw_bits))?;
         log.must_say(&format!(
             "intr_remap={}",
@@ -184,8 +183,8 @@ const SECOND_LEVEL: &[&str] = &["read-permission", "write-permission", "paging-e
 /// A function whose context entry the kernel deliberately never wrote must
 /// fault on its first transaction, and the fault must name it.
 ///
-/// This is `specs/plans/iommu-plan.md`'s exit criterion for I2 and the
-/// isolation negative control at the same time, because at this stage they are
+/// This is the exit criterion for I2 and the isolation negative control at the
+/// same time, because at this stage they are
 /// the same question. Identity mapping means a translated machine and an untranslated
 /// one produce the same result for every device that is *in* the tables, so
 /// the only way to tell the two apart is a device that is not: with the unit
@@ -248,8 +247,8 @@ pub fn iommu_context_absent(
 /// permissions of whichever access populated it and then lets its memory core
 /// drop a later access the cached entry does not allow — silently, with no
 /// fault record — so a control built on narrowing a permission hangs the boot
-/// instead of faulting. Measured, and written up in `specs/iommu-spec.md`
-/// §8.2; the first thing a device does here is fetch a descriptor, which
+/// instead of faulting. That is measured, not assumed; the first thing a
+/// device does here is fetch a descriptor, which
 /// misses the cache and is answered by the tables.
 pub fn iommu_empty_domain(
     test_config: &Path,
@@ -490,8 +489,8 @@ fn profile_name(profile: Profile) -> &'static str {
 
 /// Presence, configuration and *position* of the unit in the argv.
 ///
-/// The last one is the vacuity trap `specs/plans/userspace-drivers-spec.md` §7.2
-/// names, in its harness-side form: QEMU hands a PCI function the bypassing
+/// The last one is the vacuity trap in its harness-side form: QEMU hands a PCI
+/// function the bypassing
 /// address space when the function is created before the unit exists, so a
 /// `-device intel-iommu` emitted after the devices it is meant to decode is a
 /// unit that decodes nothing — and every assertion above it would still pass.

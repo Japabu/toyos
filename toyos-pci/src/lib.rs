@@ -5,9 +5,9 @@
 //! address the kernel programs. Everything that decides that address comes out
 //! of registers the device published: which BAR its table lives in, how far
 //! into it, how wide its address register is. So every one of those numbers is
-//! untrusted in the sense `specs/device-test-strategy.md` means — a function
-//! that names a reserved BAR indicator is not a function to truncate into
-//! range, it is a function whose interrupts this kernel declines to arm.
+//! untrusted, and untrusted here means refused rather than corrected — a
+//! function that names a reserved BAR indicator is not a function to truncate
+//! into range, it is a function whose interrupts this kernel declines to arm.
 //!
 //! [`bar`] is that sentence one register lower down, and it is where the
 //! reserved-indicator refusal stopped short: `msix` refuses a BAR *index* it
