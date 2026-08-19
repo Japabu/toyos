@@ -535,9 +535,11 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // What the C family is allowed to conclude from the line above being whole:
     // a guest writes a daemon-shaped line into a real capture window on purpose
     // and the real comparison ignores it, with the filter turned off as the
-    // control. Parallel and Fast: one boot, two `echo`s, and every verdict is a
-    // string comparison the host makes over a capture — no clock in it.
-    ("c_capture_ignores_daemon_lines", Sched::Parallel, Tier::Fast),
+    // control. One boot, two `echo`s, and every verdict is a string comparison
+    // the host makes over a capture — no clock in it; Nightly because its
+    // *wall* clock is whatever the partition co-schedules, and it straddles the
+    // fast line run to run (`src/tiers.rs` has the two measurements).
+    ("c_capture_ignores_daemon_lines", Sched::Parallel, Tier::Nightly),
     // A poll on the machine's log against a *handle* going away. Parallel and
     // Fast: both halves are verdicts the guest computes — a completion count
     // immediately after a close, retried against a record arriving in the same
