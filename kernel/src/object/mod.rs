@@ -343,6 +343,20 @@ pub(crate) fn enqueue_zero_handles(object: KObjectRef) {
 /// loop — the same three sites, and for the same reason, as the wake drains
 /// beside them. Latency is one of those, which is microseconds; nothing here
 /// waits on anything.
+///
+/// **`ZERO_PENDING` is cleared before a single hook runs, so "the queue is
+/// empty" is not "the work is done" — and the CPU that queued an object is not
+/// the one guaranteed to release it.** Any of the three sites, on any other
+/// CPU, can take a batch out from under the syscall that filled it; that
+/// syscall then reaches its own drain site, is told there is nothing to do, and
+/// **returns to userland with its objects still unreleased**. Measured from
+/// userland as a 2 MiB staircase in `SYS_SYSINFO` across consecutive calls
+/// after a kill, which is one ring page at a time on the other CPU. Nothing is
+/// lost — a killed process's pages do all come back, sub-millisecond — but
+/// nothing may be written that assumes a release has happened because the call
+/// that caused it has returned. `specs/issues/kernel/deferred-release-outlives-its-syscall.md`
+/// carries the measurement and the two shapes a fix could take; the release
+/// protocol itself is `specs/completion-architecture-spec.md` §21 row 9's.
 pub fn drain_zero_handles() {
     while ZERO_PENDING.load(Ordering::Acquire) {
         // A hook may retire further objects — dropping a connection drops the
