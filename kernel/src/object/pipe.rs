@@ -23,7 +23,7 @@ pub struct PipeReadEnd {
     /// A plain copy, because every read reaches for it and an `Arc` clone or a
     /// second lock on that path is an atomic read-modify-write TCG cannot emit
     /// inline
-    /// (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`). It names
+    /// (`issues/hardware/one-rmw-per-log-line-cost-350ms.md`). It names
     /// nothing once the reference below is given back: `IdMap` never reissues
     /// a `PipeId`.
     id: PipeId,

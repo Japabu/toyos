@@ -27,7 +27,7 @@
 //! | `fair_share_per_thread` | one fair share per thread, not per process | I5, and nothing else |
 //! | `fair_double_charge` | a share charged twice for what it runs | I5, in the opposite direction |
 //! | `fair_identity_within_share` | the lowest-keyed sibling served, not the earliest-inserted | I13, and nothing else |
-//! | `overlong_pass` | a pass costing five times its budget | an abort inside `check_pass_duration` |
+//! | `overlong_pass` | a pass costing five times its budget | `cpu::PassCosts`, which records it rather than aborting |
 //!
 //! The controls are `old_commit_fused` and `fair_identity_tiebreak`, and both
 //! must come back **clean**. They are what make two of those gates measurements
@@ -39,10 +39,11 @@
 //!
 //! # The liveness gates, which are a different claim
 //!
-//! Three checks below are not negative gates. They guard the third failure
-//! shape in `specs/README.md`'s method — a gate that goes *quiet* rather than
-//! red — by asserting that an invariant had a comparison open for a recorded
-//! fraction of the run: `the_fairness_storm_is_measured_and_holds` for I5,
+//! Three checks below are not negative gates. They guard against a gate that
+//! goes *quiet* rather than red — a change that narrows the gate's own coverage
+//! instead of violating it — by asserting that an invariant had a comparison
+//! open for a recorded fraction of the run:
+//! `the_fairness_storm_is_measured_and_holds` for I5,
 //! `invariant_i13_is_measured_and_holds` for I13, and
 //! `a_retire_completes_inside_its_derived_bound` for I14, which requires some
 //! retire to have outlived the instant it was posted in. A change that closes
@@ -831,38 +832,80 @@ fn double_charging_a_share_is_caught() {
     assert!(shipped.passed(), "{}", shipped.report());
 }
 
-/// The seventh self-validation gate: the core's `feature = "check"` pass-duration
-/// assert, which spec §10.2 makes the on-target counterpart to everything else in
-/// this file.
+/// The seventh self-validation gate: the core's `feature = "check"` pass-cost
+/// recorder, which spec §10.2 makes the on-target counterpart to everything else
+/// in this file.
 ///
-/// It is the one check here that says something about *cost* rather than about
-/// state, so it is the one the simulator cannot exercise for free: the VM's clock
-/// does not move inside a step, and an assert whose measured quantity is always
-/// zero is an assert that cannot fail. `SimHw` therefore charges every pass a
-/// modelled cost, and this gate turns that cost up past the budget.
+/// It is the one instrument here that says something about *cost* rather than
+/// about state, so it is the one the simulator cannot exercise for free: the
+/// VM's clock does not move inside a step, and a histogram whose measured
+/// quantity is always zero is a histogram that cannot say anything. `SimHw`
+/// therefore charges every pass a modelled cost, and this gate turns that cost
+/// up past the budget.
 ///
-/// Without it, "kernel check builds assert a max pass duration" would be a claim
-/// backed by an expression that computes `0 <= 200_000` a few thousand times a
-/// second.
+/// **This gate used to demand an abort and now demands a number**, because the
+/// budget stopped being asserted in the kernel: elapsed time across a pass is
+/// wall clock, a guest's wall clock runs while a hypervisor has the vCPU, and a
+/// panic may not stand over a quantity the host inflates. What the recorder must
+/// still do is see the cost — without that, "a check build measures what a pass
+/// costs" would be a claim backed by an expression that computes zero a few
+/// thousand times a second, and the harness gate downstream would be reading a
+/// distribution of nothing.
 #[test]
-fn a_pass_that_overruns_its_budget_is_caught() {
-    let caught = sweep::abort_gate(&scenarios::overlong_pass(), FAIR_SEEDS);
-    let Some((seed, message)) = caught else {
-        panic!(
-            "a pass modelled at five times `cpu::MAX_PASS_NS` went undetected in \
-             {FAIR_SEEDS} schedules — either the assert is not compiled in, or the \
-             clock it reads never moves",
-        );
-    };
+fn a_pass_that_overruns_its_budget_is_recorded() {
+    let scenario = scenarios::overlong_pass();
+    let cost = scenario.pass_cost_ns;
+    let outcome = run(scenario, &mut ChoiceStream::from_seed(0));
+    assert!(outcome.passed(), "{}", outcome.report());
+
+    let measured: u64 = outcome.pass_costs.iter().map(|c| c.count).sum();
+    let over: u64 = outcome.pass_costs.iter().map(|c| c.over).sum();
     assert!(
-        message.contains("invariant P: a scheduler pass took"),
-        "expected the pass-duration assert to be what fires (seed {seed}); got: {message}",
+        measured > 0,
+        "a run that took {} steps recorded no pass at all — either the recorder is not \
+         compiled in, or `finish` stopped feeding it",
+        outcome.steps,
     );
+    assert_eq!(
+        over, measured,
+        "every one of {measured} passes was modelled at {cost} ns, five times \
+         `cpu::MAX_PASS_NS`, and {over} of them were recorded over budget — so the clock \
+         the recorder reads does not move, or it reads it in the wrong place",
+    );
+    for report in &outcome.pass_costs {
+        assert_eq!(
+            report.max_ns, cost,
+            "cpu{} recorded a maximum of {} ns for passes modelled at {cost} ns",
+            report.cpu.0, report.max_ns,
+        );
+        // The measurement the harness gates, on the one distribution whose
+        // answer is known: every sample at the modelled cost, so every quantile
+        // is the bucket that cost falls in.
+        assert!(
+            report.count == 0 || report.quantile_upper_ns(1, 2) > toyos_sched::cpu::MAX_PASS_NS,
+            "cpu{}'s median came back at {} ns with every pass modelled at {cost}",
+            report.cpu.0,
+            report.quantile_upper_ns(1, 2),
+        );
+    }
 
     // The control: the identical workload at the default modelled cost of zero
-    // must be clean, so the gate is measuring the budget and not the workload.
-    let free = sweep::seed_sweep(&scenarios::lost_wake_pipe(), FAIR_SEEDS, 1);
+    // must record nothing over budget, so the gate is measuring the cost and not
+    // the workload.
+    let free = run(scenarios::lost_wake_pipe(), &mut ChoiceStream::from_seed(0));
     assert!(free.passed(), "{}", free.report());
+    assert!(
+        free.pass_costs.iter().map(|c| c.count).sum::<u64>() > 0,
+        "the control recorded no pass either, so the assertion above it is about nothing",
+    );
+    assert_eq!(
+        free.pass_costs.iter().map(|c| c.over).sum::<u64>(),
+        0,
+        "a workload whose passes are modelled at zero recorded passes over budget",
+    );
+
+    let sweep = sweep::seed_sweep(&scenarios::lost_wake_pipe(), FAIR_SEEDS, 1);
+    assert!(sweep.passed(), "{}", sweep.report());
 }
 
 /// The ninth self-validation gate, and the newest: invariant I9's teeth.

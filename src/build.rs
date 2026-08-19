@@ -311,7 +311,7 @@ fn config_targets(root: &Path, config: &SystemConfig) -> Vec<(PathBuf, Clean)> {
 /// One name, passed to every `cargo build` here and declared by every crate
 /// root the image is made of. `--release` used to be a flag on `cargo run`, and
 /// it silently turned `debug-assertions` and `overflow-checks` off — the two
-/// knobs `specs/issues/`'s crafted-ELF panics were *found* by. There is
+/// knobs `issues/`'s crafted-ELF panics were *found* by. There is
 /// no longer a second profile to pick, which is why there is no longer a flag.
 pub const PROFILE: &str = "toyos";
 
@@ -436,7 +436,7 @@ const OVERFLOW_CHECK_MARKER: &[u8] = b"attempt to add with overflow";
 /// `RustcAbi::Softfloat` and `+soft-float` in
 /// `rust/compiler/rustc_target/src/spec/targets/x86_64_unknown_none.rs` — and an
 /// edit turning it off would make every bracket in the kernel insufficient
-/// without changing a byte of `kernel/`. `specs/user-machine-state.md` §8.
+/// without changing a byte of `kernel/`.
 ///
 /// Asked of the compiler rather than of the manifest, and once per process: it
 /// is a property of the toolchain rather than of any one image.
@@ -471,7 +471,7 @@ fn assert_kernel_is_softfloat(path_env: &str) {
 /// [`PROFILE`] states them and `--release` is gone from this build system, so
 /// the way they can still be lost is somebody editing `[profile.toyos]`. This
 /// asks the artifact rather than the manifest, which is the only question worth
-/// asking: `specs/issues/`'s two crafted-ELF kernel panics were both
+/// asking: `issues/`'s two crafted-ELF kernel panics were both
 /// *found* by an overflow check, and one of them had no configuration in which
 /// it was an error return.
 fn assert_overflow_checked(what: &str, image: &[u8]) {
@@ -917,23 +917,28 @@ fn assert_actuators_match_features(root: &Path, features: &str, kernel: &[u8]) {
     );
 }
 
-/// The scheduler core's `feature = "check"` asserts, by their own panic text,
-/// and the two kernels that must disagree about carrying them.
+/// The scheduler core's `feature = "check"` instruments, by their own text, and
+/// the two kernels that must disagree about carrying them.
 ///
-/// Every one of these is a `#[cfg(feature = "check")]` site in `toyos-sched`:
-/// invariant P is `cpu::check_pass_duration`'s budget, and the other two are
-/// `invariants::check_cpu` — invariant T's armed-timer bound and the
-/// container-versus-state-word agreement. Their format strings are the only
-/// part of the check build with a literal the linker keeps, which is what makes
-/// the artifact answerable at all.
-const SCHED_CHECK_ASSERTS: [&str; 3] = [
-    "invariant P: a scheduler pass took",
+/// Every one of these is a `#[cfg(feature = "check")]` site in `toyos-sched`.
+/// Two are asserts from `invariants::check_cpu` — invariant T's armed-timer
+/// bound and the container-versus-state-word agreement. The third is the
+/// pass-cost report (`cpu::PassCostReport::PREFIX`), which is a *measurement*
+/// and not an assert: a pass's elapsed time includes any interval a hypervisor
+/// took the CPU away, so it is recorded and gated in the harness rather than
+/// panicked over. Their format strings are the only part of the check build
+/// with a literal the linker keeps, which is what makes the artifact answerable
+/// at all — and the report's literal is kept out of the shipping kernel by
+/// nothing but dead-code elimination, which the `want == false` direction below
+/// is what checks.
+const SCHED_CHECK_LITERALS: [&str; 3] = [
+    "sched-check pass-costs cpu=",
     "invariant T: cpu",
     "disagrees with its state word",
 ];
 
-/// Refuse to write an image whose scheduler asserts do not match the feature
-/// set that decides whether they exist.
+/// Refuse to write an image whose scheduler instruments do not match the
+/// feature set that decides whether they exist.
 ///
 /// [`assert_actuators_match_features`]'s shape and its reason: the property is
 /// about the artifact, so the artifact is what is asked, and a convention
@@ -943,10 +948,10 @@ const SCHED_CHECK_ASSERTS: [&str; 3] = [
 /// works at all.
 ///
 /// This is the half of the check-build gate that a booted guest cannot supply.
-/// A guest proves the asserts did not *fire*; a kernel with the feature quietly
-/// dropped proves that too, and rather more easily. Measured on the two binaries
-/// this build produces: 0 of 3 in the shipping kernel, 3 of 3 in the
-/// `sched-check` one.
+/// A guest proves the asserts did not *fire* and the report was published; a
+/// kernel with the feature quietly dropped proves the first of those too, and
+/// rather more easily. Measured on the two binaries this build produces: 0 of 3
+/// in the shipping kernel, 3 of 3 in the `sched-check` one.
 fn assert_sched_check_matches_features(features: &str, kernel: &[u8]) {
     let want = match features {
         "" => false,
@@ -957,17 +962,17 @@ fn assert_sched_check_matches_features(features: &str, kernel: &[u8]) {
         let needle = needle.as_bytes();
         kernel.windows(needle.len()).any(|w| w == needle)
     };
-    let wrong: Vec<&&str> = SCHED_CHECK_ASSERTS.iter().filter(|a| named(a) != want).collect();
+    let wrong: Vec<&&str> = SCHED_CHECK_LITERALS.iter().filter(|a| named(a) != want).collect();
     assert!(
         wrong.is_empty(),
-        "the {} kernel {} {} of the {} scheduler check asserts: {wrong:?}.\n\
+        "the {} kernel {} {} of the {} scheduler check instruments: {wrong:?}.\n\
          `sched-check` forwards to `toyos-sched/check`, so a build that carries the feature \
-         and not the asserts is a check build in name only — which is what a green \
+         and not the instruments is a check build in name only — which is what a green \
          `sched_check_build` would then be certifying.",
         if want { "sched-check" } else { "shipping" },
         if want { "is missing" } else { "names" },
         wrong.len(),
-        SCHED_CHECK_ASSERTS.len(),
+        SCHED_CHECK_LITERALS.len(),
     );
 }
 
@@ -1138,10 +1143,9 @@ pub fn designate_for_format(path: &Path, len: u64) {
 ///
 /// A `cargo test` run boots ~76 machines, and most of those boots ask for an
 /// image some earlier boot already built; the three `cargo` invocations then
-/// take ~1.4 s between them to answer "nothing changed"
-/// (`specs/assessments/test-cost-audit.md` §1.4). In memory and never on disk, so a run gets
-/// one answer for the tree it started against and the next run asks cargo
-/// again.
+/// take ~1.4 s between them to answer "nothing changed". In memory and never on
+/// disk, so a run gets one answer for the tree it started against and the next
+/// run asks cargo again.
 ///
 /// Per part rather than per image, because a part is what a key can be true of:
 /// the kernel is its feature set, the bootloader is its init list, the initrd is
@@ -1600,9 +1604,9 @@ mod tests {
     ///
     /// A name that reappears in `kernel/Cargo.toml` is a 46th kernel, and the
     /// suite would build it without anything saying so — which is the state
-    /// `specs/assessments/test-cost-audit.md` §5.9.7 replaced. The two lists are read from
-    /// the two files that declare them, so neither can be satisfied by editing
-    /// this test.
+    /// collapsing seven per-actuator features into `test-actuators` got out of.
+    /// The two lists are read from the two files that declare them, so neither
+    /// can be satisfied by editing this test.
     #[test]
     fn no_actuator_is_also_a_cargo_feature() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -1618,10 +1622,10 @@ mod tests {
 
     /// The features a kernel build may still carry, and the whole list.
     ///
-    /// **The gate on the count this landing is about.** Each name here is a
-    /// kernel `cargo test` may build beside the two, so adding one is a
-    /// decision to pay ~6.9 s of wall clock and ~29.6 s of CPU per full run
-    /// after any kernel edit (§5.9.2) — and `boot-actuators` exists so that
+    /// **The gate on the count.** Each name here is a kernel `cargo test` may
+    /// build beside the two, so adding one is a decision to pay the ~6.9 s of
+    /// wall clock and ~29.6 s of CPU measured for one extra kernel build per
+    /// full run after any kernel edit — and `boot-actuators` exists so that
     /// the answer is almost always a parameter instead.
     #[test]
     fn the_kernel_declares_only_the_builds_that_earned_one() {
@@ -1639,15 +1643,11 @@ mod tests {
                 // publication relaxed and prove `inbox` reds without the
                 // release.
                 "inbox-release-off",
-                // The five below join `inbox-release-off` and `wake-fence-off`
-                // as loom negative controls, and between them cost **no kernel
-                // build**: no `cargo test` invocation in `src/` or `tests/`
-                // names one, and only `kernel-loom` turns them on. They are
-                // declared here so `cfg` checking knows the names. §16.1 of
-                // `specs/completion-architecture-spec.md` pairs each with the
-                // model it must red, and the reason they exist is that five of
-                // the seven loom models carried no control at all while that
-                // section claimed every model did.
+                // The five below cost no kernel build at all, for
+                // `wake-fence-off`'s reason: each is declared only so `cfg`
+                // checking knows the name, and turned on only by
+                // `kernel-loom`, one at a time, to relax the single edge its
+                // named model rests on and prove that model reds without it.
                 "lock-acquire-off",
                 "log-commit-release-off",
                 "loom",
@@ -1663,11 +1663,74 @@ mod tests {
                 "test-actuators",
                 // Costs no kernel build at all, for `loom`'s reason: declared
                 // so `cfg` checking knows the name, and turned on only by
-                // `kernel-loom` — to remove §2.6a's two `SeqCst` fences and
-                // prove `log_wake` reds without them.
+                // `kernel-loom` — to remove the log wake path's two `SeqCst`
+                // fences and prove `log_wake` reds without them.
                 "wake-fence-off",
             ],
-            "the kernel declares a feature `specs/assessments/test-cost-audit.md` §5.9.7 does not account for"
+            "the kernel declares a feature this list does not account for"
+        );
+    }
+
+    /// Every negative control `kernel-loom/Cargo.toml` and
+    /// `toyos-sched/loom/Cargo.toml` declare — every feature name besides the
+    /// structural ones both crates carry for other reasons.
+    ///
+    /// `loom` selects loom's instrumented atomics; `check` and `protocol-port`
+    /// mirror `toyos-sched`'s own features so the shared sources compile
+    /// identically and name nothing a model turns on. Everything else declared
+    /// in either file is, by construction, a `--features <name>` command that
+    /// must red a named model — each file's own comment beside the name
+    /// carries the argument for why.
+    fn declared_loom_controls(root: &Path) -> Vec<(&'static str, String)> {
+        const NOT_A_CONTROL: &[&str] = &["loom", "check", "protocol-port", "default"];
+        let mut out = Vec::new();
+        for (crate_name, manifest) in [
+            ("kernel-loom", "kernel-loom/Cargo.toml"),
+            ("toyos-sched-loom", "toyos-sched/loom/Cargo.toml"),
+        ] {
+            let path = root.join(manifest);
+            let text = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("Failed to read {}: {e}", path.display()));
+            let parsed: KernelManifest = toml::from_str(&text)
+                .unwrap_or_else(|e| panic!("Failed to parse {}: {e}", path.display()));
+            for name in parsed.features.into_keys() {
+                if !NOT_A_CONTROL.contains(&name.as_str()) {
+                    out.push((crate_name, name));
+                }
+            }
+        }
+        out
+    }
+
+    /// **A control nobody runs is a control nobody has shown can fail.** Every
+    /// name [`declared_loom_controls`] finds must appear as `--features <name>`
+    /// somewhere in `host-tests.yml` — the one place these are wired, by every
+    /// existing comment's own account — or a new control can be declared and
+    /// run nowhere, silently, which is exactly how five of `kernel-loom`'s six
+    /// and `toyos-sched-loom`'s `doorbell-kick-relaxed` went unwired until
+    /// 2026-08-17: nothing before this test required a declared control to
+    /// have a step.
+    ///
+    /// A substring check and not a YAML parse, for `src/ci.rs`'s `nameless`
+    /// reason: the shape a step's command line has is fixed, and a real parse
+    /// would have to reconstruct multi-line `run:` blocks to find it in.
+    #[test]
+    fn every_loom_control_is_wired_into_host_tests() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workflow = fs::read_to_string(root.join(".github/workflows/host-tests.yml"))
+            .expect("host-tests.yml is readable");
+        let mut missing = Vec::new();
+        for (crate_name, control) in declared_loom_controls(root) {
+            let needle = format!("--features {control}");
+            if !workflow.contains(&needle) {
+                missing.push(format!("{crate_name}: {control} ({needle:?} not found in host-tests.yml)"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "a loom negative control is declared with no CI step running it — \
+             wire it into .github/workflows/host-tests.yml beside the others:\n  {}",
+            missing.join("\n  ")
         );
     }
 
@@ -1714,9 +1777,9 @@ mod tests {
     /// **Every config with a `[boot] start` runs `/bin/logd`, and `logread` is
     /// held by exactly the programs that read a cursor.**
     ///
-    /// `specs/log-architecture-spec.md` §5.1a and §9.5. The kernel stopped
-    /// writing `/log` at L6, so a boot config that does not start `logd` is an
-    /// image whose log partition stays empty for the whole of that boot — and on
+    /// The kernel writes no file — `/bin/logd` owns `/log` and reads records off
+    /// a cursor — so a boot config that does not start `logd` is an image whose
+    /// log partition stays empty for the whole of that boot — and on
     /// the machine this subsystem exists for, a T14 with no serial port, that is
     /// the boot with no record of itself anywhere. A thirteenth config added
     /// later fails the first clause **by default**, which is the direction this
@@ -1728,14 +1791,13 @@ mod tests {
     /// capability handed out for a plan. Two programs read a cursor —
     /// `/bin/logd`, which writes the file, and `test-runner`, which runs the
     /// conservation gates inside itself — so those two carry it and nothing
-    /// else may. `/bin/console` is the near miss the spec argues about: it
-    /// *could* show this boot's records live off a cursor instead of seeding
-    /// from the previous boot's files, and it does not hold the right until
-    /// something in it reads one.
+    /// else may. `/bin/console` is the near miss: it *could* show this boot's
+    /// records live off a cursor instead of seeding from the previous boot's
+    /// files, and it does not hold the right until something in it reads one.
     ///
-    /// It reads the **parsed** `ProgramConfig` and never the file text (§3.2):
-    /// a grep over the TOML would pass on a row that is commented out and on a
-    /// key `serde` never saw.
+    /// It reads the **parsed** `ProgramConfig` and never the file text: a grep
+    /// over the TOML would pass on a row that is commented out and on a key
+    /// `serde` never saw.
     #[test]
     fn every_boot_config_runs_logd() {
         const READERS: &[&str] = &["logd", "test-runner"];

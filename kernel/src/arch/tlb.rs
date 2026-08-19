@@ -40,12 +40,12 @@
 //! issued concurrently each spun for the other's acknowledgement with `IF`
 //! clear and no path left by which either could give one, so both died at the
 //! deadline — reproduced as a double kernel panic and as seven different
-//! wide-phase test failures carrying one signature (`specs/issues/kernel/`).
+//! wide-phase test failures carrying one signature (`issues/kernel/`).
 //!
 //! What is left is an `IF=0` spin that is *not* a `Lock` and not this wait: a
 //! driver waiting on a device register inside a handler. Those are latency, not
 //! deadlock, because each carries its own deadline — but the deadline can be
-//! seconds (`specs/issues/kernel/`, xHCI inside `drain_irqs`), so
+//! seconds (`issues/kernel/`, xHCI inside `drain_irqs`), so
 //! [`ACK_TIMEOUT`] is set above the largest of them and a CPU past it is
 //! named in a panic rather than waited for forever.
 
@@ -76,7 +76,7 @@ static SIBLINGS_ANSWER: AtomicBool = AtomicBool::new(false);
 ///
 /// Generous on purpose: a target inside `drain_irqs` may be in xHCI enumeration
 /// or endpoint recovery, which spin on `USB_TIMEOUT_NS` = 2 s with `IF` clear
-/// (`specs/issues/kernel/`). Anything past that is not a slow CPU, it is a
+/// (`issues/kernel/`). Anything past that is not a slow CPU, it is a
 /// CPU that will never answer, and a panic naming it is worth more than a hang
 /// that looks like every other freeze.
 ///

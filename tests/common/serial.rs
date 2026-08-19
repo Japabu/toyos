@@ -27,8 +27,138 @@
 
 use super::qemu::{is_kernel_line, QemuInstance};
 
-/// Panic markers. One list, so a test cannot scan for two of the three.
-const FATAL: &[&str] = &["PANIC:", "KERNEL PANIC", "panicked at"];
+/// Whose death a console line reports.
+///
+/// The distinction is not decoration — it is the whole of what
+/// [`QemuInstance::run_test_paced`] was missing. A machine that has halted
+/// answers nothing else the run asks; a process that died is what half this
+/// suite is *for*.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Died {
+    /// The kernel itself. Every path that writes one of these words ends at
+    /// `apic::halt_all_cpus` — **unless** the panic handler finds the panic
+    /// recoverable, which it does for a `panic!` taken in syscall context
+    /// (`kernel/src/main.rs`: the caller is killed and the machine carries on,
+    /// which is what `panic_recovery`, `heap_ceiling` and
+    /// `screen_recoverable_untouched` are about). No line says which of the two
+    /// happened. So what a caller learns here is "the kernel said it was
+    /// dying", and the guest going quiet afterwards is what says it meant it.
+    Kernel,
+    /// A process the kernel killed: a Ring 3 fault, reported by name in
+    /// `kernel/src/arch/idt/exceptions.rs`. The machine is fine — a test whose
+    /// whole subject is a process dying (`handle_kill_policy` and every
+    /// `faults.rs` probe) produces these deliberately. Before a boot's ready
+    /// marker it still ends the boot: whatever died was `init` or one of its
+    /// children, and nothing left is going to reach the marker.
+    Faulted,
+    /// A process that ended itself — its own panic handler wrote the line
+    /// (`userland/libc/src/lib.rs`, or the std fork's). Never the machine's
+    /// business, and not even always the boot's: `sshd` loses a race with
+    /// `netd`'s teardown on a NIC-less machine and panics across boots that
+    /// then come up perfectly
+    /// (`issues/build/sshd-panics-when-netd-exits-before-it-binds.md`),
+    /// which is why a boot wait must not end on one.
+    Panicked,
+}
+
+/// Every spelling of a death this tree produces, and what it means from each of
+/// the two speakers a console carries.
+///
+/// **One table, two columns, because the spelling is only half the answer.**
+/// `PANIC:` is the header `crash_report_panic` writes and it is also whatever a
+/// program chooses to print; `SEGFAULT` is written by the kernel *about
+/// somebody else*. So who is speaking picks the column — [`is_kernel_line`],
+/// the harness's one definition of that — and a spelling read out of the wrong
+/// column is exactly the bug this table exists to make unwriteable. Nothing
+/// else in `tests/common/qemu.rs` knows these words; `one_vocabulary` in
+/// `tests/toyos.rs` is what keeps it that way.
+///
+/// The two columns are equal for every spelling no program in this tree writes,
+/// and that is deliberate rather than lazy: the console is not line-atomic, so
+/// a program's unterminated write can be spliced ahead of a kernel record and
+/// take the `[kernel …]` prefix off the front of the assembled line. A word
+/// only the kernel says is still the kernel's however the line was built.
+///
+/// Order matters where one spelling contains another: `PANIC:` is looked for
+/// before `panicked at`, so the header of a kernel crash report is read as the
+/// header and not as its own second line — and `EARLY PANIC:` needs no row,
+/// because it carries `PANIC:` inside it.
+///
+/// What this table does **not** claim, because the console cannot say it:
+/// `fatal_exception`'s recursive arm writes `FAULT rip=… RECURSIVE` and then
+/// halts if the fault was the kernel's and kills the process if it was a
+/// program's — and it is the only line either case produces, because that arm
+/// skips `crash_report`. The non-recursive arm prints the same `FAULT rip=…`
+/// before every ordinary Ring 3 segfault, of which this suite stages many
+/// deliberately. So the spelling is ambiguous both ways and is left out; a
+/// recursive kernel fault is still found by the guard, one silent ceiling later.
+const DEATHS: &[(&str, Died, Died)] = &[
+    // spelling             the kernel wrote it   anybody else wrote it
+    // kernel/src/arch/idt/exceptions.rs — a Ring 0 exception. Always fatal.
+    ("KERNEL PANIC", Died::Kernel, Died::Kernel),
+    // `double_fault_handler`, which is `-> !` and ends at `halt_all_cpus`. It
+    // writes none of the words above it, which is how a staged `#DF` inside a
+    // `run_test` was still reported as a stall after the rest of this table
+    // existed — the measurement that put this row here.
+    ("DOUBLE FAULT", Died::Kernel, Died::Kernel),
+    // `machine_check_handler`, the one exception a Ring 3 frame does not make
+    // the process's fault. Also `-> !`.
+    ("MACHINE CHECK", Died::Kernel, Died::Kernel),
+    // kernel/src/iommu/vtd/fault.rs — every stream on this machine is
+    // kernel-owned, so a DMA fault is a kernel bug and the handler halts.
+    ("iommu: DMA FAULT", Died::Kernel, Died::Kernel),
+    // kernel/src/main.rs — a panic taken while already panicking.
+    ("DOUBLE PANIC", Died::Kernel, Died::Kernel),
+    // kernel/src/main.rs — the reentry guard, written straight out the UART
+    // port with no lock and therefore with no prefix. It reaches the 16550 log
+    // rather than the console, and is here so that a capture carrying it is
+    // never read as anything else.
+    ("PANIC REENTRY", Died::Kernel, Died::Kernel),
+    // kernel/src/arch/idt/exceptions.rs `crash_report_panic` — a Rust `panic!`.
+    ("PANIC:", Died::Kernel, Died::Panicked),
+    // `PanicInfo`'s `Display` newlines this out of the record above, so the
+    // kernel writes it too — and so does every program's panic handler.
+    ("panicked at", Died::Kernel, Died::Panicked),
+    ("libc panic:", Died::Panicked, Died::Panicked),
+    // kernel/src/arch/idt/exceptions.rs — a Ring 3 fault, by name.
+    ("SEGFAULT", Died::Faulted, Died::Faulted),
+    ("SIGILL tid=", Died::Faulted, Died::Faulted),
+    ("SIGFPE tid=", Died::Faulted, Died::Faulted),
+    ("SIGBUS tid=", Died::Faulted, Died::Faulted),
+    ("FATAL tid=", Died::Faulted, Died::Faulted),
+];
+
+/// What this console line says died, if anything.
+///
+/// The one answer. `wait_for_ready` ends a boot on a death of any kind the
+/// machine cannot come back from; `run_test_paced` and `await_guest` end a run
+/// on [`Died::Kernel`] alone, because a program is allowed to die without
+/// taking the machine with it; and [`Serial::must_be_clean`] refuses a capture
+/// carrying one. Four questions, one vocabulary, and no way for them to
+/// disagree about a spelling.
+pub fn died(line: &str) -> Option<Died> {
+    let (_, by_kernel, by_anyone) = DEATHS.iter().find(|(word, _, _)| line.contains(word))?;
+    Some(if is_kernel_line(line) { *by_kernel } else { *by_anyone })
+}
+
+/// The first line of a capture on which the kernel said it was dying.
+///
+/// For a wait that holds the whole capture rather than reading a line at a time
+/// — [`super::qemu::await_guest`] is the one — and for the same reason: a guest
+/// that has halted every CPU has stopped for a reason that is written down, and
+/// a verdict of "it went quiet" throws that reason away.
+pub fn kernel_death(capture: &str) -> Option<&str> {
+    capture.lines().find(|l| died(l) == Some(Died::Kernel))
+}
+
+/// What the one answer is made of, for the gate that keeps it the only one.
+///
+/// `one_vocabulary` in `tests/toyos.rs` refuses a wait that hands any of these
+/// straight to a scan of its own; it reads them from here so that it cannot
+/// become a second, staler copy of the list it is protecting.
+pub fn spellings() -> impl Iterator<Item = &'static str> {
+    DEATHS.iter().map(|(word, _, _)| *word)
+}
 
 pub struct Serial {
     text: String,
@@ -68,7 +198,7 @@ impl Serial {
     /// A line carrying a kernel prefix somewhere other than its start, which
     /// is the virtio-console's missing line atomicity showing up in the
     /// capture: `log!` and a userspace `println!` interleave mid-word (see
-    /// `specs/issues/`). Reported rather than repaired — a needle that went
+    /// `issues/`). Reported rather than repaired — a needle that went
     /// missing because it was split in half should say so instead of looking
     /// like the guest never said it.
     pub fn interleaved(&self) -> Option<&str> {
@@ -117,7 +247,7 @@ impl Serial {
     /// then read the first `nothing decoded` line in its capture as the answer;
     /// the driver's own bring-up produces one before that marker, and on a
     /// laptop a real spurious interrupt can too
-    /// (`specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`).
+    /// (`issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`).
     ///
     /// The marker is what the injection was timed off, so it is the boundary the
     /// test actually knows — no host clock is involved, and a stranger line
@@ -163,9 +293,18 @@ impl Serial {
         }
     }
 
-    /// Nothing panicked. The one place the marker list lives.
+    /// Nothing panicked.
+    ///
+    /// Read straight off [`DEATHS`] rather than out of a second list beside it:
+    /// what this refuses is every spelling the *kernel* uses about itself,
+    /// wherever on the line it appears. A process dying is not this assertion's
+    /// business — `must_not_say("SEGFAULT")` is a thing a caller says when it
+    /// means it.
     pub fn must_be_clean(&self) -> Result<(), String> {
-        for bad in FATAL {
+        for (bad, by_kernel, _) in DEATHS {
+            if *by_kernel != Died::Kernel {
+                continue;
+            }
             self.must_not_say(bad)?;
         }
         Ok(())
@@ -267,10 +406,84 @@ pub fn self_check() -> Result<(), String> {
         return Err(format!("a split needle failed without naming the cause: {err}"));
     }
 
+    // **Who died, and the case the naive fix gets wrong.** A wait that ends a
+    // run on a bare panic spelling ends it on a *program's* panic too, and a
+    // program is expected to be able to die without killing the machine. The
+    // prefix is the whole discriminator, so it is asserted from both sides:
+    // the same words, once from the kernel and once from somebody else.
+    const KERNEL_PANIC_LINE: &str =
+        "[kernel 1.450 cpu3] PANIC: panicked at kernel/src/sched/reserve.rs:812:9:";
+    const USER_PANIC_LINE: &str = "thread 'main' (1) panicked at sshd/src/main.rs:359:23:";
+    let whose: &[(&str, Option<Died>)] = &[
+        // The kernel, about itself.
+        (KERNEL_PANIC_LINE, Some(Died::Kernel)),
+        ("[kernel 0.068 cpu0] KERNEL PANIC: read unmapped address at 0x0", Some(Died::Kernel)),
+        // The three that write none of the words beside them. The first is
+        // verbatim what a staged `#DF` put on the console.
+        (
+            "[kernel 0.443 cpu0] DOUBLE FAULT on CPU 0 (pid=Some(Pid(5)) tid=Some(Tid(0)))",
+            Some(Died::Kernel),
+        ),
+        ("[kernel 0.443 cpu0] MACHINE CHECK on CPU 3", Some(Died::Kernel)),
+        (
+            "[kernel 4.100 cpu0] iommu: DMA FAULT unit0 stream=00:1f.2 addr=0x1000 access=read \
+             reason=0x06 unknown",
+            Some(Died::Kernel),
+        ),
+        ("[kernel 0.001 cpu0] EARLY PANIC: nothing is up yet", Some(Died::Kernel)),
+        ("[kernel 2.000 cpu1] DOUBLE PANIC", Some(Died::Kernel)),
+        // No prefix, and still the kernel's: the reentry line goes out the UART
+        // port directly, and no program in this tree says these words.
+        ("\n!!! PANIC REENTRY: CPU halted !!!", Some(Died::Kernel)),
+        ("KERNEL PANIC: spliced onto somebody's unterminated write", Some(Died::Kernel)),
+        // The kernel, about a process. Its line, somebody else's death.
+        ("[kernel 0.412 cpu0] SEGFAULT tid=7: read unmapped address at 0x0", Some(Died::Faulted)),
+        ("[kernel 0.412 cpu0] SIGILL tid=7: illegal instruction", Some(Died::Faulted)),
+        ("[kernel 0.412 cpu0] FATAL tid=7: machine check", Some(Died::Faulted)),
+        // A process, about itself. Neither of these ends anybody's run.
+        (USER_PANIC_LINE, Some(Died::Panicked)),
+        ("libc panic: panicked at src/main.rs:9:1:", Some(Died::Panicked)),
+        // The one the naive fix cannot tell from the kernel's, and must.
+        ("PANIC: printed by a program that felt like printing it", Some(Died::Panicked)),
+        // Nothing died.
+        ("[kernel 0.377 cpu0] NVMe: found", None),
+        ("hello from userland", None),
+        ("", None),
+    ];
+    for (line, want) in whose {
+        let got = died(line);
+        if got != *want {
+            return Err(format!("{line:?} reads as {got:?}, and it is {want:?}"));
+        }
+    }
+    // The two spellings that decide it, side by side, from both speakers. Stated
+    // as its own case because the table above would still pass if `died`
+    // ignored the prefix and every kernel-written line simply came first.
+    for word in ["PANIC:", "panicked at"] {
+        let kernel = format!("[kernel 1.450 cpu3] {word} whatever follows");
+        let program = format!("some program says {word} whatever follows");
+        if died(&kernel) != Some(Died::Kernel) || died(&program) != Some(Died::Panicked) {
+            return Err(format!(
+                "{word:?} does not depend on who said it: kernel {:?}, program {:?}",
+                died(&kernel),
+                died(&program)
+            ));
+        }
+    }
+    // And `must_be_clean` still refuses both of them, because a boot that
+    // carries either is not a clean boot whoever wrote it.
+    for line in [KERNEL_PANIC_LINE, USER_PANIC_LINE] {
+        let capture = Serial::named("test capture", format!("[kernel 0.001 cpu0] up\n{line}\n"));
+        if capture.must_be_clean().is_ok() {
+            return Err(format!("must_be_clean passed a capture carrying {line:?}"));
+        }
+    }
+
     eprintln!(
         "  [serial] {} vocabulary cases, both directions, plus the anchored scan against a \
-         stranger line",
-        cases.len()
+         stranger line and {} lines classified by who said them",
+        cases.len(),
+        whose.len()
     );
     Ok(())
 }

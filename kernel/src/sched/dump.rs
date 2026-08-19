@@ -15,7 +15,7 @@
 //! can say "cpu 3 is not scheduling at all".
 //!
 //! Nothing here allocates, nothing waits on a lock it could find held, and
-//! every list is bounded. See `specs/issues/diagnostics/` for what it was built
+//! every list is bounded. See `issues/diagnostics/` for what it was built
 //! to settle.
 //!
 //! **This report cannot describe the state it is summoned to describe, and the

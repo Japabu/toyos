@@ -4,7 +4,7 @@
 //! `PROCESS_TABLE` on every trip round the idle loop — the standing aggressor
 //! against the crash report's `try_lock`, which is the whole reason a fault
 //! report could print a bare address for a symbol that was right there
-//! (`specs/issues/panic-path/`). Gating housekeeping on a flag is only sound if
+//! (`issues/panic-path/`). Gating housekeeping on a flag is only sound if
 //! the flag cannot lose a raise, and that is what these models are for: a raise
 //! concurrent with a claim, from every interleaving loom can build.
 //!
@@ -26,7 +26,7 @@
 //!
 //! makes `reap_gate.rs`'s `raise` store relaxed and this file must red, at
 //! [`a_claim_sees_the_enrolled_work`] — *a claimed gate handed the reaper an
-//! empty poison slot*, which is the defect stated exactly. Verified 2026-08-16,
+//! empty poison slot*, which is the defect stated exactly. Verified 2026-08-17,
 //! both ways round.
 
 use kernel_loom::reap_gate::ReapGate;

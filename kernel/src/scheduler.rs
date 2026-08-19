@@ -878,23 +878,57 @@ pub fn flush_current_stats(acct: &mut process::ProcessAccounting) {
 /// be a log file on the stick it booted from. The occupancy of the run queues
 /// and the occupancy of the page pools are read together or not at all.
 ///
-/// A [`Cadence`] under §3.4's widened definition — "how often a thing may be
-/// re-done, and what makes that rate affordable" — and *not* a deadline. It
-/// rate-limits an opportunistic check on a CPU that is already awake;
-/// converting it into something a CPU is woken for would add a wake to a
-/// machine with nothing to run, which is an audio change.
+/// A [`Cadence`] — how often a thing may be re-done, and what makes that rate
+/// affordable — and *not* a deadline. It rate-limits an opportunistic check on
+/// a CPU that is already awake; converting it into something a CPU is woken for
+/// would add a wake to a machine with nothing to run, which is an audio change.
 const SNAPSHOT_INTERVAL: Cadence = Cadence::every(
     Duration::from_secs(10),
     "one clock read and one relaxed compare per idle trip, on a CPU already awake",
 );
+
+/// `sched-fast-health`'s cadence, and the same kind of thing at a rate no
+/// shipped machine pays: the actuator exists because telling a CPU that spins
+/// through idle from one that halts cleanly needs two prints to compare — the
+/// `trips=` counter inside each line is not itself rate-limited, only the print
+/// carrying it is — and no guest test program this suite runs lives past
+/// [`SNAPSHOT_INTERVAL`] once, let alone the two prints a comparison needs.
+const FAST_SNAPSHOT_INTERVAL: Cadence = Cadence::every(
+    Duration::from_millis(200),
+    "an actuator no boot arms; a test that needs two prints buys them for one boot",
+);
+
+/// Which of the two cadences this boot took, read once per idle trip.
+fn snapshot_interval_ns() -> u64 {
+    if crate::actuator::sched_fast_health() {
+        FAST_SNAPSHOT_INTERVAL.nanos()
+    } else {
+        SNAPSHOT_INTERVAL.nanos()
+    }
+}
 
 /// When each CPU may next print its own line. Per CPU rather than global: which
 /// CPUs reach idle is most of what the line says, and one global deadline would
 /// let whichever CPU won the race speak for all of them.
 static NEXT_HEALTH: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
+/// How many times each CPU has passed through idle since boot, counted on
+/// every trip rather than only the ones that print.
+///
+/// This is the counter the rate limit above took out of the log line, kept
+/// but not silenced: incrementing it costs one relaxed `fetch_add`, nothing
+/// like the print it used to gate, so it carries no part of the feedback loop
+/// `log_health`'s doc comment describes. What it restores is the signal
+/// `i8042_quarantine` needs — "a keyboard, not a CPU" is a claim about
+/// whether a CPU is halting, and a rate-limited *count of lines* cannot tell
+/// a CPU that halts between rare wakes from one that spins between rare
+/// prints: both produce one line per [`snapshot_interval_ns`], because the
+/// print is what the rate limit throttles. The number inside the line is
+/// what still moves at two different speeds — this one.
+static IDLE_TRIPS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
 /// A snapshot of this CPU's run queues, at most once per
-/// [`SNAPSHOT_INTERVAL`], plus the machine's page pools on the same cadence.
+/// [`snapshot_interval_ns`], plus the machine's page pools on the same cadence.
 ///
 /// Called from the idle loop on every trip, and the cadence is a wall clock
 /// because a trip is not a unit of time. It used to be one line per 1000 trips
@@ -918,8 +952,14 @@ pub fn log_health() {
     let now = crate::hw::now_ns();
     let cpu = percpu::cpu_id();
     let Some(next_health) = NEXT_HEALTH.get(cpu as usize) else { return };
+    // Unconditional and every trip, unlike the print below: this is the part
+    // of the old per-trip counter that is safe to keep unthrottled, because
+    // nothing downstream of it runs more often for having moved.
+    let trips = IDLE_TRIPS
+        .get(cpu as usize)
+        .map_or(0, |t| t.fetch_add(1, Ordering::Relaxed) + 1);
     if now >= next_health.load(Ordering::Relaxed) {
-        next_health.store(now + SNAPSHOT_INTERVAL.nanos(), Ordering::Relaxed);
+        next_health.store(now + snapshot_interval_ns(), Ordering::Relaxed);
         let ready = driver::ready_len() + usize::from(percpu::current_tid().is_some());
         let parked = driver::parked_len();
         // **`dying` is on the line because this line is the whole account.** On
@@ -930,24 +970,25 @@ pub fn log_health() {
         // send.
         let dying = driver::dying_len();
         crate::log!(
-            "sched: cpu={} ready={} dying={} parked={} current={:?}",
+            "sched: cpu={} ready={} dying={} parked={} current={:?} trips={}",
             cpu,
             ready,
             dying,
             parked,
-            percpu::current_tid()
+            percpu::current_tid(),
+            trips,
         );
     }
 
     static NEXT_PMM_DUMP: AtomicU64 = AtomicU64::new(0);
     let next = NEXT_PMM_DUMP.load(Ordering::Relaxed);
     if next == 0 {
-        NEXT_PMM_DUMP.store(now + SNAPSHOT_INTERVAL.nanos(), Ordering::Relaxed);
+        NEXT_PMM_DUMP.store(now + snapshot_interval_ns(), Ordering::Relaxed);
     } else if now >= next
         && NEXT_PMM_DUMP
             .compare_exchange(
                 next,
-                now + SNAPSHOT_INTERVAL.nanos(),
+                now + snapshot_interval_ns(),
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             )

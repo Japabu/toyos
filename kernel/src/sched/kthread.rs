@@ -1,18 +1,17 @@
 //! Kernel threads: a task with no address space of its own, and the one place
 //! that says what a panic inside one means.
 //!
-//! `specs/log-architecture-spec.md` §4.3 is the design and L3 built it for one
-//! thread, `klogd`. `specs/completion-architecture-spec.md` §10's C6 put the
-//! other two on it — `drivers::xhci::usbd` and `crate::iod` — so [`ROWS`] now
-//! carries all three, and the machine has one thread per kind of work that must
-//! not borrow whichever thread happened to trap.
+//! There are three: `klogd`, the console drainer; `drivers::xhci::usbd`; and
+//! `crate::iod`. [`ROWS`] carries all three, and the machine has one thread per
+//! kind of work that must not borrow whichever thread happened to trap — a
+//! stuck USB enumeration must not stop the log.
 //!
 //! **A kernel thread is not a special kind of task.** It is an ordinary task
-//! whose `NewTask::address_space` is `None` — `driver::spawn` then names the
-//! kernel's own `cr3`, which is what every CPU is already in between two user
-//! threads — reached through a trampoline that never issues an `iretq`
-//! (`loader::start::kernel_start`). It is preemptible, it is stealable, it
-//! shows up in `ps` and in Ctrl+Alt+D, and it logs like anything else.
+//! that names `mm::paging::kernel` as its address space — the one every CPU is
+//! already in between two user threads — reached through a trampoline that
+//! never issues an `iretq` (`loader::start::kernel_start`). It is preemptible,
+//! it is stealable, it shows up in `ps` and in Ctrl+Alt+D, and it logs like
+//! anything else.
 //!
 //! It gets a process-table entry rather than a bare task, and that is what
 //! makes it nameable: `share_for` is keyed by `Pid`, `sched::dump`'s census
@@ -69,7 +68,7 @@ const CLAIMING: u64 = u64::MAX - 1;
 /// a kernel thread, it is nondeterministic.** `main.rs`'s panic handler
 /// recovers when `percpu::syscall_rip() != 0 && percpu::current_tid().is_some()`
 /// — and `syscall_rip` is *never cleared*
-/// (`specs/issues/panic-path/syscall-rip-never-cleared.md`, and
+/// (`issues/panic-path/syscall-rip-never-cleared.md`, and
 /// `arch/idt/exceptions.rs` says so in its own comment). A kernel thread has a
 /// tid, so the second clause holds; the first reads whatever user thread last
 /// ran on *this* CPU left behind. The same panic on the same build therefore
@@ -226,7 +225,7 @@ pub fn spawn(name: &str, body: extern "C" fn(u64) -> !, arg: u64, on_panic: OnPa
 
     // **Reserved here, before the table lock, and published before
     // `enqueue_new`.** Its refusal is a panic, and a panic holding the process
-    // table is `specs/issues/panic-path/panic-holding-process-table-hangs.md`.
+    // table is `issues/panic-path/panic-holding-process-table-hangs.md`.
     let claim = Claim::take(name);
 
     let mut short = [0u8; THREAD_NAME_LEN];
@@ -256,7 +255,7 @@ pub fn spawn(name: &str, body: extern "C" fn(u64) -> !, arg: u64, on_panic: OnPa
     // **The kernel address space, named rather than defaulted to.** A kernel
     // thread runs in the one every CPU is already in between two user threads;
     // saying so here is what let `KernelPayload.address_space` stop being an
-    // `Option` (`specs/completion-architecture-spec.md` §15 row 12).
+    // `Option`, so one declaration decides every task's `cr3`.
     let sched = scheduler::enqueue_new(
         TaskId(pid, tid),
         stack,

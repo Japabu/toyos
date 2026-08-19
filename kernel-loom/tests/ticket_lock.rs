@@ -17,7 +17,7 @@
 //! makes `sync.rs`'s two loads of `now` relaxed and this file must red — loom
 //! answers `Causality violation: Concurrent write accesses to UnsafeCell`, which
 //! is a lock handing out data it did not synchronize, stated exactly. Verified
-//! 2026-08-16, both ways round.
+//! 2026-08-17, both ways round.
 
 use kernel_loom::sync::Lock;
 use loom::sync::Arc;

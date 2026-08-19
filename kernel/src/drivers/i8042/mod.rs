@@ -59,6 +59,10 @@ use crate::sync::Lock;
 use crate::time::{Budget, Cadence, Duration};
 use super::ioapic::{self, Gsi};
 
+mod tally;
+
+use tally::{Carried, Tally};
+
 const DATA: u16 = 0x60;
 const STATUS: u16 = 0x64;
 const COMMAND: u16 = 0x64;
@@ -125,39 +129,40 @@ static OVERRUNS: AtomicU32 = AtomicU32::new(0);
 static KEYBOARD_GSI: AtomicU32 = AtomicU32::new(u32::MAX);
 static AUX_GSI: AtomicU32 = AtomicU32::new(u32::MAX);
 
-/// Times the pin has actually asserted. The ISR's only bookkeeping, and the
-/// one number that answers the question `init`'s success line cannot: that
-/// line says the driver armed the line, not that anything ever came back over
-/// it.
+/// Every interrupt the pin has delivered, split by what the ISR found behind
+/// it. The ISR's only bookkeeping, and the one number that answers the question
+/// `init`'s success line cannot: that line says the driver armed the line, not
+/// that anything ever came back over it.
 ///
 /// Entries and not bytes, deliberately. `handler_poll` puts bytes in the ring
 /// from `init` with interrupts off, so a byte count cannot tell a delivered
 /// interrupt from a byte that was already sitting in the output buffer — which
 /// is exactly the confusion this counter exists to remove.
-static IRQS: AtomicU32 = AtomicU32::new(0);
+///
+/// One word rather than two counters, and `tally.rs` is the whole argument:
+/// "did anything arrive to decode" used to be a subtraction of two numbers the
+/// ISR wrote at either end of its burst, so a reader inside the burst answered
+/// it wrongly.
+static TALLY: Tally = Tally::new();
+
+/// Bytes taken off the ring, counted in [`pop`] before the byte leaves it.
+///
+/// **Where it is counted is load-bearing**, and after the drain was where it
+/// used to be. The mute verdict's `has_bytes` guard defers the report to the
+/// pass that holds the byte; a byte popped and not yet added here is in neither
+/// place, so a report from another CPU during the decode said `0 bytes` about a
+/// byte that had arrived and was in front of a decoder at that moment. Counted
+/// in `pop`, a delivered byte is in the ring or in this number at every instant
+/// and the guard means what it says.
 static RX_BYTES: AtomicU32 = AtomicU32::new(0);
 
-/// Interrupts the ISR found **nothing behind**: OBF clear on the first sample,
-/// so the burst read no byte at all.
-///
-/// `init` sends commands to the controller and *polls* for the answers, and the
-/// pin is armed before the last of those reads — so a byte can be taken by the
-/// polling reader before the ISR that same byte raised gets to run. What
-/// arrives then is an edge with an empty output buffer, and the counters are
-/// honest about it while the conclusion drawn from them was not: nothing was
-/// undecodable, the byte was simply somebody else's.
-///
-/// It is subtracted from [`IRQS`] wherever the question is "did anything arrive
-/// to decode", never where the question is "has the pin ever asserted" — an
-/// empty interrupt is evidence of the second and of nothing else.
-static EMPTY_IRQS: AtomicU32 = AtomicU32::new(0);
-
-/// When the pin first asserted. Set in the handler beside `IRQS`, which is the
-/// only place the two can be made to agree — the health line says "first seen"
-/// and there is now more than one line, so reading the clock where the line is
+/// When the pin first asserted. Set in the handler, which is the only place it
+/// and the tally can be made to agree — the health line says "first seen" and
+/// there is now more than one line, so reading the clock where the line is
 /// written dates the second one to when it was printed rather than to the event
-/// it reports. Never written by `handler_poll`: those bytes came from a poll
-/// and no pin asserted for them.
+/// it reports. Published by the tally's release, so a reader that sees the
+/// interrupt counted sees the stamp it belongs to. Never written by
+/// `handler_poll`: those bytes came from a poll and no pin asserted for them.
 static FIRST_IRQ_NS: AtomicU64 = AtomicU64::new(0);
 
 /// When the pin last asserted. What makes the periodic line's verdict exact
@@ -380,22 +385,36 @@ fn first_irq_ms() -> u64 {
 /// keeps two CPUs from both reporting.
 ///
 /// **"Nothing decoded" is a claim about bytes, so it is only made when bytes
-/// have arrived and been accounted for.** Two producers used to make it about
-/// something else, and both printed a line naming no byte at all — which is the
+/// have arrived and been accounted for.** Three producers used to make it about
+/// something else, and each printed a line naming no byte at all — which is the
 /// one shape `Unexplained` exists to replace, and which
 /// `i8042_undecoded_bytes` reads as a report about its own injection:
 ///
-/// - An interrupt with no byte behind it ([`EMPTY_IRQS`]). Counted apart and
-///   said in its own words below; the mute verdict stays owed.
-/// - A byte still in the ring. `service` drains before it reports, but the pin
-///   is live between the two, so an interrupt landing in that gap is counted
-///   here with its byte undecoded. One `has_bytes` load defers the report to
-///   the pass that has the byte, which is where the report was always meant to
-///   be made.
+/// - An interrupt with no byte behind it. Classified by the ISR and counted
+///   apart in [`TALLY`], said in its own words below; the mute verdict stays
+///   owed.
+/// - An interrupt still *inside* its burst. `carried` used to move on the way
+///   in, so a reader between the pin and the first `push_isr` had a count of
+///   arrived bytes and no byte anywhere. `tally.rs` is why that is no longer
+///   representable: the count moves once, after the burst, and after the bytes
+///   are in the ring.
+/// - A byte still in the ring, or one popped and not yet counted. `service`
+///   drains before it reports, but the pin is live between the two, so an
+///   interrupt landing in that gap is counted here with its byte undecoded. One
+///   `has_bytes` load defers the report to the pass that has the byte, which is
+///   where the report was always meant to be made — and [`RX_BYTES`] is counted
+///   in `pop` so that a byte in mid-decode is on one side of that guard rather
+///   than neither.
+///
+/// Between them: `carried > 0` means bytes reached the ring, and a byte that
+/// reached the ring is in it or in `RX_BYTES` at every instant, so `N interrupts
+/// and 0 bytes, nothing decoded` cannot be printed. The one exception says so
+/// itself — a ring overflow drops bytes the ISR had already counted, and
+/// `drain` logs that on its own line.
 fn report_health(state: u8) {
-    let irqs = IRQS.load(Ordering::Relaxed);
-    let carried = irqs.saturating_sub(EMPTY_IRQS.load(Ordering::Relaxed));
-    if carried > 0 || RX_BYTES.load(Ordering::Relaxed) > 0 {
+    let counts = TALLY.read();
+    let irqs = counts.irqs();
+    if counts.carried > 0 || RX_BYTES.load(Ordering::Relaxed) > 0 {
         if has_bytes() {
             return;
         }
@@ -477,7 +496,8 @@ fn arm_repeat() {
 /// and a compare; the compare-exchange is what keeps two CPUs in the same pass
 /// from both reporting, and is reached only when a line is actually owed.
 fn report_counters() {
-    let irqs = IRQS.load(Ordering::Relaxed);
+    let counts = TALLY.read();
+    let irqs = counts.irqs();
     if irqs == REPORTED_IRQS.load(Ordering::Relaxed) {
         return;
     }
@@ -494,7 +514,9 @@ fn report_counters() {
     // `empty` rides with the fault counters because that is the only place it
     // can still be read once traffic starts: the line above it fires only while
     // *every* interrupt was empty, and the common case is one at bring-up
-    // followed by a keyboard that works.
+    // followed by a keyboard that works. It comes out of the same reading as
+    // the total, so the two cannot disagree about how many interrupts there
+    // were.
     log!(
         "i8042: {} interrupts, {} bytes, {} keys, {} motion, {} undecoded, {} discarded, {} overruns, {} dropped, {} lost edges, {} empty — last byte at {}ms",
         irqs,
@@ -506,7 +528,7 @@ fn report_counters() {
         OVERRUNS.load(Ordering::Relaxed),
         DROPPED_TOTAL.load(Ordering::Relaxed),
         LOST_EDGES.load(Ordering::Relaxed),
-        EMPTY_IRQS.load(Ordering::Relaxed),
+        counts.empty,
         LAST_IRQ_NS.load(Ordering::Relaxed) / 1_000_000
     );
 }
@@ -543,7 +565,7 @@ pub fn report_line() {
     log!(
         "i8042: line status={:#04x} irqs={} bytes={} kbd {} aux {}",
         inb(STATUS),
-        IRQS.load(Ordering::Relaxed),
+        TALLY.read().irqs(),
         RX_BYTES.load(Ordering::Relaxed),
         Rte(KEYBOARD_GSI.load(Ordering::Relaxed)),
         Rte(AUX_GSI.load(Ordering::Relaxed)),
@@ -646,6 +668,11 @@ fn pop() -> Option<(u8, bool, u64)> {
         return None;
     }
     let value = BYTES[tail as usize % RING_LEN].load(Ordering::Relaxed);
+    // Counted *before* the slot is released, so that a byte is in the ring or in
+    // this number and never in neither: `report_health`'s `has_bytes` guard is
+    // only a guard if a byte in mid-decode is on one side of it. See
+    // [`RX_BYTES`].
+    RX_BYTES.fetch_add(1, Ordering::Relaxed);
     TAIL.store(tail.wrapping_add(1), Ordering::Release);
     Some((value as u8, value & AUX_FLAG != 0, (value >> TIME_SHIFT) * 1_000))
 }
@@ -670,7 +697,6 @@ fn buffer_full(status: u8) -> bool {
 /// Rust half of the pin-interrupt handler. Read the module doc before adding
 /// anything to it.
 pub extern "sysv64" fn handler() {
-    IRQS.fetch_add(1, Ordering::Relaxed);
     let timestamp = crate::clock::nanos_since_boot();
     // No compare-exchange: delivery is pinned to one CPU behind an interrupt
     // gate, so this handler cannot nest and there is no second writer.
@@ -696,12 +722,11 @@ pub extern "sysv64" fn handler() {
         // It cannot mask the line itself — that needs the I/O APIC lock.
         QUARANTINE.store(true, Ordering::Relaxed);
     }
-    if n == 0 {
-        // An edge with an empty output buffer. One relaxed add, in the one
-        // place that can tell it from an interrupt that delivered something:
-        // see [`EMPTY_IRQS`].
-        EMPTY_IRQS.fetch_add(1, Ordering::Relaxed);
-    }
+    // One release-add, here and not on the way in: what this says is what the
+    // burst *found*, so it is only sayable now — and the release publishes the
+    // bytes above it, so no reader can see this interrupt counted and go looking
+    // for a byte that has not landed. `tally.rs` carries the argument.
+    TALLY.record(if n == 0 { Carried::Nothing } else { Carried::Bytes });
     if n > 0 {
         crate::irq_ring::isr_publish(IrqSource::I8042, timestamp);
         crate::preempt::set_need_resched();
@@ -991,7 +1016,8 @@ fn drain() -> Drained {
 
     KBD_EVENTS.fetch_add(out.keys as u32, Ordering::Relaxed);
     AUX_EVENTS.fetch_add(out.motion as u32, Ordering::Relaxed);
-    RX_BYTES.fetch_add(out.bytes as u32, Ordering::Relaxed);
+    // `RX_BYTES` is not here: `pop` counts each byte as it takes it, which is
+    // what keeps a byte from being invisible for the length of its own decode.
     out
 }
 

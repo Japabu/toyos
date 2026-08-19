@@ -1,11 +1,14 @@
 //! Walking a live codec into a [`Codec`].
 //!
-//! The traversal `specs/plans/hda-driver-plan.md` §2.3 steps 1 and 2 describe, with
-//! every device-supplied count bounded and every contradiction a refusal. It is
-//! here rather than in the driver for the reason §5.2 gives about the path
-//! search: what a codec is asked, in what order, and which answers are refused
-//! are decisions, and a decision that can be a pure function is one a host test
-//! runs in milliseconds.
+//! The root node's subordinates give the function groups — the audio ones are
+//! kept, the modem ones named and skipped — and each group's own subordinate
+//! range gives its widgets and their capability words. Every device-supplied
+//! count is bounded and every contradiction is a refusal.
+//!
+//! It is here rather than in the driver for the reason the path search is: what
+//! a codec is asked, in what order, and which answers are refused are
+//! decisions, and a decision that can be a pure function is one a host test runs
+//! in milliseconds.
 //!
 //! The I/O is the caller's, as one method. Everything below it is arithmetic.
 

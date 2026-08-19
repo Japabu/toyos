@@ -179,7 +179,7 @@ pub fn init() {
 // The bracket spans the handler *and* the exit-to-user epilogue, because both
 // can context-switch. The epilogue used to run with the user state already put
 // back, so a switch there returned to Ring 3 carrying whatever the task that
-// ran in between had left in the registers — `specs/user-machine-state.md` §3.
+// ran in between had left in the registers.
 #[unsafe(naked)]
 extern "sysv64" fn syscall_entry() {
     ring3_naked_asm!(
@@ -997,8 +997,8 @@ enum RegTarget {
 ///
 /// The fd is the authorization and the device behind it owns the allow-list, so
 /// this function knows nothing about codecs or virtqueues — which is the test
-/// `specs/plans/hda-driver-plan.md` §4.4 sets for it being a device-register call
-/// rather than a device protocol back in the syscall table. Two stubs answer it
+/// for it being a device-register call rather than a device protocol smuggled
+/// back into the syscall table. Two stubs answer it
 /// now, which is the first evidence for that claim rather than a restatement of
 /// it.
 fn sys_device_reg(handle: RawHandle, offset: u64, width: u64, value: Option<u64>) -> u64 {
@@ -2031,15 +2031,14 @@ fn sys_shm_map(h: RawHandle) -> u64 {
 /// every refusal leaves the caller's table exactly as it was**, which is what
 /// makes `Gone` and `ResourceExhausted` honest: they are answers about the
 /// peer, and a caller retrying or closing what it still holds is right rather
-/// than fatal. Refusing to send the connection over itself is what keeps
-/// `capability-handles-spec.md` §8.4's cross-pair cycle to two objects rather
-/// than one.
+/// than fatal. Refusing to send the connection over itself is what keeps a
+/// cross-pair reference cycle to two objects rather than one.
 ///
 /// **Rights travel unchanged, `TRANSFER` included.** A move requires it and
 /// carries it, so everything that can be moved can be moved on: the
 /// non-transitive grant the pid ACL had is not expressible, and making it so
 /// is a rights word on *both* move paths rather than on this one
-/// (`specs/issues/isolation/a-moved-handle-is-always-re-movable.md`).
+/// (`issues/isolation/a-moved-handle-is-always-re-movable.md`).
 fn sys_handle_send(conn_h: RawHandle, handles: &crate::user_ptr::UserBytes, count: usize) -> u64 {
     let mut wanted = [RawHandle(0); MAX_TRANSFER_HANDLES];
     for (i, slot) in wanted.iter_mut().enumerate().take(count) {
@@ -2180,7 +2179,7 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
         if req_addr & (crate::mm::PAGE_2M - 1) != 0
             || req_addr < crate::vma::alloc_floor()
             || end > crate::vma::ALLOC_CEILING
-            || !crate::mm::user_span::in_user_half(req_addr, aligned as u64)
+            || !toyos_userbound::in_user_half(req_addr, aligned as u64)
         {
             return SyscallError::InvalidArgument.to_u64();
         }

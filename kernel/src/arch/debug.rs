@@ -4,11 +4,11 @@
 //! with zero callers each — `set_context`, `watch_write`, `clear`,
 //! `monitor_pte` and a timer-tick PTE poller — kept behind
 //! `arch/mod.rs`'s `#[allow(dead_code)]` for a bring-up that had ended.
-//! `specs/issues/design-debt/four-deletions-still-owed.md` named them and git
+//! `issues/design-debt/four-deletions-still-owed.md` named them and git
 //! history is the shelf: a session that wants a hardware watchpoint sets it
-//! from the debugger (`specs/debugging.md`), and one that genuinely wants the
-//! guest to arm its own writes it against the DR7 encoding in the manual rather
-//! than inheriting a dead one.
+//! from the debugger, and one that genuinely wants the guest to arm its own
+//! writes it against the DR7 encoding in the manual rather than inheriting a
+//! dead one.
 //!
 //! What is left is the read side, which the handler in `arch/idt/exceptions.rs`
 //! calls on every debug exception however that exception was armed.

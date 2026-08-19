@@ -1,17 +1,23 @@
 //! Identifiers a tree may not name, and the exceptions that are named instead.
 //!
-//! `specs/assessments/capability-handles-spec.md` §12.2 asks for this as
-//! `kernel/clippy.toml`'s `disallowed-methods`. **Nothing in this repository
-//! runs clippy** — not CI, not `cargo test`, not the build — so a `clippy.toml`
-//! would be a wall with nothing behind it. A scan in `cargo test --lib` runs on
-//! every machine that builds this tree, in milliseconds, and can carry its
-//! exceptions with the reason each one is allowed.
+//! The first scan bans, over `kernel/src` and `toyos-sched/src`, the methods
+//! that take an object's lifetime out of its `Arc`'s hands — `Arc::into_raw`,
+//! `Arc::from_raw`, the two strong-count adjusters — and `mem::forget`. The
+//! natural home for that would be
+//! `kernel/clippy.toml`'s `disallowed-methods`, but **nothing in this
+//! repository runs clippy** — not CI, not `cargo test`, not the build — so a
+//! `clippy.toml` would be a wall with nothing behind it. A scan in
+//! `cargo test --lib` runs on every machine that builds this tree, in
+//! milliseconds, and can carry its exceptions with the reason each one is
+//! allowed.
 //!
 //! The exceptions are per file and per line count, so an *added* `forget`
 //! beside a permitted one is a red rather than a silence.
 //!
-//! The second scan is `specs/capability-endowment-spec.md` §8: the global
-//! registry's names must be gone from the code, not merely unused. It reads
+//! The second scan enforces that there is no global registry: a name a process
+//! could present and have resolved for it is the thing this architecture
+//! deleted, so the registry's identifiers must be gone from the code rather
+//! than merely unused. It reads
 //! **code only** — comments and string literals are stripped first — because
 //! the history of what a name used to mean is worth keeping and the
 //! retired-syscall gravestone table names every one of them as a string on
@@ -250,9 +256,8 @@ const LOG_PRODUCERS: &[&str] = &["log!(", "alert!(", "boot_phase!(", "log::emit(
 /// whatever it is written next to.
 ///
 /// Both of these write raw bytes straight to the UART. They never enter the
-/// ring, so `panic_console`'s deleted scan could not see them either and
-/// `Level` was never their business
-/// (`specs/log-architecture-spec.md` §2.1).
+/// ring, so `panic_console`'s deleted scan could not see them either and the
+/// record's typed `Level` was never their business.
 /// Counted in occurrences of `!!!` and not in lines, because each of these
 /// writes one at each end of its message.
 const SENTINEL_ALLOWED: &[(&str, usize)] = &[
@@ -282,8 +287,7 @@ mod tests {
     /// put back into a message would be a marker marking nothing — a second,
     /// silent alert channel beside the typed one. The two `!!!` still in
     /// `kernel/` write raw bytes straight to the UART, never enter the ring, and
-    /// were never `has_alert`'s business either
-    /// (`specs/log-architecture-spec.md` §2.1).
+    /// were never `has_alert`'s business either.
     #[test]
     fn nmi_does_not_log() {
         let lines = kernel_lines();
@@ -382,10 +386,9 @@ mod tests {
         }
     }
 
-    /// **There is no global registry.** `specs/capability-endowment-spec.md`
-    /// §8: a name a process could present and have resolved for it is the
-    /// thing this architecture deletes, so its identifiers may not be reachable
-    /// from any code the guest compiles.
+    /// **There is no global registry.** A name a process could present and have
+    /// resolved for it is the thing this architecture deletes, so its
+    /// identifiers may not be reachable from any code the guest compiles.
     #[test]
     fn no_name_resolves_through_a_registry_any_more() {
         let mut complaints = Vec::new();

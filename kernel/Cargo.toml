@@ -17,41 +17,40 @@ loom = []
 # `kernel-loom/tests/log_wake.rs` must red when it does. A model that has never
 # failed proves nothing, and no guest test can stand in for it — on x86 a build
 # with either fence removed behaves identically, which is the whole reason the
-# obligation is a model. `specs/log-architecture-spec.md` §2.5's W3.
+# obligation is a model.
 wake-fence-off = []
 # The same arrangement for the completion core: `kernel-loom` turns it on to
 # make `completion::inbox`'s record publication relaxed, and
 # `kernel-loom/tests/inbox.rs` must red when it does. On x86 a build with the
 # release removed behaves identically, which is the whole reason the obligation
-# is a model. `specs/completion-architecture-spec.md` §16.1.
+# is a model.
 inbox-release-off = []
-# The same arrangement, five more times, one per loom model that had no control
-# until 2026-08-16. Each is declared here and never enabled here; `kernel-loom`
-# turns exactly one on at a time and the named model must red. None costs a
-# kernel build — no kernel `cargo test` invocation names any of them, for
-# `loom`'s reason. `specs/completion-architecture-spec.md` §16.1 enumerates
-# which model each one reds, and `kernel-loom/Cargo.toml` carries the command.
+# The same arrangement, five more times, one per `kernel-loom` model that had
+# no control of its own until 2026-08-17. Each is declared here and never
+# enabled here; `kernel-loom` turns exactly one on at a time and the named
+# model must red. None costs a kernel build — no kernel `cargo test`
+# invocation names any of them, for `loom`'s reason.
 #
 # `src/sync.rs`'s two loads of `now` go `Relaxed`, and `ticket_lock` reds.
 lock-acquire-off = []
-# `src/sched/reap_gate.rs`'s `raise` store goes `Relaxed`, and `reap_gate` reds.
+# `src/sched/reap_gate.rs`'s `raise` store goes `Relaxed`, and `reap_gate`
+# reds.
 reap-raise-relaxed = []
 # `src/shootdown.rs`'s `serve` reads what it owes `Relaxed`, and
 # `tlb_shootdown` reds.
 shootdown-serve-relaxed = []
 # `src/log/shard.rs`'s publishing store goes `Relaxed`, and `log_record` reds.
 log-commit-release-off = []
-# `src/log/registry.rs`'s pointer store and load go `Relaxed`, and `log_publish`
-# reds.
+# `src/log/registry.rs`'s pointer store and load go `Relaxed`, and
+# `log_publish` reds.
 shard-publish-relaxed = []
 # The same arrangement for the sleep lock's acquire edge, and it is the first
 # *contended*-acquire model this tree has: `src/sleeplock.rs`'s two loads of
 # `now` — the ones that decide whose turn it is — go `Relaxed`, so the previous
 # holder's writes are unordered against the next holder's reads, and
 # `kernel-loom/tests/sleep_lock.rs` reds. `Lock::lock`'s spin is unreachable by
-# loom (`specs/issues/kernel/lock-spin-unreachable-by-loom.md`); a parking
-# acquire has no unbounded branch, which is what makes this one modellable at
-# all. `specs/completion-architecture-spec.md` §8, §16.1.
+# loom (`issues/kernel/lock-spin-unreachable-by-loom.md`); a parking acquire has
+# no unbounded branch, which is what makes this one modellable at all.
 sleeplock-acquire-off = []
 # **Every actuator, and which one is armed comes from the boot parameter.**
 # `kernel/src/actuator.rs` declares all 47 with the claim each rests on; this
@@ -61,8 +60,7 @@ sleeplock-acquire-off = []
 #
 # Until 2026-08-10 each of these was a cargo feature and therefore a kernel
 # build: 45 in a full `cargo test`, ~6.9 s of wall clock and ~29.6 s of CPU
-# each after any kernel edit. `specs/assessments/test-cost-audit.md` §3.6 is the trade and
-# §5.9.5 the design.
+# each after any kernel edit.
 boot-actuators = []
 # **`SYS_DEBUG` and every actuator reachable through it, and nothing a boot
 # runs.** A kernel carrying this boots, schedules, drives its devices and panics
@@ -108,7 +106,8 @@ sched-check = ["toyos-sched/check"]
 # Take the FP body out of `arch::entry`'s bracket and the declared state out of
 # the loader's trampolines, leaving a kernel that preserves the *rest* of the
 # user machine state and nothing else — which is the kernel this tree had before
-# `specs/user-machine-state.md`.
+# every Ring 3 transition that can reach another task saved and restored the
+# full x87/SSE state.
 #
 # The negative control for `fpu_isolation`, and the only way to have one: the
 # defect it stages is a CPU register file surviving a task switch, and QEMU has
@@ -119,17 +118,17 @@ sched-check = ["toyos-sched/check"]
 # is the `fxsave64`, the `fxrstor64` and the trampoline's load. A feature that
 # flipped an assertion would make its own gate vacuous.
 #
-# **The one actuator that kept its own kernel build, and `specs/assessments/test-cost-audit.md`
-# §5.9.7 says why**: these are `naked_asm!` bodies on every ring transition, so a
+# **The one actuator that kept its own kernel build, and here is why**: these
+# are `naked_asm!` bodies on every ring transition, so a
 # boot parameter would have to be a branch there — on the path the gate is about,
 # in a binary the shipping one no longer resembles. The gate would then certify
 # a bracket nothing ships.
 fpu-save-nothing = []
 
-# The one profile every guest binary is built with — `specs/plans/boot-image-split.md`
-# §6. Optimised, because an unoptimised guest mismeasures everything under TCG;
+# The one profile every guest binary is built with.
+# Optimised, because an unoptimised guest mismeasures everything under TCG;
 # debug-assertions and overflow-checks on, because fail-fast beats speed here
-# and both crafted-ELF kernel panics in `specs/issues/` were *found* by
+# and both crafted-ELF kernel panics in `issues/` were *found* by
 # an overflow check. `--release` would turn the last two off silently, so this
 # build system no longer has the flag.
 [profile.toyos]
@@ -144,11 +143,13 @@ bcachefs = { path = "../bcachefs", default-features = false }
 toyos-abi = { path = "../toyos-abi" }
 toyos-fat32 = { path = "../toyos-fat32" }
 toyos-elf = { path = "../toyos-elf" }
+toyos-elide = { path = "../toyos-elide" }
 toyos-gpt = { path = "../toyos-gpt" }
 toyos-hda = { path = "../toyos-hda" }
 toyos-pci = { path = "../toyos-pci" }
 toyos-ps2 = { path = "../toyos-ps2" }
 toyos-sched = { path = "../toyos-sched" }
+toyos-userbound = { path = "../toyos-userbound" }
 toyos-wallclock = { path = "../toyos-wallclock" }
 toyos-xhci = { path = "../toyos-xhci" }
 rustc-demangle = "0.1"

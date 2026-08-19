@@ -8,23 +8,29 @@
 //! [`RELEGATED`] is exactly the set the nightly job selects, and `tests/toyos.rs`
 //! writes [`Tier::Nightly`] against each of those names in its own registration.
 //!
-//! **This is interim and it is a loss.** Fifty-three registered tests are
-//! Nightly: twenty-seven for [`Why::Cost`] — a CI execution over the line
+//! **This is interim and it is a loss.** Fifty-two registered tests are
+//! Nightly: twenty-six for [`Why::Cost`] — a CI execution over the line
 //! (loaded audio and ordinary `audio_tone` each have two measured SMP labels,
 //! all four over it) — twenty-two for [`Why::TimerAnchored`], Nightly by
 //! classification rather than by cost, mostly nowhere near the line and one
 //! (`i8042_quarantine`) straddling it run to run for the classification's own
 //! reason — and four for [`Why::RidesTheBootOf`], riding
 //! `metal_sim_compositor`'s shared boot. Between them they account for
-//! 1,791.2 s of the effective 2,126.6 s CI profile, and none is gated per pull
-//! request. `guards` on every row says what stopped being gated, because a run
-//! that quietly does less is the whole failure mode here —
-//! `specs/assessments/test-cost-audit.md` §7 is the long form.
+//! 1,755.2 s of the 2,135.0 s the committed profile prices across 317 labels,
+//! and none is
+//! gated per pull request. `guards` on every row says what stopped being gated,
+//! because a run that quietly does less is the whole failure mode here.
 //!
 //! **Nothing here is an optimisation and nothing here changes an assertion.**
 //! A relegated test measures exactly what it measured; the manual nightly
 //! command runs it. #188 holds only the optimisation work that would make one
-//! of these fast enough to come back to the per-PR tier.
+//! of these fast enough to come back to the per-PR tier — and **two names left
+//! by that door on 2026-08-17**: `xhci_msi_only` (35,223 ms) and
+//! `swiss_german_layout` (12,645 ms) were each a guest binary waiting out a
+//! fixed fallback deadline nobody had sent the sentinel for, 30 s and 8 s of
+//! host wall clock with no assertion behind either. Both are `Tier::Fast`
+//! again, on run 32023797195's twelve shards rather than on the dev host:
+//! **5,857 ms and 5,441 ms**.
 //!
 //! **CI is the instrument for a per-PR policy.** The effective profile starts
 //! with the last full twelve-shard run and replaces every name measured by the
@@ -48,8 +54,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// verdict or price — belongs Nightly; only a compute-bound verdict stays Fast.
 /// **2026-08-13: the sweep applying this to the rest of the fast tier landed**
 /// — [`Why::TimerAnchored`] is the classification it needed, and every
-/// borderline name `specs/assessments/test-cost-audit.md` §7 raised has one of the three
-/// `Why` rows now.
+/// borderline name the cost audit raised has one of the three `Why` rows now.
 pub const FAST_CEILING_MS: u64 = 10_000;
 
 /// A committed profile row that exists only to put a new registration into one
@@ -107,7 +112,10 @@ pub struct Relegated {
     /// *placement*, never this field against it, so a nightly run refreshing
     /// every Nightly label does not have to reproduce this number. A human
     /// updates it by hand when a "returns to Fast" or "belongs Nightly"
-    /// finding lands a tier correction — `specs/testing-strategy.md` §5.
+    /// finding lands a tier correction. Tier movement is by measurement in both
+    /// directions, and a nightly run's measured profile is what refreshes these
+    /// numbers — validated against the tier rule, never against equality with a
+    /// past measurement.
     pub ci_ms: u64,
     pub why: Why,
     /// **What stops being gated per pull request.** Not what the test does —
@@ -126,13 +134,13 @@ pub const RELEGATED: &[Relegated] = &[
         guards: "The kernel-thread machinery, now for all three of them: klogd, usbd \
                  and iod spawn with process-table rows, `ps` and the census name them, \
                  and a deliberate panic takes the row's own branch instead of being \
-                 decided by a stale `syscall_rip` — the nondeterminism §4.3 exists to \
-                 forbid. Both branches, which is the only way two rows are two rows: \
-                 klogd's panic halts the machine, usbd's kills the thread and the \
-                 machine boots. Three boots, and the two actuator arms (`klogd-panic`, \
-                 `usbd-panic`) are the cost; the spawn half alone is one cheap boot, \
-                 and \
-                 specs/issues/build/klogd-hosted-pays-two-boots-for-one-fast-verdict.md \
+                 decided by a stale `syscall_rip` — a verdict that depended on which \
+                 syscall ran last. Both branches, which is the only way two rows are \
+                 two rows: klogd's panic halts the machine, usbd's kills the thread and \
+                 the machine boots. Three boots, and the two actuator arms \
+                 (`klogd-panic`, `usbd-panic`) are the cost; the spawn half alone is \
+                 one cheap boot, and \
+                 issues/build/klogd-hosted-pays-two-boots-for-one-fast-verdict.md \
                  is the split that puts it back in the fast tier. What still runs per \
                  pull request: every boot's console output is klogd's drain, so the \
                  thread starving or dying is visible in any test that reads a line, and \
@@ -159,8 +167,7 @@ pub const RELEGATED: &[Relegated] = &[
                  spin. A negative gate: without the second boot the first proves only \
                  that the machine works, which it did before the gate existed. What still \
                  runs per pull request: the compute-bound `fault_gates`/`std_unwind`/ \
-                 `std_unwind_so` trio (specs/user-machine-state.md §2, \
-                 specs/assessments/ci-plan-assessment-2026-08.md §9.3), ~51 ms riding an \
+                 `std_unwind_so` trio, ~51 ms riding an \
                  existing shared boot, still catches a pending x87 \
                  control word killing the next process — the one shape that put this \
                  defect on CI in the first place — but proves nothing about a leaked \
@@ -278,15 +285,6 @@ pub const RELEGATED: &[Relegated] = &[
                  text survive in the middle of a cleared screen.",
     },
     Relegated {
-        test: "xhci_msi_only",
-        ci_ms: 35_223,
-        why: Why::Cost,
-        guards: "The T14's Thunderbolt controller, which printed `no MSI-X capability, \
-                 using polled mode` on a real boot when there was no polled mode. Every \
-                 other controller in this suite has MSI-X, so `msix=off` is the only way \
-                 this branch executes at all.",
-    },
-    Relegated {
         test: "desktop_typing_damage",
         ci_ms: 81_197,
         why: Why::Cost,
@@ -302,7 +300,14 @@ pub const RELEGATED: &[Relegated] = &[
         guards: "The guard page under every per-CPU idle stack. Its absence is invisible \
                  to every log line and every screendump — an overflow rewrote whatever the \
                  allocator had put underneath — so the only way to ask is to touch it, and \
-                 SYS_DEBUG action 9 is the one read.",
+                 SYS_DEBUG action 9 is the one read. **`ci_ms` is now stale on the high \
+                 side and deliberately left:** 2026-08-17 took a flat 20 s `drain_serial` \
+                 off it — the fatal path halts every CPU without QEMU exiting, so the drain \
+                 waited out its whole ceiling for a machine that would never speak again — \
+                 and the same test measures 28.5 s to 3.0 s on the dev host. Whether \
+                 that is enough to cross back is a KVM question this branch cannot answer, \
+                 so the number above is the last CI measurement and the next nightly run \
+                 replaces it.",
     },
     Relegated {
         test: "dump_nmi_probe",
@@ -311,7 +316,14 @@ pub const RELEGATED: &[Relegated] = &[
         guards: "Ctrl+Alt+D's NMI probe: a CPU that ignores a kick is named and then asked \
                  where it is with the one interrupt it cannot mask, with the rip it brings \
                  back resolved against the kernel's own symbols. On the T14 the dump named \
-                 three CPUs without saying which of three causes each was.",
+                 three CPUs without saying which of three causes each was. **`ci_ms` is \
+                 stale on the high side for the same reason `idle_stack_guard`'s is:** \
+                 2026-08-17 replaced its flat 20 s `drain_serial` with the two lines the \
+                 report actually owes — an NMI interrupts a CPU rather than killing it, so \
+                 the guest neither exits nor halts and the drain was paid in full on every \
+                 green run — and it measures 22.4 s to 6.0 s on the dev host. That may put \
+                 it under the line on KVM; the next nightly measurement decides, and it is \
+                 the one row here most likely to return to Fast.",
     },
     Relegated {
         test: "metal_sim_pointer_churn",
@@ -371,14 +383,6 @@ pub const RELEGATED: &[Relegated] = &[
                  reading perfectly.",
     },
     Relegated {
-        test: "swiss_german_layout",
-        ci_ms: 12_645,
-        why: Why::Cost,
-        guards: "Swiss German end to end, injected by physical key position — which asserts \
-                 the table, the modifier levels, the ISO key and the dead-key machine at \
-                 once.",
-    },
-    Relegated {
         test: "iommu_discovery",
         ci_ms: 17_594,
         why: Why::Cost,
@@ -420,10 +424,10 @@ pub const RELEGATED: &[Relegated] = &[
         guards: "A device that rejects the optional flush command remains usable, while a \
                  real write failure still propagates. Treating every command error alike \
                  either loses compatible disks or hides failed writes. **The cost this \
-                 relegation is about was cut about sevenfold at L6 of the log architecture** — \
+                 relegation is about was cut about sevenfold when `/bin/logd` took the file** — \
                  `/bin/logd` ends on an error instead of retrying inside a budget, which is what \
                  turned 1,737 failing flushes over six seconds into the handful a single refusal \
-                 costs (`specs/log-architecture-spec.md` §5.4) — and `ci_ms` above is untouched \
+                 costs — and `ci_ms` above is untouched \
                  because it is a CI measurement and the new figure is a dev-host one. A nightly \
                  KVM run is what may bring this name back to Fast.",
     },

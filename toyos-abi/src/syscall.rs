@@ -227,18 +227,16 @@ pub const SYS_RT_ENTER: u64 = 112;
 
 // Number 113 is **reserved, not free**: it is held for `SYS_PORT_REARM`,
 // which would mint a fresh `Acceptor` for a port whose server died and is
-// the one thing that would make any `serves` daemon restartable
-// (`specs/capability-endowment-spec.md` reserves the number). Nothing needs
-// it yet, so nothing is built.
+// the one thing that would make any `serves` daemon restartable. Nothing
+// needs it yet, so nothing is built.
 //
-// 115 is likewise held, for `SYS_SLEEP_UNTIL`
-// (`specs/plans/iouring-blocking-spec.md`), which replaces a retired
+// 115 is likewise held, for `SYS_SLEEP_UNTIL`, which would replace the retired
 // `SYS_NANOSLEEP`.
 //
-// **Both are recorded here rather than in those specs alone**, because this
-// file is where an agent allocating a number looks and a reservation nobody
-// reads is not a reservation. Holes are already ordinary here — a retired
-// number is never reused either.
+// **Both are recorded here and nowhere else**, because this file is where an
+// agent allocating a number looks and a reservation nobody reads is not a
+// reservation. Holes are already ordinary here — a retired number is never
+// reused either.
 
 /// Copy kernel log records into a caller's buffer, advancing a cursor the
 /// caller owns. Gated by [`Rights::LOG`] on a `SysCap`. See [`log_read`] and
@@ -631,10 +629,7 @@ fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 /// Encode an optional timeout for the kernel ABI.
 /// `None` = wait forever (u64::MAX), `Some(n)` = timeout after `n` nanoseconds.
 fn encode_timeout(timeout: Option<u64>) -> u64 {
-    match timeout {
-        None => u64::MAX,
-        Some(n) => n,
-    }
+    timeout.unwrap_or(u64::MAX)
 }
 
 /// Write bytes to a file descriptor. Returns number of bytes written.
@@ -1056,8 +1051,7 @@ pub unsafe fn gpu_set_resolution(
 
 /// Shut down the machine. Does not return.
 pub fn shutdown() -> ! {
-    syscall(SYS_SHUTDOWN, 0, 0, 0, 0);
-    loop {}
+    loop { syscall(SYS_SHUTDOWN, 0, 0, 0, 0); }
 }
 
 /// The device classes, their wire numbers, and the name a `system.toml`

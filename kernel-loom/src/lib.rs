@@ -1,15 +1,15 @@
-//! Loom harness for the kernel's three memory-ordering primitives.
+//! Loom harness for the kernel's memory-ordering primitives.
 //!
-//! `kernel/src/sync.rs`, `kernel/src/shootdown.rs` and
-//! `kernel/src/sched/reap_gate.rs` are compiled into this crate with
-//! `feature = "loom"` on, so their atomics and cells resolve to loom's
-//! instrumented ones and the models drive the real primitives rather than
-//! transliterations of them — a transliteration is exactly the divergence risk a
-//! model checker is meant to remove. What the kernel files name through
-//! `crate::` is supplied below: the lock takes a preempt count and a log macro
-//! from its environment, and neither is what the models are about;
-//! `shootdown.rs` and `reap_gate.rs` name nothing at all, which is why neither
-//! has a shim here.
+//! `kernel/src/sync.rs`, `kernel/src/shootdown.rs`,
+//! `kernel/src/sched/reap_gate.rs` and `kernel/src/drivers/i8042/tally.rs` are
+//! compiled into this crate with `feature = "loom"` on, so their atomics and
+//! cells resolve to loom's instrumented ones and the models drive the real
+//! primitives rather than transliterations of them — a transliteration is
+//! exactly the divergence risk a model checker is meant to remove. What the
+//! kernel files name through `crate::` is supplied below: the lock takes a
+//! preempt count and a log macro from its environment, and neither is what the
+//! models are about; `shootdown.rs`, `reap_gate.rs` and `tally.rs` name nothing
+//! at all, which is why none of the three has a shim here.
 //!
 //! Scope for the lock, stated because it is narrower than the file: the models
 //! drive `try_lock` and `LockGuard::drop`. `lock()`'s spin cannot be modelled —
@@ -153,18 +153,16 @@ pub mod reap_gate;
 pub mod time;
 
 /// The completion core's record and inbox. It reaches `crate::time` and
-/// `crate::cell` and nothing else, which is the layout requirement
-/// `specs/completion-architecture-spec.md` §16.1 puts on C2: a file that named
-/// a pipe end or a device claim could not be compiled here at all, and the
-/// ordering would stop being checked by anything.
+/// `crate::cell` and nothing else, and that narrowness is load-bearing: a file
+/// that named a pipe end or a device claim could not be compiled here at all,
+/// and the ordering would stop being checked by anything.
 #[path = "../../kernel/src/completion/inbox.rs"]
 pub mod inbox;
 
 /// What `sleeplock.rs` names of the completion core, and nothing more.
 ///
 /// **The park is shimmed, and that is the scope statement for
-/// `tests/sleep_lock.rs`** (`specs/completion-architecture-spec.md` §16.1 asks
-/// for it in as many words). Loom has no scheduler, so there is nothing here to
+/// `tests/sleep_lock.rs`.** Loom has no scheduler, so there is nothing here to
 /// park *on*; [`completion::wait_uncancellable_until`] yields instead, which is
 /// what lets the model drive the real contended acquire at all. What the model
 /// therefore proves is the ticket arithmetic and the acquire/release edge —
@@ -265,14 +263,16 @@ pub mod scheduler {
         }
     }
 
-    /// Who this thread is, so the lock's holder word and its self-deadlock
-    /// refusal mean something. The model says; the kernel reads the same fact
-    /// out of two per-CPU words.
-    ///
-    /// **`loom::thread_local!` under loom and `std::thread_local!` without it**,
-    /// and the split is not cosmetic: loom's threads are coroutines on one OS
-    /// thread, so a `std` slot would be one cell shared by all of them and every
-    /// task in the model would be the last one to speak.
+    // Who this thread is, so the lock's holder word and its self-deadlock
+    // refusal mean something. The model says; the kernel reads the same fact
+    // out of two per-CPU words. A `//` comment and not a doc one: rustdoc
+    // documents no item a macro invocation produces, and `///` here is a
+    // warning rather than documentation.
+    //
+    // **`loom::thread_local!` under loom and `std::thread_local!` without it**,
+    // and the split is not cosmetic: loom's threads are coroutines on one OS
+    // thread, so a `std` slot would be one cell shared by all of them and every
+    // task in the model would be the last one to speak.
     #[cfg(feature = "loom")]
     loom::thread_local! {
         static WHO: core::cell::Cell<Option<TaskId>> = core::cell::Cell::new(None);
@@ -294,7 +294,14 @@ pub mod scheduler {
 }
 
 /// The sleep lock, compiled a second time against loom's atomics. Its
-/// dependency surface is the two shim modules above and nothing else, which is
-/// §16.1's layout requirement on C5 — the same one `inbox.rs` carries.
+/// dependency surface is the two shim modules above and nothing else — the same
+/// narrowness `inbox.rs` carries, and for the same reason.
 #[path = "../../kernel/src/sleeplock.rs"]
 pub mod sleeplock;
+
+/// The i8042's interrupt tally. `tests/i8042_tally.rs` is the only model whose
+/// subject is a *driver*, and it is here for the reason the others are: the
+/// property is "no reader ever sees this pair disagree", which is a claim about
+/// instants that no guest test can express and that x86's TSO hides.
+#[path = "../../kernel/src/drivers/i8042/tally.rs"]
+pub mod i8042_tally;

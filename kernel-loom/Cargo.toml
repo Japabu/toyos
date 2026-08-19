@@ -56,9 +56,10 @@ inbox-release-off = []
 #   cargo test --manifest-path kernel-loom/Cargo.toml --features inbox-signal-as-post \
 #     --test inbox
 #
-# It stages the *mechanism* and not a verdict, which is what
-# `specs/completion-architecture-spec.md` §20.3 requires of a control. Never on
-# by default, and no kernel build declares it.
+# It stages the *mechanism* and not a verdict, which is what a negative control
+# owes: a feature that asserted the failure instead of causing it would pass on
+# a build where the defect had been fixed elsewhere. Never on by default, and no
+# kernel build declares it.
 inbox-signal-as-post = []
 # The negative control for the ticket lock's acquire edge. It makes `sync.rs`'s
 # two loads of `now` — the ones that decide ownership — `Relaxed`, so the
@@ -104,10 +105,10 @@ shootdown-serve-relaxed = []
 log-commit-release-off = []
 # The negative control for W5, a shard's own publication. It makes
 # `registry.rs`'s pointer store and load `Relaxed`, so what the pointer
-# publishes stops being the shard behind it, and `log_publish.rs` must red with
-# loom's own words, `Causality violation: Concurrent load and mut accesses` —
-# the reader reaching the shard's atomics while the publisher is still building
-# them:
+# publishes stops being the shard behind it, and `log_publish.rs` must red,
+# typically with loom's own words, `Causality violation: Concurrent load and
+# mut accesses` — the reader reaching the shard's atomics while the publisher
+# is still building them:
 #
 #   cargo test --manifest-path kernel-loom/Cargo.toml --features shard-publish-relaxed \
 #     --test log_publish

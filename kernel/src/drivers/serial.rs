@@ -3,12 +3,12 @@
 //! **There is one thing here now where there were two.** `SerialWriter` was a
 //! per-invocation stack buffer that every `log!` formatted into and committed
 //! to a 64 KiB byte ring, which something else drained later; the ring is gone
-//! (`specs/log-architecture-spec.md` §8.1) and what reaches this file is whole
-//! units — a rendered record from `log::console`, a userland `write`, a panic
-//! report — each of which takes [`BackendGuard`] once and holds it for its own
-//! whole unit. That is where line atomicity comes from, and it is the only
-//! place it could come from: two producers of half-lines cannot be made
-//! atomic by anything downstream of them.
+//! and what reaches this file is whole units — a rendered record from
+//! `log::console`, a userland `write`, a panic report — each of which takes
+//! [`BackendGuard`] once and holds it for its own whole unit. That is where
+//! line atomicity comes from, and it is the only place it could come from: two
+//! producers of half-lines cannot be made atomic by anything downstream of
+//! them.
 //!
 //! [`BackendGuard`] is CLI plus a global spinlock, so an interrupts-off window
 //! is one unit long. The slow I/O happens inside it, which is why **every unit
@@ -306,17 +306,20 @@ pub fn flush_final() {
 /// **One backend acquisition per [`MAX_CONSOLE_LINE`] of output, ANSI stripped,
 /// no buffering.** It replaced `SerialWriter::console()` and the lossless
 /// byte-ring append underneath it, whose unit of interleaving was a `write`
-/// syscall — and two recorded splices to show for it, whose measurements
-/// `specs/log-architecture-spec.md` §4.4 keeps now that the entry that held
-/// them is closed. Taking the guard here is what makes this
-/// write whole against a kernel record and against another process; what it
-/// does *not* fix is `println!` handing the kernel half a line at a time.
+/// syscall — and two measured splices to show for it, each a kernel record
+/// landing inside a userland line: `hda_tone` red 1 of 3 on a loaded dev host
+/// with `soundd: hda codec0 vendor=1af4` cut between `codec` and `0`, and
+/// `desktop_audio_client` red 1 of 10 on CI with `soundd: client ` and
+/// `1 removed` either side of the kernel's four `exit:` accounting lines —
+/// `src/redlist.rs`'s retired rows are where those measurements are kept now
+/// that the entry that held them is closed. Taking the guard here is what makes
+/// this write whole against a kernel record and against another process; what
+/// it does *not* fix is `println!` handing the kernel half a line at a time.
 ///
 /// **That is what [`ConsoleLine`] fixes, and this function is now the thing it
 /// is measured against.** Every ordinary write goes through the line buffer;
 /// this path survives as the `console-unbuffered` actuator's behaviour, which
-/// is the state the tree shipped between L3 and L5 rather than an invented one
-/// (`specs/log-architecture-spec.md` §9.4).
+/// is a state this tree really shipped rather than an invented one.
 ///
 /// **The guard is taken and released per chunk, and the bound is the reason
 /// this function may be called with a userland length at all.** `BackendGuard`
@@ -328,11 +331,11 @@ pub fn flush_final() {
 /// ring this replaced never did — it appended under its own short lock and
 /// something else drained.
 ///
-/// **[`MAX_CONSOLE_LINE`] rather than a number invented here.** §4.4 of
-/// `specs/log-architecture-spec.md` bounds a console *line* by it and emits a
-/// longer one in pieces of it, so the interleaving unit this chunking creates
-/// is the same one the finished design already has: anything that will be whole
-/// after L5 is whole now, and nothing that is atomic today stops being so.
+/// **[`MAX_CONSOLE_LINE`] rather than a number invented here.** The console
+/// object bounds a *line* by it and emits a longer one in pieces of it, so the
+/// interleaving unit this chunking creates is the same one [`ConsoleLine`]
+/// already has: anything whole through the line buffer is whole here too, and
+/// nothing that is atomic today stops being so.
 /// The tradeoff is re-acquisition against latency — a write of `n` bytes now
 /// pays `ceil(n/1024)` `cli`/`compare_exchange_weak`/`popfq` triples instead of
 /// one, which is a handful of uncontended atomics against an interrupts-off

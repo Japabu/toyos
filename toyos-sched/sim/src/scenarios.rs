@@ -995,19 +995,22 @@ pub fn fair_double_charge() -> Scenario {
     scenario
 }
 
-/// Negative gate for the core's `feature = "check"` pass-duration assert
-/// (`cpu::MAX_PASS_NS`), which is the on-target counterpart to the simulator's
-/// invariants (spec §10.2).
+/// Negative gate for the core's `feature = "check"` pass-cost recorder
+/// (`cpu::PassCosts`, budget `cpu::MAX_PASS_NS`), which is the on-target
+/// counterpart to the simulator's invariants (spec §10.2).
 ///
-/// It **must abort**, like `old_preemptible_window`: the assert is the core's
-/// own, so it unwinds rather than being recorded.
+/// **It must be recorded, not aborted.** The recorder replaced an assert: a
+/// pass's elapsed time is wall clock across the pass, and a guest's wall clock
+/// advances while a hypervisor has its vCPU, so the quantity carries a term the
+/// kernel neither observes nor controls and no panic may stand over it. What
+/// stands over it is a measurement, judged where composed quantities are judged.
 ///
 /// This one is not a port of a shape the kernel had — it cannot be, because the
-/// thing being asserted is a *cost* and the simulator's clock does not advance
+/// thing being measured is a *cost* and the simulator's clock does not advance
 /// inside a step. It is calibration: `SimHw` charges every pass five times the
-/// budget, and if the assert stays quiet then it is not compiled in, or it is
-/// reading a clock that never moves, and every check build that ever came back
-/// green certified nothing about how long a pass takes.
+/// budget, and if the recorder comes back empty or under budget then it is not
+/// compiled in, or it is reading a clock that never moves, and every check build
+/// that ever came back green certified nothing about how long a pass takes.
 pub fn overlong_pass() -> Scenario {
     let mut scenario = lost_wake_pipe().with_pass_cost(5 * toyos_sched::cpu::MAX_PASS_NS);
     scenario.name = "overlong_pass";

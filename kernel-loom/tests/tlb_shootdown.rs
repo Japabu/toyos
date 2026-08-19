@@ -25,7 +25,7 @@
 //! makes that load relaxed and this file must red — *cpu 1 acknowledged the
 //! shootdown while still holding a translation for the page the initiator is
 //! about to free*, which is the use-after-free this stage removes, stated
-//! exactly. Verified 2026-08-16, both ways round.
+//! exactly. Verified 2026-08-17, both ways round.
 //!
 //! **Every spin is bounded and every assertion is conditional on the ack having
 //! arrived, so [`ACKED`] is what stops the models passing vacuously.** An

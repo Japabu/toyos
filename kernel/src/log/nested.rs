@@ -21,8 +21,6 @@
 //! the guard exists, and removing the guard would change nothing. A kernel
 //! thread's body runs with `IF` set, which is where the guard is the only thing
 //! holding the interrupt off.
-//!
-//! `specs/log-architecture-spec.md` §9.2.
 
 /// Which producer the burst's records declare themselves as.
 ///

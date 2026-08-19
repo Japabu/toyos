@@ -4,11 +4,8 @@
 //! `fmt::Arguments` and nothing else. **There is no byte-oriented entry point**,
 //! and that is what makes "half a record" untypeable: the smallest thing this
 //! module accepts is a whole one.
-//!
-//! `specs/log-architecture-spec.md` §2.
 
 pub mod console;
-pub mod elide;
 pub mod nested;
 pub mod read;
 pub mod registry;
@@ -218,7 +215,7 @@ fn reserve(guard: &crate::arch::LogCommitGuard) -> (Origin, u64) {
 ///
 /// It costs the tid of a process's *first* thread, which is `Tid(0)` and
 /// therefore also renders as absent:
-/// `specs/issues/diagnostics/a-record-cannot-name-thread-zero.md` is the entry,
+/// `issues/diagnostics/a-record-cannot-name-thread-zero.md` is the entry,
 /// and its fix is in the ABI's formatter rather than here.
 fn on_a_thread(id: u32) -> u32 {
     if id == u32::MAX { 0 } else { id }
@@ -286,7 +283,6 @@ pub fn emit(level: Level, args: core::fmt::Arguments) {
         // inside `sync.rs`, inside IRQ handlers, inside the scheduler and
         // inside every syscall's locked region — which is why the post is
         // `wake_direct` and not an ordinary queue wake.
-        // `specs/log-architecture-spec.md` §2.6a.
         console::Drain::Thread => {
             if shard::signal_after_commit(shard::log_waiter()) {
                 console::post_wake();

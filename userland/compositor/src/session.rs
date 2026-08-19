@@ -520,13 +520,13 @@ impl Session {
                 } else {
                     self.last_click_fd = Some(fd);
                     self.last_click_at = now;
-                    self.grab = Grab::on_title(i, self.stack[i].mode, at);
+                    self.grab = Grab::on_title(self.stack[i].id, self.stack[i].mode, at);
                 }
                 self.damage_all();
             }
             Hit::ResizeCorner(idx) => {
                 let i = self.stack.raise(idx);
-                self.grab = Grab::Resizing { window: i };
+                self.grab = Grab::Resizing { window: self.stack[i].id };
                 self.damage_all();
             }
             Hit::Content(idx) => {
@@ -580,7 +580,7 @@ impl Session {
                 mouse_event(&self.stack[i], self.cursor, buttons, window::MOUSE_RELEASE, 1, 0);
             deliver(&mut self.dead, &self.stack[i], window::MSG_MOUSE_INPUT, &ev);
         }
-        match self.grab.release(&self.desk, self.cursor) {
+        match self.grab.release(&self.desk, &self.stack, self.cursor) {
             Released::Nothing => {}
             Released::Snapped { window: idx, mode } => {
                 self.damage.add(self.stack[idx].frame(&self.desk.chrome));

@@ -239,7 +239,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // **A kernel thread answers from its own row and never from the two words
     // below**, because for one of them the words do not merely give the wrong
     // answer — they give a *nondeterministic* one. `syscall_rip` is never
-    // cleared (`specs/issues/panic-path/syscall-rip-never-cleared.md`), so a
+    // cleared (`issues/panic-path/syscall-rip-never-cleared.md`), so a
     // kernel task reads whatever user thread last ran on this CPU left behind:
     // the same panic on the same build would recover or halt depending on which
     // CPU work stealing had put the thread on. `sched::kthread` is where the
@@ -407,8 +407,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // everything above 200 characters in the measured corpus is this line, 18
     // of 12,497 — and unlike a demangled symbol it is a producer the kernel can
     // split. So it is split, grouped by the question each field answers, rather
-    // than truncated with a count of what was lost
-    // (`specs/log-architecture-spec.md` §2.1).
+    // than truncated with a count of what was lost.
     log!(
         "boot: memory map {:#x}+{:#x}, kernel {:#x}+{:#x}, stack {:#x}+{:#x}",
         kernel_args.memory_map_addr, kernel_args.memory_map_size,
@@ -505,8 +504,8 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     let ecam = mm::paging::map_mmio(ecam_base, 256 * 32 * 8 * 4096, CachePolicy::DeferToMtrr);
     let pci_devices = pci::enumerate(&ecam);
     // After ACPI is readable and PCI is enumerable, before any driver `init`:
-    // the unit has to be programmed before the first device is told to do DMA
-    // (`specs/iommu-spec.md` §2.1), and every function the walk above returned
+    // the unit has to be programmed before the first device is told to do DMA,
+    // and every function the walk above returned
     // has to have a context entry before translation comes on. Refuses nothing
     // — a machine with no usable unit boots exactly as it does without one.
     iommu::init(kernel_args.rsdp_addr, &pci_devices);
@@ -613,7 +612,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // unbootable. The log volume is not — it is a diagnostic partition whose
     // worst loss is the diagnostic, and `toybox` writes to it. That the log
     // file itself is unprotected is the residual; see
-    // `specs/issues/boot-media/log-is-userland-writable.md`.
+    // `issues/boot-media/log-is-userland-writable.md`.
     match fat32_adapter::mount(Role::Boot) {
         Some(fs) => vfs::lock().mount(Role::Boot.mount(), Box::new(fs), UserAccess::KernelOnly),
         None => log!("boot-volume: not mounted; the kernel has no /boot this boot"),
@@ -706,7 +705,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // below and the BSP reaches no pass before `enter_idle_loop`. A `klogd`
     // spawned earlier would sit in a run queue through phases 5, 6 and 7 —
     // which is the window a machine with no console wedges in — while the boot
-    // believed it had a drainer. `specs/log-architecture-spec.md` §4.2.
+    // believed it had a drainer.
     log::console::start();
     // The other two of §10's three, beside the drainer and for the same reason:
     // a device's work needs a context of its own rather than whichever thread
