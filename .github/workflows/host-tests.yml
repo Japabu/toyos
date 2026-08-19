@@ -1,8 +1,10 @@
 name: host tests
 
-# The host suites (specs/testing-strategy.md §2): everything that needs no
-# ToyOS toolchain and boots no guest, so it answers before the toolchain job
-# has finished restoring one.
+# The host suites, which own pure logic — decoders, validators, layouts, the
+# build system's own gates, and the memory orderings x86 TSO hides
+# (kernel-loom) — and are blind to everything that requires a booted kernel:
+# everything that needs no ToyOS toolchain and boots no guest, so it answers
+# before the toolchain job has finished restoring one.
 #
 # macOS because the dev host is macOS and `toyos-fat32` still builds its
 # volumes with `newfs_msdos` and `hdiutil` — the judge is ours now
@@ -110,7 +112,7 @@ jobs:
       # counted.
       #
       # Scoped to those targets rather than the crate:
-      # specs/issues/build/kernel-loom-ungated-models-red-without-loom.md
+      # issues/build/kernel-loom-ungated-models-red-without-loom.md
       # records that `tlb_shootdown.rs` reds deterministically under
       # --no-default-features, on main as much as here.
       - name: kernel-loom without loom
@@ -121,12 +123,14 @@ jobs:
           cargo test --manifest-path kernel-loom/Cargo.toml --no-default-features \
             --test log_zeroed_init --test log_body_words 2>&1 | tee -a /tmp/host.log
 
-      # **W3's teeth, run rather than recorded.** `wake-fence-off` removes the
-      # two `SeqCst` fences from `shard.rs`'s wake pair and `log_wake` must red
-      # under it; a model that has never failed proves nothing, and this is the
-      # only obligation in the tree whose *negative* no guest test can express —
-      # on x86 a build with either fence gone behaves identically, which is the
-      # whole reason it is a model.
+      # **The wake edge's teeth, run rather than recorded.** The obligation is
+      # that no committed record is ever left with a parked reader, and it is
+      # store-buffer shaped: `wake-fence-off` removes the two `SeqCst` fences
+      # from `shard.rs`'s wake pair and `log_wake` must red under it; a model
+      # that has never failed proves nothing, and this is the only obligation in
+      # the tree whose *negative* no guest test can express — on x86 a build
+      # with either fence gone behaves identically, which is the whole reason it
+      # is a model.
       #
       # **A non-zero exit is not the check, and until 2026-08-15 it was the
       # whole of it.** Anything that stops `cargo test` before a model runs — a
@@ -151,6 +155,183 @@ jobs:
           if ! grep -q 'a_commit_and_an_arm_cannot_both_miss \.\.\. FAILED' \
                /tmp/wake-fence-off.log; then
             echo "the fence-off build failed without a_commit_and_an_arm_cannot_both_miss reaching a verdict: this step proved nothing, and whatever stopped the model from running is what to fix" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+
+      # **The five obligations that shared `kernel-loom`'s crate with W3 but not
+      # its control, until 2026-08-17.** `ticket_lock`, `tlb_shootdown`,
+      # `reap_gate`, `log_record` and `log_publish` were green in every run with
+      # nothing proving any of the five could red — the same gap `wake-fence-off`
+      # closed for W3 above, five more times over. Each feature relaxes the one
+      # edge its model's own property rests on (`kernel-loom/Cargo.toml` carries
+      # the argument for each), and each step below is `wake-fence-off`'s shape
+      # exactly: a pass is "the model has no teeth" and a fail that never reached
+      # the named verdict line is "this step proved nothing" — both exit 1, so a
+      # compile error or a moved manifest path cannot read as a red.
+      - name: kernel-loom ticket lock's acquire edge has teeth
+        run: |
+          set -o pipefail
+          echo "=== kernel-loom --features lock-acquire-off --test ticket_lock (must red)" \
+            | tee -a /tmp/host.log
+          if cargo test --manifest-path kernel-loom/Cargo.toml \
+               --features lock-acquire-off --test ticket_lock 2>&1 \
+               | tee /tmp/lock-acquire-off.log | tee -a /tmp/host.log; then
+            echo "ticket_lock passed with the acquire relaxed: the model has no teeth" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+          if ! grep -q 'try_lock_observes_the_previous_owners_writes \.\.\. FAILED' \
+               /tmp/lock-acquire-off.log; then
+            echo "the acquire-off build failed without try_lock_observes_the_previous_owners_writes reaching a verdict: this step proved nothing" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+
+      - name: kernel-loom reap gate's enrolment edge has teeth
+        run: |
+          set -o pipefail
+          echo "=== kernel-loom --features reap-raise-relaxed --test reap_gate (must red)" \
+            | tee -a /tmp/host.log
+          if cargo test --manifest-path kernel-loom/Cargo.toml \
+               --features reap-raise-relaxed --test reap_gate 2>&1 \
+               | tee /tmp/reap-raise-relaxed.log | tee -a /tmp/host.log; then
+            echo "reap_gate passed with the raise relaxed: the model has no teeth" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+          if ! grep -q 'a_claim_sees_the_enrolled_work \.\.\. FAILED' \
+               /tmp/reap-raise-relaxed.log; then
+            echo "the raise-relaxed build failed without a_claim_sees_the_enrolled_work reaching a verdict: this step proved nothing" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+
+      - name: kernel-loom shootdown acknowledgement has teeth
+        run: |
+          set -o pipefail
+          echo "=== kernel-loom --features shootdown-serve-relaxed --test tlb_shootdown (must red)" \
+            | tee -a /tmp/host.log
+          if cargo test --manifest-path kernel-loom/Cargo.toml \
+               --features shootdown-serve-relaxed --test tlb_shootdown 2>&1 \
+               | tee /tmp/shootdown-serve-relaxed.log | tee -a /tmp/host.log; then
+            echo "tlb_shootdown passed with the serve load relaxed: the model has no teeth" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+          if ! grep -q 'an_acknowledged_flush_postdates_the_page_table_write \.\.\. FAILED' \
+               /tmp/shootdown-serve-relaxed.log \
+             || ! grep -q 'one_serve_answers_two_concurrent_shootdowns \.\.\. FAILED' \
+               /tmp/shootdown-serve-relaxed.log; then
+            echo "the serve-relaxed build failed without both shootdown models reaching a verdict: this step proved nothing" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+
+      - name: kernel-loom W1 record publication has teeth
+        run: |
+          set -o pipefail
+          echo "=== kernel-loom --features log-commit-release-off --test log_record (must red)" \
+            | tee -a /tmp/host.log
+          if cargo test --manifest-path kernel-loom/Cargo.toml \
+               --features log-commit-release-off --test log_record 2>&1 \
+               | tee /tmp/log-commit-release-off.log | tee -a /tmp/host.log; then
+            echo "log_record passed with the publishing store relaxed: the model has no teeth" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+          if ! grep -q 'a_committed_record_is_whole_or_absent \.\.\. FAILED' \
+               /tmp/log-commit-release-off.log \
+             || ! grep -q 'a_key_and_the_record_it_names_come_from_one_generation \.\.\. FAILED' \
+               /tmp/log-commit-release-off.log; then
+            echo "the commit-release-off build failed without both log_record models reaching a verdict: this step proved nothing" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+
+      - name: kernel-loom W5 shard publication has teeth
+        run: |
+          set -o pipefail
+          echo "=== kernel-loom --features shard-publish-relaxed --test log_publish (must red)" \
+            | tee -a /tmp/host.log
+          if cargo test --manifest-path kernel-loom/Cargo.toml \
+               --features shard-publish-relaxed --test log_publish 2>&1 \
+               | tee /tmp/shard-publish-relaxed.log | tee -a /tmp/host.log; then
+            echo "log_publish passed with the pointer's publication relaxed: the model has no teeth" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+          if ! grep -q 'a_reader_that_finds_a_shard_finds_it_built \.\.\. FAILED' \
+               /tmp/shard-publish-relaxed.log; then
+            echo "the shard-publish-relaxed build failed without a_reader_that_finds_a_shard_finds_it_built reaching a verdict: this step proved nothing" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+
+      # **`toyos-sched-loom`'s own controls, wired for the first time
+      # 2026-08-17.** The mandatory preempt-disabled push (spec §7.2) has
+      # carried `no-preempt-guard` since before this file existed, and it was
+      # never once run here — a control run only by hand is a control CI has
+      # never shown has teeth, the same fact this whole batch of steps repairs.
+      #
+      # **Its shape is `wake-fence-off`'s upside down.** `no-preempt-guard`
+      # models the guard away entirely rather than relaxing one ordering, and
+      # `preempted_producer_strands_suffix` (`toyos-sched/loom/tests/loom_mailbox.rs`)
+      # already wraps the model in `catch_unwind` and turns the caught panic
+      # into its own assertion — so *this* step's teeth are a green run, and a
+      # step that instead demanded red would be checking the opposite of what
+      # the test means. The verdict line is still demanded by name, for
+      # `wake-fence-off`'s reason: a compile error or a moved test name also
+      # exits non-zero and must not read as "the model has teeth."
+      - name: toyos-sched-loom preempt guard has teeth
+        run: |
+          set -o pipefail
+          echo "=== toyos-sched-loom --features no-preempt-guard --test loom_mailbox (must pass — it catches its own red)" \
+            | tee -a /tmp/host.log
+          if ! cargo test -p toyos-sched-loom --features no-preempt-guard \
+               --test loom_mailbox 2>&1 \
+               | tee /tmp/no-preempt-guard.log | tee -a /tmp/host.log; then
+            echo "loom_mailbox failed with the preempt guard modelled away: either the internal catch itself failed or something else broke, so this step proved nothing" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+          if ! grep -q 'preempted_producer_strands_suffix \.\.\. ok' \
+               /tmp/no-preempt-guard.log; then
+            echo "loom_mailbox passed without preempted_producer_strands_suffix reaching a verdict: this step proved nothing" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+
+      # **The sleep handshake's own control, same gap as the five above but in
+      # `toyos-sched-loom`.** `doorbell-kick-relaxed` relaxes `Doorbell::ring`'s
+      # read to `Relaxed`, so a producer can miss a target's freshly published
+      # SLEEPING bit and elide the IPI that would have woken it — the
+      # sleep-through `a_halted_cpu_with_queued_work_was_kicked` exists to
+      # refuse.
+      #
+      # **No `... FAILED` line here, and that is the finding rather than a
+      # miss.** The assertion's own panic unwinds into the model's `World`,
+      # whose `MailboxNode` drop bomb (N2) fires on the still-queued message and
+      # panics a second time mid-unwind — a double panic aborts the process
+      # before the harness prints a summary line. So this step's verdict is the
+      # first panic's message, grepped directly rather than a `FAILED` suffix;
+      # a non-zero exit alone would accept a compile error exactly as
+      # `wake-fence-off`'s comment above warns against.
+      - name: toyos-sched-loom doorbell kick edge has teeth
+        run: |
+          set -o pipefail
+          echo "=== toyos-sched-loom --features doorbell-kick-relaxed --test loom_sleep (must red)" \
+            | tee -a /tmp/host.log
+          if cargo test -p toyos-sched-loom \
+               --features doorbell-kick-relaxed --test loom_sleep 2>&1 \
+               | tee /tmp/doorbell-kick-relaxed.log | tee -a /tmp/host.log; then
+            echo "loom_sleep passed with the kick read relaxed: the model has no teeth" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+          if ! grep -q 'halted with 2 of 2 messages queued and no IPI in flight' \
+               /tmp/doorbell-kick-relaxed.log; then
+            echo "the kick-relaxed build failed without a_halted_cpu_with_queued_work_was_kicked reaching its verdict: this step proved nothing" \
               | tee -a /tmp/host.log
             exit 1
           fi
@@ -184,12 +365,14 @@ jobs:
               | tee -a /tmp/host.log
           done
 
-      # Four `cargo test` invocations in three steps, down from nineteen: the
-      # root package's `--lib`, one `--workspace` over the other twenty-one
-      # members, and the two userland crates. A red is still one line somewhere
-      # among them, and `--workspace` prints a `Running ...` line naming the
-      # binary rather than the `=== <crate>` the loop used to echo, so the
-      # summary matches both.
+      # The root package's `--lib`, one `--workspace` over the other host-tested
+      # members, `kernel-loom`'s no-loom command, eight negative-control runs
+      # (`wake-fence-off` plus the five `kernel-loom` gained 2026-08-17, and
+      # `toyos-sched-loom`'s `no-preempt-guard` and `doorbell-kick-relaxed`) and
+      # the three userland crates. A red is still one line somewhere among them,
+      # and `--workspace` prints a `Running ...` line naming the binary rather
+      # than the `=== <crate>` the other steps echo, so the summary matches both
+      # shapes.
       - name: failure summary
         if: failure()
         run: |

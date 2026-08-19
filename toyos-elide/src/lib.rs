@@ -24,6 +24,10 @@
 //! checked here on the host, where a seam falling inside a four-byte character
 //! costs milliseconds and no guest at all — the tree's own widest symbol is
 //! under a third of what triggers the elision, so no boot reaches it.
+//!
+//! **Naming nothing outside `core` is the property this crate has to keep to
+//! stay testable**: a dependency added here is the code leaving the host, and
+//! the tests go with it.
 
 #![no_std]
 #![forbid(unsafe_code)]

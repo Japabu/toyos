@@ -33,6 +33,24 @@ use loom::sync::atomic::{AtomicU64, Ordering};
 /// `crate::` references at all — that is what lets loom compile it.
 pub const MAX_CPUS: usize = 8;
 
+/// The load a target reads what it owes with, and what it carries.
+///
+/// It synchronizes with [`Shootdown::issue`]'s release, which is what makes the
+/// flush see the initiator's page-table write: everything the initiator did
+/// before issuing is visible to the target before the flush walks anything.
+///
+/// **A cargo feature rather than a comment, because a model that has never
+/// failed proves nothing.** `kernel-loom`'s `shootdown-serve-relaxed` makes it
+/// `Relaxed` and `kernel-loom/tests/tlb_shootdown.rs` must red under it: the
+/// target then publishes an acknowledgement for a generation its own flush did
+/// not see, and the initiator frees a page that CPU can still reach. x86's TSO
+/// hides exactly that from every guest test in this tree. No kernel build can
+/// turn the name on: the kernel declares it only so `cfg` checking knows it.
+#[cfg(not(feature = "shootdown-serve-relaxed"))]
+const OWED: Ordering = Ordering::Acquire;
+#[cfg(feature = "shootdown-serve-relaxed")]
+const OWED: Ordering = Ordering::Relaxed;
+
 /// Which shootdown a flush answers for.
 ///
 /// Monotonic and machine-wide, so "has cpu N flushed since I wrote the page
@@ -84,7 +102,7 @@ impl Shootdown {
     /// flush walks anything. Publishing a value read *after* the flush would
     /// claim more than the flush did.
     pub fn serve(&self, cpu: usize, flush: impl FnOnce()) {
-        let owed = self.requested.load(Ordering::Acquire);
+        let owed = self.requested.load(OWED);
         flush();
         self.flushed[cpu].store(owed, Ordering::Release);
     }

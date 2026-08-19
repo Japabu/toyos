@@ -38,10 +38,11 @@
 //!
 //! # The liveness gates, which are a different claim
 //!
-//! Three checks below are not negative gates. They guard the third failure
-//! shape in `specs/README.md`'s method — a gate that goes *quiet* rather than
-//! red — by asserting that an invariant had a comparison open for a recorded
-//! fraction of the run: `the_fairness_storm_is_measured_and_holds` for I5,
+//! Three checks below are not negative gates. They guard against a gate that
+//! goes *quiet* rather than red — a change that narrows the gate's own coverage
+//! instead of violating it — by asserting that an invariant had a comparison
+//! open for a recorded fraction of the run:
+//! `the_fairness_storm_is_measured_and_holds` for I5,
 //! `invariant_i13_is_measured_and_holds` for I13, and
 //! `a_retire_completes_inside_its_derived_bound` for I14, which requires some
 //! retire to have outlived the instant it was posted in. A change that closes

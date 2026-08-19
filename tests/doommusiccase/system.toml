@@ -14,9 +14,9 @@ assets = ["assets"]
 start = ["logd", "soundd", "test-runner"]
 
 # **Every image that carries a `TOYOS-LOG` partition runs this**, and every
-# image does. The kernel writes no file at all, so a boot config without
-# `logd` is a boot whose `/log` is empty — `every_boot_config_runs_logd`
-# is what refuses one.
+# image does. The kernel keeps the record ring and writes no file at all, so a
+# boot config without `logd` is a boot whose `/log` is empty —
+# `every_boot_config_runs_logd` is what refuses one.
 # It claims no device and serves no port: its whole authority
 # is `logread`, which is `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
 [programs.logd]
@@ -28,7 +28,7 @@ devices = ["hda-audio", "virtio-sound"]
 syscap = ["rt"]
 
 # No compositor: `/bin/doom --music-check` opens no window. test-runner passes
-# its namespace to doom (§6.7a).
+# its namespace to doom.
 # `logread` is the log gate's own: a spawned test binary does not inherit a
 # `SysCap` dup, so the gate that reads the kernel's records runs inside
 # `test-runner` itself.

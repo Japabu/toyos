@@ -238,9 +238,10 @@ are `build-essential` and `python3`.
 
 `cargo run` names anything it needs and cannot find, before it does anything
 else — including `df`, `ps` and `find`, which cost one feature each rather than
-the build. The full accounting of everything this project depends on that it
-did not write, with a verdict on each, is
-`specs/assessments/dependency-audit-2026-08-08.md`.
+the build. Everything this project depends on that it did not write is named
+where it is carried: `NOTICE` lists every committed third-party file with its
+hash, upstream and licence, and `forks.toml` lists every crate ToyOS patches
+with its upstream, pinned base and licence.
 
 Linux and macOS. Windows is a goal, not a claim — the build system still
 assumes Unix in places, and nothing should be advertised until a clean Windows
@@ -317,9 +318,9 @@ one is not a version of anything.
 
 ## Design
 
-Read `CLAUDE.md` for the principles the codebase is held to, and `specs/` for
-the design of each subsystem, the investigations behind the decisions, and the
-list of everything currently known to be broken.
+Read `CLAUDE.md` for the principles the codebase is held to, each subsystem's
+own module headers for its design and the decisions behind it, and `issues/`
+for the list of everything currently known to be broken.
 
 The short version: zero legacy, zero technical debt, fail fast, and prefer
 making a mistake unrepresentable over checking for it at runtime.

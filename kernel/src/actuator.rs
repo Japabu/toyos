@@ -22,9 +22,6 @@
 //!
 //! It is our own bootloader's string and crosses no trust boundary, so an
 //! unknown token is a bug in this build system and panics by name.
-//!
-//! `specs/assessments/test-cost-audit.md` §5.9.5 is the design and §3.6 is the trade the
-//! owner took.
 
 #[cfg(feature = "boot-actuators")]
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -32,10 +29,11 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// Every declared actuator: the accessor the kernel calls, the name a boot
 /// parameter uses, and what nothing else can reach.
 ///
-/// **The comment on each is the claim `specs/device-test-strategy.md` requires
-/// of it** — why the state under it cannot be staged from the host side — and
-/// it lives here rather than in `kernel/Cargo.toml` because this is the file
-/// that has to stay true when one changes.
+/// **The comment on each is the claim that earns it a place** — why the state
+/// under it cannot be staged from the host side, which is what separates an
+/// actuator from a harness that could have injected the same thing from
+/// outside — and it lives here rather than in `kernel/Cargo.toml` because this
+/// is the file that has to stay true when one changes.
 macro_rules! actuators {
     ($( $(#[$doc:meta])* $name:ident = $wire:literal; )*) => {
         /// In bit order: an actuator's bit is its index here.
@@ -135,7 +133,7 @@ actuators! {
     /// lives past the shipped 10 s once, let alone twice. Only the period
     /// moves: the counter, the fields and the halt/spin behaviour underneath
     /// are the shipped ones. See `i8042_quarantine`'s idle-trip check,
-    /// `specs/issues/kernel/i8042-quarantine-health-line-count-is-vacuous.md`.
+    /// `issues/kernel/i8042-quarantine-health-line-count-is-vacuous.md`.
     sched_fast_health = "sched-fast-health";
 
     /// Script the input core directly at end of boot. QEMU activates one input
@@ -211,9 +209,10 @@ actuators! {
     /// the backtrace that got there. The one number that says how much of the
     /// kernel is holding a spinlock while a device is being waited for, and one
     /// no static read of the call graph produces: it is 5 on an ordinary boot.
-    /// The instrument every stage of `specs/completion-architecture-spec.md` is
-    /// judged on.
-    /// It measures and stages nothing — no driver behaviour changes with it on.
+    /// The instrument the work in
+    /// `issues/kernel/every-wait-in-this-kernel-is-a-spin.md` is judged on: it
+    /// has to fall. It measures and stages nothing — no driver behaviour
+    /// changes with it on.
     io_depth_probe = "io-depth-probe";
 
     /// Starve the four xHCI bring-up register waits in `init_one` on a
@@ -478,7 +477,7 @@ actuators! {
     /// is a CPU that will never reach a scheduler pass. What the gate reads is
     /// the *console*: before `Drain::Inline` a boot that stopped here produced
     /// nothing whatsoever, including everything it had logged
-    /// (`specs/issues/diagnostics/pre-idle-wedge-says-nothing.md`), because the
+    /// (`issues/diagnostics/pre-idle-wedge-says-nothing.md`), because the
     /// only two drains in the machine were the timer tick and the idle loop.
     pre_idle_wedge = "pre-idle-wedge";
 
@@ -492,8 +491,7 @@ actuators! {
     /// page — `log_file`'s until L6 and `/bin/logd`'s since, which is the same
     /// path through the page cache and a *more* reachable one, because a
     /// userland writer's tail page is ordinary evictable cache.
-    /// See `fat32_adapter.rs`'s
-    /// `fat_backing_reads`.
+    /// See `fat32_adapter.rs`'s `fat_backing_reads`.
     fat_backing_read_fails = "fat-backing-read-fails";
 
     /// Fail every *filesystem* read of the boot volume once it is mounted, with

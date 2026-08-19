@@ -143,11 +143,11 @@ impl LaneFree {
 ///
 /// A registration is not a boot — several tests boot two machines and one boots
 /// four — so the count that decides whether a scheduling or build change worked
-/// cannot be read off the test lists. It was static analysis until now, and
-/// `specs/assessments/test-cost-audit.md` §6 records that as a lower bound.
+/// cannot be read off the test lists. It was static analysis until now, which
+/// only ever gave a lower bound.
 ///
 /// **The third is the one this run is judged on.** A kernel build is ~6.9 s of
-/// wall clock and ~29.6 s of CPU after any edit to `kernel/` (§5.9.2), and
+/// wall clock and ~29.6 s of CPU after any edit to `kernel/`, and
 /// until 2026-08-10 a full run made 45 of them. The set is what a run reports
 /// and what [`declared_kernel_builds`] refuses an addition to.
 static BOOTS: AtomicU32 = AtomicU32::new(0);
@@ -171,7 +171,7 @@ pub fn boot_census() -> (u32, u32, Vec<String>) {
 /// actuator compiled in, armed by boot parameter. `fpu-save-nothing` is the one
 /// actuator that could not become a parameter — it takes the `fxsave64` out of
 /// `arch::entry`'s `naked_asm!` bracket, which is the path its own gate is
-/// about — and `specs/assessments/test-cost-audit.md` §5.9.7 is where that is argued.
+/// about.
 ///
 /// [`toyos_build::build::SCHED_CHECK_KERNEL`] is the fourth, and it is the one
 /// this list's own warning was written about: an entry here is a decision to pay
@@ -254,9 +254,8 @@ fn record_boot(took: Duration) {
 /// corrected for how fast the machine *is*, and that is the other half of the
 /// same mistake: a number reasoned about on an M4 Pro is not a liveness ceiling
 /// on a four-core Azure vCPU, it is a verdict about which of the two is running
-/// the test. `specs/assessments/ci-plan-assessment-2026-08.md` §7.1 counted
-/// 307 bare timeouts in one CI run and
-/// every one of them was that.
+/// the test. 307 bare timeouts were counted in one CI run and every one of
+/// them was that.
 ///
 /// **Only ever upward.** On a faster host the number in the source stands,
 /// because it is the number its author reasoned about, and a ceiling that shrank
@@ -288,7 +287,7 @@ pub fn host_speed() -> (Option<u32>, u32, u32, u32) {
 /// is the part of "how fast is the host today" the harness knows. It does not
 /// know the rest, and a retry loop bounded by elapsed time has that ceiling for
 /// a *verdict* the moment the rest moves: a guest that is merely late reports
-/// exactly what a wedged one reports. `specs/issues/design-debt/` is the bill —
+/// exactly what a wedged one reports. `issues/design-debt/` is the bill —
 /// `desktop_audio_client` 385 s wide against 13 s alone, a landing gate that is
 /// a coin toss, and six reds in four suites every one of which was
 /// `ALONE: GREEN`.
@@ -444,7 +443,7 @@ pub const DIED_SAYING: &str = "--- what the kernel said as it died ---";
 /// 2026-08-18 that is what a `DOUBLE FAULT on CPU 1` cost — the wait named the
 /// death in one sentence, the kernel's report sat in `TestResult::serial`, and
 /// the arm printed `stdout`
-/// (`specs/issues/kernel/a-double-fault-on-cpu-1-under-a-wide-suite.md`). Fixing
+/// (`issues/kernel/a-double-fault-on-cpu-1-under-a-wide-suite.md`). Fixing
 /// the arms would have fixed the arms. What is fixed here is that the sentence
 /// cannot be built without the capture: [`Self::new`] is the only constructor
 /// there is and the capture is one of its two arguments, so a wait that reports
@@ -667,7 +666,7 @@ pub fn ceiling_self_check() -> Result<(), String> {
         if !carried.to_string().contains(want) {
             return Err(format!(
                 "the verdict names the death and drops {want:?}, which is the defect \
-                 `specs/issues/kernel/a-double-fault-on-cpu-1-under-a-wide-suite.md` is \
+                 `issues/kernel/a-double-fault-on-cpu-1-under-a-wide-suite.md` is \
                  about:\n{carried}"
             ));
         }
@@ -841,8 +840,7 @@ pub enum Profile {
     Diskless,
     /// metal-sim with a namespace formatted in 8 KiB logical blocks.
     ///
-    /// Sector size is a shape dimension in exactly the sense
-    /// `specs/device-test-strategy.md` means, and it was one the harness could
+    /// Sector size is a shape dimension, and it was one the harness could
     /// not express: every profile got QEMU's implicit 512-byte namespace, so
     /// nothing asked the driver what it does with a device it cannot address.
     /// The answer was `4096 / sector_size == 0` and then a divide by zero, at
@@ -980,8 +978,8 @@ pub enum Profile {
     /// Two controllers, and every input device arrives *after* the boot.
     ///
     /// The T14's shape for the one thing no profile stages: its Thunderbolt
-    /// xHCI at 00:0d.0 has five ports and has never had a device on them
-    /// (`specs/reference/metal-hardware-inventory.md`), so the controller a user plugs
+    /// xHCI at 00:0d.0 has five ports and has never had a device on them, so
+    /// the controller a user plugs
     /// into is the one that enumerated nothing at boot. Here the second
     /// controller is that one and the boot stick is on the first.
     ///
@@ -999,8 +997,8 @@ pub enum Profile {
     ///
     /// Presence of the unit is the shape dimension, and it is the one QEMU
     /// gives for free that no real machine gives at all: on hardware, "no
-    /// DMAR" and "VT-d disabled in firmware setup" are the same observation
-    /// (`specs/iommu-spec.md` §2.2). This is the machine where the kernel has
+    /// DMAR" and "VT-d disabled in firmware setup" are the same observation.
+    /// This is the machine where the kernel has
     /// to say which of the two it cannot tell apart.
     NoIommu,
     /// metal-sim whose unit advertises a 39-bit address width instead of 48.
@@ -1008,12 +1006,12 @@ pub enum Profile {
     /// `CAP.SAGAW` is a register the guest decodes into a page-table depth,
     /// and a suite with one value of it cannot tell a decode from a constant.
     /// Both widths are real: 39-bit units ship, and the IOVA base every domain
-    /// gets is derived from this number (`specs/iommu-spec.md` §5.3).
+    /// gets is derived from this number.
     IommuNarrow,
     /// metal-sim whose unit cannot remap interrupts.
     ///
     /// Two registers move together — the DMAR's own `INTR_REMAP` flag and the
-    /// unit's `ECAP.IR` — and `specs/iommu-spec.md` §2.2 gives them separate
+    /// unit's `ECAP.IR` — and the kernel gives them separate
     /// refusals, because a platform that declares it cannot remap and a unit
     /// that cannot are different facts a user can act on differently.
     IommuNoIntremap,
@@ -1025,8 +1023,8 @@ pub enum Profile {
     /// differs from the machine gate A's four recorded configs run on is the
     /// sound card, so a difference in the capture is a difference in the audio
     /// path. It is not the T14's literal shape and does not try to be — this is
-    /// the audio arm, not a PCI-topology one. `specs/plans/hda-driver-plan.md`
-    /// H0's diagnostic staged that comparison and is deleted now that the
+    /// the audio arm, not a PCI-topology one. H0's diagnostic staged that
+    /// comparison and is deleted now that the
     /// driver above answers every question it was asked for.
     Hda,
     /// [`Profile::Hda`] with a second controller that also has a codec.
@@ -1048,8 +1046,8 @@ pub enum Profile {
 /// registers from one that prints what it expected to find.
 ///
 /// `caching-mode` is deliberately not a field. It is on everywhere: it is the
-/// stricter configuration, it is the only one QEMU can stage, and
-/// `specs/iommu-spec.md` §5.5 refuses to branch on it — so a profile that
+/// stricter configuration, it is the only one QEMU can stage, and the kernel
+/// refuses to branch on it — so a profile that
 /// turned it off would be staging a machine no code here distinguishes.
 #[derive(Clone, Copy, PartialEq)]
 pub struct Iommu {
@@ -1060,8 +1058,7 @@ pub struct Iommu {
 }
 
 /// What every profile but the three that vary it declares: the widest address
-/// width QEMU offers and interrupt remapping on, which is
-/// `specs/iommu-spec.md` §8's configuration.
+/// width QEMU offers and interrupt remapping on.
 pub const IOMMU_DEFAULT: Iommu = Iommu { aw_bits: 48, intremap: true };
 
 /// The controller every profile but [`Profile::MetalUsb`] gets. `nec-usb-xhci`
@@ -1217,7 +1214,7 @@ struct Shape {
     ///
     /// Presence of a class-0403 *function* is the shape dimension, and it is
     /// separate from whether anything answers on the link behind it — which is
-    /// `specs/plans/hda-driver-plan.md` H0's question (b), and what the codec
+    /// H0's question (b), and what the codec
     /// arguments in this list decide per controller.
     hda: &'static [&'static str],
     /// The unit that decodes this machine's DMA, or its absence. Stated per
@@ -2499,7 +2496,7 @@ impl QemuInstance {
                         let rest = rest.split_once("===").map_or(rest, |(head, _)| head);
                         let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                         // **A marker naming another test is the previous one's**,
-                        // and taking it was `specs/issues/build/`'s cascade:
+                        // and taking it was `issues/build/`'s cascade:
                         // one timed-out test left the guest still producing its
                         // output, every later member of the block read a window
                         // that opened on it, and 110 of 238 went red on an
@@ -2605,7 +2602,7 @@ impl Drop for QemuInstance {
         // that exists before the console does.** Firmware, the bootloader and
         // the kernel up to the backend switch write here and nowhere else, so a
         // boot that dies before virtio-console comes up leaves this file and an
-        // empty capture — which is exactly the shape `specs/issues/diagnostics/`
+        // empty capture — which is exactly the shape `issues/diagnostics/`
         // records as looking like a kernel that never started. 1.4 KB on a
         // healthy `tests/testcases` boot, measured, against the hundreds of
         // megabytes of per-boot image beside it.
@@ -3013,8 +3010,7 @@ fn qemu_command(
     // Ahead of every other `-device`: QEMU gives a PCI function the bypassing
     // address space unless the unit exists when the function is created, so a
     // unit emitted after the devices it is meant to decode is a unit that
-    // decodes nothing — the vacuity trap `specs/plans/userspace-drivers-spec.md` §7.2
-    // is built around, in its harness-side form.
+    // decodes nothing — the vacuity trap, in its harness-side form.
     if let Some(unit) = shape.iommu {
         qemu.arg("-device").arg(format!(
             "intel-iommu,intremap={},caching-mode=on,aw-bits={}",
@@ -3295,8 +3291,8 @@ fn wait_for_ready(
     let ready = options.ready_marker;
     let panic_aborts = ready == DEFAULT_READY;
     // Ten seconds per guest this phase may have up, and never fewer than two
-    // guests' worth — the tree runs 15-25 suites a day across several agents
-    // (`specs/assessments/test-cost-audit.md` §4), so one guest on a quiet host stopped being
+    // guests' worth — the tree runs 15-25 suites a day across several agents,
+    // so one guest on a quiet host stopped being
     // the regime some time before this did. Measured on 2026-08-03 with other
     // agents building: two boots exceeded the flat ten seconds, one of them in a
     // phase running a single guest.
@@ -3345,7 +3341,7 @@ fn wait_for_ready(
             // A process that ended *itself* is not on that list, and the
             // difference is not academic: `sshd` panics across boots that then
             // come up perfectly
-            // (`specs/issues/build/sshd-panics-when-netd-exits-before-it-binds.md`).
+            // (`issues/build/sshd-panics-when-netd-exits-before-it-binds.md`).
             // The words are the same words — `panicked at` — and who wrote the
             // line is the whole of what tells them apart. `super::serial::died`
             // is where that is decided, for this wait and for [`await_guest`]

@@ -70,7 +70,7 @@ pub trait FileSystem: Send {
     /// `bcachefs::Mounted::list` has no count primitive and `btree::collect_all`
     /// under it builds the whole entry set first. Their check is on the result,
     /// so it makes the refusal uniform without making the allocation bounded —
-    /// see `specs/issues/isolation/untrusted-input-panics.md`.
+    /// see `issues/isolation/untrusted-input-panics.md`.
     fn list(&mut self, limit: usize) -> Result<Vec<(String, u64)>, SyscallError>;
 
     /// When `name` was last written, in whatever epoch the mount keeps.
@@ -685,8 +685,8 @@ impl Vfs {
     /// Is there a filesystem mounted under this name?
     ///
     /// The one thing the kernel still knows about `/log`: it mounts the volume
-    /// and hands it to
-    /// userland, and `/bin/logd` is what knows whether a file was opened on it.
+    /// and hands it to userland, and `/bin/logd` is what knows whether a file
+    /// was opened on it.
     /// `report_log_destination` is the caller and the panel is why it exists —
     /// logd's own line reaches a console and never the screen.
     pub fn has_mount(&self, name: &str) -> bool {

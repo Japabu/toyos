@@ -33,13 +33,15 @@ const HOST_ADDRESS_WIDTH: usize = 36;
 const FLAGS: usize = 37;
 
 /// Flags bit 0. Its absence is the platform declaring it cannot remap
-/// interrupts, which `specs/iommu-spec.md` §2.2 gives its own refusal.
+/// interrupts — one of the conditions that will one day refuse the machine at
+/// boot, because an interrupt is a memory write that DMA remapping does not
+/// see.
 pub const FLAG_INTR_REMAP: u8 = 1 << 0;
 /// Flags bit 1: firmware asks the OS not to enable x2APIC mode.
 pub const FLAG_X2APIC_OPT_OUT: u8 = 1 << 1;
 /// Flags bit 2: the platform asks that DMA be blocked until the OS has
-/// programmed the unit. Honoured for free by §5.6's ordering — nothing is told
-/// to DMA before translation is on — so it is logged and costs nothing.
+/// programmed the unit. Honoured for free by this kernel's ordering — nothing
+/// is told to DMA before translation is on — so it is logged and costs nothing.
 pub const FLAG_DMA_CTRL_OPT_IN: u8 = 1 << 2;
 
 /// A list element that declared a size the list cannot hold: where it starts,

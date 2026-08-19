@@ -21,7 +21,7 @@
 //! measured on 2026-08-15 at `--smp 8`: one thread per shard, two threads per
 //! shard with an explicit `yield_now` every sixteen records, and two per shard
 //! parking for 50 µs every sixteen. All three reported **0 of 8 (and 0 of 16)
-//! producers with records on a second shard**. §9.2's nesting gate is what
+//! producers with records on a second shard**. `log-nested-emit`'s gate is what
 //! reaches the reservation race instead, on one CPU, where an interrupt is a
 //! stimulus a test can actually aim.
 //!
@@ -136,8 +136,8 @@ extern "C" fn body(thread: u64) -> ! {
     // `done` past every patterned record was tried and hung a 12-wide suite;
     // the reader was rewritten instead to decide from its own cursor, which
     // removes the class rather than this instance
-    // (`userland/test-runner/src/log_gate.rs`). The record still declares
-    // what this producer emitted and the reader cross-checks it wherever it
+    // (`userland/test-runner/src/log_gate.rs`). The record still declares what
+    // this producer emitted and the reader cross-checks it wherever it
     // survives.
     crate::log!("logstorm done t={thread} emitted={STORM_RECORDS}");
 

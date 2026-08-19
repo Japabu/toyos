@@ -23,7 +23,7 @@ impl Mmio {
     /// The window's base as an integer.
     ///
     /// For the one reader that cannot hold the handle: the IOMMU's DMA-fault
-    /// interrupt handler may take no lock (`specs/iommu-spec.md` §7.1), so the
+    /// interrupt handler may take no lock, so the
     /// windows it reads live in `AtomicU64`s and are dereferenced there rather
     /// than through this type. Everything that *can* hold an `Mmio` should.
     pub fn addr(self) -> u64 {

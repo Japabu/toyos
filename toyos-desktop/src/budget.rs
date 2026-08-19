@@ -35,7 +35,7 @@ pub fn window_bytes(screen: Rect) -> u64 {
 ///
 /// **This is a mitigation, and the thing it mitigates is the real defect.** A
 /// window buffer is charged to nobody: there is no per-process memory limit, no
-/// pressure signal and no OOM killer (`specs/issues/isolation/`), so without a
+/// pressure signal and no OOM killer (`issues/isolation/`), so without a
 /// cap any client can walk the machine into exhaustion by asking for windows,
 /// and the compositor cannot tell a desktop from an attack. The 2 MiB rounding
 /// amplifies it: at 2048x2048 a window costs exactly 16 MiB, so 64 windows is

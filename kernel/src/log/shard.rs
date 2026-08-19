@@ -22,7 +22,8 @@ use toyos_abi::log::{LogRecord, MAX_RECORD_MESSAGE};
 use toyos_abi::log::RECORD_BYTES;
 
 /// Slots per CPU: 512 KiB at `RECORD_BYTES` of 1024, and 4 MiB at the shipped
-/// eight, which the owner accepted with that arithmetic in hand.
+/// eight — bought deliberately when the record was widened to hold a demangled
+/// backtrace frame, and the owner accepted it with that arithmetic in hand.
 ///
 /// **Sized by records emitted before a reader exists**, which is the only
 /// quantity this bound has to cover — after that `klogd` and `/bin/logd` are
@@ -79,6 +80,26 @@ const MSG_BYTES: usize = MSG_WORDS * 8;
 const _: () = assert!(MSG_BYTES == MAX_RECORD_MESSAGE);
 #[cfg(not(feature = "loom"))]
 const _: () = assert!(BODY_WORDS * 8 == RECORD_BYTES - core::mem::size_of::<u64>());
+
+/// The store that publishes a record, and what it carries.
+///
+/// It is the last store [`Shard::commit`] makes, and the release is what puts
+/// every body word ahead of it for a reader whose `slot.seq.load(Acquire)`
+/// answers `seq` — obligation W1, which `kernel-loom/tests/log_record.rs`
+/// states and models.
+///
+/// **A cargo feature rather than a comment, because a model that has never
+/// failed proves nothing.** `kernel-loom`'s `log-commit-release-off` makes it
+/// `Relaxed` and `kernel-loom/tests/log_record.rs` must red under it: a reader
+/// then observes the sequence number with a stale or half-written body behind
+/// it, twice over — the re-check reads the same relaxed word and accepts the
+/// mixture. On x86 every store is a release and this cannot happen, which is
+/// the whole reason W1 is a model. No kernel build can turn the name on: the
+/// kernel declares it only so `cfg` checking knows it.
+#[cfg(not(feature = "log-commit-release-off"))]
+const PUBLISH: Ordering = Ordering::Release;
+#[cfg(feature = "log-commit-release-off")]
+const PUBLISH: Ordering = Ordering::Relaxed;
 
 /// The three identity words, in the order a slot holds them.
 fn header(record: &LogRecord, len: u16) -> [u64; HEADER_WORDS] {
@@ -329,7 +350,7 @@ impl Shard {
         }
 
         // The store that publishes, and it is the last one.
-        slot.seq.store(seq, Ordering::Release);
+        slot.seq.store(seq, PUBLISH);
     }
 
     /// The timestamp of record `seq`, under exactly [`Shard::read`]'s validity
@@ -444,7 +465,7 @@ impl Shard {
 ///
 /// **One bit, and it is what keeps the producer's path free of locked
 /// read-modify-writes.** Without it every commit would pay `claim_wake`'s CAS,
-/// and `specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md` measured what
+/// and `issues/hardware/one-rmw-per-log-line-cost-350ms.md` measured what
 /// one of those per line costs under TCG: 350 ms of boot. What a producer pays
 /// here is a fence and a relaxed load; the five locked operations of the post
 /// are paid at most once per park, by whichever producer wins the swap.
