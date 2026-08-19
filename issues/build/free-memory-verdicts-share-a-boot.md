@@ -79,6 +79,42 @@ this branch has no standing to pick between them for a defect it only made
 louder. **`Instrument::Ci` cannot see any of this** — one guest per machine,
 `--jobs 1` — so nothing here is a claim about a CI red.
 
+## 2026-08-19: CI saw it, and ALONE was RED — both of this entry's escape clauses failed
+
+Everything above rests on two claims, and one CI run broke both.
+
+**"`Instrument::Ci` cannot see any of this — one guest per machine, `--jobs 1`."**
+It saw it. `guest (1)` on PR #126, run `32237424649` — a pull request whose
+entire diff is two new markdown files. `main` is red at the same commit
+(`8e9f851`): the `ci` and `gate A, thorough` workflows both failed on
+2026-08-19, at 03:40Z and 03:56Z.
+
+**"green alone both times", "every one ALONE GREEN".** Not this time. The
+harness re-ran it by itself and printed:
+
+```
+ALONE fd_lifetime: red again, the same failure both times — the defect is real.
+```
+
+The number is `16777216` — **exactly 16 MiB, the whole of what the holder took**,
+against a 6 MiB threshold. Not a margin missed by a page: nothing came back.
+
+This does not overturn the shared-boot analysis above, which stands on its own
+evidence. It says that analysis is **not the whole story**, and that the reading
+it was built to rule out — a real leak in the kill path — is back on the table,
+because the one discriminator used to separate the two has now answered the
+other way. A shared-boot artefact does not reproduce in a single guest at
+`--jobs 1`, and this did.
+
+Whoever picks this up starts by deciding which of the two it is, and the
+existing instrument can no longer make that call. `SYS_PROCESS_STATS` — the
+per-process measurement the next section already recommends — is now the
+prerequisite for reading this entry at all, rather than an improvement to it.
+
+The redlist row for `fd_lifetime` still says `ALONE … GREEN` every time. That
+sentence is false as of this run, and the row needs the same correction this
+section is.
+
 ## What to do
 
 Not "make the margin bigger": a margin that absorbs another binary's working set
