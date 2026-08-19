@@ -1,15 +1,22 @@
 //! Identifiers a tree may not name, and the exceptions that are named instead.
 //!
-//! The first scan bans, over `kernel/src` and `toyos-sched/src`, the methods
-//! that take an object's lifetime out of its `Arc`'s hands — `Arc::into_raw`,
-//! `Arc::from_raw`, the two strong-count adjusters — and `mem::forget`. The
-//! natural home for that would be
-//! `kernel/clippy.toml`'s `disallowed-methods`, but **nothing in this
-//! repository runs clippy** — not CI, not `cargo test`, not the build — so a
-//! `clippy.toml` would be a wall with nothing behind it. A scan in
-//! `cargo test --lib` runs on every machine that builds this tree, in
-//! milliseconds, and can carry its exceptions with the reason each one is
-//! allowed.
+//! **Clippy runs now, and these scans are what it cannot say.** The `host` job
+//! in `.github/workflows/host-tests.yml` runs default clippy with warnings
+//! denied over three trees on every pull request — the host workspace
+//! (`--workspace --all-targets`), the kernel (`--target x86_64-unknown-none`)
+//! and the bootloader (`--target x86_64-unknown-uefi`) — so a `clippy.toml` is
+//! no longer a wall with nothing behind it.
+//!
+//! What is behind it is still not these three scans. `disallowed-methods` could
+//! take the first one, and would lose what makes it useful: the exceptions
+//! below are per file *and per line count*, so an added `mem::forget` beside a
+//! permitted one reds, which a name-based allow list cannot express. The second
+//! and third scans ask whether an identifier is absent from the tree, which is
+//! not a question any lint asks at all. So the first scan bans, over
+//! `kernel/src` and `toyos-sched/src`, the methods that take an object's
+//! lifetime out of its `Arc`'s hands — `Arc::into_raw`, `Arc::from_raw`, the
+//! two strong-count adjusters — and `mem::forget`. It runs in
+//! `cargo test --lib`, on every machine that builds this tree, in milliseconds.
 //!
 //! The exceptions are per file and per line count, so an *added* `forget`
 //! beside a permitted one is a red rather than a silence.

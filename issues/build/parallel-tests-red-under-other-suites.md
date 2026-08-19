@@ -166,6 +166,18 @@ changes.
   `[host-slots]` lines. `the close probe exited Some(1)`, `ALONE … GREEN`, and
   `cargo run -- --known-red log_poll_outlives_a_close` answers `NOT ON THE
   LIST`, so this is its first recorded sighting. Not investigated.
+- **`xhci_full_speed_device`** — added 2026-08-19, **1 of 2** full `cargo test`
+  runs on `wt/toyos-clippygate`. `"PANIC:" during the USB gate boot`,
+  `ALONE … GREEN`, and `cargo run -- --known-red xhci_full_speed_device`
+  answers `NOT ON THE LIST`. The two runs are the measurement: the red one was
+  the branch's *first* suite after a full rebuild and its parallel phase took
+  103.9 s, the green one minutes later on a warm tree took 32.0 s — so the phase
+  that failed was carrying this worktree's own twelve kernel builds, which is
+  the load `build_slot` bounds and the section below describes. The branch's
+  kernel delta in `drivers/xhci/` is two comment blocks, two `#[allow]`
+  attributes and two pairs of parentheses that spell out the precedence Rust
+  already applied (`+` and `*` bind tighter than `|`), so no instruction in that
+  driver moved. Still `Sched::Parallel`.
 
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits
