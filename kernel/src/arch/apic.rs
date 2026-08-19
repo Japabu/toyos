@@ -143,12 +143,11 @@ pub fn send_nmi(cpu_id: u32) {
 /// inside it. `screen_fatal_halt_composited`'s `/log` half is what says so on
 /// every run.
 ///
-/// **A [`Budget`] and not a [`Bound`](crate::time::Bound), which is the one
-/// place this sweep came out a square from
-/// `specs/completion-architecture-spec.md` §3.2.** That section reclassified it
-/// away from `Tripwire` — right, because `:236` logs and *returns* rather than
-/// panicking — and landed on `Bound`, whose two constructors both demand a
-/// register or a specification section. This number has neither: it is policy,
+/// **A [`Budget`] and not a [`Bound`](crate::time::Bound) — the one place
+/// this sweep came out a square, reclassified away from `Tripwire`** — right,
+/// because `:236` logs and *returns* rather than panicking — **and landed on
+/// `Bound`, whose two constructors both demand a register or a specification
+/// section.** This number has neither: it is policy,
 /// priced against the ~460 ms the panel paint costs anyway. A `Budget`'s expiry
 /// is a degraded answer named at the site, and "the panel is the only copy" is
 /// exactly one.

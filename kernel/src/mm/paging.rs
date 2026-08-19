@@ -407,8 +407,8 @@ impl AddressSpace {
     /// address space owns. A shared-memory page is unmapped here too and its
     /// frame outlives the unmap, so a waiter in *another* process is ended
     /// where it did not have to be — a spurious futex return, which every park
-    /// site is allowed (`specs/completion-architecture-spec.md` §5.5) and every
-    /// futex loop in userland already re-checks. The converse mistake is not
+    /// site is allowed and every futex loop in userland already re-checks.
+    /// The converse mistake is not
     /// survivable, and telling the two apart would put the ownership question
     /// on a path whose only wrong answer is a use-after-free.
     pub fn unmap(&mut self, vaddr: UserAddr) {
@@ -768,8 +768,7 @@ const MIN_PHYS_MAP: u64 = 4 * 1024 * 1024 * 1024;
 /// threads — and while it could not name the same thing a process names,
 /// `KernelPayload.address_space` had to stay an `Option` with a fallback branch
 /// deciding which `cr3` a task gets. It does not now: the field is *the address
-/// space this task runs in*, for every task, with no second answer
-/// (`specs/completion-architecture-spec.md` §10 and §15 row 12).
+/// space this task runs in*, for every task, with no second answer.
 ///
 /// Published once at boot from a leaked `Arc` and read with one acquire load —
 /// `log::console`'s `KLOGD` has the same shape for the same reason. Leaked

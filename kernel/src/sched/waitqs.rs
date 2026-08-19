@@ -1,7 +1,6 @@
 //! Where the kernel's wait *subjects* live — spec §8.6.
 //!
-//! **There is no wait queue in this file any more, and that is the whole of
-//! what `specs/completion-architecture-spec.md` §5.6 asked for.** Every waitable
+//! **There is no wait queue in this file any more.** Every waitable
 //! object owns a [`Watch`] and a waiter arms on it; the park itself is on the
 //! waiter's own thread queue (`TaskHandle::park_queue`), which is the one list
 //! left in the kernel and has exactly one member. Objects with a lifetime own
@@ -46,10 +45,10 @@ pub fn wake_device(watch: &'static Watch) {
 /// The completion subject a futex word arms on, keyed by physical address so
 /// the subject is shared across every process that maps the word.
 ///
-/// **`FUTEX`, `PARK_BUCKETS` and `park_lot` are all gone from beside it**
-/// (`specs/completion-architecture-spec.md` §5.6): `waitpid`, `thread_join` and
-/// `nanosleep` stop hashing into a parking lot and arm on the object or on
-/// their own thread, every thread parks on a queue of its own
+/// **`FUTEX`, `PARK_BUCKETS` and `park_lot` are all gone from beside it**:
+/// `waitpid`, `thread_join` and `nanosleep` stop hashing into a parking lot
+/// and arm on the object or on their own thread, every thread parks on a
+/// queue of its own
 /// (`TaskHandle::park_queue`), and the futex's own 64-way queue array outlived
 /// its last registrant by one chunk — `wake_n` counted an empty list and
 /// `futex_wake` therefore returned 0 for every call in the machine.

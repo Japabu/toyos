@@ -29,9 +29,9 @@ use crate::vm::{FairEpoch, Vm, IPI_LATENCY_NS, RUN_CHUNK_NS, UNWIND_NS};
 /// another CPU's progress cannot inflate it.
 ///
 /// **The fourth term is what bounded deferral costs, and it is priced here
-/// rather than declared away.** `specs/completion-architecture-spec.md` §7.2
-/// introduced the dying list; the first attempt served it *before* `rq` and the
-/// term would have been the whole unwind, once per killed task, turning this
+/// rather than declared away.** The cancellable kill introduced the dying
+/// list; the first attempt served it *before* `rq` and the term would have
+/// been the whole unwind, once per killed task, turning this
 /// bound into a statement about how long a kernel teardown takes. The second
 /// attempt served it strictly *after* `rq` and had no term at all — at the price
 /// of a corpse that never runs under a saturated RT band, which is
@@ -310,11 +310,11 @@ fn check_sleeping_cpus(vm: &mut Vm<'_>) {
 /// retire completes within [`retire_latency_bound`]**, which is the statement
 /// the kernel's `retire_task` makes with a wall clock and a panic.
 ///
-/// **Both halves survive `specs/completion-architecture-spec.md` §7.2 and only
-/// one of them changed.** That section makes a killed task *run* rather than
-/// be reaped where it lies, so the first half's justification is now about
-/// where the unwind can start rather than where the reap can happen — the
-/// sentence above is written in those terms and the check is the same check.
+/// **Both halves survive the cancellable kill and only one of them
+/// changed.** It makes a killed task *run* rather than be reaped where it
+/// lies, so the first half's justification is now about where the unwind can
+/// start rather than where the reap can happen — the sentence above is
+/// written in those terms and the check is the same check.
 /// The second half gained one term and is re-derived at its own definition.
 ///
 /// The first half is what `scenarios::old_migrate_kept_the_corpse` proves has

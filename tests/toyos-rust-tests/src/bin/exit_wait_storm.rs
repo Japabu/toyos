@@ -1,11 +1,10 @@
 //! The park class nothing else exercises: waiting for a child, and joining a
 //! thread, under volume.
 //!
-//! `specs/completion-architecture-spec.md` §20.4. §4.1 collapses P7 (child
-//! exit) and P8 (thread exit) onto parks on the process object and on the
-//! thread's own watch, and **no other gate reaches either**:
-//! `blocking_read_stress` is pipes, `cancel_while_parked` and
-//! `killed_holder_releases` are disk and VFS. The tree's existing coverage is
+//! The one park site collapses P7 (child exit) and P8 (thread exit) onto
+//! parks on the process object and on the thread's own watch, and **no other
+//! gate reaches either**: `blocking_read_stress` is pipes, `cancel_while_parked`
+//! and `killed_holder_releases` are disk and VFS. The tree's existing coverage is
 //! ordering rather than volume — `process_lifecycle` has one arm on the wake
 //! and `std_threading` joins four threads.
 //!

@@ -81,10 +81,9 @@ static SIBLINGS_ANSWER: AtomicBool = AtomicBool::new(false);
 /// that looks like every other freeze.
 ///
 /// A [`Tripwire`]: it panics below, and neither a register nor a specification
-/// publishes it. Its *derivation* is `USB_TIMEOUT_NS`, which
-/// `specs/completion-architecture-spec.md` §3.2 splits at C10 — so the number
-/// owes a new reason to whichever chunk does that, and the kind does not change
-/// with it.
+/// publishes it. Its *derivation* is `USB_TIMEOUT_NS`, which splits at C10 —
+/// so the number owes a new reason to whichever chunk does that, and the kind
+/// does not change with it.
 const ACK_TIMEOUT: Tripwire = Tripwire::absurd(
     Duration::from_secs(5),
     "above the longest IF-clear device spin a target can be inside",

@@ -1,12 +1,11 @@
 //! `usbd`: the context USB work runs in, instead of whichever thread trapped.
 //!
-//! `specs/completion-architecture-spec.md` §10. The kernel has three kernel
-//! threads and this is the second: `klogd` drains the console
-//! (`log/console.rs`), `usbd` owns the xHCI port machine, and `iod`
-//! (`crate::iod`) owns the write-back queue. Three and not one, because a stuck
-//! USB enumeration must not stop the log — which is exactly what it does today,
-//! where [`super::poll_if_pending`] runs at the top of every scheduler pass on
-//! every CPU and `wait_transfer` spins with `XHCI` held.
+//! The kernel has three kernel threads and this is the second: `klogd` drains
+//! the console (`log/console.rs`), `usbd` owns the xHCI port machine, and
+//! `iod` (`crate::iod`) owns the write-back queue. Three and not one, because
+//! a stuck USB enumeration must not stop the log — which is exactly what it
+//! does today, where [`super::poll_if_pending`] runs at the top of every
+//! scheduler pass on every CPU and `wait_transfer` spins with `XHCI` held.
 //!
 //! **What it will own, and what it owns now.** C7 moves `poll_if_pending` off
 //! `drain_irqs` and onto this thread, C9 hands it the i8042's verdict as a
@@ -29,9 +28,9 @@
 //! `usbd` costs the machine its USB port machine — hot-plug stops working and
 //! the boot disk keeps whatever it already had — and every one of those losses
 //! is *visible*: the device does not appear, the dump names the thread as gone.
-//! A killed `klogd` costs the machine its only console drainer, which is the one
-//! failure nothing left alive can report, so that thread halts instead
-//! (`log/console.rs`, `specs/log-architecture-spec.md` §4.3).
+//! A killed `klogd` costs the machine its only console drainer, which is the
+//! one failure nothing left alive can report, so that thread halts instead
+//! (`log/console.rs`).
 
 use toyos_sched::task::WaitClass;
 

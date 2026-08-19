@@ -23,9 +23,8 @@ pub enum Container {
     Running,
     Ready,
     /// Killed, still holding a kernel stack, waiting to be dispatched so it
-    /// can unwind (`specs/completion-architecture-spec.md` §7.2). Its state
-    /// word reads `Ready`, because that is what it is — a task the pick takes
-    /// before the fair queue.
+    /// can unwind. Its state word reads `Ready`, because that is what it is —
+    /// a task the pick takes before the fair queue.
     Dying,
     Parked,
     Zombie,

@@ -195,11 +195,10 @@ pub struct CpuSched<X: SchedPayload> {
     /// ahead of the **fair** queue, and behind the RT band only until the head
     /// of this list has aged ([`DYING_AGE_NS`]).
     ///
-    /// **This is what replaces every reap-in-place** (spec §7.2 of
-    /// `specs/completion-architecture-spec.md`): this kernel does not unwind,
-    /// so a task whose value is discarded takes every guard on its stack with
-    /// it — a sleep lock nobody can ever take again. A killed task is
-    /// therefore *scheduled*, observes the cancel at its next park or at its
+    /// **This is what replaces every reap-in-place**: this kernel does not
+    /// unwind, so a task whose value is discarded takes every guard on its
+    /// stack with it — a sleep lock nobody can ever take again. A killed task
+    /// is therefore *scheduled*, observes the cancel at its next park or at its
     /// return to userland, and dies by its own `die`.
     ///
     /// Separate from the fair queue rather than ordered inside it, for the
@@ -227,8 +226,9 @@ pub struct CpuSched<X: SchedPayload> {
     /// the pick serves `rq` first whenever the RT band is occupied; both were
     /// written before the grant existed and both were false the moment it did.
     ///
-    /// **Superseded in design by `specs/scheduling-reservations-spec.md`**,
-    /// which deletes the age, the chunk and the grant together: the deferral
+    /// **Superseded in design by the reservation model**
+    /// (`issues/kernel/cpu-time-is-a-band-and-not-a-reservation.md`), which
+    /// deletes the age, the chunk and the grant together: the deferral
     /// above is bounded per *corpse* and not per CPU, so k corpses take k
     /// consecutive grants, and a real-time band that briefly empties throws the
     /// accumulated age away on every dispatch. What replaces it is a per-CPU
@@ -512,10 +512,10 @@ impl<X: SchedPayload> CpuSched<X> {
         env.hw.release(key, payload, acct);
     }
 
-    /// Every death goes through here (invariant I11) — and since
-    /// `specs/completion-architecture-spec.md` §7.2 there is only one kind: a
-    /// task's own `die`, on the stack it unwound. The reap paths this sentence
-    /// used to have to name are gone.
+    /// Every death goes through here (invariant I11) — and since the
+    /// cancellable kill there is only one kind: a task's own `die`, on the
+    /// stack it unwound. The reap paths this sentence used to have to name
+    /// are gone.
     ///
     /// A task whose context is the one this CPU is *currently executing on*
     /// cannot be handed back yet: in the kernel that record owns the kernel
@@ -761,10 +761,10 @@ impl<X: SchedPayload> CpuSched<X> {
             // A running task cannot be yanked out from under its own kernel
             // stack; it dies at its next safe point (spec §7.6). Consuming the
             // message here is only sound because the sticky kill bit outlives
-            // it and *every* safe point honours it, and
-            // `specs/completion-architecture-spec.md` §7.2 changed which points
-            // those are. **The pick no longer reaps anything** — the argument
-            // this comment used to make. What ends the task instead:
+            // it and *every* safe point honours it, and the cancellable kill
+            // changed which points those are. **The pick no longer reaps
+            // anything** — the argument this comment used to make. What ends
+            // the task instead:
             //
             // * `completion::wait` answers `Cancelled` and the caller `?`s it
             //   out, dropping every guard on the way, so the unwind reaches the
@@ -1437,8 +1437,9 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
     /// emptied `dying` first left a killed normal task holding the CPU against a
     /// ready real-time task for the whole of its unwind, quantum after quantum,
     /// because `preempt_if_due` returns it to `dying` and this pick handed it
-    /// straight back with a fresh quantum. That contradicts
-    /// `scheduler-core-spec.md` §3 outright.
+    /// straight back with a fresh quantum. That contradicts the rule this
+    /// scheduler states as law — a ready real-time task preempts the normal
+    /// band — outright.
     ///
     /// Asking only `rq.has_rt()` is the other absolute and it is worse, because
     /// its failure is a kernel panic: one permanently-RT thread that never parks

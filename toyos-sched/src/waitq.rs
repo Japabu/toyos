@@ -129,9 +129,9 @@ impl<M: SchedMsg, L: LeafLock<WaitList<M>>> WaitQueue<M, L> {
     /// what its blocked time is attributed to.
     ///
     /// **The class stopped being the queue's the moment there was one queue per
-    /// thread.** `specs/completion-architecture-spec.md` §5.2 makes every park
-    /// happen on `TaskHandle::park_queue` — a list of one, a parking place with
-    /// no subject — so a class read off that queue is the same word for every
+    /// thread.** The one park site makes every park happen on
+    /// `TaskHandle::park_queue` — a list of one, a parking place with no
+    /// subject — so a class read off that queue is the same word for every
     /// wait in the machine, and `ProcessStats`'s `blocked_io_ns`,
     /// `blocked_futex_ns`, `blocked_pipe_ns` and `blocked_ipc_ns` were
     /// permanently zero while the dump's per-thread column read "other" for
@@ -149,10 +149,9 @@ impl<M: SchedMsg, L: LeafLock<WaitList<M>>> WaitQueue<M, L> {
 
     /// Phase 1 for a wait that a kill may **not** end.
     ///
-    /// `specs/completion-architecture-spec.md` §7.4's third shape, which it
-    /// calls the honest one: a `commit()` that distinguishes cancellable from
-    /// uncancellable waits. The other two — a kill bit cleared for the window,
-    /// or a park variant that ignores it — either open a hole in the
+    /// This is the honest shape: a `commit()` that distinguishes cancellable
+    /// from uncancellable waits. The other two — a kill bit cleared for the
+    /// window, or a park variant that ignores it — either open a hole in the
     /// termination argument or hide the distinction from the type system.
     ///
     /// It exists because §7.2 makes `Commit::Killed` a *disposition* rather
@@ -330,11 +329,10 @@ pub struct WaitTicket<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> {
 
 /// Whether a kill ends this wait.
 ///
-/// A property of the *wait* and not of the task, which is what
-/// `specs/completion-architecture-spec.md` §7.4 settles: the same thread may
-/// hold both kinds, one after the other — a cancellable park on the way in and
-/// an uncancellable one on the way out, in the teardown its own cancel sent it
-/// to.
+/// A property of the *wait* and not of the task, which is what the
+/// cancellable kill settles: the same thread may hold both kinds, one after
+/// the other — a cancellable park on the way in and an uncancellable one on
+/// the way out, in the teardown its own cancel sent it to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Cancel {
     /// The ordinary park. A kill refuses the commit, the caller is told, and
@@ -453,8 +451,8 @@ impl<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> WaitTicket<'q, M, L> {
     /// woken by a wake and there is no second retire to send one, the retirer
     /// waits on a release that never comes, and the address space the payload
     /// holds is never freed. The refusal is what keeps the task *running*, on
-    /// its own stack, which since
-    /// `specs/completion-architecture-spec.md` §7.2 is where its death happens.
+    /// its own stack, which since the cancellable kill is where its death
+    /// happens.
     ///
     /// The kill check comes first because it subsumes the wake: a task about
     /// to die has no use for a wake, and `cancel_commit` puts the word back to

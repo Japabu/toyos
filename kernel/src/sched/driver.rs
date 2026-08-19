@@ -509,10 +509,10 @@ impl<'q> Ticket<'q> {
 ///
 /// **Returns on every path, and one of them changed.** A retire that catches a
 /// thread mid-registration used to turn the block into an exit and never come
-/// back; since `specs/completion-architecture-spec.md` §7.2 the `Commit::Killed`
-/// arm below is `dispose_none` — the thread keeps its stack, unwinds it, and
-/// takes the cancel from its next `completion::wait`. There is no disposition
-/// here that does not return.
+/// back; since the cancellable kill the `Commit::Killed` arm below is
+/// `dispose_none` — the thread keeps its stack, unwinds it, and takes the
+/// cancel from its next `completion::wait`. There is no disposition here that
+/// does not return.
 pub fn pass_block(ticket: Ticket<'_>, deadline: Option<Nanos>) {
     // No `preempt::disable()` of its own: the ticket has held the count raised
     // since the registration published `Committing`, and that guard *is* this

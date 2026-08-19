@@ -1,13 +1,13 @@
 //! The lost-wake canary: a pipe ping-pong across processes, counted.
 //!
-//! `specs/completion-architecture-spec.md` §20.4. Every round trip here is two
-//! parks and two posts on the completion core — the reader blocks in `sys_read`
-//! on an empty pipe, the writer's post wakes it, and the same happens back the
-//! other way. **The verdict is a count inside a wall-clock bound**, never a
-//! hang: §20.3 disqualifies a stall as a verdict, because the harness prints
-//! "the guard expired, so this says nothing about the tree" beside one and
-//! tells nobody to bisect it. A dropped completion reds as a number that is
-//! short of `ROUNDS`, with the round it stopped at named.
+//! Every round trip here is two parks and two posts on the completion core —
+//! the reader blocks in `sys_read` on an empty pipe, the writer's post wakes
+//! it, and the same happens back the other way. **The verdict is a count
+//! inside a wall-clock bound**, never a hang: a stall is disqualified as a
+//! verdict, because the harness prints "the guard expired, so this says
+//! nothing about the tree" beside one and tells nobody to bisect it. A
+//! dropped completion reds as a number that is short of `ROUNDS`, with the
+//! round it stopped at named.
 //!
 //! The echo half is this same binary with an argument, so the two ends are one
 //! file and the child's own parks are the same parks the parent's are.

@@ -179,7 +179,7 @@ pub enum MigrateShape {
 }
 
 /// How the pick weighs a ready real-time task against a corpse waiting to
-/// unwind — `scheduler-core-spec.md` §3.
+/// unwind.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AgeShape {
     /// What ships: the RT band goes first until the head of the dying list has

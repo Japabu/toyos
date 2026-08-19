@@ -1,9 +1,9 @@
 //! One completion primitive: a record, an inbox, and a watch a waiter lends to
 //! the object it is waiting on.
 //!
-//! `specs/completion-architecture-spec.md` §5. The claim the whole design rests
-//! on is that **every wait in this kernel is "a record in an inbox"** — so the
-//! park-time recheck is one predicate with no source named in it, and a new
+//! The claim the whole design rests on is that **every wait in this kernel is
+//! "a record in an inbox"** — so the park-time recheck is one predicate with
+//! no source named in it, and a new
 //! wait source cannot re-open the lost-wake window because it has no way to add
 //! a second predicate.
 //!

@@ -159,9 +159,8 @@ const GEN_MASK: u64 = (1 << GEN_BITS) - 1;
 /// Sticky: set by the retirer before it posts, never cleared. Any CPU that
 /// adopts the task *dispatches* it on arrival — into its own dying list — and
 /// the task dies by its own `die` at the first safe point its unwind reaches,
-/// which is what makes the retire chase terminate (spec §7.6, and
-/// `specs/completion-architecture-spec.md` §7.2 for why it is a dispatch and no
-/// longer a conversion).
+/// which is what makes the retire chase terminate (spec §7.6, and the
+/// cancellable kill for why it is a dispatch and no longer a conversion).
 const KILL: u64 = 1 << 62;
 /// Sticky: exactly one retirer may post the retire node (spec §7.6).
 const RETIRE_QUEUED: u64 = 1 << 63;
@@ -228,10 +227,10 @@ fn legal(from: TaskState, to: TaskState) -> bool {
         // Dispositions of the running task; the home CPU never changes here.
         (Running(a), Ready(b)) | (Running(a), Committing(b, _)) => a == b,
         (Running(_), Dead) => true,
-        // Pick and migrate. `Ready → Dead` is not a reap any more: since
-        // `specs/completion-architecture-spec.md` §7.2 nothing converts a ready
-        // task to a dead one, and the edge survives for the *panic* path, where
-        // `schedule_no_return` buries a context that cannot be resumed.
+        // Pick and migrate. `Ready → Dead` is not a reap any more: since the
+        // cancellable kill nothing converts a ready task to a dead one, and
+        // the edge survives for the *panic* path, where `schedule_no_return`
+        // buries a context that cannot be resumed.
         (Ready(a), Running(b)) => a == b,
         (Ready(_), InTransit(_)) | (Ready(_), Dead) => true,
         // The two-phase wait handshake.
@@ -535,9 +534,8 @@ impl RtState {
     /// `preempt_if_due` only preempts it at its quantum end, and that quantum
     /// starts at the same dispatch this arms from — so `now >= until` holds
     /// there and [`RtState::expire`] clears it; a `park` clears it whatever the
-    /// clock says; and the third, which
-    /// `specs/completion-architecture-spec.md` §7.2 added and this sentence
-    /// once predated, is the dying list — [`ReadyTask::end_lend`] and
+    /// clock says; and the third, which the cancellable kill added and this
+    /// sentence once predated, is the dying list — [`ReadyTask::end_lend`] and
     /// [`RunningTask::end_lend`] are called on every route into it, and their
     /// docs carry why. A second arm therefore needs a *new* lend, and one lend
     /// buys at most one quantum at the borrowed priority (spec §8.5, invariant
@@ -697,9 +695,9 @@ macro_rules! linear_state {
             /// Whether this task competes **in the real-time band** right now,
             /// which is not the same question as [`RtState::is_rt`].
             ///
-            /// A killed task unwinding its own stack is normal-band work —
-            /// `scheduler-core-spec.md` §3 — and that is a statement about what
-            /// it is *doing*, not about a right it holds. `RtState::release`
+            /// A killed task unwinding its own stack is normal-band work, and
+            /// that is a statement about what it is *doing*, not about a right
+            /// it holds. `RtState::release`
             /// ends an inherited lend and deliberately leaves the permanent
             /// flag alone, so a thread that called `SYS_RT_ENTER` and was then
             /// killed still answers `is_rt()`. Asking `is_rt()` where the band
@@ -789,8 +787,7 @@ impl<X: SchedPayload> TransitTask<X> {
     /// be converted straight to a corpse. The retire chase still terminates,
     /// and its argument is sharper for the change: whoever ends up owning the
     /// task *dispatches* it, and it dies by its own `die` once its kernel
-    /// stack has unwound. Discarding the value here discarded that stack —
-    /// `specs/completion-architecture-spec.md` §7.1's arm 6.
+    /// stack has unwound. Discarding the value here discarded that stack.
     pub(crate) fn adopt(self, cpu: CpuId, now: Nanos) -> ReadyTask<X> {
         let mut task = self.0;
         task.0.since = now;
@@ -818,14 +815,14 @@ impl<X: SchedPayload> ReadyTask<X> {
     /// puts a corpse in the RT band ahead of real real-time work, off a lend
     /// nobody can benefit from.
     ///
-    /// It is also what keeps [`RtState::arm`]'s argument true.
-    /// `specs/completion-architecture-spec.md` §7.2 added a third way out of
-    /// `Running` — the dying list — and `arm`'s enumeration was written when
-    /// there were two. It names all three now. Without this the re-arm at
-    /// the next dispatch hands the corpse a fresh window for its whole unwind,
-    /// and invariant I9 sees one lend buy more than one quantum. It does: the
-    /// sim found it at 12,500,000 ns against a 12,000,000 ns bound as soon as
-    /// `Vm::UNWIND_NS` made an unwind cost anything.
+    /// It is also what keeps [`RtState::arm`]'s argument true. The cancellable
+    /// kill added a third way out of `Running` — the dying list — and `arm`'s
+    /// enumeration was written when there were two. It names all three now.
+    /// Without this the re-arm at the next dispatch hands the corpse a fresh
+    /// window for its whole unwind, and invariant I9 sees one lend buy more
+    /// than one quantum. It does: the sim found it at 12,500,000 ns against a
+    /// 12,000,000 ns bound as soon as `Vm::UNWIND_NS` made an unwind cost
+    /// anything.
     pub(crate) fn end_lend(&mut self) {
         self.0 .0.rt.release();
     }
@@ -936,12 +933,12 @@ impl<X: SchedPayload> RunningTask<X> {
 
     /// Exit, or a kill honoured at a safe point.
     ///
-    /// **The only death there is**, since
-    /// `specs/completion-architecture-spec.md` §7.2: `ReadyTask::reap` and
-    /// `BlockedTask::reap` are gone with the arms that called them, so a task
-    /// can only become a corpse on the CPU it is running on, by its own hand,
-    /// with its kernel stack already unwound. Everything a reap-in-place used
-    /// to discard is now released by the ordinary return path.
+    /// **The only death there is**, since the cancellable kill:
+    /// `ReadyTask::reap` and `BlockedTask::reap` are gone with the arms that
+    /// called them, so a task can only become a corpse on the CPU it is
+    /// running on, by its own hand, with its kernel stack already unwound.
+    /// Everything a reap-in-place used to discard is now released by the
+    /// ordinary return path.
     pub(crate) fn die(self, cpu: CpuId, now: Nanos) -> DeadTask<X> {
         let mut task = self.0;
         task.charge_residency(now, Residency::Running);

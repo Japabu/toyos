@@ -549,7 +549,7 @@ fn census() -> Census {
         // always blocked, so the CPUs' parked lines are where they appear — and
         // those lines carry a pid and a tid and no name. On a machine that has
         // gone quiet the question is *which* of the three is stuck, and a pid is
-        // not an answer to it. `specs/completion-architecture-spec.md` §10.
+        // not an answer to it.
         let kernel = crate::sched::kthread::is_kernel_task(crate::scheduler::TaskId(
             thread.pid,
             thread.tid,

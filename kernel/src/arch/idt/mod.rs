@@ -387,15 +387,15 @@ extern "sysv64" fn common_entry() {
 ///
 /// What remains is one instant wide and not one quantum: the kill bit is set
 /// by a remote CPU's plain atomic, so it can be raised between this check and
-/// the `iretq`. `scheduler-core-spec.md` invariant 7 states the resulting
-/// bound — the retire's `Urgency::Preempt` kick is already on its way, and the
-/// thread takes it in Ring 3 and comes straight back here.
+/// the `iretq`. The bound that leaves is one interrupt delivery — the retire's
+/// `Urgency::Preempt` kick is already on its way, and the thread takes it in
+/// Ring 3 and comes straight back here.
 pub(crate) extern "sysv64" fn kernel_exit_to_user_check() {
     flush_ring0_timer_fires_to_trace();
     loop {
         // A killed thread returns to Ring 3 exactly once more: never. Its
-        // kernel stack is empty here by definition, so this is where the unwind
-        // ends — `specs/completion-architecture-spec.md` §7.2.
+        // kernel stack is empty here by definition, so this is where the
+        // unwind ends.
         crate::scheduler::exit_if_killed();
         if !crate::preempt::need_resched() {
             return;

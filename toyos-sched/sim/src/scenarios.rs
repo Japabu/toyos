@@ -219,9 +219,8 @@ pub fn old_migrate_kept_the_corpse() -> Scenario {
 }
 
 /// **One CPU, one permanently-RT thread that never parks, and a process that
-/// dies underneath it** — the shape that turns `scheduler-core-spec.md` §3 into
-/// a kernel panic if the real-time band's precedence over the dying list is
-/// unqualified.
+/// dies underneath it** — the shape that turns the real-time band's precedence
+/// into a kernel panic if that precedence over the dying list is unqualified.
 ///
 /// It is not a hypothetical workload. `Rights::RT` is capability-gated, but
 /// `soundd` holds it in the shipped `system.toml` and `SYS_RT_ENTER` has no

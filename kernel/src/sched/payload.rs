@@ -85,10 +85,9 @@ pub struct KernelPayload {
     /// The address space this task runs in. **Not an `Option`**: a kernel thread
     /// runs in the kernel's, and `mm::paging::kernel` hands that out in the same
     /// `PageTables` shape a process's has — so there is no task without one and
-    /// no second answer for `driver::spawn` to choose between.
-    /// `specs/completion-architecture-spec.md` §15 row 12 is the retype, the one
-    /// `capability-handles-spec.md` §9.4 left standing, and it is C6's because
-    /// C6 is what made a kernel thread able to name an address space at all.
+    /// no second answer for `driver::spawn` to choose between. The `Option`
+    /// went when the kernel-thread work made a kernel thread able to name an
+    /// address space at all.
     pub address_space: PageTables,
     /// The cross-CPU-readable face of this task. A `CpuSched` is `!Sync`, so a
     /// remote `ps` cannot walk it; what it can read is here.
@@ -126,10 +125,10 @@ pub struct TaskHandle {
     ///
     /// **Its own queue, one waiter, and never woken as a queue.** The
     /// rendezvous protocol needs a `WaitQueue` to register on — that is what
-    /// closes the check-then-block window — but after
-    /// `specs/completion-architecture-spec.md` §5.2 nothing is *woken* by
-    /// queue: a post writes a record into the inbox and then claims this
-    /// task's rendezvous word directly. So the queue is a parking place and
+    /// closes the check-then-block window — but after the completion work
+    /// nothing is *woken* by queue: a post writes a record into the inbox and
+    /// then claims this task's rendezvous word directly. So the queue is a
+    /// parking place and
     /// nothing else, which is what `waitqs::PARK_BUCKETS` was, without the
     /// hashing: 32 shared buckets whose `Registration::finish` had to scan
     /// past every unrelated sleeper are one list of one.
@@ -145,9 +144,7 @@ pub struct TaskHandle {
     /// panics at the call site that asked rather than spinning — which is what
     /// a loop that re-waits instead of returning would otherwise do.
     cancels: AtomicU32,
-    /// This thread's completions
-    /// (`specs/completion-architecture-spec.md` §5.2's first of the two
-    /// inboxes).
+    /// This thread's completions — the first of the two inboxes.
     ///
     /// **Here rather than in a thread table, and the reason is the same one
     /// this struct exists for**: it is the cross-CPU-readable face of a task,
@@ -192,7 +189,7 @@ impl TaskHandle {
         self.released.store(true, Ordering::Release);
         // The retirer is armed on this thread's own watch — the same subject a
         // joiner uses, and the reason the release no longer needs a queue of
-        // its own (`specs/completion-architecture-spec.md` §5.6).
+        // its own.
         crate::completion::post(
             crate::completion::Subject::of(&self.watch),
             crate::completion::Outcome::Gone(crate::completion::Reason::Closed),

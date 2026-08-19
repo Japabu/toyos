@@ -236,16 +236,16 @@ fn an_adopting_cpu_always_observes_the_kill_bit() {
     });
 }
 
-/// **The fifth race, and the one `specs/completion-architecture-spec.md` §7.3
-/// names as missing: a retire that finds its victim already parked.**
+/// **The fifth race, and the one the completion work names as missing: a
+/// retire that finds its victim already parked.**
 ///
-/// §7.2 rewrites that arm from a reap-in-place into a claim-arbitrated wake,
-/// and the arbitration is the whole of what can go wrong. The retirer and a
-/// remote waker reach for the same rendezvous word; exactly one of them may win
-/// it, and whichever loses must leave the task somewhere the other one's
-/// message will find it. The defect this excludes is the one §7.2(c) describes
-/// in terms: remove-then-convert, where the retirer takes the entry out of
-/// `parked` and then loses the claim, so the in-flight `Msg::Wake` lands on a
+/// The cancellable kill rewrites that arm from a reap-in-place into a
+/// claim-arbitrated wake, and the arbitration is the whole of what can go
+/// wrong. The retirer and a remote waker reach for the same rendezvous word;
+/// exactly one of them may win it, and whichever loses must leave the task
+/// somewhere the other one's message will find it. The defect this excludes
+/// is remove-then-convert: the retirer takes the entry out of `parked` and
+/// then loses the claim, so the in-flight `Msg::Wake` lands on a
 /// `handle_wake` whose `parked.remove` returns `None` — and the task is in no
 /// container at all, never runnable, never reaped, until the retirer's own
 /// tripwire panics the machine.

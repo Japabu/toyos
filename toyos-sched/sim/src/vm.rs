@@ -64,11 +64,11 @@ pub const IPI_LATENCY_NS: u64 = 200_000;
 /// by a host test instead, which is the wrong instrument for a scheduling
 /// property.
 ///
-/// `specs/completion-architecture-spec.md` §7.2 is what makes the unwind real:
-/// a killed task with a live kernel stack runs again, on that stack, through
-/// the return path of whatever syscall it was in — `?`-ing a `Cancelled` out,
-/// dropping guards, `teardown_resources`, `close_all`. So the sim charges it
-/// like any other run: `RUN_CHUNK_NS` at a time, preemptible at every chunk.
+/// The cancellable kill is what makes the unwind real: a killed task with a
+/// live kernel stack runs again, on that stack, through the return path of
+/// whatever syscall it was in — `?`-ing a `Cancelled` out, dropping guards,
+/// `teardown_resources`, `close_all`. So the sim charges it like any other
+/// run: `RUN_CHUNK_NS` at a time, preemptible at every chunk.
 ///
 /// **The number is derived from what it has to be able to show.** An unwind
 /// shorter than invariant I4's own bound could starve the RT band for the whole
@@ -144,11 +144,10 @@ pub struct ProcState {
 /// read.
 ///
 /// **The wall clock, and the previous form of this doc argued for the
-/// opposite.** It said a killed task is normal-band work, that
-/// `scheduler-core-spec.md` §3 gives a ready real-time task unqualified
-/// precedence over the normal band, and that the retire-to-release interval
-/// therefore contains an unbounded quantity — so I14 should be read on a clock
-/// with the RT band's service subtracted out.
+/// opposite.** It said a killed task is normal-band work, that a ready
+/// real-time task takes unqualified precedence over the normal band, and that
+/// the retire-to-release interval therefore contains an unbounded quantity — so
+/// I14 should be read on a clock with the RT band's service subtracted out.
 ///
 /// Every step of that was true and the conclusion was a blindfold. The kernel
 /// does not wait on that clock: `scheduler::retire_task` blocks behind a
@@ -1061,14 +1060,14 @@ impl<'q> Vm<'q> {
                         (pass.dispose_none().finish(), None, BlockEnd::Woken)
                     }
                     // A retire landed while the task was deciding to park.
-                    // **The task keeps its stack and unwinds**, which is
-                    // `specs/completion-architecture-spec.md` §7.2 and is what
-                    // the kernel's `pass_block` does: this driver buried it
-                    // here until the model could charge an unwind, and burying
-                    // it was the one disposition the amended design does not
-                    // have. The commit withdrew the registration and put the
-                    // word back at `Running`; the next `exec_op` finds the kill
-                    // bit and spends `UNWIND_NS` before its own `die`.
+                    // **The task keeps its stack and unwinds**, which is the
+                    // cancellable kill and is what the kernel's `pass_block`
+                    // does: this driver buried it here until the model could
+                    // charge an unwind, and burying it was the one
+                    // disposition the amended design does not have. The
+                    // commit withdrew the registration and put the word back
+                    // at `Running`; the next `exec_op` finds the kill bit and
+                    // spends `UNWIND_NS` before its own `die`.
                     Commit::Killed => {
                         (pass.dispose_none().finish(), None, BlockEnd::Killed)
                     }

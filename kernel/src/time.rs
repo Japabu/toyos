@@ -1,10 +1,9 @@
 //! Every duration in this kernel is one of a closed set of *kinds*, and the
 //! constructor of each demands what justifies it.
 //!
-//! `specs/completion-architecture-spec.md` §3 is the law and this file is its
-//! implementation. A bare `u64` of nanoseconds is not a thing: it says nothing
-//! about where the number came from, and — the part that actually costs — it
-//! says nothing about what happens when it runs out. Three of the four
+//! A bare `u64` of nanoseconds is not a thing: it says nothing about where
+//! the number came from, and — the part that actually costs — it says
+//! nothing about what happens when it runs out. Three of the four
 //! behaviours a kernel duration can have at expiry are *different failures*
 //! (a device that broke, a machine that broke, an answer that got smaller), and
 //! a type that cannot tell them apart is a type that lets an implementer pick

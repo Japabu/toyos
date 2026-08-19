@@ -1069,8 +1069,7 @@ fn read_block(object: &KObjectRef) -> ReadBlock {
             /// read is about. The 16550's IER is written to zero and
             /// `virtio_console` has no handler at all, so nothing posts a
             /// serial key and what ends this wait is the re-poll and nothing
-            /// else. `specs/completion-architecture-spec.md` §3.2 keeps the
-            /// number and reclassifies it: it is the [`Cadence`] of a poll on
+            /// else. It is the [`Cadence`] of a poll on
             /// `serial::has_data`, which C10 makes explicit.
             const CONSOLE_REPOLL: Cadence = Cadence::every(
                 Duration::from_millis(10),

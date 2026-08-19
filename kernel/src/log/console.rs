@@ -135,8 +135,7 @@ pub fn post_wake() {
     // is live for the rest of the machine's life.
     let shared = unsafe { &*ptr };
     // **The record first, then the claim** — invariant W, in the one shape
-    // that may take no lock (`specs/completion-architecture-spec.md` §5.3a's
-    // first constraint). `emit` runs inside `sync.rs`, inside IRQ handlers,
+    // that may take no lock. `emit` runs inside `sync.rs`, inside IRQ handlers,
     // inside the scheduler and inside every syscall's locked region, so the
     // ordinary `completion::post` — which walks a watch list under the
     // subject's leaf lock — is not available here.
@@ -501,10 +500,10 @@ extern "C" fn body(_arg: u64) -> ! {
         // arming first left a window where the producer claimed a
         // still-`Running` `klogd`, took `Claim::Lost` and *dropped* the wake.
         // A completion post cannot drop one: it stores the record before it
-        // claims (`specs/completion-architecture-spec.md` §5.4), so a claim
-        // that finds nobody leaves a record `wait`'s own recheck finds. That
-        // is the log branch's §2.6a fallback converted, and it is what makes
-        // the order below a choice rather than a proof obligation.
+        // claims, so a claim that finds nobody leaves a record `wait`'s own
+        // recheck finds. That is the log branch's §2.6a fallback converted,
+        // and it is what makes the order below a choice rather than a proof
+        // obligation.
         let Some(armed) = completion::arm(
             completion::Subject::of(handle.watch()),
             completion::Token::new(0),

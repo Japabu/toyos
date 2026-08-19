@@ -1,18 +1,18 @@
 //! The retire protocol — spec §7.6: a sticky kill bit plus a message chase.
 //!
-//! **Termination argument, restated for `specs/completion-architecture-spec.md`
-//! §7.2.** The kill bit is already set when the message is posted, so whichever
-//! CPU ends up owning the task *schedules* it — into that CPU's dying list, or
-//! by asking a running victim for a safe point — and it dies by its own `die`
-//! at the first safe point its own unwind reaches. The chase is bounded by the
+//! **Termination argument, restated for the cancellable kill.** The kill bit
+//! is already set when the message is posted, so whichever CPU ends up owning
+//! the task *schedules* it — into that CPU's dying list, or by asking a
+//! running victim for a safe point — and it dies by its own `die` at the
+//! first safe point its own unwind reaches. The chase is bounded by the
 //! number of in-flight hops (≤1 in practice). Nothing scans; the home CPU in
 //! the state word is the proof.
 //!
 //! The struck form said the owning CPU "converts it to a dead task on arrival",
-//! and that conversion is exactly what §7.2 deleted: this kernel does not
-//! unwind, so discarding the task value discarded every guard on its kernel
-//! stack. The chase's bound is unchanged — what changed is what the last hop
-//! does.
+//! and that conversion is exactly what the cancellable kill deleted: this
+//! kernel does not unwind, so discarding the task value discarded every guard
+//! on its kernel stack. The chase's bound is unchanged — what changed is what
+//! the last hop does.
 
 use crate::cpu::CpuHandles;
 use crate::hw::{CpuId, Kicker};
@@ -215,11 +215,10 @@ mod tests {
         assert_eq!(&*kicks.0.lock().unwrap(), &[C0, C1]);
     }
 
-    /// **The kill bit is set before the kick, and invariant 7's residual bound
-    /// is the wrong way round without it.**
+    /// **The kill bit is set before the kick, and the residual bound on a
+    /// killed thread's Ring 3 time is the wrong way round without it.**
     ///
-    /// `scheduler-core-spec.md` invariant 7 bounds a killed thread's remaining
-    /// time in Ring 3 at one interrupt delivery: the exit boundary reads the
+    /// That bound is one interrupt delivery: the exit boundary reads the
     /// bit with IF=0 immediately before the `iretq`, so a bit raised in that
     /// instant is missed — and what brings the thread back is this
     /// `Urgency::Preempt` kick. That argument holds only because the kick

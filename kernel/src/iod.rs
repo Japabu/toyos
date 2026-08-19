@@ -1,11 +1,10 @@
 //! `iod`: the context deferred filesystem work runs in, because `Drop` has no
 //! `Parkable`.
 //!
-//! `specs/completion-architecture-spec.md` §10 and §13. The third of the
-//! kernel's three threads — `klogd` drains the console (`log/console.rs`),
-//! `usbd` owns the xHCI port machine (`drivers::xhci::usbd`), and this one owns
-//! the write-back queue: the flush a closed file's dirty pages owe, and
-//! page-cache eviction's.
+//! The third of the kernel's three threads — `klogd` drains the console
+//! (`log/console.rs`), `usbd` owns the xHCI port machine
+//! (`drivers::xhci::usbd`), and this one owns the write-back queue: the flush
+//! a closed file's dirty pages owe, and page-cache eviction's.
 //!
 //! **Why the write-back cannot stay where it is.** `OpenFileState::drop`
 //! (`object/file.rs`) takes the VFS lock and flushes. Once that lock is a

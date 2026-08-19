@@ -241,9 +241,8 @@ pub fn boot_aps(madt: &MadtInfo, boot_cr3: u64) {
         // How long an AP gets to reach `ap_entry` before it is declared
         // absent by name and the machine boots without it.
         //
-        // **A [`Budget`] and not the `Tripwire`
-        // `specs/completion-architecture-spec.md` §3.3 offered as the
-        // alternative to finding a source.** Its expiry is already a degraded
+        // **A [`Budget`] and not the `Tripwire` offered as the alternative to
+        // finding a source.** Its expiry is already a degraded
         // answer that says so — "failed to start!", one fewer CPU, a machine
         // that boots — and making it a panic would be a behaviour change,
         // which C1's own gate forbids. The number itself still has no source:

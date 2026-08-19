@@ -252,7 +252,7 @@ struct IoUringInstance {
     /// `enter` started parking through `completion::wait_until` on the calling
     /// thread's own queue. The pair's own doc said it existed "so a site cannot
     /// take one and forget the other", which is a real hazard
-    /// (`specs/issues/kernel/io-uring-source-half-a-wake-pair.md` records losing
+    /// (`issues/kernel/io-uring-source-half-a-wake-pair.md` records losing
     /// it twice) and was not that type's to prevent: §5.6's answer is that there
     /// is **no pair**, and a type minted to enforce one is the pair surviving
     /// under a new name. Both the alias and the `wakeable()` accessor are gone
@@ -418,9 +418,9 @@ pub fn enter(
     // and `u64::MAX` meaning forever — that is the ABI until C11 — but inside
     // the kernel each becomes a named `Deadline`: `passed()` is evaluate-once,
     // `never()` arms no timer, and anything else is an instant. What this
-    // replaces mapped relative `0` onto absolute `1` and `1` back onto `0`,
-    // which is `specs/completion-architecture-spec.md` §14.1's motivating
-    // example for why the absolute form may not be a bare `u64`.
+    // replaces mapped relative `0` onto absolute `1` and `1` back onto `0` —
+    // the motivating example for why the absolute form may not be a bare
+    // `u64`.
     let non_blocking = timeout_nanos == 0;
     let deadline = if non_blocking {
         Deadline::passed()

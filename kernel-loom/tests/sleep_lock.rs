@@ -3,15 +3,14 @@
 //!
 //! `Lock::lock`'s spin is unreachable by loom — the model checker explores a
 //! `core::hint::spin_loop` as an unbounded branch and gives up, which is what
-//! `specs/issues/kernel/lock-spin-unreachable-by-loom.md` records, so
+//! `issues/kernel/lock-spin-unreachable-by-loom.md` records, so
 //! `ticket_lock.rs` can only drive `try_lock`. A parking acquire has no
 //! unbounded branch: the contender gives the CPU back and loom's own
 //! `yield_now` is a branch it can bound. So the path `ticket_lock.rs` cannot
 //! reach is exactly the path this file is about.
 //!
-//! **What this proves and what it does not**, because
-//! `specs/completion-architecture-spec.md` §16.1 asks for the scope in terms.
-//! Loom has no scheduler, so the park itself is shimmed
+//! **What this proves and what it does not.** Loom has no scheduler, so the
+//! park itself is shimmed
 //! (`kernel_loom::completion::wait_uncancellable_until` yields). What is
 //! therefore under test is the lock: the ticket arithmetic, mutual exclusion,
 //! and the release-to-acquire edge that hands the next holder the previous
@@ -37,6 +36,12 @@
 //! makes `sleeplock.rs`'s two loads of `now` relaxed and this file must red —
 //! loom answers `Causality violation: Concurrent write accesses to UnsafeCell`,
 //! which is a lock handing out data it did not synchronize, stated exactly.
+//! Verified 2026-08-19, both ways round: all four models red under the feature
+//! and all four pass without it. The step that runs it is `host-tests.yml`'s
+//! "kernel-loom sleep lock's acquire edge has teeth", which demands
+//! `a_parking_contender_observes_the_holders_writes` and
+//! `two_holders_never_overlap` by name — the contended park and mutual
+//! exclusion, the two the *ordering* breaks rather than the arithmetic.
 
 use kernel_loom::scheduler::{become_task, Parkable, TaskId};
 use kernel_loom::sleeplock::SleepLock;

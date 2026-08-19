@@ -100,9 +100,9 @@ fn blocking_baseline() -> u32 {
 
 /// The right to give the CPU back.
 ///
-/// `specs/completion-architecture-spec.md` §6. Made once per trap entry and
-/// once per kernel-thread body; [`Parkable::of_current`] asserts the context's
-/// baseline preempt depth, so a caller holding a spinlock cannot make one. Not
+/// Made once per trap entry and once per kernel-thread body;
+/// [`Parkable::of_current`] asserts the context's baseline preempt depth, so a
+/// caller holding a spinlock cannot make one. Not
 /// `Copy`, not `Clone`, and never stored in a struct: it is threaded down the
 /// call chain by reference, and that is the whole mechanism.
 ///
@@ -269,9 +269,9 @@ pub fn prepare_wait(queue: &KWaitQueue, cancel: Cancel, class: WaitClass) -> Tic
 ///
 /// **The deadline is a [`Deadline`] and no longer a `u64` whose zero means
 /// "forever".** That convention was invisible at a call site and inverted by
-/// `specs/completion-architecture-spec.md` §14.1's absolute form, where zero is
-/// simply the past; a site left passing `0` through that change becomes a busy
-/// loop rather than a compile error. [`Deadline::never`] is the one that does
+/// the absolute form, where zero is simply the past; a site left passing `0`
+/// through that change becomes a busy loop rather than a compile error.
+/// [`Deadline::never`] is the one that does
 /// not arm a timer, and every other value arms one — including
 /// [`Deadline::passed`], which fires at the next pass.
 #[track_caller]
@@ -357,7 +357,6 @@ pub fn do_preempt() {
 /// break the bound, not what establishes it: an IPI taken in Ring 0 ahead of a
 /// bit nobody can see leaves no interrupt in flight once the bit appears, and
 /// the victim sits in Ring 3 until an unrelated tick.
-/// `scheduler-core-spec.md` invariant 7 states that bound, and
 /// `toyos-sched/src/retire.rs`'s module header states the same order.
 ///
 /// One relaxed load per return to userland, which is the whole cost. The
@@ -550,10 +549,10 @@ pub fn futex_wake(phys_addr: DirectMap, count: usize) -> u64 {
 ///
 /// The retire itself is one message (spec §7.6): the sticky kill bit plus
 /// `Msg::Retire` to the CPU the state word names. **Whichever CPU ends up
-/// owning the task then *schedules* it** — `specs/completion-architecture-spec.md`
-/// §7.2 — because this kernel does not unwind and a discarded stack takes every
-/// guard on it. A parked victim is woken into that CPU's dying list, a queued
-/// one is moved into it, a running one is asked for a safe point, and one in
+/// owning the task then *schedules* it** because this kernel does not unwind
+/// and a discarded stack takes every guard on it. A parked victim is woken
+/// into that CPU's dying list, a queued one is moved into it, a running one
+/// is asked for a safe point, and one in
 /// transit is adopted and dispatched. It dies by its own `die`, at the first
 /// safe point its own unwind reaches. Nothing scans anything and nobody spins.
 ///
@@ -596,7 +595,7 @@ pub fn retire_task(sched: &ThreadSched) {
         Duration::from_millis(50),
         "two hundred re-polls inside the tripwire, on a thread that is otherwise parked",
     );
-    /// **Superseded in whole by `specs/scheduling-reservations-spec.md` §8, and
+    /// **Superseded in whole by the scheduling-reservations design, and
     /// kept until that design lands because a constant with a broken derivation
     /// is still the thing this kernel runs.** Two of the terms below are known
     /// wrong and neither is repairable by moving the number: the prologue count
@@ -607,9 +606,9 @@ pub fn retire_task(sched: &ThreadSched) {
     ///
     /// **Re-derived twice at C3+C4, and the second time because the first was
     /// below its own sum.** What this bounds is no longer "an IPI, one remote
-    /// pass and a release": since `specs/completion-architecture-spec.md` §7.2
-    /// the victim is *scheduled* rather than reaped, so the wait covers every
-    /// hop between the claim and `Hw::release`. Term by term, from the tree:
+    /// pass and a release": since the cancellable kill the victim is
+    /// *scheduled* rather than reaped, so the wait covers every hop between
+    /// the claim and `Hw::release`. Term by term, from the tree:
     ///
     /// * **8 s — four pass prologues at 2 s each.** `sched::driver::pass` opens
     ///   with `drain_irqs()`, which calls `xhci::poll_if_pending()` *before* the
@@ -619,7 +618,7 @@ pub fn retire_task(sched: &ThreadSched) {
     ///   2,000,000,000 ns while holding `XHCI`. This is the term that made the
     ///   struck 1 s fire on the owner's T14 at 949 s of uptime with doom
     ///   exiting, and it has nothing to do with §7.2:
-    ///   `specs/issues/kernel/scheduler-pass-blocks-in-xhci.md` is open and says
+    ///   `issues/kernel/scheduler-pass-blocks-in-xhci.md` is open and says
     ///   in terms that "`retire_task`'s bound is measuring the USB bus".
     ///
     ///   **Four named passes, and the count is an undercount rather than a
@@ -638,7 +637,7 @@ pub fn retire_task(sched: &ThreadSched) {
     ///   and only `try_lock`s, so "every pass pays the prologue unconditionally"
     ///   is false as written and the term that dominates this number rests on
     ///   it. Neither horn is fixed by a larger constant, which is why
-    ///   `specs/scheduling-reservations-spec.md` §8 declines to price this term
+    ///   the scheduling-reservations design declines to price this term
     ///   at all and names the pass, not the wait, as what has to change.
     /// * **20 ms — two quanta.** One for the victim's CPU to be free to pick
     ///   the dying task (a running fair task keeps the CPU to its quantum end),
@@ -664,7 +663,7 @@ pub fn retire_task(sched: &ThreadSched) {
     ///   consecutive chunks, and a band that briefly empties dispatches a corpse
     ///   with no grant and restamps it, throwing the accumulated age away. The
     ///   factor is therefore not a worst case in either direction.
-    ///   `specs/scheduling-reservations-spec.md` §8 replaces it with a rate —
+    ///   The scheduling-reservations design replaces it with a rate —
     ///   the dying server's own reservation — which reaches the same 110 ms and
     ///   reaches it for every k. **The struck derivation priced this term at
     ///   nothing** — "a machine that spends this tripwire on RT service is a
@@ -683,7 +682,7 @@ pub fn retire_task(sched: &ThreadSched) {
     ///   independent retirers*: separate killer threads retiring separate
     ///   victims that happen to share a CPU. Nothing bounds how many, which is
     ///   the whole of the filed defect
-    ///   `specs/issues/kernel/retire-tripwire-is-not-queue-shaped.md`, and 8 is
+    ///   `issues/kernel/retire-tripwire-is-not-queue-shaped.md`, and 8 is
     ///   a chosen number rather than a measured or derived one.
     ///
     /// 9.01 s of derived terms, and 10 s is the next round number above it —

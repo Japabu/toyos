@@ -6215,9 +6215,9 @@ fn blocked_dump() -> Result<(), String> {
     // the parked lines above carry them as a pid and a tid and nothing else —
     // and on a machine that has gone quiet the question is *which* of the three
     // is stuck. `sched::dump`'s census tags a kernel thread whatever it is
-    // doing, which is C6's gate: `specs/completion-architecture-spec.md` §10
-    // gives `klogd` the console drain, `usbd` the xHCI port machine and `iod`
-    // the write-back queue, precisely so that one of them wedging does not stop
+    // doing, which is C6's gate: three kernel threads split the work —
+    // `klogd` the console drain, `usbd` the xHCI port machine, `iod` the
+    // write-back queue — precisely so that one of them wedging does not stop
     // the other two. A report that cannot tell them apart cannot say which did.
     //
     // Matched with the ` cpu=` that follows the name on the census line, because
@@ -8448,13 +8448,13 @@ fn run_machine_test(
             }
             eprintln!("  [klogd] {}", line.trim());
 
-            // **The other two threads, and the opposite row.**
-            // `specs/completion-architecture-spec.md` §10: `usbd` owns the xHCI
-            // port machine and `iod` the write-back queue, so a stuck USB
-            // enumeration cannot stop the log. Their panics are *recoverable*
-            // and `klogd`'s deliberately is not — a killed drainer is the one
-            // loss nothing left alive can report — and this is the one boot in
-            // the suite where all three rows are on the wire together.
+            // **The other two threads, and the opposite row.** `usbd` owns
+            // the xHCI port machine and `iod` the write-back queue, so a
+            // stuck USB enumeration cannot stop the log. Their panics are
+            // *recoverable* and `klogd`'s deliberately is not — a killed
+            // drainer is the one loss nothing left alive can report — and
+            // this is the one boot in the suite where all three rows are on
+            // the wire together.
             for name in ["usbd", "iod"] {
                 let line = boot.must_say(&format!("kthread: {name}"))?;
                 if !line.contains("kills the thread") {
@@ -10751,10 +10751,10 @@ fn idle_is_spinning(serial: &str) -> Option<(u32, u64)> {
 /// names is violated, not just that it still passes when it is not.
 fn idle_trip_verdict() -> Result<(), String> {
     let healthy = "\
-[kernel 0.1 cpu0] sched: cpu=0 ready=0 parked=0 current=None trips=1\n\
-[kernel 0.1 cpu1] sched: cpu=1 ready=0 parked=0 current=None trips=1\n\
-[kernel 0.1 cpu1] sched: cpu=1 ready=0 parked=0 current=None trips=3\n\
-[kernel 0.1 cpu0] sched: cpu=0 ready=0 parked=0 current=None trips=2\n";
+[kernel 0.1 cpu0] sched: cpu=0 ready=0 dying=0 parked=0 current=None trips=1\n\
+[kernel 0.1 cpu1] sched: cpu=1 ready=0 dying=0 parked=0 current=None trips=1\n\
+[kernel 0.1 cpu1] sched: cpu=1 ready=0 dying=0 parked=0 current=None trips=3\n\
+[kernel 0.1 cpu0] sched: cpu=0 ready=0 dying=0 parked=0 current=None trips=2\n";
     if let Some((cpu, delta)) = idle_is_spinning(healthy) {
         return Err(format!("a healthy trace was refused: cpu{cpu} moved by {delta}"));
     }
@@ -10762,10 +10762,10 @@ fn idle_trip_verdict() -> Result<(), String> {
     // The regression's own shape: one CPU quarantines cleanly and stays
     // quiet, the other's undrained ring never lets it halt.
     let spinning = "\
-[kernel 0.1 cpu0] sched: cpu=0 ready=0 parked=0 current=None trips=1\n\
-[kernel 0.1 cpu1] sched: cpu=1 ready=0 parked=0 current=None trips=4\n\
-[kernel 0.1 cpu0] sched: cpu=0 ready=0 parked=0 current=None trips=2\n\
-[kernel 0.1 cpu1] sched: cpu=1 ready=0 parked=0 current=None trips=2685004\n";
+[kernel 0.1 cpu0] sched: cpu=0 ready=0 dying=0 parked=0 current=None trips=1\n\
+[kernel 0.1 cpu1] sched: cpu=1 ready=0 dying=0 parked=0 current=None trips=4\n\
+[kernel 0.1 cpu0] sched: cpu=0 ready=0 dying=0 parked=0 current=None trips=2\n\
+[kernel 0.1 cpu1] sched: cpu=1 ready=0 dying=0 parked=0 current=None trips=2685004\n";
     match idle_is_spinning(spinning) {
         Some((1, delta)) if delta > MAX_IDLE_TRIP_DELTA => {}
         Some((cpu, delta)) => {

@@ -712,7 +712,6 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // happened to trap. Here rather than earlier because nothing can run before
     // `enter_idle_loop` anyway, and after `klogd` because a kernel thread that
     // logs its own spawn wants a drainer to exist.
-    // `specs/completion-architecture-spec.md` §10.
     drivers::xhci::usbd::start();
     iod::start();
 

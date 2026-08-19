@@ -480,7 +480,6 @@ actuators! {
     /// none of which had ever seen a task with no address space of its own. The
     /// host has no stimulus for it even in principle: there is no process to
     /// kill and no syscall to make.
-    /// `specs/completion-architecture-spec.md` §10.
     usbd_panic = "usbd-panic";
 
     /// Stop the boot dead in phase 3, with interrupts off, before anything that

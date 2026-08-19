@@ -1,9 +1,8 @@
 //! The lock a contender parks on.
 //!
-//! `specs/completion-architecture-spec.md` §8. One sentence: **a CPU never
-//! spins on a lock whose holder is descheduled** — a contender takes a ticket,
-//! arms on the lock's own watch and gives the CPU back, and the release posts to
-//! the one whose turn it now is.
+//! One sentence: **a CPU never spins on a lock whose holder is descheduled**
+//! — a contender takes a ticket, arms on the lock's own watch and gives the
+//! CPU back, and the release posts to the one whose turn it now is.
 //!
 //! **Preemption stays on for the holder, and that is the whole point.** A
 //! [`crate::sync::Lock`] guard raises the preempt count for its whole life, so
@@ -51,9 +50,8 @@
 //! surcharge is the whole of what [`SleepLock::holder`] and the addressed wake
 //! cost a lock nobody is waiting on. The contended paths add four RMWs to the
 //! acquirer and three to the releaser, all of them on the far side of a park.
-//! Nothing on either path is a `fetch_add` on a *count*, which is
-//! `specs/completion-architecture-spec.md` §16.2's first rule and the reason it
-//! exists: one such increment per log line cost 350 ms of boot under TCG.
+//! Nothing on either path is a `fetch_add` on a *count*: one such increment
+//! per log line cost 350 ms of boot under TCG.
 //!
 //! ## The two rules an acquirer has to know
 //!

@@ -3,8 +3,8 @@
 //! **This file is compiled a second time by `kernel-loom`**, so it may name
 //! only what that crate supplies: the atomics, the cell, `toyos_abi`'s error
 //! type and `crate::time`. That is a layout requirement rather than a style
-//! rule — `specs/completion-architecture-spec.md` §16.1 states it — and it is
-//! why `Subject`, `Watch` and `arm` live one level up in `mod.rs`, where they
+//! rule, and it is why `Subject`, `Watch` and `arm` live one level up in
+//! `mod.rs`, where they
 //! may name pipe ends and device claims. x86's TSO gives every load acquire and
 //! every store release semantics, so a missing edge here is invisible to every
 //! guest test; loom is the only instrument in the tree that can see one, and
@@ -18,7 +18,7 @@
 //!
 //! **No read-modify-write on the post path, and that is a measured
 //! constraint.** One `fetch_add` per log line cost 350 ms of boot under TCG
-//! (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`), because QEMU
+//! (`issues/hardware/one-rmw-per-log-line-cost-350ms.md`), because QEMU
 //! cannot always emit an inline host atomic for a guest RMW. So `tail` is a
 //! plain load and a plain store made under the lock the poster already holds
 //! (§16.2 rule 1), `head` is the same in the taker's hand, and the overflow
@@ -269,9 +269,8 @@ impl Inbox {
     /// such serialization and a second one racing it is undefined behaviour
     /// rather than a lost record. The machine's log is that producer, by
     /// necessity: `emit` runs inside `sync.rs`, inside IRQ handlers, inside the
-    /// scheduler and inside every syscall's locked region
-    /// (`specs/completion-architecture-spec.md` §5.3a's first constraint), and
-    /// one read-modify-write per log line measured 350 ms of boot under TCG.
+    /// scheduler and inside every syscall's locked region, and one
+    /// read-modify-write per log line measured 350 ms of boot under TCG.
     ///
     /// What it costs the reader is exactness: a signal carries no `at` and no
     /// outcome of its own, which is §5.3a's *edge* contract stated as a type —

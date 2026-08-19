@@ -13,10 +13,10 @@ use crate::hw::HW;
 // killed while running in Ring 3 was preempted here, put in the dying list,
 // picked straight back off it with a fresh quantum, and returned to userland
 // with the kill pending and nothing on the path that reads it. Once per tick,
-// for as long as the thread cared to loop: `scheduler-core-spec.md`
-// invariant 7's "never dispatched into *userland* again" was false without a
-// bound. `exit_if_killed` lives in that epilogue, which is why the fix is to
-// join it rather than to add a second check here.
+// for as long as the thread cared to loop: "a killed thread is never dispatched
+// into *userland* again" was false without a bound. `exit_if_killed` lives in
+// that epilogue, which is why the fix is to join it rather than to add a second
+// check here.
 #[unsafe(naked)]
 pub(super) extern "sysv64" fn timer_entry() {
     ring3_naked_asm!(

@@ -141,7 +141,7 @@ fn live_process() {
 /// adds the live slice. So the parent ends the wait, lets the child exit, and
 /// asks the object afterwards, which is what `exited_child` above already
 /// relies on. The gap is filed as
-/// `specs/issues/diagnostics/blocked-time-is-invisible-while-the-park-lasts.md`.
+/// `issues/diagnostics/blocked-time-is-invisible-while-the-park-lasts.md`.
 fn blocked_time_names_what_it_waited_on() {
     let mut child = Command::new(SELF_PATH)
         .arg("held")

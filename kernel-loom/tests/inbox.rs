@@ -20,7 +20,10 @@
 //!
 //! makes the publication relaxed and this file must red — loom answers
 //! `Causality violation: Concurrent write accesses to UnsafeCell`, which is the
-//! defect stated exactly. Verified 2026-08-16, on this branch, both ways round.
+//! defect stated exactly. Verified 2026-08-16 and again 2026-08-19 after the
+//! merge with `main`, both ways round; the step that runs it is
+//! `host-tests.yml`'s "kernel-loom inbox publication has teeth", which demands
+//! `a_record_reaches_its_taker_intact ... FAILED` by name.
 //!
 //! **Invariant W's own teeth are a mutation rather than a feature**, because
 //! what would have to be broken is the *caller's* order and not a line in
@@ -43,8 +46,6 @@
 //! interleaving that matters is not in the state space at all, and the model
 //! passes vacuously. Measured while writing this file — the reader-on-main
 //! form asserted `!has_record()` and *passed*, with the release in place.
-//!
-//! `specs/completion-architecture-spec.md` §5.4 and §16.1.
 
 #![cfg(feature = "loom")]
 
@@ -274,7 +275,9 @@ fn an_overflow_is_reported_once_and_then_cleared() {
 /// this model passes. Its teeth are the `inbox-signal-as-post` feature, which
 /// puts the producers back on `post`: loom then answers **`Causality
 /// violation: Concurrent write accesses to UnsafeCell`**, which is the defect
-/// stated exactly.
+/// stated exactly. Verified 2026-08-19, both ways round, and run by
+/// `host-tests.yml`'s "kernel-loom lock-free post has teeth", which demands
+/// this test's own `... FAILED` line.
 #[test]
 fn two_unlocked_producers_are_a_race_and_a_signal_is_not() {
     loom::model(|| {

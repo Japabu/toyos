@@ -23,9 +23,9 @@
 //!    parent's next connect through the connector must be `Gone`.
 //! 4. **Not blocked at all** — spinning in Ring 3, with an empty kernel stack
 //!    and no syscall to cancel. The other three ask what a kill *releases*;
-//!    this one asks whether it **ends**, which is `scheduler-core-spec.md`
-//!    invariant 7's "never dispatched into userland again" and the one claim in
-//!    it that no existing test executes. It is the one arm that does not issue
+//!    this one asks whether it **ends** — "a killed thread is never dispatched
+//!    into userland again", the claim about a kill that no other test in this
+//!    tree executes. It is the one arm that does not issue
 //!    its own kill: a `kill` that does not end its target does not return
 //!    either, so the killer is a process of its own and this one only watches.
 //!
@@ -65,10 +65,9 @@ const VICTIM_LABEL: &str = "victim";
 /// How long arm 4 gives a killed Ring 3 spinner to reach its last exit
 /// boundary, watched from outside the kill.
 ///
-/// **A number rather than a hang, for `specs/completion-architecture-spec.md`
-/// §20.3's reason**: a guest that stops making progress reds as `STALL`, which
-/// the harness prints apart and tells nobody to bisect. What it buys is a
-/// failure that names itself.
+/// **A number rather than a hang**: a guest that stops making progress reds
+/// as `STALL`, which the harness prints apart and tells nobody to bisect.
+/// What it buys is a failure that names itself.
 ///
 /// **Priced against the quantity it actually bounds**, which is not one
 /// interrupt delivery: what this constant covers is the whole of
