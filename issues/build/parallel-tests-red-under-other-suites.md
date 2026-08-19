@@ -220,6 +220,25 @@ changes.
   attributes and two pairs of parentheses that spell out the precedence Rust
   already applied (`+` and `*` bind tighter than `|`), so no instruction in that
   driver moved. Still `Sched::Parallel`.
+- **`diskless_boot`** — added 2026-08-19, one full `cargo test` on
+  `wt/toyos-i8042deep`, whose whole delta is host-side harness code
+  (`tests/toyos.rs`, `src/redlist.rs`) and no kernel file at all. Twelve wide
+  with `toyos-spawnrule`'s suite holding guest slots throughout, named in that
+  run's own `[host-slots]` lines. `[qemu] QEMU died before ===READY=== (status:
+  Ok(ExitStatus(unix_wait_status(0))))` — **QEMU exited zero**, so this is
+  neither a guest that panicked nor a wall-clock guard reporting the content it
+  was going to assert; it is the process going away cleanly before the guest was
+  ready, which nothing here explains. 7 s under load, `ALONE: GREEN` in 3 s, and
+  `cargo run -- --known-red diskless_boot` answered `NOT ON THE LIST`. Not
+  investigated.
+- **`nvme_large_device`** — same run, same session, and **its mechanism is not
+  this file's**: a machine-wide `KERNEL PANIC: execute unmapped address at 0x1b`
+  in ring 0 on a `spawn` syscall, which is
+  `issues/kernel/a-ring-0-fetch-at-0x1b-during-a-loaded-boot.md`'s class and is
+  recorded there with its registers — the console `metal_sim_input` above owes,
+  paid by a different name. Listed here only so this register resolves the name
+  too: the red is the panic and `nvme_large_device` is the workload it
+  interrupted. `ALONE: GREEN`.
 
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits
