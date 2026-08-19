@@ -8,6 +8,8 @@ use crate::object::{ops, port, KObjectRef};
 use crate::{device, log, pipe, process, vfs};
 use crate::{DirectMap, UserAddr};
 
+use toyos_untrusted::Untrusted;
+
 // MSR addresses
 const MSR_EFER: u32 = 0xC000_0080;
 const MSR_STAR: u32 = 0xC000_0081;
@@ -806,7 +808,17 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_process_stats(&ctx, RawHandle(a1 as u32), addr)
         },
         SYS_SET_THREAD_NAME => {
-            let len = (a2 as usize).min(process::THREAD_NAME_LEN);
+            // `a2` used to be clamped to `THREAD_NAME_LEN` with `.min`, which
+            // silently set the truncated prefix of a name too long to fit
+            // rather than telling the caller its name did not fit —
+            // `issues/isolation/untrusted-sites-not-yet-adopted.md`'s
+            // pattern for the whole file. Refused by name instead: a length
+            // past the bound is the caller's argument being wrong, not a
+            // shorter name to go write.
+            let Ok(len) = Untrusted::new(a2).at_most(process::THREAD_NAME_LEN as u64) else {
+                return SyscallError::InvalidArgument.to_u64();
+            };
+            let len = len as usize;
             let Some(bytes) = ctx.user_bytes(UserAddr::new(a1), len as u64) else {
                 return bad_addr;
             };
