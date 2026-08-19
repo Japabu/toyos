@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::ops::{Index, IndexMut};
 
-use crate::window::Window;
+use crate::window::{Window, WindowId};
 
 /// The windows, bottom to top.
 ///
@@ -16,11 +16,18 @@ use crate::window::Window;
 /// existed, and `push` puts an ordinary window above every topmost one.
 pub struct Stack<C> {
     windows: Vec<Window<C>>,
+    /// The id `insert` hands to the next window that does not already have
+    /// one. Monotonic and never reused, so a [`WindowId`] a caller is still
+    /// holding never comes to name a different window than the one it named
+    /// when it was taken.
+    next_id: u64,
 }
 
 impl<C> Default for Stack<C> {
     fn default() -> Self {
-        Self { windows: Vec::new() }
+        // 0 is `WindowId::UNASSIGNED`; starting here is what makes it a value
+        // `insert` can never hand out.
+        Self { windows: Vec::new(), next_id: 1 }
     }
 }
 
@@ -49,9 +56,30 @@ impl<C> Stack<C> {
         self.windows.iter().position(pred)
     }
 
+    /// The current position of the window named `id`, or `None` if it is no
+    /// longer here.
+    ///
+    /// This is how state that outlives one event-loop pass — a drag, a
+    /// resize — has to reach a window: never by the position it had when the
+    /// pass began, which `remove`, `retain`, `raise` and `cycle` all make
+    /// stale the moment anything else in the stack changes.
+    pub fn position(&self, id: WindowId) -> Option<usize> {
+        self.windows.iter().position(|w| w.id == id)
+    }
+
     /// Put `w` as high as its topmost flag entitles it to be, and say where it
     /// landed.
-    pub fn insert(&mut self, w: Window<C>) -> usize {
+    ///
+    /// A window with [`WindowId::UNASSIGNED`](crate::window::WindowId) — one
+    /// fresh out of `Window::new` — is minted a real, never-repeated id here.
+    /// A window that already has one, because this is `raise` moving it
+    /// rather than a client's window being seen for the first time, keeps it:
+    /// identity survives reorder even though position does not.
+    pub fn insert(&mut self, mut w: Window<C>) -> usize {
+        if w.id == WindowId::UNASSIGNED {
+            w.id = WindowId(self.next_id);
+            self.next_id += 1;
+        }
         let at = if w.topmost {
             self.windows.len()
         } else {

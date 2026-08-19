@@ -426,7 +426,7 @@ impl AddressSpace {
     /// writable pointer into kernel memory.
     pub fn translate(&self, vaddr: UserAddr) -> Option<super::DirectMap> {
         let va = vaddr.raw();
-        if !super::user_span::is_user_addr(va) {
+        if !toyos_userbound::is_user_addr(va) {
             return None;
         }
         let (pml4_idx, pdpt_idx, pd_idx) = indices(va);

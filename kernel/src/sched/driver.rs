@@ -72,7 +72,7 @@ pub fn preempt_off<R>(f: impl FnOnce(&PreemptOff) -> R) -> R {
 /// read-modify-writes.** `preempt::disable` is `lock add` and `enable` is a
 /// `lock sub` plus a `need_resched` poll that can reach `do_preempt`, which is
 /// a scheduling pass — and one locked RMW per log line cost 350 ms of boot
-/// (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`). `IrqGuard` is
+/// (`issues/hardware/one-rmw-per-log-line-cost-350ms.md`). `IrqGuard` is
 /// `pushfq`/`pop`/`cli` with `push`/`popfq` on drop: no locked operation at
 /// all, and on the dominant path `IF` is already clear.
 pub struct IrqOff(());
@@ -291,9 +291,10 @@ fn placement() -> CpuId {
 /// `alloc_kernel_stack` built.
 ///
 /// **`address_space: None` is a kernel thread and not an error.** It was one
-/// until L3 of `specs/log-architecture-spec.md`: `spawn` expected the `Option`
-/// and the field has always been one, so the whole of "the scheduler cannot
-/// host a kernel task" was a single `.expect` in the line below.
+/// until `klogd`, this kernel's first kernel thread, arrived: `spawn` expected
+/// the `Option` and the field has always been one, so the whole of "the
+/// scheduler cannot host a kernel task" was a single `.expect` in the line
+/// below.
 pub struct NewTask {
     pub id: TaskId,
     pub kernel_stack: OwnedAlloc,

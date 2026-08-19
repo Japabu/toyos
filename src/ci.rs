@@ -1,8 +1,7 @@
 //! The instrument every guest in this project is measured with, declared once.
 //!
-//! `specs/assessments/ci-plan-assessment-2026-08.md` §7.3 is the measurement
-//! this exists for: on one runner
-//! image, one commit and one accelerator, `desktop_typing_damage` is red on
+//! The measurement this exists for: on one runner image, one commit and one
+//! accelerator, `desktop_typing_damage` is red on
 //! QEMU 8.2.2 and green on 11.0.3, and `usb_storage_shapes` with it. So the
 //! QEMU version is not a detail of the environment — it decides verdicts, and
 //! a job that does not say which one it ran produces a number nobody can
@@ -65,9 +64,10 @@ pub fn qemu_version_note(root: &Path) -> Option<String> {
     (have != want).then(|| {
         format!(
             "Note: this host runs QEMU {have} and .github/qemu-version declares {want} — \
-             CI's guests and tests/audio-baseline.toml are on {want}, and \
-             specs/assessments/ci-plan-assessment-2026-08.md §7.3 measured that the version \
-             decides test outcomes. Nothing here is broken; a comparison across the two is."
+             CI's guests and tests/audio-baseline.toml are on {want}, and the QEMU version \
+             has been measured to decide test outcomes (`desktop_typing_damage` and \
+             `usb_storage_shapes` are red on 8.2.2 and green on 11.0.3, same image, same \
+             commit, same accelerator). Nothing here is broken; a comparison across the two is."
         )
     })
 }
@@ -81,9 +81,8 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     }
 
-    /// The workflows whose verdict somebody acts on. `probe-*.yml` are the
-    /// throwaway measurement branches `specs/assessments/ci-plan-assessment-2026-08.md`
-    /// is made of and are not
+    /// The workflows whose verdict somebody acts on. `probe-*.yml` are
+    /// throwaway measurement branches and are not
     /// on this list; `toolchain.yml` installs QEMU for `check_prerequisites`
     /// and boots nothing.
     const GATES: &[&str] = &["ci.yml", "gate-a.yml"];
@@ -125,8 +124,7 @@ mod tests {
     /// The rule is here rather than in one workflow's review because the way
     /// this hides is that a workflow reads perfectly well and never says what
     /// it is comparing against — gate A ran QEMU 8.2.2 against every other
-    /// guest in CI on 11.0.3 for as long as that file existed
-    /// (`specs/assessments/ci-plan-assessment-2026-08.md` §12.1).
+    /// guest in CI on 11.0.3 for as long as that file existed.
     fn nameless(text: &str) -> Vec<String> {
         jobs(text)
             .into_iter()

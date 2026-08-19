@@ -10,7 +10,7 @@
 //! `i8042_undecoded_bytes` at about one full suite in three under load came from
 //! the same handler counting on the way *in*, ahead of any byte reaching the
 //! ring, which needs no subtraction at all; the boot-order argument is in
-//! `specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`.
+//! `issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`.
 //! One word closes both. The distinction is written here because blaming a
 //! proved race for an observed line, without checking that a reader could have
 //! been there, is the mistake this file exists downstream of.

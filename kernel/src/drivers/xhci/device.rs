@@ -296,8 +296,8 @@ fn parse_config(buf: &[u8]) -> Option<(u8, Function)> {
 /// as much as it is a register bit — so the boot path spins on the register
 /// ([`init_device`]) while the runtime path comes back when the event arrives,
 /// and neither is a second implementation of the other. The T14's own root
-/// ports take 55 ms over this (`specs/reference/metal-hardware-inventory.md`), which is
-/// the whole reason the runtime path must not hold a scheduler pass across it.
+/// ports take 55 ms over this, measured, which is the whole reason the runtime
+/// path must not hold a scheduler pass across it.
 pub fn reset_port(ctrl: &mut XhciController, port_idx: u8, kind: Reset) {
     let portsc = ctrl.read_portsc(port_idx);
     ctrl.write_portsc(port_idx, port::reset_write(kind, portsc));

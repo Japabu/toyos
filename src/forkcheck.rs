@@ -1,17 +1,60 @@
 //! `cargo run -- --check-forks` — which lockfile pins have fallen behind the
 //! fork branch they name.
 //!
-//! Every fork lives on a branch in its own repository, and every lockfile pins
-//! one commit of that branch. Branches move; lockfiles do not follow, and no
-//! build notices: the pinned commit still exists, so cargo is content to build
-//! last month's code forever. On 2026-08-08 six pins across five lockfiles had
-//! drifted. Two of them mattered — `raw-window-handle` was pinned at the commit
-//! *before* the one its branch was moved to so the tree would match the head of
-//! open upstream PR #223, so the code we built was not the code we had asked
-//! upstream to merge; and `target-lexicon`'s unpinned commit was the one adding
-//! `OperatingSystem::Toyos` to the SysV arm, so `default_calling_convention()`
-//! answered `Err(())` in `toyos-cc` and `SystemV` in cranelift.
-//! `specs/assessments/dependency-audit-2026-08-08.md` §11 has both.
+//! # The fork estate
+//!
+//! Every forked crate is a `toyos` branch in its own repository, based on a
+//! pinned upstream commit and consumed through a `[patch.crates-io]` git
+//! dependency. `forks.toml` is the inventory: it records each fork's upstream,
+//! base commit, delta size, tier and PR status, and it has to stay accurate —
+//! nothing else in the tree knows what a fork is for.
+//!
+//! - A fresh `git clone` plus `cargo run` needs no setup; cargo fetches the
+//!   forks.
+//! - To *edit* a fork, clone it beside the monorepo and list it in
+//!   `.cargo/config.toml` (gitignored; `.cargo/config.toml.example` is the
+//!   shape). Commit and push in the fork repository — the monorepo only pins
+//!   the branch. **Fork clones are shared by every worktree**: use explicit
+//!   paths, never `stash`, never switch branches in one.
+//! - `git log <base>..toyos` in a fork is the ToyOS delta, and it is the
+//!   content of a future upstream PR.
+//! - Forks depend on ToyOS crates by version, never by path: a path outside the
+//!   fork's own repository cannot resolve once cargo checks the fork out alone.
+//!   Local builds resolve those versions through `[patch]`; an upstream PR
+//!   cannot, so `toyos-abi`, `toyos` and `window` have to be published to
+//!   crates.io before one can be opened.
+//! - Every change must be upstream-mergeable. ToyOS enters as a *new platform*
+//!   under `#[cfg(target_os = "toyos")]` beside the existing ones, cross-platform
+//!   code is not modified, comments follow upstream's idiom and density, and the
+//!   ToyOS rationale goes in the commit message rather than into the diff.
+//!
+//! The `rust/` submodule is the same estate under stricter rules, because its
+//! delta is the largest: ToyOS is a new platform alongside unix/windows/wasi and
+//! never a repurposed cfg gate; prefer ToyOS-specific files (`sys/pal/toyos/`,
+//! `os/toyos/`, anything with `toyos` in the path); a cross-platform file is
+//! touched only to add a target arm at an existing platform-dispatch site, never
+//! to change cross-platform semantics or API shape; `library/alloc` and
+//! `library/core` have **zero** delta. Cherry-picking an already-merged upstream
+//! commit is allowed. Copying an unmerged PR is not — the delta must stay
+//! exactly the content of a future upstream PR.
+//!
+//! **Coverage, and this is the one that bites:** the fork sources live *outside*
+//! this repository, so a repository-wide search or gate does not reach them. An
+//! enumeration of call sites must also cover `~/.cargo/git/checkouts/` or the
+//! local fork clones, or it is an enumeration of part of the tree.
+//!
+//! # Why the drift check exists
+//!
+//! Every lockfile pins one commit of a fork branch. Branches move; lockfiles do
+//! not follow, and no build notices: the pinned commit still exists, so cargo is
+//! content to build last month's code forever. On 2026-08-08 six pins across
+//! five lockfiles had drifted. Two of them mattered — `raw-window-handle` was
+//! pinned at the commit *before* the one its branch was moved to so the tree
+//! would match the head of open upstream PR #223, so the code we built was not
+//! the code we had asked upstream to merge; and `target-lexicon`'s unpinned
+//! commit was the one adding `OperatingSystem::Toyos` to the SysV arm, so
+//! `default_calling_convention()` answered `Err(())` in `toyos-cc` and `SystemV`
+//! in cranelift.
 //!
 //! **On demand only, and it must stay that way.** It asks every fork remote for
 //! a branch head, so it needs the network. Wiring it into `cargo test` or into

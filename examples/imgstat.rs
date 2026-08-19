@@ -2,12 +2,12 @@
 //!
 //! `cargo run --example imgstat -- target/bootable.img`
 //!
-//! Every size in `specs/plans/boot-image-split.md` comes from here, and each of that
-//! plan's stages changes one of them — so the claim "the image is N bytes and
-//! M% of it is X" stays a command anyone can re-run rather than a figure that
-//! was true once. It parses the GPT, both FAT32 volumes and the initrd's
-//! bcachefs with the same three crates the build system writes them with, so it
-//! cannot drift from the writer the way a separate parser would.
+//! Every published size of a boot image comes from here — so the claim "the
+//! image is N bytes and M% of it is X" stays a command anyone can re-run rather
+//! than a figure that was true once. It parses the GPT, both FAT32 volumes and
+//! the initrd's bcachefs with the same three crates the build system writes
+//! them with, so it cannot drift from the writer the way a separate parser
+//! would.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

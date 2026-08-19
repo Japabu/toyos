@@ -8,14 +8,15 @@ A production-grade operating system built from scratch in Rust. Modern x86-64 ha
 
 | | |
 |---|---|
-| `kernel/CLAUDE.md` | which spec owns what, and the caveats that bite kernel work |
+| `kernel/CLAUDE.md` | the caveats that bite kernel work |
 | `userland/CLAUDE.md` | the server doctrine, and the caveats that bite userland work |
-| `tests/CLAUDE.md` | the caveats that bite the harness; the law is `specs/testing-strategy.md` |
+| `tests/CLAUDE.md` | the caveats that bite the harness |
 | `src/CLAUDE.md` | boot modes, the locks and slots, worktrees — the operational file |
-| `specs/testing-strategy.md` | the testing law: instruments, tiers, the PR gate, the nightly |
-| `specs/forks.md` | the ecosystem fork estate and the std library rules |
-| `specs/debugging.md` | LLDB, QMP, frozen guests, audio verification |
-| `specs/README.md` | the specs taxonomy: law, plans, assessments, reference, issues |
+| `issues/README.md` | the issue tracker: one file per issue, typed by kind; `ls` is the index |
+
+There are no spec documents. Rules live where they are enforced — a gate, a
+module header, the redlist — and everything else is an issue. Free text that
+merely describes the tree rots and is deleted, not maintained.
 
 A subdirectory `CLAUDE.md` loads when a file in that subtree is `Read`, and not from `Bash`. A rule whose violation is unrecoverable or invisible stays here; everything else lives where the work is.
 
@@ -56,11 +57,11 @@ The bar is not yet the tree. The standing failures are declared rather than remo
 
 - **toyos-ld** — custom linker for bootloader, kernel and all userland. Its output is reproducible, and the container types say so: anything iterated into the output is a `BTreeMap`/`BTreeSet`; a container asked only for membership stays hashed.
 - **toyos-cc** — minimal C compiler; exists to bootstrap tinycc and compile doomgeneric, not to grow. A layout or linkage construct it does not implement is refused by name — dropping one silently is a miscompilation.
-- **rust/** — Rust compiler/std fork with ToyOS platform support (submodule). Auto-bootstraps; kept current with upstream. Its rules: `specs/forks.md`.
+- **rust/** — Rust compiler/std fork with ToyOS platform support (submodule). Auto-bootstraps; kept current with upstream. Its rules: `src/forkcheck.rs`'s module header.
 
 ## Build & test
 
-`specs/testing-strategy.md` is the testing law. Operationally:
+The testing rules live where they are enforced: instruments and known reds in `src/redlist.rs`, tiers in `src/tiers.rs`, the PR gate and the nightly in `.github/workflows/`. Operationally:
 
 - `cargo run` builds everything (toolchain, kernel, bootloader, userland, initrd) and launches QEMU; `--build-only` skips the launch. `cargo test` runs the QEMU harness; `cargo test --workspace --exclude toyos-build` runs every host-crate suite.
 - **Agents verify through `cargo test`, never `cargo run`** — the run path opens a QEMU window on the owner's desktop by design; the harness runs headless.
@@ -72,8 +73,8 @@ The bar is not yet the tree. The standing failures are declared rather than remo
 src/               Build system (the root cargo project, package name: toyos-build; its Cargo.toml is also the host workspace, and a gate reds on a crate that joins neither members nor exclude)
 kernel/            Kernel
 kernel-loom/       Loom models of the kernel's lock-free concurrency, beside the kernel and not in it
-kernel-span/       Host harness for `kernel/src/mm/user_span.rs`, the same arrangement
-kernel-elide/      Host harness for `kernel/src/log/elide.rs`, the same arrangement
+toyos-userbound/   Every decision the kernel makes about the user/kernel boundary, pure
+toyos-elide/       Log elision decisions, pure
 bootloader/        UEFI bootloader
 userland/          All userland programs
 toyos-abi/         Kernel ABI (types, constants, syscall numbers, syscall wrappers)
@@ -92,11 +93,7 @@ toyos-ld/          Custom linker
 toyos-cc/          Custom C compiler
 rust/              Rust compiler/std fork (submodule)
 tests/             Integration tests (QEMU-based)
-specs/             Living normative documents (specs/README.md is the taxonomy)
-specs/plans/       Staged intentions — a plan dies on completion
-specs/assessments/ Dated evidence, frozen
-specs/reference/   Non-normative fact sheets
-specs/issues/      Known issues, one file per issue — see its README
+issues/            The issue tracker: one file per issue, typed by kind — see its README
 system.toml        What to build and boot
 ```
 
@@ -104,7 +101,7 @@ system.toml        What to build and boot
 
 **One agent, one worktree, one branch.** `cargo run -- --worktree add <path>` makes one; never `git worktree add` by hand — the naive path clones the rust fork's history and takes the machine-global toolchain name from every other checkout. The primary checkout is not a workspace: it owns `rust/`, the rustup link and `main`; `cargo run -- --sync` moves it onto whatever GitHub merged.
 
-- Stay on the current task. File what you find in `specs/issues/` and do not go fix it; one file per issue, its README has the shape.
+- Stay on the current task. File what you find in `issues/` and do not go fix it; one file per issue, its README has the shape.
 - If something blocks, stop and report it. Don't work around it.
 - Never degrade audible or visual quality — even temporarily, even for a big win elsewhere — without the owner's explicit sign-off.
 - **Never truncate command output.** No `| head`, `| tail`, `| grep` to reduce it; long output runs in the background and is read from the file.
@@ -116,14 +113,8 @@ system.toml        What to build and boot
 - **Host load is not an excuse.** A load-coincident audio failure is investigated as a real defect, never re-run away as noise; evidence against that assumption goes to the owner, not into quiet workarounds.
 - **Subagents wait in the foreground.** Background-task notifications do not reliably re-wake subagents: run long commands in the foreground with an explicit `timeout`, and for longer work background once and block with a few long foreground waits — never hundreds of polls. Always poll before sleeping.
 - **Subagents get an explicit model, never the session default.** The orchestrator scopes, dispatches and verifies; it does not hand-work. Judgment-bearing coding gets Opus or stronger; mechanical execution from an exact brief gets Sonnet; non-coding mechanical work gets Haiku; trivial edits need no agent.
-- **Durable facts go in the spec that owns the subject or the module header at the site — never in private agent memory, and almost never in a `CLAUDE.md`.** A `CLAUDE.md` is pointers and caveats; **an agent never edits one.** A rule that truly has no better home and whose violation is invisible or unrecoverable is *proposed as one sentence in the final report*, and the orchestrator places it or declines. The story of a change goes in its commit message; after each task, audit the spec or module header that owns what you changed.
+- **Durable facts go in the module header at the site — never in private agent memory, and almost never in a `CLAUDE.md`.** A `CLAUDE.md` is pointers and caveats; **an agent never edits one.** A rule that truly has no better home and whose violation is invisible or unrecoverable is *proposed as one sentence in the final report*, and the orchestrator places it or declines. The story of a change goes in its commit message; after each task, audit the module header that owns what you changed.
 
 ## Planned work
 
-- `specs/scheduler-core-spec.md` — the ownership-typed scheduler core; nine negative gates prove the harnesses have teeth, never weaken one to make a change pass.
-- `specs/iommu-spec.md` + `specs/plans/iommu-plan.md` + `specs/plans/userspace-drivers-spec.md` — the IOMMU and the userspace drivers it makes safe.
-- `specs/plans/hda-driver-plan.md` — HDA on the T14; the line is who writes an address: soundd never holds a physical address.
-- `specs/completion-architecture-spec.md` — kill every wait: one completion primitive, one park site, a CPU never waits for a device, and a kill is answered by `Cancelled` rather than by discarding the stack.
-- `specs/plans/metal-boot-plan.md` — the T14 metal track; carries the metal session checklist.
-- `specs/plans/net-gate-plan.md`, `specs/plans/wlan-plan.md`, `specs/plans/introspection-plan.md`, `specs/plans/diagnostics-roadmap.md` — queued tracks.
-- `specs/device-test-strategy.md` — ground truth at the hardware boundary; device shape and lifecycle before protocol depth.
+Staged work is an issue like everything else: `rg -l 'kind: track' issues/` lists every open track.

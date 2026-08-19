@@ -10,8 +10,6 @@
 //! this handler is delivered to **Ring 0** — inside `emit`, which is where the
 //! whole point of it is — and that entry is the one in the tree that saves the
 //! scratch registers and aligns the stack for an entry from either ring.
-//!
-//! `specs/log-architecture-spec.md` §9.2.
 
 use super::device_irq::device_irq_entry;
 

@@ -48,12 +48,14 @@ dependencies = [
  "rustc-demangle",
  "toyos-abi",
  "toyos-elf",
+ "toyos-elide",
  "toyos-fat32",
  "toyos-gpt",
  "toyos-hda",
  "toyos-pci",
  "toyos-ps2",
  "toyos-sched",
+ "toyos-userbound",
  "toyos-wallclock",
  "toyos-xhci",
 ]
@@ -76,6 +78,10 @@ version = "0.1.0"
 
 [[package]]
 name = "toyos-elf"
+version = "0.1.0"
+
+[[package]]
+name = "toyos-elide"
 version = "0.1.0"
 
 [[package]]
@@ -103,6 +109,10 @@ version = "0.1.0"
 
 [[package]]
 name = "toyos-sched"
+version = "0.1.0"
+
+[[package]]
+name = "toyos-userbound"
 version = "0.1.0"
 
 [[package]]

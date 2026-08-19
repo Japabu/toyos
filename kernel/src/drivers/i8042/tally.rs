@@ -20,7 +20,7 @@
 //! bytes with no byte anywhere — no subtraction involved, and true of the very
 //! first interrupt a machine takes. Both windows have the same shape and the
 //! same cure, which is why one change closes both; the write-up
-//! (`specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`)
+//! (`issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`)
 //! records which was which, because a torn read that was proved to exist got
 //! blamed for a line it could not have printed.
 //!

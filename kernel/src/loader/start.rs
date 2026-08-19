@@ -291,7 +291,7 @@ pub fn build_child_handles(
         // object *is* the line buffer (`object::device::ConsoleObject`), so a
         // child sharing its parent's would accumulate into one buffer with it
         // and the two half-lines would splice inside the mechanism that exists
-        // to stop splicing (`specs/log-architecture-spec.md` §4.4). Authority
+        // to stop splicing. Authority
         // does not move: a child gets a console exactly when this pair says it
         // does, which is the rule that was already here, and the duplicate above
         // is still what refuses a handle without `DUP`. Aliasing does not move

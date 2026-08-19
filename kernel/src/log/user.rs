@@ -12,8 +12,6 @@
 //! **Reading the whole machine's log is authority**, so it rides
 //! [`Rights::LOG`] on a `SysCap` rather than being ambient: every record every
 //! CPU wrote is every process's business and no process's right by default.
-//!
-//! `specs/log-architecture-spec.md` §3.2.
 
 use alloc::vec::Vec;
 
@@ -33,7 +31,7 @@ use super::read::{drain_ordered, Cursor, RecordSink};
 /// completion architecture's C3 folds all six into one watch list and deletes
 /// them together. Adding a sixth instance of a mechanism that is about to be
 /// unified is the honest cost of landing first, and it is one static and one
-/// match arm (`specs/log-architecture-spec.md` §3.2).
+/// match arm.
 static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
 
 pub fn add_io_uring_watcher(id: RingId) {
