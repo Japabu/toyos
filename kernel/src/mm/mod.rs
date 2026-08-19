@@ -20,6 +20,13 @@ pub const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 /// rest of the kernel names it `mm::PAGE_2M`.
 pub use toyos_userbound::PAGE_2M;
 
+/// The hardware page size — every block-device transfer is a whole multiple
+/// of this, and it is what `paging::PAGE_SIZE_BIT` marks a PDE as mapping
+/// directly instead of through a PT. `mm` did not export a 4 KiB constant
+/// before this; a caller that reached for one and found nothing here is why
+/// more than one private copy exists elsewhere in the kernel.
+pub const PAGE_SIZE: u64 = 4096;
+
 /// Round `size` up to the next 2MB boundary.
 ///
 /// Only for a size the kernel computed. Use [`align_2m_checked`] for one that
