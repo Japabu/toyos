@@ -270,7 +270,7 @@ mod tests {
         let value = format!("{}x{}", "a".repeat(100), "𝄞".repeat(10));
         let got = render(&value);
         assert!(got.ends_with("𝄞𝄞"), "the tail is two whole characters, not eight bytes: {got}");
-        assert_eq!(std::str::from_utf8(got.as_bytes()).is_ok(), true);
+        assert!(std::str::from_utf8(got.as_bytes()).is_ok());
     }
 
     /// Every character straddles a seam sooner or later; sweeping the length

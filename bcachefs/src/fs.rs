@@ -398,7 +398,7 @@ impl<IO: BlockIO> Formatted<IO> {
         let block_count = io.block_count();
 
         // Layout: [superblock(1)] [bitmap] [journal(reserved, 0 for now)] [data...] [sb_backup(1)]
-        let bitmap_blocks = (block_count + BLOCK_SIZE as u64 * 8 - 1) / (BLOCK_SIZE as u64 * 8);
+        let bitmap_blocks = block_count.div_ceil(BLOCK_SIZE as u64 * 8);
         let bitmap_start = BlockNum::new(1);
         // Reserve journal space but don't use it in Phase 1
         let journal_start = BlockNum::new(1 + bitmap_blocks);

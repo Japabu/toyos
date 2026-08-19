@@ -199,7 +199,7 @@ pub fn resolve(epoch: u64, local_secs_of_day: u64) -> Recovery {
 }
 
 fn is_leap(year: u64) -> bool {
-    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
 }
 
 fn days_in_month(year: u64, month: u64) -> u64 {

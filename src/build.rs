@@ -23,7 +23,7 @@ thread_local! {
     /// cumulative thread-local clock lets the harness remove a cold build from
     /// the test that happened to ask for it first. A process-wide counter would
     /// subtract another worker's concurrent build instead.
-    static ARTIFACT_BUILD_TIME: Cell<Duration> = Cell::new(Duration::ZERO);
+    static ARTIFACT_BUILD_TIME: Cell<Duration> = const { Cell::new(Duration::ZERO) };
 }
 
 /// One reading of the artifact-build clock for the current thread.

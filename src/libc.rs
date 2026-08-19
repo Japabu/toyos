@@ -138,7 +138,7 @@ fn merge_rlibs(rlib_paths: &[std::path::PathBuf]) -> Vec<u8> {
     for (i, (_name, data)) in members.iter().enumerate() {
         let header = format!(
             "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
-            &name_refs[i], "0", "0", "0", "100644", data.len()
+            name_refs[i], "0", "0", "0", "100644", data.len()
         );
         buf.extend_from_slice(header.as_bytes());
         buf.extend_from_slice(data);

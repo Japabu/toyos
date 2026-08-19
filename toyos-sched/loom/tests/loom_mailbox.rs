@@ -5,13 +5,13 @@
 //! CPU — plus the scheduler pass that IRQ exit may run:
 //!
 //! * `local`  — CPU0 thread context, pushing to CPU0's own mailbox under a
-//!              [`PreemptModel`] guard (the mandatory preempt-disabled push).
+//!   [`PreemptModel`] guard (the mandatory preempt-disabled push).
 //! * `irq`    — CPU0 IRQ context: pushes (interrupting `local`'s push in some
-//!              interleavings), then at IRQ exit runs a pass *if* preemption
-//!              is enabled.
+//!   interleavings), then at IRQ exit runs a pass *if* preemption
+//!   is enabled.
 //! * `remote` — another CPU: pushes and rings with `Urgency::Normal`, so a
-//!              busy target gets no IPI (spec §7.3) — its message is the one
-//!              that ends up behind the unlinked suffix.
+//!   busy target gets no IPI (spec §7.3) — its message is the one
+//!   that ends up behind the unlinked suffix.
 //!
 //! Two properties are checked.
 //!

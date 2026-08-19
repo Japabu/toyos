@@ -87,7 +87,7 @@ impl<'a> SymTab<'a> {
         if i >= self.count() {
             return None;
         }
-        Some(parse_at(self.syms, i * ENTRY_SIZE)?)
+        parse_at(self.syms, i * ENTRY_SIZE)
     }
 
     /// The `i`th symbol's name, or `""` for an index past the end or a
