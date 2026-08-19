@@ -11,8 +11,8 @@ The only writer is `cache_loaded_lib`'s `push` (`:206`); the only reader is
 `try_clone_cached`'s `position` (`:225`). Nothing removes an entry, nothing
 counts them, and `SYS_DLCLOSE` is `arch/syscall.rs:502 => 0` — a literal no-op.
 So every distinct path any process has ever `dlopen`ed holds a `PageAlloc` for
-the rest of the boot. `specs/assessments/2026-08-15-mechanism-consolidation-audit.md`
-§1.7 recorded it in passing — *"a cache with no eviction and no bound … every
+the rest of the boot. The 2026-08-15 mechanism-consolidation audit
+recorded it in passing — *"a cache with no eviction and no bound … every
 other cache got a budget in task #28; this one did not"* — and it was never
 filed.
 
@@ -39,6 +39,6 @@ second time, with no way for the caller to tell.
 
 Not fixed here: a budget is a policy number and eviction of a shared image needs
 a rule for the processes that already have it mapped. Both belong to whoever
-owns the loader.
-`specs/assessments/2026-08-17-move1-loader-scoping.md` §2.2 is the measurement,
-and notes that Move 1 would delete this cache rather than bound it.
+owns the loader. The measurement above was taken while scoping the move of the
+loader out to Ring 3, 2026-08-17, which would delete this cache rather than
+bound it.

@@ -9,7 +9,6 @@ opened: 2026-08-08
 Nine of the owner's review notes asked whether a large file could become a
 crate, a host test, or both. Four have been answered and five have not; the
 numbers below are 2026-08-08 and exist so the next reader does not re-measure.
-Full verdicts and target shapes: `specs/assessments/code-quality-review-2026-08.md` §2.
 
 **Answered:**
 

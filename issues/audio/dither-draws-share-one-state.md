@@ -26,6 +26,5 @@ indistinguishable from two independent streams.
 
 **Deliberately not "fixed anyway".** Changing the dither changes the captured wav
 bit-for-bit, so it would perturb the audio gate to chase a defect nobody can
-demonstrate. This project has been bitten specifically by gates that cannot fail
-(`specs/assessments/metal-track-history.md`); spending the gate's sensitivity on a
-non-defect is the same error wearing a tidier hat.
+demonstrate. This project has been bitten specifically by gates that cannot fail; spending
+the gate's sensitivity on a non-defect is the same error wearing a tidier hat.

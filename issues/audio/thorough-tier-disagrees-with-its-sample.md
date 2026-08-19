@@ -30,8 +30,8 @@ Two readings, and nothing here decides between them:
 
 - the recorded sample in `tests/audio-baseline.toml` was taken with one QEMU at a
   time and no concurrent agents, and this host now runs several worktrees at once
-  — `specs/assessments/audio-gate-history.md`'s own lesson is that these counters drift
-  between batches on one host with no code change;
+  — the audio gate's own history is that these counters drift between batches
+  on one host with no code change;
 - or something landed since the sample was recorded and nobody re-ran the
   thorough tier to notice.
 

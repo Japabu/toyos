@@ -40,8 +40,8 @@ does not hold across a transfer.
 
 1. **Report the kind.** `SYS_HANDLE_RECV` writes `(RawHandle, kind)` pairs
    instead of bare handles. One ABI shape change, in-tree only — no fork names
-   `handle_recv` (`specs/assessments/dependency-audit-2026-08-08.md`'s estate was swept for
-   this branch and `handle_recv` is not in it). The receiver then refuses by
+   `handle_recv` (the whole fork estate was swept for this branch and
+   `handle_recv` is not in it). The receiver then refuses by
    name and the fail-fast policy is untouched.
 2. **A fifteenth syscall** answering the kind of a handle. Cheaper to write and
    worse: it is a second place to ask, and it makes "what is this" a round trip

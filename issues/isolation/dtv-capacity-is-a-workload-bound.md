@@ -37,7 +37,6 @@ with more than ~62 proc-macro dependencies aborts rustc.
 
 Not fixed here. A growable DTV is a change to a structure `__tls_get_addr`'s
 naked fast path indexes directly, and the honest fix may be that the kernel
-should not own the DTV at all —
-`specs/assessments/2026-08-17-move1-loader-scoping.md` §3 is the inventory this
-came out of, and Move 1 would move it to Ring 3 where the process's own address
-space is the bound.
+should not own the DTV at all: moving the loader out to Ring 3 puts the DTV in
+the process's own address space, where that address space is the bound. This
+came out of the 2026-08-17 scoping of exactly that move.

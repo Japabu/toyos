@@ -46,9 +46,10 @@ meant to shorten.
 
 **What the idea would buy is runner minutes** — about 11 × 112 s ≈ 1,230 s per
 run — and `ci.yml` already records why that is not the currency: the repository
-is public and its minutes are unmetered. The queue is the thing minutes buy,
-and §12.5 of `specs/assessments/ci-plan-assessment-2026-08.md` already spent
-the large one there.
+is public and its minutes are unmetered. The queue is the thing minutes buy, and
+the `target/` cache the shards restore already spent the large one there — 3,036
+s of runner time and 228 s of critical path per run, measured on two consecutive
+attempts of run `31389081797`.
 
 **What is still on the floor and is not this.** The 52–59 s `deps` step is a
 package install repeated in every guest job on every run, and it is not a build

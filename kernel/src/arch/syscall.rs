@@ -1922,9 +1922,8 @@ fn sys_shm_map(h: RawHandle) -> u64 {
 /// every refusal leaves the caller's table exactly as it was**, which is what
 /// makes `Gone` and `ResourceExhausted` honest: they are answers about the
 /// peer, and a caller retrying or closing what it still holds is right rather
-/// than fatal. Refusing to send the connection over itself is what keeps
-/// `capability-handles-spec.md` §8.4's cross-pair cycle to two objects rather
-/// than one.
+/// than fatal. Refusing to send the connection over itself is what keeps a
+/// cross-pair reference cycle to two objects rather than one.
 ///
 /// **Rights travel unchanged, `TRANSFER` included.** A move requires it and
 /// carries it, so everything that can be moved can be moved on: the

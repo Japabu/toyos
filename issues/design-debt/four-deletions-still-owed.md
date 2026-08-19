@@ -10,8 +10,8 @@ Grouped because none is worth a task of its own and all of them are the same
 judgement: code that exists to have existed. Verified on `main` 2026-08-08.
 
 **One of the four is done.** `arch/mod.rs`'s `#[allow(dead_code)]` on `debug`
-and the five tools it masked went on 2026-08-16 (Wave A item A5 of
-`specs/assessments/2026-08-15-mechanism-consolidation-audit.md`): `set_context`,
+and the five tools it masked went on 2026-08-16 (Wave A, item A5 of the
+2026-08-15 mechanism-consolidation audit): `set_context`,
 `watch_write`, `clear`, `monitor_pte` and `check_pte_monitor`, 78 lines,
 with the allow. `read_dr6` and `context` stayed, as this entry said they should
 — and `context` now has no writer at all, which the module header records

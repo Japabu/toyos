@@ -18,10 +18,9 @@ if self.tid != 0 {
 So zero is the field's "no thread here". **It is also a real thread.**
 `ProcessEntry::new` returns *"the allocated main tid (always `Tid(0)` for the
 first thread)"* (`kernel/src/process.rs`), and tids are per-process, so `Tid(0)`
-is the main thread of every process on the machine. Measured over the committed
-T14 logs (`grep -oh 'tid=[0-9]*' specs/assessments/metal-logs/*/*.log`, 2026-08-14):
-**738 `tid=0` against 49 `tid=1`** — the value the formatter drops is the one
-almost every line carries.
+is the main thread of every process on the machine. Counted 2026-08-14 over
+every `tid=` in the T14 boot logs then committed: **738 `tid=0` against 49
+`tid=1`** — the value the formatter drops is the one almost every line carries.
 
 The kernel's own sentinel is a third value again: `PerCpu::current_tid` is
 `u32::MAX` when no thread is running (`kernel/src/arch/percpu.rs:85`), which the

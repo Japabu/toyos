@@ -42,9 +42,9 @@ harness callers drive — exits on a sentinel (the End key's release) and keeps
 `Instant::now() + Duration::from_secs(5)` only as "a liveness ceiling, not the
 measurement … this only bounds a run that lost it". A run that loses the
 sentinel therefore pays five seconds it does not normally pay, which is the
-size of the gap. `specs/assessments/test-cost-audit.md` records that the fixed
-deadline *was* the whole family's cost history until the sentinel replaced it,
-and that the fallback was kept deliberately. Nothing in the job log says the
+size of the gap. That fixed deadline *was* the whole family's cost history until
+the sentinel replaced it, and the fallback was kept deliberately when it did.
+Nothing in the job log says the
 sentinel was lost; the verdict does not depend on it, so the test passes either
 way and only the clock notices.
 

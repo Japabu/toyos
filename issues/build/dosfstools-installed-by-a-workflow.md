@@ -9,6 +9,9 @@ opened: 2026-08-08
 `.github/workflows/probe-toolchain.yml:39` installs it beside `qemu-system-x86`
 and `ovmf`. It only runs on `ci/probe-toolchain` pushes, so it is not on any
 path `main` takes — but it is committed, and a refused dependency left in the
-tree is how it comes back. `specs/assessments/ci-plan-assessment-2026-08.md`
-§6.1 discusses `fsck.vfat` as an option and does not record that the answer
-was no.
+tree is how it comes back. The refusal is not in doubt: the owner turned down
+`fsck.vfat` on 2026-08-08 together with the `/sbin/fsck_msdos` it would have
+replaced, and the FAT32 gate's outside judge is `toyos-fat32-check/` — ours,
+written from Microsoft's fatgen103 — precisely so that no host binary is needed
+to judge a volume. This workflow is the one place in the tree that does not know
+that.

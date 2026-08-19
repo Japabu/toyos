@@ -59,10 +59,11 @@ correct.
 ## Why it matters for pipeline 2
 
 The completion track makes every kernel wait a cancellable completion, answered
-by `Cancelled` rather than by discarding the stack; the mechanism-consolidation
-audit (`specs/assessments/2026-08-15-mechanism-consolidation-audit.md`, Wave B)
-calls the userland-facing half of that "pipeline 2" and names its cancellation
-rewrite the highest-risk piece of the whole track. mio's selector is exactly
+by `Cancelled` rather than by discarding the stack
+(`issues/kernel/every-wait-in-this-kernel-is-a-spin.md`). The 2026-08-15
+mechanism-consolidation audit called the userland-facing half of that "pipeline
+2" and named its cancellation rewrite the highest-risk piece of the whole
+track. mio's selector is exactly
 the kind of consumer that rewrite has to get right: a `deregister` that cannot
 promise "no event after this point" is the userland mirror of the kernel-side
 bug pipeline 2 exists to remove. Re-adding a cancel op (or otherwise making

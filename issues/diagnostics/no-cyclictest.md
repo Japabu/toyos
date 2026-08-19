@@ -7,11 +7,11 @@ opened: 2026-08-08
 # There is no cyclictest, so nobody can ask this machine what its wake latency is
 
 `grep -rni cyclictest` over the tree finds it only in prose and never in code.
-`specs/reference/production-audio-baselines.md:343-347` and `:667-670` state the
-design — an RT-priority thread that arms an absolute timer, sleeps, and
-histograms `actual − programmed` at 1 µs resolution — and the consequence:
-"Until such a tool exists, **no honest 2x claim can be made on this metric in
-either direction**." A cyclictest-equivalent should exist before the first metal
+The design is not the hard part — an RT-priority thread that arms an absolute
+timer, sleeps, and histograms `actual − programmed` at 1 µs resolution — and the
+consequence of not having it is stated: until such a tool exists, **no honest 2x
+claim can be made on this metric in either direction**. A cyclictest-equivalent
+should exist before the first metal
 boot, because it is the instrument that turns that boot into a measurement. That
 is CLAUDE.md's hard bar, unmeasurable for scheduling.
 

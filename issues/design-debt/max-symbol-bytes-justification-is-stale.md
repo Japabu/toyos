@@ -39,6 +39,4 @@ What is owed is the number, because a policy constant defended by a measurement
 is only as good as the measurement, and the next agent asked to move this bound
 will re-derive it from the stale figure.
 
-Found while measuring for
-`specs/assessments/2026-08-17-move1-loader-scoping.md` §3.2, which carries the
-same figures.
+Found while scoping the loader's symbol handling, 2026-08-17.

@@ -40,10 +40,10 @@ alpha-blending through it, so they read the panel as well as write it) are in
 neither. The 1920x1080 figures above have no window on screen and therefore no
 icons; a desktop's do.
 
-**The panic console's repaint is ~460 ms on the T14**, measured from inter-line
-gaps in both boot logs (461 ms and 459 ms) in
-`specs/reference/metal-hardware-inventory.md`; five of the six `boot_checkpoint`
-repaints fall inside the reported 3422 ms boot, which is most of it.
+**The panic console's repaint is ~460 ms on the T14**, measured from the
+inter-line gaps in both boot logs (461 ms and 459 ms); five of the six
+`boot_checkpoint` repaints fall inside the reported 3422 ms boot, which is most
+of it.
 
 This is *not* the same defect. `kernel/src/drivers/panic_console/mod.rs` never
 reads the framebuffer — it writes `core::ptr::write_volatile` one `u32` at a

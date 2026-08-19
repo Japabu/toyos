@@ -6,26 +6,25 @@ opened: 2026-08-08
 
 # Three of the six USB/ESP gate holes the teeth audit demonstrated are still open
 
-`specs/assessments/type-safety-audit/usb-gate-teeth.md` is the record — it names each hole,
-gives the mutation that proved it, and its Part 3 is a ranked work list. It was
-written against `8d7044c`, which `git rev-list --count 8d7044c..HEAD` puts 738
-commits behind as of this entry, and three of its six have closed since. Filed
-here so a reader does not re-investigate all six, and so the open ones are
-visible from this file:
+The USB/ESP gate-teeth audit named each hole, gave the mutation that proved it,
+and left a ranked work list of eleven items. It was written against `8d7044c`,
+which `git rev-list --count 8d7044c..HEAD` puts 738 commits behind as of this
+entry, and three of its six holes have closed since. What follows is that list
+as it stands, so a reader does not re-investigate all six:
 
 **Closed.**
 
 - The ESP fsck gate's blindness to any value in the `..` entries of `/EFI` and
-  `/toyos` (audit `:30-35`, `:230-274`) — closed by rewrite. `tests/common/volumes.rs:36`
+  `/toyos` — closed by rewrite. `tests/common/volumes.rs:36`
   now judges with `toyos-fat32-check`, which has `Complaint::DotCluster` /
   `DotDotCluster` / `DotInRoot` and derives from neither our writer nor our
   reader (`volumes.rs:35`), and the gate is **silence rather than sameness**: a non-empty complaint
   list is refused before the guest runs (`volumes.rs:275-281`) and after
   (`:342-348`). That is the audit's own ranked item 5.
-- `tests/common/usb.rs`'s needle that could never fire (audit `:43-45`) — now
+- `tests/common/usb.rs`'s needle that could never fire — now
   `" designated, blocks="` at `usb.rs:292-297`, with a comment naming the old
   defect.
-- `healthy=true` as an asserted constant (audit `:46`, `:119-128`) — now
+- `healthy=true` as an asserted constant — now
   `xhci::storage_online(self.index) == Some(true)` (`usb_storage.rs:73-75`) down
   to `MscDevice::online()` (`xhci/wait/msc.rs:102-104`).
 

@@ -141,5 +141,8 @@ Three things it does **not** give, in the order they will bite:
   render the three-byte sequence as a single `-`; the honest one is to stop
   putting non-ASCII in `log!`.
 
-`specs/assessments/metal-log-capture.md` is the durable version of the same problem and its
-Phase 2 fixed the *panic* half only.
+The *panic* half of this problem is already answered and stayed answered: the
+log ring retains what serial has collected, the console paginates it, and
+`page_forever` cycles those pages on a halted machine, with
+`screen_paged_scrollback` as the gate. Nothing does any of that for a boot that
+succeeds, which is this entry.

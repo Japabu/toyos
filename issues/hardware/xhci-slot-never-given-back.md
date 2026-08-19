@@ -34,8 +34,8 @@ The fourth is the one with a test behind it: `xhci_slot_exhaustion` leaves five
 slots enabled with a zero DCBAA entry every run, which makes the entry's own
 test the largest producer of the leak it describes.
 
-**The count is 11, not four plus three**, enumerated in
-`specs/assessments/type-safety-audit/usb-storage.md` F12 by reading every path between the
+**The count is 11, not four plus three**, enumerated by the USB storage
+type-safety audit (finding F12) by reading every path between the
 successful Enable Slot and a bound device. Three of them are named nowhere
 else: SET_CONFIGURATION failing (`device.rs`), Configure Endpoint failing for
 the bulk pair (`msc.rs`) and for the HID interrupt endpoint (`device.rs`), plus

@@ -28,7 +28,9 @@ byte-identical.
    to write" is only half done while it holds.
 2. **It is a mount-level policy, not a capability.** There is no way to say
    "this process may write `/boot`", so a future installer has nothing to ask
-   for. `specs/assessments/capability-handles-spec.md` is where that lives.
+   for. The capability-shaped form is a handle carrying a write right that
+   `/bin/init` moves into the installer and into nothing else, and no part of
+   that exists.
 3. **The FAT32 write path's guest-side coverage moved to `/log`** — same
    adapter, same driver, so nothing is lost, but `esp_files` no longer proves
    anything about writes reaching *the ESP*, because it may not make any.

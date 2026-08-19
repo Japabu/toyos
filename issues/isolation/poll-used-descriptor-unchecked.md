@@ -47,11 +47,11 @@ virtio-console and virtio-gpu do not, and virtio-gpu's `submit` masks a bogus id
 with `% size` (`virtio.rs:346`) so it silently aliases another submission's
 descriptors instead of failing.
 
-**Standing.** Audited and explicitly never filed:
-`specs/assessments/type-safety-audit/kernel-drivers.md` F1 has the full analysis and the
+**Standing.** Audited and explicitly never filed: the kernel-drivers type-safety
+audit's F1 carried the full analysis and the
 proposed fix at the primitive — `submit` records each chain's byte total, and
 `poll_used` answers `None` on an id past `size` or a length past the chain — and
-its closing line reads "**Standing.** … Not filed." This is that filing. Two of
-its citations have since drifted: `virtio.rs:161-164` is `:169-172` today, and
-the two `virtio_sound.rs` `assert!`s it names as the counter-example are gone,
+closed with "**Standing.** … Not filed." This is that filing. Two of
+its citations had already drifted: `virtio.rs:161-164` is `:169-172` today, and
+the two `virtio_sound.rs` `assert!`s it named as the counter-example are gone,
 replaced by the `stray` counter above. No test covers any of it.

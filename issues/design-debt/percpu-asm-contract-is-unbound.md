@@ -24,8 +24,8 @@ its field together does not, and the 47 asm sites then read the wrong bytes
 with no diagnostic at all — on the syscall entry path, the timer stub and the
 preemption counter.
 
-Fix shape, agreed in the 2026-08 review (`specs/assessments/code-quality-review-2026-08.md`
-§2 arch/, deep dive 1): feed `offset_of!` into the asm as `const` operands. One
+Fix shape, agreed in the 2026-08 code-quality review: feed `offset_of!` into the
+asm as `const` operands. One
 source, and all 14 asserts delete with it.
 
 Two smaller PerCpu items ride this and **must not precede it**, because field

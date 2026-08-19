@@ -34,8 +34,11 @@ Two answers, and neither is this branch's to pick:
   rights model rules it out: sending needs `TRANSFER`, so the model cannot
   express it. That is a bound on delegation rather than a revocation, and it is
   the cheaper of the two.
-- **Revocation proper**, which `specs/assessments/capability-handles-spec.md` §14.5 rejects
-  by name: unmapping a running process's pages is the `gpu::set_resolution`
+- **Revocation proper**, which the capability-handle design rejects by name:
+  shm revoke, unmap-others and the TLB-shootdown machinery under them are scoped
+  out, forced reclaim is defined as killing the holder, and the exclusion is to
+  be revisited only if an arbitration case appears that killing cannot serve.
+  Unmapping a running process's pages is the `gpu::set_resolution`
   hazard — freeing memory a consumer may hold pointers into. A capability system
   may refuse to hand out a new mapping; taking one back from a running process is
   a different thing.

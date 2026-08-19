@@ -326,10 +326,7 @@ fn read_permit(offset: u64, width: RegWidth) -> Result<&'static str, ()> {
 
 fn refuse(what: &str, offset: u64, width: RegWidth) -> SyscallError {
     if REFUSALS.fetch_add(1, Ordering::Relaxed) < MAX_NAMED_REFUSALS {
-        log!(
-            "hda: refused a {width:?} {what} of {offset:#x} — not on the allow-list \
-             (hda-driver-plan.md §4.1.3)"
-        );
+        log!("hda: refused a {width:?} {what} of {offset:#x} — not on the allow-list");
     }
     SyscallError::PermissionDenied
 }
@@ -389,7 +386,7 @@ fn start_stop(controller: &HdaController, value: u8) -> Result<(), SyscallError>
         if REFUSALS.fetch_add(1, Ordering::Relaxed) < MAX_NAMED_REFUSALS {
             log!(
                 "hda: refused SDnCTL {value:#04x} — stream reset clears the buffer descriptor \
-                 address, which is the kernel's (hda-driver-plan.md §4.1.3)"
+                 address, which is the kernel's"
             );
         }
         return Err(SyscallError::PermissionDenied);

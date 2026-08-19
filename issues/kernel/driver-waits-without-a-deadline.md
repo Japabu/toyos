@@ -41,9 +41,9 @@ in `kernel/src/drivers/hda_probe.rs` (`:979`, `:990`), deleted with the HDA
 probe's whole diagnostic once the driver above it answered every question that
 probe was asked for.
 
-**Standing.** `specs/assessments/type-safety-audit/kernel-drivers.md` F10 (`:928`, deadlines
+**Standing.** The kernel-drivers type-safety audit's F10 (deadlines
 and durations as bare `u64` in two different units, so `wait_writable(500)`
-compiles and means "expired at boot") and F11 (`:987`, the
+compiles and means "expired at boot") and F11 (the
 `wait(off, until, pred) -> Result<u32, Timeout>` primitive and its blast radius)
 are the design; F11's own closing line is "**Standing.** Not filed." Two
 corrections to it: its count of eight unbounded MMIO polls is **five** today,

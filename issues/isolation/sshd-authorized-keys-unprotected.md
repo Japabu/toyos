@@ -12,9 +12,9 @@ user model and no file permissions, so **any process on the machine can read
 the first and rewrite the second** — the second being the one that matters:
 appending a line to it is a remote login, and nothing stops a process doing it.
 
-This is not an sshd defect and cannot be fixed inside sshd. It is the absence
-of the thing `specs/assessments/capability-handles-spec.md` is about — an owner for a
-kernel object, and a process that holds fewer rights than the machine.
+This is not an sshd defect and cannot be fixed inside sshd. It is the absence of
+the capability-handle model — an owner for a kernel object, and a process that
+holds fewer rights than the machine.
 Deliberately not worked around here: a daemon-private hiding place would be
 obfuscation, and inventing a user model to serve one daemon is the wrong shape
 for the decision. Until there is one, **sshd's trust boundary is the machine,

@@ -18,5 +18,5 @@ narrower surviving reason — freezing the report at the panic instant, where
 to — and carry a comment saying explicitly not to delete them on the grounds
 that the tests pass.
 
-Another gate that cannot fail (`specs/assessments/metal-track-history.md`), and the third
-found this session, after I5 fairness and the unreachable kernel `check` build.
+Another gate that cannot fail, and the third found this session, after I5
+fairness and the unreachable kernel `check` build.

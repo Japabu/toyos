@@ -13,9 +13,9 @@ and **the fork estate is not in this repository**. Sixteen forks consume
 a deletion here can break a fork branch that no gate in this repository, and no
 build this repository runs, ever compiles.
 
-**`SYS_STACK_INFO` (61) is the live case.** The mechanism consolidation audit
-(`specs/assessments/2026-08-15-mechanism-consolidation-audit.md`, A9) records it
-as CONFIRMED caller-less, and inside the tree it is: at `821c40b` the only hits
+**`SYS_STACK_INFO` (61) is the live case.** The 2026-08-15 mechanism
+consolidation audit, item A9, recorded it as CONFIRMED caller-less, and inside
+the tree it is: at `821c40b` the only hits
 are the declaration, the wrapper, the kernel arm, and prose. Outside it:
 
 ```

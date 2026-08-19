@@ -328,10 +328,7 @@ fn write_permit(info: &abi::VirtioSoundInfo, offset: u64, width: RegWidth) -> bo
 
 fn refuse(what: &str, offset: u64, width: RegWidth) -> SyscallError {
     if REFUSALS.fetch_add(1, Ordering::Relaxed) < MAX_NAMED_REFUSALS as u32 {
-        log!(
-            "virtio-sound: refused a {width:?} {what} of {offset:#x} — not on the allow-list \
-             (hda-driver-plan.md §4.1.3)"
-        );
+        log!("virtio-sound: refused a {width:?} {what} of {offset:#x} — not on the allow-list");
     }
     SyscallError::PermissionDenied
 }

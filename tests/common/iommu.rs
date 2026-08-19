@@ -183,8 +183,8 @@ const SECOND_LEVEL: &[&str] = &["read-permission", "write-permission", "paging-e
 /// A function whose context entry the kernel deliberately never wrote must
 /// fault on its first transaction, and the fault must name it.
 ///
-/// This is the exit criterion for I2 and the
-/// isolation negative control at the same time, because at this stage they are
+/// This is the exit criterion for I2 and the isolation negative control at the
+/// same time, because at this stage they are
 /// the same question. Identity mapping means a translated machine and an untranslated
 /// one produce the same result for every device that is *in* the tables, so
 /// the only way to tell the two apart is a device that is not: with the unit
@@ -489,8 +489,8 @@ fn profile_name(profile: Profile) -> &'static str {
 
 /// Presence, configuration and *position* of the unit in the argv.
 ///
-/// The last one is the vacuity trap in its harness-side form: QEMU hands a
-/// PCI function the bypassing
+/// The last one is the vacuity trap in its harness-side form: QEMU hands a PCI
+/// function the bypassing
 /// address space when the function is created before the unit exists, so a
 /// `-device intel-iommu` emitted after the devices it is meant to decode is a
 /// unit that decodes nothing — and every assertion above it would still pass.

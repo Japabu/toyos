@@ -6,14 +6,17 @@ opened: 2026-08-04
 
 # `Sched::Parallel` tests that go red under other worktrees' suites
 
-Caught by the re-run-alone pass (`specs/assessments/test-cost-audit.md` §5.4.6) on
-2026-08-04, on a host carrying three to four concurrent full suites, and green
+Caught by the re-run-alone pass on 2026-08-04, on a host carrying three to four
+concurrent full suites, and green
 the moment each was re-run by itself in the same process. None predates or was
 introduced by the parallel-width work; all have been `Sched::Parallel` since the
 phase landed, and none reproduces on a host running one suite.
 
-**Read this list against `specs/assessments/test-cost-audit.md` §5.8 before adding to it.**
-Every entry below that says `nothing typed at the terminal window reached a
+**Read this list against what a wall-clock guard can actually say before adding
+to it.** These entries share one shape: a test waits a number of host seconds
+for the guest to do something and, when the number expires, reports the
+*content* it was going to assert — so the red's name is the workload and never
+the cause. Every entry below that says `nothing typed at the terminal window reached a
 shell` — `desktop_typing_damage`, `desktop_locale_detect`, `blocked_dump`, and
 `desktop_audio_client` in `desktop-window-child-holds-a-lane` — is now known to be the
 `/bin/terminal` boot race (`kernel/terminal-races-compositor-at-boot`, since
@@ -182,7 +185,7 @@ guest live that was measured while this was being written, on a host where the
 semaphore was doing precisely what it says. `buildlock::build_slot` is the
 second count: four across every worktree, its own directory so a suite holding
 every guest slot can still compile, `--host-builds N` to override and `0` to turn
-off (`specs/assessments/test-cost-audit.md` §5.7). It bounds the build half of a landing gate
+off. It bounds the build half of a landing gate
 by construction, since a gate's builds are these builds. What it does **not**
 bound is anything that never enters `src/build.rs` — a `toyos-sched-sim measure`,
 a hand-run `cargo build` in a fork clone, the primary's `./x.py`.
@@ -193,8 +196,8 @@ them should get is a widened bound — a gate that tolerates one lost byte
 tolerates the defect it was written for. The two fixes above are the two shapes
 that are legitimate: make the verdict independent of the rate, or scale a
 liveness ceiling with the phase. The global QEMU-slot semaphore this section
-used to name as the closing move now exists (`buildlock::guest_slot`,
-`specs/assessments/test-cost-audit.md` §5.6): the host admits twelve guests across every
+used to name as the closing move now exists (`buildlock::guest_slot`): the host
+admits twelve guests across every
 worktree, so the four-suite regime these were observed in cannot recur. A looser
 assertion is still not the answer.
 

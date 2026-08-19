@@ -24,9 +24,10 @@ and the next:
 
 The two large ones are configs carrying userland programs the shared test image
 does not: `metalcase` starts `compositor`, `netd` and `sshd`, `sshdcase` starts
-`netd` and `sshd`, and every one of our crates recompiles in a fresh checkout
-(`specs/assessments/ci-plan-assessment-2026-08.md` §12.5 says why, and that the
-direction is deliberate).
+`netd` and `sshd`, and every one of our crates recompiles in a fresh checkout —
+`actions/checkout` writes every source with the current time and cargo's
+freshness for a path crate is an mtime comparison, which is deliberate, because
+a fresh checkout makes cargo rebuild more than it needs to and never less.
 
 **What it costs the partition.** The twelve `suite` steps of that run:
 

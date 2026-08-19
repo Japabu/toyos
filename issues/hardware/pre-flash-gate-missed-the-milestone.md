@@ -6,10 +6,10 @@ opened: 2026-08-01
 
 # The pre-flash gate certified everything except the milestone
 
-`specs/assessments/pre-flash-gate-2026-08-01.md` §7 records **GO** at
+The pre-flash gate of 2026-08-01 recorded **GO** at
 `b82fc4a` with a 182/182 guest suite, against the checklist now in
 `issues/hardware/a-metal-session-runs-a-pre-flash-gate-first.md`. Its six
-sections are storage safety, image well-formedness, boot-time panics, the
+sections were storage safety, image well-formedness, boot-time panics, the
 on-screen console, and two sections of "recent changes do not alter boot".
 **There is no input section**, and the seventeen-row verdict table has no
 input row. Input — the thing the metal input milestone exists for and the reason
@@ -18,8 +18,8 @@ NOT cover".
 
 That is the hole, and it is not "the gate ran the wrong test". The gate's own
 method is to ask a false-pass question per item, and it asks it well for the two
-items whose QEMU-versus-hardware divergence it noticed: §3.2 (TCG always reports
-FSGSBASE) and §3.3 (QEMU's `stride == width`), both explicitly recorded as
+items whose QEMU-versus-hardware divergence it noticed — TCG always reports
+FSGSBASE, and QEMU's `stride == width` — both explicitly recorded as
 read-verified because QEMU cannot exercise them. The i8042 has **more** such
 branches than either, every one of them silent
 (`kernel-log-unreadable-once-userland-owns-the-screen`), and no item asks about

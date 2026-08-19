@@ -28,9 +28,10 @@ fault handler already leaves unhandled and `file_cache::read_page` zero-fills.
 **Revocation, not lifetime extension**, and deliberately not the capability
 refcounting this entry used to ask for: keeping a deleted file's blocks alive
 for as long as something can read them is POSIX's answer to a question ToyOS
-has not been asked, and doing it honestly still needs
-`specs/assessments/capability-handles-spec.md`. Making the stale read *fail* is the whole of
-what the disclosure needs and it is expressible today.
+has not been asked, and doing it honestly still needs the capability-handle
+model — an owner for a kernel object, and a refcount that outlives the name.
+Making the stale read *fail* is the whole of what the disclosure needs and it is
+expressible today.
 
 Gate: `home_backing_revoked`, in the shared boot. It asserts the read is
 **zeros**, not merely "not the attacker's byte", so it cannot pass by the blocks

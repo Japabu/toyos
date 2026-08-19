@@ -105,8 +105,8 @@ trusting the answer, this one is a hole where the answer would be.
    it against 96% / 69% / 99%, and forcing the balance condition false takes it
    to 0% and reds the test. **A/B that number across the redesign; a collapse is
    as loud as a violation.** This is the gate that goes quiet — the change under
-   test narrowing the gate's own coverage rather than violating it — with the
-   evidence in `specs/assessments/metal-track-history.md`.
+   test narrowing the gate's own coverage rather than violating it — and this
+   project's history has more than one of those in it.
 3. **The margin at 32 CPUs is 1.2× and trending up** — 10 ms at one CPU to
    50 ms at 32 against a 60 ms bound — with nothing measured above 32, while
    the scheduler's own staged target is 1–128. Measure 64 and 128 first, or a

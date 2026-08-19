@@ -59,8 +59,8 @@ Consequences worth stating separately:
   not the freeze, so it does not belong in `EXPECTED_FAILURES`.
 
 Not fixed here, and the fix is not obviously "reclassify": `Sched::Serial` for
-all three desktops moves ~5 minutes into the serial tail, which
-`specs/assessments/test-cost-audit.md` §5.4 spent a wave getting out of. Candidates worth
+all three desktops moves ~5 minutes into the serial tail, which a whole wave of
+test-cost work was spent getting out of. Candidates worth
 pricing: cap what a lane will spend on an `EXPECTED_FAILURES` test, exclude a
 test's contention wait from what the profile records, or give the profile a
 notion of how much host a task wants so two eight-CPU guests do not pair.
@@ -120,8 +120,7 @@ instead of spending up to four minutes at width 12 — which is the lane
 mechanism of "whichever other desktop lands beside it loses its typing window".
 
 `qemu::budget` also scales by how fast the host is now, not only by how many
-guests are on it (`specs/assessments/ci-plan-assessment-2026-08.md` §7.2).
-Neither change touches
+guests are on it. Neither change touches
 `screen_blocked_dump`, `i8042_mouse`, `screen_console_scroll` or the rest of
 `parallel-tests-red-under-other-suites`' list, whose verdicts are elsewhere — this closes the desktop family's
 share of it and no more. Measured after: four desktop tests wide, 16/27/28/31 s
