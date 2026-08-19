@@ -83,6 +83,48 @@ const BANS: &[Ban] = &[
             ("kernel/src/mm/alloc.rs", 1),
         ],
     },
+    // `toyos_untrusted::Untrusted` has no accessor, no cast, no arithmetic and
+    // no `From`, so a number that crossed a trust boundary cannot reach an
+    // index or a length except through `index(len)` or `at_most(bound)`. That
+    // closes every *accidental* way out, which is every one of the filed sites:
+    // each was a cast or a bare comparison somebody wrote without noticing they
+    // were deciding anything.
+    //
+    // What typing alone cannot close is a bound that is not a bound. A caller
+    // may write `at_most(u64::MAX)` and get the value straight back, and no
+    // signature distinguishes that from a real ceiling. So the deliberate form
+    // is banned here instead — which is the difference between "nothing stops
+    // the ninth site" and "one scan does". These five needles are the whole of
+    // it, because a bound written as a type's own maximum is the only shape
+    // that admits every value.
+    Ban {
+        needle: "at_most(u64::MAX",
+        why: "a bound of u64::MAX admits every value: it is an unwrap wearing a \
+              check's name. If there is genuinely no ceiling then the value is \
+              not a length, and it does not want this exit",
+        allowed: &[],
+    },
+    Ban {
+        needle: "at_most(u32::MAX",
+        why: "as above, for a value already narrower than the bound it names",
+        allowed: &[],
+    },
+    Ban {
+        needle: "at_most(u16::MAX",
+        why: "as above",
+        allowed: &[],
+    },
+    Ban {
+        needle: "at_most(u8::MAX",
+        why: "as above",
+        allowed: &[],
+    },
+    Ban {
+        needle: "index(usize::MAX",
+        why: "the same hole in the other exit: every value indexes a table of \
+              usize::MAX entries, and no such table exists",
+        allowed: &[],
+    },
 ];
 
 fn rel(root: &Path, path: &Path) -> String {

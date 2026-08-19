@@ -55,6 +55,13 @@ struct VirtioNic {
     rx_ptrs: [*mut u8; RX_BUF_COUNT],
     // Maps virtqueue descriptor index -> rx_bufs index
     desc_to_buf: [u16; RX_QUEUE_SIZE as usize],
+    /// The RX queue's refusal count as of the last line this driver wrote
+    /// about it.
+    ///
+    /// `poll_used` cannot log — `virtio_console` calls it under the serial
+    /// backend's own lock — so the count is carried and named here, which is
+    /// the one virtio queue whose used ring a userland process could reach.
+    reported_refusals: u32,
     /// Stash area: slot returned by poll_used, indexed by buf_idx, consumed by refill_rx_buf.
     pending_rx_slots: [Option<DescSlot>; RX_BUF_COUNT],
     tx_slot: Option<DescSlot>,
@@ -82,7 +89,23 @@ impl crate::net::Nic for VirtioNic {
     }
 
     fn poll_rx(&mut self) -> Option<(usize, usize)> {
-        let (slot, written_len) = self.rxq.poll_used()?;
+        let polled = self.rxq.poll_used();
+        // Named here and not in `poll_used`: this runs on the `irq_ring` drain,
+        // where a log line is ordinary, and it is the used ring an untrusted
+        // process is closest to. Reported on change rather than per element, so
+        // a device or a peer writing garbage costs one line and not a flood.
+        let refused = self.rxq.refused();
+        if refused != self.reported_refusals {
+            log!(
+                "VirtIO net: refused {} RX used-ring element(s) — the device named a descriptor \
+                 this queue never published or claimed more bytes than it was given",
+                refused - self.reported_refusals
+            );
+            self.reported_refusals = refused;
+        }
+        let (slot, written_len) = polled?;
+        // In range by construction: `poll_used` refuses a head past the queue,
+        // and `desc_to_buf` is exactly `RX_QUEUE_SIZE` long.
         let buf_idx = self.desc_to_buf[slot.id() as usize] as usize;
         let total = written_len as usize;
         if total <= NET_HDR_SIZE {
@@ -225,6 +248,7 @@ pub fn init(devices: &[PciDevice]) {
     let mut nic = VirtioNic {
         device, rxq, txq, rx_phys, tx_phys, rx_ptrs,
         desc_to_buf: [0; RX_QUEUE_SIZE as usize],
+        reported_refusals: 0,
         pending_rx_slots: [NONE_SLOT; RX_BUF_COUNT],
         tx_slot: Some(tx_slot),
     };

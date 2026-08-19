@@ -55,6 +55,7 @@ dependencies = [
  "toyos-pci",
  "toyos-ps2",
  "toyos-sched",
+ "toyos-untrusted",
  "toyos-userbound",
  "toyos-wallclock",
  "toyos-xhci",
@@ -109,6 +110,10 @@ version = "0.1.0"
 
 [[package]]
 name = "toyos-sched"
+version = "0.1.0"
+
+[[package]]
+name = "toyos-untrusted"
 version = "0.1.0"
 
 [[package]]
