@@ -1799,8 +1799,12 @@ pub const KNOWN_RED: &[Red] = &[
                and the first dev-host one the panic vocabulary has named rather than reported as \
                silence. `ALONE … GREEN`, which that vocabulary's own write-up says is not evidence \
                against a panic — one reached under contention does not reproduce alone either. \
-               The kernel's report is not in the record: this test's failure arm prints \
-               `tail(&result.stdout)` and never `TestResult::serial`",
+               The kernel's report is not in *this* record: the arm printed \
+               `tail(&result.stdout)`, which is the userland half of the capture, and the report \
+               sat unread in `TestResult::serial`. That is closed at the field rather than at the \
+               arm — `TestResult::error` is a `WaitVerdict`, which cannot be built without the \
+               capture it was reached on — so the next sighting arrives with `cr2`, the page \
+               walk, the backtrace and `[ist1] used N of M` under the sentence",
         evidence: "three full `cargo test` runs in one session on `wt/toyos-purecrates`, twelve \
                    wide, `fastest boot 1522 ms against the reference 1320 ms` on the run that \
                    red",
