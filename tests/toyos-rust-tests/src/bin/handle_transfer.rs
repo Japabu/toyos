@@ -1,10 +1,9 @@
 //! A batch of handles crossing a connection, and what happens at each point a
 //! peer can die.
 //!
-//! `specs/capability-endowment-spec.md` §8 requires this gate and nothing in
-//! the tree was it: the only two `handle_send` call sites in the whole test
-//! estate sent a `SharedMem`, which is why three of this branch's defects lived
-//! here unseen.
+//! Nothing in the tree was this gate: the only two `handle_send` call sites in
+//! the whole test estate sent a `SharedMem`, which is why three of this
+//! branch's defects lived here unseen.
 //!
 //! Five arms, one per point a batch can be at.
 //!

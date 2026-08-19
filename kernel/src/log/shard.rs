@@ -9,8 +9,6 @@
 //! that can see one. **ARM64 is planned**, and on it the missing edge is not
 //! hypothetical. If this file grows a dependency on a subject, the model stops
 //! compiling and the ordering stops being checked by anything.
-//!
-//! `specs/log-architecture-spec.md` §2.2, §2.4 and §2.5.
 
 #[cfg(not(feature = "loom"))]
 use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
@@ -24,7 +22,8 @@ use toyos_abi::log::{LogRecord, MAX_RECORD_MESSAGE};
 use toyos_abi::log::RECORD_BYTES;
 
 /// Slots per CPU: 512 KiB at `RECORD_BYTES` of 1024, and 4 MiB at the shipped
-/// eight. `specs/log-architecture-spec.md` §13.3 is the ruling that bought it.
+/// eight — bought deliberately when the record was widened to hold a demangled
+/// backtrace frame.
 ///
 /// **Sized by records emitted before a reader exists**, which is the only
 /// quantity this bound has to cover — after that `klogd` and `/bin/logd` are

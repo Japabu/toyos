@@ -1,9 +1,9 @@
 //! The virtio-sound stub: bring-up, the virtqueues, and the allow-list.
 //!
-//! `specs/plans/hda-driver-plan.md` §4.1 is the design and this device is the second
-//! to take that shape. **The line is who writes an address**, and a split
-//! virtqueue puts every address a virtio driver ever programs in one place: the
-//! descriptor table. So the three tables here live in a page no process maps,
+//! **The line is who writes an address**, and this device is the second to take
+//! that shape after `hda.rs`. A split virtqueue puts every address a virtio
+//! driver ever programs in one place: the descriptor table. So the three tables
+//! here live in a page no process maps,
 //! their chains are built once at bind out of offsets into a region the kernel
 //! allocated, and what the driver gets is the avail rings that select a chain by
 //! index, the used rings that say one came back, and one register write to ring

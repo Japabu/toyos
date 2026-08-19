@@ -1,13 +1,13 @@
 //! `/bin/logd` — the machine's log, written to a file by a process that can be
 //! killed without taking the kernel with it.
 //!
-//! `specs/log-architecture-spec.md` §5 and §6 are the design. What this program
-//! replaces is `kernel/src/log_file.rs`: a kernel module that appended the log
-//! ring to a FAT volume **from the idle loop**, which is why an idle CPU on this
-//! machine could be found four spinlocks deep inside a USB transfer with a
-//! userland `println!` behind it. The kernel keeps the record ring and the
-//! console; every policy about files — where they go, what they are called, how
-//! many there are, what happens when the stick stops answering — is here.
+//! What this program replaces is `kernel/src/log_file.rs`: a kernel module that
+//! appended the log ring to a FAT volume **from the idle loop**, which is why an
+//! idle CPU on this machine could be found four spinlocks deep inside a USB
+//! transfer with a userland `println!` behind it. The kernel keeps the record
+//! ring and the console; every policy about files — where they go, what they
+//! are called, how many there are, what happens when the stick stops answering
+//! — is here.
 //!
 //! # Its whole authority
 //!
@@ -15,50 +15,51 @@
 //! manifest row asks for by the name `logread`. With it, it may read every
 //! record every CPU wrote and park on the readiness source when there is
 //! nothing new. It claims no device, opens no compositor connection and can
-//! name no process. Writing files is ambient, which is the endowment spec's
-//! declared residual D6 and not this program's to close.
+//! name no process. Writing files is ambient — a known residual of the
+//! capability endowment, and not this program's to close.
 //!
-//! # What it does not do at L6, and why the port is not here
+//! # What it does not do, and why the port is not here
 //!
-//! §5.2 gives it a `log` port with two frame kinds, and **neither has a caller
-//! on this tree**:
+//! Its design carries a `log` port with two frame kinds, and **neither has a
+//! caller on this tree**:
 //!
 //! - `Register` carries the read ends of a child's stdout and stderr pipes.
-//!   Those pipes are L7's — until then every program's stdio is a console
-//!   object minted at spawn (§4.4), and nothing sends this frame.
+//!   Those pipes do not exist yet — until they do, every program's stdio is a
+//!   console object minted at spawn, and nothing sends this frame.
 //! - `Sync` was the shutdown path asking for durability. It is **struck**: the
 //!   asker is `SYS_SHUTDOWN`, which runs in the *kernel*, and a kernel that
 //!   opens an IPC connection to a userland server to ask it a question is the
 //!   inversion this architecture exists to avoid. `LogCursor::durable` already
 //!   travels the other way on a call this program makes every loop, so the
-//!   kernel reads a word instead — §6.3 and §6.4 are one mechanism now, not two.
+//!   kernel reads a word instead — shutdown and panic are one mechanism now,
+//!   not two.
 //!
-//! So `serves = ["log"]` is not on its manifest row yet. §5.1a's own rule is
-//! the argument, applied to this program instead of to `/bin/console`: *a right
-//! with no caller is a capability handed out for a plan*. The acceptor arrives
-//! in L7 with the first `Register`.
+//! So `serves = ["log"]` is not on its manifest row yet, by the same rule that
+//! keeps `logread` off `/bin/console`'s: *a right with no caller is a
+//! capability handed out for a plan*. The acceptor arrives with the first
+//! `Register`.
 //!
 //! # Durability, which is a contract and not a hope
 //!
 //! Every batch is written, `fsync`ed and only then published: `LogTail::
 //! publish_durable` carries the `at_ns` of the newest record now **on the
 //! device**, the kernel clamps it and keeps the maximum in `LOG_DURABLE_NS`,
-//! and a panicking kernel waits on that word for its own report to land
-//! (§6.4). Publishing before the sync would make the word a lie in exactly the
-//! case it exists for, so the order here is load-bearing: write, sync, publish,
-//! never two of the three.
+//! and a panicking kernel waits on that word for its own report to land.
+//! Publishing before the sync would make the word a lie in exactly the case it
+//! exists for, so the order here is load-bearing: write, sync, publish, never
+//! two of the three.
 //!
-//! `SYS_FSYNC` reaches the device's own cache flush since L6 (§12.4) — before
-//! that it stopped at the page cache, and this program calling the result
-//! durable would have been a spec lying about its own guarantee.
+//! `SYS_FSYNC` reaches the device's own cache flush — before it did, it stopped
+//! at the page cache, and this program calling the result durable would have
+//! been a claim of durability that was not one.
 //!
 //! # The console is the kernel's and stays the kernel's
 //!
 //! This program does **not** write kernel records to the console. `klogd` does,
 //! at the commit, and a second copy from here would double every line on the
 //! wire. What it writes to its own console is what only it knows: where the log
-//! is going, and when it has stopped going there. §4.1's split, taken
-//! literally.
+//! is going, and when it has stopped going there — the kernel keeping the
+//! console and giving up the filesystem, taken literally.
 
 mod store;
 mod wall;

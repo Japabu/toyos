@@ -4,7 +4,7 @@
 //! Two subjects, in this order because the second rests on the first:
 //!
 //! 1. [`console_line_atomicity`] — every line on the console is one writer's,
-//!    whole. `specs/log-architecture-spec.md` §4.4 and §9.5.
+//!    whole.
 //! 2. [`verdict`] — therefore a line's *first bytes are its writer's own*, so
 //!    the C family can tell a daemon's line from the program under test's by
 //!    reading it, and stop failing on output that is not its own.

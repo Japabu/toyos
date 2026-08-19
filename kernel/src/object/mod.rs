@@ -14,8 +14,6 @@
 //! lifecycle event rides `handle_count`, which process teardown drains on the
 //! killer's CPU. The stranded `Arc` leaks memory: bounded, visible in the
 //! [`census`], and unable to delay a semantic event.
-//!
-//! `specs/capability-endowment-spec.md` §2.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;

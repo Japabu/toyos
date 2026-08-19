@@ -51,9 +51,10 @@ mod cr4 {
 /// - `EM` (2) clear and `MP` (1) set — the pair that says an x87 instruction
 ///   executes on the FPU rather than raising `#NM` (SDM Vol. 3A §2.5), and that
 ///   `WAIT` respects `TS`.
-/// - `TS` (3) clear — lazy FP switching is ruled out
-///   (`specs/user-machine-state.md` §6.3), so nothing ever sets it and `#NM`
-///   keeps its meaning of "a userland bug".
+/// - `TS` (3) clear — lazy FP switching is ruled out, because deferring the
+///   restore behind `#NM` leaks the previous task's register file across the
+///   deferral boundary. Nothing ever sets it and `#NM` keeps its meaning of
+///   "a userland bug".
 /// - `AM` (18) clear — with it set, `RFLAGS.AC` would make an unaligned Ring 3
 ///   access `#AC`. Nothing in this kernel is ready to be the thing that decides
 ///   a process wanted that.

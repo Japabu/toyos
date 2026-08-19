@@ -36,7 +36,7 @@ struct TestDef {
 /// Whether a test may run while other guests are up.
 ///
 /// Every entry of [`MACHINE_TESTS`] and [`SCREEN_TESTS`] answers this or does
-/// not compile. That is `specs/assessments/test-cost-audit.md` §3.3's serial-by-default rule
+/// not compile. That is the serial-by-default rule
 /// in its stronger form: the rule's whole safety argument is that *forgetting*
 /// must cost a slow suite rather than a wrong measurement, and a name that
 /// cannot be added without an answer cannot be forgotten at all.
@@ -67,16 +67,16 @@ enum Sched {
 ///
 /// **Twelve is the number for one suite on this host**, and [`HostSlots`] is
 /// what stops four agents at twelve being 48 guests on 14 cores.
-/// `specs/assessments/test-cost-audit.md` §5.4.7 carries the tables, including the one that
-/// said eight, which was taken while `drain_serial` was still width-scaled and
+/// An earlier table said eight; it was taken while `drain_serial` was still
+/// width-scaled and
 /// `metal_sim_pointer_churn`'s twenty-four paced drains *were* the phase.
 const DEFAULT_WIDTH: usize = 12;
 
 /// This run's claim on the host's guest budget.
 ///
 /// [`DEFAULT_WIDTH`] is a number for *one* suite, and nothing was handing out
-/// the cores that two suites both spend (`specs/assessments/test-cost-audit.md` §4.1
-/// constraint 3). A second suite on this machine is not a slower first suite, it
+/// the cores that two suites both spend.
+/// A second suite on this machine is not a slower first suite, it
 /// is a wrong one: `screen_fatal_halt` red at 11 s against 3.3 s alone, and an
 /// agent's hour spent chasing that as a regression.
 ///
@@ -315,8 +315,8 @@ const AUDIO_SMP: &[u32] = &[1, 8];
 // bitmap it rendered itself, before anything points it at a real screen.
 /// The order was once about kernel rebuilds — every actuator was a build, and a
 /// feature-carrying test last left the plain-kernel ones above it untouched by
-/// the thrash. Since `specs/assessments/test-cost-audit.md` §5.9.7 there are two kernels and
-/// nothing to thrash; the order is kept because these are read the way they are
+/// the thrash. There are two kernels now and nothing to thrash; the order is
+/// kept because these are read the way they are
 /// written.
 const SCREEN_TESTS: &[(&str, Sched, Tier)] = &[
     ("screen_decoder", Sched::Parallel, Tier::Fast),
@@ -451,8 +451,8 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // wall-clock margin on the host as much as on the guest: at width 12 the
     // probe missed the window and reported the NMI as never delivered, which
     // reads exactly like the defect it hunts, and it was green alone in the
-    // same run and three times after it. Serial by `specs/assessments/test-cost-audit.md`
-    // §3.3 — a verdict that is a duration does not go in the parallel phase.
+    // same run and three times after it. Serial by the default rule — a
+    // verdict that is a duration does not go in the parallel phase.
     ("dump_nmi_probe", Sched::Serial, Tier::Nightly),
     ("diskless_boot", Sched::Parallel, Tier::Fast),
     // Every verdict is a line of text or a device property, and no clock is in
@@ -771,7 +771,7 @@ enum Stale {
     OnAPass,
     /// **A date, because a pass proves nothing.** For a failure that does not
     /// fire every run. One green of an intermittent test is one sample of a
-    /// rate, and `specs/assessments/audio-gate-history.md` is the standing evidence that a
+    /// rate, and this tree's audio-gate history is the standing evidence that a
     /// verdict taken from one sample is a verdict about nothing — so
     /// [`Stale::OnAPass`] here would red a tree with nothing wrong with it, on
     /// the first lucky run, and teach everybody to re-run until it went away.
@@ -1756,8 +1756,8 @@ const TONE_MIN_ACTIVE_SECS: f64 = 2.5;
 /// signal path is broken even if technically "active".
 const TONE_MIN_PEAK: i32 = 4000;
 
-/// Recorded per-(test, smp) baselines — gate A's thorough tier
-/// (specs/testing-strategy.md §5). Two independent instruments per config:
+/// Recorded per-(test, smp) baselines — gate A's thorough tier.
+/// Two independent instruments per config:
 /// the wav underrun histogram (`gaps`, keyed by gap length in device periods)
 /// and ceilings on soundd's own counters. The wav is a rare-event detector;
 /// the counters fire on nearly every run and carry the statistical power. Both
@@ -1893,9 +1893,8 @@ impl AudioRun {
 /// A switch and not a test of its own, because it changes no verdict: it makes
 /// the four audio configs measure a machine the host cannot otherwise present,
 /// and what it produces is an A/B against the same command without it in the
-/// same session. `specs/completion-architecture-spec.md` is what the numbers are
-/// for and
-/// which stage turns one of them into an assertion.
+/// same session. `issues/kernel/every-wait-in-this-kernel-is-a-spin.md` is what
+/// the numbers are for.
 static SLOW_USB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Boot a fresh QEMU with the given CPU count, run one in-guest audio test,
@@ -2248,8 +2247,7 @@ fn rate_verdict(
 }
 
 /// Thorough tier — N iterations of all four configs, gating on *rates* and
-/// *distributions* rather than on single outcomes. The nightly runs it
-/// (specs/testing-strategy.md §5).
+/// *distributions* rather than on single outcomes. The nightly runs it.
 ///
 /// Certifies, at N=30 and the measured clean-tree distributions:
 ///   * wake lateness has not shifted by 25% (detected 99.9% of the time) or
@@ -5423,8 +5421,8 @@ const SNAKE_TURNS: usize = 8;
 ///
 /// **The wiring is all this measures, and the wiring is the part nothing else
 /// can.** `src/soundfont.rs`'s host tests say the committed bank covers every
-/// instrument `assets/DOOM1.WAD` selects, and `specs/assessments/doom-music-soundfont.md`
-/// §4 says the subset renders bit-exact against the full bank through this same
+/// instrument `assets/DOOM1.WAD` selects, and the subset was measured to render
+/// bit-exact against the full bank through this same
 /// `mus2mid.c` and this same rustysynth. Neither can say the file got into an
 /// initrd, that doom opened it, or that what came out reached an audio device.
 /// Those three are what `b8b0749` broke for a cycle with the suite green.
@@ -6897,8 +6895,8 @@ fn run_machine_test(
     // temp dir, so a guest still running when the next one starts takes that
     // one's socket and it exits before its first line — which is what every
     // test after a group reported the first time a group outlived its members.
-    // (It is also what `specs/assessments/test-cost-audit.md` §3.3's parallel boots would
-    // have to fix first.)
+    // (It is also what parallel boots in this process would have to fix
+    // first.)
     if group_of(name) != held.as_ref().map(|up| up.group) {
         *held = None;
     }
@@ -8222,7 +8220,7 @@ fn run_machine_test(
             Ok(())
         }
         "fpu_isolation" => {
-            // `specs/user-machine-state.md` §10. Two boots that must answer
+            // Two boots that must answer
             // differently: the shipped kernel preserves the whole user machine
             // state across every transition out of Ring 3, and the kernel built
             // with `fpu-save-nothing` — the same bracket with the two FP
@@ -8411,7 +8409,7 @@ fn run_machine_test(
             // so a kernel task reads whatever user thread last ran on *that*
             // CPU left behind, and recovers or halts by accident of work
             // stealing. The row in `sched::kthread` is what replaces the
-            // accident with an answer. `specs/log-architecture-spec.md` §4.3.
+            // accident with an answer.
             let qemu = QemuInstance::boot_with_options(
                 test_config,
                 c_bins,
@@ -8531,8 +8529,7 @@ fn run_machine_test(
             // instruction after the `wrmsr` that armed it, forever. Eight boots
             // of the owner's T14 caught it twice by NMI, at
             // `arm_one_shot+0x8d` and at `timer_entry+0x0`, which are the two
-            // instruction boundaries of exactly that loop
-            // (`specs/assessments/metal-logs/2026-08-08-cpu0/`).
+            // instruction boundaries of exactly that loop.
             //
             // Its own boot because the failure is a CPU that never runs
             // anything again: on the shared boot it would be reported against
@@ -9728,9 +9725,8 @@ fn run_machine_test(
             // caught up by the last of them is a fact about how fast the machine
             // is. On a KVM runner it had not — the last two cycles' bindings were
             // still on their way out when the count was taken, and the test read
-            // six of eight as a driver that missed them (run `31246245541`,
-            // `specs/assessments/ci-plan-assessment-2026-08.md` §7.3). The
-            // assertion is the same one; what
+            // six of eight as a driver that missed them (run `31246245541`).
+            // The assertion is the same one; what
             // changed is that a console behind the guest costs wall clock instead
             // of a verdict.
             let bindings = |text: &str| text.matches("merges as source").count();
@@ -10345,7 +10341,7 @@ fn parse_xhci_binds(log: &str) -> Vec<XhciBind> {
 ///
 /// `OSXSAVE` is asserted *clear*: with it set the CPU would permit `XCR0` to
 /// name components `FXSAVE64` does not save, and this kernel saves user FP
-/// state with `FXSAVE64` (`specs/user-machine-state.md` §5).
+/// state with `FXSAVE64`.
 ///
 /// Both halves, because the kernel writes both registers whole: every bit named
 /// below must hold its named value, **and a bit named nowhere below may not be
@@ -10501,7 +10497,7 @@ fn control_regs_verdict() -> Result<(), String> {
         "NE",
     )?;
     // The bit that must be *absent*: with it set, XCR0 can name components
-    // FXSAVE64 does not save (`specs/user-machine-state.md` §5).
+    // FXSAVE64 does not save.
     refused("OSXSAVE set", &[(DECLARED.0, DECLARED.1 | (1 << 18)); 4], "OSXSAVE")?;
     // Two bits a machine could hold uniformly, each one line of kernel diff
     // away, and neither reachable by an actuator. `AM` is named clear above and
@@ -11445,7 +11441,7 @@ fn nightly_tier_is_announced() -> Result<(), String> {
         "not run — the nightly tier",
         "desktop_window_child, sshd_fail_closed",
         "`cargo test --test toyos-build -- --nightly` runs them",
-        "specs/assessments/test-cost-audit.md",
+        "src/tiers.rs",
         "2 held back for the nightly tier",
     ] {
         if !announced.contains(want) {
@@ -11741,7 +11737,7 @@ impl Tally {
             say(format!("    {}", self.relegated.join(", ")));
             say(
                 "    `cargo test --test toyos-build -- --nightly` runs them. \
-                 specs/assessments/test-cost-audit.md §7 says what each one guarded and why it is not \
+                 `src/tiers.rs`'s `RELEGATED` says what each one guarded and why it is not \
                  gated per pull request."
                     .to_string(),
             );
@@ -11854,14 +11850,14 @@ fn expected_failure_verdicts() -> Result<(), String> {
         ExpectedFailure {
             test: "fails_every_run",
             task: 4242,
-            spec: "specs/nowhere.md",
+            spec: "nowhere.md",
             says: &["the guest never answered", "the shell never answered again"],
             stale: Stale::OnAPass,
         },
         ExpectedFailure {
             test: "fails_sometimes",
             task: 4243,
-            spec: "specs/nowhere.md",
+            spec: "nowhere.md",
             says: &["the shell never answered again"],
             stale: Stale::OnThisDate("2999-01-01"),
         },
@@ -11955,14 +11951,14 @@ fn expected_failure_exit_status() -> Result<(), String> {
     static LISTED: &[ExpectedFailure] = &[ExpectedFailure {
         test: "a_test_pending_on_a_defect",
         task: 4242,
-        spec: "specs/nowhere.md §9",
+        spec: "nowhere.md §9",
         says: &["the shell never answered again"],
         stale: Stale::OnAPass,
     }];
     static EXPIRED: &[ExpectedFailure] = &[ExpectedFailure {
         test: "a_test_pending_on_a_defect",
         task: 4242,
-        spec: "specs/nowhere.md §9",
+        spec: "nowhere.md §9",
         says: &["the shell never answered again"],
         stale: Stale::OnThisDate("2020-02-29"),
     }];
@@ -11994,7 +11990,7 @@ fn expected_failure_exit_status() -> Result<(), String> {
             return Err(format!("the result line does not say {wanted:?}: {result}"));
         }
     }
-    if !text.contains("specs/nowhere.md §9") {
+    if !text.contains("nowhere.md §9") {
         return Err(format!("the report never points at where the defect is written up:\n{text}"));
     }
 
@@ -12280,14 +12276,14 @@ fn expected_failure_entries() -> Result<(), String> {
     static NAMED_NOTHING: &[ExpectedFailure] = &[ExpectedFailure {
         test: "a_test_that_was_renamed",
         task: 1,
-        spec: "specs/nowhere.md",
+        spec: "nowhere.md",
         says: &["something"],
         stale: Stale::OnAPass,
     }];
     static ABSORBS_EVERYTHING: &[ExpectedFailure] = &[ExpectedFailure {
         test: "a_real_test",
         task: 1,
-        spec: "specs/nowhere.md",
+        spec: "nowhere.md",
         says: &[],
         stale: Stale::OnAPass,
     }];
@@ -12298,14 +12294,14 @@ fn expected_failure_entries() -> Result<(), String> {
     static NEVER_EXPIRES: &[ExpectedFailure] = &[ExpectedFailure {
         test: "a_real_test",
         task: 1,
-        spec: "specs/nowhere.md",
+        spec: "nowhere.md",
         says: &["x"],
         stale: Stale::OnThisDate("next month"),
     }];
     static GOOD: &[ExpectedFailure] = &[ExpectedFailure {
         test: "a_real_test",
         task: 1,
-        spec: "specs/nowhere.md",
+        spec: "nowhere.md",
         says: &["x"],
         stale: Stale::OnThisDate("2026-09-06"),
     }];
@@ -12365,7 +12361,7 @@ fn expected_failure_entries() -> Result<(), String> {
 /// kernel, and one the suite has no other way to notice.
 ///
 /// **A green retry does not turn the run green.** A rerun-only pass counting as
-/// a pass is `specs/assessments/test-cost-audit.md` §3.7 by the back door; the failure line
+/// a pass is selective test running by the back door; the failure line
 /// says which of the two it was and the run stays red until somebody fixes the
 /// classification. That is the whole safety argument for widening the parallel
 /// phase: getting a scheduling answer wrong costs a red run, never a quiet one.
@@ -12567,8 +12563,7 @@ fn durations_path() -> std::path::PathBuf {
 /// A machine with no measurement at all prices every test the same, and
 /// [`Shard::keep`]'s LPT then degenerates to round-robin — which is what put 191
 /// of 268 tests on one CI shard and cut it off at its job timeout while another
-/// finished in sixteen minutes (`specs/assessments/ci-plan-assessment-2026-08.md`
-/// §7.2). Every runner is that
+/// finished in sixteen minutes. Every runner is that
 /// machine on every push, because a fresh clone has no `target/`.
 ///
 /// Measured on a runner rather than here, deliberately: it is read by the
@@ -13407,7 +13402,7 @@ fn main() {
             "[toyos] nightly tier: {} test(s) NOT run, {:.1} s of effective CI test time. \
              `cargo test --test toyos-build -- --nightly` runs them manually; \
              .github/workflows/ci.yml runs them every night at 03:00 UTC. \
-             specs/assessments/test-cost-audit.md §7 says what each one guards.",
+             `src/tiers.rs`'s `RELEGATED` says what each one guards.",
             held_back.len(),
             ms as f64 / 1000.0,
         );
@@ -13454,9 +13449,8 @@ fn main() {
     // putting its feature-carrying ones last still holds inside each phase.
     //
     // No longest-first heuristic, deliberately: the phase's wall clock is set by
-    // its longest job and the durations that would order it are not in the tree
-    // — see `specs/assessments/test-cost-audit.md` §5.3, which measures the deficit and says
-    // what it would take to close it.
+    // its longest job and the durations that would order it are not in the
+    // tree.
     if !tests_to_run.is_empty() {
         let actuator_count =
             tests_to_run.iter().filter(|t| ACTUATOR_TESTS.contains(&t.name.as_str())).count();
@@ -13651,9 +13645,9 @@ fn main() {
     // A run with both real failures and invalidated tests exits 1: a red that
     // survives is still a red, and re-running the suspended ones does not make
     // it green.
-    // What this run cost cargo, and the number `specs/assessments/test-cost-audit.md` §5.9.7
-    // is about: a kernel build is ~6.9 s of wall clock and ~29.6 s of CPU after
-    // any edit under `kernel/`, and a full run used to make 45 of them.
+    // What this run cost cargo: a kernel build is ~6.9 s of wall clock and
+    // ~29.6 s of CPU after any edit under `kernel/`, and a full run used to
+    // make 45 of them.
     let (boots, feature_boots, kernels) = qemu::boot_census();
     eprintln!(
         "  --- {boots} guests, {feature_boots} of them not the shipping kernel, {} kernel \

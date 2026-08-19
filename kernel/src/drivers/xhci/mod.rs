@@ -384,7 +384,7 @@ fn port_answers() -> bool {
 /// does not reach the USB transport's completion at all. A USB flash stick's
 /// 4 KiB write, on the other hand, is tens of milliseconds — the erase block is
 /// the reason and every stick has one — and that is the whole of what the
-/// T14's audio pops are made of (`specs/known-issues.md` §4).
+/// T14's audio pops are made of (`issues/audio/disk-wait-pins-a-cpu.md`).
 ///
 /// What is replaced is *when the controller publishes the event*, not the
 /// event. The TRB really ran, the completion code is the controller's own and

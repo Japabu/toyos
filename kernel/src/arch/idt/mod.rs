@@ -331,7 +331,7 @@ extern "sysv64" fn stub_halt_all() {
 /// fault taken from Ring 3 can return through another task — and until this
 /// bracket existed it did so carrying whatever that task left in the registers.
 /// A demand-paging fault corrupting XMM produces a wrong number rather than a
-/// signal, which is why nothing had noticed (`specs/user-machine-state.md` §3).
+/// signal, which is why nothing had noticed.
 ///
 /// `rdi` is taken before the bracket because the bracket moves `rsp`: the frame
 /// [`trap_dispatch`] is handed is the one the pushes above built, and the CS

@@ -7,7 +7,6 @@
 //! transmute of an atomic into a value nobody synchronises on, and gives a
 //! userland reader a field named `commit` that commits nothing.
 //!
-//! `specs/log-architecture-spec.md` §2.1 is the derivation and §3.2 the surface.
 //! Nothing here dispatches: the kernel's implementation of [`SYS_LOG_READ`]
 //! arrives with the record ring it reads, and until then the number falls to the
 //! syscall dispatch's default and answers `InvalidArgument`, which is what an
@@ -18,15 +17,15 @@
 /// Message bytes a record carries.
 ///
 /// **Sized to the next power-of-two record that holds the measured maximum
-/// line.** `specs/assessments/metal-logs/` measured 12,497 committed T14
-/// boot-log lines, message length after the `[kernel … ] ` prefix: min 14,
-/// p50 59, p90 111, p99 154, p999 857, max 863. The record's other fields are
-/// 32 bytes fixed, so [`RECORD_BYTES`] — a power of two by its own derivation
-/// — is 32 plus this constant; 1024 is the smallest power of two past 32 +
-/// 863, which makes this 992, covering the measured maximum with headroom at
-/// zero alignment padding. The unbounded case — a demangled backtrace symbol
-/// — is not solved by any fixed bound and is handled separately by
-/// head-and-tail elision at the producer (log architecture L2).
+/// line.** Across 12,497 committed T14 boot-log lines, message length after the
+/// `[kernel … ] ` prefix measured: min 14, p50 59, p90 111, p99 154, p999 857,
+/// max 863. The record's other fields are 32 bytes fixed, so [`RECORD_BYTES`] —
+/// a power of two by its own derivation — is 32 plus this constant; 1024 is the
+/// smallest power of two past 32 + 863, which makes this 992, covering the
+/// measured maximum with headroom at zero alignment padding. The unbounded case
+/// — a demangled backtrace symbol — is not solved by any fixed bound and is
+/// handled separately by head-and-tail elision at the producer
+/// (`kernel/src/log/elide.rs`).
 pub const MAX_RECORD_MESSAGE: usize = 992;
 
 /// One record on the wire, and one slot in a shard. A power of two so a reader

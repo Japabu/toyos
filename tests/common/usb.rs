@@ -1,7 +1,7 @@
 //! The USB mass-storage gate.
 //!
-//! Ground truth is the backing file on the *host*, per
-//! `specs/device-test-strategy.md`: the harness writes bytes into the image
+//! Ground truth is the backing file on the *host*: the harness writes bytes
+//! into the image
 //! before the boot and the guest has to find them, and the guest writes bytes
 //! the harness finds afterwards. Neither half of the driver certifies the
 //! other, which a read-back-what-you-wrote test would have let it do.
@@ -941,8 +941,8 @@ fn optional_flush_keeps_the_log(
 /// **Re-pointed at `/bin/logd` at L6, and the policy it observes changed shape
 /// with the writer.** The kernel sink disabled itself on the *first* error,
 /// because the alternative from an idle loop was an error every pass. logd's
-/// give-up is a *duration* — `LOG_WRITE_BUDGET`, five seconds
-/// (`specs/log-architecture-spec.md` §5.4) — because a userland writer can
+/// give-up is a *duration* — `LOG_WRITE_BUDGET`, five seconds — because a
+/// userland writer can
 /// afford to tell a stick that is busy apart from one that is gone, and a
 /// device that answers slowly under load is not a device to abandon.
 ///
@@ -1274,10 +1274,10 @@ pub fn xhci_slow_connect(
     verify(&image, bytes, nonce)?;
     // The guest's own boot stamp, printed rather than asserted on.
     //
-    // **This is `specs/log-architecture-spec.md` §1.4's and §9.6's named
-    // instrument, and until 2026-08-15 it could not be read off the test that
-    // *is* it.** Both sections ask for an interleaved A/B of a producer-path
-    // cost against this boot's `Boot: complete`, and the stamp reached only the
+    // **This is the named instrument for the log producer path's cost, and
+    // until 2026-08-15 it could not be read off the test that
+    // *is* it.** The obligation is an interleaved A/B of that cost against this
+    // boot's `Boot: complete`, and the stamp reached only the
     // per-run UART file, which goes when the guest does. So the measurement had
     // to instrument something — and the lesson
     // `issues/hardware/one-rmw-per-log-line-cost-350ms.md` leaves is that

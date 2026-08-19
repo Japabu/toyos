@@ -32,8 +32,6 @@
 //!
 //! removes both fences from `shard.rs` and this file must red. A model that has
 //! never failed proves nothing.
-//!
-//! `specs/log-architecture-spec.md` §2.5's W3 and §2.6a.
 
 #![cfg(feature = "loom")]
 

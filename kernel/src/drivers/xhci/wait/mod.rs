@@ -26,9 +26,10 @@
 //! - [`msc::bind`] — **the one door**, and the only blocking thing a scheduler
 //!   pass can still reach. A disk plugged in after boot has to be brought up by
 //!   somebody, its bring-up is Bulk-Only Transport, and that is a machine of
-//!   its own that `specs/plans/xhci-port-machine-plan.md` X2c gives one to. Until
-//!   then the claim above holds of everything except a disk arriving after
-//!   boot.
+//!   its own that has not been written yet
+//!   (`issues/hardware/the-bot-scsi-machine-is-still-hand-written-in-the-kernel.md`).
+//!   Until then the claim above holds of everything except a disk arriving
+//!   after boot.
 
 pub mod boot;
 pub mod msc;
@@ -39,8 +40,9 @@ pub mod msc;
 /// A measurement and not an actuator: nothing here changes what the driver
 /// does. It exists because the depth cannot be read off the call graph — the
 /// backtrace it prints beside it is what says which locks those are, and one of
-/// them is named nowhere in the chain of function names. Every stage of
-/// `specs/completion-architecture-spec.md` is judged on this number falling.
+/// them is named nowhere in the chain of function names. The work in
+/// `issues/kernel/every-wait-in-this-kernel-is-a-spin.md` is judged on this
+/// number falling.
 ///
 /// Deepest-so-far rather than every wait, because a line per transfer on a
 /// machine whose log lives on the transfer's own device is the self-sustaining

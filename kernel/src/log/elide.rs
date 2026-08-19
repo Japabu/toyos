@@ -14,8 +14,9 @@
 //! This file names nothing outside itself, which is what lets `kernel-elide`
 //! compile it and run the tests below on the host — where a seam falling inside
 //! a four-byte character costs milliseconds to check and no guest at all.
-//!
-//! `specs/log-architecture-spec.md` §2.1.
+//! **That is the property this file has to keep to stay testable**: a
+//! dependency added here is the file leaving the host, and the tests go with
+//! it.
 
 use core::fmt::{self, Display, Write};
 

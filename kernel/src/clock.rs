@@ -90,9 +90,9 @@ pub fn calibrated() -> bool {
 /// every panel with them. Losing a CPU's lines is recoverable; being lied to
 /// about which line is newest is not.
 ///
-/// It stays an assumption that this does not happen: §2.1 of
-/// `specs/log-architecture-spec.md` rests cross-CPU ordering on an invariant,
-/// firmware-synchronised TSC, and
+/// It stays an assumption that this does not happen: the log's cross-CPU record
+/// ordering rests on the TSC being invariant and firmware-synchronised, which it
+/// is on the 2020+ x86-64 machines this kernel targets, and
 /// `issues/kernel/ap-tsc-trail-is-assumed-and-never-checked.md` is the
 /// entry for the fact that nothing measures it.
 pub fn nanos_since_boot() -> u64 {

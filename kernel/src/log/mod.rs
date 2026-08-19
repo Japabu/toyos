@@ -4,8 +4,6 @@
 //! `fmt::Arguments` and nothing else. **There is no byte-oriented entry point**,
 //! and that is what makes "half a record" untypeable: the smallest thing this
 //! module accepts is a whole one.
-//!
-//! `specs/log-architecture-spec.md` §2.
 
 pub mod console;
 pub mod elide;
@@ -282,7 +280,6 @@ pub fn emit(level: Level, args: core::fmt::Arguments) {
         // inside `sync.rs`, inside IRQ handlers, inside the scheduler and
         // inside every syscall's locked region — which is why the post is
         // `wake_direct` and not an ordinary queue wake.
-        // `specs/log-architecture-spec.md` §2.6a.
         console::Drain::Thread => {
             if shard::signal_after_commit(shard::log_waiter()) {
                 console::post_wake();

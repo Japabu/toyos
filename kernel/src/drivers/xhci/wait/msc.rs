@@ -993,8 +993,9 @@ pub(in crate::drivers::xhci) fn prepare(
 ///
 /// **The last blocking path a scheduler pass can reach**, and the one door in
 /// the split X2b builds: everything below is Bulk-Only Transport, which is a
-/// machine of its own and `specs/plans/xhci-port-machine-plan.md` X2c is where it
-/// gets one. A hot-plugged disk has to be brought up by *some*body and there is
+/// machine of its own and does not have one yet
+/// (`issues/hardware/the-bot-scsi-machine-is-still-hand-written-in-the-kernel.md`).
+/// A hot-plugged disk has to be brought up by *some*body and there is
 /// no other context that may block, so until then this runs where it always
 /// did.
 ///

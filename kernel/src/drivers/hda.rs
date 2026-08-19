@@ -1,7 +1,6 @@
 //! The Intel HDA stub: bring-up, one output stream, and the allow-list.
 //!
-//! `specs/plans/hda-driver-plan.md` §4.1 is the design and §4.1.6 is the shape this
-//! file implements. **The line is who touches a register.** The kernel resets
+//! **The line is who touches a register.** The kernel resets
 //! the controller, allocates the PCM ring and the buffer descriptor list,
 //! programs every register whose value is an address or indexes one of those
 //! structures, acknowledges the interrupt and derives the completion mask from
@@ -12,7 +11,7 @@
 //! refused by name.
 //!
 //! Nothing here decides. The moment this file has to know which codec or which
-//! pin, the line has moved and §4.1.5's last bullet has fired.
+//! pin, the line has moved and this stub has become a driver.
 //!
 //! Register offsets, bit positions and the descriptor layout come from the
 //! Intel High Definition Audio specification.

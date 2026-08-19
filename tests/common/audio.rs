@@ -246,8 +246,8 @@ pub const TONE_HZ: f64 = 440.0;
 
 /// Where the captured tone stops being one sine.
 ///
-/// `specs/plans/hda-driver-plan.md` §5.3 item 5 and risk 7: **a cyclic DMA engine
-/// replays a period nobody refilled**, and a repeat is audible harm that
+/// The harm this exists for: **a cyclic DMA engine replays a period nobody
+/// refilled**, and a repeat is audible harm that
 /// [`analyze`]'s gap detector cannot see — the samples are not silent and the
 /// seam is not a large enough single-sample jump to be a click. The
 /// zero-on-complete rule is what stops a repeat happening, and it is a design
@@ -342,7 +342,7 @@ pub fn wrong_pitch(wav: &Wav) -> Option<String> {
 /// Underrun histogram keyed by gap length in device periods (rounded,
 /// min 1): `gaps[n]` = number of mid-signal silent runs of ~n×2.902ms. This is
 /// the unit gate A's thorough tier compares against the recorded sample in
-/// `tests/audio-baseline.toml` (specs/testing-strategy.md §5).
+/// `tests/audio-baseline.toml`.
 pub fn gap_histogram(analysis: &Analysis, sample_rate: u32) -> BTreeMap<u32, u32> {
     let mut gaps = BTreeMap::new();
     for run in &analysis.underruns {

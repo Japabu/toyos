@@ -291,7 +291,7 @@ fn placement() -> CpuId {
 /// `alloc_kernel_stack` built.
 ///
 /// **`address_space: None` is a kernel thread and not an error.** It was one
-/// until L3 of `specs/log-architecture-spec.md`: `spawn` expected the `Option`
+/// until this kernel grew its first kernel thread: `spawn` expected the `Option`
 /// and the field has always been one, so the whole of "the scheduler cannot
 /// host a kernel task" was a single `.expect` in the line below.
 pub struct NewTask {

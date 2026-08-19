@@ -1,9 +1,9 @@
 //! Kernel threads: a task with no address space of its own, and the one place
 //! that says what a panic inside one means.
 //!
-//! `specs/log-architecture-spec.md` §4.3 is the design. L3 builds it for one
-//! thread, `klogd`; the completion branch's C6 spawns `usbd` and `iod` on it
-//! and adds their two rows to [`ROWS`].
+//! Built for one thread, `klogd`, which is the kernel's console drainer; the
+//! `usbd` and `iod` threads the completion work owes are spawned on the same
+//! machinery and add their two rows to [`ROWS`].
 //!
 //! **A kernel thread is not a special kind of task.** It is an ordinary task
 //! whose `NewTask::address_space` is `None` — `driver::spawn` then names the

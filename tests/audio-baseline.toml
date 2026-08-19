@@ -1,6 +1,4 @@
 # Audio gate (gate A) baselines — one section per (test, smp) config.
-# specs/testing-strategy.md §5, specs/audio-subsystem-spec.md §5.4/§5.9,
-# specs/assessments/audio-glitch-distribution-2026-07-28.md.
 #
 # Every config must appear here. A missing section is a hard error, not a
 # pass: an ungated config would go green by omission.
@@ -25,8 +23,8 @@
 #                     named no wake time — the idle path, and the one wake
 #                     after a drain before the DLL re-locks — contribute
 #                     nothing: nothing was due, so nothing can be late.
-#   drains            Cycles that found the entire DMA pipeline free (§5.9)
-#                     *and* could only have got there by soundd being late.
+#   drains            Cycles that found the entire DMA pipeline free *and*
+#                     could only have got there by soundd being late.
 #                     The idle path empties the pipeline by design, and a
 #                     device that retires faster than it plays empties it
 #                     without anything having been due; neither counts. See
@@ -35,9 +33,8 @@
 #
 # RE-RECORDED 2026-08-15 on tree 4c7d809, justified by an instrument change:
 # the dev host's QEMU moved 11.0.3 -> 11.1.0 (owner-approved upgrade; CI's
-# runner had already moved and `.github/qemu-version` declares 11.1.0), and
-# `specs/assessments/ci-plan-assessment-2026-08.md` §7.3 is the measurement
-# that the QEMU version decides verdicts — so every comparison of a fresh
+# runner had already moved and `.github/qemu-version` declares 11.1.0), and the
+# QEMU version was measured to decide verdicts — so every comparison of a fresh
 # 11.1.0 arm against the 11.0.3 sample was cross-instrument and void. The
 # prior sample (2026-07-31, 17a6c88 — see git log for its full narrative,
 # including the CQE fan-out A/B that justified it) described the old
@@ -143,7 +140,7 @@
 # streaming phase: soundd zeroes them when the first client arrives and
 # flushes them when the last one leaves, so no number here is diluted by the
 # idle path (which since the suspend-on-idle series is a stopped device and a
-# parked soundd — no wakes at all; audio spec §5.8).
+# parked soundd — no wakes at all).
 #
 # THE PHYSICAL SCALE. The DMA pipeline holds TX_INFLIGHT_MAX = 8 buffers of
 # 128 frames at 44.1kHz = 23.219ms. That is soundd's entire timing budget:
@@ -239,7 +236,7 @@
 #   What it CANNOT certify: any statement about a rate. One run is one sample.
 #
 # THOROUGH TIER — `cargo test --test toyos-build -- --audio-gate 30`, ~17 minutes.
-#   What the nightly runs (specs/testing-strategy.md §5).
+#   What the nightly runs.
 #   N iterations of all four configs; every per-run outcome becomes a rate or a
 #   distribution, and the fresh sample is compared against the RECORDED SAMPLE
 #   below — Mann-Whitney for the counters, Fisher exact for the yes/no
@@ -404,7 +401,7 @@ drains = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 [audio_tone_load.smp1]
 # wake_lat median 5765us, max 7064us (0.30 pl); drains 0; underruns 0.
 # Dropouts: 0 of 30. No run's worst wake reached a pipeline depth.
-# The spec's first-class case (§5.10: glitch-free on one CPU under load)
+# The first-class case — glitch-free on one CPU under load —
 # stays the flattest config, and 11.1.0 made it faster: lateness spans
 # 5271-7064us, a 1.34x ratio. The 186000 ceiling is now ~26.3x the observed
 # maximum and is left deliberately loose: it is the catastrophe detector, and
