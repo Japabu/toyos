@@ -10,6 +10,23 @@
 //! Two producers, so the edge-coalescing rule of §7.3 (a normal wake to a
 //! busy CPU costs zero IPIs; a sleeping CPU always gets one) is exercised
 //! rather than assumed.
+//!
+//! The edge the property rests on is `ring`'s read of the doorbell's bits: it
+//! is what lets a producer see a target's freshly published SLEEPING before
+//! deciding to elide the IPI. On x86 every read-modify-write is a full fence,
+//! so a build with it relaxed behaves identically to this one and no guest
+//! test can fail here. The negative case is a cargo feature rather than a
+//! comment:
+//!
+//! ```text
+//! cargo test -p toyos-sched-loom --features doorbell-kick-relaxed \
+//!   --test loom_sleep
+//! ```
+//!
+//! makes that read relaxed and this file must red, at
+//! [`a_halted_cpu_with_queued_work_was_kicked`] — *halted with 2 of 2 messages
+//! queued and no IPI in flight — a sleep-through (spec §7.5)*, stated exactly.
+//! Verified 2026-08-17, both ways round.
 
 use loom::sync::atomic::{AtomicUsize, Ordering};
 use loom::sync::Arc;
