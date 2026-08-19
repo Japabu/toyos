@@ -108,6 +108,24 @@ pub fn is_member(root: &Path, crate_dir: &Path) -> bool {
 /// Everything else this is asked about — `kernel/`, `bootloader/`, `userland/`,
 /// the guest crates under `tests/` — is excluded from the workspace and keeps
 /// its own.
+///
+/// **One target directory per checkout, and never one across them.** Cargo's
+/// freshness for a path package is mtime rather than content, and `-C metadata`
+/// carries no checkout path, so two worktrees aimed at one directory contend for
+/// one artifact under one name: the tree whose sources are merely *older* is
+/// declared fresh, compiles nothing, and links the other branch's code, with no
+/// diagnostic anywhere. Measured — and `toyos-ld` is a member here, so what it
+/// would swap is the linker every guest binary is built with.
+///
+/// **`-Z checksum-freshness` fixes that and still cannot be relied on here**, so
+/// the rule above is about enablement and not about the feature: the flag is
+/// honoured by a nightly-capable cargo and *silently ignored* by any other, and
+/// nothing a `.cargo/config.toml` can say travels with the shared `target-dir`
+/// it would also carry. This host's rustup default is stable, and
+/// `src/toolchain.rs`'s `host_cargo` lends the `toyos` toolchain whatever cargo
+/// the machine has — stable's, on every CI runner. Sharing on with
+/// freshness off is the mis-link above, so this function joins one path and
+/// stays out of it.
 pub fn target_dir(root: &Path, crate_dir: &Path) -> PathBuf {
     if is_member(root, crate_dir) {
         root.join("target")
