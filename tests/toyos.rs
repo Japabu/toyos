@@ -8308,14 +8308,18 @@ fn run_machine_test(
             // compiles and counts, not what a real pass on real silicon costs.
             // Only a booted kernel reads a TSC.
             //
-            // **And the cost half is gated here rather than in the kernel.**
-            // What a pass measures is wall clock across the pass, and a guest's
-            // wall clock runs while the host has taken its vCPU away — so the
-            // quantity includes a term the host's scheduler sets. The check
-            // build publishes the distribution and `common::passcost` judges it;
-            // `passcost`'s own two-directions self-check runs first, because a
-            // gate that must stay green under host descheduling has to be shown
-            // doing so on a case no booted machine can stage.
+            // **And the cost half is gated here rather than in the kernel, and
+            // against a recorded sample rather than against the budget.** What
+            // a pass measures is wall clock across the pass, and a guest's wall
+            // clock runs while the host has taken its vCPU away — so the
+            // quantity includes a term the host's scheduler sets. Measured
+            // 2026-08-18, that term moves *every* order statistic and not only
+            // the tail, so `common::passcost` judges each accelerator against
+            // what that accelerator has been recorded producing, and takes no
+            // verdict at all where the recorded sample supports none. Its own
+            // two-directions self-check runs first, because a gate that must
+            // stay green under host descheduling has to be shown doing so on a
+            // case no booted machine can stage.
             //
             // **The workload is `sched_stress`** because the asserts are dense
             // on exactly what it does: it spawns burners that drive vruntime,
@@ -8384,11 +8388,17 @@ fn run_machine_test(
                     capture.text(),
                 ));
             }
+            // Which recorded sample this run is judged against, before the
+            // numbers it judges: a verdict taken against a sample is
+            // unreadable without naming the sample, and a run that judged
+            // nothing has to say so where a reader cannot miss it.
+            let baseline = common::passcost::baseline();
+            eprintln!("  [sched-check] {}", common::passcost::judgement_line(baseline));
             for report in &reports {
                 eprintln!("  [sched-check] {}", common::passcost::describe(report));
             }
             for report in &reports {
-                common::passcost::verdict(report)?;
+                common::passcost::verdict(report, baseline)?;
             }
             Ok(())
         }
