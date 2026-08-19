@@ -1712,6 +1712,58 @@ pub const KNOWN_RED: &[Red] = &[
         measured: "2026-08-17",
     },
     // ---------------------------------------------------------------------
+    // PR #128 run 32249152467, job `guest (2)`, 2026-08-19. Shard 2/12 at
+    // `--jobs 1 --host-slots 0` — the log reads `--- parallel, 1 wide ---`, so
+    // one guest on the machine and no contention to appeal to. **Two i8042
+    // names in one shard, in one phase, and a first sighting for both**:
+    // `--known-red` answered `NOT ON THE LIST` for each. New names, so they get
+    // rows of their own rather than joining the family's existing ones — the
+    // undecoded-bytes rows are a different producer and merging would make
+    // three failures read as one. Each was re-run as its group and passed
+    // twice, and the run is red on the rate.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "i8042_keyboard",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`no event for HID usage 0x29 in [KeyLine { usage: 11, modifiers: 0, translated: \
+               \"h\" }, …]` — twenty `KeyLine`s carrying the rest of the scripted sequence and \
+               translating it: `h e l l o`, shift-`B` (`usage: 5`, `modifiers: 1`, `\"B\"`), then \
+               `usage: 80` → `\\u{1b}[D` and `usage: 77` → `\\u{1b}[F`. Escape is `0x29` and is \
+               nowhere. **One structural oddity, recorded and not read as a cause**: the second \
+               `usage: 225` press/release pair encloses no key event, where the first encloses \
+               the `B`. `ALONE: GREEN, and it was alone both times — a rate and not a \
+               classification`",
+        evidence: "PR #128 run 32249152467, job `guest (2)`, shard 2/12 at `--jobs 1`; re-run as \
+                   its group twice in the same job, `PASS (5s)` and `PASS (6s)`. In the same \
+                   phase `i8042_mouse` passed with `0 keys, 0 undecoded` in its tally where both \
+                   re-run boots reported `28 keys, 12 undecoded` — three separate boots, so an \
+                   accompanying observation and not a shared-guest claim",
+        source: "specs/issues/kernel/two-i8042-verdicts-red-together-on-one-ci-shard.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "i8042_no_spurious_wake",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`no drain produced zero events — the stimulus never landed` — **and the capture it \
+               prints contradicts its second clause**: the kernel names all six bytes of the \
+               test's own Pause, `no event from [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5]`, so the \
+               stimulus landed. What is missing is a drain carrying *only* it — the drain that \
+               took it reports `bytes=8 keys=2` and the next `bytes=12 keys=4`, so neither has \
+               zero events. Alone the same test reports `2 zero-event drains, none woke; 3 real \
+               ones, all did`. Whether a real key byte sharing that drain is the instrument's \
+               fault or the batching's is **not** decided here. `ALONE: GREEN, and it was alone \
+               both times — a rate and not a classification`",
+        evidence: "PR #128 run 32249152467, job `guest (2)`, the same shard and phase as this \
+                   run's `i8042_keyboard` row; re-run as its group twice in the same job, \
+                   `PASS (227ms)` and `PASS (222ms)`",
+        source: "specs/issues/kernel/two-i8042-verdicts-red-together-on-one-ci-shard.md",
+        measured: "2026-08-19",
+    },
+    // ---------------------------------------------------------------------
     // `wt/toyos-purecrates`, dev host, 2026-08-18: three full `cargo test` runs
     // in one session, on a branch whose whole delta is three kernel files
     // moving into two pure crates with no line of their logic changed — every
