@@ -30,7 +30,8 @@
 //! **What this does not bound is the address.** A BAR that says memory names a
 //! physical address the kernel then maps, and every non-zero value is a
 //! possible one. Bounding what a device may be *pointed at* is the IOMMU's
-//! question (`specs/iommu-spec.md`), not this decoder's.
+//! question (`issues/kernel/the-iommu-stops-at-translation.md`), not this
+//! decoder's.
 
 use core::fmt;
 

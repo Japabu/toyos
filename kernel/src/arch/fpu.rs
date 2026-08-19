@@ -1,8 +1,11 @@
 //! The user machine state: what a transition out of Ring 3 has to preserve.
 //!
-//! `specs/user-machine-state.md` is the invariant and the reasoning. This file
-//! owns the x86-64 half of it — eventually `arch/x86_64/fpu.rs`, once the
-//! architecture split this tree owes actually happens.
+//! **The invariant**: a transition out of Ring 3 that can reach another task
+//! saves and restores the whole of it, and a task that has never run in Ring 3
+//! starts from a *declared* state rather than from whatever the hardware's init
+//! instruction leaves. This file owns the x86-64 half of that — eventually
+//! `arch/x86_64/fpu.rs`, once the architecture split this tree owes actually
+//! happens.
 
 use crate::log;
 

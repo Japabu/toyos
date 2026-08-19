@@ -383,9 +383,10 @@ impl Virtqueue {
     ///
     /// The half of [`submit`](Self::submit) that names memory, separated so a
     /// queue whose chains are fixed at bind can have them built once by the
-    /// kernel and published by somebody who never sees a descriptor
-    /// (`specs/plans/hda-driver-plan.md` §4.1). Chains built this way are addressed by
-    /// index rather than by a [`DescSlot`], because the proof a slot carries —
+    /// kernel and published by somebody who never sees a descriptor — the line
+    /// that keeps a device address out of a driver's hands. Chains built this
+    /// way are addressed by index rather than by a [`DescSlot`], because the
+    /// proof a slot carries —
     /// that this descriptor is not in flight — is the publisher's to hold and
     /// the publisher is not here.
     pub fn write_chain(&mut self, first_desc: u16, bufs: &[(u64, u32, BufDir)]) {
@@ -628,7 +629,8 @@ impl Virtqueue {
 /// backend that makes one report a head descriptor it was never given or a
 /// length past the buffer it was posted. So without this the refusals below
 /// would ship never having executed, which is what
-/// `specs/device-test-strategy.md` asks a driver-side bound to answer for.
+/// `issues/hardware/device-shape-and-lifecycle-have-no-coverage.md` asks a
+/// driver-side bound to answer for.
 ///
 /// Nothing is simulated: the queue is a real [`Virtqueue`] over a real DMA
 /// page, the elements are written into its used ring the way a device writes

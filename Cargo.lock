@@ -553,20 +553,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "kernel-elide"
-version = "0.1.0"
-
-[[package]]
 name = "kernel-loom"
 version = "0.1.0"
 dependencies = [
  "loom",
  "toyos-abi",
 ]
-
-[[package]]
-name = "kernel-span"
-version = "0.1.0"
 
 [[package]]
 name = "lazy_static"
@@ -1066,6 +1058,10 @@ name = "toyos-elf"
 version = "0.1.0"
 
 [[package]]
+name = "toyos-elide"
+version = "0.1.0"
+
+[[package]]
 name = "toyos-fat32"
 version = "0.1.0"
 dependencies = [
@@ -1135,6 +1131,10 @@ dependencies = [
 
 [[package]]
 name = "toyos-untrusted"
+version = "0.1.0"
+
+[[package]]
+name = "toyos-userbound"
 version = "0.1.0"
 
 [[package]]

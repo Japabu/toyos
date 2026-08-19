@@ -51,9 +51,10 @@ mod cr4 {
 /// - `EM` (2) clear and `MP` (1) set — the pair that says an x87 instruction
 ///   executes on the FPU rather than raising `#NM` (SDM Vol. 3A §2.5), and that
 ///   `WAIT` respects `TS`.
-/// - `TS` (3) clear — lazy FP switching is ruled out
-///   (`specs/user-machine-state.md` §6.3), so nothing ever sets it and `#NM`
-///   keeps its meaning of "a userland bug".
+/// - `TS` (3) clear — lazy FP switching is ruled out, because deferring the
+///   restore behind `#NM` leaks the previous task's register file across the
+///   deferral boundary. Nothing ever sets it and `#NM` keeps its meaning of
+///   "a userland bug".
 /// - `AM` (18) clear — with it set, `RFLAGS.AC` would make an unaligned Ring 3
 ///   access `#AC`. Nothing in this kernel is ready to be the thing that decides
 ///   a process wanted that.
@@ -284,7 +285,7 @@ fn opt(value: u64, bit: u64, name: &'static str) -> &'static str {
 /// **The dev host cannot answer this and no test asserts on it.** QEMU's TCG
 /// models no cache, so `CR0.CD` there is a bit with no timing consequence, and
 /// a KVM guest does not hold the bit at all — an AP that never cleared `CD`
-/// reads it clear (`specs/issues/kernel/ap-control-registers-inherit-init.md`).
+/// reads it clear (`issues/kernel/ap-control-registers-inherit-init.md`).
 /// The number is bare metal's, not a VM on
 /// it, and the owner takes it with
 /// `--diag-boot --kernel-param control-regs-bench`, off the panel.

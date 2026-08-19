@@ -312,8 +312,8 @@ pub fn init_timer_ap() {}
 /// Ring 0 stub reloads whatever was last armed with no Rust in the path, so a
 /// count too small to outlast the interrupt it schedules is not one late tick
 /// but a livelock nothing recomputes its way out of. Ring 3 can ask for one — a
-/// deadline already past when the pass arms it — and did (`#156`,
-/// `specs/assessments/metal-logs/2026-08-08-cpu0/`).
+/// deadline already past when the pass arms it — and did (`#156`, observed on
+/// the owner's T14).
 ///
 /// Policy, not physics, and it sits between two bounds. Below: an interrupt
 /// entry and `iretq`, which is what the interval has to be worth more than for

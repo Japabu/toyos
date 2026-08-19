@@ -17,7 +17,7 @@ loom = []
 # `kernel-loom/tests/log_wake.rs` must red when it does. A model that has never
 # failed proves nothing, and no guest test can stand in for it — on x86 a build
 # with either fence removed behaves identically, which is the whole reason the
-# obligation is a model. `specs/log-architecture-spec.md` §2.5's W3.
+# obligation is a model.
 wake-fence-off = []
 # **Every actuator, and which one is armed comes from the boot parameter.**
 # `kernel/src/actuator.rs` declares all 47 with the claim each rests on; this
@@ -27,8 +27,7 @@ wake-fence-off = []
 #
 # Until 2026-08-10 each of these was a cargo feature and therefore a kernel
 # build: 45 in a full `cargo test`, ~6.9 s of wall clock and ~29.6 s of CPU
-# each after any kernel edit. `specs/assessments/test-cost-audit.md` §3.6 is the trade and
-# §5.9.5 the design.
+# each after any kernel edit.
 boot-actuators = []
 # **`SYS_DEBUG` and every actuator reachable through it, and nothing a boot
 # runs.** A kernel carrying this boots, schedules, drives its devices and panics
@@ -74,7 +73,8 @@ sched-check = ["toyos-sched/check"]
 # Take the FP body out of `arch::entry`'s bracket and the declared state out of
 # the loader's trampolines, leaving a kernel that preserves the *rest* of the
 # user machine state and nothing else — which is the kernel this tree had before
-# `specs/user-machine-state.md`.
+# every Ring 3 transition that can reach another task saved and restored the
+# full x87/SSE state.
 #
 # The negative control for `fpu_isolation`, and the only way to have one: the
 # defect it stages is a CPU register file surviving a task switch, and QEMU has
@@ -85,17 +85,17 @@ sched-check = ["toyos-sched/check"]
 # is the `fxsave64`, the `fxrstor64` and the trampoline's load. A feature that
 # flipped an assertion would make its own gate vacuous.
 #
-# **The one actuator that kept its own kernel build, and `specs/assessments/test-cost-audit.md`
-# §5.9.7 says why**: these are `naked_asm!` bodies on every ring transition, so a
+# **The one actuator that kept its own kernel build, and here is why**: these
+# are `naked_asm!` bodies on every ring transition, so a
 # boot parameter would have to be a branch there — on the path the gate is about,
 # in a binary the shipping one no longer resembles. The gate would then certify
 # a bracket nothing ships.
 fpu-save-nothing = []
 
-# The one profile every guest binary is built with — `specs/plans/boot-image-split.md`
-# §6. Optimised, because an unoptimised guest mismeasures everything under TCG;
+# The one profile every guest binary is built with.
+# Optimised, because an unoptimised guest mismeasures everything under TCG;
 # debug-assertions and overflow-checks on, because fail-fast beats speed here
-# and both crafted-ELF kernel panics in `specs/issues/` were *found* by
+# and both crafted-ELF kernel panics in `issues/` were *found* by
 # an overflow check. `--release` would turn the last two off silently, so this
 # build system no longer has the flag.
 [profile.toyos]
@@ -110,12 +110,14 @@ bcachefs = { path = "../bcachefs", default-features = false }
 toyos-abi = { path = "../toyos-abi" }
 toyos-fat32 = { path = "../toyos-fat32" }
 toyos-elf = { path = "../toyos-elf" }
+toyos-elide = { path = "../toyos-elide" }
 toyos-gpt = { path = "../toyos-gpt" }
 toyos-hda = { path = "../toyos-hda" }
 toyos-pci = { path = "../toyos-pci" }
 toyos-ps2 = { path = "../toyos-ps2" }
 toyos-sched = { path = "../toyos-sched" }
 toyos-untrusted = { path = "../toyos-untrusted" }
+toyos-userbound = { path = "../toyos-userbound" }
 toyos-wallclock = { path = "../toyos-wallclock" }
 toyos-xhci = { path = "../toyos-xhci" }
 rustc-demangle = "0.1"

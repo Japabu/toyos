@@ -6,7 +6,7 @@
 //! port-drain burst, subtracted by a reader on another CPU, and a reader landing
 //! between the two writes blamed an interrupt that had carried nothing. It fired
 //! about one full suite in three under load
-//! (`specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`).
+//! (`issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`).
 //!
 //! **A rate is why this is a model and not a test.** The window is a handful of
 //! instructions on one CPU; no guest boot can be made to land in it on demand,

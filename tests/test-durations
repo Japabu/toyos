@@ -228,6 +228,7 @@ nightly_tier_is_announced 0
 null_sink_client_exits 2266
 null_sink_shipped_client 6590
 nvme_home_roundtrip 13
+nvme_image_is_held_by_one_guest 0
 nvme_large_device 4443
 nvme_wide_sector 3550
 panic_recovery 69
