@@ -1987,6 +1987,46 @@ pub const KNOWN_RED: &[Red] = &[
         source: "issues/kernel/a-btreemap-panicked-inside-its-own-navigation-in-a-scheduler-pass.md",
         measured: "2026-08-19",
     },
+    // ---------------------------------------------------------------------
+    // The same session's last two runs, after the branch merged `origin/main`
+    // at `bf54143`. Both red, both `ALONE … GREEN`, neither about the diff —
+    // and with the two above them that is **three kernel deaths of three
+    // different shapes in four contended suites, against one clean run**. The
+    // one file that carries the table is this pair's write-up.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "i8042_kbd_echo",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 2),
+        standing: Standing::Stands,
+        what: "`kernel panic: KERNEL PANIC: execute unmapped address at 0x1b` at 850 ms of \
+               boot, `cs=0x0008`, `user=false` — the second sighting of `0x1b` and the first \
+               with a register dump: `rsp` exactly 4 KiB-aligned with nothing under it and \
+               `rbp` holding an `RFLAGS` word, so a restored frame read one quadword out of \
+               place rather than a corrupted pointer. A second fault follows it in the report \
+               machinery. `ALONE i8042_kbd_echo: GREEN`",
+        evidence: "the fourth of five full `cargo test` runs of `wt/toyos-spawnrule` in one \
+                   session, the first after merging `origin/main` at `bf54143`; `fastest boot \
+                   2165 ms against the reference 1320 ms`, 1.64x width",
+        source: "issues/kernel/a-ring-0-fetch-at-0x1b-with-the-stack-pointer-on-a-page-boundary.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "screen_console_shell",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 2),
+        standing: Standing::Stands,
+        what: "`typed \\`echo zqjxk\\` at the prompt and no row of the panel is its output` — a \
+               **different assertion** from this name's 2026-08-17 CI row, which is about the \
+               seeded `i8042:` line. 786 s against `PASS (2s)` alone in the same run, and the \
+               panel it decoded carries only the first frames of boot, so the guest never \
+               reached the prompt inside the window. The one red of this session's five that \
+               is not a kernel death",
+        evidence: "the fifth run of the same session, `fastest boot 1622 ms against the \
+                   reference 1320 ms`, 1.23x width; `ALONE screen_console_shell: GREEN`",
+        source: "issues/kernel/a-ring-0-fetch-at-0x1b-with-the-stack-pointer-on-a-page-boundary.md",
+        measured: "2026-08-19",
+    },
 ];
 
 // ---------------------------------------------------------------------------
