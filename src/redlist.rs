@@ -1960,9 +1960,10 @@ pub const KNOWN_RED: &[Red] = &[
         measured: "2026-08-18",
     },
     // ---------------------------------------------------------------------
-    // `wt/toyos-i8042deep`, dev host, 2026-08-19 (22:03 UTC). Adjudicated here
-    // re-run away: it answered `NOT ON THE LIST` when it was asked, and the
-    // branch it appeared on touches no kernel file at all.
+    // `wt/toyos-i8042deep`, dev host, 2026-08-19. Adjudicated here rather than
+    // re-run away: each answered `NOT ON THE LIST` when it was asked, and the
+    // branch they appeared on touches no kernel file at all — its whole delta
+    // is `tests/toyos.rs` and this file.
     // ---------------------------------------------------------------------
     Red {
         test: "i8042_budget_expiry",
@@ -1981,6 +1982,37 @@ pub const KNOWN_RED: &[Red] = &[
                    its class taken with nothing to blame contention for. The run's other eight \
                    guests were green",
         source: "issues/kernel/a-ring-0-fetch-at-0x1b-during-a-loaded-boot.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "nvme_large_device",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`[qemu] Init process crashed during boot: KERNEL PANIC: execute unmapped address \
+               at 0x1b`, ring 0, on `num=90` — **the name is the workload and not the cause**. \
+               Fourth sighting of the same filed class and the third of its shifted-frame half, \
+               and the one that ties them together: `user_rip=0x1000003d598` is the same \
+               instruction as the `i8042_budget_expiry` row above, in a different guest booting \
+               a different configuration, with `rax` and `rbx` identical again. `ALONE: GREEN`",
+        evidence: "one full `cargo test` twelve wide, 79 guests, `fastest boot 1356 ms against \
+                   the reference 1320 ms`, with `toyos-spawnrule`'s suite holding guest slots \
+                   throughout — named in the run's own `[host-slots]` lines",
+        source: "issues/kernel/a-ring-0-fetch-at-0x1b-during-a-loaded-boot.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "diskless_boot",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`[qemu] QEMU died before ===READY=== (status: Ok(ExitStatus(unix_wait_status(0))))`. \
+               **QEMU exited zero**, so this is neither a panicked guest nor a wall-clock guard \
+               reporting the content it meant to assert — the process went away cleanly before \
+               the guest was ready, which nothing in the register explains. 7 s under load \
+               against 3 s alone; `ALONE: GREEN`. Not investigated",
+        evidence: "the same run as this session's `nvme_large_device` row",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-19",
     },
 ];
