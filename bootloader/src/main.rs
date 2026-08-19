@@ -453,7 +453,7 @@ unsafe fn build_boot_page_tables(pt_mem: *mut u8, size: u64) -> u64 {
     let identity_pdpt = alloc_page(pt_mem);
     let high_pdpt = alloc_page(pt_mem);
 
-    let num_gb = ((size + GB - 1) / GB) as usize;
+    let num_gb = size.div_ceil(GB) as usize;
     for gi in 0..num_gb {
         let pd = alloc_page(pt_mem);
         for pdi in 0..512u64 {
@@ -474,6 +474,9 @@ unsafe fn build_boot_page_tables(pt_mem: *mut u8, size: u64) -> u64 {
     pml4 as u64
 }
 
+// Ten arguments because this is the handoff and they are what firmware leaves:
+// every one is moved into `KernelArgs` below and nothing else calls it.
+#[allow(clippy::too_many_arguments)]
 fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, cmdline: vec::Vec<u8>, rsdp_addr: u64, gop: Option<GopInfo>, boot_part: Option<BootPartition>, log_partition_guid: [u8; 16], rtc_utc_offset: Option<i32>, system_table: SystemTable<Boot>) -> ! {
     let mms = system_table.boot_services().memory_map_size();
     let memory_map_entry_count = mms.map_size / mms.entry_size + 8;
@@ -492,7 +495,7 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
     uefi_memory_map.entries().for_each(|entry| {
         memory_map.push(MemoryMapEntry {
             uefi_type: entry.ty.0,
-            start: entry.phys_start as u64,
+            start: entry.phys_start,
             end: entry.phys_start + entry.page_count * PAGE_SIZE as u64,
         });
     });
