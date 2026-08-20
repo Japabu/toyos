@@ -510,6 +510,17 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // measured 11.8 s on CI KVM, over the fast line, so the whole verdict is
     // nightly until the split the relegation row names.
     ("klogd_hosted", Sched::Parallel, Tier::Nightly),
+    // The two dead ends of the panic path, each staged on purpose and read for
+    // what the machine manages to say on its way out. **Two names because one
+    // over two boots measured 12 s twelve-wide on the dev host**, against
+    // `screen_late_panic`'s 5 s there for one boot of the same shape and its
+    // 3,782 ms in CI — a single name would have arrived at the fast tier's line
+    // with nothing to spare. Each boot dies inside the boot phases at the marker
+    // the harness waits for, so neither pays for a userland. Parallel and Fast:
+    // every verdict is a substring of a report the guest wrote, and there is no
+    // clock in any of it.
+    ("reentry_names_the_first_panic", Sched::Parallel, Tier::Fast),
+    ("double_panic_names_the_fault", Sched::Parallel, Tier::Fast),
     // §9.1's conservation law across `SYS_LOG_READ`, one registered name per
     // width, and §9.2's nesting gate at one CPU. **Three names because one over
     // three boots measured 17,112 ms in CI** — over the fast tier's line, and
@@ -8735,6 +8746,140 @@ fn run_machine_test(
             survived.push(&qemu.drain_serial(CARRIED_ON));
             survived.must_say(qemu::DEFAULT_READY)?;
             eprintln!("  [usbd] a kernel thread's panic killed the thread and the machine booted");
+            Ok(())
+        }
+        "reentry_names_the_first_panic" => {
+            // **The one class of crash that is by definition two bugs deep, and
+            // the one class that used to leave no evidence.** A machine two
+            // crashes deep said `DOUBLE PANIC` and nothing else — not what the
+            // first crash was, not where, and not what the second one was
+            // (`issues/panic-path/a-double-panic-at-boots-edge-says-nothing-but-its-name.md`).
+            // What closed it is a bounded byte copy taken *before* either
+            // report runs, into a static reserved at link time
+            // (`kernel/src/panic.rs`), so what the second crash reads is the
+            // first crash's own words rather than whatever the log path
+            // survived.
+            //
+            // **Two names because the two dead ends are reached by different
+            // accidents**, and `double_panic_names_the_fault` is the other. The
+            // reentry guard fires when the panic *report* panics, on a CPU whose
+            // panic depth is already one; `DOUBLE PANIC` fires when a panic
+            // lands on a CPU that a *fault* had, whose depth is zero.
+            //
+            // **This one: the panic path panics.** `test-late-panic` is a real
+            // panic with a literal message at a fixed site, and
+            // `panic-in-report` kills the report of it before it says a word —
+            // so everything on the wire about the first panic came out of the
+            // capture. The reentry guard writes straight to the 16550 with no
+            // lock, deliberately, because the record path is exactly what has
+            // just failed: the marker and the verdict are both in the UART file
+            // rather than on the console.
+            const REENTRY: &str = "PANIC REENTRY";
+            let qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    kernel_params: &["test-late-panic", "panic-in-report"],
+                    ready_marker: REENTRY,
+                    ..Default::default()
+                },
+            );
+            let mut reentry = serial::Serial::boot(&qemu);
+            reentry.push(&qemu.uart_log());
+            // Nothing of the first panic reached the record ring: the report
+            // that writes `PANIC:` is the one that died. So this is not a
+            // weaker way of reading the same line — without the capture there
+            // is no other copy of the site anywhere in the capture.
+            reentry.must_not_say("PANIC:")?;
+            let header = reentry.must_say(REENTRY)?;
+            eprintln!("  [reentry] {}", header.trim());
+            let first = reentry.must_say("first (apic")?;
+            // `src/main.rs` and not `kernel/src/main.rs`: `build.rs` runs cargo
+            // in `kernel/`, so the kernel's own `file!()` is crate-relative.
+            for want in ["panic at ", "src/main.rs:", "test-late-panic: on-screen console check"] {
+                if !first.contains(want) {
+                    return Err(format!(
+                        "the reentry report does not carry {want:?} — the first panic's own \
+                         words are what the capture exists to keep: {first:?}"
+                    ));
+                }
+            }
+            eprintln!("  [reentry] {}", first.trim());
+            let second = reentry.must_say("second: panic at")?;
+            if !second.contains("panic-in-report: the crash report panicked") {
+                return Err(format!(
+                    "the reentry report does not name the second panic: {second:?}"
+                ));
+            }
+            eprintln!("  [reentry] {}", second.trim());
+            Ok(())
+        }
+        "double_panic_names_the_fault" => {
+            // **A panic on top of a fault, which is what the sighting was and
+            // what no test in this tree had ever executed**: a Ring 0 exception
+            // is not something a guest program or a QEMU property can produce,
+            // so `fatal_exception`'s kernel arm — and the `DOUBLE PANIC` branch
+            // only reachable through it — had never run under a test at all.
+            // `reentry_names_the_first_panic` is the other dead end and carries
+            // the shared argument.
+            //
+            // `test-kernel-fault` takes the `#UD` with nothing current, so
+            // `fatal_exception` runs its kernel arm; `panic-in-report` panics it
+            // before the `FAULT rip=…` line, which is the shape the sighting had
+            // — a fault whose report died before saying anything at all. This
+            // dead end says it as a record too, because a machine with no serial
+            // port has no other channel, so the verdict is on the console.
+            let qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    kernel_params: &["test-kernel-fault", "panic-in-report"],
+                    ready_marker: "DOUBLE PANIC",
+                    ..Default::default()
+                },
+            );
+            let mut double = serial::Serial::boot(&qemu);
+            double.push(&qemu.uart_log());
+            // The fault said nothing about itself, which is the state under
+            // test: `FAULT rip=…` is `fatal_exception`'s own first line and it
+            // never ran.
+            double.must_not_say("FAULT rip=")?;
+            let line = double.must_say("DOUBLE PANIC")?;
+            for want in [
+                // Which of the four states the arriving panic found. A panic on
+                // top of a fault and a panic on top of a panic are different
+                // machines and the old line named neither.
+                "already in Fatal",
+                // The fault, by the same name the report it never reached would
+                // have given it, and where it was.
+                "invalid opcode",
+                "rip=0x",
+                // And the panic that ended it.
+                "second: panic at ",
+                "panic-in-report: the crash report panicked",
+            ] {
+                if !line.contains(want) {
+                    return Err(format!(
+                        "the DOUBLE PANIC line does not carry {want:?}, so the machine still \
+                         dies without saying what it was already doing: {line:?}"
+                    ));
+                }
+            }
+            eprintln!("  [double] {}", line.trim());
+            // And the same report on the channel that cannot be held by
+            // whatever broke — the raw port write goes out before the record
+            // does, so a wedge in the log path costs the second copy and never
+            // the first.
+            let raw = serial::Serial::named("16550 file", qemu.uart_log());
+            let raw_line = raw.must_say("first (apic")?;
+            if !raw_line.contains("invalid opcode") {
+                return Err(format!(
+                    "the lock-free copy of the report does not name the fault: {raw_line:?}"
+                ));
+            }
+            eprintln!("  [double] {}", raw_line.trim());
             Ok(())
         }
         "pre_idle_wedge_speaks" => {

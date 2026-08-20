@@ -330,6 +330,35 @@ actuators! {
     /// draining the ring.
     test_late_panic = "test-late-panic";
 
+    /// Take a Ring 0 `#UD` once the boot phases are done, with no thread
+    /// current, so `fatal_exception` runs its `Blame::Kernel` arm.
+    ///
+    /// **Nothing outside the kernel can make the kernel fault.** Every
+    /// exception this suite stages is a *program*'s — a segfault, an illegal
+    /// instruction, a bad syscall pointer — and all of them end at
+    /// `recover_or_halt`'s process arm. There is no QEMU device, machine
+    /// property or guest program that puts a Ring 0 frame on a bad instruction,
+    /// so before this the kernel arm of the fault path, and the `DOUBLE PANIC`
+    /// branch reachable only through it, had never been executed by a test at
+    /// all.
+    test_kernel_fault = "test-kernel-fault";
+
+    /// Panic inside the crash report, before it has said anything: at the head
+    /// of `crash_report_panic` and at the head of `fatal_exception`, which are
+    /// the two reports this kernel writes.
+    ///
+    /// **The panic path panicking is not stageable from the host in any other
+    /// way.** It is a second failure *inside* the handler for the first, on one
+    /// CPU, between two statements — no injection reaches there, and the
+    /// sighting that asked for it took two worktrees' suites running at once to
+    /// produce once
+    /// (`issues/panic-path/a-double-panic-at-boots-edge-says-nothing-but-its-name.md`).
+    /// Armed alone it changes nothing: a boot that reports no crash reaches
+    /// neither site. What it drives is which words a machine that is two bugs
+    /// deep leaves behind — the reentry guard's when the first crash was a
+    /// panic, and `DOUBLE PANIC`'s when it was a fault.
+    panic_in_report = "panic-in-report";
+
     /// Panic a few seconds after a *compositor* has claimed the framebuffer,
     /// from an idle CPU, so the panic handler's recovery branch is not taken and
     /// the report reaches `halt_all_cpus`.
