@@ -13,6 +13,12 @@ use toyos::syscap::SysCap;
 use toyos::{AsHandle, Connection, HdaDev, VirtioSoundDev};
 use toyos_abi::syscall::{self, DeviceType};
 use toyos_hda::stream;
+use toyos_mixer::{
+    accumulate, append_planar, client_period_frames, decode_i16_to_f32, deferral_floor_nanos,
+    interleave, mix_interleaved, period_frames, period_nanos, quantize_period, ramp_frames,
+    scratch_frames, Dll, Gain, GainRamp, MixStats, Xorshift32, MAX_CLIENT_RATE,
+    MIN_CLIENT_RATE,
+};
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -192,8 +198,6 @@ impl Backend for HdaBackend {
 
 use rubato::{Resampler, SincFixedOut, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
-const MIN_CLIENT_RATE: u32 = 8_000;
-const MAX_CLIENT_RATE: u32 = 192_000;
 const STATS_INTERVAL_NANOS: u64 = 2_000_000_000;
 
 struct ClientResampler {
@@ -203,77 +207,6 @@ struct ClientResampler {
     /// into this buffer on demand instead of fed one fixed chunk per cycle.
     accum: Vec<Vec<f32>>,
     output: Vec<Vec<f32>>,
-}
-
-/// A gain that has already crossed the trust boundary: finite, and within
-/// §7.4's [0.0, 1.0].
-///
-/// The check has to be a type rather than a `clamp` at each call site: `clamp`
-/// returns NaN unchanged, and a NaN gain reaches the *shared* mix bus through
-/// `accumulate`, silencing every stream.
-#[derive(Clone, Copy)]
-struct Gain(f32);
-
-impl Gain {
-    const SILENT: Gain = Gain(0.0);
-    const UNITY: Gain = Gain(1.0);
-
-    /// §7.4 clamps out-of-range values, and ±inf is out of range. NaN is not a
-    /// value at all, so it is refused rather than guessed at; the control
-    /// thread treats a refusal as any other malformed message.
-    fn from_wire(gain: f32) -> Option<Gain> {
-        if gain.is_nan() {
-            return None;
-        }
-        Some(Gain(gain.clamp(0.0, 1.0)))
-    }
-
-    fn raw(self) -> f32 {
-        self.0
-    }
-}
-
-struct GainRamp {
-    current: f32,
-    target: f32,
-    step: f32,
-    remaining: u32,
-}
-
-impl GainRamp {
-    fn new(initial: Gain) -> Self {
-        Self { current: initial.raw(), target: initial.raw(), step: 0.0, remaining: 0 }
-    }
-
-    fn set_target(&mut self, target: Gain, ramp_frames: u32) {
-        self.target = target.raw();
-        self.step = (self.target - self.current) / ramp_frames as f32;
-        self.remaining = ramp_frames;
-    }
-
-    /// Gain for the next frame (both channels of a frame get the same gain).
-    fn next(&mut self) -> f32 {
-        if self.remaining > 0 {
-            self.current += self.step;
-            self.remaining -= 1;
-            if self.remaining == 0 { self.current = self.target; }
-        }
-        self.current
-    }
-
-    /// Advance the ramp across a period of silence (§7.3: the ramp applies to
-    /// silence when the ring is empty — otherwise a drained closing client
-    /// would never finish its ramp and never be removed).
-    fn advance_frames(&mut self, frames: u32) {
-        let n = frames.min(self.remaining);
-        self.current += self.step * n as f32;
-        self.remaining -= n;
-        if self.remaining == 0 { self.current = self.target; }
-    }
-
-    fn is_idle(&self) -> bool { self.remaining == 0 }
-
-    fn level(&self) -> f32 { self.current }
 }
 
 /// How a stream ended, as far as soundd can honestly tell.
@@ -457,222 +390,17 @@ impl CommandRing {
     }
 }
 
-/// One scale for both directions of the i16 <-> f32 conversion.
+/// One reporting window on the console. One line, one `write`.
 ///
-/// Decoding by 32768 and quantizing by 32767 is not a round trip: it is a gain
-/// of 32767/32768 on everything that passes through, and 32703 of the 65536
-/// i16 values come back one LSB different from what the client sent. 32768 is
-/// the correct constant in both directions because it is the magnitude of
-/// `i16::MIN`; the positive end is one code short of full scale, which is what
-/// the clamp is for and what two's complement costs.
-const I16_SCALE: f32 = 32768.0;
-
-fn decode_i16_to_f32(src: &[u8], dst: &mut [f32]) {
-    for i in 0..dst.len() {
-        let sample = i16::from_le_bytes([src[i * 2], src[i * 2 + 1]]);
-        dst[i] = sample as f32 / I16_SCALE;
-    }
-}
-
-fn channel_convert_mono_to_stereo(src: &[f32], dst: &mut [f32]) {
-    for i in 0..src.len() {
-        dst[i * 2] = src[i];
-        dst[i * 2 + 1] = src[i];
-    }
-}
-
-fn channel_convert_stereo_to_mono(src: &[f32], dst: &mut [f32]) {
-    for i in 0..dst.len() {
-        dst[i] = (src[i * 2] + src[i * 2 + 1]) * 0.5;
-    }
-}
-
-/// Deinterleave one decoded client period into the resampler's planar
-/// accumulation buffers, channel-converting on the way.
-fn append_planar(decoded: &[f32], client_channels: usize, accum: &mut [Vec<f32>]) {
-    let device_channels = accum.len();
-    let frames = decoded.len() / client_channels;
-    for ch in accum.iter() {
-        assert!(ch.len() + frames <= ch.capacity(), "resampler accum overflow");
-    }
-    match (client_channels, device_channels) {
-        (c, d) if c == d => {
-            for frame in 0..frames {
-                for ch in 0..c {
-                    accum[ch].push(decoded[frame * c + ch]);
-                }
-            }
-        }
-        (1, 2) => {
-            for &s in decoded {
-                accum[0].push(s);
-                accum[1].push(s);
-            }
-        }
-        (2, 1) => {
-            for frame in 0..frames {
-                accum[0].push((decoded[frame * 2] + decoded[frame * 2 + 1]) * 0.5);
-            }
-        }
-        (c, d) => panic!("soundd: unsupported channel conversion {c}→{d}"),
-    }
-}
-
-/// Gain-scale `src` and add it onto the mix bus. The ramp steps per frame so
-/// both channels of a frame get the same gain and a 5ms ramp lasts 5ms.
-fn accumulate(mix: &mut [f32], src: &[f32], channels: usize, gain: &mut GainRamp) {
-    assert_eq!(src.len(), mix.len());
-    if gain.is_idle() {
-        let g = gain.level();
-        if g == 1.0 {
-            for (m, s) in mix.iter_mut().zip(src) { *m += s; }
-        } else if g > 0.0 {
-            for (m, s) in mix.iter_mut().zip(src) { *m += s * g; }
-        }
-    } else {
-        for frame in 0..src.len() / channels {
-            let g = gain.next();
-            for ch in 0..channels {
-                mix[frame * channels + ch] += src[frame * channels + ch] * g;
-            }
-        }
-    }
-}
-
-struct Xorshift32(u32);
-
-impl Xorshift32 {
-    fn next(&mut self) -> f32 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 17;
-        self.0 ^= self.0 << 5;
-        (self.0 as f32) / (u32::MAX as f32) - 0.5
-    }
-}
-
-/// §5.4. TPDF dither is defined against a **round-to-nearest** quantizer; that
-/// pairing is what makes the error zero-mean and its variance
-/// signal-independent. `as i16` truncates instead, which biases every sample
-/// 0.5 LSB toward zero and swallows the dither whole — a 2-LSB dead zone at
-/// the zero crossing and a noise floor that collapses with the signal.
-fn dither_and_quantize(sample: f32, rng: &mut Xorshift32) -> i16 {
-    let dither = rng.next() + rng.next(); // triangular PDF in [-1.0, 1.0]
-    quantize(sample, dither)
-}
-
-/// Split out from `dither_and_quantize` so the scale can be checked against
-/// every i16 there is without a generator in the way.
-fn quantize(sample: f32, dither: f32) -> i16 {
-    (sample * I16_SCALE + dither).round().clamp(-32768.0, 32767.0) as i16
-}
-
-/// Counters for one reporting window. A window covers streaming only: zeroed
-/// when the first client arrives, flushed when the last one leaves, so no
-/// number here is diluted by the idle path — where soundd waits on raw
-/// completion IRQs with no timer and a batched IRQ is indistinguishable from a
-/// missed deadline. The audio gate reads these (`tests/audio-baseline.toml`),
-/// so each has to mean exactly one thing.
-#[derive(Default)]
-struct MixStats {
-    wakes: u32,
-    completions: u32,
-    /// Every period put on the wire in this window, underruns included.
-    submitted: u32,
-    /// Periods submitted with no client audio behind them *while at least one
-    /// client was streaming* (`ClientStream::is_streaming`) — silence that
-    /// interrupted a stream rather than preceding or following one. Strictly
-    /// narrower than `submitted`, which like `wakes`/`completions`/`drains`
-    /// covers the whole time soundd has clients.
-    underruns: u32,
-    /// The longest unbroken run of them, which is the silence a listener
-    /// actually hears — 54 scattered singles and one gap of 54 are the same
-    /// `underruns` and are not the same defect. It is also the only thing that
-    /// separates a client that never had margin from one that lost it: the ring
-    /// is eight periods deep, so a run past one is a producer that stopped for
-    /// a measurable time rather than one that missed a deadline by a hair.
-    starve_max: u32,
-    /// The run [`starve_max`](Self::starve_max) is the maximum of. Working
-    /// state, not a field of the report; a run crossing a window boundary is
-    /// counted in both, which understates it and never invents one.
-    starve_run: u32,
-    /// Cycles that found the whole DMA pipeline free (§5.9) *and* could only
-    /// have got there by soundd being late. A device that retires the pipeline
-    /// faster than it plays it empties the free list without soundd having
-    /// missed anything; see the count site.
-    drains: u32,
-    /// Worst overshoot of a DLL prediction soundd actually armed a timer on
-    /// (§5.1). Waits that named no wake time contribute nothing; see the
-    /// sample site.
-    max_wake_lat_ns: u64,
-    max_batch: u32,
-    /// Free buffers left unfilled because a streaming client was still
-    /// producing the period that belongs in them (§5.10) — an activity signal,
-    /// not a fault, and so uncapped.
-    deferred: u32,
-}
-
-impl MixStats {
-    /// Account one period, whichever sink played it.
-    fn period(&mut self, streaming: bool, covered: bool) {
-        if !streaming {
-            return;
-        }
-        if covered {
-            self.starve_run = 0;
-            return;
-        }
-        self.underruns += 1;
-        self.starve_run += 1;
-        self.starve_max = self.starve_max.max(self.starve_run);
-    }
-
-    fn report(&self, clients: usize) {
-        say!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={} deferred={} starve_max={}",
-            self.wakes, self.completions, self.submitted, self.underruns, self.drains,
-            self.max_wake_lat_ns / 1_000, self.max_batch, clients, self.deferred,
-            self.starve_max);
-    }
-}
-
-struct Dll {
-    t_estimated: Option<f64>,
-    period: f64,
-    nominal_period: f64,
-    bw: f64,
-}
-
-impl Dll {
-    fn new(nominal_period_nanos: f64) -> Self {
-        Self { t_estimated: None, period: nominal_period_nanos, nominal_period: nominal_period_nanos, bw: 0.03 }
-    }
-
-    /// Forget the estimate after a pipeline re-prime (§5.9); the next
-    /// completion record re-initializes it.
-    fn reset(&mut self) {
-        self.t_estimated = None;
-        self.period = self.nominal_period;
-    }
-
-    /// Feed one completion record: `n_periods` buffers finished with a single
-    /// interrupt at `t_actual`. The batch timestamp belongs to the *last* of
-    /// the n grid points, so the prediction error is measured against
-    /// `t_estimated + (n-1)·period`.
-    fn update(&mut self, t_actual: f64, n_periods: u32) {
-        match self.t_estimated {
-            None => {
-                self.t_estimated = Some(t_actual + self.period);
-            }
-            Some(t_est) => {
-                let predicted = t_est + (n_periods - 1) as f64 * self.period;
-                let error = t_actual - predicted;
-                let next = predicted + self.period + self.bw * error;
-                // Clamp period to [50%, 200%] of nominal to prevent collapse
-                self.period = (self.period + self.bw * self.bw * error)
-                    .clamp(self.nominal_period * 0.5, self.nominal_period * 2.0);
-                self.t_estimated = Some(next);
-            }
-        }
-    }
+/// The counters are `toyos_mixer::MixStats`, and what they mean is documented
+/// there beside the decision that fills them; this is the emission, which is an
+/// effect and stays here. `#106`'s status tool reads one shape, so the null
+/// sink prints the same line.
+fn report(stats: &MixStats, clients: usize) {
+    say!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={} deferred={} starve_max={}",
+        stats.wakes, stats.completions, stats.submitted, stats.underruns, stats.drains,
+        stats.max_wake_lat_ns / 1_000, stats.max_batch, clients, stats.deferred,
+        stats.starve_max);
 }
 
 fn open_stream(
@@ -685,12 +413,8 @@ fn open_stream(
     slot_count: u32,
     ramp_frames: u32,
 ) -> Option<ClientStream> {
-    let client_period_frames = if req.sample_rate != device_sample_rate {
-        ((device_period_frames as u64 * req.sample_rate as u64 + device_sample_rate as u64 - 1)
-            / device_sample_rate as u64) as u32
-    } else {
-        device_period_frames
-    };
+    let client_period_frames =
+        client_period_frames(device_period_frames, req.sample_rate, device_sample_rate);
 
     let sample_size: u32 = 2; // FORMAT_S16LE, validated before open_stream
     let client_frame_size = req.channels as u32 * sample_size;
@@ -848,11 +572,7 @@ fn mix_client(
 
         let out_samples = produced * device_channels;
         assert!(out_samples <= convert_buf.len());
-        for frame in 0..produced {
-            for ch in 0..device_channels {
-                convert_buf[frame * device_channels + ch] = rs.output[ch][frame];
-            }
-        }
+        interleave(&rs.output, produced, &mut convert_buf[..out_samples]);
         accumulate(mix_f32, &convert_buf[..out_samples], device_channels, &mut stream.gain);
         return true;
     }
@@ -864,19 +584,14 @@ fn mix_client(
     decode_i16_to_f32(slot.data(), &mut decode_buf[..client_samples]);
     slot.advance();
 
-    let src: &[f32] = if client_channels != device_channels {
-        let out_samples = client_frames * device_channels;
-        assert!(out_samples <= convert_buf.len());
-        match (client_channels, device_channels) {
-            (1, 2) => channel_convert_mono_to_stereo(&decode_buf[..client_samples], &mut convert_buf[..out_samples]),
-            (2, 1) => channel_convert_stereo_to_mono(&decode_buf[..client_samples], &mut convert_buf[..out_samples]),
-            (c, d) => panic!("soundd: unsupported channel conversion {c}→{d}"),
-        }
-        &convert_buf[..out_samples]
-    } else {
-        &decode_buf[..client_samples]
-    };
-    accumulate(mix_f32, src, device_channels, &mut stream.gain);
+    mix_interleaved(
+        mix_f32,
+        &decode_buf[..client_samples],
+        convert_buf,
+        client_channels,
+        device_channels,
+        &mut stream.gain,
+    );
     true
 }
 
@@ -949,104 +664,6 @@ fn retain_active(streams: &mut Vec<ClientStream>) {
     });
 }
 
-/// Of a pipeline's periods, how many soundd keeps in reserve rather than
-/// spending on a client that is still filling (§4).
-///
-/// Policy, not physics, with the same standing as the kernel's `MAX_USER_STR`:
-/// of the shipped pipeline's 8 periods, soundd waits on a client for at most 3
-/// and always keeps 5 unplayed. It cannot be derived from worst-case wake
-/// lateness — the recorded worst exceeds two whole pipelines, so no floor
-/// inside the pipeline covers it. Move it only with a full re-baseline.
-const DEFERRAL_RESERVE: usize = 5;
-
-/// How much unplayed audio must still be on the wire before the mix loop may
-/// defer a buffer for a client that is mid-refill (§4), or `None` on a pipeline
-/// with nothing to spend.
-///
-/// **The `None` used to be a startup panic** — `assert!(num_buffers > 5)`, a
-/// device shape killing the daemon that serves every client on the machine, in
-/// the class of the NVMe and xHCI zero-device panics. §4 already says what to
-/// do instead and always did: *on a pipeline of five or fewer buffers the
-/// deferral policy is disabled and every free buffer is mixed immediately*. A
-/// reserve that is the whole pipeline is not a reserve, and mixing at once is
-/// what soundd does when it cannot afford to wait.
-fn deferral_floor_nanos(num_buffers: usize, period_nanos: u64) -> Option<u64> {
-    (num_buffers > DEFERRAL_RESERVE).then(|| DEFERRAL_RESERVE as u64 * period_nanos)
-}
-
-/// The deepest pipeline the mix loop can hold.
-///
-/// Its free list is a `u32` bitmask, so `1u32 << num_buffers` has to fit; with
-/// the power-of-two rule below, 16 is the deepest that does.
-const MAX_PIPELINE: usize = 16;
-
-/// A device shape soundd cannot render a period into.
-///
-/// Every arm is a constraint the mix loop's own arithmetic imposes, named where
-/// it is imposed. A shape that trips one is refused by name and the machine
-/// gets the null sink (§6): requirement 6 is that soundd always runs and always
-/// accepts streams, and it does not except itself from that when the surprise
-/// is a device rather than an absence. Silence a client can play into beats a
-/// dead daemon whose every connect is refused for the machine's lifetime.
-enum Shape {
-    /// A pipeline of one has no depth: `min_drain_nanos` is zero, so §5.9's
-    /// drain count could not tell a stall from ordinary operation.
-    Shallow(usize),
-    /// Deeper than [`MAX_PIPELINE`].
-    Deep(usize),
-    /// `slot_count` is the pipeline depth and the client ring's indices are
-    /// free-running mod 2^32 (§3), so the depth has to divide that evenly.
-    Uneven(usize),
-    /// The mixer converts mono and stereo, and nothing else.
-    Channels(u16),
-    /// A period that is not a whole number of frames — including a period of
-    /// no bytes at all, which would divide by zero on the way to the frame
-    /// count.
-    PartialFrame { period_bytes: usize, frame_bytes: usize },
-}
-
-impl core::fmt::Display for Shape {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Shape::Shallow(n) => write!(f, "a {n}-period pipeline has no depth to drain"),
-            Shape::Deep(n) => write!(f, "{n} periods is deeper than the {MAX_PIPELINE} a free list holds"),
-            Shape::Uneven(n) => write!(f, "{n} periods is not a power of two, and a client ring's indices wrap mod 2^32"),
-            Shape::Channels(c) => write!(f, "{c} channels is neither mono nor stereo"),
-            Shape::PartialFrame { period_bytes, frame_bytes } => {
-                write!(f, "a {period_bytes}-byte period is not a whole number of {frame_bytes}-byte frames")
-            }
-        }
-    }
-}
-
-/// The frames in one device period, or why soundd cannot serve this device.
-///
-/// The arithmetic that could fault lives inside the check, so no caller can
-/// perform it before asking.
-fn period_frames(
-    num_buffers: usize,
-    device_channels: u16,
-    device_period_bytes: usize,
-) -> Result<usize, Shape> {
-    if num_buffers < 2 {
-        return Err(Shape::Shallow(num_buffers));
-    }
-    if num_buffers > MAX_PIPELINE {
-        return Err(Shape::Deep(num_buffers));
-    }
-    if !num_buffers.is_power_of_two() {
-        return Err(Shape::Uneven(num_buffers));
-    }
-    if device_channels != 1 && device_channels != 2 {
-        return Err(Shape::Channels(device_channels));
-    }
-    let frame_bytes = device_channels as usize * 2;
-    if device_period_bytes == 0 || device_period_bytes % frame_bytes != 0 {
-        return Err(Shape::PartialFrame { period_bytes: device_period_bytes, frame_bytes });
-    }
-    Ok(device_period_bytes / frame_bytes)
-}
-
 fn mix_thread(
     backend: &mut dyn Backend,
     cmd_ring: &CommandRing,
@@ -1059,7 +676,7 @@ fn mix_thread(
     ramp_frames: u32,
 ) {
     let device_period_samples = device_period_frames * device_channels as usize;
-    let period_nanos = (device_period_frames as u64 * 1_000_000_000) / device_sample_rate as u64;
+    let period_nanos = period_nanos(device_period_frames as u64, device_sample_rate as u64);
     let pipeline = backend.pipeline();
     // The device plays one period per `period_nanos`, so the wall-clock cost of
     // emptying the pipeline is bounded from below. Every buffer is in flight
@@ -1141,11 +758,10 @@ fn mix_thread(
     let mut mix_f32 = vec![0.0f32; device_period_samples];
     // Sized for the highest client rate accepted at stream open, so the mix
     // path never allocates.
-    let max_client_frames = (device_period_frames * MAX_CLIENT_RATE as usize)
-        .div_ceil(device_sample_rate as usize);
+    let max_client_frames = scratch_frames(device_period_frames, device_sample_rate as usize);
     let mut decode_buf = vec![0.0f32; max_client_frames * 2];
     let mut convert_buf = vec![0.0f32; max_client_frames * 2];
-    let mut dither_rng = Xorshift32((syscall::clock_nanos() as u32) | 1);
+    let mut dither_rng = Xorshift32::new(syscall::clock_nanos() as u32);
     let mut dll = Dll::new(period_nanos as f64);
     let mut records = [AudioCompletionRecord { mask: 0, _pad: 0, timestamp_nanos: 0 }; 16];
 
@@ -1424,9 +1040,7 @@ fn mix_thread(
             let dma_buf = unsafe {
                 core::slice::from_raw_parts_mut(backend.buffer(idx) as *mut i16, device_period_samples)
             };
-            for i in 0..device_period_samples {
-                dma_buf[i] = dither_and_quantize(mix_f32[i], &mut dither_rng);
-            }
+            quantize_period(dma_buf, &mix_f32, &mut dither_rng);
 
             if !started {
                 started = true;
@@ -1492,12 +1106,12 @@ fn mix_thread(
         // shorter than two windows that tail is most of it.
         let now_ns = syscall::clock_nanos();
         if was_streaming && streams.is_empty() {
-            stats.report(0);
+            report(&stats, 0);
             stats = MixStats::default();
             next_stats_ns = now_ns + STATS_INTERVAL_NANOS;
         } else if now_ns >= next_stats_ns {
             if !streams.is_empty() {
-                stats.report(streams.len());
+                report(&stats, streams.len());
                 stats = MixStats::default();
             }
             next_stats_ns = now_ns + STATS_INTERVAL_NANOS;
@@ -1531,15 +1145,14 @@ fn null_sink_thread(
     ramp_frames: u32,
 ) {
     let device_period_samples = device_period_frames * device_channels as usize;
-    let period_nanos = (device_period_frames as u64 * 1_000_000_000) / device_sample_rate as u64;
+    let period_nanos = period_nanos(device_period_frames as u64, device_sample_rate as u64);
 
     let mut streams: Vec<ClientStream> = Vec::new();
     let poller = Poller::new(64);
     let mut mix_f32 = vec![0.0f32; device_period_samples];
     // Sized for the highest client rate accepted at stream open, exactly as
     // mix_thread sizes its scratch, so `mix_client` never allocates.
-    let max_client_frames = (device_period_frames * MAX_CLIENT_RATE as usize)
-        .div_ceil(device_sample_rate as usize);
+    let max_client_frames = scratch_frames(device_period_frames, device_sample_rate as usize);
     let mut decode_buf = vec![0.0f32; max_client_frames * 2];
     let mut convert_buf = vec![0.0f32; max_client_frames * 2];
 
@@ -1650,13 +1263,13 @@ fn null_sink_thread(
         // silent about being discarded (#106's status tool reads one shape).
         let now_ns = syscall::clock_nanos();
         if was_streaming && streams.is_empty() {
-            stats.report(0);
+            report(&stats, 0);
             stats = MixStats::default();
             next_stats_ns = now_ns + STATS_INTERVAL_NANOS;
             say!("soundd: null sink idle");
         } else if now_ns >= next_stats_ns {
             if !streams.is_empty() {
-                stats.report(streams.len());
+                report(&stats, streams.len());
                 stats = MixStats::default();
             }
             next_stats_ns = now_ns + STATS_INTERVAL_NANOS;
@@ -1814,7 +1427,7 @@ fn control_thread(
     // One handle per client plus the acceptor; `MAX_CONTROL_CLIENTS` is derived
     // from this ring, so the set always fits in one batch.
     let poller = Poller::new(MAX_CONTROL_CLIENTS as u32 + 1);
-    let period_nanos = (device_period_frames as u64 * 1_000_000_000) / device_sample_rate as u64;
+    let period_nanos = period_nanos(device_period_frames as u64, device_sample_rate as u64);
 
     struct ControlClient {
         conn: Connection,
@@ -2095,8 +1708,7 @@ fn run_with_device(
     // at most num_buffers periods, so a full client ring always covers it.
     let slot_count = num_buffers as u32;
 
-    // ~5ms connect/disconnect/volume ramp
-    let ramp_frames = device_sample_rate * 5 / 1000;
+    let ramp_frames = ramp_frames(device_sample_rate);
 
     say!("soundd: ready, {} buffers, {}Hz {}ch, {} bytes/period, {} frames/period",
         num_buffers, device_sample_rate, device_channels, device_period_bytes, device_period_frames);
@@ -2140,8 +1752,7 @@ fn run_null_sink(acceptor: Acceptor) {
     let device_period_frames = NULL_SINK_PERIOD_FRAMES;
     let slot_count = NULL_SINK_BUFFERS as u32;
 
-    // ~5ms connect/disconnect/volume ramp, same as the device path.
-    let ramp_frames = device_sample_rate * 5 / 1000;
+    let ramp_frames = ramp_frames(device_sample_rate);
 
     say!(
         "soundd: no audio device, presenting a null sink ({}Hz {}ch, {} frames/period, streams discarded)",
@@ -2181,89 +1792,6 @@ fn run_null_sink(acceptor: Acceptor) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A client playing i16 at the device's own rate and channel count must get
-    /// its own bytes back. Nothing resamples or mixes on that path, so any
-    /// difference here is a gain nobody asked for.
-    #[test]
-    fn passthrough_is_bit_exact_for_every_i16() {
-        let mut changed = 0;
-        for s in i16::MIN..=i16::MAX {
-            let mut decoded = [0.0f32; 1];
-            decode_i16_to_f32(&s.to_le_bytes(), &mut decoded);
-            if quantize(decoded[0], 0.0) != s {
-                changed += 1;
-            }
-        }
-        assert_eq!(changed, 0, "{changed} of 65536 i16 values do not survive a passthrough");
-    }
-
-    /// Both rails, named explicitly: `i16::MIN` is the value the scale is
-    /// derived from, and `i16::MAX` is the one the clamp has to catch rather
-    /// than wrap.
-    #[test]
-    fn full_scale_clamps_instead_of_wrapping() {
-        assert_eq!(quantize(-1.0, 0.0), i16::MIN);
-        assert_eq!(quantize(1.0, 0.0), i16::MAX);
-        assert_eq!(quantize(-2.0, 0.0), i16::MIN, "overrange must clamp");
-        assert_eq!(quantize(2.0, 0.0), i16::MAX, "overrange must clamp");
-        // Dither may not push an in-range sample past a rail either.
-        assert_eq!(quantize(-1.0, -1.0), i16::MIN);
-        assert_eq!(quantize(1.0, 1.0), i16::MAX);
-    }
-
-    /// One period of the shipped 44100 Hz stereo device, in nanoseconds.
-    const PERIOD_NS: u64 = 2_902_494;
-
-    /// §4's shallow-pipeline clause: *on a pipeline of five or fewer buffers
-    /// the deferral policy is disabled and every free buffer is mixed
-    /// immediately*. It was an `assert!(num_buffers > 5)` — a startup panic —
-    /// for as long as the spec said this.
-    #[test]
-    fn a_pipeline_with_nothing_to_reserve_disables_deferral() {
-        for shallow in 1..=DEFERRAL_RESERVE {
-            assert_eq!(
-                deferral_floor_nanos(shallow, PERIOD_NS),
-                None,
-                "a {shallow}-period pipeline has no {DEFERRAL_RESERVE} periods to keep back, \
-                 so there is no floor to defer above"
-            );
-        }
-    }
-
-    /// The other side of the same rule, and the number gate A's baseline was
-    /// recorded against: eight periods, five held.
-    #[test]
-    fn the_shipped_pipeline_keeps_five_periods_in_reserve() {
-        assert_eq!(deferral_floor_nanos(8, PERIOD_NS), Some(5 * PERIOD_NS));
-        assert_eq!(deferral_floor_nanos(6, PERIOD_NS), Some(5 * PERIOD_NS));
-    }
-
-    /// Both shipped devices — virtio-sound and HDA — present the same shape,
-    /// and it is served rather than refused. A refusal here would put every
-    /// machine on the null sink.
-    #[test]
-    fn the_shipped_device_shape_is_served() {
-        assert!(matches!(period_frames(8, 2, 512), Ok(128)));
-    }
-
-    /// Every constraint the mix loop imposes is refused by name rather than by
-    /// a panic, and the arithmetic that would fault never runs: a zero channel
-    /// count used to divide by zero one line before the assert that was
-    /// supposed to catch it.
-    #[test]
-    fn a_shape_the_mixer_cannot_render_is_refused_and_nothing_divides_by_zero() {
-        assert!(matches!(period_frames(1, 2, 512), Err(Shape::Shallow(1))));
-        assert!(matches!(period_frames(32, 2, 512), Err(Shape::Deep(32))));
-        assert!(matches!(period_frames(6, 2, 512), Err(Shape::Uneven(6))));
-        assert!(matches!(period_frames(8, 0, 512), Err(Shape::Channels(0))));
-        assert!(matches!(period_frames(8, 6, 512), Err(Shape::Channels(6))));
-        assert!(matches!(period_frames(8, 2, 0), Err(Shape::PartialFrame { .. })));
-        assert!(matches!(period_frames(8, 2, 513), Err(Shape::PartialFrame { .. })));
-        // A shape the free list *can* hold, which is what makes the ceiling a
-        // ceiling rather than a refusal of everything unusual.
-        assert!(matches!(period_frames(16, 1, 512), Ok(256)));
-    }
 
     /// The race the `died` line lost: two witnesses, either order, one word.
     ///

@@ -1,0 +1,924 @@
+# toyos-mixer corpus: every decision, over the space that reaches it.
+# f32 values are their bit patterns; i16 values are decimal.
+# Captured from userland/soundd/src/main.rs before the extraction.
+
+== constants
+I16_SCALE 47000000
+MAX_PIPELINE 16
+DEFERRAL_RESERVE 5
+MIN_CLIENT_RATE 8000
+MAX_CLIENT_RATE 192000
+
+== decode: every i16, exhaustive
+decode-digest ddc0e10e67e61818
+roundtrip-digest 30711afa1979df25
+roundtrip-changed 0
+rails-in[0000] -32768 -32767 -16384     -1      0      1  16384  32766  32767
+rails-out[0000] bf800000 bf7ffe00 bf000000 b8000000 00000000 38000000 3f000000 3f7ffc00
+rails-out[0008] 3f7ffe00
+period-out[0000] bf800000 bf5ffa00 bf3ff400 bf1fee00 beffd000 bebfc400 be7f7000 bdfeb000
+period-out[0008] 3a400000 3e00d800 3e807800 3ec08400 3f004800 3f204e00 3f405400 3f605a00
+period-out[0016] bf7fa000 bf5f9a00
+
+== quantize: the rails, the ties and the overrange
+q 00000000 -1 -1 -1 0 0 0 0 0 1 1 1
+q 00000001 -1 -1 -1 0 0 0 0 0 1 1 1
+q ffffffff 0 0 0 0 0 0 0 0 0 0 0
+q 37800000 -1 0 0 0 0 1 1 1 1 1 2
+q b7800000 -2 -1 -1 -1 -1 -1 0 0 0 0 1
+q 38000000 0 0 1 1 1 1 1 1 2 2 2
+q b8000000 -2 -2 -2 -1 -1 -1 -1 -1 -1 0 0
+q 80000000 -1 -1 -1 0 0 0 0 0 1 1 1
+q 80000001 -1 -1 -1 0 0 0 0 0 1 1 1
+q 7fffffff 0 0 0 0 0 0 0 0 0 0 0
+q 37800000 -1 0 0 0 0 1 1 1 1 1 2
+q b7800000 -2 -1 -1 -1 -1 -1 0 0 0 0 1
+q 38000000 0 0 1 1 1 1 1 1 2 2 2
+q b8000000 -2 -2 -2 -1 -1 -1 -1 -1 -1 0 0
+q 3f800000 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q 3f800001 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q 3f7fffff 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q 3f800080 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q 3f7fff00 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q 3f800100 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q 3f7ffe00 32766 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q bf800000 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32767
+q bf800001 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32767
+q bf7fffff -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32767 -32767 -32767 -32767
+q bf7fff00 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32767 -32767 -32767 -32767
+q bf800080 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768
+q bf7ffe00 -32768 -32768 -32768 -32768 -32767 -32767 -32767 -32767 -32767 -32767 -32766
+q bf800100 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768
+q 3f7ffe00 32766 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q 3f7ffe01 32766 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q 3f7ffdff 32766 32766 32766 32766 32767 32767 32767 32767 32767 32767 32767
+q 3f7fff00 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q 3f7ffd00 32766 32766 32766 32766 32767 32767 32767 32767 32767 32767 32767
+q 3f800000 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q 3f7ffc00 32765 32766 32766 32766 32766 32766 32766 32767 32767 32767 32767
+q bf7ffe00 -32768 -32768 -32768 -32768 -32767 -32767 -32767 -32767 -32767 -32767 -32766
+q bf7ffe01 -32768 -32768 -32768 -32768 -32767 -32767 -32767 -32767 -32767 -32767 -32766
+q bf7ffdff -32768 -32767 -32767 -32767 -32767 -32767 -32767 -32766 -32766 -32766 -32766
+q bf7ffd00 -32768 -32767 -32767 -32767 -32767 -32767 -32767 -32766 -32766 -32766 -32766
+q bf7fff00 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32767 -32767 -32767 -32767
+q bf7ffc00 -32767 -32767 -32767 -32767 -32766 -32766 -32766 -32766 -32766 -32766 -32765
+q bf800000 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32767
+q 3f000000 16383 16384 16384 16384 16384 16384 16384 16385 16385 16385 16385
+q 3f000001 16383 16384 16384 16384 16384 16384 16384 16385 16385 16385 16385
+q 3effffff 16383 16383 16383 16383 16384 16384 16384 16384 16385 16385 16385
+q 3f000100 16384 16384 16384 16384 16385 16385 16385 16385 16385 16385 16386
+q 3efffe00 16383 16383 16383 16383 16384 16384 16384 16384 16384 16384 16385
+q 3f000200 16384 16385 16385 16385 16385 16385 16385 16386 16386 16386 16386
+q 3efffc00 16382 16383 16383 16383 16383 16383 16383 16384 16384 16384 16384
+q bf000000 -16385 -16385 -16385 -16385 -16384 -16384 -16384 -16384 -16384 -16384 -16383
+q bf000001 -16385 -16385 -16385 -16385 -16384 -16384 -16384 -16384 -16384 -16384 -16383
+q beffffff -16385 -16385 -16385 -16384 -16384 -16384 -16384 -16383 -16383 -16383 -16383
+q befffe00 -16385 -16384 -16384 -16384 -16384 -16384 -16384 -16383 -16383 -16383 -16383
+q bf000100 -16386 -16385 -16385 -16385 -16385 -16385 -16385 -16384 -16384 -16384 -16384
+q befffc00 -16384 -16384 -16384 -16384 -16383 -16383 -16383 -16383 -16383 -16383 -16382
+q bf000200 -16386 -16386 -16386 -16386 -16385 -16385 -16385 -16385 -16385 -16385 -16384
+q 40000000 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q 40000001 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q 3fffffff 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q 40000040 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q 3fffff80 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q 40000080 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q 3fffff00 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767 32767
+q c0000000 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768
+q c0000001 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768
+q bfffffff -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768
+q bfffff80 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768
+q c0000040 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768
+q bfffff00 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768
+q c0000080 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768
+q 3089705f -1 0 0 0 0 0 0 1 1 1 1
+q 30897060 -1 0 0 0 0 0 0 1 1 1 1
+q 3089705e -1 0 0 0 0 0 0 1 1 1 1
+q 37800226 0 0 0 0 1 1 1 1 1 1 2
+q b77ffbb4 -1 -1 -1 -1 0 0 0 0 0 0 1
+q 38000113 0 1 1 1 1 1 1 2 2 2 2
+q b7fffdda -2 -1 -1 -1 -1 -1 -1 0 0 0 0
+q b089705f -1 -1 -1 -1 0 0 0 0 0 0 1
+q b0897060 -1 -1 -1 -1 0 0 0 0 0 0 1
+q b089705e -1 -1 -1 -1 0 0 0 0 0 0 1
+q 377ffbb4 -1 0 0 0 0 0 0 1 1 1 1
+q b7800226 -2 -1 -1 -1 -1 -1 -1 0 0 0 0
+q 37fffdda 0 0 0 0 1 1 1 1 1 1 2
+q b8000113 -2 -2 -2 -2 -1 -1 -1 -1 -1 -1 0
+q 00800000 -1 -1 -1 0 0 0 0 0 1 1 1
+q 00800001 -1 -1 -1 0 0 0 0 0 1 1 1
+q 007fffff -1 -1 -1 0 0 0 0 0 1 1 1
+q 37800000 -1 0 0 0 0 1 1 1 1 1 2
+q b7800000 -2 -1 -1 -1 -1 -1 0 0 0 0 1
+q 38000000 0 0 1 1 1 1 1 1 2 2 2
+q b8000000 -2 -2 -2 -1 -1 -1 -1 -1 -1 0 0
+q 80800000 -1 -1 -1 0 0 0 0 0 1 1 1
+q 80800001 -1 -1 -1 0 0 0 0 0 1 1 1
+q 807fffff -1 -1 -1 0 0 0 0 0 1 1 1
+q 37800000 -1 0 0 0 0 1 1 1 1 1 2
+q b7800000 -2 -1 -1 -1 -1 -1 0 0 0 0 1
+q 38000000 0 0 1 1 1 1 1 1 2 2 2
+q b8000000 -2 -2 -2 -1 -1 -1 -1 -1 -1 0 0
+q b8e00000 -5 -4 -4 -4 -4 -4 -4 -3 -3 -3 -3
+q b8a00000 -4 -3 -3 -3 -3 -3 -3 -2 -2 -2 -2
+q b8400000 -3 -2 -2 -2 -2 -2 -1 -1 -1 -1 -1
+q b7800000 -2 -1 -1 -1 -1 -1 0 0 0 0 1
+q 37800000 -1 0 0 0 0 1 1 1 1 1 2
+q 38400000 1 1 1 1 1 2 2 2 2 2 3
+q 38a00000 2 2 2 2 3 3 3 3 3 3 4
+q 38e00000 3 3 3 3 4 4 4 4 4 4 5
+q 39100000 4 4 4 4 5 5 5 5 5 5 6
+
+== quantize: every half-way point in the i16 range, exhaustive
+tie-digest 61a53b0ae3d7b667
+tie-below-zero -1
+tie-above-zero 1
+tie-at-top 32767
+tie-at-bottom -32768
+
+== dither: the generator
+rng-00000000[0000] befff7c0 bef7eff4 3dee6548 bedb54ce 3d6f9180 bea72148 beb49b9a becc0dc6
+rng-00000000[0008] bd0788f0 3e37408c 3df30018 be1b8da4 3e52e130 bef6380f bef592a0 3e93892c
+rng-00000000-digest 2d0480e4de78644d
+rng-00000001[0000] befff7c0 bef7eff4 3dee6548 bedb54ce 3d6f9180 bea72148 beb49b9a becc0dc6
+rng-00000001[0008] bd0788f0 3e37408c 3df30018 be1b8da4 3e52e130 bef6380f bef592a0 3e93892c
+rng-00000001-digest 2d0480e4de78644d
+rng-00000002[0000] beffe73f bee7eeec 3e5151c0 bd632df8 bd95b600 bec681ae 3e9b0f60 be56260c
+rng-00000002[0008] be81fd7c 3efeab38 3eaeae3c 3e19ceb4 3e260864 3e634ed4 bef3de32 be701c06
+rng-00000002-digest 732f8397388ac5aa
+rng-5eedface[0000] 3eae7252 3e5f4718 bde953b8 3e288d1c 3ddf0c08 3ea93b20 3e52321c 3e21e9fc
+rng-5eedface[0008] bed6dc52 3ec0640a 3e57f09c bed42c93 be61aa1a 3ef895ac bcebb5d0 bdfa1c68
+rng-5eedface-digest 14455139ce9deea8
+rng-ffffffff[0000] befff840 3ef80ffc bd344678 3ee39912 bcbae230 3dc52a88 bdd2f004 bedea4fc
+rng-ffffffff[0008] 3e4b1220 bdd4ffa8 3ec875f2 3ebf9fd6 bd760f30 3e5805c4 3dd49d48 bec30709
+rng-ffffffff-digest 2bd7a48fb38e32e9
+rng-499602d3[0000] 3e412384 beb1ce7c 3eb5a838 bd9f4660 3eb134fe bcd1aec0 bebd87ff 3ce179c0
+rng-499602d3[0008] beb339d8 3e8e4f96 3ee1cc44 3e3a550c 3ebf88a0 3edbf506 bee10e6d 3eb9a898
+rng-499602d3-digest ddbc04a61b53b363
+
+== dither: the quantizer under it
+dq-silence[0000]      1      0      0      0      0      0      0      0      0      0     -1      0      0      0      0      0
+dq-silence[0016]      1      0     -1      1     -1      0      1      0      0      0      0      0      0      0      0      0
+dq-silence[0032]      1      1      1     -1      0     -1      0      0      0      1      0      1      0      0      0      0
+dq-silence[0048]     -1      1      0      0      0     -1      0      0      1      0     -1     -1      0      0      0      1
+dq-silence-digest 470d679b904240d2
+dq-full-scale[0000]  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767
+dq-full-scale[0016]  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767
+dq-full-scale[0032]  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767
+dq-full-scale[0048]  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767  32767
+dq-full-scale-digest f5d0ecb80650a325
+dq-neg-full-scale[0000] -32767 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768
+dq-neg-full-scale[0016] -32767 -32768 -32768 -32767 -32768 -32768 -32767 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768 -32768
+dq-neg-full-scale[0032] -32767 -32767 -32767 -32768 -32768 -32768 -32768 -32768 -32768 -32767 -32768 -32767 -32768 -32768 -32768 -32768
+dq-neg-full-scale[0048] -32768 -32767 -32768 -32768 -32768 -32768 -32768 -32768 -32767 -32768 -32768 -32768 -32768 -32768 -32768 -32767
+dq-neg-full-scale-digest 58df46d93b731c55
+dq-half[0000]  16385  16384  16384  16384  16384  16384  16384  16384  16384  16384  16383  16384  16384  16384  16384  16384
+dq-half[0016]  16385  16384  16383  16385  16383  16384  16385  16384  16384  16384  16384  16384  16384  16384  16384  16384
+dq-half[0032]  16385  16385  16385  16383  16384  16383  16384  16384  16384  16385  16384  16385  16384  16384  16384  16384
+dq-half[0048]  16383  16385  16384  16384  16384  16383  16384  16384  16385  16384  16383  16383  16384  16384  16384  16385
+dq-half-digest bdfc8789aef60d6c
+dq-sub-lsb[0000]      1      0      1      1      0      0      1      0      0      0      0      0      0      0      0      0
+dq-sub-lsb[0016]      1      0      0      1      0      1      1      0      0      0      0      0      0      1      0      0
+dq-sub-lsb[0032]      1      1      1      0      0      0      0      1      0      1      0      1      0      0      0      1
+dq-sub-lsb[0048]      0      1      0      0      1     -1      0      0      1      0      0     -1      1      0      0      1
+dq-sub-lsb-digest e8b1137f33343420
+
+== channel conversion
+mono-to-stereo-1 5f386e2cd3e5a875
+mono-to-stereo-1-out[0000] bf800000 bf800000
+mono-to-stereo-2 38317d208265d675
+mono-to-stereo-2-out[0000] bf800000 bf800000 bf5ffa00 bf5ffa00
+mono-to-stereo-3 620c68b14de0a329
+mono-to-stereo-3-out[0000] bf800000 bf800000 bf5ffa00 bf5ffa00 bf3ff400 bf3ff400
+mono-to-stereo-127 78115fe78ba9759d
+mono-to-stereo-128 20fd817cbe332781
+mono-to-stereo-129 03e12a3bf378e731
+stereo-to-mono-1 4b72bf7f9c5cfb80
+stereo-to-mono-1-out[0000] b7800000
+stereo-to-mono-2 f9c25cd8e96c15f5
+stereo-to-mono-2-out[0000] b7800000 b7800000
+stereo-to-mono-3 d2af39b07183a2b0
+stereo-to-mono-3-out[0000] b7800000 b7800000 b7800000
+stereo-to-mono-127 ad187dbc26aae9d0
+stereo-to-mono-128 d5693565b4055725
+stereo-to-mono-129 a67cdd585a3d6f80
+downmix-rails[0000] 00000000 00000000 3f800000 bf800000
+
+== planar append and interleave
+planar-1to1-ch0[0000] bf800000 bf5ffa00 bf3ff400 bf1fee00 beffd000 bebfc400 be7f7000 bf800000
+planar-1to1-ch0[0008] bf5ffa00 bf3ff400 bf1fee00 beffd000 bebfc400 be7f7000
+interleave-1to1[0000] bf800000 bf5ffa00 bf3ff400 bf1fee00 beffd000 bebfc400 be7f7000 bf800000
+interleave-1to1[0008] bf5ffa00 bf3ff400 bf1fee00 beffd000 bebfc400 be7f7000
+planar-2to2-ch0[0000] bf800000 bf3ff400 beffd000 be7f7000 3a400000 3e807800 3f004800 bf800000
+planar-2to2-ch0[0008] bf3ff400 beffd000 be7f7000 3a400000 3e807800 3f004800
+planar-2to2-ch1[0000] bf5ffa00 bf1fee00 bebfc400 bdfeb000 3e00d800 3ec08400 3f204e00 bf5ffa00
+planar-2to2-ch1[0008] bf1fee00 bebfc400 bdfeb000 3e00d800 3ec08400 3f204e00
+interleave-2to2[0000] bf800000 bf5ffa00 bf3ff400 bf1fee00 beffd000 bebfc400 be7f7000 bdfeb000
+interleave-2to2[0008] 3a400000 3e00d800 3e807800 3ec08400 3f004800 3f204e00 bf800000 bf5ffa00
+interleave-2to2[0016] bf3ff400 bf1fee00 beffd000 bebfc400 be7f7000 bdfeb000 3a400000 3e00d800
+interleave-2to2[0024] 3e807800 3ec08400 3f004800 3f204e00
+planar-1to2-ch0[0000] bf800000 bf5ffa00 bf3ff400 bf1fee00 beffd000 bebfc400 be7f7000 bf800000
+planar-1to2-ch0[0008] bf5ffa00 bf3ff400 bf1fee00 beffd000 bebfc400 be7f7000
+planar-1to2-ch1[0000] bf800000 bf5ffa00 bf3ff400 bf1fee00 beffd000 bebfc400 be7f7000 bf800000
+planar-1to2-ch1[0008] bf5ffa00 bf3ff400 bf1fee00 beffd000 bebfc400 be7f7000
+interleave-1to2[0000] bf800000 bf800000 bf5ffa00 bf5ffa00 bf3ff400 bf3ff400 bf1fee00 bf1fee00
+interleave-1to2[0008] beffd000 beffd000 bebfc400 bebfc400 be7f7000 be7f7000 bf800000 bf800000
+interleave-1to2[0016] bf5ffa00 bf5ffa00 bf3ff400 bf3ff400 bf1fee00 bf1fee00 beffd000 beffd000
+interleave-1to2[0024] bebfc400 bebfc400 be7f7000 be7f7000
+planar-2to1-ch0[0000] bf6ffd00 bf2ff100 bedfca00 be3f6400 3d819800 3ea07e00 3f104b00 bf6ffd00
+planar-2to1-ch0[0008] bf2ff100 bedfca00 be3f6400 3d819800 3ea07e00 3f104b00
+interleave-2to1[0000] bf6ffd00 bf2ff100 bedfca00 be3f6400 3d819800 3ea07e00 3f104b00 bf6ffd00
+interleave-2to1[0008] bf2ff100 bedfca00 be3f6400 3d819800 3ea07e00 3f104b00
+
+== gain: the trust boundary
+from-wire 00000000 00000000
+from-wire 80000000 80000000
+from-wire 3f800000 3f800000
+from-wire 3f000000 3f000000
+from-wire bf800000 00000000
+from-wire 40000000 3f800000
+from-wire 3f800001 3f800000
+from-wire b3d6bf95 00000000
+from-wire 7f800000 3f800000
+from-wire ff800000 00000000
+from-wire 7fc00000 refused
+from-wire ffc00000 refused
+from-wire 00800000 00800000
+from-wire 7f7fffff 3f800000
+from-wire ff7fffff 00000000
+
+== gain: the ramp
+ramp-in-8[0000] 3e000000 3e800000 3ec00000 3f000000 3f200000 3f400000 3f600000 3f800000
+ramp-in-8[0008] 3f800000 3f800000 3f800000 3f800000
+ramp-in-8-idle true
+ramp-out-220-digest 30dbe45e4fd3a481
+ramp-out-220-head[0000] 3f7ed61c 3f7dac38 3f7c8254 3f7b5870 3f7a2e8c 3f7904a8 3f77dac4 3f76b0e0
+ramp-out-220-tail[0000] 3d02549d 3cdf6cb8 3cba3036 3c94f3b4 3c5f6e64 3c14f560 3b94f8b7 00000000
+ramp-out-220-level 00000000
+ramp-retarget[0000] 3ee84049 3ee7c66c 3ee74c8f 3ee6d2b2 3ee658d5 3ee5def8 3ee5651b 3ee4eb3e
+advance-128 3ed61bee idle=false
+advance-past 00000000 idle=true
+advance-idle 00000000 idle=true
+ramp-1 00000000
+ramp-1-again 00000000
+ramp-to-self[0000] 3f800000 3f800000 3f800000 3f800000
+
+== accumulate: one client, every gain state
+acc-1ch-1f-unity 4b72c77f9c5d0918
+acc-1ch-1f-unity-out[0000] bf800000
+acc-1ch-1f-silent 4d25767f9dce13f5
+acc-1ch-1f-silent-out[0000] 00000000
+acc-1ch-1f-half 4d24c77f9dccea98
+acc-1ch-1f-half-out[0000] bf000000
+acc-1ch-1f-ramp-short 4d24c77f9dccea98 level=3f000000
+acc-1ch-1f-ramp-exact 4b72c77f9c5d0918 level=3f800000
+acc-1ch-1f-ramp-long dd8f5fb73f5fedfb level=3b94f209
+acc-1ch-2f-unity 4c986829f48aed7c
+acc-1ch-2f-unity-out[0000] bf800000 bf5ffa00
+acc-1ch-2f-silent a8c7f832281a39c5
+acc-1ch-2f-silent-out[0000] 00000000 00000000
+acc-1ch-2f-half 941558288773e82f
+acc-1ch-2f-half-out[0000] bf000000 bedffa00
+acc-1ch-2f-ramp-short 9261572886009efc level=3f800000
+acc-1ch-2f-ramp-exact 9261572886009efc level=3f800000
+acc-1ch-2f-ramp-long 05859392180d8cd7 level=3c14f209
+acc-1ch-3f-unity f6b1dac2235b2d36
+acc-1ch-3f-unity-out[0000] bf800000 bf5ffa00 bf3ff400
+acc-1ch-3f-silent 5467b0da1d106495
+acc-1ch-3f-silent-out[0000] 00000000 00000000 00000000
+acc-1ch-3f-half 5c1222e13e0fbd26
+acc-1ch-3f-half-out[0000] bf000000 bedffa00 bebff400
+acc-1ch-3f-ramp-short 2bff5ec89cdbaeb6 level=3f800000
+acc-1ch-3f-ramp-exact 916ee15e59733ef3 level=3f800000
+acc-1ch-3f-ramp-long ac4d58741fe0401e level=3c5f6b0e
+acc-1ch-127f-unity 9d7443bd530153a7
+acc-1ch-127f-silent 0319015562663f55
+acc-1ch-127f-half 5c5057f3f37d115f
+acc-1ch-127f-ramp-short 36cbe1ab1e5be127 level=3f800000
+acc-1ch-127f-ramp-exact c8d756e24817ce63 level=3f800000
+acc-1ch-127f-ramp-long 8e24fb36f300f3e9 level=3f13c81f
+acc-1ch-128f-unity 8f9988c6d86db646
+acc-1ch-128f-silent 7da144b97d054b25
+acc-1ch-128f-half 7a28d3b012fc7cb1
+acc-1ch-128f-ramp-short e1218f1aba2086c6 level=3f800000
+acc-1ch-128f-ramp-exact 3919387e19574807 level=3f800000
+acc-1ch-128f-ramp-long 01bd6b4a328d3ed6 level=3f14f203
+acc-1ch-129f-unity 28d09eb368bae60a
+acc-1ch-129f-silent f500035eafd7bbf5
+acc-1ch-129f-half 16ed0e5d74112396
+acc-1ch-129f-ramp-short 075d1e05ba9f4b8a level=3f800000
+acc-1ch-129f-ramp-exact 0766c4540600940c level=3f800000
+acc-1ch-129f-ramp-long b0b6ca782d37fed7 level=3f161be7
+acc-2ch-1f-unity 4c986829f48aed7c
+acc-2ch-1f-unity-out[0000] bf800000 bf5ffa00
+acc-2ch-1f-silent a8c7f832281a39c5
+acc-2ch-1f-silent-out[0000] 00000000 00000000
+acc-2ch-1f-half 941558288773e82f
+acc-2ch-1f-half-out[0000] bf000000 bedffa00
+acc-2ch-1f-ramp-short 941558288773e82f level=3f000000
+acc-2ch-1f-ramp-exact 4c986829f48aed7c level=3f800000
+acc-2ch-1f-ramp-long 03d39092169da63e level=3b94f209
+acc-2ch-2f-unity d46bb3aa9c5a487a
+acc-2ch-2f-unity-out[0000] bf800000 bf5ffa00 bf3ff400 bf1fee00
+acc-2ch-2f-silent 88201fb960ff6465
+acc-2ch-2f-silent-out[0000] 00000000 00000000 00000000 00000000
+acc-2ch-2f-half 6fac35243535a35d
+acc-2ch-2f-half-out[0000] bf000000 bedffa00 bebff400 be9fee00
+acc-2ch-2f-ramp-short 6cc8e9465bde659d level=3f800000
+acc-2ch-2f-ramp-exact 6cc8e9465bde659d level=3f800000
+acc-2ch-2f-ramp-long dfdd28ba65e778b1 level=3c14f209
+acc-2ch-3f-unity afff2b7ac4c85cd2
+acc-2ch-3f-unity-out[0000] bf800000 bf5ffa00 bf3ff400 bf1fee00 beffd000 bebfc400
+acc-2ch-3f-silent 81d23fd7003c2305
+acc-2ch-3f-silent-out[0000] 00000000 00000000 00000000 00000000 00000000 00000000
+acc-2ch-3f-half 8ce96b2b0f22f0b5
+acc-2ch-3f-half-out[0000] bf000000 bedffa00 bebff400 be9fee00 be7fd000 be3fc400
+acc-2ch-3f-ramp-short a433ff1feed7ea75 level=3f800000
+acc-2ch-3f-ramp-exact 4078db6cd4c43069 level=3f800000
+acc-2ch-3f-ramp-long 2e58e84a74e20cfc level=3c5f6b0e
+acc-2ch-127f-unity 7f9a604254f77911
+acc-2ch-127f-silent 28a6b7476058f085
+acc-2ch-127f-half c7343a684253820f
+acc-2ch-127f-ramp-short ab3ab828ba472ad6 level=3f800000
+acc-2ch-127f-ramp-exact 75e2118e03e8d6cf level=3f800000
+acc-2ch-127f-ramp-long 7aa602165aff587a level=3f13c81f
+acc-2ch-128f-unity 3c784f87266a9adb
+acc-2ch-128f-silent 51d88627df287325
+acc-2ch-128f-half 3e916d0d99cc6859
+acc-2ch-128f-ramp-short 4e02cc33ada48bd0 level=3f800000
+acc-2ch-128f-ramp-exact e1d2f4ea19d52527 level=3f800000
+acc-2ch-128f-ramp-long a1c537c3eb7a5b8e level=3f14f203
+acc-2ch-129f-unity ba6b1e51d0b35582
+acc-2ch-129f-silent 03b18c35670a89c5
+acc-2ch-129f-half d50a3e9289051d7c
+acc-2ch-129f-ramp-short 1c571d72e2fb6c5d level=3f800000
+acc-2ch-129f-ramp-exact 83b328549b34f918 level=3f800000
+acc-2ch-129f-ramp-long 594785efe7e4f155 level=3f161be7
+
+== accumulate: saturation on the shared bus
+saturate-bus[0000] 407ffe00 c0800000 407ffe00 c0800000 407ffe00 c0800000 407ffe00 c0800000
+saturate-bus[0008] 407ffe00 c0800000 407ffe00 c0800000 407ffe00 c0800000 407ffe00 c0800000
+saturate-out[0000]  32767 -32768  32767 -32768  32767 -32768  32767 -32768  32767 -32768  32767 -32768  32767 -32768  32767 -32768
+saturate-out[0016]  32767 -32768  32767 -32768  32767 -32768  32767 -32768  32767 -32768  32767 -32768  32767 -32768  32767 -32768
+saturate-digest 29a2e997556854a5
+cancel-bus[0000] b8000000 c0000000 b8000000 c0000000 b8000000 c0000000 b8000000 c0000000
+
+== device shape
+shape 0 0 0 -> refused a 0-period pipeline has no depth to drain
+shape 0 0 1 -> refused a 0-period pipeline has no depth to drain
+shape 0 0 2 -> refused a 0-period pipeline has no depth to drain
+shape 0 0 4 -> refused a 0-period pipeline has no depth to drain
+shape 0 0 511 -> refused a 0-period pipeline has no depth to drain
+shape 0 0 512 -> refused a 0-period pipeline has no depth to drain
+shape 0 0 513 -> refused a 0-period pipeline has no depth to drain
+shape 0 0 1024 -> refused a 0-period pipeline has no depth to drain
+shape 0 1 0 -> refused a 0-period pipeline has no depth to drain
+shape 0 1 1 -> refused a 0-period pipeline has no depth to drain
+shape 0 1 2 -> refused a 0-period pipeline has no depth to drain
+shape 0 1 4 -> refused a 0-period pipeline has no depth to drain
+shape 0 1 511 -> refused a 0-period pipeline has no depth to drain
+shape 0 1 512 -> refused a 0-period pipeline has no depth to drain
+shape 0 1 513 -> refused a 0-period pipeline has no depth to drain
+shape 0 1 1024 -> refused a 0-period pipeline has no depth to drain
+shape 0 2 0 -> refused a 0-period pipeline has no depth to drain
+shape 0 2 1 -> refused a 0-period pipeline has no depth to drain
+shape 0 2 2 -> refused a 0-period pipeline has no depth to drain
+shape 0 2 4 -> refused a 0-period pipeline has no depth to drain
+shape 0 2 511 -> refused a 0-period pipeline has no depth to drain
+shape 0 2 512 -> refused a 0-period pipeline has no depth to drain
+shape 0 2 513 -> refused a 0-period pipeline has no depth to drain
+shape 0 2 1024 -> refused a 0-period pipeline has no depth to drain
+shape 0 3 0 -> refused a 0-period pipeline has no depth to drain
+shape 0 3 1 -> refused a 0-period pipeline has no depth to drain
+shape 0 3 2 -> refused a 0-period pipeline has no depth to drain
+shape 0 3 4 -> refused a 0-period pipeline has no depth to drain
+shape 0 3 511 -> refused a 0-period pipeline has no depth to drain
+shape 0 3 512 -> refused a 0-period pipeline has no depth to drain
+shape 0 3 513 -> refused a 0-period pipeline has no depth to drain
+shape 0 3 1024 -> refused a 0-period pipeline has no depth to drain
+shape 0 6 0 -> refused a 0-period pipeline has no depth to drain
+shape 0 6 1 -> refused a 0-period pipeline has no depth to drain
+shape 0 6 2 -> refused a 0-period pipeline has no depth to drain
+shape 0 6 4 -> refused a 0-period pipeline has no depth to drain
+shape 0 6 511 -> refused a 0-period pipeline has no depth to drain
+shape 0 6 512 -> refused a 0-period pipeline has no depth to drain
+shape 0 6 513 -> refused a 0-period pipeline has no depth to drain
+shape 0 6 1024 -> refused a 0-period pipeline has no depth to drain
+shape 1 0 0 -> refused a 1-period pipeline has no depth to drain
+shape 1 0 1 -> refused a 1-period pipeline has no depth to drain
+shape 1 0 2 -> refused a 1-period pipeline has no depth to drain
+shape 1 0 4 -> refused a 1-period pipeline has no depth to drain
+shape 1 0 511 -> refused a 1-period pipeline has no depth to drain
+shape 1 0 512 -> refused a 1-period pipeline has no depth to drain
+shape 1 0 513 -> refused a 1-period pipeline has no depth to drain
+shape 1 0 1024 -> refused a 1-period pipeline has no depth to drain
+shape 1 1 0 -> refused a 1-period pipeline has no depth to drain
+shape 1 1 1 -> refused a 1-period pipeline has no depth to drain
+shape 1 1 2 -> refused a 1-period pipeline has no depth to drain
+shape 1 1 4 -> refused a 1-period pipeline has no depth to drain
+shape 1 1 511 -> refused a 1-period pipeline has no depth to drain
+shape 1 1 512 -> refused a 1-period pipeline has no depth to drain
+shape 1 1 513 -> refused a 1-period pipeline has no depth to drain
+shape 1 1 1024 -> refused a 1-period pipeline has no depth to drain
+shape 1 2 0 -> refused a 1-period pipeline has no depth to drain
+shape 1 2 1 -> refused a 1-period pipeline has no depth to drain
+shape 1 2 2 -> refused a 1-period pipeline has no depth to drain
+shape 1 2 4 -> refused a 1-period pipeline has no depth to drain
+shape 1 2 511 -> refused a 1-period pipeline has no depth to drain
+shape 1 2 512 -> refused a 1-period pipeline has no depth to drain
+shape 1 2 513 -> refused a 1-period pipeline has no depth to drain
+shape 1 2 1024 -> refused a 1-period pipeline has no depth to drain
+shape 1 3 0 -> refused a 1-period pipeline has no depth to drain
+shape 1 3 1 -> refused a 1-period pipeline has no depth to drain
+shape 1 3 2 -> refused a 1-period pipeline has no depth to drain
+shape 1 3 4 -> refused a 1-period pipeline has no depth to drain
+shape 1 3 511 -> refused a 1-period pipeline has no depth to drain
+shape 1 3 512 -> refused a 1-period pipeline has no depth to drain
+shape 1 3 513 -> refused a 1-period pipeline has no depth to drain
+shape 1 3 1024 -> refused a 1-period pipeline has no depth to drain
+shape 1 6 0 -> refused a 1-period pipeline has no depth to drain
+shape 1 6 1 -> refused a 1-period pipeline has no depth to drain
+shape 1 6 2 -> refused a 1-period pipeline has no depth to drain
+shape 1 6 4 -> refused a 1-period pipeline has no depth to drain
+shape 1 6 511 -> refused a 1-period pipeline has no depth to drain
+shape 1 6 512 -> refused a 1-period pipeline has no depth to drain
+shape 1 6 513 -> refused a 1-period pipeline has no depth to drain
+shape 1 6 1024 -> refused a 1-period pipeline has no depth to drain
+shape 2 0 0 -> refused 0 channels is neither mono nor stereo
+shape 2 0 1 -> refused 0 channels is neither mono nor stereo
+shape 2 0 2 -> refused 0 channels is neither mono nor stereo
+shape 2 0 4 -> refused 0 channels is neither mono nor stereo
+shape 2 0 511 -> refused 0 channels is neither mono nor stereo
+shape 2 0 512 -> refused 0 channels is neither mono nor stereo
+shape 2 0 513 -> refused 0 channels is neither mono nor stereo
+shape 2 0 1024 -> refused 0 channels is neither mono nor stereo
+shape 2 1 0 -> refused a 0-byte period is not a whole number of 2-byte frames
+shape 2 1 1 -> refused a 1-byte period is not a whole number of 2-byte frames
+shape 2 1 2 -> ok 1
+shape 2 1 4 -> ok 2
+shape 2 1 511 -> refused a 511-byte period is not a whole number of 2-byte frames
+shape 2 1 512 -> ok 256
+shape 2 1 513 -> refused a 513-byte period is not a whole number of 2-byte frames
+shape 2 1 1024 -> ok 512
+shape 2 2 0 -> refused a 0-byte period is not a whole number of 4-byte frames
+shape 2 2 1 -> refused a 1-byte period is not a whole number of 4-byte frames
+shape 2 2 2 -> refused a 2-byte period is not a whole number of 4-byte frames
+shape 2 2 4 -> ok 1
+shape 2 2 511 -> refused a 511-byte period is not a whole number of 4-byte frames
+shape 2 2 512 -> ok 128
+shape 2 2 513 -> refused a 513-byte period is not a whole number of 4-byte frames
+shape 2 2 1024 -> ok 256
+shape 2 3 0 -> refused 3 channels is neither mono nor stereo
+shape 2 3 1 -> refused 3 channels is neither mono nor stereo
+shape 2 3 2 -> refused 3 channels is neither mono nor stereo
+shape 2 3 4 -> refused 3 channels is neither mono nor stereo
+shape 2 3 511 -> refused 3 channels is neither mono nor stereo
+shape 2 3 512 -> refused 3 channels is neither mono nor stereo
+shape 2 3 513 -> refused 3 channels is neither mono nor stereo
+shape 2 3 1024 -> refused 3 channels is neither mono nor stereo
+shape 2 6 0 -> refused 6 channels is neither mono nor stereo
+shape 2 6 1 -> refused 6 channels is neither mono nor stereo
+shape 2 6 2 -> refused 6 channels is neither mono nor stereo
+shape 2 6 4 -> refused 6 channels is neither mono nor stereo
+shape 2 6 511 -> refused 6 channels is neither mono nor stereo
+shape 2 6 512 -> refused 6 channels is neither mono nor stereo
+shape 2 6 513 -> refused 6 channels is neither mono nor stereo
+shape 2 6 1024 -> refused 6 channels is neither mono nor stereo
+shape 3 0 0 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 0 1 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 0 2 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 0 4 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 0 511 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 0 512 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 0 513 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 0 1024 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 1 0 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 1 1 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 1 2 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 1 4 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 1 511 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 1 512 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 1 513 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 1 1024 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 2 0 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 2 1 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 2 2 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 2 4 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 2 511 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 2 512 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 2 513 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 2 1024 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 3 0 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 3 1 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 3 2 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 3 4 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 3 511 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 3 512 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 3 513 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 3 1024 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 6 0 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 6 1 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 6 2 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 6 4 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 6 511 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 6 512 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 6 513 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 3 6 1024 -> refused 3 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 4 0 0 -> refused 0 channels is neither mono nor stereo
+shape 4 0 1 -> refused 0 channels is neither mono nor stereo
+shape 4 0 2 -> refused 0 channels is neither mono nor stereo
+shape 4 0 4 -> refused 0 channels is neither mono nor stereo
+shape 4 0 511 -> refused 0 channels is neither mono nor stereo
+shape 4 0 512 -> refused 0 channels is neither mono nor stereo
+shape 4 0 513 -> refused 0 channels is neither mono nor stereo
+shape 4 0 1024 -> refused 0 channels is neither mono nor stereo
+shape 4 1 0 -> refused a 0-byte period is not a whole number of 2-byte frames
+shape 4 1 1 -> refused a 1-byte period is not a whole number of 2-byte frames
+shape 4 1 2 -> ok 1
+shape 4 1 4 -> ok 2
+shape 4 1 511 -> refused a 511-byte period is not a whole number of 2-byte frames
+shape 4 1 512 -> ok 256
+shape 4 1 513 -> refused a 513-byte period is not a whole number of 2-byte frames
+shape 4 1 1024 -> ok 512
+shape 4 2 0 -> refused a 0-byte period is not a whole number of 4-byte frames
+shape 4 2 1 -> refused a 1-byte period is not a whole number of 4-byte frames
+shape 4 2 2 -> refused a 2-byte period is not a whole number of 4-byte frames
+shape 4 2 4 -> ok 1
+shape 4 2 511 -> refused a 511-byte period is not a whole number of 4-byte frames
+shape 4 2 512 -> ok 128
+shape 4 2 513 -> refused a 513-byte period is not a whole number of 4-byte frames
+shape 4 2 1024 -> ok 256
+shape 4 3 0 -> refused 3 channels is neither mono nor stereo
+shape 4 3 1 -> refused 3 channels is neither mono nor stereo
+shape 4 3 2 -> refused 3 channels is neither mono nor stereo
+shape 4 3 4 -> refused 3 channels is neither mono nor stereo
+shape 4 3 511 -> refused 3 channels is neither mono nor stereo
+shape 4 3 512 -> refused 3 channels is neither mono nor stereo
+shape 4 3 513 -> refused 3 channels is neither mono nor stereo
+shape 4 3 1024 -> refused 3 channels is neither mono nor stereo
+shape 4 6 0 -> refused 6 channels is neither mono nor stereo
+shape 4 6 1 -> refused 6 channels is neither mono nor stereo
+shape 4 6 2 -> refused 6 channels is neither mono nor stereo
+shape 4 6 4 -> refused 6 channels is neither mono nor stereo
+shape 4 6 511 -> refused 6 channels is neither mono nor stereo
+shape 4 6 512 -> refused 6 channels is neither mono nor stereo
+shape 4 6 513 -> refused 6 channels is neither mono nor stereo
+shape 4 6 1024 -> refused 6 channels is neither mono nor stereo
+shape 6 0 0 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 0 1 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 0 2 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 0 4 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 0 511 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 0 512 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 0 513 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 0 1024 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 1 0 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 1 1 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 1 2 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 1 4 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 1 511 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 1 512 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 1 513 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 1 1024 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 2 0 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 2 1 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 2 2 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 2 4 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 2 511 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 2 512 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 2 513 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 2 1024 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 3 0 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 3 1 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 3 2 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 3 4 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 3 511 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 3 512 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 3 513 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 3 1024 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 6 0 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 6 1 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 6 2 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 6 4 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 6 511 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 6 512 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 6 513 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 6 6 1024 -> refused 6 periods is not a power of two, and a client ring's indices wrap mod 2^32
+shape 8 0 0 -> refused 0 channels is neither mono nor stereo
+shape 8 0 1 -> refused 0 channels is neither mono nor stereo
+shape 8 0 2 -> refused 0 channels is neither mono nor stereo
+shape 8 0 4 -> refused 0 channels is neither mono nor stereo
+shape 8 0 511 -> refused 0 channels is neither mono nor stereo
+shape 8 0 512 -> refused 0 channels is neither mono nor stereo
+shape 8 0 513 -> refused 0 channels is neither mono nor stereo
+shape 8 0 1024 -> refused 0 channels is neither mono nor stereo
+shape 8 1 0 -> refused a 0-byte period is not a whole number of 2-byte frames
+shape 8 1 1 -> refused a 1-byte period is not a whole number of 2-byte frames
+shape 8 1 2 -> ok 1
+shape 8 1 4 -> ok 2
+shape 8 1 511 -> refused a 511-byte period is not a whole number of 2-byte frames
+shape 8 1 512 -> ok 256
+shape 8 1 513 -> refused a 513-byte period is not a whole number of 2-byte frames
+shape 8 1 1024 -> ok 512
+shape 8 2 0 -> refused a 0-byte period is not a whole number of 4-byte frames
+shape 8 2 1 -> refused a 1-byte period is not a whole number of 4-byte frames
+shape 8 2 2 -> refused a 2-byte period is not a whole number of 4-byte frames
+shape 8 2 4 -> ok 1
+shape 8 2 511 -> refused a 511-byte period is not a whole number of 4-byte frames
+shape 8 2 512 -> ok 128
+shape 8 2 513 -> refused a 513-byte period is not a whole number of 4-byte frames
+shape 8 2 1024 -> ok 256
+shape 8 3 0 -> refused 3 channels is neither mono nor stereo
+shape 8 3 1 -> refused 3 channels is neither mono nor stereo
+shape 8 3 2 -> refused 3 channels is neither mono nor stereo
+shape 8 3 4 -> refused 3 channels is neither mono nor stereo
+shape 8 3 511 -> refused 3 channels is neither mono nor stereo
+shape 8 3 512 -> refused 3 channels is neither mono nor stereo
+shape 8 3 513 -> refused 3 channels is neither mono nor stereo
+shape 8 3 1024 -> refused 3 channels is neither mono nor stereo
+shape 8 6 0 -> refused 6 channels is neither mono nor stereo
+shape 8 6 1 -> refused 6 channels is neither mono nor stereo
+shape 8 6 2 -> refused 6 channels is neither mono nor stereo
+shape 8 6 4 -> refused 6 channels is neither mono nor stereo
+shape 8 6 511 -> refused 6 channels is neither mono nor stereo
+shape 8 6 512 -> refused 6 channels is neither mono nor stereo
+shape 8 6 513 -> refused 6 channels is neither mono nor stereo
+shape 8 6 1024 -> refused 6 channels is neither mono nor stereo
+shape 16 0 0 -> refused 0 channels is neither mono nor stereo
+shape 16 0 1 -> refused 0 channels is neither mono nor stereo
+shape 16 0 2 -> refused 0 channels is neither mono nor stereo
+shape 16 0 4 -> refused 0 channels is neither mono nor stereo
+shape 16 0 511 -> refused 0 channels is neither mono nor stereo
+shape 16 0 512 -> refused 0 channels is neither mono nor stereo
+shape 16 0 513 -> refused 0 channels is neither mono nor stereo
+shape 16 0 1024 -> refused 0 channels is neither mono nor stereo
+shape 16 1 0 -> refused a 0-byte period is not a whole number of 2-byte frames
+shape 16 1 1 -> refused a 1-byte period is not a whole number of 2-byte frames
+shape 16 1 2 -> ok 1
+shape 16 1 4 -> ok 2
+shape 16 1 511 -> refused a 511-byte period is not a whole number of 2-byte frames
+shape 16 1 512 -> ok 256
+shape 16 1 513 -> refused a 513-byte period is not a whole number of 2-byte frames
+shape 16 1 1024 -> ok 512
+shape 16 2 0 -> refused a 0-byte period is not a whole number of 4-byte frames
+shape 16 2 1 -> refused a 1-byte period is not a whole number of 4-byte frames
+shape 16 2 2 -> refused a 2-byte period is not a whole number of 4-byte frames
+shape 16 2 4 -> ok 1
+shape 16 2 511 -> refused a 511-byte period is not a whole number of 4-byte frames
+shape 16 2 512 -> ok 128
+shape 16 2 513 -> refused a 513-byte period is not a whole number of 4-byte frames
+shape 16 2 1024 -> ok 256
+shape 16 3 0 -> refused 3 channels is neither mono nor stereo
+shape 16 3 1 -> refused 3 channels is neither mono nor stereo
+shape 16 3 2 -> refused 3 channels is neither mono nor stereo
+shape 16 3 4 -> refused 3 channels is neither mono nor stereo
+shape 16 3 511 -> refused 3 channels is neither mono nor stereo
+shape 16 3 512 -> refused 3 channels is neither mono nor stereo
+shape 16 3 513 -> refused 3 channels is neither mono nor stereo
+shape 16 3 1024 -> refused 3 channels is neither mono nor stereo
+shape 16 6 0 -> refused 6 channels is neither mono nor stereo
+shape 16 6 1 -> refused 6 channels is neither mono nor stereo
+shape 16 6 2 -> refused 6 channels is neither mono nor stereo
+shape 16 6 4 -> refused 6 channels is neither mono nor stereo
+shape 16 6 511 -> refused 6 channels is neither mono nor stereo
+shape 16 6 512 -> refused 6 channels is neither mono nor stereo
+shape 16 6 513 -> refused 6 channels is neither mono nor stereo
+shape 16 6 1024 -> refused 6 channels is neither mono nor stereo
+shape 17 0 0 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 0 1 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 0 2 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 0 4 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 0 511 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 0 512 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 0 513 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 0 1024 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 1 0 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 1 1 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 1 2 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 1 4 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 1 511 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 1 512 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 1 513 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 1 1024 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 2 0 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 2 1 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 2 2 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 2 4 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 2 511 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 2 512 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 2 513 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 2 1024 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 3 0 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 3 1 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 3 2 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 3 4 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 3 511 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 3 512 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 3 513 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 3 1024 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 6 0 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 6 1 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 6 2 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 6 4 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 6 511 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 6 512 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 6 513 -> refused 17 periods is deeper than the 16 a free list holds
+shape 17 6 1024 -> refused 17 periods is deeper than the 16 a free list holds
+shape 32 0 0 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 0 1 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 0 2 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 0 4 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 0 511 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 0 512 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 0 513 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 0 1024 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 1 0 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 1 1 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 1 2 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 1 4 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 1 511 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 1 512 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 1 513 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 1 1024 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 2 0 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 2 1 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 2 2 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 2 4 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 2 511 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 2 512 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 2 513 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 2 1024 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 3 0 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 3 1 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 3 2 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 3 4 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 3 511 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 3 512 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 3 513 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 3 1024 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 6 0 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 6 1 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 6 2 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 6 4 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 6 511 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 6 512 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 6 513 -> refused 32 periods is deeper than the 16 a free list holds
+shape 32 6 1024 -> refused 32 periods is deeper than the 16 a free list holds
+
+== deferral floor
+floor 0 -> none
+floor 1 -> none
+floor 2 -> none
+floor 3 -> none
+floor 4 -> none
+floor 5 -> none
+floor 6 -> 14512470
+floor 7 -> 14512470
+floor 8 -> 14512470
+floor 9 -> 14512470
+floor 10 -> 14512470
+floor 11 -> 14512470
+floor 12 -> 14512470
+floor 13 -> 14512470
+floor 14 -> 14512470
+floor 15 -> 14512470
+floor 16 -> 14512470
+
+== client period sizing
+sizing 44100 64 scratch=279 worst=279 digest=459947b6a70b318d
+sizing 44100 128 scratch=558 worst=558 digest=91e576a5be170837
+sizing 44100 256 scratch=1115 worst=1115 digest=b9b1f92041764031
+sizing 48000 64 scratch=256 worst=256 digest=cb423c163d7b3d2e
+sizing 48000 128 scratch=512 worst=512 digest=c67bcf579bf8271a
+sizing 48000 256 scratch=1024 worst=1024 digest=208402334e11e24c
+sizing 96000 64 scratch=128 worst=128 digest=e8ade32761a1fc43
+sizing 96000 128 scratch=256 worst=256 digest=cb423c163d7b3d2e
+sizing 96000 256 scratch=512 worst=512 digest=c67bcf579bf8271a
+sizing 192000 64 scratch=64 worst=64 digest=f1e5b948327eb666
+sizing 192000 128 scratch=128 worst=128 digest=e8ade32761a1fc43
+sizing 192000 256 scratch=256 worst=256 digest=cb423c163d7b3d2e
+sizing-one 44100 44100 -> 128
+sizing-one 44100 8000 -> 24
+sizing-one 44100 192000 -> 558
+sizing-one 44100 44099 -> 128
+sizing-one 44100 44101 -> 129
+sizing-one 48000 44100 -> 118
+sizing-one 48000 48000 -> 128
+
+== period and ramp
+period-nanos 8000 64 -> 8000000
+period-nanos 8000 128 -> 16000000
+period-nanos 8000 256 -> 32000000
+ramp-frames 8000 -> 40
+period-nanos 44100 64 -> 1451247
+period-nanos 44100 128 -> 2902494
+period-nanos 44100 256 -> 5804988
+ramp-frames 44100 -> 220
+period-nanos 48000 64 -> 1333333
+period-nanos 48000 128 -> 2666666
+period-nanos 48000 256 -> 5333333
+ramp-frames 48000 -> 240
+period-nanos 96000 64 -> 666666
+period-nanos 96000 128 -> 1333333
+period-nanos 96000 256 -> 2666666
+ramp-frames 96000 -> 480
+period-nanos 192000 64 -> 333333
+period-nanos 192000 128 -> 666666
+period-nanos 192000 256 -> 1333333
+ramp-frames 192000 -> 960
+
+== dll
+dll-0 period=414624ef00000000 est=41ce3c26bcfec56d
+dll-1 period=414624ee9bb09737 est=41ce524b9eef191d
+dll-2 period=414624edd6142782 est=41ce687073cfc07e
+dll-3 period=414624ec4e224e12 est=41ce94ba1c7315d3
+dll-4 period=414624ea6de7d2a4 est=41ceaadeca399ab9
+dll-5 period=414624e92273a716 est=41cec103897f0ce0
+dll-digest d1b300b31e7ce529
+dll-period 414623e69666c754
+dll-runaway-period 415624ef00000000
+dll-collapse-period 413624ef00000000
+dll-reset period=414624ef00000000 est=None
+
+== stats
+stats-0 underruns=0 starve_run=0 starve_max=0
+stats-1 underruns=0 starve_run=0 starve_max=0
+stats-2 underruns=0 starve_run=0 starve_max=0
+stats-3 underruns=1 starve_run=1 starve_max=1
+stats-4 underruns=2 starve_run=2 starve_max=2
+stats-5 underruns=3 starve_run=3 starve_max=3
+stats-6 underruns=3 starve_run=0 starve_max=3
+stats-7 underruns=4 starve_run=1 starve_max=3
+stats-8 underruns=4 starve_run=1 starve_max=3
+stats-9 underruns=5 starve_run=2 starve_max=3
+stats-10 underruns=6 starve_run=3 starve_max=3
+stats-11 underruns=7 starve_run=4 starve_max=4
+stats-12 underruns=8 starve_run=5 starve_max=5
+stats-13 underruns=8 starve_run=0 starve_max=5
+stats-14 underruns=8 starve_run=0 starve_max=5
+stats-15 underruns=9 starve_run=1 starve_max=5
+stats-16 underruns=9 starve_run=1 starve_max=5
+stats-17 underruns=10 starve_run=2 starve_max=5
+stats-18 underruns=10 starve_run=0 starve_max=5
+stats-19 underruns=11 starve_run=1 starve_max=5
+stats-20 underruns=12 starve_run=2 starve_max=5
+stats-21 underruns=13 starve_run=3 starve_max=5
+stats-22 underruns=14 starve_run=4 starve_max=5
+stats-23 underruns=15 starve_run=5 starve_max=5
+
+== scenes: the whole chain
+scene-stereo-128-p0[0000]  32767 -16608  32767 -16793  32767 -16943  32767 -17054  32767 -17128  32767 -17166  32767 -17166  32767 -17129
+scene-stereo-128-p0[0016]  17054 -32768  17315 -32768  17614 -32768  17949 -32768  18320 -32768  18731 -32768  19178 -32768  19663 -32768
+scene-stereo-128-p7[0000]     -1 -28668   8197 -20471  16396 -12273  24593  -4075  32767   4123  32767  12320  32767  20520  32767  28717
+scene-stereo-128-p7[0016] -32721 -32768 -24522 -32768 -16324 -32768  -8127 -32768     72 -28598   8269 -20399  16468 -12201  24666  -4003
+scene-stereo-128-digest b97ac78de0fd7764
+scene-stereo-128-gain0 3f800000
+scene-stereo-128-gain1 3f800000
+scene-stereo-128-gain2 00000000
+scene-stereo-128-gain3 3f000000
+scene-mono-128-p0[0000]  16160  15974  15825  15714  15639  15602  15602  15639 -15713 -15452 -15154 -14819 -14446 -14037 -13589 -13105
+scene-mono-128-p0[0016]  12588  12702  12851  13037  13262  13523  13821  14157 -14515 -13956 -13360 -12725 -12054 -11346 -10600  -9817
+scene-mono-128-p7[0000] -14335  -6137   2062  10259  18457  26656  32767  32767 -32768 -32768 -30658 -22460 -14262  -6064   2133  10331
+scene-mono-128-p7[0016] -14239  -6041   2157  10355  18553  26751  32767  32767 -32768 -32768 -30563 -22366 -14166  -5969   2230  10427
+scene-mono-128-digest 5d16efbdb198642a
+scene-mono-128-gain0 3f800000
+scene-mono-128-gain1 3f800000
+scene-mono-128-gain2 00000000
+scene-mono-128-gain3 3f000000
+scene-stereo-1-p0[0000]  32767 -16608
+scene-stereo-1-p7[0000] -32768 -32768
+scene-stereo-1-digest 8dc0f7be7b9d0704
+scene-stereo-1-gain0 3f800000
+scene-stereo-1-gain1 3d14f209
+scene-stereo-1-gain2 3f76b0e0
+scene-stereo-1-gain3 3f000000
+scene-stereo-3-p0[0000]  32767 -16608  32767 -16793  32767 -16943
+scene-stereo-3-p7[0000] -32768 -32768 -32768 -32768 -27394 -32768
+scene-stereo-3-digest 116afd665921c510
+scene-stereo-3-gain0 3f800000
+scene-stereo-3-gain1 3ddf6b12
+scene-stereo-3-gain2 3f6412a0
+scene-stereo-3-gain3 3f000000
+scene-stereo-127-p0[0000]  32767 -16608  32767 -16793  32767 -16943  32767 -17054  32767 -17128  32767 -17166  32767 -17166  32767 -17129
+scene-stereo-127-p0[0016]  17054 -32768  17315 -32768  17614 -32768  17949 -32768  18320 -32768  18731 -32768  19178 -32768  19663 -32768
+scene-stereo-127-p7[0000]      0 -28669   8198 -20471  16396 -12273  24594  -4075  32767   4123  32767  12321  32767  20519  32767  28718
+scene-stereo-127-p7[0016] -32721 -32768 -24522 -32768 -16325 -32768  -8126 -32768     71 -28598   8269 -20398  16467 -12201  24665  -4002
+scene-stereo-127-digest 9b739a6d7a7dfb62
+scene-stereo-127-gain0 3f800000
+scene-stereo-127-gain1 3f800000
+scene-stereo-127-gain2 00000000
+scene-stereo-127-gain3 3f000000
+scene-stereo-129-p0[0000]  32767 -16608  32767 -16793  32767 -16943  32767 -17054  32767 -17128  32767 -17166  32767 -17166  32767 -17129
+scene-stereo-129-p0[0016]  17054 -32768  17315 -32768  17614 -32768  17949 -32768  18320 -32768  18731 -32768  19178 -32768  19663 -32768
+scene-stereo-129-p7[0000]     -1 -28669   8197 -20470  16396 -12273  24594  -4075  32767   4123  32767  12320  32767  20519  32767  28717
+scene-stereo-129-p7[0016] -32720 -32768 -24523 -32768 -16325 -32768  -8127 -32768     71 -28597   8269 -20399  16467 -12201  24665  -4003
+scene-stereo-129-digest c1d065eedc6a468c
+scene-stereo-129-gain0 3f800000
+scene-stereo-129-gain1 3f800000
+scene-stereo-129-gain2 00000000
+scene-stereo-129-gain3 3f000000
+
+== scenes: a client that supplies nothing
+starved-0 3ed61bee idle=false
+starved-1 00000000 idle=true
+starved-2 00000000 idle=true
