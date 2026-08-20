@@ -27,6 +27,10 @@ pub struct RawKeyEvent {
     pub modifiers: u8,
 }
 
+/// Every byte belongs to a field: this crosses the boundary through
+/// `as_bytes`, so a gap would publish whatever the kernel stack held.
+const _: () = assert!(core::mem::size_of::<RawKeyEvent>() == 1 + 1);
+
 impl RawKeyEvent {
     pub fn pressed(&self) -> bool { self.modifiers & MOD_RELEASED == 0 }
     pub fn released(&self) -> bool { self.modifiers & MOD_RELEASED != 0 }
@@ -36,6 +40,10 @@ impl RawKeyEvent {
     pub fn gui(&self) -> bool { self.modifiers & MOD_GUI != 0 }
 
     pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `self` is a valid `&Self` (non-null, aligned, readable for
+        // `size_of::<Self>()` bytes), and the const assert above proves the
+        // `repr(C)` layout has no padding, so every byte the slice exposes is
+        // an initialized field, not a gap.
         unsafe {
             core::slice::from_raw_parts(self as *const Self as *const u8, core::mem::size_of::<Self>())
         }
@@ -53,8 +61,16 @@ pub struct MouseEvent {
     pub abs_y: u16,
 }
 
+/// Every byte belongs to a field: this crosses the boundary through
+/// `as_bytes`, so a gap would publish whatever the kernel stack held.
+const _: () = assert!(core::mem::size_of::<MouseEvent>() == 1 + 1 + 2 + 2);
+
 impl MouseEvent {
     pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `self` is a valid `&Self` (non-null, aligned, readable for
+        // `size_of::<Self>()` bytes), and the const assert above proves the
+        // `repr(C)` layout has no padding, so every byte the slice exposes is
+        // an initialized field, not a gap.
         unsafe {
             core::slice::from_raw_parts(self as *const Self as *const u8, core::mem::size_of::<Self>())
         }
