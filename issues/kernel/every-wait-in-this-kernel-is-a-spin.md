@@ -121,6 +121,20 @@ both before any lock conversion; the order is forced, not preferred.
   68 process-data sites, 259 lock calls over 45 statics. **The token cannot be
   threaded through the block-device trait**, which lives in a pure host-tested
   crate.
+
+  **Six, and the count above is the xHCI chunk's rather than the machine's.**
+  Checked 2026-08-20: the four are `vfs::VFS`, `fat32_adapter::VOLUMES`,
+  `xhci::XHCI` and `process::ProcessData`, and that is exact for the USB path,
+  because `FatDevice` owns its `Box<dyn BlockDevice>` outright and a FAT read
+  never touches the page cache. The **NVMe** path is
+  `page_cache::BLOCK_CACHE` → `page_cache::BLOCK_DEV` → `NvmeDisk::read_blocks`,
+  and both of those are `sync::Lock`s held across the whole device round trip
+  (`raw_block_read`, `raw_block_write`, `PageCacheGuard::cache_and_dev`; the
+  order is stated in `page_cache.rs` and never reversed). So whoever converts
+  the NVMe wait inherits two more statics, and neither is a leaf: `BLOCK_CACHE`
+  guards a `HashMap` and a slot vector every btree walk touches, and `BLOCK_DEV`
+  guards the `Box<dyn BlockDevice>` whose trait provably cannot carry a park
+  token. Nobody may read "there is no fifth" as a property of the kernel.
 - **A bulk transfer has zero real cancellers once the transfer bound is
   deleted** — the reset-recovery path's only trigger *is* that bound. So the
   largest open decision is a tripwire on the transfer against a budget at the
@@ -279,12 +293,15 @@ request, because the baseline assertion refuses any split.
    abandoning anything: the waiter wakes and *then* decides. So the owed item is
    a property of the park and lands with it.
 
-Two findings from the 2026-08-20 pass, filed rather than fixed:
-`issues/kernel/the-nvme-wait-has-two-locks-the-four-lock-count-does-not-name.md`
-— "four locks and there is no fifth" is true of the xHCI path and not of the
-machine, because `page_cache::{BLOCK_CACHE, BLOCK_DEV}` are both held across
-`nvme::Queue::wait_completion`, which spins with no deadline at all — and
-`issues/build/kernel-clippy-runs-without-the-actuator-features.md`.
+One finding from the 2026-08-20 pass, filed rather than fixed:
+`issues/build/kernel-clippy-runs-without-the-actuator-features.md`. The other —
+the two page-cache locks the count above did not name — is now the paragraph
+under "Four locks convert and there is no fifth", and the deadline half of it
+landed the same day: `nvme::Queue::wait_completion` spun with nothing bounding
+it at all, and now takes `drivers/nvme.rs`'s `COMMAND` inside a command and
+`block::OPERATION` between two, exactly as the USB path does. The **conversion**
+of `BLOCK_CACHE` and `BLOCK_DEV` did not land and is not in the list above; it
+is the NVMe chunk's, and it is owed on top of the four.
 
 `drain_zero_handles`'s derived constraint — none of its three drain sites can
 park, so no `on_zero_handles` hook may take a sleep lock — is **untouched by

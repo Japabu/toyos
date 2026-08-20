@@ -53,7 +53,7 @@ shard-publish-relaxed = []
 # no unbounded branch, which is what makes this one modellable at all.
 sleeplock-acquire-off = []
 # **Every actuator, and which one is armed comes from the boot parameter.**
-# `kernel/src/actuator.rs` declares all 47 with the claim each rests on; this
+# `kernel/src/actuator.rs` declares every one of them with the claim each rests on; this
 # name is the whole of what a build decides about them. A kernel without it has
 # no arm set, no name and no parser, every accessor is `const fn … { false }`,
 # and a constant an actuator moves is still a constant.
