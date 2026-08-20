@@ -1,0 +1,32 @@
+name: self-hosted-runner-smoke
+
+# Deliberately manual-only: this persistent runner belongs to a public
+# repository, so no pull request or fork-controlled tree may select it.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  container:
+    runs-on: [self-hosted, Linux, X64, toyos]
+    # A wedge guard, not a measured duration: every step is a fixed host or
+    # device assertion and no source tree is checked out.
+    timeout-minutes: 5
+    container:
+      image: ubuntu:24.04
+      options: --device=/dev/kvm
+    steps:
+      - name: runner and container boundary
+        run: |
+          test "$RUNNER_NAME" = t14
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          test -f /.dockerenv
+          test -c /dev/kvm
+          test -r /dev/kvm
+          test -w /dev/kvm
+          uname -a
+          cat /etc/os-release
+          nproc
+          df -h /
