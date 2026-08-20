@@ -22,6 +22,7 @@ use std::os::toyos::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use toyos::port::Acceptor;
+use toyos::AsHandle;
 use toyos::{ipc, namespace, port};
 use toyos_abi::syscall::SVC_LABEL;
 use window::{CreateError, Window};
@@ -78,7 +79,7 @@ fn server() {
 /// readable once the writer is gone.
 fn serve_one(acceptor: &Acceptor, reply: Option<u32>) {
     let accepted = acceptor.accept().expect("accept a client");
-    let handle = accepted.fd();
+    let handle = accepted.as_handle();
     let header = ipc::recv_header(handle).expect("request header");
     assert_eq!(header.msg_type, window::MSG_CREATE_WINDOW, "client sent the wrong request");
     let _req: window::CreateWindowRequest =

@@ -1,4 +1,4 @@
-//! A cancelled `POLL_ADD` must wake the thread that is waiting for it.
+//! A cancelled `OP_WATCH` must wake the thread that is waiting for it.
 //!
 //! `io_uring::cancel_by_source` cancels every pending poll on a source that is going
 //! away and posts `-NotFound` for each, so the caller knows to look at the
@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos_abi::syscall;
 
 const TOKEN: u64 = 7;
@@ -44,7 +44,7 @@ fn main() {
 
     let waiter = thread::spawn(move || {
         let poller = Poller::new(4);
-        poller.poll_add_fd(pipe.read, IORING_POLL_IN, TOKEN);
+        poller.watch_raw(pipe.read, READABLE, TOKEN);
         // A non-blocking enter, so the poll is registered in the kernel before
         // anything is closed. Without it the close could reach a ring with
         // nothing pending in it and cancel nothing at all, which is a

@@ -35,7 +35,7 @@ use std::os::toyos::process::CommandExt;
 use toyos::device::Keyboard;
 use toyos::endow::Endowments;
 use toyos::namespace;
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::port::{self, Connector};
 use toyos::surface::{self, Delivery, Host, Notice};
 use toyos::syscap::SysCap;
@@ -216,10 +216,10 @@ fn detect(mut surface: Surface, connector: &Connector) {
     let poller = Poller::new(1 + Host::POLL_HANDLES);
     let deadline = Instant::now() + Duration::from_secs(25);
     while !wizard_done.load(Ordering::Relaxed) && Instant::now() < deadline {
-        poller.poll_add(&surface.keyboard, IORING_POLL_IN, TOKEN_KEYBOARD);
-        poller.poll_add_fd(surface.host.acceptor_fd(), IORING_POLL_IN, TOKEN_LISTEN);
-        for client in surface.host.client_fds() {
-            poller.poll_add_fd(client, IORING_POLL_IN, TOKEN_CLIENT);
+        poller.watch(&surface.keyboard, READABLE, TOKEN_KEYBOARD);
+        poller.watch_raw(surface.host.acceptor_handle(), READABLE, TOKEN_LISTEN);
+        for client in surface.host.client_handles() {
+            poller.watch_raw(client, READABLE, TOKEN_CLIENT);
         }
 
         let mut ready = [false; 4];
