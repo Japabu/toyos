@@ -19,6 +19,13 @@ caches concurrently. A cancelled build can leave an incomplete Cargo target;
 Cargo resumes or rebuilds it. An incomplete compiler entry has no `.complete`
 marker and is emptied before the next download.
 
+`link-build-cache.sh` links every Cargo target before the suite. If the build
+system invalidates an external-dependency stamp, Cargo replaces that link with
+a real directory; `save-build-cache.sh` snapshots only those directories back
+to the content-keyed cache before Actions cleans the checkout. It uses hard
+links when the workspace and cache share a filesystem and falls back to a
+normal copy when they do not.
+
 ## Rebuild the image
 
 From a trusted checkout on the T14:

@@ -259,6 +259,16 @@ jobs:
             $SUITE_TIER_ARGS 2>&1 \
             | tee /tmp/suite.log
 
+      # A stale external-dependency stamp makes `cargo clean` replace a target
+      # symlink with a real checkout directory. Preserve that rebuilt directory
+      # before checkout cleanup so the next T14 job is warm. Links that survived
+      # already wrote into the persistent cache and this step leaves them alone.
+      - name: save local build cache
+        if: runner.name == 't14' && always()
+        env:
+          TAG: ${{ steps.key.outputs.tag }}
+        run: sh .github/runner/save-build-cache.sh
+
       # `cargo test` runs several binaries and each prints a `test result:`
       # line; the line grepped here is the suite's own, the one that
       # counts a total and names any declared `EXPECTED_FAILURES`. The
