@@ -86,10 +86,28 @@ impl Rights {
     ///
     /// [`SYS_LOG_READ`]: crate::syscall::SYS_LOG_READ
     pub const LOG: Rights = Rights(1 << 9);
+    /// On a `SysCap`: power the machine off.
+    ///
+    /// [`SYS_SHUTDOWN`] ends every process there is and does not come back, so
+    /// it is the largest authority this capability carries — and it was the one
+    /// machine-wide authority that took no handle and no right at all, so any
+    /// process that could make a syscall could end the machine. It rides a bit
+    /// for the same reason minting a device claim and entering the real-time
+    /// band do: what can cut the power is exactly what `/bin/init` endowed, and
+    /// there is nothing a program can name to reach it otherwise.
+    ///
+    /// The kernel mints one capability carrying it, at boot, for `/bin/init`
+    /// (`kernel::loader::spawn_init`). `/bin/toybox` holds a narrowed duplicate
+    /// because `/bin/shutdown` is that binary under another name, and
+    /// `test-runner` holds one because `run shutdown` is how the suite ends a
+    /// guest and reads what reached the volume.
+    ///
+    /// [`SYS_SHUTDOWN`]: crate::syscall::SYS_SHUTDOWN
+    pub const POWER: Rights = Rights(1 << 10);
 
     /// Every bit that has a caller. A wider set than this is a bug in whoever
     /// composed it, not a right nobody uses.
-    pub const ALL: Rights = Rights(0x3ff);
+    pub const ALL: Rights = Rights(0x7ff);
 
     pub const fn from_bits(bits: u32) -> Option<Self> {
         if bits & !Self::ALL.0 == 0 { Some(Rights(bits)) } else { None }
@@ -120,7 +138,7 @@ impl Rights {
 /// refusal saying which right was missing.
 impl core::fmt::Debug for Rights {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        const NAMES: [(Rights, &str); 10] = [
+        const NAMES: [(Rights, &str); 11] = [
             (Rights::DUP, "DUP"),
             (Rights::TRANSFER, "TRANSFER"),
             (Rights::READ, "READ"),
@@ -131,6 +149,7 @@ impl core::fmt::Debug for Rights {
             (Rights::RT, "RT"),
             (Rights::DEVICE, "DEVICE"),
             (Rights::LOG, "LOG"),
+            (Rights::POWER, "POWER"),
         ];
         if self.0 == 0 {
             return f.write_str("NONE");

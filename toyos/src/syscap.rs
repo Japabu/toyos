@@ -1,10 +1,10 @@
 //! The capability whose whole authority is in the rights on the handle.
 //!
-//! Three things are reachable no other way — minting a device claim, entering
-//! the real-time band, and turning a pid into a process handle — and each is
-//! one bit on a handle to this. The kernel makes exactly one at boot, for
-//! `/bin/init`, so the set of processes that can ever do any of the three is
-//! exactly what init endowed.
+//! Four things are reachable no other way — minting a device claim, entering
+//! the real-time band, turning a pid into a process handle, and powering the
+//! machine off — and each is one bit on a handle to this. The kernel makes
+//! exactly one at boot, for `/bin/init`, so the set of processes that can ever
+//! do any of the four is exactly what init endowed.
 
 use toyos_abi::handle::Rights;
 use toyos_abi::syscall::{self, DeviceType, SyscallError};
@@ -41,6 +41,16 @@ impl SysCap {
     /// this; a right is.
     pub fn enter_rt(&self) -> Result<(), SyscallError> {
         syscall::rt_enter(self.0.raw())
+    }
+
+    /// Power the machine off.
+    ///
+    /// **Returns only when refused**, because a shutdown that happened has no
+    /// caller left to answer. `PermissionDenied` is a capability that does not
+    /// carry [`Rights::POWER`] — which is every capability in the machine but
+    /// the ones a `system.toml` row named `power` in.
+    pub fn shutdown(&self) -> SyscallError {
+        syscall::shutdown(self.0.raw())
     }
 
     /// A second handle to this capability carrying **less**.

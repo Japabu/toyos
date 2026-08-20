@@ -87,8 +87,14 @@ receives = ["compositor", "filepicker"]
 [programs.files]
 receives = ["compositor", "filepicker"]
 
+# `power` is `/bin/shutdown`'s, and `/bin/shutdown` is this binary under
+# another name: init resolves the symlink to this row, so the applet is endowed
+# a `SysCap` carrying `Rights::POWER` and nothing else in the image is. The
+# row's granularity is the binary, so every other applet is endowed it too —
+# the same shape as `soundd` reaching `ls`, one authority larger.
 [programs.toybox]
 receives = ["compositor", "soundd", "surface"]
+syscap = ["power"]
 
 # Symlinks created in the initrd at build time.
 # Paths are relative to the filesystem root (no leading /).

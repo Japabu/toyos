@@ -1068,9 +1068,20 @@ pub unsafe fn gpu_set_resolution(
     ))
 }
 
-/// Shut down the machine. Does not return.
-pub fn shutdown() -> ! {
-    loop { syscall(SYS_SHUTDOWN, 0, 0, 0, 0); }
+/// Power the machine off, presenting a `SysCap` that carries
+/// [`Rights::POWER`](crate::handle::Rights::POWER).
+///
+/// **The only way this comes back is refused.** A shutdown that happened has no
+/// caller left to answer, so there is no success to report and the return type
+/// is the refusal alone. The loop is what says so: a kernel that answered `0`
+/// without cutting the power has not shut down, and is asked again rather than
+/// reported as a success that did not happen.
+pub fn shutdown(syscap: RawHandle) -> SyscallError {
+    loop {
+        if let Err(e) = check_unit(syscall(SYS_SHUTDOWN, syscap.0 as u64, 0, 0, 0)) {
+            return e;
+        }
+    }
 }
 
 /// The device classes, their wire numbers, and the name a `system.toml`
