@@ -752,6 +752,18 @@ pub mod debug_action {
     /// guest can make, so only the number can move and moving it runs the
     /// shipped count, comparison and refusal.
     pub const LOWER_SYSINFO_BOUND: u64 = 19;
+    /// Put one of the caller's own **free** handle slots at the last generation
+    /// it can be issued at, and answer the `RawHandle` its next install will
+    /// carry. The argument is a slot number; a slot out of range, one that still
+    /// holds a handle, and one that has already retired all answer
+    /// `InvalidArgument`.
+    ///
+    /// A slot has 1,048,575 lifecycles, so what a table does at the end of them
+    /// is reachable for real only by a test spending two syscalls on each one.
+    /// This stages the last lifecycle and nothing else: the generation is the
+    /// shipped field, and the install and the close that follow are the shipped
+    /// paths making the shipped decision (`kernel::object::handle`).
+    pub const SLOT_TO_LAST_GENERATION: u64 = 20;
 }
 
 /// Every kind of kernel object, in the order the kernel's own `kobject!`
@@ -790,8 +802,9 @@ pub const OBJECT_KINDS: &[&str] = &[
 /// error word cut in half.
 ///
 /// A packed pair can never be mistaken for an error word: no handle is ever
-/// `0xFFFF_FFFF`, because a slot at `MAX_GENERATION` is retired rather than
-/// reissued, and `SyscallError` occupies only the top 256 values.
+/// `0xFFFF_FFFF`, because no slot is ever issued at `MAX_GENERATION` — one
+/// retires rather than stepping to it — and `SyscallError` occupies only the
+/// top 256 values.
 pub fn pipe() -> Result<PipeEnds, SyscallError> {
     let raw = check(syscall(SYS_PIPE, 0, 0, 0, 0))?;
     Ok(PipeEnds {

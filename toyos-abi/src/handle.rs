@@ -26,11 +26,21 @@ impl RawHandle {
     /// the kernel refuses by.
     pub const MAX_SLOTS: usize = 1 << Self::SLOT_BITS;
 
-    /// A slot is retired rather than reissued at this generation, so
-    /// [`HANDLE_INVALID`] — which encodes slot 4095 at this generation — is
-    /// never a handle anything holds.
+    /// **No table ever issues a handle at this generation.** A slot whose
+    /// counter would step to it retires instead — permanently, by owner ruling
+    /// of 2026-08-20 — so a spent slot is one the table no longer has rather
+    /// than one whose numbers start again. Two things rest on it: an ancient
+    /// handle can never come back to life, and [`HANDLE_INVALID`] — which
+    /// encodes slot 4095 at this generation — is a number nothing holds.
+    ///
+    /// The last generation a slot is issued at is therefore `MAX_GENERATION - 1`
+    /// (`kernel::object::handle`).
     pub const MAX_GENERATION: u32 = (1 << (32 - Self::SLOT_BITS)) - 1;
 
+    /// A generation past [`MAX_GENERATION`](Self::MAX_GENERATION) loses its
+    /// overflowing bits here rather than panicking, in every profile — which is
+    /// why the kernel's table retires a slot instead of counting past the field
+    /// and finding itself back at generation 0.
     pub const fn new(slot: u16, generation: u32) -> Self {
         Self((generation << Self::SLOT_BITS) | (slot as u32 & Self::SLOT_MASK))
     }

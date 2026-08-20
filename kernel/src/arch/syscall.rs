@@ -813,6 +813,27 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
                 SYSINFO_BOUND_LOWERED.store(true, core::sync::atomic::Ordering::Relaxed);
                 0
             }
+            // Put one of the caller's own free slots one lifecycle from the
+            // end, and answer the handle its next install will carry. A slot's
+            // counter is twenty bits, so the only other way to a table at the
+            // end of one is 1,048,575 close/reopen round trips: the retirement
+            // ruling of 2026-08-20 would be gated by a test nobody could afford
+            // to run, which is how it went ungated. Nothing here is simulated —
+            // what follows the call is the shipped install, the shipped close
+            // and `HandleTable::retire`'s own decision.
+            //
+            // It acts on the caller's own table and confers nothing: a process
+            // can already close its own handles, and all this says is which
+            // generation the next one comes back at.
+            DA::SLOT_TO_LAST_GENERATION => {
+                let Ok(slot) = u16::try_from(a2) else {
+                    return SyscallError::InvalidArgument.to_u64();
+                };
+                match process::with_process_data(|d| d.handles.stage_last_generation(slot)) {
+                    Some(h) => u64::from(h.0),
+                    None => SyscallError::InvalidArgument.to_u64(),
+                }
+            }
             _ => SyscallError::InvalidArgument.to_u64(),
         },
         SYS_SCHED_INFO => match ctx.copy_out(UserAddr::new(a1), &sys_sched_info()) {
