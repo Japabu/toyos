@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 use super::entry::{restore_user_state, ring3_naked_asm, save_user_state, Ring3Entry};
 use super::{cpu, percpu};
 use crate::drivers::acpi;
-use crate::mm::paging::{CachePolicy, Occupancy};
+use crate::mm::paging::{CachePolicy, Occupancy, Prot};
 use crate::user_ptr::{SyscallContext, UserBytes, UserBytesMut};
 use toyos_sched::task::WaitClass;
 
@@ -10,12 +10,13 @@ use crate::completion;
 use crate::object::{ops, port, KObjectRef};
 use crate::time::{Cadence, Deadline, Duration};
 use crate::{device, log, pipe, process, vfs};
-use crate::{DirectMap, UserAddr};
+use crate::UserAddr;
 
 use toyos_untrusted::Untrusted;
 
-// MSR addresses
-const MSR_EFER: u32 = 0xC000_0080;
+// MSR addresses. `IA32_EFER` is not among them: `SCE` is one bit of a register
+// `arch::control_regs` declares whole, and reading it back to OR a bit in here
+// was the second place deciding what one register held.
 const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_FMASK: u32 = 0xC000_0084;
@@ -164,10 +165,12 @@ mod canary {
     }
 }
 
+/// Point `SYSCALL` at [`syscall_entry`] on this CPU.
+///
+/// `EFER.SCE` — the bit that makes the instruction exist at all — is not set
+/// here: it is `arch::control_regs`'s, applied and asserted on this CPU before
+/// this call on both the BSP's path and an AP's.
 pub fn init() {
-    let efer = cpu::rdmsr(MSR_EFER);
-    cpu::wrmsr(MSR_EFER, efer | 1);
-
     let star = ((percpu::STAR_SYSRET_BASE as u64) << 48) | ((percpu::KERNEL_CS as u64) << 32);
     cpu::wrmsr(MSR_STAR, star);
     // `LSTAR` is an IDT slot by another name: the one thing `syscall` can reach.
@@ -1432,7 +1435,7 @@ fn sys_pipe_map(h: RawHandle) -> u64 {
         };
         let pt = crate::scheduler::current_address_space()
             .expect("sys_pipe_map: no address space");
-        let Some((vaddr, _aligned)) = process::vma_map(&pt, phys.phys(), pipe::PIPE_SIZE as u64) else {
+        let Some((vaddr, _aligned)) = process::vma_map(&pt, phys.phys(), pipe::PIPE_SIZE as u64, Prot::ReadWrite) else {
             return Ok(SyscallError::ResourceExhausted.to_u64());
         };
         data.pipe_maps.push(process::PipeMap { pipe: pipe_id, addr: vaddr });
@@ -2184,7 +2187,12 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
     }
     let aligned = crate::mm::align_2m(size as usize);
     let fixed = flags.contains(MmapFlags::FIXED);
-    let writable = prot.contains(MmapProt::WRITE);
+    // **Anonymous memory is never executable, and `MmapProt` has no bit that
+    // asks for it.** There is no JIT in this system and no `mprotect` to turn
+    // a page into code afterwards, so the heap, every guard page and every
+    // `MAP_ANONYMOUS` arena a libc hands out are data — which is what makes a
+    // stack or heap overflow a fault instead of a foothold.
+    let mapping_prot = if prot.contains(MmapProt::WRITE) { Prot::ReadWrite } else { Prot::Read };
 
     // A fixed mapping bypasses `find_gap`, so it has to respect `find_gap`'s
     // range itself: `PageTables::remap` only asserts 2 MiB alignment, so a
@@ -2278,7 +2286,6 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
                 start,
                 crate::vma::Region {
                     size: aligned as u64,
-                    writable,
                     kind: crate::vma::RegionKind::Mapped,
                 },
             );
@@ -2287,7 +2294,7 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
                     start,
                     pages.phys(),
                     aligned as u64,
-                    writable,
+                    mapping_prot,
                     CachePolicy::DeferToMtrr,
                 );
             }
@@ -2316,8 +2323,8 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
         let pt = process::current_address_space();
         let vaddr = process::with_process_data(|data| {
             let placed = match &pages {
-                Some(pages) => pt.lock().alloc_and_map(pages.phys(), aligned as u64, writable, CachePolicy::DeferToMtrr).map(|(v, _)| v),
-                None => pt.lock().alloc_region(aligned as u64, crate::vma::RegionKind::Mapped, false),
+                Some(pages) => pt.lock().alloc_and_map(pages.phys(), aligned as u64, mapping_prot, CachePolicy::DeferToMtrr).map(|(v, _)| v),
+                None => pt.lock().alloc_region(aligned as u64, crate::vma::RegionKind::Mapped),
             };
             let Some(vaddr) = placed else { return Err(()) };
             data.mmap_regions.push(process::MmapRegion {
@@ -2760,40 +2767,26 @@ fn sys_dlopen(ctx: &crate::user_ptr::SyscallContext, path: &str, init_out: Optio
     // return, not an `.expect` in syscall context.
     let pt = process::current_address_space();
     let mapped = process::with_process_data(|_data| {
-        match &lib.memory {
-            crate::elf::LibMemory::Owned(alloc) => {
-                let phys = DirectMap::phys_of(alloc.ptr());
-                let Some((vaddr, _)) = process::vma_map(&pt, phys, alloc.size() as u64) else {
-                    return Err(SyscallError::ResourceExhausted);
-                };
-                let delta = vaddr.raw() as i64 - lib.user_base.raw() as i64;
-                if delta != 0 {
-                    crate::elf::rebase_relative_relocs(&lib, delta);
-                }
-                lib.user_base = vaddr;
-                
-            }
-            crate::elf::LibMemory::Shared { rw_alloc, cached_image, rw_offset, .. } => {
-                let cached_phys = cached_image.phys();
-                let Some((lib_vaddr, _)) = process::vma_map(&pt, cached_phys, cached_image.size() as u64) else {
-                    return Err(SyscallError::ResourceExhausted);
-                };
-                let num_rw_pages = rw_alloc.size() / crate::mm::PAGE_2M as usize;
-                let rw_phys = DirectMap::phys_of(rw_alloc.ptr());
-                for i in 0..num_rw_pages {
-                    let user_virt = lib_vaddr.raw() + *rw_offset as u64 + i as u64 * crate::mm::PAGE_2M;
-                    let phys = rw_phys + i as u64 * crate::mm::PAGE_2M;
-                    pt.lock().remap(UserAddr::new(user_virt), phys, true);
-                }
-                crate::arch::tlb::shootdown();
-                let delta = lib_vaddr.raw() as i64 - lib.user_base.raw() as i64;
-                if delta != 0 {
-                    crate::elf::rebase_relative_relocs(&lib, delta);
-                }
-                lib.user_base = lib_vaddr;
-                
-            }
+        // One `map_into` for both ownership modes, and the module's own program
+        // headers decide which of its pages may be written and which may be
+        // executed. This used to be two arms that each mapped the whole image
+        // writable — which is to say executable *and* writable, for every
+        // library in every process.
+        let Some(vaddr) = lib.map_into(&pt) else {
+            return Err(SyscallError::ResourceExhausted);
+        };
+        // A `Shared` module's windows are written over a range this address
+        // space may already have handed out and reused, and a sibling thread
+        // can be running in it: what `map_window` discharged reaches this CPU
+        // only, and the rest of the machine is told here.
+        if matches!(lib.memory, crate::elf::LibMemory::Shared { .. }) {
+            crate::arch::tlb::shootdown();
         }
+        let delta = vaddr.raw() as i64 - lib.user_base.raw() as i64;
+        if delta != 0 {
+            crate::elf::rebase_relative_relocs(&lib, delta);
+        }
+        lib.user_base = vaddr;
         Ok(())
     });
     if let Err(e) = mapped {
@@ -2927,7 +2920,7 @@ fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
             let block_phys = page_alloc.phys();
             let pt = process::current_address_space();
             process::with_process_data(|data| {
-                let (vaddr, _) = process::vma_map(&pt, block_phys, page_alloc.size() as u64)
+                let (vaddr, _) = process::vma_map(&pt, block_phys, page_alloc.size() as u64, Prot::ReadWrite)
                     .ok_or(SyscallError::ResourceExhausted)?;
                 data.alloc_count += 1;
                 data.elf.dynamic_tls_blocks

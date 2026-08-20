@@ -18,6 +18,19 @@
 // the machine is `arch::tlb::shootdown`, and it stays the caller's: which other
 // CPUs hold a translation is not knowable from the entry.
 //
+// **Every user mapping states one `Prot`, and W^X is the variant that does not
+// exist.** There is no writable-and-executable page a call site can ask for, so
+// the boolean pair that used to decide it cannot be got wrong. `EFER.NXE` is
+// `arch::control_regs`' to declare; without it bit 63 would be reserved rather
+// than a permission, and every `Prot::ReadWrite` would fault.
+//
+// **User mappings are 2 MiB except where a program's own segments forbid it.**
+// One binary has one window where `.text` ends and `.data` begins, and
+// `map_window` splits exactly that window into 4 KiB entries over the same
+// frame — `WindowProt` carries the measurement that ruled out the alternatives.
+// A split is one-way: nothing coalesces a window back, and the page table lives
+// in `children` until the address space does.
+//
 // **No mapping in this kernel is global.** There is no `PAGE_GLOBAL` and
 // `CR4.PGE` is not in `arch::control_regs`'s declaration, which is what makes
 // the single-address forms complete here: INVPCID type 0 and INVLPG both leave
@@ -52,8 +65,92 @@ const PAGE_SIZE_BIT: u64 = 1 << 7;
 /// The PAT bit of a 2 MiB PDE. In a 4 KiB PTE the same bit is bit 7, so a PDE's
 /// flags cannot be carried across a split without moving it.
 const PAGE_PAT_2M: u64 = 1 << 12;
+/// The `XD` bit. Means *not executable* only while `EFER.NXE` is set, and
+/// *reserved* otherwise — `arch::control_regs` declares `NXE` on every CPU and
+/// asserts it on each, so nothing here has to ask.
+const PAGE_NX: u64 = 1 << 63;
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 const ADDR_MASK_2M: u64 = 0x000F_FFFF_FFE0_0000;
+
+/// 4 KiB pages in one 2 MiB page.
+const PAGES_PER_2M: usize = (PAGE_2M / 4096) as usize;
+
+/// What a user mapping may be used for.
+///
+/// **W^X is the missing fourth variant.** Nothing can name a page that is both
+/// writable and executable, so no call site can produce one by passing the
+/// wrong pair of booleans — which is what a `writable: bool` and an
+/// unconditionally executable entry amounted to at every mapping this kernel
+/// made.
+///
+/// Read is implied by all three: this kernel has no execute-only and no
+/// write-only mapping, because `PAGE_USER` grants read wherever it grants
+/// anything at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Prot {
+    /// A program's read-only segment, and a mapping a caller asked to be
+    /// unwritable. Neither writable nor executable.
+    Read,
+    /// Data: the stack, the heap, `mmap`, shared memory, a TLS block, a pipe's
+    /// ring, an `io_uring`'s rings. Never executable.
+    ReadWrite,
+    /// Code. Never writable.
+    ReadExec,
+}
+
+impl Prot {
+    /// The permission bits a leaf entry carries, at either granularity.
+    ///
+    /// The address, `PAGE_SIZE_BIT` and the cache policy stay the caller's —
+    /// the cache policy has to, because the PAT bit is bit 12 of a 2 MiB PDE
+    /// and bit 7 of a 4 KiB PTE.
+    fn leaf_bits(self) -> u64 {
+        let common = PAGE_PRESENT | PAGE_USER;
+        match self {
+            Self::Read => common | PAGE_NX,
+            Self::ReadWrite => common | PAGE_WRITE | PAGE_NX,
+            Self::ReadExec => common,
+        }
+    }
+}
+
+/// What each 4 KiB page of one 2 MiB window may be used for.
+///
+/// **The reason this kernel has 4 KiB user mappings at all.** `toyos-ld` emits
+/// three `PT_LOAD`s at 4 KiB alignment, so a binary has exactly one 2 MiB
+/// window holding both the end of `.text` and the start of `.data`. Measured
+/// over the boot set on 2026-08-20: 20 binaries, 33 windows, **20 of them
+/// mixed**. One [`Prot`] for such a window has to be wrong in one direction,
+/// and both wrong answers were measured: at 2 MiB granularity only 48.9 % of
+/// 44.96 MiB of text can be write-protected, and **0 %** of 2.96 MiB of program
+/// data can be made non-executable, because every writable byte in the boot set
+/// shares a window with code. Aligning the linker's segments to 2 MiB instead
+/// costs +4 MiB of physical memory per process; one page table per mixed window
+/// costs 4 KiB.
+///
+/// [`AddressSpace::map_window`] is the only consumer, and a window whose pages
+/// agree stays one 2 MiB PDE and pays no page table.
+pub struct WindowProt([Prot; PAGES_PER_2M]);
+
+impl WindowProt {
+    /// A window whose pages all say the same thing — every mapping in this
+    /// kernel that is not an ELF image.
+    pub const fn uniform(prot: Prot) -> Self {
+        Self([prot; PAGES_PER_2M])
+    }
+
+    /// Set the protection of the 4 KiB page `offset` bytes into the window. An
+    /// offset past the window is the caller's arithmetic and panics here.
+    pub fn set(&mut self, offset: u64, prot: Prot) {
+        self.0[(offset / 4096) as usize] = prot;
+    }
+
+    /// The one protection every page carries, or `None` where they disagree.
+    fn agreed(&self) -> Option<Prot> {
+        let first = self.0[0];
+        self.0.iter().all(|&p| p == first).then_some(first)
+    }
+}
 
 /// Which PAT entry a 2 MiB mapping selects, and so what memory type its pages
 /// have.
@@ -146,6 +243,24 @@ impl PageTablePage {
         Owed::of(core::mem::replace(&mut self.0[idx], value), va)
     }
 
+    /// Write one entry of a *page directory*, where a present entry is either a
+    /// 2 MiB leaf or a page table — and the two owe different invalidations.
+    ///
+    /// A leaf covers one linear address's translation and `invlpg` on any
+    /// address in it is complete. A page table has 512 leaves under it, each of
+    /// which may have its own TLB entry, and one linear address reaches exactly
+    /// one of them; the other 511 would keep a translation to a frame the PDE
+    /// no longer names. So a PDE that stops naming its page table owes the
+    /// context, derived here rather than chosen by whoever unmapped it.
+    fn write_pde(&mut self, idx: usize, va: u64, value: u64) -> Owed {
+        let prior = core::mem::replace(&mut self.0[idx], value);
+        if prior & PAGE_PRESENT != 0 && prior & PAGE_SIZE_BIT == 0 {
+            Owed::Context
+        } else {
+            Owed::of(prior, va)
+        }
+    }
+
     /// Widen an upper-level entry, which x86-64 requires to be at least as
     /// permissive as any leaf below it.
     ///
@@ -184,7 +299,9 @@ enum Owed {
     Nothing,
     /// One linear address, whose leaf changed under it.
     Address { va: u64, prior: u64 },
-    /// Everything under an upper-level entry whose permissions widened.
+    /// Everything under an upper-level entry whose permissions widened, or
+    /// under a page directory entry that stopped naming the page table its 512
+    /// leaves came from.
     Context,
 }
 
@@ -435,7 +552,7 @@ impl AddressSpace {
         vaddr: UserAddr,
         phys: u64,
         size: u64,
-        writable: bool,
+        prot: Prot,
         cache: CachePolicy,
     ) {
         assert!(
@@ -450,14 +567,11 @@ impl AddressSpace {
         while offset < size {
             let va = vaddr.raw() + offset;
             let pa = phys + offset;
-            let mut flags = PAGE_PRESENT | PAGE_USER | cache.pde_bits();
-            if writable {
-                flags |= PAGE_WRITE;
-            }
+            let flags = prot.leaf_bits() | cache.pde_bits();
             let pd_idx = indices(va).2;
             let user_flags = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
             let pd = self.ensure_table(va, user_flags, user_flags);
-            pd.write(pd_idx, va, pa | flags | PAGE_SIZE_BIT)
+            pd.write_pde(pd_idx, va, pa | flags | PAGE_SIZE_BIT)
                 .expect_install("map_range");
             offset += PAGE_2M;
         }
@@ -487,7 +601,7 @@ impl AddressSpace {
     /// caller: `sys_dlopen` replaces a mapping a sibling thread can be running
     /// on and shoots down, `loader::map_libs` writes a child no CPU has ever
     /// loaded and does not.
-    pub fn remap(&mut self, vaddr: UserAddr, phys: u64, writable: bool) {
+    pub fn remap(&mut self, vaddr: UserAddr, phys: u64, prot: Prot) {
         let va = vaddr.raw();
         assert!(
             va & (PAGE_2M - 1) == 0,
@@ -498,16 +612,72 @@ impl AddressSpace {
             "remap: phys {phys:#x} not 2MB-aligned"
         );
 
-        let mut flags = PAGE_PRESENT | PAGE_USER;
-        if writable {
-            flags |= PAGE_WRITE;
+        let pd_idx = indices(va).2;
+        let user_flags = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
+        let target = self.cr3();
+        let pd = self.ensure_table(va, user_flags, user_flags);
+        pd.write_pde(pd_idx, va, phys | prot.leaf_bits() | PAGE_SIZE_BIT)
+            .discharge(target);
+    }
+
+    /// Map one 2 MiB frame at whatever granularity its protections need.
+    ///
+    /// A window whose pages agree is a 2 MiB PDE, exactly as [`remap`] writes
+    /// one. A window whose pages disagree — the one per binary where `.text`
+    /// ends and `.data` begins — becomes a page table of 512 entries into the
+    /// same frame, each carrying its own page's [`Prot`]. See [`WindowProt`]
+    /// for why that is the design and what the alternatives were measured at.
+    ///
+    /// The frame stays one contiguous 2 MiB allocation either way, so the split
+    /// costs a page table and nothing else: no second physical page, and the
+    /// demand pager still fills one frame per fault.
+    ///
+    /// **The page table is written before it is linked**, so nothing can be
+    /// walking it while it is filled and its 512 entries owe no invalidation;
+    /// what the PDE write owes is derived from what was there, as everywhere
+    /// else. The split is one way — a window is never coalesced back — and
+    /// `children` owns the table for the address space's life, which is why
+    /// this may not be called repeatedly on one address. It is not: the only
+    /// caller is the demand-paging fault, on a PDE it has already proven
+    /// absent.
+    ///
+    /// [`remap`]: Self::remap
+    pub fn map_window(&mut self, vaddr: UserAddr, phys: u64, prot: &WindowProt) {
+        if let Some(uniform) = prot.agreed() {
+            self.remap(vaddr, phys, uniform);
+            return;
         }
+        let va = vaddr.raw();
+        assert!(
+            va & (PAGE_2M - 1) == 0,
+            "map_window: vaddr {va:#x} not 2MB-aligned"
+        );
+        assert!(
+            phys & (PAGE_2M - 1) == 0,
+            "map_window: phys {phys:#x} not 2MB-aligned"
+        );
+
+        let mut table = Box::new(PageTablePage([0; 512]));
+        for (i, &page_prot) in prot.0.iter().enumerate() {
+            // No cache bits: a split window is RAM the PMM handed out, whose
+            // policy is `DeferToMtrr` — which is the zero pattern at both
+            // granularities. A window that ever needed another memory type
+            // would have to place the PAT bit at bit 7 here, not bit 12.
+            table.init_entry(i, (phys + i as u64 * 4096) | page_prot.leaf_bits());
+        }
+        let table_phys = table.phys();
+        self.children.push(table);
 
         let pd_idx = indices(va).2;
         let user_flags = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
         let target = self.cr3();
         let pd = self.ensure_table(va, user_flags, user_flags);
-        pd.write(pd_idx, va, phys | flags | PAGE_SIZE_BIT).discharge(target);
+        // The PDE carries no `Prot` of its own: an upper-level entry must be at
+        // least as permissive as any leaf below it, so the permissions live in
+        // the 512 entries and this one only has to be present, writable and
+        // user — `NX` here would make the whole window non-executable whatever
+        // the leaves say.
+        pd.write_pde(pd_idx, va, table_phys | user_flags).discharge(target);
     }
 
     /// Unmap one 2MB page and free its physical memory.
@@ -544,8 +714,20 @@ impl AddressSpace {
             if let Some(pd) = pdpt.child_mut(pdpt_idx) {
                 let pde = pd[pd_idx];
                 if pde & PAGE_PRESENT != 0 {
-                    pd.write(pd_idx, va, 0).discharge(target);
-                    let phys = pde & ADDR_MASK_2M;
+                    // A split window's frame is not in the PDE — the PDE names
+                    // the page table. Every entry in that table addresses one
+                    // 4 KiB page of the same 2 MiB frame (`map_window` builds
+                    // no other shape), so the first one names the frame.
+                    let phys = if pde & PAGE_SIZE_BIT != 0 {
+                        pde & ADDR_MASK_2M
+                    } else {
+                        let table = unsafe { PageTablePage::from_phys(pde & ADDR_MASK) };
+                        table[0] & ADDR_MASK_2M
+                    };
+                    // `write_pde` and not `write`: clearing a PDE that named a
+                    // page table owes the context, because 512 leaves could
+                    // each be in the TLB and this one address reaches one.
+                    pd.write_pde(pd_idx, va, 0).discharge(target);
                     // Before the page can reach the PMM, and after the entry is
                     // gone: a waiter that translated this word already is on
                     // the bucket for this walk to find, and one arriving after
@@ -578,6 +760,15 @@ impl AddressSpace {
         let pde = pd[pd_idx];
         if pde & PAGE_PRESENT == 0 {
             return None;
+        }
+        if pde & PAGE_SIZE_BIT == 0 {
+            // A window `map_window` split, so the leaf is one level down.
+            let pt = pd.child(pd_idx)?;
+            let pte = pt[((va >> 12) & 0x1FF) as usize];
+            if pte & PAGE_PRESENT == 0 {
+                return None;
+            }
+            return Some(super::DirectMap::from_phys((pte & ADDR_MASK) + (va & 0xFFF)));
         }
         let page_phys = pde & ADDR_MASK_2M;
         let offset = va & (PAGE_2M - 1);
@@ -614,31 +805,25 @@ impl AddressSpace {
     }
 
     /// Allocate a virtual address range and register the region.
-    pub fn alloc_region(
-        &mut self,
-        size: u64,
-        kind: RegionKind,
-        writable: bool,
-    ) -> Option<UserAddr> {
+    pub fn alloc_region(&mut self, size: u64, kind: RegionKind) -> Option<UserAddr> {
         let aligned = align_up_2m(size);
         let addr = self.find_gap(aligned)?;
-        self.regions.insert(
-            addr,
-            Region {
-                size: aligned,
-                writable,
-                kind,
-            },
-        );
+        self.regions.insert(addr, Region { size: aligned, kind });
         Some(addr)
     }
 
-    /// Allocate a region and map physical memory into it.
+    /// Allocate a region and map physical memory into it, one protection for
+    /// the whole of it.
+    ///
+    /// An image whose pages do not agree — a shared library, whose `.text` may
+    /// not be writable and whose `.data` may not be executable — takes
+    /// [`alloc_region`](Self::alloc_region) and then one
+    /// [`map_window`](Self::map_window) per 2 MiB instead.
     pub fn alloc_and_map(
         &mut self,
         phys: u64,
         size: u64,
-        writable: bool,
+        prot: Prot,
         cache: CachePolicy,
     ) -> Option<(UserAddr, u64)> {
         let aligned = align_up_2m(size);
@@ -651,11 +836,10 @@ impl AddressSpace {
             addr,
             Region {
                 size: aligned,
-                writable,
                 kind: RegionKind::Mapped,
             },
         );
-        self.map_range(addr, phys, aligned, writable, cache);
+        self.map_range(addr, phys, aligned, prot, cache);
         Some((addr, aligned))
     }
 
@@ -745,7 +929,25 @@ impl AddressSpace {
     fn policy_at(&self, virt: u64) -> Option<CachePolicy> {
         let (pml4_idx, pdpt_idx, pd_idx) = indices(virt);
         let pde = self.root.child(pml4_idx)?.child(pdpt_idx)?[pd_idx];
-        (pde & PAGE_PRESENT != 0).then(|| CachePolicy::from_pde(pde))
+        if pde & PAGE_PRESENT == 0 {
+            return None;
+        }
+        if pde & PAGE_SIZE_BIT == 0 {
+            // A page table below: `guard_4k` and `map_window` are the two that
+            // build one, and both write leaves whose cache bits are all clear
+            // — entry 0 of the PAT, which is `DeferToMtrr`. Asserted rather
+            // than assumed, because reading a memory type off the wrong bit
+            // position is exactly the mistake the two granularities invite.
+            let pte = self.root.child(pml4_idx)?.child(pdpt_idx)?.child(pd_idx)?
+                [((virt >> 12) & 0x1FF) as usize];
+            assert!(
+                pte & (PAGE_CACHE_DISABLE | PAGE_WRITE_THROUGH | PAGE_SIZE_BIT) == 0,
+                "policy_at: the 4 KiB entry {pte:#x} at {virt:#x} selects a PAT entry \
+                 outside 0",
+            );
+            return Some(CachePolicy::DeferToMtrr);
+        }
+        Some(CachePolicy::from_pde(pde))
     }
 
     pub fn direct_map_policy(&self, phys: u64) -> Option<CachePolicy> {
@@ -801,7 +1003,7 @@ impl AddressSpace {
             self.children.push(pt);
             // Both writes are covered by the flush below, which is this CPU's
             // whole TLB and so wider than either could owe.
-            pd.write(pd_idx, virt, pt_phys | PAGE_PRESENT | PAGE_WRITE)
+            pd.write_pde(pd_idx, virt, pt_phys | PAGE_PRESENT | PAGE_WRITE)
                 .subsumed_by_flush();
         }
 
@@ -845,7 +1047,7 @@ impl AddressSpace {
         // flushes every CPU because the memory type may have changed under a
         // sibling, which the entry cannot tell it; `init` runs before any TLB
         // exists and ends by loading `CR3` with a flush.
-        pd.write(pd_idx, virt, entry).subsumed_by_flush();
+        pd.write_pde(pd_idx, virt, entry).subsumed_by_flush();
     }
 
     /// Everything an upper-level entry may carry besides the address of the
