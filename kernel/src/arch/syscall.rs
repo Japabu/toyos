@@ -1054,19 +1054,21 @@ fn sys_device_reg(handle: RawHandle, offset: u64, width: u64, value: Option<u64>
                 Err(e) => e.to_u64(),
             }
         }
-        Some(value) if value <= u32::MAX as u64 => {
-            let written = match target {
-                RegTarget::Hda => crate::drivers::hda::reg_write(offset, width, value as u32),
-                RegTarget::VirtioSound => {
-                    crate::drivers::virtio_sound::reg_write(offset, width, value as u32)
+        Some(value) => match u32::try_from(value) {
+            Ok(value) => {
+                let written = match target {
+                    RegTarget::Hda => crate::drivers::hda::reg_write(offset, width, value),
+                    RegTarget::VirtioSound => {
+                        crate::drivers::virtio_sound::reg_write(offset, width, value)
+                    }
+                };
+                match written {
+                    Ok(()) => 0,
+                    Err(e) => e.to_u64(),
                 }
-            };
-            match written {
-                Ok(()) => 0,
-                Err(e) => e.to_u64(),
             }
-        }
-        Some(_) => SyscallError::InvalidArgument.to_u64(),
+            Err(_) => SyscallError::InvalidArgument.to_u64(),
+        },
     }
 }
 
