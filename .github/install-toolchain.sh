@@ -31,6 +31,28 @@ echo "toolchain: $tag"
 # the established release-download path below.
 cache=${TOYOS_LOCAL_CACHE:-}
 cache_entry=""
+
+# The build system intentionally verifies the literal rustup link target: an
+# installed artifact belongs to this checkout at rust/build/.../stage2. Keep
+# that path while storing the bytes once in the local cache.
+link_toolchain() {
+  source_stage2=$1
+  linked_stage2=$source_stage2
+  if [ -n "$cache" ]; then
+    linked_stage2="$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+    mkdir -p "$(dirname "$linked_stage2")"
+    if [ -L "$linked_stage2" ]; then
+      rm -f "$linked_stage2"
+    elif [ -e "$linked_stage2" ]; then
+      echo "::error::$linked_stage2 exists and is not the local-cache link"
+      exit 1
+    fi
+    ln -s "$source_stage2" "$linked_stage2"
+  fi
+  rustup toolchain link toyos "$linked_stage2"
+  "$source_stage2/bin/rustc" -vV
+}
+
 if [ -n "$cache" ]; then
   case "$tag" in
     toolchain-linux-x86_64-[0-9a-f][0-9a-f]*) ;;
@@ -40,8 +62,7 @@ if [ -n "$cache" ]; then
   stage2="$cache_entry/x86_64-unknown-linux-gnu/stage2"
   if [ -f "$cache_entry/.complete" ] && [ -x "$stage2/bin/rustc" ]; then
     echo "local toolchain cache hit: $tag"
-    rustup toolchain link toyos "$stage2"
-    "$stage2/bin/rustc" -vV
+    link_toolchain "$stage2"
     exit 0
   fi
   mkdir -p "$cache_entry"
@@ -100,5 +121,4 @@ if [ -n "$cache_entry" ]; then
   touch "$cache_entry/.complete"
   echo "local toolchain cache filled: $tag"
 fi
-rustup toolchain link toyos "$stage2"
-"$stage2/bin/rustc" -vV
+link_toolchain "$stage2"
