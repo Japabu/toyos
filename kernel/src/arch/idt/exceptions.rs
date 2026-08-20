@@ -255,6 +255,20 @@ fn crash_report_exception(ctx: &ExceptionContext) {
     log!("    cs={:#06x}  ss={:#06x}  rflags={:#018x}",
         ctx.frame.cs, ctx.frame.ss, ctx.frame.rflags);
 
+    // **Ahead of both backtraces, because a crash report can die before it
+    // finishes.** A 2026-08-20 storm capture of the `BTreeMap` class ended
+    // `FAULT rip=… cr2=0x0 … RECURSIVE` one line into the user backtrace, and
+    // everything the report had left to say went with it. This is the part that
+    // decides between the two readings of that class, so it goes where a later
+    // fault cannot take it.
+    //
+    // Only where the kernel is the one that failed: a Ring 3 fault says nothing
+    // about which CPU is on which kernel stack, and these lines under every user
+    // segfault would bury the report that is about the process.
+    if !theirs {
+        crate::hw::report_contexts(ctx.frame.rsp, None);
+    }
+
     log!("  Backtrace:");
     if ring3 {
         if let Some(pid) = pid {
@@ -307,6 +321,16 @@ fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
 
     log!("  Backtrace:");
     kernel_backtrace(rbp, 20);
+
+    // **A panic is where this class of defect actually surfaces**, which is why
+    // it is here and not only on the fault path: the two `BTreeMap` deaths and
+    // the two `cpu N has no CpuSched` deaths on record are all Rust panics with
+    // no register dump at all, and every one of them turns on whether a sibling
+    // was standing on this stack. The address of a local is the stack pointer
+    // the containment test wants — this frame is on the crashing stack, which is
+    // the whole of what it asks.
+    let here = 0u64;
+    crate::hw::report_contexts(core::ptr::addr_of!(here) as u64, None);
 
     // Process/thread context (try_lock only)
     if let Some(pid) = percpu::current_pid() {

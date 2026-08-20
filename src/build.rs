@@ -1655,6 +1655,17 @@ mod tests {
                 "loom",
                 "reap-raise-relaxed",
                 "sched-check",
+                // The stray-write tripwire on the per-CPU `CpuSched` record: a
+                // byte shadow taken and compared at both ends of the driver's
+                // exclusive region, plus a walk of its three containers. It
+                // earns a build of its own because what it watches cannot be
+                // reached from a boot parameter — the shadow's subject is a
+                // whole record and the walk's is a container, and both are
+                // decided at compile time by a dependency's cargo feature, the
+                // same wall `sched-check` is behind. No suite builds it: it is
+                // not in `TEST_SUITE_KERNEL_BUILDS`, so a full run pays nothing
+                // for it and a boot storm asks for it by name.
+                "sched-tripwire",
                 "shard-publish-relaxed",
                 "shootdown-serve-relaxed",
                 // The eighth loom control, and the first over a *contended*
@@ -1677,14 +1688,14 @@ mod tests {
     /// `toyos-sched/loom/Cargo.toml` declare — every feature name besides the
     /// structural ones both crates carry for other reasons.
     ///
-    /// `loom` selects loom's instrumented atomics; `check` and `protocol-port`
-    /// mirror `toyos-sched`'s own features so the shared sources compile
-    /// identically and name nothing a model turns on. Everything else declared
-    /// in either file is, by construction, a `--features <name>` command that
-    /// must red a named model — each file's own comment beside the name
-    /// carries the argument for why.
+    /// `loom` selects loom's instrumented atomics; `check`, `protocol-port` and
+    /// `tripwire` mirror `toyos-sched`'s own features so the shared sources
+    /// compile identically and name nothing a model turns on. Everything else
+    /// declared in either file is, by construction, a `--features <name>`
+    /// command that must red a named model — each file's own comment beside the
+    /// name carries the argument for why.
     fn declared_loom_controls(root: &Path) -> Vec<(&'static str, String)> {
-        const NOT_A_CONTROL: &[&str] = &["loom", "check", "protocol-port", "default"];
+        const NOT_A_CONTROL: &[&str] = &["loom", "check", "protocol-port", "tripwire", "default"];
         let mut out = Vec::new();
         for (crate_name, manifest) in [
             ("kernel-loom", "kernel-loom/Cargo.toml"),

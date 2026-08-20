@@ -421,6 +421,95 @@ impl<X: SchedPayload> CpuSched<X> {
     }
 }
 
+/// The stray-write tripwire's *layout*, so a driver can hold this record's bytes
+/// to **not having changed while nothing was allowed to change it**.
+///
+/// The reading itself is the driver's: this crate writes `unsafe` in
+/// [`crate::mailbox`] and nowhere else (spec §4), and a byte-level copy of a
+/// record is exactly the kind of thing that rule exists to keep out of the state
+/// machine. What is here is what only this module can compute — where the one
+/// remotely-written field sits, and which field a byte offset lands in.
+///
+/// **Why bytes and not an invariant.** Four kernel deaths are on record whose
+/// whole content is a per-CPU scheduler record reading as a value no operation on
+/// it produces — a `BTreeMap` whose `root` says `None` while its `length` does
+/// not, a `BTreeMap` node whose `len` overruns its own storage, and twice an
+/// `Option<CpuSched>` in the driver's `static` reading `None` on a CPU that had
+/// already completed a pass. Every one of them is a *word that changed*, and no
+/// predicate over the containers names which word or what it was before. A
+/// shadow copy does both, and it is the difference between "something wrote this
+/// record" — which is where that class has sat since 2026-08-19 — and an offset,
+/// a field, and the value that landed.
+///
+/// **The one field a sibling legitimately writes is excluded.** `steal_probe` is
+/// a [`MailboxNode`] embedded in this record and posted into *another* CPU's
+/// mailbox: that CPU links it, and its consumer clears `in_flight` when it
+/// unlinks it. Those are remote writes into these bytes by design, so the words
+/// covering that field read back as zero and the tripwire says nothing about
+/// them.
+///
+/// Everything else here is written by the owning CPU alone, inside the driver's
+/// exclusive region, so any difference across a window in which that region was
+/// not entered is a write nothing in this crate made.
+#[cfg(feature = "tripwire")]
+impl<X: SchedPayload> CpuSched<X> {
+    /// How many `u64` words a whole-record shadow takes.
+    pub fn tripwire_words() -> usize {
+        core::mem::size_of::<Self>().div_ceil(8)
+    }
+
+    /// The half-open byte range of the one field a remote CPU may write, which a
+    /// shadow must leave out.
+    pub fn tripwire_remote_range() -> (usize, usize) {
+        let lo = core::mem::offset_of!(Self, steal_probe);
+        (lo, lo + core::mem::size_of::<MailboxNode<Msg<X>>>())
+    }
+
+    /// Which field a byte offset lands in — the field with the greatest offset
+    /// at or below it, because `repr(Rust)` orders these by layout and not by
+    /// declaration.
+    ///
+    /// The `protocol-port` fields are deliberately absent: that feature and this
+    /// one are never enabled together, and under both the name would be the
+    /// nearest field below rather than the exact one.
+    pub fn tripwire_field(off: usize) -> &'static str {
+        const fn pick(fields: &[(usize, &'static str)], off: usize) -> &'static str {
+            let mut best = "<before the first field>";
+            let mut best_at = 0;
+            let mut i = 0;
+            while i < fields.len() {
+                let (at, name) = fields[i];
+                if at <= off && (best_at <= at) {
+                    best_at = at;
+                    best = name;
+                }
+                i += 1;
+            }
+            best
+        }
+        pick(
+            &[
+                (core::mem::offset_of!(Self, id), "id"),
+                (core::mem::offset_of!(Self, running), "running"),
+                (core::mem::offset_of!(Self, rq), "rq (the ready band: rt deque, fair map, insert_seq)"),
+                (core::mem::offset_of!(Self, parked), "parked (the park map)"),
+                (core::mem::offset_of!(Self, dying), "dying"),
+                (core::mem::offset_of!(Self, zombie), "zombie"),
+                (core::mem::offset_of!(Self, mailbox), "mailbox"),
+                (core::mem::offset_of!(Self, steal_probe), "steal_probe (excluded: a sibling writes it)"),
+                (core::mem::offset_of!(Self, steal_requests), "steal_requests"),
+                (core::mem::offset_of!(Self, quantum_end), "quantum_end"),
+                (core::mem::offset_of!(Self, aged_grant), "aged_grant"),
+                (core::mem::offset_of!(Self, loaded), "loaded"),
+                (core::mem::offset_of!(Self, loaded_ctx), "loaded_ctx"),
+                (core::mem::offset_of!(Self, idle_ctx), "idle_ctx"),
+                (core::mem::offset_of!(Self, armed), "armed"),
+            ],
+            off,
+        )
+    }
+}
+
 /// Broken protocol shapes, reproduced for the simulator's negative gates
 /// (spec §10.3). Behind a feature the kernel does not enable, so they are not
 /// compiled into production at all.
@@ -584,6 +673,22 @@ impl<X: SchedPayload> CpuSched<X> {
     /// kill that lands *after* the adopt was posted, and that case always has a
     /// `Msg::Retire` aimed at the same CPU — whose adopter dispatches it, which
     /// is what makes the chase terminate.
+    ///
+    /// **The loaded task is never migrated, and the rule is asserted here
+    /// because this is where every migration passes.** It was implemented one
+    /// caller up, in [`crate::queue::RunQueue::pop_surplus`]'s `loaded`
+    /// argument, which covers the steal path and only the steal path; the
+    /// wake-forward in [`CpuSched::place`] reaches this function too, and what
+    /// kept *it* correct was an argument rather than a check — a task `place`
+    /// hands on came out of `parked` or off the wire in `InTransit`, and the
+    /// loaded task is the one in `running`, which the linear task states make
+    /// disjoint from both. That argument is worth one comparison per migration
+    /// to stop being an argument: if it is ever wrong, the far CPU restores a
+    /// stack this one is standing on, and what the machine reports is not this
+    /// site but a container somewhere else reading as a value nothing can write
+    /// (`issues/kernel/`, the `BTreeMap`-inside-its-own-insert class). Two CPUs
+    /// on one kernel stack is not a state to return an error from — it is a
+    /// kernel bug, and it dies here where it can still be named.
     fn hand_off<H: Hw<Payload = X>, P: PreemptGuard>(
         &mut self,
         task: ReadyTask<X>,
@@ -591,6 +696,12 @@ impl<X: SchedPayload> CpuSched<X> {
         env: Env<'_, H, P>,
         now: Nanos,
     ) {
+        assert!(
+            Some(task.key()) != self.loaded_key(),
+            "cpu {:?} handed {:?} to {dst:?} while standing on its context",
+            self.id,
+            task.key(),
+        );
         #[cfg(not(feature = "protocol-port"))]
         let migrate_anyway = false;
         #[cfg(feature = "protocol-port")]
@@ -2991,6 +3102,13 @@ mod tests {
     /// It reds on a tree without the `loaded` argument: the just-preempted task
     /// carries the highest vruntime in the band, so `pop_surplus`'s `next_back`
     /// names it first and every run hands over exactly the wrong one.
+    ///
+    /// **Under that mutation the red is now [`CpuSched::hand_off`]'s own
+    /// assertion**, which fires inside `run_a_pass_at` before this function's
+    /// `assert!` on the state word is reached. Both are the same finding; the
+    /// panic is the earlier and the more precise of the two, and the assertions
+    /// below stay because they are what reads the *policy* half — that the probe
+    /// is still answered, from the rest of the band.
     #[test]
     fn a_cpu_does_not_hand_over_the_context_it_is_still_standing_on() {
         let mut w = World::new(2);

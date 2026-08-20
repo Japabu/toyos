@@ -103,6 +103,28 @@ debug-wait = []
 # Not a boot parameter, and the one that could not be: it forwards to a
 # dependency's cargo feature, which no runtime value can reach.
 sched-check = ["toyos-sched/check"]
+# The stray-write tripwire on the per-CPU `CpuSched` record: a shadow copy of its
+# bytes, taken when the driver's exclusive region is left and compared when it is
+# next entered, so a word that changed while nothing was allowed to change it is
+# reported as an offset, a field, a before and an after. `sched::driver`'s
+# `tripwire` module and `toyos_sched::cpu`'s `tripwire` impl block carry the
+# argument, and the four deaths it exists for are named there.
+#
+# **Not `sched-check`, and the distinction is the whole point.** That one asserts
+# the scheduler's own invariants, every one of which holds perfectly well over a
+# record a stray write has just landed in — the container and the state word
+# agree, because the thing that disagreed is a `BTreeMap`'s root pointer or an
+# `Option`'s niche. This one asks a question no invariant can: did these bytes
+# change while nobody was allowed to change them.
+#
+# Off by default and never on in a measured build: a copy and a compare of ~300
+# bytes at every entry to that region, which is every pass and every
+# `running`-peek. It compiles readers and no decision, so a kernel carrying it
+# schedules exactly as one without it.
+#
+# Not a boot parameter, and the one that could not be, for `sched-check`'s
+# reason: it forwards to a dependency's cargo feature.
+sched-tripwire = ["toyos-sched/tripwire"]
 # Take the FP body out of `arch::entry`'s bracket and the declared state out of
 # the loader's trampolines, leaving a kernel that preserves the *rest* of the
 # user machine state and nothing else — which is the kernel this tree had before

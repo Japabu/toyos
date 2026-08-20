@@ -23,6 +23,11 @@ check = []
 # the name, never enabled — the loom models exercise the primitives, and the
 # old protocol is the simulator's business.
 protocol-port = []
+# And likewise the kernel's stray-write tripwire, which compiles a layout
+# reader onto `CpuSched`. Declared so `cfg` checking knows the name; nothing
+# here enables it, because the models exercise the primitives and the
+# tripwire's subject is a whole record in a kernel `static`.
+tripwire = []
 # Model the mandatory preempt-disabled push away (spec §7.2). The
 # `preempted_producer_strands_suffix` case must FAIL under this feature —
 # `loom/tests/loom_mailbox.rs` asserts exactly that.

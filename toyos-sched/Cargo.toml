@@ -15,6 +15,12 @@ std = []
 # Deep cross-container invariant asserts (spec invariants.rs). Off by default;
 # enabled by sim runs and kernel check builds.
 check = []
+# The byte-level stray-write tripwire on `CpuSched` — the `tripwire` impl block
+# in `src/cpu.rs` carries what it is for. Off by default and never on in a
+# measured build: it copies and compares the whole record at every entry to the
+# driver's exclusive region. It compiles readers and no decision, so a build
+# carrying it schedules exactly as one without it.
+tripwire = []
 # Compiles the escape hatch `old_steal_port` needs to re-create the OLD
 # scheduler's steal-in-transit algorithm (spec §10.3). The simulator enables
 # it; the kernel does not, so the old protocol is not reachable from
