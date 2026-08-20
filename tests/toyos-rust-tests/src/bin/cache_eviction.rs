@@ -138,7 +138,7 @@ fn main() {
     }
     drop(tmp);
 
-    // A file the cache still holds an fd for, truncated and rewritten shorter:
+    // A file the cache still holds a handle for, truncated and rewritten shorter:
     // the pages past the new end must not survive as stale cache entries.
     {
         let mut f = fs::OpenOptions::new().write(true).open(BIG).expect("reopen for truncate");

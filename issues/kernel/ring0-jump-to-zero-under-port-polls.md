@@ -105,7 +105,7 @@ Audited in code, not assumed.
   went" is not expressible either.
 - The `Arc` is dropped by exactly five things, all of which now go through one
   function (§4): the poll completing, being replaced by a re-arm on the same
-  handle, `POLL_REMOVE`, `remove_fd`'s cancellation, and the ring's own
+  handle, `POLL_REMOVE`, `cancel_by_source`'s cancellation, and the ring's own
   teardown.
 - `Acceptor::on_zero_handles` sets `closed` and empties the queue. It runs
   *before* the `Arc<Acceptor>` in the deferred batch drops, so the queue is

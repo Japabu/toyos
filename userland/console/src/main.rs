@@ -144,8 +144,8 @@ fn main() {
         poller.poll_add_fd(toyos::RawHandle(shell.stderr.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDERR);
         poller.poll_add(&kb, IORING_POLL_IN, TOKEN_KEYBOARD);
         poller.poll_add_fd(host.acceptor_fd(), IORING_POLL_IN, TOKEN_LISTEN);
-        for fd in host.client_fds() {
-            poller.poll_add_fd(fd, IORING_POLL_IN, TOKEN_CLIENT);
+        for client in host.client_fds() {
+            poller.poll_add_fd(client, IORING_POLL_IN, TOKEN_CLIENT);
         }
 
         let mut ready = [false; 5];

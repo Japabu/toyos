@@ -6,6 +6,24 @@ opened: 2026-08-19
 
 # "fd" is libc jargon, and the rest of the tree still speaks it
 
+> **Where this stands, 2026-08-20.** **PR-B is done** — the tree-local half:
+> `kernel/`, `userland/` outside libc, `tests/`, `src/` and the pure crates,
+> including `with_fd_owner_data` → `with_process_data` (70 sites),
+> `io_uring::remove_fd` → `cancel_by_source`, `fd_lifetime` →
+> `handle_lifetime` and `abuse_fd_table` → `abuse_handle_table` (both carrying
+> the `UNMEASURED` marker), and every stale `MAX_FDS` / `fd::*` /
+> `build_child_fds` citation.
+>
+> **PR-A is not started and is blocked on the owner**, unchanged: `toyos-abi`
+> and `toyos` are consumed by three fork repositories, so their half is a
+> four-repository landing and a linked worktree cannot do the first step of it.
+> Until it moves, the whole SDK surface — `Connection::fd`, `poll_add_fd`,
+> `into_fd`, `inherit_fd`, `acceptor_fd`, `client_fds`, `IoUringSqe::fd` — and
+> the two registered names `abuse_io_uring` and `io_uring_cancel_wakes` keep
+> the word. Two citations PR-B could not repair for the same reason:
+> `toyos/src/poller.rs:189` still names `remove_fd`, and `kernel/CLAUDE.md`
+> and `userland/CLAUDE.md` both still say it (an agent does not edit one).
+
 Owner ruling, 2026-08-19: **"fds belong only in libc jargon."** The kernel has
 no file descriptors — `kernel/src/fd.rs` is deleted, `toyos-abi/src/handle.rs`
 is the vocabulary, and a process holds typed handles. POSIX's integer fd is the

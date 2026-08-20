@@ -3,7 +3,7 @@
 //! `Poller::new(handles)` used to round the request up and *clamp* it, and
 //! `poll_add_fd` used to flush a full submission ring mid-registration. Those
 //! two together are the loss: the flush makes the kernel process registrations
-//! while the caller is still registering, so fds that are already ready post
+//! while the caller is still registering, so handles that are already ready post
 //! completions into a ring sized for a set the caller never actually declared.
 //! Past `cq_size` the kernel increments `dropped` and returns, and the caller
 //! blocks forever on readiness that was thrown away.

@@ -77,10 +77,10 @@ fn main() {
     loop {
         poller.poll_add_fd(RawHandle(shell_stdout.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDOUT);
         poller.poll_add_fd(RawHandle(shell_stderr.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDERR);
-        poller.poll_add_fd(window.fd(), IORING_POLL_IN, TOKEN_WINDOW);
+        poller.poll_add_fd(window.handle(), IORING_POLL_IN, TOKEN_WINDOW);
         poller.poll_add_fd(host.acceptor_fd(), IORING_POLL_IN, TOKEN_LISTEN);
-        for fd in host.client_fds() {
-            poller.poll_add_fd(fd, IORING_POLL_IN, TOKEN_CLIENT);
+        for client in host.client_fds() {
+            poller.poll_add_fd(client, IORING_POLL_IN, TOKEN_CLIENT);
         }
 
         let mut ready = [false; 5];

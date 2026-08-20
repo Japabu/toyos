@@ -912,7 +912,7 @@ fn home_of(state: TaskState) -> Option<CpuId> {
 /// where the budget sits: 2% of a quantum, and an order of magnitude above any
 /// pass that is doing scheduling rather than work.
 ///
-/// It is a *policy* number, like `MAX_USER_STR` and `MAX_FDS`: nothing in the
+/// It is a *policy* number, like `MAX_USER_STR` and `MAX_HANDLES`: nothing in the
 /// design forces 200 µs. If a measurement crosses it on honest work, the honest
 /// response is to find out which pass grew and why — not to raise it.
 ///

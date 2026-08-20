@@ -1,4 +1,4 @@
-//! Claims the mouse fd and prints every pointer event that arrives.
+//! Claims the mouse and prints every pointer event that arrives.
 //!
 //! Driven by the `i8042_mouse` host test, which paces its injection against
 //! these lines: a packet goes out for each one printed here, so this is the

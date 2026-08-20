@@ -81,7 +81,7 @@ const UNHELD_SLOT: u32 = 3000;
 const CHURN_ROUNDS: usize = 16;
 
 /// The most 10 ms census samples `settled_census` takes before answering with
-/// what it last saw. `fd_lifetime`'s bound, for the same deferred queues.
+/// what it last saw. `handle_lifetime`'s bound, for the same deferred queues.
 const SETTLE_SAMPLES: usize = 100;
 
 /// The three kinds that end the caller. Each is a role this binary runs as, and
@@ -175,7 +175,7 @@ fn a_poll_without_wait_is_a_word() {
 /// **Not a refusal, and that is why it is its own arm.** The handle resolves,
 /// it carries `WAIT`, and the caller is entitled to ask — a pipe's read end
 /// simply has no writability, so there is no source to register on and nothing
-/// that could ever complete the poll. `POSIX poll(fd, POLLOUT)` on a read end is
+/// that could ever complete the poll. POSIX's `poll` for `POLLOUT` on a read end is
 /// exactly this call, so it is a mistake real programs make, and the answer the
 /// kernel gave was silence.
 fn a_poll_with_no_source_is_answered() {
@@ -269,7 +269,7 @@ fn a_full_table_is_a_word() {
 /// still loses to the lag it describes: on a loaded CI shard the last corpse's
 /// own `Process` object outlived the parent's `wait` into the second census —
 /// `[("Process", 6, 7)]`, twice on one shard, green alone both times (PR #141
-/// run 32307331537, the same deferral `fd_lifetime` measured decaying across
+/// run 32307331537, the same deferral `handle_lifetime` measured decaying across
 /// eight back-to-back reads). The kernel half is
 /// `issues/kernel/deferred-release-outlives-its-syscall.md`; here it is a lag
 /// and not a leak exactly when settling converges, which is what
@@ -301,7 +301,7 @@ fn churn(rounds: usize) -> Census {
 }
 
 /// The census once the deferred queues have finished giving back what the
-/// kills released. `fd_lifetime`'s `settled_free_bytes`, for object counts:
+/// kills released. `handle_lifetime`'s `settled_free_bytes`, for object counts:
 /// sample until two readings ten milliseconds apart agree, which is the
 /// machine saying it has finished. **A liveness bound and not a margin** — a
 /// kernel that leaks holds a stable, elevated census, is quiescent on the

@@ -140,7 +140,7 @@ changes.
   with a second worktree's suite on the host throughout. `16 more killed
   processes left more live objects behind: [("Process", 6, 7)]`, `ALONE …
   GREEN`, and green on all twelve KVM shards of the same tree (run
-  `32023797195`). **Its mechanism is `fd_lifetime`'s and not the terminal
+  `32023797195`). **Its mechanism is `handle_lifetime`'s and not the terminal
   race's**: both are shared-boot binaries whose verdict is a *machine-wide*
   census either side of a kill — free bytes there, live objects by type here —
   taken on a guest where a hundred and fifty other tests are also starting and

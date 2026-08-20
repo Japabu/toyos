@@ -330,7 +330,7 @@ pub const RELEGATED: &[Relegated] = &[
         ci_ms: 260_607,
         why: Why::Cost,
         guards: "Eight plug-and-pull cycles of a pointer under a compositor holding the \
-                 merged pointer's fd across all of them. The owner froze his desktop this \
+                 merged pointer's handle across all of them. The owner froze his desktop this \
                  way twice, on the fourth cycle's enumeration.",
     },
     Relegated {

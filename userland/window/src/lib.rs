@@ -496,7 +496,7 @@ impl Window {
     ///
     /// **`Close` is the last element of this stream, and it is delivered
     /// exactly once.** Without the latch a closed window is an infinite source
-    /// of it: the compositor drops the connection, the fd is then permanently
+    /// of it: the compositor drops the connection, the handle is then permanently
     /// read-ready at EOF, and every call returns `Some(Event::Close)` again.
     /// A caller that drains until `None` — which is the ordinary shape, and is
     /// what `winit`'s ToyOS backend does — never leaves that loop, so closing
@@ -602,7 +602,7 @@ impl Window {
         let _ = self.conn.send(MSG_PRESENT, &damage);
     }
 
-    pub fn fd(&self) -> toyos_abi::RawHandle {
+    pub fn handle(&self) -> toyos_abi::RawHandle {
         self.conn.fd()
     }
 

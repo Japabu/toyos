@@ -1856,7 +1856,7 @@ static XHCI: Lock<Vec<XhciController>> = Lock::new(Vec::new());
 /// `XHCI`, which is a ticket spinlock and therefore preemption off for its
 /// whole life. Called from a syscall, it makes that syscall's thread the
 /// driver's engine and stops the CPU rescheduling for as long as the bus takes.
-/// `fd::try_read` called it for `Descriptor::{Keyboard, Mouse}` so a read would
+/// The read path called it for the keyboard and mouse claims so a read would
 /// see a report that had just landed; on the T14 that made the compositor's own
 /// mouse read the hot-plug engine and froze the desktop for seconds at a time,
 /// with a live kernel and nothing dropped. A caller that wants fresh input

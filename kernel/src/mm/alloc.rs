@@ -103,7 +103,7 @@ unsafe impl GlobalAlloc for KernelAllocator {
                 //
                 // `MAX_HEAP_ALLOC` rather than whatever dlmalloc's padding
                 // happens to permit, so the documented number is the enforced
-                // number — the way `MAX_FDS` and `MAX_USER_STR` are at their
+                // number — the way `MAX_HANDLES` and `MAX_USER_STR` are at their
                 // own primitives. Measured: 2,097,152 asks the page source
                 // for 2,162,688, which it cannot back.
                 //
