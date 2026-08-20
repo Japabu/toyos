@@ -345,8 +345,8 @@ impl XhciController {
         }
     }
 
-    /// The completion of the transfer `on` names, as a completion code and the
-    /// number of bytes the controller did *not* move.
+    /// The completion of the transfer queued at `trb` on (`slot`, `dci`), as a
+    /// completion code and the number of bytes the controller did *not* move.
     ///
     /// The event ring is one queue for the whole controller, so anything that
     /// arrives here and is not ours belongs to a bound device delivering a
@@ -360,14 +360,12 @@ impl XhciController {
     /// (slot, dci) alone hands that late answer — and its residue, which is how
     /// many of the caller's bytes are real — to whatever asked next on the same
     /// endpoint.
-    fn wait_transfer(&mut self, on: Await) -> Option<(u32, u32)> {
+    fn wait_transfer(&mut self, slot: u8, dci: u8, trb: u64) -> Option<(u32, u32)> {
         #[cfg(feature = "boot-actuators")]
         if crate::actuator::io_depth_probe() {
             depth_probe::report();
         }
-        let Await::Transfer { slot, .. } = on else {
-            unreachable!("wait_transfer was given a command to wait for");
-        };
+        let on = Await::Transfer { slot, dci, trb };
         let deadline = deadline();
         let port = self.port_of_slot(slot);
         loop {
@@ -426,7 +424,7 @@ impl XhciController {
 
         let mut delivered = 0u16;
         if let Some(data) = trbs.data {
-            match self.wait_transfer(Await::Transfer { slot, dci: 1, trb: data }) {
+            match self.wait_transfer(slot, 1, data) {
                 Some((CC_SUCCESS | CC_SHORT_PACKET, residue)) => {
                     // A residue past the length asked for is a controller
                     // contradicting itself; believing it would report more bytes
@@ -440,7 +438,7 @@ impl XhciController {
                 None => return Control::Silent { stage: "data" },
             }
         }
-        match self.wait_transfer(Await::Transfer { slot, dci: 1, trb: trbs.status }) {
+        match self.wait_transfer(slot, 1, trbs.status) {
             Some((CC_SUCCESS, _)) => Control::Done { delivered },
             Some((code, _)) => Control::Failed { stage: "status", code },
             None => Control::Silent { stage: "status" },

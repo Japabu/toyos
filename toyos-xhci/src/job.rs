@@ -245,7 +245,6 @@ impl<W> Outstanding<W> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -9,7 +9,6 @@
 
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
-use toyos_xhci::job::Await;
 
 use crate::log;
 use crate::scheduler::Operation;
@@ -885,7 +884,7 @@ impl XhciController {
         if transport_break::take() {
             return None;
         }
-        self.wait_transfer(Await::Transfer { slot, dci, trb: at })
+        self.wait_transfer(slot, dci, at)
     }
 
     /// One of this disk's bulk endpoints, as the recovery needs to see it.
