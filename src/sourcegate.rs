@@ -310,9 +310,10 @@ const LOG_PRODUCERS: &[&str] = &["log!(", "alert!(", "boot_phase!(", "log::emit(
 /// Counted in occurrences of `!!!` and not in lines, because each of these
 /// writes one at each end of its message.
 const SENTINEL_ALLOWED: &[(&str, usize)] = &[
-    // `\n!!! PANIC REENTRY: CPU halted !!!\n`, written with the IDT possibly
-    // gone.
-    ("kernel/src/main.rs", 2),
+    // The two ends of `panic::last_words`' first line — `\n!!! <the dead end
+    // this is> !!!` — written with the IDT possibly gone. Two whichever dead
+    // end called it, because there is one writer of them.
+    ("kernel/src/panic.rs", 2),
     // `\n!!! DB TRAP !!!\n`, from the #DB handler before it clears DR7.
     ("kernel/src/arch/idt/exceptions.rs", 2),
 ];

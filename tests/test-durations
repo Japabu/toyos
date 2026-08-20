@@ -155,6 +155,7 @@ diskless_boot 4506
 doom_music 7543
 doom_sound_flood 5714
 double_fault_stack 4323
+double_panic_names_the_first 18446744073709551615
 dump_nmi_probe 24625
 empty_dir_stat 12
 endowment_denied 69
