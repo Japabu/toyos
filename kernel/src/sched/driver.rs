@@ -791,6 +791,17 @@ pub fn current_handle() -> Option<Arc<crate::sched::payload::TaskHandle>> {
     try_with_cpu(|cpu| cpu.running().map(|t| t.ext().handle.clone())).flatten()
 }
 
+/// The same face, borrowed rather than cloned, for a reader that does not
+/// outlive the peek. `None` on a CPU with no task, exactly as above.
+///
+/// It exists because [`current_handle`]'s `Arc::clone` is two uncontended
+/// read-modify-writes, and `scheduler::Operation::established` asks this
+/// question on every park token minted in the machine — the hot-path atomic
+/// `tests/CLAUDE.md` names as the one TCG prices unlike hardware.
+pub fn with_current_handle<R>(f: impl FnOnce(&crate::sched::payload::TaskHandle) -> R) -> Option<R> {
+    try_with_cpu(|cpu| cpu.running().map(|t| f(t.ext().handle.as_ref())))?
+}
+
 /// Whether the running task has been killed — one relaxed load, no clone.
 ///
 /// Read on every return to Ring 3, which is why it takes no `Arc`: a refcount

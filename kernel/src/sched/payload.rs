@@ -21,6 +21,7 @@ use toyos_sched::waitq::{WaitList, WaitQueue, WaitTicket};
 
 use crate::completion::{Inbox, Watch};
 use crate::mm::paging::Cr3;
+use crate::scheduler::OperationSlot;
 use crate::process::{OwnedAlloc, PageTables, ProcessAccounting, TaskId};
 use crate::sync::Lock;
 
@@ -153,6 +154,16 @@ pub struct TaskHandle {
     /// the waiter arms, so a post reaches the inbox without asking the process
     /// table anything — which a park on a hot path could not afford.
     inbox: Inbox,
+    /// The operation this thread is inside, if it is inside one — owner ruling
+    /// 1B's word.
+    ///
+    /// **On the handle and not on the `CpuSched`**, for the reason the two
+    /// fields above it are here: a `CpuSched` is `!Sync` and cannot be walked,
+    /// and this word has to survive the migration a sleep-lock-holding thread
+    /// can take mid-operation. It travels with the thread because the handle
+    /// does. `scheduler::Operation` owns every rule about it; nothing here
+    /// reads it.
+    operation: OperationSlot,
 }
 
 impl TaskHandle {
@@ -166,6 +177,7 @@ impl TaskHandle {
             watch: Watch::new(),
             cancels: AtomicU32::new(0),
             inbox: Inbox::new(),
+            operation: OperationSlot::new(),
         }
     }
 
@@ -203,6 +215,12 @@ impl TaskHandle {
 
     pub fn inbox(&self) -> &Inbox {
         &self.inbox
+    }
+
+    /// Where this thread's establishment lives. Read and written only by
+    /// `scheduler::Operation`, which is where every rule about it is stated.
+    pub fn operation(&self) -> &OperationSlot {
+        &self.operation
     }
 
     pub fn park_queue(&self) -> &KWaitQueue {

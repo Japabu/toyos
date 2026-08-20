@@ -570,7 +570,7 @@ pub fn enter(
         // spin instead of parking. It runs *after* the arm, inside
         // `completion::wait_until`, which is what closes the window a sibling
         // thread closing this ring's handle opens.
-        let parkable = scheduler::Parkable::of_current();
+        let parkable = scheduler::Parkable::at_entry();
         if completion::wait_until(
             &parkable,
             completion::Subject::of(&queue),

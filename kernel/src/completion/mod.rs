@@ -504,7 +504,7 @@ pub fn wait_uncancellable_until(
     }
     // Unlike `wait_until`, "no current task" cannot be answered by returning:
     // the caller would carry on believing it holds a lock it never took. It is
-    // also unreachable — `Parkable::of_current` asserts a baseline boot cannot
+    // also unreachable — `Parkable::at_entry` asserts a baseline boot cannot
     // meet — so it is a kernel bug and says so.
     let armed = arm(subject, token, WaitClass::Other)
         .expect("completion: an uncancellable wait with no task to park");
@@ -524,7 +524,7 @@ pub fn wait_uncancellable_until(
 #[cfg(feature = "boot-actuators")]
 #[track_caller]
 pub fn park_forever() -> ! {
-    let parkable = crate::scheduler::Parkable::of_current();
+    let parkable = crate::scheduler::Parkable::at_entry();
     let handle = crate::sched::driver::current_handle().expect("a kernel thread is a task");
     let armed =
         arm(Subject::of(handle.watch()), Token::new(0), WaitClass::Other).expect("a task can arm");

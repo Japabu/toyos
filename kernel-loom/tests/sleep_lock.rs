@@ -101,7 +101,7 @@ fn a_parking_contender_observes_the_holders_writes() {
             let lock = lock.clone();
             loom::thread::spawn(move || {
                 become_task(TWO);
-                let parkable = Parkable::of_current();
+                let parkable = Parkable::at_entry();
                 let mut guard = lock.lock(&parkable);
                 // Read-modify-write *through the guard*: a lock that failed to
                 // synchronize hands this side a stale value, which is the
@@ -111,7 +111,7 @@ fn a_parking_contender_observes_the_holders_writes() {
         };
 
         become_task(ONE);
-        let parkable = Parkable::of_current();
+        let parkable = Parkable::at_entry();
         {
             let mut guard = lock.lock(&parkable);
             *guard += 1;
@@ -141,7 +141,7 @@ fn two_holders_never_overlap() {
             let lock = lock.clone();
             loom::thread::spawn(move || {
                 become_task(TWO);
-                let parkable = Parkable::of_current();
+                let parkable = Parkable::at_entry();
                 let mut guard = lock.lock(&parkable);
                 assert!(!*guard, "two tasks held the lock at once");
                 *guard = true;
@@ -150,7 +150,7 @@ fn two_holders_never_overlap() {
         };
 
         become_task(ONE);
-        let parkable = Parkable::of_current();
+        let parkable = Parkable::at_entry();
         {
             let mut guard = lock.lock(&parkable);
             assert!(!*guard, "two tasks held the lock at once");
@@ -177,14 +177,14 @@ fn a_queued_contender_is_served_and_named() {
             let lock = lock.clone();
             loom::thread::spawn(move || {
                 become_task(TWO);
-                let parkable = Parkable::of_current();
+                let parkable = Parkable::at_entry();
                 let _guard = lock.lock(&parkable);
                 assert_eq!(lock.holder(), Some(TWO), "the holder word names nobody");
             })
         };
 
         become_task(ONE);
-        let parkable = Parkable::of_current();
+        let parkable = Parkable::at_entry();
         {
             let _guard = lock.lock(&parkable);
             assert_eq!(lock.holder(), Some(ONE), "the holder word names nobody");
