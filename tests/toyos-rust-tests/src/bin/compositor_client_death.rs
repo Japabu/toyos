@@ -106,7 +106,7 @@ fn run() {
     // `MSG_CREATE_WINDOW` on one arrives with nothing to promote. The
     // compositor read that as its own bug.
     let doubled = Window::create(64, 64).expect("a window to send a second create on");
-    write_handle(doubled.fd(), &create_frame(), "a second create");
+    write_handle(doubled.handle(), &create_frame(), "a second create");
     probe("a second create on a live window");
 
     // A clipboard frame with no region sent ahead of it. The receive is not a
@@ -129,7 +129,7 @@ fn run() {
     // did not latch answered `Close` for as long as anybody kept asking, and a
     // client draining until `None` never got out. Two calls decide it.
     let mut ending = Window::create(64, 64).expect("a window to close from the inside");
-    ipc::signal(ending.fd(), window::MSG_DESTROY_WINDOW)
+    ipc::signal(ending.handle(), window::MSG_DESTROY_WINDOW)
         .expect("ask the compositor to destroy this window");
     // Named rather than kept, because `Event` is not `Debug` and a failure
     // here has to print the whole sequence it saw.

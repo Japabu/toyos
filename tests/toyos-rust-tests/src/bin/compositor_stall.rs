@@ -86,8 +86,8 @@ fn main() {
     // stall is on an established connection rather than a fresh one, which is
     // the sibling of the accept-path defect and had the same cure.
     let stuck = Window::create(64, 64).expect("a window to stall mid-message with");
-    write_handle(stuck.fd(), &header(window::MSG_CLIPBOARD_SET, 116), "window mid-message");
-    write_handle(stuck.fd(), &[b'x'; 8], "window mid-message");
+    write_handle(stuck.handle(), &header(window::MSG_CLIPBOARD_SET, 116), "window mid-message");
+    write_handle(stuck.handle(), &[b'x'; 8], "window mid-message");
     probe("window stopped mid-message");
 
     // A window that asks faster than it reads. The compositor's answer has to
@@ -98,7 +98,7 @@ fn main() {
     for _ in 0..REQUESTS {
         requests.extend_from_slice(&header(window::MSG_GET_RESOLUTION, 0));
     }
-    write_handle(deaf.fd(), &requests, "window that will not read");
+    write_handle(deaf.handle(), &requests, "window that will not read");
     await_refusal(&deaf);
     probe("window that will not read");
 
@@ -107,7 +107,7 @@ fn main() {
     // ends only when nothing is ready never reaches the screen. The assertion
     // is the host's: frames, between these two markers.
     let noisy = Window::create(64, 64).expect("a window to stream from");
-    let handle = noisy.fd();
+    let handle = noisy.handle();
     println!("compositor stall: stream start");
     let streamer = thread::spawn(move || {
         let frame = header(UNKNOWN_MSG, 0);
@@ -174,7 +174,7 @@ fn write_handle(handle: toyos_abi::RawHandle, bytes: &[u8], what: &str) {
 /// answers `Ok` here forever.
 fn await_refusal(deaf: &Window) {
     for _ in 0..REFUSAL_POLLS {
-        if let Err(SyscallError::NotFound) = syscall::write_nonblock(deaf.fd(), &[]) {
+        if let Err(SyscallError::NotFound) = syscall::write_nonblock(deaf.handle(), &[]) {
             return;
         }
         syscall::nanosleep(PROBE_POLL_NS);
