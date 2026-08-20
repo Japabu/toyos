@@ -281,7 +281,10 @@ kobject! {
     deferred Connection => service::ConnectionEnd,
     deferred Device => device::DeviceClaim,
     deferred Acceptor => port::Acceptor,
-    deferred IoUring => service::IoUringObject,
+    // The kind name is the ABI's: `toyos_abi::syscall::OBJECT_KINDS` carries it
+    // and `CENSUS_KIND` asserts the two lists agree name for name. The object
+    // type keeps the old spelling until the tree-local vocabulary PR renames it.
+    deferred Inbox => service::IoUringObject,
     // Every mapping goes with the last handle, and the flush that makes that
     // safe waits for every other CPU — so it runs from the queue, with nothing
     // held, and never inline at a `close`.

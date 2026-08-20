@@ -53,7 +53,7 @@ unsafe impl UserSafe for toyos_abi::syscall::NamespaceBuild {}
 unsafe impl UserSafe for toyos_abi::syscall::SchedInfo {}
 unsafe impl UserSafe for toyos_abi::syscall::ProcessStats {}
 unsafe impl UserSafe for toyos_abi::FramebufferInfo {}
-unsafe impl UserSafe for toyos_abi::syscall::IoUringSetup {}
+unsafe impl UserSafe for toyos_abi::syscall::InboxSetup {}
 
 unsafe impl UserSafe for toyos_abi::input::RawKeyEvent {}
 unsafe impl UserSafe for toyos_abi::input::MouseEvent {}

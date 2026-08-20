@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use toyos_abi::RawHandle;
-use toyos::poller::{IORING_POLL_IN, Poller};
+use toyos::poller::{READABLE, Poller};
 use toyos::ipc;
+use toyos::AsHandle;
 use toyos::ipc::{Connection, IpcPayload, RxStep};
 /// One line, one `write`.
 ///
@@ -329,7 +330,7 @@ impl Client {
                 ipc::TrySendError::TooLarge => "the answer netd built is larger than a frame",
                 ipc::TrySendError::Syscall(_) => "its connection is gone",
             };
-            say!("netd: dropping client {} — {why}", self.conn.fd().0);
+            say!("netd: dropping client {} — {why}", self.conn.as_handle().0);
         }
     }
 }
@@ -651,7 +652,7 @@ impl NetDaemon {
         };
 
         let mut buf = vec![0u8; req.len as usize];
-        let n = match toyos_abi::syscall::read_nonblock(pipes.tx_read.fd(), &mut buf) {
+        let n = match toyos_abi::syscall::read_nonblock(pipes.tx_read.as_handle(), &mut buf) {
             Ok(n) => n,
             // The client writes the datagram into the pipe and *then* sends this
             // request, so an empty pipe is a client naming bytes it never put
@@ -731,7 +732,7 @@ impl NetDaemon {
             msg.client.error(ERR_NOT_CONNECTED);
             return;
         };
-        let rx_write = pipes.rx_write.fd();
+        let rx_write = pipes.rx_write.as_handle();
         let socket = socket_set.get_mut::<udp::Socket>(handle);
 
         if Self::deliver_datagram(&msg.client, socket, req.max_len, rx_write) {
@@ -1020,7 +1021,7 @@ impl NetDaemon {
                     let mut buf = [0u8; 4096];
                     match socket.recv_slice(&mut buf) {
                         Ok(n) if n > 0 => {
-                            let _ = toyos_abi::syscall::write_nonblock(pipe.fd(), &buf[..n]);
+                            let _ = toyos_abi::syscall::write_nonblock(pipe.as_handle(), &buf[..n]);
                         }
                         _ => break,
                     };
@@ -1033,7 +1034,7 @@ impl NetDaemon {
             while socket.can_send() {
                 if let Some(ref pipe) = conn.tx_read {
                     let mut buf = [0u8; 4096];
-                    match toyos_abi::syscall::read_nonblock(pipe.fd(), &mut buf) {
+                    match toyos_abi::syscall::read_nonblock(pipe.as_handle(), &mut buf) {
                         Ok(n) if n > 0 => { let _ = socket.send_slice(&buf[..n]); }
                         _ => break,
                     }
@@ -1076,7 +1077,7 @@ impl NetDaemon {
             // Not `is_active`: that is already true in SynReceived, before the
             // three-way handshake completes.
             if socket.state() == tcp::State::Established && !listener.notified {
-                let _ = toyos_abi::syscall::write_nonblock(listener.notify_write.fd(), &[1]);
+                let _ = toyos_abi::syscall::write_nonblock(listener.notify_write.as_handle(), &[1]);
                 listener.notified = true;
             }
         }
@@ -1122,7 +1123,7 @@ impl NetDaemon {
                 self.pending_udp_recvs.swap_remove(i);
                 continue;
             };
-            let rx_write = pipes.rx_write.fd();
+            let rx_write = pipes.rx_write.as_handle();
             let max_len = pr.max_len;
             let socket = socket_set.get_mut::<udp::Socket>(handle);
             if Self::deliver_datagram(&self.pending_udp_recvs[i].client, socket, max_len, rx_write)
@@ -1310,18 +1311,18 @@ fn main() {
             }
         };
 
-        poller.poll_add(&acceptor, IORING_POLL_IN, TOKEN_LISTENER);
-        poller.poll_add(&device.nic, IORING_POLL_IN, TOKEN_NIC);
+        poller.watch(&acceptor, READABLE, TOKEN_LISTENER);
+        poller.watch(&device.nic, READABLE, TOKEN_NIC);
 
         // Submit POLL_ADD for each active tx pipe (client → netd direction)
         for (i, conn) in daemon.piped_connections.iter().enumerate() {
             if let Some(ref pipe) = conn.tx_read {
-                poller.poll_add(pipe, IORING_POLL_IN, TOKEN_TX_PIPE_BASE + i as u64);
+                poller.watch(pipe, READABLE, TOKEN_TX_PIPE_BASE + i as u64);
             }
         }
 
         for p in pending.iter() {
-            poller.poll_add(&p.conn, IORING_POLL_IN, TOKEN_PENDING_BASE + p.conn.fd().0 as u64);
+            poller.watch(&p.conn, READABLE, TOKEN_PENDING_BASE + p.conn.as_handle().0 as u64);
         }
 
         let timeout = match timeout_nanos {
@@ -1349,7 +1350,7 @@ fn main() {
         for p in pending.iter().filter(|p| now_wall.duration_since(p.since) >= HANDSHAKE_TIMEOUT) {
             say!(
                 "netd: dropping client {} — it never finished its request",
-                p.conn.fd().0
+                p.conn.as_handle().0
             );
         }
         pending.retain(|p| now_wall.duration_since(p.since) < HANDSHAKE_TIMEOUT);
@@ -1363,7 +1364,7 @@ fn main() {
                 say!(
                     "netd: refusing client {} — {MAX_PENDING_CONNS} connections are already \
                      waiting to say what they want",
-                    conn.fd().0
+                    conn.as_handle().0
                 );
             } else {
                 pending.push(PendingConn { conn, rx: ClientRx::new(), since: Instant::now() });
@@ -1376,7 +1377,7 @@ fn main() {
         let mut requests: Vec<Request> = Vec::new();
         let mut i = 0;
         while i < pending.len() {
-            let handle = pending[i].conn.fd();
+            let handle = pending[i].conn.as_handle();
             if !ready.contains(&(TOKEN_PENDING_BASE + handle.0 as u64)) {
                 i += 1;
                 continue;
@@ -1398,7 +1399,7 @@ fn main() {
                     say!(
                         "netd: dropping client {} — it sent a frame this protocol cannot \
                          describe",
-                        pending[i].conn.fd().0
+                        pending[i].conn.as_handle().0
                     );
                     pending.remove(i);
                 }

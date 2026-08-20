@@ -11390,7 +11390,7 @@ fn build_test_registry(
             // Its verdict is that a parked waiter woke, so the failing run is
             // the slow one: it spends its own patience before reporting, and
             // the report is worth more than the harness's timeout message.
-            "io_uring_cancel_wakes" => Duration::from_secs(30),
+            "inbox_cancel_wakes" => Duration::from_secs(30),
             _ => Duration::from_secs(5),
         };
         tests.push(TestDef {

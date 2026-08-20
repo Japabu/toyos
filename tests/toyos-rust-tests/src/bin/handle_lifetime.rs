@@ -27,7 +27,7 @@ use std::os::toyos::process::CommandExt;
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 use toyos::{namespace, port, AsHandle};
-use toyos_abi::io_uring::IoUringParams;
+use toyos_abi::inbox::RingLayout;
 use toyos_abi::syscall::{self, OpenFlags, SeekFrom, SyscallError, SERVE_PREFIX};
 
 const SELF_PATH: &str = "/bin/test_rs_handle_lifetime";
@@ -111,7 +111,7 @@ fn acceptor_survives_one_close() {
 }
 
 fn ring_survives_one_close() {
-    let (a, base) = unsafe { syscall::io_uring_setup(8) }.expect("io_uring_setup");
+    let (a, base) = unsafe { syscall::inbox_setup(8) }.expect("inbox_setup");
     let b = syscall::dup(a).expect("dup a ring handle");
     syscall::close(a);
 
@@ -120,10 +120,10 @@ fn ring_survives_one_close() {
     // there is no separate region and no token naming one — so reading the
     // params back through the pointer setup handed over is what says the close
     // did not unmap it.
-    syscall::io_uring_enter(b, 0, 0, 0)
+    syscall::inbox_submit(b, 0, 0, 0)
         .expect("closing one of two ring handles destroyed the instance");
-    let params = unsafe { core::ptr::read_volatile(base as *const IoUringParams) };
-    assert_eq!(params.sq_ring_size, 8, "the ring's page no longer describes the ring");
+    let params = unsafe { core::ptr::read_volatile(base as *const RingLayout) };
+    assert_eq!(params.submission_ring_size, 8, "the ring's page no longer describes the ring");
 
     syscall::close(b);
 
@@ -302,13 +302,13 @@ fn kill_and_reap(child: &mut Child) {
 
 /// Both handles to one ring, both closed, and then the number presented again.
 fn closed_ring() -> ! {
-    let (a, _base) = unsafe { syscall::io_uring_setup(8) }.expect("closed-ring: io_uring_setup");
+    let (a, _base) = unsafe { syscall::inbox_setup(8) }.expect("closed-ring: inbox_setup");
     let b = syscall::dup(a).expect("closed-ring: dup");
     syscall::close(a);
     syscall::close(b);
     println!("closed");
     std::io::stdout().flush().expect("closed-ring: flush");
-    let answered = syscall::io_uring_enter(b, 0, 0, 0);
+    let answered = syscall::inbox_submit(b, 0, 0, 0);
     panic!("a ring handle closed twice over answered {answered:?}");
 }
 
@@ -324,7 +324,7 @@ fn holder(kind: &str) {
         }
         "ring" => {
             let rings: Vec<_> = (0..HOLDER_RINGS)
-                .map(|_| unsafe { syscall::io_uring_setup(8) }.expect("holder: io_uring_setup"))
+                .map(|_| unsafe { syscall::inbox_setup(8) }.expect("holder: inbox_setup"))
                 .collect();
             // Held for the process's life: the point is what the kill does.
             core::mem::forget(rings);

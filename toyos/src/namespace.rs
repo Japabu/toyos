@@ -22,7 +22,7 @@ impl Namespace {
     /// [`SyscallError::Gone`] is "the server exited". There is no third answer,
     /// and in particular there is no "not yet".
     pub fn open(&self, name: &str) -> Result<Connection, SyscallError> {
-        syscall::namespace_open(self.0.fd(), name).map(|fd| Connection(OwnedHandle(fd)))
+        syscall::namespace_open(self.0.raw(), name).map(|h| Connection(OwnedHandle(h)))
     }
 
     pub fn into_raw(self) -> RawHandle {
@@ -39,7 +39,7 @@ impl Namespace {
 
 impl AsHandle for Namespace {
     fn as_handle(&self) -> RawHandle {
-        self.0.fd()
+        self.0.raw()
     }
 }
 
@@ -138,7 +138,7 @@ impl<'a> Builder<'a> {
     /// absent from the result: narrowing is an intersection, and asking for a
     /// name you do not hold grants nothing either way.
     pub fn keep(mut self, base: &Namespace, names: &[&str]) -> Self {
-        self.base = base.0.fd();
+        self.base = base.0.raw();
         for name in names {
             match self.names.push(name) {
                 Some((off, len)) => {
@@ -182,6 +182,6 @@ impl<'a> Builder<'a> {
         };
         // SAFETY: every pointer above names this stack frame's own storage,
         // and the syscall reads it before returning.
-        unsafe { syscall::namespace_build(&args) }.map(|fd| Namespace(OwnedHandle(fd)))
+        unsafe { syscall::namespace_build(&args) }.map(|h| Namespace(OwnedHandle(h)))
     }
 }

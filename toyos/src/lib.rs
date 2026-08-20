@@ -31,6 +31,12 @@ pub use toyos_abi::RawHandle;
 /// Trait for types that wrap a kernel handle.
 ///
 /// Used by [`poller`] and other APIs that accept any handle type.
+///
+/// **One thing, one name.** Six of the typed wrappers below and in [`device`]
+/// and [`ipc`] carried a second public accessor with an identical body until
+/// 2026-08-20, when the wave that confined libc's descriptor vocabulary to
+/// `userland/libc` deleted them rather than renaming them: a second word for
+/// what `as_handle` already says is the blur that ruling exists to remove.
 pub trait AsHandle {
     fn as_handle(&self) -> RawHandle;
 }
@@ -41,8 +47,8 @@ pub trait AsHandle {
 /// who holds its ends, and nothing but a transfer puts one in somebody else's
 /// table.
 pub fn pipe_pair() -> Result<(Pipe, Pipe), toyos_abi::syscall::SyscallError> {
-    let fds = toyos_abi::syscall::pipe()?;
-    Ok((Pipe(OwnedHandle(fds.read)), Pipe(OwnedHandle(fds.write))))
+    let ends = toyos_abi::syscall::pipe()?;
+    Ok((Pipe(OwnedHandle(ends.read)), Pipe(OwnedHandle(ends.write))))
 }
 
 /// One owned handle, closed when it drops.
@@ -55,7 +61,7 @@ pub fn pipe_pair() -> Result<(Pipe, Pipe), toyos_abi::syscall::SyscallError> {
 pub(crate) struct OwnedHandle(pub(crate) RawHandle);
 
 impl OwnedHandle {
-    pub(crate) fn fd(&self) -> RawHandle { self.0 }
+    pub(crate) fn raw(&self) -> RawHandle { self.0 }
 
     /// Give up ownership: the handle stays open and this stops answering for
     /// it.
@@ -96,8 +102,6 @@ impl Drop for OwnedHandle {
 pub struct Device(pub(crate) OwnedHandle);
 
 impl Device {
-    pub fn fd(&self) -> RawHandle { self.0.fd() }
-
     /// Give up ownership, for a claim about to be endowed. A claim carries no
     /// `DUP` right, so this is the only way one changes hands.
     pub fn into_raw(self) -> RawHandle { self.0.into_raw() }
@@ -108,7 +112,7 @@ impl Device {
 }
 
 impl AsHandle for Device {
-    fn as_handle(&self) -> RawHandle { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.raw() }
 }
 
 /// One end of a kernel pipe.
@@ -118,8 +122,6 @@ impl AsHandle for Device {
 pub struct Pipe(pub(crate) OwnedHandle);
 
 impl Pipe {
-    pub fn fd(&self) -> RawHandle { self.0.fd() }
-
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, toyos_abi::syscall::SyscallError> {
         self.0.read(buf)
     }
@@ -137,11 +139,11 @@ impl Pipe {
     }
 
     pub fn pipe_map(&self) -> Result<*mut u8, toyos_abi::syscall::SyscallError> {
-        toyos_abi::syscall::pipe_map(self.fd())
+        toyos_abi::syscall::pipe_map(self.0.raw())
     }
 
     /// Consume the `Pipe`, giving up the handle without closing it.
-    pub fn into_fd(self) -> RawHandle {
+    pub fn into_raw(self) -> RawHandle {
         self.0.into_raw()
     }
 
@@ -156,5 +158,5 @@ impl Pipe {
 }
 
 impl AsHandle for Pipe {
-    fn as_handle(&self) -> RawHandle { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.raw() }
 }

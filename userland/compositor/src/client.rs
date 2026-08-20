@@ -11,6 +11,7 @@
 use std::time::{Duration, Instant};
 
 use toyos::shm::SharedMemory;
+use toyos::AsHandle;
 use toyos::{ipc, Connection};
 use toyos_abi::RawHandle;
 use toyos_desktop::Window;
@@ -185,7 +186,7 @@ pub fn note_closed(by: &str, client: RawHandle, remaining: usize) {
 /// which is the price of never blocking on it.
 pub fn deliver<T: ipc::IpcPayload>(dead: &mut Vec<Dead>, win: &Win, msg_type: u32, payload: &T) {
     if let Err(e) = win.client.conn.try_send(msg_type, payload) {
-        mark_dead(dead, win.client.conn.fd(), e.into());
+        mark_dead(dead, win.client.conn.as_handle(), e.into());
     }
 }
 
@@ -202,13 +203,13 @@ pub fn deliver_with_handles<T: ipc::IpcPayload>(
     payload: &T,
 ) {
     if let Err(e) = win.client.conn.try_send_with_handles(handles, msg_type, payload) {
-        mark_dead(dead, win.client.conn.fd(), e.into());
+        mark_dead(dead, win.client.conn.as_handle(), e.into());
     }
 }
 
 /// [`deliver`] for a message that is only its own header.
 pub fn deliver_signal(dead: &mut Vec<Dead>, win: &Win, msg_type: u32) {
     if let Err(e) = win.client.conn.try_signal(msg_type) {
-        mark_dead(dead, win.client.conn.fd(), e.into());
+        mark_dead(dead, win.client.conn.as_handle(), e.into());
     }
 }

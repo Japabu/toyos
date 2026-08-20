@@ -5,7 +5,7 @@ use std::time::Duration;
 use std::process::{Command, Stdio};
 
 use toyos_abi::syscall;
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::{namespace, port};
 
 fn main() {
@@ -68,7 +68,7 @@ fn test_acceptor_isolation_io_uring() {
         let handle = acc_a.into_raw();
         a_ready2.store(true, Ordering::Release);
         let poller = Poller::new(1);
-        poller.poll_add_fd(handle, IORING_POLL_IN, 0);
+        poller.watch_raw(handle, READABLE, 0);
         let mut ready = false;
         poller.wait(1, 500_000_000, |_| ready = true);
         syscall::close(handle);
@@ -80,7 +80,7 @@ fn test_acceptor_isolation_io_uring() {
         let handle = acc_b.into_raw();
         b_ready2.store(true, Ordering::Release);
         let poller = Poller::new(1);
-        poller.poll_add_fd(handle, IORING_POLL_IN, 0);
+        poller.watch_raw(handle, READABLE, 0);
         let mut ready = false;
         poller.wait(1, 200_000_000, |_| ready = true);
         syscall::close(handle);

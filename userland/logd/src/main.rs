@@ -68,7 +68,7 @@ use std::time::{Duration, Instant};
 
 use toyos::endow::{Endowments, SYSCAP_LABEL};
 use toyos::log::{LogTail, Record};
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::syscap::SysCap;
 use toyos_wallclock::Civil;
 
@@ -194,9 +194,9 @@ fn main() {
     // the readiness is an edge, so the window is closed by reading once more
     // after arming rather than by asking the kernel a question about a cursor
     // it does not hold. `min_complete` 0 with no timeout submits the entry and
-    // returns — one `wait` per `poll_add`, which is what the ring's own
+    // returns — one `wait` per `watch`, which is what the ring's own
     // capacity accounting requires.
-    poller.poll_add(&cap, IORING_POLL_IN, LOG_TOKEN);
+    poller.watch(&cap, READABLE, LOG_TOKEN);
     poller.wait(0, 0, |_| {});
 
     let mut lost = 0u64;
@@ -226,7 +226,7 @@ fn main() {
             // **Nothing new, so park on the readiness source rather than spin.**
             // `SYS_LOG_READ` never blocks by design; this is the other half of
             // that design.
-            poller.poll_add(&cap, IORING_POLL_IN, LOG_TOKEN);
+            poller.watch(&cap, READABLE, LOG_TOKEN);
             poller.wait(1, IDLE_NANOS, |_| {});
             continue;
         }

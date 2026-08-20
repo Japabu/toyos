@@ -205,7 +205,7 @@ fn an_acceptor_killed_in_the_accept() {
     drop(child);
 
     assert_eq!(
-        ns.open(SERVICE).map(|conn| conn.fd()),
+        ns.open(SERVICE).map(|conn| conn.as_handle()),
         Err(SyscallError::Gone),
         "a port whose only acceptor was killed mid-accept still queued a connection",
     );
@@ -351,7 +351,7 @@ fn child(role: &str) -> ! {
         "accept" => {
             let acceptor = endow::acceptor(SERVICE).expect("the parent endowed an acceptor");
             say("parked in accept");
-            let taken = acceptor.accept().map(|conn| conn.fd());
+            let taken = acceptor.accept().map(|conn| conn.as_handle());
             panic!("accept came back with {taken:?}");
         }
         other => panic!("unknown role {other:?}"),

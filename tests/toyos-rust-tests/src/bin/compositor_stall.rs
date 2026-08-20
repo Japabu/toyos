@@ -20,6 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use toyos::endow;
+use toyos::AsHandle;
 use toyos::{ipc, Connection};
 use toyos_abi::syscall::{self, SyscallError};
 use window::Window;
@@ -148,7 +149,7 @@ fn connect(what: &str) -> Connection {
 }
 
 fn write_raw(conn: &Connection, bytes: &[u8], what: &str) {
-    write_handle(conn.fd(), bytes, what);
+    write_handle(conn.as_handle(), bytes, what);
 }
 
 /// Every write here fits in the pipe it goes into, so a blocking `write` can
@@ -189,7 +190,7 @@ fn await_refusal(deaf: &Window) {
 /// Ask the compositor something it always answers, and give it a deadline.
 fn probe(what: &str) {
     let conn = connect(what);
-    if let Err(e) = ipc::signal(conn.fd(), window::MSG_GET_RESOLUTION) {
+    if let Err(e) = ipc::signal(conn.as_handle(), window::MSG_GET_RESOLUTION) {
         fail(&format!("[{what}] could not ask the compositor for its resolution: {e:?}"));
     }
     let mut buf = [0u8; 16];

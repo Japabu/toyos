@@ -29,6 +29,7 @@ use std::os::toyos::process::CommandExt;
 use std::process::{exit, Command, Stdio};
 
 use toyos::endow;
+use toyos::AsHandle;
 use toyos::shm::SharedMemory;
 use toyos::{ipc, Connection};
 use toyos_abi::syscall::{self, SyscallError};
@@ -174,13 +175,13 @@ fn run() {
 /// to establish before dying.
 fn connect_and_go() {
     let conn = endow::service("compositor").expect("the compositor is not serving");
-    // The kernel clones the descriptor into the child's table
+    // The kernel clones the handle into the child's table
     // (`loader::build_child_handles`), so the socket — and the pipes under it —
     // outlive this process.
     Command::new(SELF_PATH)
         .arg("finish")
-        .inherit_fd(RELAY_SOCKET.0, conn.fd().0)
-        .inherit_fd(RELAY_GO.0, 0)
+        .inherit_handle(RELAY_SOCKET.0, conn.as_handle().0)
+        .inherit_handle(RELAY_GO.0, 0)
         .spawn()
         .expect("spawn the process that finishes the request");
     println!("connected");
@@ -249,7 +250,7 @@ fn write_handle(handle: toyos_abi::RawHandle, bytes: &[u8], what: &str) {
 fn probe(what: &str) {
     let conn: Connection = endow::service("compositor")
         .unwrap_or_else(|e| fail(&format!("[{what}] the compositor is not serving: {e:?}")));
-    if let Err(e) = ipc::signal(conn.fd(), window::MSG_GET_RESOLUTION) {
+    if let Err(e) = ipc::signal(conn.as_handle(), window::MSG_GET_RESOLUTION) {
         fail(&format!("[{what}] could not ask the compositor for its resolution: {e:?}"));
     }
     let mut buf = [0u8; 16];

@@ -14,7 +14,7 @@
 
 use std::thread;
 
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::{namespace, port};
 use toyos_abi::syscall;
 
@@ -53,7 +53,7 @@ fn acceptor_then_ring(queue_a_connection: bool) {
     let (acceptor, connector) = port::create().expect("a port");
     let poller = Poller::new(1);
     let acc = acceptor.into_raw();
-    poller.poll_add_fd(acc, IORING_POLL_IN, 0);
+    poller.watch_raw(acc, READABLE, 0);
     // Hand the submission to the kernel without waiting for it: nothing has
     // connected, so the poll stays armed on the other side of this call.
     poller.wait(0, 0, |_| {});
@@ -81,7 +81,7 @@ fn ring_then_acceptor() {
     let acc = acceptor.into_raw();
     {
         let poller = Poller::new(1);
-        poller.poll_add_fd(acc, IORING_POLL_IN, 0);
+        poller.watch_raw(acc, READABLE, 0);
         poller.wait(0, 0, |_| {});
     }
     syscall::close(acc);
@@ -105,7 +105,7 @@ fn shared_port_race() {
         let second = syscall::dup(first).expect("an acceptor carries DUP");
 
         let watcher = Poller::new(1);
-        watcher.poll_add_fd(first, IORING_POLL_IN, 0);
+        watcher.watch_raw(first, READABLE, 0);
         watcher.wait(0, 0, |_| {});
 
         // A second ring registers on the same `PortShared` and then goes away
@@ -113,7 +113,7 @@ fn shared_port_race() {
         // count loses the first ring's registration.
         {
             let transient = Poller::new(1);
-            transient.poll_add_fd(second, IORING_POLL_IN, 0);
+            transient.watch_raw(second, READABLE, 0);
             transient.wait(0, 0, |_| {});
         }
         syscall::close(second);
@@ -121,7 +121,7 @@ fn shared_port_race() {
         // Drain whatever the close posted, so what the assertion below sees is
         // the connection and cannot be the cancellation.
         watcher.wait(0, 0, |_| {});
-        watcher.poll_add_fd(first, IORING_POLL_IN, 1);
+        watcher.watch_raw(first, READABLE, 1);
 
         let ns = namespace::build().add("p", &connector).finish().expect("a namespace");
         let client = ns.open("p").expect("open");
