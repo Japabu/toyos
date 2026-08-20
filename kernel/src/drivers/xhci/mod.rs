@@ -264,9 +264,37 @@ fn earliest(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
-/// Put one control transfer's TRBs on an EP0 ring, and say whether it carries
-/// a data stage — which is what decides how many completions it produces and
-/// therefore what a caller has to wait for.
+/// Where a control transfer's completions come from.
+///
+/// **The addresses and not a count**, which is what [`Await::Transfer`]'s TRB
+/// address needs: a Transfer Event names the TRB that generated it, so the two
+/// stages of one control transfer are two named events rather than two
+/// anonymous ones on the same endpoint.
+#[derive(Clone, Copy)]
+struct ControlTrbs {
+    /// The Data Stage TRB, for a transfer that carries one. It is the stage
+    /// that says how many bytes arrived, so it is the one an operation is
+    /// submitted on.
+    data: Option<u64>,
+    /// The Status Stage TRB, which every control transfer has and which is the
+    /// device's verdict on the whole of it.
+    status: u64,
+}
+
+impl ControlTrbs {
+    /// What the driver waits for, as [`Outstanding::submit`] wants it: the
+    /// first completion owed, and whatever is owed after it.
+    fn awaits(self, slot: u8) -> (Await, Stages) {
+        let on = |trb| Await::Transfer { slot, dci: 1, trb };
+        match self.data {
+            Some(data) => (on(data), Stages::DataThenStatus(on(self.status))),
+            None => (on(self.status), Stages::One),
+        }
+    }
+}
+
+/// Put one control transfer's TRBs on an EP0 ring, and say where each of its
+/// completions will come from.
 ///
 /// Separate from the wait because the two ends have different callers: an
 /// endpoint recovery stepped across scheduler passes submits here and comes
@@ -280,7 +308,7 @@ fn enqueue_control(
     w_index: u16,
     data_buf: Option<u64>,
     data_len: u16,
-) -> bool {
+) -> ControlTrbs {
     let is_in = (bm_request_type & 0x80) != 0;
     let has_data = data_len > 0 && data_buf.is_some();
     let trt = if !has_data { 0u32 } else if is_in { 3 } else { 2 };
@@ -291,7 +319,7 @@ fn enqueue_control(
     setup.control = TRB_SETUP_STAGE | (1 << 6) | (trt << 16);
     ring.enqueue(setup);
 
-    if let Some(buf) = data_buf.filter(|_| has_data) {
+    let data_at = data_buf.filter(|_| has_data).map(|buf| {
         let mut data = Trb::ZERO;
         data.param = buf;
         data.status = data_len as u32;
@@ -303,14 +331,13 @@ fn enqueue_control(
         // of "how many bytes are actually in that buffer", and a descriptor
         // read has no other way to ask.
         data.control = TRB_DATA_STAGE | dir | (1 << 2) | (1 << 5);
-        ring.enqueue(data);
-    }
+        ring.enqueue(data)
+    });
 
     let mut status = Trb::ZERO;
     let status_dir = if has_data && is_in { 0 } else { 1u32 << 16 };
     status.control = TRB_STATUS_STAGE | (1 << 5) | status_dir;
-    ring.enqueue(status);
-    has_data
+    ControlTrbs { data: data_at, status: ring.enqueue(status) }
 }
 
 /// The line for an endpoint no sequence of commands takes back to Running.
@@ -570,11 +597,14 @@ impl TrbRing {
         (self.base_phys + (self.tail as u64) * 16) | (self.cycle as u64)
     }
 
-    /// Put `trb` on the ring and answer with **where it landed**, which for the
-    /// command ring is the only name a Command Completion Event gives it
-    /// (xHCI 1.2 §6.4.2.2). A caller matching on anything coarser than that —
-    /// "the next completion of any command" — takes the answer belonging to a
-    /// command that ran out its deadline and replied afterwards.
+    /// Put `trb` on the ring and answer with **where it landed**, which is the
+    /// only name the event carries: a Command Completion Event names its
+    /// Command TRB (xHCI 1.2 §6.4.2.2) and a Transfer Event names the Transfer
+    /// TRB that generated it (§6.4.2.1, with ED clear — no TRB this driver
+    /// enqueues sets Event Data). A caller matching on anything coarser than
+    /// that — "the next completion of any command", "the next completion on
+    /// this endpoint" — takes the answer belonging to an operation that ran out
+    /// its deadline and replied afterwards.
     fn enqueue(&mut self, mut trb: Trb) -> u64 {
         if self.cycle {
             trb.control |= TRB_CYCLE;
@@ -1149,15 +1179,21 @@ impl XhciController {
         let slot = ((event.control >> 24) & 0xFF) as u8;
 
         // **The outstanding operation first, and recorded rather than acted
-        // on.** The Command TRB pointer's low four bits are reserved in the
-        // event, so the address is masked out of it rather than compared whole.
-        // The second number each event kind carries goes with it: a Command
-        // Completion Event's Slot ID, which is the controller's answer to
-        // Enable Slot, and a Transfer Event's residue.
+        // on.** Both event kinds name the TRB they answer in their first two
+        // dwords — a Command Completion Event its Command TRB (§6.4.2.2), a
+        // Transfer Event the Transfer TRB that generated it (§6.4.2.1) — and the
+        // low four bits are reserved in both, so the address is masked out
+        // rather than compared whole. The second number each event kind carries
+        // goes with it: a Command Completion Event's Slot ID, which is the
+        // controller's answer to Enable Slot, and a Transfer Event's residue.
         let answers = match trb_type {
             EVENT_CMD_COMPLETE => Some((Await::Command { trb: event.param & !0xF }, slot as u32)),
             EVENT_TRANSFER => Some((
-                Await::Transfer { slot, dci: ((event.control >> 16) & 0x1F) as u8 },
+                Await::Transfer {
+                    slot,
+                    dci: ((event.control >> 16) & 0x1F) as u8,
+                    trb: event.param & !0xF,
+                },
                 event.status & 0x00FF_FFFF,
             )),
             _ => None,
@@ -1323,14 +1359,14 @@ impl XhciController {
                 self.outstanding.submit(what, on, Stages::One, deadline());
             }
             Act::ClearHalt => {
-                enqueue_control(
+                let trbs = enqueue_control(
                     &mut self.devices[at].ep0_ring, 0x02, 0x01, 0, ep_addr as u16, None, 0,
                 );
                 self.ring_doorbell(slot_id, 1);
-                let on = Await::Transfer { slot: slot_id, dci: 1 };
+                let (on, stages) = trbs.awaits(slot_id);
                 let what =
                     What::Recovering { slot_id, seq, issued: "CLEAR_FEATURE(ENDPOINT_HALT)" };
-                self.outstanding.submit(what, on, Stages::One, deadline());
+                self.outstanding.submit(what, on, stages, deadline());
             }
         }
     }
