@@ -24,7 +24,7 @@
 use std::process::Command;
 
 use toyos::log::{LogTail, Record};
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::syscap::SysCap;
 
 /// The poll's token. One handle is watched, so one number.
@@ -80,9 +80,9 @@ fn probe(cap: &SysCap) -> Result<(), String> {
         drain(cap, &mut tail, &mut buf)?;
 
         let poller = Poller::new(2);
-        poller.poll_add(cap, IORING_POLL_IN, TOKEN);
+        poller.watch(cap, READABLE, TOKEN);
         // **Submitted before the close, and this is the whole of what the gate
-        // has to get right.** `poll_add` only queues a submission entry;
+        // has to get right.** `watch` only queues a submission entry;
         // `wait` is what enters the kernel. A round that closed the sibling
         // handle first would stage nothing at all — the ring is not a watcher
         // of the log yet, so there is nothing for a cancellation to reach, and

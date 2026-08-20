@@ -6,7 +6,7 @@ use toyos::audio::{
 };
 use toyos::endow::{self, Endowments};
 use toyos::ipc::{self, RxStep};
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::port::Acceptor;
 use toyos::shm::SharedMemory;
 use toyos::syscap::SysCap;
@@ -742,7 +742,7 @@ fn open_stream(
     // is that order, and a client reading the frame is guaranteed to find
     // them. Both are moved whether or not this succeeds.
     if control.send_with_handles(
-        &[client_shm, signal_read.into_fd()],
+        &[client_shm, signal_read.into_raw()],
         MSG_STREAM_OPENED,
         &StreamOpenResponse {
             client_period_frames,
@@ -790,7 +790,7 @@ fn open_stream(
     Some(ClientStream {
         client_id,
         slot_reader,
-        signal_write: signal_write.into_fd(),
+        signal_write: signal_write.into_raw(),
         gain,
         client_channels: req.channels,
         client_period_frames,
@@ -1205,8 +1205,8 @@ fn mix_thread(
             }
         };
 
-        poller.poll_add_fd(backend.handle(), IORING_POLL_IN, TOKEN_AUDIO);
-        poller.poll_add_fd(cmd_pipe_read, IORING_POLL_IN, TOKEN_CMD);
+        poller.watch_raw(backend.handle(), READABLE, TOKEN_AUDIO);
+        poller.watch_raw(cmd_pipe_read, READABLE, TOKEN_CMD);
 
         let mut cmd_ready = false;
         poller.wait(1, timeout, |token| match token {
@@ -1568,7 +1568,7 @@ fn null_sink_thread(
             next_period_ns.saturating_sub(syscall::clock_nanos()).max(1)
         };
 
-        poller.poll_add_fd(cmd_pipe_read, IORING_POLL_IN, TOKEN_CMD);
+        poller.watch_raw(cmd_pipe_read, READABLE, TOKEN_CMD);
         let mut cmd_ready = false;
         poller.wait(1, timeout, |token| match token {
             TOKEN_CMD => cmd_ready = true,
@@ -1838,9 +1838,9 @@ fn control_thread(
     const TOKEN_ACCEPT: u64 = u64::MAX;
 
     loop {
-        poller.poll_add(&acceptor, IORING_POLL_IN, TOKEN_ACCEPT);
+        poller.watch(&acceptor, READABLE, TOKEN_ACCEPT);
         for (i, client) in clients.iter().enumerate() {
-            poller.poll_add(&client.conn, IORING_POLL_IN, i as u64);
+            poller.watch(&client.conn, READABLE, i as u64);
         }
 
         let mut ready: Vec<u64> = Vec::new();

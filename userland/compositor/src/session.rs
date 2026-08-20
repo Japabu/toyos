@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use toyos::endow;
 use toyos::ipc::RxStep;
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::port::Acceptor;
 use toyos::shm::SharedMemory;
 use toyos::{ipc, system, AsHandle, FramebufferDev, Keyboard, Mouse};
@@ -219,9 +219,9 @@ impl Session {
         // and one per pending connection, and `MSG_SET_RESOLUTION` can raise
         // `max_windows` mid-run.
         let poller = Poller::new(FIXED_POLL_HANDLES + MAX_WINDOW_SLOTS + MAX_PENDING_CONNS);
-        poller.poll_add(&kb, IORING_POLL_IN, kb.fd().0 as u64);
-        poller.poll_add(&mouse, IORING_POLL_IN, mouse.fd().0 as u64);
-        poller.poll_add(&acceptor, IORING_POLL_IN, acceptor.as_handle().0 as u64);
+        poller.watch(&kb, READABLE, kb.as_handle().0 as u64);
+        poller.watch(&mouse, READABLE, mouse.as_handle().0 as u64);
+        poller.watch(&acceptor, READABLE, acceptor.as_handle().0 as u64);
 
         let cursor = Point { x: desk.screen.w() / 2, y: desk.screen.h() / 2 };
         if hw_cursor {
@@ -311,11 +311,11 @@ impl Session {
         self.poller.wait(1, timeout.as_nanos() as u64, |token| ready.push(token));
         self.ready = ready;
 
-        let kb_ready = self.is_ready(self.kb.fd());
-        let mouse_ready = self.is_ready(self.mouse.fd());
+        let kb_ready = self.is_ready(self.kb.as_handle());
+        let mouse_ready = self.is_ready(self.mouse.as_handle());
         let accept_ready = self.is_ready(self.acceptor.as_handle());
-        let client_ready = self.stack.iter().any(|w| self.is_ready(w.client.conn.fd()))
-            || self.pending.iter().any(|p| self.is_ready(p.conn.fd()));
+        let client_ready = self.stack.iter().any(|w| self.is_ready(w.client.conn.as_handle()))
+            || self.pending.iter().any(|p| self.is_ready(p.conn.as_handle()));
 
         // A handshake that never completes is the reason this deadline exists,
         // and the sweep has to happen on a pass that found nothing ready too —
@@ -325,7 +325,7 @@ impl Session {
         for p in self.pending.iter().filter(|p| now.duration_since(p.since) >= HANDSHAKE_TIMEOUT) {
             eprintln!(
                 "compositor: dropping client {} — {}",
-                p.conn.fd().0,
+                p.conn.as_handle().0,
                 DropReason::HandshakeTimeout.why()
             );
         }
@@ -420,7 +420,7 @@ impl Session {
                     let Some(idx) = focused else { continue };
                     self.damage.add(self.stack[idx].frame(&self.desk.chrome));
                     let win = self.stack.remove(idx);
-                    note_closed("GUI+Q", win.client.conn.fd(), self.stack.len());
+                    note_closed("GUI+Q", win.client.conn.as_handle(), self.stack.len());
                     let _ = win.client.conn.try_signal(window::MSG_WINDOW_CLOSE);
                     self.damage_all();
                 }
@@ -492,7 +492,7 @@ impl Session {
         match hit_test(&self.desk, &self.stack, at, self.launcher_open) {
             Hit::CloseButton(idx) => {
                 let win = self.stack.remove(idx);
-                note_closed("its close button", win.client.conn.fd(), self.stack.len());
+                note_closed("its close button", win.client.conn.as_handle(), self.stack.len());
                 self.damage.add(win.frame(&self.desk.chrome));
                 let _ = win.client.conn.try_signal(window::MSG_WINDOW_CLOSE);
                 self.damage_all();
@@ -512,7 +512,7 @@ impl Session {
                 self.damage.add(self.stack[i].frame(&self.desk.chrome));
 
                 let now = Instant::now();
-                let handle = self.stack[i].client.conn.fd();
+                let handle = self.stack[i].client.conn.as_handle();
                 let double = Some(handle) == self.last_click_handle
                     && now.duration_since(self.last_click_at) < DOUBLE_CLICK_TIME;
                 if double {
@@ -629,11 +629,11 @@ impl Session {
                 eprintln!(
                     "compositor: refusing client {} — {MAX_PENDING_CONNS} connections are already \
                      waiting to say what they want",
-                    conn.fd().0
+                    conn.as_handle().0
                 );
             }
             Ok(conn) => {
-                self.poller.poll_add(&conn, IORING_POLL_IN, conn.fd().0 as u64);
+                self.poller.watch(&conn, READABLE, conn.as_handle().0 as u64);
                 self.pending.push(PendingConn { conn, rx: ClientRx::new(), since: Instant::now() });
             }
         }
@@ -648,14 +648,14 @@ impl Session {
         let mut out: Vec<ClientFrame> = Vec::new();
 
         for i in 0..self.pending.len() {
-            if !self.is_ready(self.pending[i].conn.fd()) {
+            if !self.is_ready(self.pending[i].conn.as_handle()) {
                 continue;
             }
             let step = {
                 let p = &mut self.pending[i];
                 p.rx.pump(&p.conn)
             };
-            let handle = self.pending[i].conn.fd();
+            let handle = self.pending[i].conn.as_handle();
             match step {
                 RxStep::Idle => {}
                 RxStep::Eof => mark_dead(&mut self.dead, handle, DropReason::Gone),
@@ -682,12 +682,12 @@ impl Session {
         }
 
         for i in 0..self.stack.len() {
-            if !self.is_ready(self.stack[i].client.conn.fd()) {
+            if !self.is_ready(self.stack[i].client.conn.as_handle()) {
                 continue;
             }
             let win = &mut self.stack[i];
             let step = win.client.rx.pump(&win.client.conn);
-            let handle = win.client.conn.fd();
+            let handle = win.client.conn.as_handle();
             match step {
                 RxStep::Idle => {}
                 RxStep::Eof => mark_dead(&mut self.dead, handle, DropReason::Gone),
@@ -714,16 +714,16 @@ impl Session {
                         mark_dead(&mut self.dead, handle, DropReason::OutOfProtocol);
                         continue;
                     };
-                    if let Some(i) = self.stack.find(|w| w.client.conn.fd() == handle) {
+                    if let Some(i) = self.stack.find(|w| w.client.conn.as_handle() == handle) {
                         self.stack[i].presented = true;
                         let claim = Rect::from_wire(rect.x, rect.y, rect.w, rect.h);
                         self.damage.add(self.stack[i].present_damage(claim));
                     }
                 }
                 window::MSG_DESTROY_WINDOW => {
-                    if let Some(i) = self.stack.find(|w| w.client.conn.fd() == handle) {
+                    if let Some(i) = self.stack.find(|w| w.client.conn.as_handle() == handle) {
                         let gone = self.stack.remove(i);
-                        note_closed("the client itself", gone.client.conn.fd(), self.stack.len());
+                        note_closed("the client itself", gone.client.conn.as_handle(), self.stack.len());
                         self.damage.add(gone.frame(&self.desk.chrome));
                         self.damage_all();
                     }
@@ -780,7 +780,7 @@ impl Session {
                         mark_dead(&mut self.dead, handle, DropReason::OutOfProtocol);
                         continue;
                     };
-                    if let Some(i) = self.stack.find(|w| w.client.conn.fd() == handle) {
+                    if let Some(i) = self.stack.find(|w| w.client.conn.as_handle() == handle) {
                         self.stack[i].cursor_style = cursor_from_wire(style);
                     }
                 }
@@ -904,7 +904,7 @@ impl Session {
             CursorStyle::Default,
         ));
 
-        self.poller.poll_add(&self.stack[at].client.conn, IORING_POLL_IN, handle.0 as u64);
+        self.poller.watch(&self.stack[at].client.conn, READABLE, handle.0 as u64);
         let pixel_format = self.pixel_format();
         deliver_with_handles(
             &mut self.dead,
@@ -983,12 +983,12 @@ impl Session {
         let vacated: Vec<Rect> = self
             .stack
             .iter()
-            .filter(|w| self.dead.iter().any(|(handle, _)| *handle == w.client.conn.fd()))
+            .filter(|w| self.dead.iter().any(|(handle, _)| *handle == w.client.conn.as_handle()))
             .map(|w| w.frame(&self.desk.chrome))
             .collect();
         let dead = std::mem::take(&mut self.dead);
-        self.stack.retain(|w| !dead.iter().any(|(handle, _)| *handle == w.client.conn.fd()));
-        self.pending.retain(|p| !dead.iter().any(|(handle, _)| *handle == p.conn.fd()));
+        self.stack.retain(|w| !dead.iter().any(|(handle, _)| *handle == w.client.conn.as_handle()));
+        self.pending.retain(|p| !dead.iter().any(|(handle, _)| *handle == p.conn.as_handle()));
         self.dead = dead;
         if self.stack.len() != before {
             for rect in vacated {
@@ -1001,25 +1001,25 @@ impl Session {
     /// Re-arm the one-shot poll registrations for every handle that fired.
     fn rearm(&mut self, kb: bool, mouse: bool, acceptor: bool) {
         if kb {
-            self.poller.poll_add(&self.kb, IORING_POLL_IN, self.kb.fd().0 as u64);
+            self.poller.watch(&self.kb, READABLE, self.kb.as_handle().0 as u64);
         }
         if mouse {
-            self.poller.poll_add(&self.mouse, IORING_POLL_IN, self.mouse.fd().0 as u64);
+            self.poller.watch(&self.mouse, READABLE, self.mouse.as_handle().0 as u64);
         }
         if acceptor {
             let h = self.acceptor.as_handle();
-            self.poller.poll_add(&self.acceptor, IORING_POLL_IN, h.0 as u64);
+            self.poller.watch(&self.acceptor, READABLE, h.0 as u64);
         }
         for win in self.stack.iter() {
-            let handle = win.client.conn.fd();
+            let handle = win.client.conn.as_handle();
             if self.is_ready(handle) {
-                self.poller.poll_add(&win.client.conn, IORING_POLL_IN, handle.0 as u64);
+                self.poller.watch(&win.client.conn, READABLE, handle.0 as u64);
             }
         }
         for p in self.pending.iter() {
-            let handle = p.conn.fd();
+            let handle = p.conn.as_handle();
             if self.is_ready(handle) {
-                self.poller.poll_add(&p.conn, IORING_POLL_IN, handle.0 as u64);
+                self.poller.watch(&p.conn, READABLE, handle.0 as u64);
             }
         }
     }
@@ -1165,11 +1165,11 @@ impl Session {
             return;
         }
         for win in
-            self.stack.iter().filter(|w| dead.iter().any(|(h, _)| *h == w.client.conn.fd()))
+            self.stack.iter().filter(|w| dead.iter().any(|(h, _)| *h == w.client.conn.as_handle()))
         {
             self.damage.add(win.frame(&self.desk.chrome));
         }
-        self.stack.retain(|w| !dead.iter().any(|(handle, _)| *handle == w.client.conn.fd()));
+        self.stack.retain(|w| !dead.iter().any(|(handle, _)| *handle == w.client.conn.as_handle()));
         self.damage_all();
     }
 
@@ -1215,7 +1215,7 @@ impl Session {
                 .conn
                 .try_send_bytes(window::MSG_CLIPBOARD_PASTE, self.clipboard.as_bytes())
             {
-                mark_dead(&mut self.dead, win.client.conn.fd(), e.into());
+                mark_dead(&mut self.dead, win.client.conn.as_handle(), e.into());
             }
             return;
         }
@@ -1228,7 +1228,7 @@ impl Session {
             Err(e) => {
                 eprintln!(
                     "compositor: client {} gets no paste — no memory for {} bytes ({e:?})",
-                    win.client.conn.fd().0,
+                    win.client.conn.as_handle().0,
                     self.clipboard.len()
                 );
                 return;
@@ -1237,7 +1237,7 @@ impl Session {
         let Ok(handle) = shm.share() else {
             eprintln!(
                 "compositor: client {} gets no paste — its region cannot be shared",
-                win.client.conn.fd().0
+                win.client.conn.as_handle().0
             );
             return;
         };
@@ -1329,7 +1329,7 @@ fn rebuffer(win: &mut Win, pixel_format: u32, dead: &mut Vec<Dead>) -> bool {
         Err(e) => {
             eprintln!(
                 "compositor: client {} keeps its {}x{} buffer — no memory for {w}x{h} ({e:?})",
-                win.client.conn.fd().0,
+                win.client.conn.as_handle().0,
                 win.buf_w,
                 win.buf_h
             );
@@ -1339,7 +1339,7 @@ fn rebuffer(win: &mut Win, pixel_format: u32, dead: &mut Vec<Dead>) -> bool {
     let Ok(client_shm) = new_shm.share() else {
         eprintln!(
             "compositor: client {} keeps its {}x{} buffer — the new one cannot be shared",
-            win.client.conn.fd().0,
+            win.client.conn.as_handle().0,
             win.buf_w,
             win.buf_h
         );

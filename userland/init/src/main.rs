@@ -37,7 +37,7 @@ use toyos::endow::Endowments;
 use toyos::ipc::{self, Connection, RxStep};
 use toyos::launch::{self, Request};
 use toyos::namespace::{self, Namespace};
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::port::{self, Acceptor, Connector};
 use toyos::syscap::SysCap;
 use toyos::AsHandle;
@@ -171,9 +171,9 @@ fn launch_forever<'a>(
     let mut pending: Vec<Pending> = Vec::new();
     let mut ready: Vec<u64> = Vec::new();
     loop {
-        poller.poll_add(launcher, IORING_POLL_IN, TOKEN_ACCEPTOR);
+        poller.watch(launcher, READABLE, TOKEN_ACCEPTOR);
         for p in &pending {
-            poller.poll_add(&p.conn, IORING_POLL_IN, TOKEN_PENDING_BASE + p.conn.fd().0 as u64);
+            poller.watch(&p.conn, READABLE, TOKEN_PENDING_BASE + p.conn.as_handle().0 as u64);
         }
         // A client that connects and then says nothing wakes nothing, so the
         // deadline that removes it has to be a wake in its own right —
@@ -199,7 +199,7 @@ fn launch_forever<'a>(
         for p in pending.iter().filter(|p| now.duration_since(p.since) >= HANDSHAKE_TIMEOUT) {
             say!(
                 "init: launcher: dropping client {} — it never finished its launch",
-                p.conn.fd().0
+                p.conn.as_handle().0
             );
         }
         pending.retain(|p| now.duration_since(p.since) < HANDSHAKE_TIMEOUT);
@@ -214,7 +214,7 @@ fn launch_forever<'a>(
                 say!(
                     "init: launcher: refusing client {} — {MAX_PENDING_LAUNCHES} connections are \
                      already waiting to say what to start",
-                    conn.fd().0
+                    conn.as_handle().0
                 );
             } else {
                 pending.push(Pending { conn, rx: LaunchRx::new(), since: Instant::now() });
@@ -225,7 +225,7 @@ fn launch_forever<'a>(
         // so leaving `i` alone visits each connection exactly once.
         let mut i = 0;
         while i < pending.len() {
-            let handle = pending[i].conn.fd();
+            let handle = pending[i].conn.as_handle();
             if !ready.contains(&(TOKEN_PENDING_BASE + handle.0 as u64)) {
                 i += 1;
                 continue;
@@ -346,7 +346,7 @@ fn serve_launch<'a>(
     // was never told which applet it is.
     let mut command = Command::new(request.program);
     for (slot, handle) in request.slot_numbers().zip(slots.0.iter().copied()) {
-        command.inherit_fd(slot, handle.0);
+        command.inherit_handle(slot, handle.0);
     }
     // **Carried, not inherited.** A child of the launcher would otherwise get
     // init's environment and init's working directory, so `cd /tmp && ls` would
@@ -369,7 +369,7 @@ fn serve_launch<'a>(
         }
     }
 
-    // `inherit_fd` duplicates into the child, so init's own copies go with
+    // `inherit_handle` duplicates into the child, so init's own copies go with
     // `slots` when this returns.
     let started = start(command, program, system, syscap, acceptors, connectors, &extras);
     match started {
@@ -384,7 +384,7 @@ fn serve_launch<'a>(
             // this call is about to drop, which releases it — and closing it
             // here would be closing a handle init no longer holds, which under
             // the bad-handle policy is init exiting.
-            match toyos_abi::syscall::handle_send(conn.fd(), &[handle]) {
+            match toyos_abi::syscall::handle_send(conn.as_handle(), &[handle]) {
                 Ok(()) => {
                     let _ = conn.try_signal(launch::MSG_LAUNCHED);
                 }

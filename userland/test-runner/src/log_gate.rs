@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use toyos::log::{LogTail, Record, MAX_LOG_SHARDS};
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::syscap::SysCap;
 
 /// The first sequence number any shard issues — one, so a slot nothing has ever
@@ -250,7 +250,7 @@ fn gate(cap: &SysCap) -> Result<(), String> {
     let started = Instant::now();
     loop {
         if !armed {
-            poller.poll_add(cap, IORING_POLL_IN, LOG_TOKEN);
+            poller.watch(cap, READABLE, LOG_TOKEN);
             armed = true;
         }
         poller.wait(0, 0, |token| {
@@ -337,7 +337,7 @@ fn gate(cap: &SysCap) -> Result<(), String> {
             .map_err(|e| format!("the record-making child would not start: {e}"))?;
         let _ = child.wait();
         if !armed {
-            poller.poll_add(cap, IORING_POLL_IN, LOG_TOKEN);
+            poller.watch(cap, READABLE, LOG_TOKEN);
         }
         poller.wait(1, READINESS_WAIT_NANOS, |token| {
             assert_eq!(token, LOG_TOKEN, "the log poll completed with another token");
