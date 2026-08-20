@@ -10,6 +10,7 @@ use toyos_sched::hw::CpuId;
 
 use crate::choice::ChoiceStream;
 use crate::invariants;
+use crate::latency::{ReadyCause, RunWait};
 use crate::vm::{build_queues, Step, Vm};
 use crate::workload::Scenario;
 
@@ -82,6 +83,21 @@ pub struct Outcome {
     /// a separate question from its verdict and one a change to the pick or the
     /// balance can silently shrink; see [`crate::vm::Vm::thread_covered_ns`].
     pub thread_covered_ns: u64,
+    /// Per process: how long its threads waited between being owed a dispatch
+    /// and getting one, split by why they were owed one. The measured policy
+    /// suite's instrument — see [`crate::latency`] and `sim/tests/policy.rs`.
+    pub run_wait: Vec<RunWait>,
+    /// Per process: CPU nanoseconds delivered over the whole run, and the
+    /// wall-clock instant its last thread was released (`None` for a process
+    /// still holding one when the run quiesced).
+    ///
+    /// Together they are a *rate*, which is what a fair share is a claim about:
+    /// a process whose scripts carry a fixed amount of work and whose rival
+    /// never runs out finished at exactly the share it was given.
+    pub process_service_ns: Vec<u64>,
+    pub process_finish_ns: Vec<Option<u64>>,
+    /// How many tasks the balance path moved between CPUs.
+    pub migrations: u64,
     /// What each CPU's passes cost, as the core's `feature = "check"` recorder
     /// measured them — the on-target instrument, driven here by the scenario's
     /// modelled `pass_cost_ns`.
@@ -97,6 +113,22 @@ pub struct Outcome {
 impl Outcome {
     pub fn passed(&self) -> bool {
         self.violations.is_empty()
+    }
+
+    /// The longest any task of any process waited while it was owed the CPU —
+    /// the starvation number, with no question asked about which process or how
+    /// it came to be owed one.
+    pub fn worst_run_wait_ns(&self) -> u64 {
+        self.run_wait
+            .iter()
+            .map(RunWait::worst_ns)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// One process's waits of one kind, for a case that knows which it means.
+    pub fn wait(&self, process: usize, cause: ReadyCause) -> &crate::latency::Latency {
+        self.run_wait[process].get(cause)
     }
 
     pub fn report(&self) -> String {
@@ -232,6 +264,10 @@ fn outcome_of(scenario: &'static str, vm: &Vm<'_>, choices: &ChoiceStream) -> Ou
         thread_bound: vm.thread_bound,
         thread_over_bound: vm.thread_over_bound,
         thread_covered_ns: vm.thread_covered_ns,
+        run_wait: vm.run_wait.clone(),
+        process_service_ns: vm.service_ns.clone(),
+        process_finish_ns: vm.finish_ns.clone(),
+        migrations: vm.migrations,
         pass_costs: (0..vm.handles.len())
             .map(|cpu| {
                 let cpu = CpuId(cpu as u32);

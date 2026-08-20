@@ -20,6 +20,7 @@ use toyos_sched::task::{TaskKey, TaskState};
 
 use toyos_sched::cpu::{DYING_AGE_NS, DYING_CHUNK_NS};
 
+use crate::latency::ReadyCause;
 use crate::vm::{FairEpoch, Vm, IPI_LATENCY_NS, RUN_CHUNK_NS, UNWIND_NS};
 
 /// How long a CPU may keep running a normal task while an RT task is ready on
@@ -148,6 +149,7 @@ pub fn check_all(vm: &mut Vm<'_>) {
     check_share_refcounts(vm);
     check_address_spaces(vm);
     check_boost_windows(vm);
+    note_run_latency(vm);
 }
 
 /// What one walk of the containers has to yield for both fairness invariants:
@@ -334,6 +336,10 @@ fn check_retires(vm: &mut Vm<'_>) {
         vm.trace_cursor = s.trace.len();
         fresh
     });
+    // Counted on the same walk that judges them: the policy suite's wakeup-storm
+    // case claims a machine drains in parallel, and that claim is only about the
+    // balance path if the balance path moved something.
+    vm.migrations += migrated.len() as u64;
     for (key, to) in migrated {
         if vm.killed.contains_key(&key) {
             problems.push(format!(
@@ -884,6 +890,85 @@ fn check_thread_service(vm: &mut Vm<'_>, members: &[usize]) {
     for problem in problems {
         vm.violate(problem);
     }
+}
+
+/// The measured policy suite's instrument: how long each task waited between
+/// being owed a dispatch and getting one (`crate::latency`, `sim/tests/policy.rs`).
+///
+/// **A measurement and not a verdict**, which is why it returns nothing and
+/// fails nothing. Every wait this records is legal in *some* workload — a fair
+/// task waits out a saturated RT band, a corpse waits out an aged deferral — so
+/// a bound belongs to a scenario and not to the walk, and it is asserted where
+/// the scenario is known. What the walk owes is the number.
+///
+/// **"Owed a dispatch" spans two containers**, and the second is the half a
+/// naive instrument loses. A task in a run queue is owed one. So is a *parked*
+/// task whose `TaskState::WakeQueued` says a wake has already claimed it and
+/// posted its `Msg::Wake`: the interval `mailbox::Urgency::Normal` puts a bound
+/// on — "a busy target drains at its next safe point (≤ one quantum)" — starts
+/// at that claim, and an instrument that started at the enqueue would measure
+/// the run queue and call the answer a wake latency.
+///
+/// A task in transit keeps its stamp, because its migration is part of the wait.
+/// A task in the dying list drops it: a corpse's wait for the CPU is invariant
+/// I14's quantity, on I14's clock and against I14's bound, and counting it twice
+/// under a second name would make a policy bound answer for a teardown.
+fn note_run_latency(vm: &mut Vm<'_>) {
+    let now = vm.clock;
+    let mut seen: BTreeMap<TaskKey, Container> = BTreeMap::new();
+    for cpu in 0..vm.scenario.cpus {
+        for (key, container) in residents(&vm.cpus[cpu]) {
+            seen.insert(key, container);
+        }
+    }
+
+    let mut dispatched: Vec<(TaskKey, ReadyCause, u64)> = Vec::new();
+    for (&key, &container) in &seen {
+        let claimed_wake = container == Container::Parked
+            && matches!(vm.shared[&key].state(), TaskState::WakeQueued(_));
+        if container == Container::Ready || claimed_wake {
+            if !vm.awaiting.contains_key(&key) {
+                let cause = match vm.prev_container.get(&key) {
+                    // Off the CPU at its own quantum, or handed back by an RT
+                    // preemption: waiting for its next turn in the fair band.
+                    Some(Container::Running) => ReadyCause::Preempted,
+                    Some(Container::Parked) => ReadyCause::Woken,
+                    // Never seen anywhere: an `Adopt` that has just landed, which
+                    // is spawn placement rather than either of the above.
+                    None => ReadyCause::Fresh,
+                    // A task cannot arrive in a run queue *from* one, and the
+                    // two remaining containers are terminal for this instrument.
+                    Some(Container::Ready | Container::Dying | Container::Zombie) => {
+                        ReadyCause::Fresh
+                    }
+                };
+                vm.awaiting.insert(key, (now, cause));
+            }
+        } else if container == Container::Running {
+            if let Some((since, cause)) = vm.awaiting.remove(&key) {
+                dispatched.push((key, cause, now.since(since)));
+            }
+        } else {
+            vm.awaiting.remove(&key);
+        }
+    }
+    for (key, cause, ns) in dispatched {
+        if let Some(process) = vm.process_of(key) {
+            vm.run_wait[process].note(cause, ns);
+        }
+    }
+
+    // A task in no container at all is inside a message (invariant I1 requires
+    // its word to say `InTransit`), which is a hop of the wait and not the end
+    // of it. Anything else has stopped being a task.
+    vm.awaiting.retain(|key, _| {
+        seen.contains_key(key)
+            || matches!(
+                vm.shared.get(key).map(|shared| shared.state()),
+                Some(TaskState::InTransit(_))
+            )
+    });
+    vm.prev_container = seen;
 }
 
 /// I6: `FairShare.runnable_threads` equals the actual Ready+Running count of
