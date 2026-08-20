@@ -1176,8 +1176,18 @@ pub const KNOWN_RED: &[Red] = &[
         source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-07",
     },
+    // ---------------------------------------------------------------------
+    // **`fd_lifetime` is `handle_lifetime` since 2026-08-20.** The rename is
+    // the fd/inbox wave's
+    // (`issues/design-debt/fd-is-libc-jargon-and-the-tree-still-speaks-it.md`).
+    // Every reading in the three rows below was taken before it, so the harness
+    // lines they quote and the command they name printed and spelled
+    // `fd_lifetime` at the time; all three have been re-spelled to the live
+    // name, because a row naming a test that no longer exists matches nothing,
+    // adjudicates nothing, and hands whoever re-runs it a command that fails.
+    // ---------------------------------------------------------------------
     Red {
-        test: "fd_lifetime",
+        test: "handle_lifetime",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(4, 7),
         standing: Standing::Retired(
@@ -1223,7 +1233,7 @@ pub const KNOWN_RED: &[Red] = &[
     // three instruments and no one of them says what the others do.
     // ---------------------------------------------------------------------
     Red {
-        test: "fd_lifetime",
+        test: "handle_lifetime",
         instrument: Instrument::Ci,
         finding: Finding::Seen,
         standing: Standing::Retired(
@@ -1234,7 +1244,7 @@ pub const KNOWN_RED: &[Red] = &[
         ),
         what: "`a killed process kept 16777216 bytes of its io_urings` — the **whole** 16 MiB \
                the holder allocated, against a 6 MiB threshold, so the release had made no \
-               progress at all when the reading was taken. `ALONE fd_lifetime: red again, the \
+               progress at all when the reading was taken. `ALONE handle_lifetime: red again, the \
                same failure both times`, which on a shared-block name is a fresh boot carrying \
                that binary and nothing else",
         evidence: "CI run 32237424649 (PR #126, job `guest (1)`); `main` red at `8e9f851` on \
@@ -1243,7 +1253,7 @@ pub const KNOWN_RED: &[Red] = &[
         measured: "2026-08-19",
     },
     Red {
-        test: "fd_lifetime",
+        test: "handle_lifetime",
         instrument: Instrument::DevHostAlone,
         finding: Finding::quiet(20),
         standing: Standing::Stands,
@@ -1251,7 +1261,7 @@ pub const KNOWN_RED: &[Red] = &[
                why every dev-host sighting of this name had said `ALONE … GREEN` and why the \
                defect was read as its neighbours' page churn. The dev host is two CPUs under \
                TCG; CI is four under KVM, and the race widens with the CPU count",
-        evidence: "20 × `cargo test --test toyos-build -- fd_lifetime` on one quiet dev host, \
+        evidence: "20 × `cargo test --test toyos-build -- handle_lifetime` on one quiet dev host, \
                    `wt/toyos-fdleak` at `8e9f851`",
         source: "issues/build/free-memory-verdicts-share-a-boot.md",
         measured: "2026-08-19",

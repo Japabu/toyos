@@ -65,25 +65,25 @@ fn test_acceptor_isolation_io_uring() {
 
     // Thread A: watch its acceptor, report whether the poll completed
     let a = thread::spawn(move || -> bool {
-        let fd = acc_a.into_raw();
+        let handle = acc_a.into_raw();
         a_ready2.store(true, Ordering::Release);
         let poller = Poller::new(1);
-        poller.poll_add_fd(fd, IORING_POLL_IN, 0);
+        poller.poll_add_fd(handle, IORING_POLL_IN, 0);
         let mut ready = false;
         poller.wait(1, 500_000_000, |_| ready = true);
-        syscall::close(fd);
+        syscall::close(handle);
         ready
     });
 
     // Thread B: a different port, watched the same way
     let b = thread::spawn(move || -> bool {
-        let fd = acc_b.into_raw();
+        let handle = acc_b.into_raw();
         b_ready2.store(true, Ordering::Release);
         let poller = Poller::new(1);
-        poller.poll_add_fd(fd, IORING_POLL_IN, 0);
+        poller.poll_add_fd(handle, IORING_POLL_IN, 0);
         let mut ready = false;
         poller.wait(1, 200_000_000, |_| ready = true);
-        syscall::close(fd);
+        syscall::close(handle);
         ready
     });
 
@@ -162,12 +162,12 @@ fn test_connect_storm() {
     );
 
     let server = thread::spawn(move || {
-        let fd = acceptor.into_raw();
+        let handle = acceptor.into_raw();
         for _ in 0..num_clients {
-            let conn = syscall::accept(fd).expect("accept failed");
+            let conn = syscall::accept(handle).expect("accept failed");
             syscall::close(conn);
         }
-        syscall::close(fd);
+        syscall::close(handle);
     });
 
     thread::sleep(Duration::from_millis(50));

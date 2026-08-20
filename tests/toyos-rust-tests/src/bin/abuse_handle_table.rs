@@ -1,6 +1,6 @@
 //! The handle-table cap must hold on every insertion path.
 //!
-//! There are three of them — plain open, `dup2` and `SYS_SPAWN`'s fd_map — and
+//! There are three of them — plain open, `dup2` and `SYS_SPAWN`'s slot map — and
 //! a table that grows past the cap on any one reaches a hashbrown doubling
 //! above the kernel's 2 MiB single-allocation ceiling.
 //!

@@ -1,6 +1,6 @@
 //! A cancelled `POLL_ADD` must wake the thread that is waiting for it.
 //!
-//! `io_uring::remove_fd` cancels every pending poll on a source that is going
+//! `io_uring::cancel_by_source` cancels every pending poll on a source that is going
 //! away and posts `-NotFound` for each, so the caller knows to look at the
 //! handle again. It posted them into the ring and woke nobody — and nothing
 //! else can end that wait: the poll is gone, so the source's own wake path
@@ -38,7 +38,7 @@ static RETURNED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     let pipe = syscall::pipe().expect("the pipe the waiter parks on");
-    // The second descriptor. Closing this one is what `remove_fd` acts on,
+    // The second descriptor. Closing this one is what `cancel_by_source` acts on,
     // while `pipe.read` keeps the pipe's reader count above zero.
     let dup = syscall::dup(pipe.read).expect("dup the read end");
 

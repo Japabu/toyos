@@ -169,7 +169,7 @@ pub fn log_nested_emit(
 /// can cancel.
 ///
 /// **The L4 review's F1, gated.** `object::ops::close` handed every source the
-/// closing object named to `io_uring::remove_fd`, which cancels across every
+/// closing object named to `io_uring::cancel_by_source`, which cancels across every
 /// ring in the machine — right for a pipe whose other end has really gone, and
 /// wrong for a stream that outlives every handle. Every `SysCap` maps to
 /// `Source::Log`, so any process closing any capability posted `-NotFound` into

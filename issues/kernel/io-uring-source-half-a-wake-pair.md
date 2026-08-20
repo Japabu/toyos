@@ -11,7 +11,7 @@ Every source needs two wakes at its event site: the direct-blocker queue, and
 registered. Nothing in the type system pairs them, so deleting or forgetting
 one half leaves a source that looks wired and silently never completes a
 `POLL_ADD` — the poller's CQE then arrives only on submit-time readiness (the
-immediate post or the TOCTOU recheck) or on close, when `remove_fd` posts
+immediate post or the TOCTOU recheck) or on close, when `cancel_by_source` posts
 `NotFound`. Otherwise it waits forever.
 
 Both halves are present for every source today. Audio and Network were

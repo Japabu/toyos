@@ -83,7 +83,7 @@ fn closed_by_peer(conn: &Connection) -> bool {
             // means the connection is alive — which is not what was asked.
             Ok(_) => return false,
             Err(syscall::SyscallError::WouldBlock) => syscall::nanosleep(EOF_POLL_NS),
-            // The fd itself is gone, which is the same hang-up seen from the
+            // The connection itself is gone, which is the same hang-up seen from the
             // other end of the same race.
             Err(_) => return true,
         }

@@ -47,7 +47,7 @@ the T14 at 47 s — the control thread took both to accept doom's connection and
 open its stream. The mixer's timeout while streaming is finite (one device
 period), so a park with that deadline is the only way to stop, and the timer
 that ends it is the same one the compositor's frame interval rides. The
-closed `io_uring::remove_fd` lost wake is *not* this: the mix loop's only
+closed `io_uring::cancel_by_source` lost wake is *not* this: the mix loop's only
 registration is on the command pipe, which soundd owns both ends of and nobody
 closes.
 
