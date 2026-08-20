@@ -1945,6 +1945,43 @@ pub const KNOWN_RED: &[Red] = &[
         measured: "2026-08-19",
     },
     Red {
+        test: "screen_console_clear",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`the graffiti actuator did not reach the panel: 0 of 2073600 pixels are \
+               [0, 192, 0] and the 8px strip below the cells is not`, at 127 s against a \
+               fast-tier price — a panel that never received the write inside a window two \
+               orders above its cost, not a wrong pixel. The same run's `durations` job then \
+               refused the 126,762 ms reading against the 10,000 ms line, correctly: that \
+               number is this stall and must never be committed as a price. First sighting; \
+               same evening and same shape as `screen_console_panic`'s row — composition \
+               under a loaded host loses the panel's update. **Not about the diff it was \
+               found on**, a tier declaration and a duration table (PR #135). `ALONE: GREEN, \
+               and it was alone both times`",
+        evidence: "PR #135 run 32303408773, job 96231120463 (`guest (11)`), 2026-08-19; the \
+                   isolated re-run in the same job was green",
+        source: "issues/diagnostics/the-panel-once-took-no-pixels-for-two-minutes-under-load.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "console_line_atomicity",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`writer A declared 1000 whole lines and the capture carries 995` — five lines \
+               of one writer's thousand missing from the shared capture, the name's first \
+               sighting on THIS instrument: its standing rows are the loaded dev host's \
+               (fires 1 of 3 there), and CI runs one guest per machine, so whatever loses \
+               the lines here is not host contention. `ALONE: GREEN, and it was alone both \
+               times — a rate and not a classification`. **Not about the diff it was found \
+               on**, an issues-and-prose capability audit (PR #166)",
+        evidence: "PR #166 run 32364721784, job 96411690231 (`guest (10)`), 2026-08-20; the \
+                   isolated re-run in the same job was green",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-20",
+    },
+    Red {
         test: "exit_wait_storm",
         instrument: Instrument::Ci,
         finding: Finding::Seen,
