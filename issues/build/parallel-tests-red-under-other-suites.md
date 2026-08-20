@@ -288,6 +288,18 @@ changes.
   and is the one thing this test already has both samples for. Still
   `Sched::Parallel`, not investigated further.
 
+- **`console_locale_detect`** — added 2026-08-20, first push-triggered `main`
+  sighting: `ci` run `32314166262`, `guest (9)`, headSha `eba06ad6`, found
+  auditing the merge-health backfill (`issues/build/the-eased-merge-law-carries-a-threshold.md`).
+  `STALLED: waiting for the wizard to ask for a key under /bin/console — the
+  console did not lend it the keyboard — it never stopped talking and never got
+  there`, `ALONE … GREEN` on the harness's own re-run. Same shape as
+  `desktop_locale_detect` above — a wizard waiting for a key it was never
+  handed — but against `/bin/console` rather than `/bin/terminal`, so it is not
+  provably the same boot race and is filed separately. `cargo run --
+  --known-red console_locale_detect` answered `NOT ON THE LIST`. Not
+  investigated.
+
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits
 twelve guests across every worktree. It recurred on 2026-08-07: **eight

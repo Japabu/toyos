@@ -2098,6 +2098,28 @@ pub const KNOWN_RED: &[Red] = &[
         source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-19",
     },
+    // Found auditing the merge-health backfill
+    // (`issues/build/the-eased-merge-law-carries-a-threshold.md`), not by
+    // anyone working the diff it rode on.
+    Red {
+        test: "console_locale_detect",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`STALLED: waiting for the wizard to ask for a key under /bin/console — the \
+               console did not lend it the keyboard — it never stopped talking and never got \
+               there`. Same shape as `desktop_locale_detect`'s terminal-boot-race family — a \
+               wizard waiting for a key it was never handed — but against `/bin/console` rather \
+               than `/bin/terminal`, so it is not provably the same race and is not folded into \
+               it. First sighting: `--known-red` answered `NOT ON THE LIST`. **Not about the \
+               diff it was found on**, which is #142's log-redesign decision record, no kernel \
+               byte. `ALONE: GREEN, and it was alone both times — a rate and not a \
+               classification`",
+        evidence: "push-triggered `ci` run 32314166262, job 96263949273 (`guest (9)`), headSha \
+                   eba06ad6, 2026-08-19",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-20",
+    },
     // ---------------------------------------------------------------------
     // `wt/toyos-i8042deep`, dev host, 2026-08-19. Adjudicated here rather than
     // re-run away: each answered `NOT ON THE LIST` when it was asked, and the
