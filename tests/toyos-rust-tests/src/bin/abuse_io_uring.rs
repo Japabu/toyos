@@ -12,24 +12,24 @@ use toyos_abi::syscall::{self, SyscallError};
 const DEPTH: u32 = 8;
 
 fn main() {
-    let (ring_fd, base) = unsafe { syscall::io_uring_setup(DEPTH) }.expect("io_uring_setup");
+    let (ring, base) = unsafe { syscall::io_uring_setup(DEPTH) }.expect("io_uring_setup");
     let sq = unsafe { &*(base.add(SQ_RING_OFF as usize) as *const IoUringRingHeader) };
 
     // 4 million entries claimed in an 8-entry ring: 160 MB of IoUringSqe.
     sq.tail.store(4_000_000, Ordering::Release);
-    let err = syscall::io_uring_enter(ring_fd, 4_000_000, 0, 0)
+    let err = syscall::io_uring_enter(ring, 4_000_000, 0, 0)
         .expect_err("enter must reject an SQ tail beyond the ring depth");
     assert_eq!(err, SyscallError::InvalidArgument, "wrong error for bogus tail");
 
     // Saturated on both sides: the capacity computation itself overflows.
     sq.tail.store(u32::MAX, Ordering::Release);
-    let err = syscall::io_uring_enter(ring_fd, u32::MAX, 0, 0)
+    let err = syscall::io_uring_enter(ring, u32::MAX, 0, 0)
         .expect_err("enter must reject a saturated SQ tail");
     assert_eq!(err, SyscallError::InvalidArgument, "wrong error for saturated tail");
 
     // An honest ring with a to_submit larger than it could ever hold.
     sq.tail.store(sq.head.load(Ordering::Acquire), Ordering::Release);
-    let err = syscall::io_uring_enter(ring_fd, 1_000_000, 0, 0)
+    let err = syscall::io_uring_enter(ring, 1_000_000, 0, 0)
         .expect_err("enter must reject to_submit beyond the ring depth");
     assert_eq!(err, SyscallError::InvalidArgument, "wrong error for bogus to_submit");
 
@@ -47,9 +47,9 @@ fn main() {
     sqe.user_data = 0xC0FFEE;
     sq.tail.store(head.wrapping_add(1), Ordering::Release);
 
-    let completions = syscall::io_uring_enter(ring_fd, 1, 1, 0).expect("honest NOP submission");
+    let completions = syscall::io_uring_enter(ring, 1, 1, 0).expect("honest NOP submission");
     assert_eq!(completions, 1, "NOP did not complete after the rejected batches");
 
-    syscall::close(ring_fd);
+    syscall::close(ring);
     println!("io_uring SQ header abuse rejected, ring still usable");
 }

@@ -128,7 +128,7 @@ fn a_claim_shaped_handle_cannot_be_duplicated() {
 
 /// `dup2(h, slot)` answers `slot` at *that slot's* generation.
 ///
-/// POSIX says `dup2` returns `newfd`; here the answer carries a generation the
+/// POSIX says `dup2` returns the new descriptor; here the answer carries a generation the
 /// caller has no business choosing, so it equals the bare slot number only
 /// while that slot has never been closed. `userland/libc` says so at its own
 /// `dup2` and this is the gate under it.

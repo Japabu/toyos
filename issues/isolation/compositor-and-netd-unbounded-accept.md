@@ -13,8 +13,8 @@ plus one per window, with `windows.push` unguarded (`:127`, `:1377`). netd calls
 pipe. **The 256 and the 64 are guesses, not caps derived from anything.**
 
 This is the same class as the two bounds CLAUDE.md holds up as policy —
-`user_ptr::MAX_USER_STR` and `fd.rs`'s `MAX_FDS`, each sized against a stated
-ceiling and enforced at the one primitive that can breach it. Nobody wrote these
+`user_ptr::MAX_USER_STR` and `object::handle`'s `MAX_HANDLES`, each sized
+against a stated ceiling and enforced at the one primitive that can breach it. Nobody wrote these
 two. A defect on its own terms, not poller plumbing: the poller capacity is where
 it happens to surface first.
 
@@ -35,6 +35,6 @@ can watch, and refuses past it with `ERR_RESOURCE_EXHAUSTED` — gated by
 measure where the refusals start. The `accept` rework added the second bound the
 entry did not know it needed, `MAX_PENDING_CONNS`, for connections accepted and
 not yet identified; `netd_hostile_peer` measures that one. `Poller::new(64)` is
-now `Poller::new(FIXED_POLL_FDS + MAX_PIPED_SLOTS + MAX_PENDING_CONNS)`
+now `Poller::new(FIXED_POLL_HANDLES + MAX_PIPED_SLOTS + MAX_PENDING_CONNS)`
 (`netd/src/main.rs:1228`). The compositor's half is not this agent's to close and
 its numbers here want the same re-reading.

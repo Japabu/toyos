@@ -220,7 +220,7 @@ pub fn isr_complete() {
     crate::preempt::set_need_resched();
 }
 
-/// Are completions pending? Lock-free — fd readiness, io_uring poll and the
+/// Are completions pending? Lock-free — handle readiness, io_uring poll and the
 /// scheduler's park-time recheck all ask this.
 pub fn has_pending() -> bool {
     ISR.mask.load(Ordering::Acquire) != 0

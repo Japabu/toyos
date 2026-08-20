@@ -1,7 +1,7 @@
 //! A pending poll on stdin outlives the keyboard *claim* being closed.
 //!
 //! **The defect this is aimed at was cancellation by an object that did not own
-//! the source.** `io_uring::remove_fd` cancels by source across every ring in
+//! the source.** `io_uring::cancel_by_source` cancels by source across every ring in
 //! the machine — right for a pipe, whose other end really has gone — and
 //! `object::ops::close` decided whether to call it by asking the *object*:
 //! `Device(_)` answered "this ends its sources", on the argument that a claim
@@ -14,7 +14,8 @@
 //! never consulted.
 //!
 //! It runs inside `test-runner` because a spawned binary's stdin is a pipe: this
-//! process's fd 0 is the `Console` that names `Source::Keyboard`, and the claim
+//! process's handle 0 is the `Console` that names `Source::Keyboard`, and the
+//! claim
 //! it closes is minted from the capability the estate holds. Both objects are in
 //! one process, which is the smallest machine the collision exists on; the real
 //! failure needs two, and neither has to know about the other.

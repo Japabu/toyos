@@ -5,9 +5,9 @@
 //! registry. The attack was `listen(name)`, `dup`, `close(original)` — the
 //! close unregistered the name and left the dup naming nothing, so when the
 //! real service claimed the freed name its own `listen` succeeded, and from
-//! that moment the stale fd resolved to *its* listener: `accept` on it took the
+//! that moment the stale handle resolved to *its* listener: `accept` on it took the
 //! service's connections and `close` on it unregistered the service. Giving the
-//! descriptor a `ListenerId` made a stale fd name nothing forever, and left the
+//! descriptor a `ListenerId` made a stale handle name nothing forever, and left the
 //! squat itself — any process could take any name first.
 //!
 //! **The whole setup is gone.** There is no registry, no `listen` and no name a

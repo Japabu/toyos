@@ -405,7 +405,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_PROCESS_WAIT => sys_process_wait(RawHandle(a1 as u32), a2),
         SYS_PROCESS_KILL => {
-            match process::with_fd_owner_data(|data| {
+            match process::with_process_data(|data| {
                 data.handles
                     .get::<crate::object::process::ProcessObject>(RawHandle(a1 as u32), Rights::MANAGE)
             }) {
@@ -555,7 +555,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_EXIT => sys_exit(a1 as i32),
         SYS_GET_ENV => {
-            let env = process::with_fd_owner_data(|d| d.env.clone());
+            let env = process::with_process_data(|d| d.env.clone());
             if a2 == 0 {
                 env.len() as u64
             } else {
@@ -880,7 +880,7 @@ fn with_object_ref<R>(
     need: Rights,
     f: impl FnOnce(&KObjectRef) -> R,
 ) -> Result<R, crate::object::HandleError> {
-    process::with_fd_owner_data(|data| data.handles.get_ref(h, need).map(f))
+    process::with_process_data(|data| data.handles.get_ref(h, need).map(f))
 }
 
 /// The gate on every syscall that drives a claimed device.
@@ -929,7 +929,7 @@ fn with_object(h: RawHandle, need: Rights, f: impl FnOnce(&KObjectRef) -> u64) -
 
 fn sys_write(h: RawHandle, buf: &UserBytes) -> u64 {
     loop {
-        let action = process::with_fd_owner_data(|data| {
+        let action = process::with_process_data(|data| {
             let object = match data.handles.get_ref(h, Rights::WRITE) {
                 Ok(object) => object,
                 Err(e) => return Err(WriteBlock::BadHandle(e)),
@@ -981,7 +981,7 @@ enum WriteBlock {
     BadHandle(crate::object::HandleError),
 }
 
-/// What `sys_read` parks on when the fd has nothing to give. Each variant
+/// What `sys_read` parks on when the handle has nothing to give. Each variant
 /// carries what its own re-check needs — the queue is registered on *before*
 /// the condition is re-read, which is what closes the check-then-block window.
 enum ReadBlock {
@@ -999,7 +999,7 @@ enum ReadBlock {
     BadHandle(crate::object::HandleError),
 }
 
-/// Which stub a claimed fd names, and nothing about what it drives.
+/// Which stub a claimed device handle names, and nothing about what it drives.
 enum RegTarget {
     Hda,
     VirtioSound,
@@ -1007,7 +1007,8 @@ enum RegTarget {
 
 /// One register of a claimed device, read or written.
 ///
-/// The fd is the authorization and the device behind it owns the allow-list, so
+/// The handle is the authorization and the device behind it owns the
+/// allow-list, so
 /// this function knows nothing about codecs or virtqueues — which is the test
 /// for it being a device-register call rather than a device protocol smuggled
 /// back into the syscall table. Two stubs answer it
@@ -1023,7 +1024,7 @@ fn sys_device_reg(handle: RawHandle, offset: u64, width: u64, value: Option<u64>
     // was missing, where `SYS_DEVICE_CLAIM` beside it ends the caller for the
     // same mistake (`object::HandleError::refuse_as_error`). `get` is asked
     // for the type, so a pipe presented here is the `WrongType` that it is.
-    let target = process::with_fd_owner_data(|data| {
+    let target = process::with_process_data(|data| {
         data.handles
             .get::<crate::object::device::DeviceClaim>(handle, Rights::NONE)
             .map(|claim| match claim.class() {
@@ -1032,7 +1033,7 @@ fn sys_device_reg(handle: RawHandle, offset: u64, width: u64, value: Option<u64>
                 _ => None,
             })
     });
-    // Nothing held: `with_fd_owner_data` has given the guard up, which is what
+    // Nothing held: `with_process_data` has given the guard up, which is what
     // `refuse` requires of the three kinds that do not come back from it.
     let target = match target {
         Ok(t) => t,
@@ -1113,7 +1114,7 @@ fn read_block(object: &KObjectRef) -> ReadBlock {
 
 fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
     loop {
-        let action = process::with_fd_owner_data(|data| {
+        let action = process::with_process_data(|data| {
             let object = match data.handles.get_ref(h, Rights::READ) {
                 Ok(object) => object,
                 Err(e) => return Err(ReadBlock::BadHandle(e)),
@@ -1215,7 +1216,7 @@ fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
 ///
 /// `WRITE` alone is not the question: `CREATE` makes a file, `TRUNCATE`
 /// destroys one's contents, and `APPEND` is a write position. A read-only open
-/// of a `KernelOnly` mount is fine and stays fine — the fd it hands back has
+/// of a `KernelOnly` mount is fine and stays fine — the handle it hands back has
 /// `writable` false, so nothing downstream needs a second check.
 fn open_modifies(flags: OpenFlags) -> bool {
     flags.contains(OpenFlags::WRITE)
@@ -1225,12 +1226,12 @@ fn open_modifies(flags: OpenFlags) -> bool {
 }
 
 fn sys_open(path: &str, flags: OpenFlags) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
     if open_modifies(flags) && !vfs::lock().user_may_modify(&resolved) {
         return SyscallError::PermissionDenied.to_u64();
     }
-    process::with_fd_owner_data(|data| ops::open(&mut data.handles, &resolved, flags))
+    process::with_process_data(|data| ops::open(&mut data.handles, &resolved, flags))
 }
 
 /// **Closing a handle wakes nobody, and that is the whole of it.**
@@ -1242,7 +1243,7 @@ fn sys_open(path: &str, flags: OpenFlags) -> u64 {
 /// close, so a pipe with a live writer and no bytes in it was announced
 /// readable; a one-shot io_uring poll consumed on that never fires again.
 fn sys_close(h: RawHandle) -> u64 {
-    let result = process::with_fd_owner_data(|data| {
+    let result = process::with_process_data(|data| {
         ops::close(&mut data.handles, h, &mut data.pipe_maps)
     });
     match result {
@@ -1288,7 +1289,7 @@ fn sys_random(out: &mut UserBytesMut) -> u64 {
 /// Refusing to write a partial answer is the point — a caller that ignores
 /// the return still gets zeroes rather than a plausible short listing.
 fn sys_readdir(path: &str, out: &mut UserBytesMut) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let entries = match vfs::lock().list(&cwd, path) {
         Ok(e) => e,
         Err(e) => return e.to_u64(),
@@ -1319,7 +1320,7 @@ fn sys_readdir(path: &str, out: &mut UserBytesMut) -> u64 {
 }
 
 fn sys_delete(path: &str) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     if !vfs.user_may_modify(&resolved) {
@@ -1332,10 +1333,10 @@ fn sys_delete(path: &str) -> u64 {
 }
 
 fn sys_chdir(path: &str) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     match vfs::lock().cd(&cwd, path) {
         Ok(new_cwd) => {
-            process::with_fd_owner_data(|d| d.cwd = new_cwd);
+            process::with_process_data(|d| d.cwd = new_cwd);
             0
         }
         Err(e) => e.to_u64(),
@@ -1366,7 +1367,7 @@ fn sys_chdir(path: &str) -> u64 {
 /// `vfs::MAX_PATH` bounds `cwd`, so the required length is always far below the
 /// range `SyscallError` encodes and can never be misread as one.
 fn sys_getcwd(out: &mut UserBytesMut) -> u64 {
-    process::with_fd_owner_data(|data| {
+    process::with_process_data(|data| {
         let cwd = data.cwd.as_bytes();
         if cwd.len() <= out.len() {
             out.write_at(0, cwd);
@@ -1386,7 +1387,7 @@ fn sys_pipe() -> u64 {
     let (reader, writer) = pipe::create();
     let read_end = KObjectRef::PipeRead(crate::object::pipe::PipeReadEnd::new(reader));
     let write_end = KObjectRef::PipeWrite(crate::object::pipe::PipeWriteEnd::new(writer));
-    process::with_fd_owner_data(|data| {
+    process::with_process_data(|data| {
         let Ok(read_h) = ops::install(&mut data.handles, read_end) else {
             return SyscallError::ResourceExhausted.to_u64();
         };
@@ -1403,7 +1404,7 @@ fn sys_pipe() -> u64 {
 ///
 /// The window is recorded against the pipe (`process::PipeMap`) so that
 /// closing the last descriptor for it takes the mapping away. It used to be
-/// recorded nowhere: `SYS_PIPE`, `SYS_PIPE_MAP`, close both fds freed the ring
+/// recorded nowhere: `SYS_PIPE`, `SYS_PIPE_MAP`, close both ends freed the ring
 /// page back to the PMM with the caller's writable mapping of it still live,
 /// and whatever the PMM handed that page to next — another process's pipe, a
 /// kernel heap region, a DMA buffer — was readable and writable by a process
@@ -1413,7 +1414,7 @@ fn sys_pipe() -> u64 {
 /// rather than a second window onto the same page. That is what keeps
 /// `pipe_maps` bounded by the descriptor table.
 fn sys_pipe_map(h: RawHandle) -> u64 {
-    let mapped = process::with_fd_owner_data(|data| {
+    let mapped = process::with_process_data(|data| {
         let pipe_id = match data.handles.get_ref(h, Rights::MAP) {
             Ok(object) => ops::pipe_id_read(object).or_else(|| ops::pipe_id_write(object)),
             Err(e) => return Err(e),
@@ -1453,7 +1454,7 @@ fn sys_pipe_map(h: RawHandle) -> u64 {
 /// `std`'s `TcpStream` is one handle and netd's data path is two pipes, and
 /// that is the whole of why this exists.
 fn sys_connection_join(rx_h: RawHandle, tx_h: RawHandle) -> u64 {
-    let ends = process::with_fd_owner_data(|data| {
+    let ends = process::with_process_data(|data| {
         let rx = data.handles.get::<crate::object::pipe::PipeReadEnd>(rx_h, Rights::READ)?;
         let tx = data.handles.get::<crate::object::pipe::PipeWriteEnd>(tx_h, Rights::WRITE)?;
         Ok::<_, crate::object::HandleError>((rx.reference(), tx.reference()))
@@ -1463,11 +1464,11 @@ fn sys_connection_join(rx_h: RawHandle, tx_h: RawHandle) -> u64 {
         Err(e) => return e.refuse(),
     };
     let object = KObjectRef::Connection(crate::object::service::ConnectionEnd::joined(rx, tx));
-    process::with_fd_owner_data(|data| handle_result(ops::install(&mut data.handles, object)))
+    process::with_process_data(|data| handle_result(ops::install(&mut data.handles, object)))
 }
 
 fn sys_read_nonblock(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
-    let result = process::with_fd_owner_data(|data| {
+    let result = process::with_process_data(|data| {
         let object = match data.handles.get_ref(h, Rights::READ) {
             Ok(object) => object,
             Err(e) => return Err(e),
@@ -1521,7 +1522,7 @@ fn sys_spawn(
     env: alloc::vec::Vec<u8>,
 ) -> u64 {
     let args: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
-    let cwd = process::with_fd_owner_data(|data| data.cwd.clone());
+    let cwd = process::with_process_data(|data| data.cwd.clone());
     // Refused with this frame holding nothing: `spawn`'s own frame owned the
     // child's address space and its stacks, and the three handle kinds that end
     // the caller do so from `refuse`.
@@ -1529,7 +1530,7 @@ fn sys_spawn(
         Ok(object) => object,
         Err(e) => return e.refuse(),
     };
-    let installed = process::with_fd_owner_data(|data| {
+    let installed = process::with_process_data(|data| {
         ops::install(&mut data.handles, KObjectRef::Process(object.clone()))
     });
     match installed {
@@ -1548,7 +1549,7 @@ fn sys_spawn(
 /// process is gone gets it too. `WNOHANG` is the same question with the park
 /// taken out.
 fn sys_process_wait(h: RawHandle, flags: u64) -> u64 {
-    let object = match process::with_fd_owner_data(|data| {
+    let object = match process::with_process_data(|data| {
         data.handles.get::<crate::object::process::ProcessObject>(h, Rights::WAIT)
     }) {
         Ok(object) => object,
@@ -1592,7 +1593,7 @@ fn sys_process_wait(h: RawHandle, flags: u64) -> u64 {
 /// exactly one cap that carries the right — so what can reach a process it did
 /// not start is exactly what init endowed.
 fn sys_process_open(syscap: RawHandle, pid: process::Pid) -> u64 {
-    if let Err(e) = process::with_fd_owner_data(|data| {
+    if let Err(e) = process::with_process_data(|data| {
         data.handles.get::<crate::object::syscap::SysCap>(syscap, Rights::MANAGE)
     }) {
         return e.refuse();
@@ -1600,7 +1601,7 @@ fn sys_process_open(syscap: RawHandle, pid: process::Pid) -> u64 {
     let Some(object) = process::process_object(pid) else {
         return SyscallError::NotFound.to_u64();
     };
-    process::with_fd_owner_data(|data| {
+    process::with_process_data(|data| {
         handle_result(ops::install(&mut data.handles, KObjectRef::Process(object)))
     })
 }
@@ -1617,7 +1618,7 @@ fn sys_device_claim(syscap: RawHandle, class: u64) -> u64 {
     let Some(class) = device::DeviceType::from_raw(class) else {
         return SyscallError::InvalidArgument.to_u64();
     };
-    if let Err(e) = process::with_fd_owner_data(|data| {
+    if let Err(e) = process::with_process_data(|data| {
         data.handles.get::<crate::object::syscap::SysCap>(syscap, Rights::DEVICE)
     }) {
         return e.refuse();
@@ -1630,7 +1631,7 @@ fn sys_device_claim(syscap: RawHandle, class: u64) -> u64 {
         Err(device::ClaimError::Absent) => return SyscallError::NotFound.to_u64(),
         Err(device::ClaimError::Owned) => return SyscallError::AlreadyExists.to_u64(),
     };
-    process::with_fd_owner_data(|data| {
+    process::with_process_data(|data| {
         handle_result(ops::install(&mut data.handles, KObjectRef::Device(claim)))
     })
 }
@@ -1645,7 +1646,7 @@ fn sys_device_claim(syscap: RawHandle, class: u64) -> u64 {
 /// with it. This is the privilege that comment asked for, and it is endowed
 /// per manifest rather than won.
 fn sys_rt_enter(syscap: RawHandle) -> u64 {
-    if let Err(e) = process::with_fd_owner_data(|data| {
+    if let Err(e) = process::with_process_data(|data| {
         data.handles.get::<crate::object::syscap::SysCap>(syscap, Rights::RT)
     }) {
         return e.refuse();
@@ -1673,7 +1674,7 @@ fn sys_log_read(
     out: &mut UserBytesMut,
     capacity: usize,
 ) -> u64 {
-    if let Err(e) = process::with_fd_owner_data(|data| {
+    if let Err(e) = process::with_process_data(|data| {
         data.handles.get::<crate::object::syscap::SysCap>(syscap, Rights::LOG)
     }) {
         return e.refuse();
@@ -1699,7 +1700,7 @@ fn sys_log_read(
 /// endowment table is not a smaller endowment table, it is a caller that would
 /// go on to look up a label that is not in what it got.
 fn sys_endowments(out: &mut crate::user_ptr::UserBytesMut) -> u64 {
-    let data_arc = process::fd_owner_data();
+    let data_arc = process::process_data();
     let data = data_arc.lock();
     let needed = data.endowments.encoded_len();
     if out.is_empty() {
@@ -1724,7 +1725,7 @@ fn sys_endowments(out: &mut crate::user_ptr::UserBytesMut) -> u64 {
 /// [`SYS_PORT_CREATE`].
 fn sys_port_create() -> u64 {
     let (acceptor, connector) = port::create();
-    process::with_fd_owner_data(|data| {
+    process::with_process_data(|data| {
         let Ok(a) = ops::install(&mut data.handles, KObjectRef::Acceptor(acceptor)) else {
             return SyscallError::ResourceExhausted.to_u64();
         };
@@ -1773,7 +1774,7 @@ fn sys_namespace_build(ctx: &SyscallContext, args: &NamespaceBuild) -> u64 {
         else {
             return SyscallError::BadAddress.to_u64();
         };
-        let base = match process::with_fd_owner_data(|data| {
+        let base = match process::with_process_data(|data| {
             data.handles.get::<crate::object::namespace::Namespace>(args.base, Rights::READ)
         }) {
             Ok(base) => base,
@@ -1813,7 +1814,7 @@ fn sys_namespace_build(ctx: &SyscallContext, args: &NamespaceBuild) -> u64 {
             let Some(name) = name_at(off, len) else {
                 return SyscallError::InvalidArgument.to_u64();
             };
-            let connector = match process::with_fd_owner_data(|data| {
+            let connector = match process::with_process_data(|data| {
                 data.handles.get::<port::Connector>(handle, Rights::TRANSFER)
             }) {
                 Ok(c) => c,
@@ -1841,7 +1842,7 @@ fn sys_namespace_build(ctx: &SyscallContext, args: &NamespaceBuild) -> u64 {
             return SyscallError::AlreadyExists.to_u64()
         }
     };
-    process::with_fd_owner_data(|data| {
+    process::with_process_data(|data| {
         handle_result(ops::install(&mut data.handles, KObjectRef::Namespace(namespace)))
     })
 }
@@ -1853,7 +1854,7 @@ fn sys_namespace_build(ctx: &SyscallContext, args: &NamespaceBuild) -> u64 {
 /// `Gone` — a statement about the machine. Only the kernel can tell them apart,
 /// so only the kernel may collapse them, and it does not.
 fn sys_namespace_open(ns_h: RawHandle, name: &str) -> u64 {
-    let connector = match process::with_fd_owner_data(|data| {
+    let connector = match process::with_process_data(|data| {
         let ns = data
             .handles
             .get::<crate::object::namespace::Namespace>(ns_h, Rights::READ)?;
@@ -1887,7 +1888,7 @@ fn connect_through(connector: &port::Connector) -> u64 {
         to_client.clone(),  // and receives what the server sent
         to_server.clone(),
     ));
-    let h = match process::with_fd_owner_data(|data| ops::install(&mut data.handles, object)) {
+    let h = match process::with_process_data(|data| ops::install(&mut data.handles, object)) {
         Ok(h) => h,
         Err(e) => return e.to_u64(),
     };
@@ -1899,7 +1900,7 @@ fn connect_through(connector: &port::Connector) -> u64 {
         outbox: to_client,
     });
     if let Err(e) = queued {
-        process::with_fd_owner_data(|data| {
+        process::with_process_data(|data| {
             ops::close(&mut data.handles, h, &mut data.pipe_maps)
                 .expect("the connection this call installed a moment ago");
         });
@@ -1953,7 +1954,7 @@ fn sys_gpu_reset_scanout(
         cursor,
     };
     device::set_framebuffer_info(screen.clone());
-    let minted = process::with_fd_owner_data(|data| {
+    let minted = process::with_process_data(|data| {
         let claim = data
             .handles
             .get::<crate::object::device::DeviceClaim>(claim_h, Rights::WRITE)?;
@@ -1973,7 +1974,7 @@ fn sys_gpu_reset_scanout(
 }
 
 fn sys_accept(h: RawHandle) -> u64 {
-    let acceptor = match process::with_fd_owner_data(|data| {
+    let acceptor = match process::with_process_data(|data| {
         data.handles.get::<port::Acceptor>(h, Rights::READ)
     }) {
         Ok(a) => a,
@@ -1992,7 +1993,7 @@ fn sys_accept(h: RawHandle) -> u64 {
                     conn.outbox,
                 ),
             );
-            let installed = process::with_fd_owner_data(|data| {
+            let installed = process::with_process_data(|data| {
                 ops::install(&mut data.handles, object)
             });
             return handle_result(installed);
@@ -2030,11 +2031,11 @@ fn sys_shm_create(size: u64) -> u64 {
         Ok(shm) => KObjectRef::SharedMem(shm),
         Err(e) => return e.to_u64(),
     };
-    process::with_fd_owner_data(|data| handle_result(ops::install(&mut data.handles, object)))
+    process::with_process_data(|data| handle_result(ops::install(&mut data.handles, object)))
 }
 
 fn sys_shm_map(h: RawHandle) -> u64 {
-    let shm = match process::with_fd_owner_data(|data| {
+    let shm = match process::with_process_data(|data| {
         data.handles.get::<crate::object::shm::SharedMemObject>(h, Rights::MAP)
     }) {
         Ok(shm) => shm,
@@ -2072,7 +2073,7 @@ fn sys_handle_send(conn_h: RawHandle, handles: &crate::user_ptr::UserBytes, coun
     }
     let wanted = &wanted[..count];
 
-    let sent = process::with_fd_owner_data(|data| {
+    let sent = process::with_process_data(|data| {
         let conn = data
             .handles
             .get::<crate::object::service::ConnectionEnd>(conn_h, Rights::TRANSFER)?;
@@ -2116,7 +2117,7 @@ fn sys_handle_recv(
     out: &mut crate::user_ptr::UserBytesMut,
     cap: usize,
 ) -> u64 {
-    let taken = process::with_fd_owner_data(|data| {
+    let taken = process::with_process_data(|data| {
         let conn = data
             .handles
             .get::<crate::object::service::ConnectionEnd>(conn_h, Rights::READ)?;
@@ -2227,8 +2228,8 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
         let pt = process::current_address_space();
         let start = UserAddr::new(start);
         // Both ledgers move together, under both locks, in the order the
-        // arm below established: the fd-owner data, then the address space.
-        let replaced = process::with_fd_owner_data(|data| {
+        // arm below established: the process data, then the address space.
+        let replaced = process::with_process_data(|data| {
             let mut as_guard = pt.lock();
             // A placed mapping names its own range, so the question `find_gap`
             // answers for every other mapping has to be asked here — and it
@@ -2311,7 +2312,7 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
         }
     } else {
         let pt = process::current_address_space();
-        let vaddr = process::with_fd_owner_data(|data| {
+        let vaddr = process::with_process_data(|data| {
             let placed = match &pages {
                 Some(pages) => pt.lock().alloc_and_map(pages.phys(), aligned as u64, writable, CachePolicy::DeferToMtrr).map(|(v, _)| v),
                 None => pt.lock().alloc_region(aligned as u64, crate::vma::RegionKind::Mapped, false),
@@ -2341,7 +2342,7 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
 /// half of the FIXED defect that outlived the mapping.
 fn sys_munmap(addr: u64, _size: u64) -> u64 {
     let pt = process::current_address_space();
-    let taken = process::with_fd_owner_data(|data| {
+    let taken = process::with_process_data(|data| {
         let idx = data.mmap_regions.iter().position(|r| r.addr.raw() == addr)?;
         let region = data.mmap_regions.swap_remove(idx);
         data.free_count += 1;
@@ -2354,7 +2355,7 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
         return SyscallError::NotFound.to_u64();
     };
     // Dropped out here, not inside the closure: the drop shoots down and waits,
-    // and the fd-owner lock the closure holds is one a sibling can be spinning
+    // and the process-data lock the closure holds is one a sibling can be spinning
     // on with `IF` clear.
     drop(unmapped);
     0
@@ -2571,20 +2572,20 @@ fn sys_nanosleep(nanos: u64) -> u64 {
     0
 }
 
-/// A second descriptor for the object `fd_num` names.
+/// A second handle to the same object, carrying no more than the first.
 ///
 /// `PermissionDenied` is the answer for a device claim: it is the one object
-/// that admits a single descriptor, and `Descriptor::duplicate` says so at the
-/// only place that can. Before this, `dup` handed back a claim's exclusivity
-/// while leaving the caller a working descriptor.
-/// A second handle to the same object, carrying no more than the first.
+/// that admits a single handle, and `ops::initial_rights` says so by
+/// withholding `Rights::DUP` — exclusivity is a property of the type rather
+/// than of a check here. Before that, `dup` handed back a claim's exclusivity
+/// while leaving the caller a working handle.
 ///
 /// `want` is the wire form of `Option<Rights>` — [`RIGHTS_UNCHANGED`] for the
 /// source's own set — decoded here and nowhere else. A set with a bit no right
 /// uses is a caller with a bug, and so is one the source does not hold: rights
 /// only shrink, and the refusal names which.
 fn sys_handle_dup(h: RawHandle, want: u64) -> u64 {
-    let duplicated = process::with_fd_owner_data(|data| {
+    let duplicated = process::with_process_data(|data| {
         let held = data.handles.rights_of(h)?;
         let rights = if want == RIGHTS_UNCHANGED {
             held
@@ -2615,7 +2616,7 @@ fn sys_dup2(old: RawHandle, slot: u64) -> u64 {
     let Ok(slot) = u16::try_from(slot) else {
         return SyscallError::ResourceExhausted.to_u64();
     };
-    let result = process::with_fd_owner_data(|data| {
+    let result = process::with_process_data(|data| {
         let rights = data.handles.rights_of(old)?;
         let entry = data.handles.duplicate_entry(old, rights)?;
         data.handles
@@ -2654,7 +2655,7 @@ fn sys_dup2(old: RawHandle, slot: u64) -> u64 {
 struct Displaced(Option<crate::object::HandleEntry>);
 
 fn sys_rename(old: &str, new: &str) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let old_abs = vfs.resolve_absolute(&cwd, old);
     let new_abs = vfs.resolve_absolute(&cwd, new);
@@ -2668,7 +2669,7 @@ fn sys_rename(old: &str, new: &str) -> u64 {
 }
 
 fn sys_mkdir(path: &str) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     if !vfs.user_may_modify(&resolved) {
@@ -2681,7 +2682,7 @@ fn sys_mkdir(path: &str) -> u64 {
 }
 
 fn sys_rmdir(path: &str) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     if !vfs.user_may_modify(&resolved) {
@@ -2692,7 +2693,7 @@ fn sys_rmdir(path: &str) -> u64 {
 }
 
 fn sys_symlink(target: &str, link: &str) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, link);
     if !vfs.user_may_modify(&resolved) {
@@ -2708,7 +2709,7 @@ fn sys_symlink(target: &str, link: &str) -> u64 {
 }
 
 fn sys_readlink(path: &str, out: &mut UserBytesMut) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     match vfs.read_link(&resolved) {
@@ -2724,7 +2725,7 @@ fn sys_readlink(path: &str, out: &mut UserBytesMut) -> u64 {
 }
 
 fn sys_dlopen(ctx: &crate::user_ptr::SyscallContext, path: &str, init_out: Option<UserAddr>) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
 
     let lib = crate::elf::try_clone_cached(&resolved);
@@ -2756,7 +2757,7 @@ fn sys_dlopen(ctx: &crate::user_ptr::SyscallContext, path: &str, init_out: Optio
     // so exhausting it is a loop any process can write. Exhaustion is an error
     // return, not an `.expect` in syscall context.
     let pt = process::current_address_space();
-    let mapped = process::with_fd_owner_data(|_data| {
+    let mapped = process::with_process_data(|_data| {
         match &lib.memory {
             crate::elf::LibMemory::Owned(alloc) => {
                 let phys = DirectMap::phys_of(alloc.ptr());
@@ -2800,7 +2801,7 @@ fn sys_dlopen(ctx: &crate::user_ptr::SyscallContext, path: &str, init_out: Optio
 
     let lib_has_tls = lib.tls_memsz > 0;
 
-    let data_arc = process::fd_owner_data();
+    let data_arc = process::process_data();
     {
         let mut data = data_arc.lock();
         crate::elf::resolve_dlopen_relocs(&lib, &data.elf.loaded_libs);
@@ -2892,7 +2893,7 @@ fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
         return Err(SyscallError::ResourceExhausted);
     }
 
-    let owner_arc = process::fd_owner_data();
+    let owner_arc = process::process_data();
     let (tls_memsz, tls_template) = {
         let data = owner_arc.lock();
         let m = data.elf.tls_modules.iter().find(|m| m.module_id == module_id)
@@ -2906,7 +2907,7 @@ fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
     // first mapping stays present, USER and writable, over whatever the PMM
     // hands out next.
     let tid = process::current_tid();
-    let existing = process::with_fd_owner_data(|data| {
+    let existing = process::with_process_data(|data| {
         data.elf.dynamic_tls_blocks.get(&(tid, module_id)).map(|b| b.vaddr())
     });
 
@@ -2923,7 +2924,7 @@ fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
 
             let block_phys = page_alloc.phys();
             let pt = process::current_address_space();
-            process::with_fd_owner_data(|data| {
+            process::with_process_data(|data| {
                 let (vaddr, _) = process::vma_map(&pt, block_phys, page_alloc.size() as u64)
                     .ok_or(SyscallError::ResourceExhausted)?;
                 data.alloc_count += 1;
@@ -2946,7 +2947,7 @@ fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
 }
 
 fn sys_dlsym(handle: u64, name: &str) -> u64 {
-    let data_arc = process::fd_owner_data();
+    let data_arc = process::process_data();
     let data = data_arc.lock();
     let idx = handle as usize;
     if idx >= data.elf.loaded_libs.len() {
@@ -2973,7 +2974,7 @@ fn sys_io_uring_setup(ctx: &SyscallContext, depth: u32, out: u64) -> u64 {
     };
     // A refused install drops the reference, which tears the ring down again.
     let object = KObjectRef::IoUring(crate::object::service::IoUringObject::new(ring));
-    let installed = process::with_fd_owner_data(|data| ops::install(&mut data.handles, object));
+    let installed = process::with_process_data(|data| ops::install(&mut data.handles, object));
     let handle = match installed {
         Ok(h) => h,
         Err(e) => return e.to_u64(),
@@ -2982,7 +2983,7 @@ fn sys_io_uring_setup(ctx: &SyscallContext, depth: u32, out: u64) -> u64 {
     match ctx.copy_out(out, &answer) {
         Ok(()) => 0,
         Err(e) => {
-            process::with_fd_owner_data(|data| {
+            process::with_process_data(|data| {
                 ops::close(&mut data.handles, handle, &mut data.pipe_maps)
                     .expect("the ring this call installed a moment ago");
             });
@@ -3001,7 +3002,7 @@ fn sys_io_uring_enter(
     // `NotFound` and one of the wrong type is `PermissionDenied`, the same as
     // every other call. Collapsing both into `InvalidArgument` made "this ring
     // was closed" indistinguishable from "this argument is nonsense".
-    let ring_id = process::with_fd_owner_data(|data| {
+    let ring_id = process::with_process_data(|data| {
         data.handles
             .get::<crate::object::service::IoUringObject>(
                 ring_h,
@@ -3041,7 +3042,7 @@ fn sys_process_stats(
     h: RawHandle,
     out: UserAddr,
 ) -> u64 {
-    let object = match process::with_fd_owner_data(|data| {
+    let object = match process::with_process_data(|data| {
         data.handles.get::<crate::object::process::ProcessObject>(h, Rights::READ)
     }) {
         Ok(object) => object,
@@ -3086,7 +3087,7 @@ fn sys_query_modules(out: &mut UserBytesMut) -> u64 {
         unsafe { core::mem::transmute_copy(info) }
     }
 
-    process::with_fd_owner_data(|data| {
+    process::with_process_data(|data| {
         let module_count = 1 + data.elf.loaded_libs.len();
 
         let exe_path_bytes = data.exe_path.as_bytes();

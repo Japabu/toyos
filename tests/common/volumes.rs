@@ -921,7 +921,7 @@ pub fn log_on_device(
 /// - the failure is **reported** (`serving zeros`, the marker triage greps for,
 ///   which this path could not emit at all);
 /// - the failure **propagates** to the caller — `FatBacking` →
-///   `file_cache::write_page` → `fd::write` → the process, every one of which
+///   `file_cache::write_page` → `ops::try_write` → the process, every one of which
 ///   returned `()` or swallowed on some link of the chain;
 /// - the file on the device is **not corrupted**, checked on the host against
 ///   the bytes the host itself wrote. This is the claim the other two exist to
@@ -1016,7 +1016,7 @@ pub fn log_backing_read_error(
     //    know its bytes went into a page invented out of a failed read.
     if !log.contains("reread: the write failed") {
         return Err(format!(
-            "the process was not told: a refused page has to reach `fd::write` as an error \
+            "the process was not told: a refused page has to reach `ops::try_write` as an error \
              instead of being merged into zeros\n{log}"
         ));
     }

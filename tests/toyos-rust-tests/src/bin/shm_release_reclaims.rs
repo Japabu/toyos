@@ -51,7 +51,7 @@ const SETTLE_SAMPLES: usize = 100;
 /// `object::drain_zero_handles` clears its pending flag before it runs the
 /// hooks, so the CPU that queued them can find the queue empty while another
 /// CPU is still working through the batch, and the release then escapes the
-/// syscall that caused it. `fd_lifetime` carries the measurement and
+/// syscall that caused it. `handle_lifetime` carries the measurement and
 /// `issues/kernel/deferred-release-outlives-its-syscall.md` the kernel
 /// half.
 ///

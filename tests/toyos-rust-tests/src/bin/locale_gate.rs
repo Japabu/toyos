@@ -218,8 +218,8 @@ fn detect(mut surface: Surface, connector: &Connector) {
     while !wizard_done.load(Ordering::Relaxed) && Instant::now() < deadline {
         poller.poll_add(&surface.keyboard, IORING_POLL_IN, TOKEN_KEYBOARD);
         poller.poll_add_fd(surface.host.acceptor_fd(), IORING_POLL_IN, TOKEN_LISTEN);
-        for fd in surface.host.client_fds() {
-            poller.poll_add_fd(fd, IORING_POLL_IN, TOKEN_CLIENT);
+        for client in surface.host.client_fds() {
+            poller.poll_add_fd(client, IORING_POLL_IN, TOKEN_CLIENT);
         }
 
         let mut ready = [false; 4];

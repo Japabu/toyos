@@ -15,9 +15,16 @@ opened: 2026-08-10
 > and on what evidence — the new reading has to account for the same
 > measurements, and it does.
 
-`fd_lifetime`'s `kill_releases_ring` takes `free_bytes()` before spawning a
+> **The test was called `fd_lifetime` until 2026-08-20**, when the fd/inbox
+> wave (`issues/design-debt/fd-is-libc-jargon-and-the-tree-still-speaks-it.md`)
+> renamed it `handle_lifetime`. Every reading below was taken under the old
+> name, including the harness line quoted verbatim; all of them are re-spelled
+> to the live one, because a record naming a test that does not exist sends the
+> next reader nowhere.
+
+`handle_lifetime`'s `kill_releases_ring` takes `free_bytes()` before spawning a
 holder, kills it, and requires free memory to come back within 6 MiB
-(`tests/toyos-rust-tests/src/bin/fd_lifetime.rs`). `shm_release_reclaims` has
+(`tests/toyos-rust-tests/src/bin/handle_lifetime.rs`). `shm_release_reclaims` has
 the same shape. Both run on the shared `tests/testcases` boot, in one guest,
 beside every other Rust guest binary.
 
@@ -108,7 +115,7 @@ entire diff is two new markdown files. `main` is red at the same commit
 harness re-ran it by itself and printed:
 
 ```
-ALONE fd_lifetime: red again, the same failure both times — the defect is real.
+ALONE handle_lifetime: red again, the same failure both times — the defect is real.
 ```
 
 The number is `16777216` — **exactly 16 MiB, the whole of what the holder took**,
@@ -133,7 +140,7 @@ for reading this entry at all, rather than an improvement to it.
 > repetition — twenty kill rounds, which turn a leak into a slope and a race
 > into noise around zero.
 
-The redlist row for `fd_lifetime` still says `ALONE … GREEN` every time. That
+The redlist row for `handle_lifetime` still says `ALONE … GREEN` every time. That
 sentence is false as of this run, and the row needs the same correction this
 section is.
 
