@@ -14,8 +14,9 @@ every one of them disables preemption for its whole life. `io-depth-probe`
 idle loop, 5 from a syscall. So **making `xhci::wait_transfer` park cannot work
 and would not help**: `prepare_wait` asserts the depth equals the context's
 baseline, so a park there is a named panic on the first flush — and the three
-locks above `XHCI` would still hold the CPU if it were not. `fd.rs:644` puts
-every userland file write-back at the same depth, so this is not a property of
+locks above `XHCI` would still hold the CPU if it were not.
+`object/ops.rs:619` (`fsync`, formerly `fd.rs:644` before the handle-table
+rewrite) puts every userland file write-back at the same depth, so this is not a property of
 the log sink; it is that this kernel cannot touch a disk without pinning a CPU
 for the whole device round trip. The log sink is only the writer that runs
 continuously, which is why it is the one gate A sees.

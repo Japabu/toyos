@@ -17,7 +17,7 @@
 //!
 //! **Which subjects exist here.** All of them. The four device watches
 //! (`waitqs::{KEYBOARD, MOUSE, NETWORK, AUDIO}`), both ends of a pipe, the port
-//! acceptor, the process and thread objects, the io_uring ring, the futex
+//! acceptor, the process and thread objects, the inbox ring, the futex
 //! bucket, and a thread's own watch for the waits whose end is a deadline. The
 //! header listed five park sites and said C3 would add the rest; C3 did.
 //!

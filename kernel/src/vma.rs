@@ -16,7 +16,7 @@ pub const ALLOC_CEILING: u64 = STACK_BASE;
 /// Why an actuator rather than a program. The shipped arena is
 /// `ALLOC_CEILING - alloc_floor()`, about 1015 GB. Every region in it costs
 /// `align_up_2m(size) + GUARD_SIZE` of address space against at least
-/// `align_up_2m(size)` of *physical* memory — mmap, shared memory, io_uring
+/// `align_up_2m(size)` of *physical* memory — mmap, shared memory, an inbox
 /// and TLS all allocate through the PMM, and `dlopen`'s shared-image arm still
 /// allocates its own writable window. The worst ratio is therefore 2:1, at a
 /// 4 KiB request: 4 MiB of address space for 2 MiB of RAM. Exhausting 1015 GB

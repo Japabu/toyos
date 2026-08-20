@@ -34,3 +34,9 @@ Whichever it is, op code 4 gains a row.
 
 Neither op code may be reused whichever way this lands: 2 and 4 are retired,
 and `toyos-abi/src/inbox.rs` is where they are recorded beside the live three.
+
+**Two doc citations in the sysroot crates still say `kernel/src/io_uring.rs`**
+(`toyos-abi/src/ring.rs:10`, `toyos/src/poller.rs:61`): the kernel file they
+cite renamed to `inbox.rs` in the internal-vocabulary pass, but a doc change
+under those crates costs a sysroot claim and may not ride a kernel PR — they
+ride the next PR that lawfully claims the sysroot.

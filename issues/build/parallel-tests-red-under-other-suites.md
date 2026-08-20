@@ -262,6 +262,15 @@ changes.
   alone both times` — a rate, not a classification; the redlist row carries
   the sighting.
 
+- **`console_line_atomicity`** — added 2026-08-20, the name's first sighting
+  on the CI instrument (its standing rows are the loaded dev host's, 1 of 3
+  there): PR #166 run 32364721784, `guest (10)`, `writer A declared 1000
+  whole lines and the capture carries 995`, `ALONE: GREEN` in the same job.
+  CI runs one guest per machine, so whatever loses five of a writer's
+  thousand lines there is not host contention — which sharpens this file's
+  question rather than settling it. The diff it rode on is an
+  issues-and-prose audit.
+
 - **`tlb_shootdown_waits`** — added 2026-08-20, **1 of 3** full `cargo test`
   runs on `wt/toyos-p2conv`, with `toyos-dpanic`'s suite holding guest slots
   throughout and named in that run's own `[host-slots]` lines. The other two
@@ -287,6 +296,18 @@ changes.
   against an absolute, which is the first of the two legitimate fix shapes below
   and is the one thing this test already has both samples for. Still
   `Sched::Parallel`, not investigated further.
+
+- **`console_locale_detect`** — added 2026-08-20, first push-triggered `main`
+  sighting: `ci` run `32314166262`, `guest (9)`, headSha `eba06ad6`, found
+  auditing the merge-health backfill (`issues/build/the-eased-merge-law-carries-a-threshold.md`).
+  `STALLED: waiting for the wizard to ask for a key under /bin/console — the
+  console did not lend it the keyboard — it never stopped talking and never got
+  there`, `ALONE … GREEN` on the harness's own re-run. Same shape as
+  `desktop_locale_detect` above — a wizard waiting for a key it was never
+  handed — but against `/bin/console` rather than `/bin/terminal`, so it is not
+  provably the same boot race and is filed separately. `cargo run --
+  --known-red console_locale_detect` answered `NOT ON THE LIST`. Not
+  investigated.
 
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits

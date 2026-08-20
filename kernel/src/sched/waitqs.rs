@@ -4,7 +4,7 @@
 //! object owns a [`Watch`] and a waiter arms on it; the park itself is on the
 //! waiter's own thread queue (`TaskHandle::park_queue`), which is the one list
 //! left in the kernel and has exactly one member. Objects with a lifetime own
-//! an `Arc<Watch>` (pipe ends, listeners, io_uring rings), singleton devices own
+//! an `Arc<Watch>` (pipe ends, listeners, inbox rings), singleton devices own
 //! a `static`, and futex words — which have no object at all — hash into a fixed
 //! bucket array, because a bucket is a *place to arm*, not a set whose
 //! membership means anything.

@@ -1945,6 +1945,43 @@ pub const KNOWN_RED: &[Red] = &[
         measured: "2026-08-19",
     },
     Red {
+        test: "screen_console_clear",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`the graffiti actuator did not reach the panel: 0 of 2073600 pixels are \
+               [0, 192, 0] and the 8px strip below the cells is not`, at 127 s against a \
+               fast-tier price — a panel that never received the write inside a window two \
+               orders above its cost, not a wrong pixel. The same run's `durations` job then \
+               refused the 126,762 ms reading against the 10,000 ms line, correctly: that \
+               number is this stall and must never be committed as a price. First sighting; \
+               same evening and same shape as `screen_console_panic`'s row — composition \
+               under a loaded host loses the panel's update. **Not about the diff it was \
+               found on**, a tier declaration and a duration table (PR #135). `ALONE: GREEN, \
+               and it was alone both times`",
+        evidence: "PR #135 run 32303408773, job 96231120463 (`guest (11)`), 2026-08-19; the \
+                   isolated re-run in the same job was green",
+        source: "issues/diagnostics/the-panel-once-took-no-pixels-for-two-minutes-under-load.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "console_line_atomicity",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`writer A declared 1000 whole lines and the capture carries 995` — five lines \
+               of one writer's thousand missing from the shared capture, the name's first \
+               sighting on THIS instrument: its standing rows are the loaded dev host's \
+               (fires 1 of 3 there), and CI runs one guest per machine, so whatever loses \
+               the lines here is not host contention. `ALONE: GREEN, and it was alone both \
+               times — a rate and not a classification`. **Not about the diff it was found \
+               on**, an issues-and-prose capability audit (PR #166)",
+        evidence: "PR #166 run 32364721784, job 96411690231 (`guest (10)`), 2026-08-20; the \
+                   isolated re-run in the same job was green",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-20",
+    },
+    Red {
         test: "exit_wait_storm",
         instrument: Instrument::Ci,
         finding: Finding::Seen,
@@ -2053,14 +2090,31 @@ pub const KNOWN_RED: &[Red] = &[
     // The first of those two deaths was `process_lifecycle`'s Ring 0 fetch at
     // `0x0` inside `SYS_READ`, and its row is gone with the defect: it was a
     // `context_switch` restoring a task another CPU was still standing on, and
-    // a red under that name now is a new measurement rather than this one. What
-    // stays is the second death, which is not yet accounted for.
+    // a red under that name now is a new measurement rather than this one. The
+    // second is the row below, and it was the last of the session still
+    // unaccounted for; it is the same defect, and the row's `Retired` reason
+    // carries what decided that.
     // ---------------------------------------------------------------------
     Red {
         test: "sched_stress",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(1, 3),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the same defect as the four Ring 0 fetches filed beside it, and it was fixed \
+             before this row was ever re-measured: `navigate.rs:161` is `init_front().unwrap()`, \
+             which `BTreeMap::iter` reaches only when the map's `root` reads `None` and its \
+             `length` does not — a pair no sequence of inserts and removes produces, so the \
+             panic reports corruption of the record rather than a scheduler decision. That \
+             record is `CpuSched` in `static SCHEDS`, and `SchedPass`'s own `&mut CpuSched` is \
+             a local on the kernel stack the pre-fix `pop_surplus` handed to two CPUs at once, \
+             a few hundred instructions before `apply_timer` walks the map. Measured \
+             2026-08-20, same host, one-word A/B: 0 kernel deaths in 3,600 boots on this tree, \
+             2 in 3,120 with `pop_surplus(None)` restored — both of them `cpu 7 has no \
+             CpuSched` at `sched/driver.rs:219`, the same static reading as a value only a \
+             stray write produces, and both after cpu7 had already completed a pass. 20 loaded \
+             `sched_stress` runs green at 4.27x-8.00x host width against the 1.41x that took \
+             this one. A red under this name now is a new measurement",
+        ),
         what: "`QEMU disconnected` — the kernel panicked at \
                `alloc/src/collections/btree/navigate.rs:161`, `Option::unwrap()` on `None` \
                **inside `BTreeMap`'s own immutable iterator**, walking a CPU's `parked` map \
@@ -2071,7 +2125,7 @@ pub const KNOWN_RED: &[Red] = &[
         evidence: "the same session's third run and the most loaded of the three, `fastest boot \
                    1867 ms against the reference 1320 ms`; `ALONE sched_stress: GREEN` and \
                    `PASS (2s)` in the same run",
-        source: "issues/kernel/a-btreemap-panicked-inside-its-own-navigation-in-a-scheduler-pass.md",
+        source: "src/redlist.rs",
         measured: "2026-08-19",
     },
     // ---------------------------------------------------------------------
@@ -2097,6 +2151,28 @@ pub const KNOWN_RED: &[Red] = &[
                    reference 1320 ms`, 1.23x width; `ALONE screen_console_shell: GREEN`",
         source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-19",
+    },
+    // Found auditing the merge-health backfill
+    // (`issues/build/the-eased-merge-law-carries-a-threshold.md`), not by
+    // anyone working the diff it rode on.
+    Red {
+        test: "console_locale_detect",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`STALLED: waiting for the wizard to ask for a key under /bin/console — the \
+               console did not lend it the keyboard — it never stopped talking and never got \
+               there`. Same shape as `desktop_locale_detect`'s terminal-boot-race family — a \
+               wizard waiting for a key it was never handed — but against `/bin/console` rather \
+               than `/bin/terminal`, so it is not provably the same race and is not folded into \
+               it. First sighting: `--known-red` answered `NOT ON THE LIST`. **Not about the \
+               diff it was found on**, which is #142's log-redesign decision record, no kernel \
+               byte. `ALONE: GREEN, and it was alone both times — a rate and not a \
+               classification`",
+        evidence: "push-triggered `ci` run 32314166262, job 96263949273 (`guest (9)`), headSha \
+                   eba06ad6, 2026-08-19",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-20",
     },
     // ---------------------------------------------------------------------
     // `wt/toyos-i8042deep`, dev host, 2026-08-19. Adjudicated here rather than
