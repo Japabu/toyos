@@ -83,6 +83,13 @@ jobs:
       - name: the instrument
         run: .github/instrument.sh
 
+      - name: fresh Rustup state on the persistent runner
+        if: runner.name == 't14'
+        run: |
+          for dir in "$HOME/.cargo" "$HOME/.rustup"; do
+            [ ! -d "$dir" ] || find "$dir" -mindepth 1 -delete
+          done
+
       - name: rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \

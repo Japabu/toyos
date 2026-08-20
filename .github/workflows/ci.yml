@@ -176,6 +176,16 @@ jobs:
                 HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)" \
             >> "$GITHUB_OUTPUT"
 
+      # A self-hosted container job's /github/home persists outside Docker.
+      # A cancelled rustup can therefore strand a directory with no manifest.
+      # Hosted runners are ephemeral and retain their established path.
+      - name: fresh Rustup state on the persistent runner
+        if: runner.name == 't14'
+        run: |
+          for dir in "$HOME/.cargo" "$HOME/.rustup"; do
+            [ ! -d "$dir" ] || find "$dir" -mindepth 1 -delete
+          done
+
       - name: rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -388,6 +398,13 @@ jobs:
                 HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)" \
             >> "$GITHUB_OUTPUT"
 
+      - name: fresh Rustup state on the persistent runner
+        if: runner.name == 't14'
+        run: |
+          for dir in "$HOME/.cargo" "$HOME/.rustup"; do
+            [ ! -d "$dir" ] || find "$dir" -mindepth 1 -delete
+          done
+
       - name: rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
@@ -468,6 +485,13 @@ jobs:
           echo "tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
                 HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)" \
             >> "$GITHUB_OUTPUT"
+
+      - name: fresh Rustup state on the persistent runner
+        if: runner.name == 't14'
+        run: |
+          for dir in "$HOME/.cargo" "$HOME/.rustup"; do
+            [ ! -d "$dir" ] || find "$dir" -mindepth 1 -delete
+          done
 
       - name: rust
         run: |
