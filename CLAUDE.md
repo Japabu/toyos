@@ -41,7 +41,7 @@ A subdirectory `CLAUDE.md` loads when a file in that subtree is `Read`, and not 
 
 **Syscall ABI** — `toyos-abi/`: struct layouts, syscall numbers, typed wrappers; completely unstable, read the code. Never add or change a syscall without discussion; a deleted syscall's number is retired, never reused. `toyos/` builds on it with typed handles, IPC framing, ports, namespaces and `surface` — userland uses `toyos`, the kernel uses `toyos-abi` only.
 
-**Capabilities** — a process holds exactly what its parent moved into it, and there is nothing it can name to get more. No registry, no connect-by-name, no pid-as-authority: `/bin/init` builds every program's namespace and device claims from `system.toml` before spawning it, and a handle a process does not hold is a bug in that process — the kernel ends it rather than answering a word it can ignore.
+**Capabilities** — a process holds exactly what its parent moved into it, and among kernel objects there is nothing it can name to get more. No registry, no connect-by-name, no pid-as-authority: `/bin/init` builds every program's namespace and device claims from `system.toml` before spawning it, and a handle a process does not hold is a bug in that process — the kernel ends it rather than answering a word it can ignore. **The filesystem is the declared exception** (owner ruling 2026-08-20): paths are ambient, `/boot`'s mount guard is the one restriction the ambient space carries, and the full intentional ambient set is the capability end-state track's committed answer.
 
 **CPU state** — a CPU's control registers come from one declaration, applied by the BSP and by every AP and asserted on each; no read-modify-write decides what either holds.
 
