@@ -547,12 +547,11 @@ fn control(
     if data.is_some() {
         unsafe { write_bytes(dma.ptr_at(OFF_DATA_BUF), 0, MAX_CONFIG_DESC); }
     }
-    let has_data = enqueue_control(
+    let trbs = enqueue_control(
         &mut state.ep0_ring, bm_request_type, b_request, w_value, w_index, data, len,
     );
     ctrl.ring_doorbell(state.slot_id, 1);
-    let stages = if has_data { Stages::DataThenStatus } else { Stages::One };
-    (Await::Transfer { slot: state.slot_id, dci: 1 }, stages)
+    trbs.awaits(state.slot_id)
 }
 
 /// What one control request that completed left in the scratch page, and what

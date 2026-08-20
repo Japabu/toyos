@@ -9,6 +9,7 @@
 
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
+
 use crate::log;
 use crate::scheduler::Operation;
 use crate::time::{Budget, Deadline, Duration};
@@ -876,14 +877,14 @@ impl XhciController {
         // ISP so a device that sends less than asked reports it instead of
         // leaving the transfer outstanding, IOC so it reports at all.
         trb.control = TRB_NORMAL | (1 << 5) | (1 << 2);
-        ring.enqueue(trb);
+        let at = ring.enqueue(trb);
         let slot = dev.slot_id;
         self.ring_doorbell(slot, dci);
         #[cfg(feature = "boot-actuators")]
         if transport_break::take() {
             return None;
         }
-        self.wait_transfer(slot, dci)
+        self.wait_transfer(slot, dci, at)
     }
 
     /// One of this disk's bulk endpoints, as the recovery needs to see it.
