@@ -166,13 +166,31 @@ pub enum ParkShape {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MigrateShape {
     /// Spec §7.6's promptness carried into the balance path: a killed task is
-    /// reaped by the CPU that holds it, and never handed on.
+    /// kept by the CPU that holds it and dispatched there, never handed on.
+    /// The variant keeps the name it was minted with, and the name is now the
+    /// *old* mechanism — §7.2 replaced the reap with a dispatch and the
+    /// promptness argument is unchanged by that.
     ReapTheCorpse,
     /// The balance path before it read the kill bit: a killed ready task is
-    /// migrated like any other, and its reap then rides an `Urgency::Normal`
-    /// adopt to a CPU that owes it nothing sooner than its next voluntary pass.
-    /// See `scenarios::old_migrate_kept_the_corpse`.
+    /// migrated like any other, and its unwind then waits on an
+    /// `Urgency::Normal` adopt reaching a CPU that owes it nothing sooner than
+    /// its next voluntary pass. See `scenarios::old_migrate_kept_the_corpse`.
     KeepTheCorpse,
+}
+
+/// How the pick weighs a ready real-time task against a corpse waiting to
+/// unwind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AgeShape {
+    /// What ships: the RT band goes first until the head of the dying list has
+    /// waited `DYING_AGE_NS`, and then that corpse takes one `DYING_CHUNK_NS`
+    /// ahead of it. Bounded in both directions.
+    BoundedDeferral,
+    /// The shape this branch shipped between the two fixes: `pick` asks only
+    /// `rq.has_rt()`, so a permanently-RT thread that never parks holds the
+    /// dying list closed for ever and `scheduler::retire_task`'s tripwire
+    /// panics the kernel. See `scenarios::old_rt_starved_the_corpse`.
+    RtOutranksEveryCorpse,
 }
 
 /// What a fair share is a share *of* — spec §9.1's "all threads of one process
@@ -235,6 +253,7 @@ pub struct Scenario {
     pub window: WindowShape,
     pub park: ParkShape,
     pub migrate: MigrateShape,
+    pub age: AgeShape,
     pub share: ShareShape,
     pub charge: ChargeShape,
     /// How the fair band picks between two ready threads of one share. A
@@ -311,6 +330,11 @@ impl Scenario {
 
     pub fn with_migrate(mut self, migrate: MigrateShape) -> Self {
         self.migrate = migrate;
+        self
+    }
+
+    pub fn with_age(mut self, age: AgeShape) -> Self {
+        self.age = age;
         self
     }
 

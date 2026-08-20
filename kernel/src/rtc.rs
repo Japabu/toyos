@@ -26,6 +26,7 @@ use core::fmt;
 
 use crate::arch::cpu;
 use crate::clock;
+use crate::time::{Bound, Duration};
 use toyos_wallclock::Civil;
 
 const CMOS_ADDR: u16 = 0x70;
@@ -62,7 +63,13 @@ const PM: u8 = 1 << 7;
 /// What the caller sees when it is hit is [`RtcFault::Updating`], which reaches
 /// the boot log by name and leaves this boot with no wall clock — a state every
 /// consumer of [`clock`] can represent.
-const MAX_UIP_NANOS: u64 = 100_000_000;
+///
+/// A [`Bound`]: the number is the MC146818's own, and its expiry is a named
+/// refusal ([`RtcFault::Updating`]) rather than a retry or a panic.
+const MAX_UIP: Bound = Bound::from_spec(
+    Duration::from_millis(100),
+    "MC146818: the flag is raised 244us ahead of an update and cleared at most 1984us later",
+);
 
 /// How many times [`read`] takes the whole register set hoping for two in a row
 /// that agree.
@@ -76,7 +83,7 @@ const MAX_READ_ATTEMPTS: u32 = 4;
 /// Why this machine did not say what time it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RtcFault {
-    /// The update flag never cleared inside [`MAX_UIP_NANOS`]. What an absent
+    /// The update flag never cleared inside [`MAX_UIP`]. What an absent
     /// RTC looks like: an unclaimed port reads `0xFF`, and bit 7 of that is the
     /// flag.
     Updating,
@@ -94,7 +101,7 @@ impl fmt::Display for RtcFault {
             Self::Updating => write!(
                 f,
                 "its update flag never cleared in {} ms, which is what an absent one looks like",
-                MAX_UIP_NANOS / 1_000_000
+                MAX_UIP.duration().millis()
             ),
             Self::Unstable => write!(
                 f,
@@ -173,7 +180,7 @@ fn century_read(reg: u8) -> u8 {
 }
 
 fn wait_for_update() -> Result<(), RtcFault> {
-    let deadline = clock::nanos_since_boot() + MAX_UIP_NANOS;
+    let deadline = clock::nanos_since_boot() + MAX_UIP.nanos();
     while cmos_read(STATUS_A) & UPDATE_IN_PROGRESS != 0 {
         if clock::nanos_since_boot() >= deadline {
             return Err(RtcFault::Updating);

@@ -2,6 +2,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use super::{cpu, percpu};
 use crate::log;
+use crate::time::{Budget, Delay, Duration, Floor};
 
 // x2APIC MSR addresses (base 0x800 + xAPIC_offset >> 4)
 const IA32_APIC_BASE_MSR: u32 = 0x1B;
@@ -141,7 +142,19 @@ pub fn send_nmi(cpu_id: u32) {
 /// anyway, and a machine whose logd is alive and schedulable finishes far
 /// inside it. `screen_fatal_halt_composited`'s `/log` half is what says so on
 /// every run.
-const LOG_FILE_DRAIN_NANOS: u64 = 500_000_000;
+///
+/// **A [`Budget`] and not a [`Bound`](crate::time::Bound) — the one place
+/// this sweep came out a square, reclassified away from `Tripwire`** — right,
+/// because `:236` logs and *returns* rather than panicking — **and landed on
+/// `Bound`, whose two constructors both demand a register or a specification
+/// section.** This number has neither: it is policy,
+/// priced against the ~460 ms the panel paint costs anyway. A `Budget`'s expiry
+/// is a degraded answer named at the site, and "the panel is the only copy" is
+/// exactly one.
+const LOG_FILE_DRAIN: Budget = Budget::of(
+    Duration::from_millis(500),
+    "the report reaches the panel and not /log",
+);
 
 /// Does `/log` still owe this boot the report?
 ///
@@ -225,15 +238,18 @@ fn wait_for_log_file() {
             kick_cpu(cpu);
         }
     }
-    let deadline = crate::clock::nanos_since_boot().saturating_add(LOG_FILE_DRAIN_NANOS);
+    let deadline = crate::clock::now() + LOG_FILE_DRAIN.duration();
     while owed(want) {
-        if crate::clock::nanos_since_boot() >= deadline {
+        if crate::clock::now() >= deadline {
             // Reaches the panel only on the fatal paths that paint the live
             // ring rather than a snapshot taken before this ran, and reaches
             // serial on a machine that has one. On a T14 mid-panic it is the
             // honest record for whoever reads the *next* boot's log and finds
             // no report in this one.
-            crate::log!("panic: the report did not reach /log in {LOG_FILE_DRAIN_NANOS}ns; the panel is the only copy");
+            crate::log!(
+                "panic: the report did not reach /log in {}ns; the panel is the only copy",
+                LOG_FILE_DRAIN.nanos()
+            );
             return;
         }
         core::hint::spin_loop();
@@ -285,8 +301,14 @@ pub fn init_timer() {
     cpu::wrmsr(X2APIC_LVT_TIMER, 1 << 16);
     cpu::wrmsr(X2APIC_TIMER_INIT, 0xFFFF_FFFF);
 
+    // The window the tick rate is counted over. Nothing expires: what elapses
+    // is what is being measured.
+    const CALIBRATION: Delay = Delay::to_measure(
+        Duration::from_millis(10),
+        "LAPIC ticks counted against the monotonic clock, and the tick figure is reported per 10ms",
+    );
     let start = crate::clock::nanos_since_boot();
-    while crate::clock::nanos_since_boot() - start < 10_000_000 {}
+    while crate::clock::nanos_since_boot() - start < CALIBRATION.nanos() {}
     let elapsed = crate::clock::nanos_since_boot() - start;
 
     let remaining = cpu::rdmsr(X2APIC_TIMER_CURRENT) as u32;
@@ -316,7 +338,15 @@ pub fn init_timer() {
 /// entry and `iretq`, which is what the interval has to be worth more than for
 /// the interrupted code to get any of the CPU at all. Above: `QUANTUM_NS`,
 /// which this is a thousandth of, so no scheduling decision can feel it.
-const MIN_ONE_SHOT_NS: u64 = 10_000;
+///
+/// **The kind is [`Floor`], and it is why that kind exists.** It is not a
+/// register's number and not a specification's, nothing expires, and no caller
+/// chose it — an implementer applying RT7 with only the first four kinds finds
+/// it unconstructible and deletes it, which reopens #156.
+const MIN_ONE_SHOT: Floor = Floor::policy(
+    Duration::from_micros(10),
+    "above an interrupt entry and iretq, a thousandth of QUANTUM_NS",
+);
 
 /// A count the CPU can make progress under, and the only thing that reaches
 /// `X2APIC_TIMER_INIT` or `last_armed_ticks`.
@@ -330,7 +360,7 @@ struct OneShot(u32);
 impl OneShot {
     fn ticks(ticks: u64) -> Self {
         let per_10ms = TIMER_TICKS.load(Ordering::Relaxed) as u64;
-        let floor = (MIN_ONE_SHOT_NS * per_10ms / 10_000_000).max(1);
+        let floor = (MIN_ONE_SHOT.nanos() * per_10ms / 10_000_000).max(1);
         // Zero is the register's "stopped", so it is `stop_timer`'s word and
         // never a count — `min` alone would let a calibration this small write
         // it. `u32::MAX` is the register.
@@ -355,7 +385,7 @@ impl OneShot {
 }
 
 /// Arm a one-shot timer to fire after `nanos` nanoseconds, or after
-/// [`MIN_ONE_SHOT_NS`] if that is longer.
+/// [`MIN_ONE_SHOT`] if that is longer.
 pub fn arm_one_shot(nanos: u64) {
     OneShot::after(nanos).arm();
     crate::trace::trace(crate::trace::Kind::TimerArm, nanos as u32);
@@ -366,7 +396,7 @@ pub fn arm_one_shot(nanos: u64) {
 ///
 /// The minimum against what is already armed is what keeps this close to a pure
 /// addition: a parked task's deadline is never pushed out by more than
-/// [`MIN_ONE_SHOT_NS`], and all the scheduler ever sees is extra passes — which
+/// [`MIN_ONE_SHOT`], and all the scheduler ever sees is extra passes — which
 /// it already tolerates, since a kick IPI is one.
 ///
 /// Traces nothing, unlike [`arm_one_shot`]: no scheduler deadline is being set

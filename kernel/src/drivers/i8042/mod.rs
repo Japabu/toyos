@@ -56,6 +56,7 @@ use crate::arch::idt::I8042_VECTOR;
 use crate::irq_ring::IrqSource;
 use crate::log;
 use crate::sync::Lock;
+use crate::time::{Budget, Cadence, Duration};
 use super::ioapic::{self, Gsi};
 
 mod tally;
@@ -264,10 +265,16 @@ static ARMED_NS: AtomicU64 = AtomicU64::new(0);
 // already costs a reader per idle minute, and it bounds the line to one per
 // 10 s of *typing* — an idle machine pays nothing.
 fn health_period_ns() -> u64 {
+    /// A log-rate limit, which is what §3.4's widened `Cadence` covers: what
+    /// makes the rate affordable is that an idle machine pays nothing at all.
+    const HEALTH: Cadence = Cadence::every(
+        Duration::from_secs(10),
+        "the PMM dump's own cadence, and one line per 10s of typing",
+    );
     if crate::actuator::i8042_fast_health() {
-        500_000_000
+        Duration::from_millis(500).nanos()
     } else {
-        10_000_000_000
+        HEALTH.nanos()
     }
 }
 static NEXT_REPORT_NS: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -610,7 +617,10 @@ static AUX_REENABLE_FAILURES: AtomicU32 = AtomicU32::new(0);
 /// A device that answers at all answers a one-byte command in well under a
 /// millisecond; this is interrupts-off time on the one CPU that takes the
 /// vector, so it is sized for "the controller is gone", not for slowness.
-const AUX_REENABLE_MS: u64 = 30;
+const AUX_REENABLE: Budget = Budget::of(
+    Duration::from_millis(30),
+    "the re-enable handshake is abandoned and counted against AUX_REENABLE_GIVE_UP",
+);
 
 /// A TrackPoint that resets in a loop would otherwise buy the same handshake
 /// forever. After this many consecutive failures the aux line is masked and
@@ -1067,6 +1077,15 @@ fn deadline(millis: u64) -> u64 {
     crate::clock::nanos_since_boot() + millis * 1_000_000
 }
 
+/// The millisecond figure this module's polled init is written in.
+///
+/// Every stage below is a [`Budget`] — expiry names the stage and degrades the
+/// probe's answer, never panics — and the arithmetic that sums them stays in
+/// milliseconds, where it was written and where its own doc argues about it.
+const fn ms(budget: Budget) -> u64 {
+    budget.duration().millis()
+}
+
 /// Everything that is not inside a named stage draws on this: the initial
 /// disable and flush, the config read-modify-write and its read-back, both
 /// interface tests, and the arming write at the end. Each is a controller
@@ -1076,18 +1095,30 @@ fn deadline(millis: u64) -> u64 {
 ///
 /// An allowance, not a measurement. No real EC has ever been timed here, in
 /// either direction.
-const CONTROLLER_MS: u64 = 250;
+const CONTROLLER: Budget = Budget::of(
+    Duration::from_millis(250),
+    "the stage that ran out is named and the probe reports DISABLED",
+);
 /// `0xAA`. A floating bus is already gone by here, so what this separates is
 /// "a controller" from "something else decoding 0x60/0x64" — firmware trapping
 /// the ports in SMM for USB legacy emulation is the case that exists.
-const SELFTEST_MS: u64 = 500;
+const SELFTEST: Budget = Budget::of(
+    Duration::from_millis(500),
+    "the controller is reported absent and the machine boots with no PS/2 input",
+);
 /// `0xF5`, the `0xF0 0x00` read-back and `0xF4`, each acknowledged by the
 /// keyboard itself rather than by the controller.
-const KEYBOARD_MS: u64 = 750;
+const KEYBOARD: Budget = Budget::of(
+    Duration::from_millis(750),
+    "the keyboard stage is named as the one that ran out",
+);
 /// The aux port's `0xFF` is a *device reset*: a real PS/2 device answers it
 /// with a self-test that takes real time, which is why this stage is the one
 /// that must not be shortened to make an arithmetic error go away.
-const AUX_RESET_MS: u64 = 600;
+const AUX_RESET: Budget = Budget::of(
+    Duration::from_millis(600),
+    "the pointer is written off and the keyboard half still comes up",
+);
 
 /// Derived, never written down independently.
 ///
@@ -1108,7 +1139,7 @@ fn init_budget_ms() -> u64 {
     if crate::actuator::i8042_budget_expired() {
         0
     } else {
-        CONTROLLER_MS + SELFTEST_MS + KEYBOARD_MS + AUX_RESET_MS
+        ms(CONTROLLER) + ms(SELFTEST) + ms(KEYBOARD) + ms(AUX_RESET)
     }
 }
 
@@ -1327,7 +1358,7 @@ fn aux_reenable() {
     AUX_RESET_PENDING.store(false, Ordering::Relaxed);
     let ok = {
         let _irq = crate::hw::IrqGuard::close();
-        let budget = deadline(AUX_REENABLE_MS);
+        let budget = deadline(ms(AUX_REENABLE));
         // The keyboard is still scanning — masking the *line* does not stop
         // the *device*. `init` disables port 1 for exactly this reason: a
         // keystroke arriving mid-handshake is consumed as the aux ack, and
@@ -1444,14 +1475,18 @@ pub fn init(rsdp_addr: u64) {
         }
     }
 
-    let Some(selftest_deadline) = stage(SELFTEST_MS, budget, "self-test") else {
+    let Some(selftest_deadline) = stage(ms(SELFTEST), budget, "self-test") else {
         return;
     };
     command(CMD_SELF_TEST, selftest_deadline);
     match read_data(selftest_deadline) {
         Some(0x55) => {}
         other => {
-            log!("i8042: absent (self-test {:?}, {SELFTEST_MS}ms) — no PS/2 input", other);
+            log!(
+                "i8042: absent (self-test {:?}, {}ms) — no PS/2 input",
+                other,
+                ms(SELFTEST)
+            );
             return;
         }
     }
@@ -1484,7 +1519,7 @@ pub fn init(rsdp_addr: u64) {
     );
 
     // The slowest step on a real EC, hence its own budget.
-    let Some(kbd) = stage(KEYBOARD_MS, budget, "keyboard") else {
+    let Some(kbd) = stage(ms(KEYBOARD), budget, "keyboard") else {
         return;
     };
     if !device_command(&[0xF5], kbd) {
@@ -1553,7 +1588,7 @@ pub fn init(rsdp_addr: u64) {
     // every step logs and falls through rather than returning.
     let aux = port2 && {
         command(CMD_ENABLE_AUX, budget);
-        stage(AUX_RESET_MS, budget, "aux reset").is_some_and(|reset| {
+        stage(ms(AUX_RESET), budget, "aux reset").is_some_and(|reset| {
             // 0xFF answers 0xFA, then 0xAA (BAT ok), then the device id.
             aux_command(&[0xFF], reset)
                 && read_data(reset) == Some(0xAA)

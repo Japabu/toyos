@@ -15,6 +15,7 @@
 //! early and costs that machine nothing it has today.
 
 use crate::mm::Mmio;
+use crate::time::{Duration, Tripwire};
 
 use super::table::{Table, Tables};
 use super::{FSTS_REG, IQA_REG, IQT_REG};
@@ -53,7 +54,10 @@ const FSTS_QUEUE_ERRORS: u32 = (1 << 4) | (1 << 5) | (1 << 6);
 /// be, it is the bound past which the kernel gives up rather than spins for
 /// ever. Expiry is a panic (§5.5): what a device can reach is unknown from
 /// there.
-const ACK_TIMEOUT_NS: u64 = 1_000_000_000;
+const ACK_TIMEOUT: Tripwire = Tripwire::absurd(
+    Duration::from_secs(1),
+    "Linux waits one second for the same acknowledgement, and what a device can reach is unknown past it",
+);
 
 pub struct Queue {
     descriptors: Table,
@@ -114,7 +118,7 @@ impl Queue {
 
         regs.write_u64(IQT_REG, (self.tail * 16) as u64);
 
-        let deadline = crate::clock::nanos_since_boot() + ACK_TIMEOUT_NS;
+        let deadline = crate::clock::nanos_since_boot() + ACK_TIMEOUT.nanos();
         while self.status.read_device_u32(0) != WAIT_DONE {
             let faults = regs.read_u32(FSTS_REG);
             assert!(
@@ -123,8 +127,9 @@ impl Queue {
             );
             assert!(
                 crate::clock::nanos_since_boot() < deadline,
-                "iommu: the unit did not acknowledge an invalidation within {ACK_TIMEOUT_NS} ns, \
-                 FSTS={faults:#010x}"
+                "iommu: the unit did not acknowledge an invalidation within {} ns, \
+                 FSTS={faults:#010x}",
+                ACK_TIMEOUT.nanos()
             );
             core::hint::spin_loop();
         }

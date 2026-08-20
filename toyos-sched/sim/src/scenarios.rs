@@ -9,8 +9,8 @@ use toyos_sched::queue::FairOrder;
 use toyos_sched::task::WaitClass;
 
 use crate::workload::{
-    BlockShape, ChargeShape, IrqSpec, MigrateShape, Op, ParkShape, ProcSpec, Protocol, QueueSpec,
-    Scenario, Script, ShareShape, WindowShape,
+    AgeShape, BlockShape, ChargeShape, IrqSpec, MigrateShape, Op, ParkShape, ProcSpec, Protocol,
+    QueueSpec, Scenario, Script, ShareShape, WindowShape,
 };
 
 const MS: u64 = 1_000_000;
@@ -36,6 +36,7 @@ fn scenario(
         window: WindowShape::PreemptOff,
         park: ParkShape::ReleaseLend,
         migrate: MigrateShape::ReapTheCorpse,
+        age: AgeShape::BoundedDeferral,
         share: ShareShape::PerProcess,
         charge: ChargeShape::Honest,
         order: FairOrder::InsertSequence,
@@ -206,14 +207,84 @@ pub fn retire_under_balance() -> Scenario {
 ///
 /// It **must fail** invariant I14. `answer_steal_requests` pops from the back
 /// of the fair band and migrates without reading the kill bit, so a task the
-/// victim CPU would have reaped at its own next `pick` becomes an
+/// victim CPU would have dispatched at its own next `pick` becomes an
 /// `Urgency::Normal` adopt aimed at a CPU that owes it nothing until its next
 /// voluntary pass. Every other state a killed task can be in has an interrupt
-/// behind its reap; `InTransit` has none, and this is the code that put tasks
-/// there on purpose.
+/// behind the pass that handles it; `InTransit` has none, and this is the code
+/// that put tasks there on purpose.
 pub fn old_migrate_kept_the_corpse() -> Scenario {
     let mut scenario = retire_under_balance().with_migrate(MigrateShape::KeepTheCorpse);
     scenario.name = "old_migrate_kept_the_corpse";
+    scenario
+}
+
+/// **One CPU, one permanently-RT thread that never parks, and a process that
+/// dies underneath it** — the shape that turns the real-time band's precedence
+/// into a kernel panic if that precedence over the dying list is unqualified.
+///
+/// It is not a hypothetical workload. `Rights::RT` is capability-gated, but
+/// `soundd` holds it in the shipped `system.toml` and `SYS_RT_ENTER` has no
+/// revocation call anywhere in the tree, so an RT process that stops blocking is
+/// one bug away — and every thread killed on its CPU then waits behind it. One
+/// CPU is deliberate: `hand_off` refuses to migrate a killed task and
+/// `pop_surplus` reads the fair band only, so a sibling CPU is no rescue and
+/// pretending otherwise would only make the scenario slower to reach the point.
+///
+/// What invariant I14 reads here is the wall clock, which is the clock the
+/// kernel's own tripwire reads — see [`crate::vm::Killed`].
+pub fn rt_saturated_retire() -> Scenario {
+    scenario(
+        "rt_saturated_retire",
+        1,
+        vec![queue(WaitClass::Io), queue(WaitClass::Pipe)],
+        vec![
+            // The RT thread that stopped blocking. One block to let the
+            // teardown happen underneath it, then a run long enough to outlast
+            // invariant I14's whole bound — which is the point: if the band's
+            // precedence over the dying list were unqualified, the corpse would
+            // still be queued when this run ended.
+            ProcSpec {
+                name: "soundd",
+                initial: vec![0],
+                templates: vec![Script::new(vec![
+                    Op::Block {
+                        queue: 0,
+                        deadline: Some(2 * MS),
+                    },
+                    Op::Run(300 * MS),
+                ])],
+                rt: true,
+            },
+            // The process that dies under it: a main thread that tears down
+            // early, and a worker parked on a queue nothing ever signals, so
+            // the retire is what makes it runnable and the whole of its unwind
+            // is still owed when the RT band takes the CPU.
+            process(
+                "client",
+                vec![0, 1],
+                vec![
+                    Script::new(vec![Op::Run(MS), Op::Teardown]),
+                    Script::new(vec![Op::Block {
+                        queue: 1,
+                        deadline: Some(500 * MS),
+                    }]),
+                ],
+            ),
+        ],
+    )
+}
+
+/// The tenth negative gate, and the second direction of the seventh: the same
+/// workload with `pick` asking only `rq.has_rt()`, which is the shape this
+/// branch shipped between the two fixes. The corpse never runs, `Hw::release`
+/// is never called, and invariant I14 must say so.
+///
+/// `old_migrate_kept_the_corpse` is the other direction — a corpse handed away
+/// and left waiting on a voluntary pass. Both are I14's, and a fix for either
+/// that broke the other is exactly what this pair exists to stop.
+pub fn old_rt_starved_the_corpse() -> Scenario {
+    let mut scenario = rt_saturated_retire().with_age(AgeShape::RtOutranksEveryCorpse);
+    scenario.name = "old_rt_starved_the_corpse";
     scenario
 }
 
@@ -955,6 +1026,7 @@ pub fn all() -> Vec<Scenario> {
     vec![
         crash_md_exit_race(),
         retire_under_balance(),
+        rt_saturated_retire(),
         lost_wake_pipe(),
         lost_wake_futex(),
         lost_wake_iouring(),
@@ -983,6 +1055,7 @@ pub fn by_name(name: &str) -> Option<Scenario> {
     match name {
         "old_steal_port" => Some(old_steal_port()),
         "old_migrate_kept_the_corpse" => Some(old_migrate_kept_the_corpse()),
+        "old_rt_starved_the_corpse" => Some(old_rt_starved_the_corpse()),
         "fair_share_per_thread" => Some(fair_share_per_thread()),
         "fair_double_charge" => Some(fair_double_charge()),
         "fair_identity_tiebreak" => Some(fair_identity_tiebreak()),

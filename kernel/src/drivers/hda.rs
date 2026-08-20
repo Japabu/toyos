@@ -30,6 +30,7 @@ use crate::mm::paging::CachePolicy;
 use crate::mm::Mmio;
 use crate::object::shm::Region;
 use crate::sync::Lock;
+use crate::time::{Delay, Duration};
 
 const CLASS_MULTIMEDIA: u8 = 0x04;
 const SUBCLASS_HDA: u8 = 0x03;
@@ -41,7 +42,13 @@ const COMMAND_MEMORY_SPACE: u16 = 1 << 1;
 const CAP_POWER_MANAGEMENT: u8 = 0x01;
 const PM_CONTROL_STATUS: u64 = 0x04;
 const PM_STATE_MASK: u16 = 0x3;
-const PM_D3HOT_RECOVERY_NS: u64 = 10_000_000;
+/// The recovery a device gets after being taken out of D3hot, which it may
+/// not be asked anything during. A [`Delay`]: nothing is waited *for* and
+/// nothing expires — spending it is the whole requirement.
+const PM_D3HOT_RECOVERY: Delay = Delay::from_spec(
+    Duration::from_millis(10),
+    "PCI Power Management: the mandated D3hot-to-D0 recovery time",
+);
 
 const GCAP: u64 = 0x00;
 const VMIN: u64 = 0x02;
@@ -114,7 +121,10 @@ const SETTLE_NS: u64 = 100_000_000;
 
 /// The delay the specification requires between releasing `CRST` and believing
 /// `STATESTS`: 25 frames at 48 kHz, rounded up to a millisecond.
-const CODEC_DETECT_NS: u64 = 1_000_000;
+const CODEC_DETECT: Delay = Delay::from_spec(
+    Duration::from_millis(1),
+    "HD Audio: 25 frames at 48kHz between releasing CRST and believing STATESTS",
+);
 
 /// How many refused register accesses are named in the log before the driver is
 /// told to stop asking.
@@ -703,7 +713,7 @@ fn power_up(pci: &PciDevice) {
         return;
     }
     cap.write_u16(PM_CONTROL_STATUS, pmcsr & !PM_STATE_MASK);
-    spin_ns(PM_D3HOT_RECOVERY_NS);
+    spin_ns(PM_D3HOT_RECOVERY.nanos());
 }
 
 /// Hold the controller in reset and release it, waiting for both edges: the bit
@@ -719,7 +729,7 @@ fn reset_controller(regs: Mmio) -> bool {
     if !crate::clock::settles(SETTLE_NS, || regs.read_u32(GCTL) & GCTL_CRST != 0) {
         return false;
     }
-    spin_ns(CODEC_DETECT_NS);
+    spin_ns(CODEC_DETECT.nanos());
     true
 }
 

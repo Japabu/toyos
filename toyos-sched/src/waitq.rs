@@ -121,6 +121,60 @@ impl<M: SchedMsg, L: LeafLock<WaitList<M>>> WaitQueue<M, L> {
     /// cancelled or committed.
     #[must_use = "a wait ticket must be committed or cancelled"]
     pub fn prepare_wait<'q>(&'q self, cur: &CurrentTask<'_, M>) -> WaitTicket<'q, M, L> {
+        self.register(cur, Cancel::Answers, self.class)
+    }
+
+    /// Phase 1, saying both things a *wait* decides for itself rather than
+    /// inheriting from the queue it registers on: whether a kill ends it, and
+    /// what its blocked time is attributed to.
+    ///
+    /// **The class stopped being the queue's the moment there was one queue per
+    /// thread.** The one park site makes every park happen on
+    /// `TaskHandle::park_queue` — a list of one, a parking place with no
+    /// subject — so a class read off that queue is the same word for every
+    /// wait in the machine, and `ProcessStats`'s `blocked_io_ns`,
+    /// `blocked_futex_ns`, `blocked_pipe_ns` and `blocked_ipc_ns` were
+    /// permanently zero while the dump's per-thread column read "other" for
+    /// everyone. What a waiter is waiting for is a property of the subject it
+    /// armed on, so it is named at the wait.
+    #[must_use = "a wait ticket must be committed or cancelled"]
+    pub fn prepare_wait_as<'q>(
+        &'q self,
+        cur: &CurrentTask<'_, M>,
+        cancel: Cancel,
+        class: WaitClass,
+    ) -> WaitTicket<'q, M, L> {
+        self.register(cur, cancel, class)
+    }
+
+    /// Phase 1 for a wait that a kill may **not** end.
+    ///
+    /// This is the honest shape: a `commit()` that distinguishes cancellable
+    /// from uncancellable waits. The other two — a kill bit cleared for the
+    /// window, or a park variant that ignores it — either open a hole in the
+    /// termination argument or hide the distinction from the type system.
+    ///
+    /// It exists because §7.2 makes `Commit::Killed` a *disposition* rather
+    /// than an exit: a killed task keeps running and unwinds. A site that
+    /// cannot propagate a cancel — the retirer waiting for its victim's
+    /// release is the one — would otherwise get `Killed` back from every
+    /// acquire and spin, which is exactly the `sleeplock-spins` negative gate
+    /// staged by the production path. Such a site is bounded by its own
+    /// tripwire and by the event it waits for, never by the kill.
+    #[must_use = "a wait ticket must be committed or cancelled"]
+    pub fn prepare_wait_uncancellable<'q>(
+        &'q self,
+        cur: &CurrentTask<'_, M>,
+    ) -> WaitTicket<'q, M, L> {
+        self.register(cur, Cancel::Ignores, self.class)
+    }
+
+    fn register<'q>(
+        &'q self,
+        cur: &CurrentTask<'_, M>,
+        cancel: Cancel,
+        class: WaitClass,
+    ) -> WaitTicket<'q, M, L> {
         assert!(
             cur.shared.set_waiting(),
             "a task waits on at most one queue",
@@ -132,6 +186,8 @@ impl<M: SchedMsg, L: LeafLock<WaitList<M>>> WaitQueue<M, L> {
             shared: cur.shared.clone(),
             cpu: cur.cpu,
             generation,
+            cancel,
+            class,
             armed: true,
             _not_send: PhantomData,
         }
@@ -261,10 +317,30 @@ pub struct WaitTicket<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> {
     shared: Arc<TaskShared<M>>,
     cpu: CpuId,
     generation: Gen,
+    cancel: Cancel,
+    /// What this *wait* is, for the blocked-time attribution — not what the
+    /// queue is. See [`WaitQueue::prepare_wait_as`].
+    class: WaitClass,
     /// Disarmed by `cancel`/`commit`; still armed at drop means a
     /// registration was abandoned.
     armed: bool,
     _not_send: PhantomData<*mut ()>,
+}
+
+/// Whether a kill ends this wait.
+///
+/// A property of the *wait* and not of the task, which is what the
+/// cancellable kill settles: the same thread may hold both kinds, one after
+/// the other — a cancellable park on the way in and an uncancellable one on
+/// the way out, in the teardown its own cancel sent it to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Cancel {
+    /// The ordinary park. A kill refuses the commit, the caller is told, and
+    /// it unwinds.
+    Answers,
+    /// The park a kill may not end. The caller cannot propagate a cancel and
+    /// is bounded by something else.
+    Ignores,
 }
 
 /// The result of cancelling a registration.
@@ -371,16 +447,19 @@ impl<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> WaitTicket<'q, M, L> {
     /// task "dies at its next safe point" has to be kept *here* and cannot be
     /// kept later: `handle_retire` already consumed the retire message and
     /// answered it with `need_resched` because the task was still running.
-    /// Park it anyway and nothing is left to reap it — a parked task is never
-    /// picked, the retirer waits on a word that never reaches `Dead`, and the
-    /// address space the payload holds is never released.
+    /// Park it anyway and nothing brings the task back — a parked task is
+    /// woken by a wake and there is no second retire to send one, the retirer
+    /// waits on a release that never comes, and the address space the payload
+    /// holds is never freed. The refusal is what keeps the task *running*, on
+    /// its own stack, which since the cancellable kill is where its death
+    /// happens.
     ///
     /// The kill check comes first because it subsumes the wake: a task about
     /// to die has no use for a wake, and `cancel_commit` puts the word back to
     /// `Running(cpu)` either way, which is what the exit disposition needs.
     pub fn commit(mut self) -> Commit<'q, M, L> {
         self.armed = false;
-        if self.shared.kill_pending() {
+        if self.cancel == Cancel::Answers && self.shared.kill_pending() {
             self.queue.dequeue(&self.shared);
             let _ = self.shared.cancel_commit(self.cpu, self.generation);
             return Commit::Killed;
@@ -390,7 +469,7 @@ impl<'q, M: SchedMsg, L: LeafLock<WaitList<M>>> WaitTicket<'q, M, L> {
                 CommittedTicket {
                     shared: self.shared.clone(),
                     cpu: self.cpu,
-                    class: self.queue.class(),
+                    class: self.class,
                 },
                 Registration {
                     queue: self.queue,

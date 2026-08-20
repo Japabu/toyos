@@ -46,12 +46,13 @@
 //! driver waiting on a device register inside a handler. Those are latency, not
 //! deadlock, because each carries its own deadline — but the deadline can be
 //! seconds (`issues/kernel/`, xHCI inside `drain_irqs`), so
-//! [`ACK_TIMEOUT_NS`] is set above the largest of them and a CPU past it is
+//! [`ACK_TIMEOUT`] is set above the largest of them and a CPU past it is
 //! named in a panic rather than waited for forever.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::shootdown::{Generation, Shootdown};
+use crate::time::{Duration, Tripwire};
 
 use super::{apic, percpu, smp};
 
@@ -78,7 +79,15 @@ static SIBLINGS_ANSWER: AtomicBool = AtomicBool::new(false);
 /// (`issues/kernel/`). Anything past that is not a slow CPU, it is a
 /// CPU that will never answer, and a panic naming it is worth more than a hang
 /// that looks like every other freeze.
-const ACK_TIMEOUT_NS: u64 = 5_000_000_000;
+///
+/// A [`Tripwire`]: it panics below, and neither a register nor a specification
+/// publishes it. Its *derivation* is `USB_TIMEOUT_NS`, which splits at C10 —
+/// so the number owes a new reason to whichever chunk does that, and the kind
+/// does not change with it.
+const ACK_TIMEOUT: Tripwire = Tripwire::absurd(
+    Duration::from_secs(5),
+    "above the longest IF-clear device spin a target can be inside",
+);
 
 /// Spins between deadline checks. `nanos_since_boot` is an HPET read on the
 /// machines that have no invariant TSC, and reading it every iteration would
@@ -139,10 +148,11 @@ fn wait_for(me: usize, cpu: u32, generation: Generation) {
             spins = 0;
             let now = crate::clock::nanos_since_boot();
             match deadline {
-                None => deadline = Some(now.saturating_add(ACK_TIMEOUT_NS)),
+                None => deadline = Some(now.saturating_add(ACK_TIMEOUT.nanos())),
                 Some(at) if now >= at => panic!(
-                    "tlb: cpu {cpu} has not flushed for generation {generation:?} in \
-                     {ACK_TIMEOUT_NS}ns — it is not taking interrupts",
+                    "tlb: cpu {cpu} has not flushed for generation {generation:?} in {}ns — \
+                     it is not taking interrupts",
+                    ACK_TIMEOUT.nanos(),
                 ),
                 Some(_) => {}
             }

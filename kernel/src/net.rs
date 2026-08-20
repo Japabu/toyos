@@ -50,7 +50,7 @@ pub fn remove_io_uring_watcher(id: RingId) {
 
 /// Wake every thread blocked on an incoming frame.
 pub fn wake_waiters() {
-    crate::sched::waitqs::wake_all(&crate::sched::waitqs::NETWORK);
+    crate::sched::waitqs::wake_device(&crate::sched::waitqs::NETWORK_WATCH);
 }
 
 pub fn io_uring_watchers() -> Vec<RingId> {

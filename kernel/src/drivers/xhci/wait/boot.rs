@@ -10,6 +10,7 @@ use core::ptr::write_volatile;
 use core::sync::atomic::Ordering;
 
 use crate::log;
+use crate::time::{Budget, Cadence, Duration};
 use crate::mm::paging::CachePolicy;
 use crate::mm::Mmio;
 use crate::drivers::pci::PciDevice;
@@ -49,7 +50,10 @@ use toyos_xhci::Protocol;
 /// `tPollingLFPSTimeout` (360 ms, USB 3.2 §7.5.4.3) before it falls back, and
 /// the USB2 connect and debounce behind that add ~100 ms — and it sits under
 /// Linux's `HUB_DEBOUNCE_TIMEOUT`, which is 2000 ms in `drivers/usb/core/hub.c`.
-const EMPTY_BUS_NS: u64 = 1_000_000_000;
+const EMPTY_BUS: Budget = Budget::of(
+    Duration::from_secs(1),
+    "the scan reports the bus as empty and the boot goes on without whatever was slow",
+);
 
 /// When the driver stops waiting for a root hub that keeps changing its mind.
 ///
@@ -58,12 +62,18 @@ const EMPTY_BUS_NS: u64 = 1_000_000_000;
 /// naming the machine's port state and a scan of whatever is connected at that
 /// moment — a flapping port costs the boot a bounded second and a half, never
 /// the machine.
-pub const PORT_SETTLE_CEILING_NS: u64 = 1_500_000_000;
+pub const PORT_SETTLE_CEILING: Budget = Budget::of(
+    Duration::from_millis(1_500),
+    "the scan takes whatever is connected at that instant and names the port state",
+);
 
 /// How often the settle re-reads the port registers. Each pass is one MMIO read
 /// per port, so on the widest controller in reach this is 16 reads per
 /// millisecond of the debounce.
-pub const PORT_POLL_NS: u64 = 1_000_000;
+pub const PORT_POLL: Cadence = Cadence::every(
+    Duration::from_millis(1),
+    "one MMIO read per port, so sixteen reads per millisecond on the widest controller",
+);
 /// Wait for every root hub on the machine to stop changing its mind.
 ///
 /// **`PORTSC.CCS` is not a question that can be asked at an instant.** HCRST
@@ -101,18 +111,18 @@ fn await_connect_settle(controllers: &[XhciController]) {
         let debounced = seen
             .iter()
             .all(|(_, at)| now.saturating_sub(*at) >= PORT_DEBOUNCE_NS);
-        let looked_long_enough = !empty || now.saturating_sub(powered_at) >= EMPTY_BUS_NS;
+        let looked_long_enough = !empty || now.saturating_sub(powered_at) >= EMPTY_BUS.nanos();
         if debounced && looked_long_enough {
             return;
         }
-        if now.saturating_sub(powered_at) >= PORT_SETTLE_CEILING_NS {
+        if now.saturating_sub(powered_at) >= PORT_SETTLE_CEILING.nanos() {
             log!("xHCI: no root hub on this machine held one connect state for {} ms within \
                  {} ms; enumerating whatever is connected now",
-                PORT_DEBOUNCE_NS / 1_000_000, PORT_SETTLE_CEILING_NS / 1_000_000);
+                PORT_DEBOUNCE_NS / 1_000_000, PORT_SETTLE_CEILING.duration().millis());
             return;
         }
 
-        let next = now + PORT_POLL_NS;
+        let next = now + PORT_POLL.nanos();
         while crate::clock::nanos_since_boot() < next {
             core::hint::spin_loop();
         }

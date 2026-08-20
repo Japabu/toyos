@@ -106,11 +106,11 @@ fn a_wait_before_the_exit_is_woken_by_it() {
 ///
 /// The other reason is ordinary and needs nothing staged: a thread's exit wakes
 /// its process's main thread *by name* (`process::thread_exit`), whatever that
-/// thread is waiting for. Before `scheduler::wait_until` looped, the wake was
-/// the answer — `sys_process_wait` read an exit code that had not been
-/// published and the kernel panicked on `expect`, from a plain userland
-/// `Child::wait()`. So this arm makes that wake land, on purpose, in the middle
-/// of a wait whose condition is provably false.
+/// thread is waiting for. Before the park rechecked its own predicate and
+/// re-parked, the wake was the answer — `sys_process_wait` read an exit code
+/// that had not been published and the kernel panicked on `expect`, from a
+/// plain userland `Child::wait()`. So this arm makes that wake land, on
+/// purpose, in the middle of a wait whose condition is provably false.
 ///
 /// The two handshakes are what make it land rather than merely be likely, and
 /// both read a state the kernel publishes for `ps` and nothing else can

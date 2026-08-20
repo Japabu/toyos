@@ -687,7 +687,7 @@ pub fn spawn(
         scheduler::TaskId(pid, tid),
         ks_alloc,
         ks_rsp,
-        Some(child_pt.clone()),
+        child_pt.clone(),
         fs_base,
     );
     table.get_mut(pid).unwrap().threads_mut().get_mut(tid).unwrap().set_sched(sched);

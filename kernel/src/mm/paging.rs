@@ -403,8 +403,7 @@ fn align_up_2m(v: u64) -> u64 {
 impl AddressSpace {
     /// Create a new user address space with kernel entries shallow-copied.
     pub fn new_user() -> Self {
-        let guard = kernel().lock();
-        let kernel_as = guard.as_ref().expect("paging not initialized");
+        let kernel_as = kernel().lock();
         let mut pml4 = Box::new(PageTablePage([0; 512]));
 
         for i in 256..512 {
@@ -512,6 +511,25 @@ impl AddressSpace {
     }
 
     /// Unmap one 2MB page and free its physical memory.
+    ///
+    /// **A wait armed on a word in this frame ends here**, because there is
+    /// nothing left for it to be woken by. A futex waiter's completion token is
+    /// its word's *physical* address — that is what makes a futex in shared
+    /// memory work across processes — and nothing pins the frame behind it, so
+    /// the moment the entry below goes and the page reaches the PMM that token
+    /// names whatever is mapped there next. `revoke_futex_range` is the
+    /// deletion of that hazard rather than bookkeeping against it: the waiter is
+    /// told `Gone(Closed)` and taken off the bucket, so no later `futex_wake`
+    /// can find it. See `sched::waitqs::revoke_futex_range`.
+    ///
+    /// It runs on every present entry rather than only on the frames this
+    /// address space owns. A shared-memory page is unmapped here too and its
+    /// frame outlives the unmap, so a waiter in *another* process is ended
+    /// where it did not have to be — a spurious futex return, which every park
+    /// site is allowed and every futex loop in userland already re-checks.
+    /// The converse mistake is not
+    /// survivable, and telling the two apart would put the ownership question
+    /// on a path whose only wrong answer is a use-after-free.
     pub fn unmap(&mut self, vaddr: UserAddr) {
         let va = vaddr.raw();
         assert!(
@@ -528,6 +546,11 @@ impl AddressSpace {
                 if pde & PAGE_PRESENT != 0 {
                     pd.write(pd_idx, va, 0).discharge(target);
                     let phys = pde & ADDR_MASK_2M;
+                    // Before the page can reach the PMM, and after the entry is
+                    // gone: a waiter that translated this word already is on
+                    // the bucket for this walk to find, and one arriving after
+                    // it has nothing to translate.
+                    crate::sched::waitqs::revoke_futex_range(phys, PAGE_2M);
                     // Remove the page from our owned list — Drop frees it.
                     // No-op for shared memory pages (not in this map).
                     self.pages.remove(&phys);
@@ -864,14 +887,34 @@ impl AddressSpace {
 
 const MIN_PHYS_MAP: u64 = 4 * 1024 * 1024 * 1024;
 
-static KERNEL: Lock<Option<AddressSpace>> = Lock::new(None);
+/// The kernel address space, in the same shape a process's is.
+///
+/// **An `Arc<Lock<AddressSpace>>` and not a `Lock<Option<AddressSpace>>`,
+/// because a task has to be able to *name* it.** A kernel thread runs here —
+/// `driver::spawn` gives it the `cr3` every CPU is already in between two user
+/// threads — and while it could not name the same thing a process names,
+/// `KernelPayload.address_space` had to stay an `Option` with a fallback branch
+/// deciding which `cr3` a task gets. It does not now: the field is *the address
+/// space this task runs in*, for every task, with no second answer.
+///
+/// Published once at boot from a leaked `Arc` and read with one acquire load —
+/// `log::console`'s `KLOGD` has the same shape for the same reason. Leaked
+/// deliberately: the kernel address space outlives every task by construction,
+/// so no task's payload may hold the last reference to it.
+static KERNEL: core::sync::atomic::AtomicPtr<alloc::sync::Arc<Lock<AddressSpace>>> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
 
 /// Kernel CR3, cached for lock-free access from panic/crash paths.
 static KERNEL_CR3: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The kernel address space. Mapped once at boot, lives forever.
-pub fn kernel() -> &'static Lock<Option<AddressSpace>> {
-    &KERNEL
+pub fn kernel() -> &'static alloc::sync::Arc<Lock<AddressSpace>> {
+    let ptr = KERNEL.load(core::sync::atomic::Ordering::Acquire);
+    assert!(!ptr.is_null(), "paging not initialized");
+    // SAFETY: written once in `init` from a leaked `Box`, with the `Release`
+    // this `Acquire` pairs with, and never cleared — so the pointer is live for
+    // the rest of the machine's life.
+    unsafe { &*ptr }
 }
 
 /// Kernel CR3. Lock-free — safe to call from panic context.
@@ -894,7 +937,7 @@ pub fn kernel_cr3() -> Cr3 {
 /// is SDM Vol. 3A §11.12.4 undefined behaviour, and hanging is a permitted
 /// outcome.
 pub fn map_mmio(phys: u64, size: u64, cache: CachePolicy) -> super::Mmio {
-    let mmio = kernel().lock_unwrap().map_mmio(phys, size, cache);
+    let mmio = kernel().lock().map_mmio(phys, size, cache);
     crate::arch::tlb::shootdown();
     mmio
 }
@@ -906,7 +949,7 @@ pub fn map_mmio(phys: u64, size: u64, cache: CachePolicy) -> super::Mmio {
 /// see [`AddressSpace::guard_4k`].
 pub fn guard_kernel_page(addr: u64) {
     assert!(super::is_kernel_addr(addr), "guard_kernel_page: {addr:#x} is not a kernel address");
-    kernel().lock().as_mut().expect("paging not initialized").guard_4k(super::DirectMap::phys_of(addr as *const u8));
+    kernel().lock().guard_4k(super::DirectMap::phys_of(addr as *const u8));
 }
 
 /// Build kernel page tables: map all physical memory in the high half using 2MB large pages.
@@ -935,7 +978,14 @@ pub(super) fn init(memory_map: &[MemoryMapEntry]) {
 
     let cr3 = kernel.cr3();
     KERNEL_CR3.store(cr3.0, core::sync::atomic::Ordering::Release);
-    *KERNEL.lock() = Some(kernel);
+    // Leaked, and `Release` after the space is built: see [`KERNEL`].
+    let published: &'static alloc::sync::Arc<Lock<AddressSpace>> = Box::leak(Box::new(
+        alloc::sync::Arc::new(Lock::new(kernel)),
+    ));
+    KERNEL.store(
+        published as *const _ as *mut _,
+        core::sync::atomic::Ordering::Release,
+    );
     // Boot path: load CR3 with flush (PCID not yet enabled).
     unsafe {
         cr3.load_flush();

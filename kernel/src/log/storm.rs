@@ -146,7 +146,6 @@ extern "C" fn body(thread: u64) -> ! {
     // spinning thread here would go on competing with the reader for the whole
     // rest of the boot.
     loop {
-        let ticket = crate::scheduler::prepare_wait(crate::scheduler::park_lot());
-        crate::scheduler::block_on(ticket, 0);
+        crate::completion::park_forever();
     }
 }
