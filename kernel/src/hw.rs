@@ -246,6 +246,15 @@ impl Hw for KernelHw {
     /// reloaded; the percpu identity, the TSS stack and CR3 must all be the
     /// incoming task's *before* the stack pointer moves, because after
     /// `context_switch` this frame no longer exists.
+    ///
+    /// **The outgoing `rsp` is the last thing written, and everything above is
+    /// a window.** `context_switch`'s `mov [rdi], rsp` is what makes the
+    /// outgoing context resumable; until it retires, that context still names
+    /// the stack pointer from the previous switch away — or, for a task that
+    /// has never been switched away, `alloc_kernel_stack`'s entry frame. The
+    /// pass that produced this token has already ended, so it is the *core*
+    /// that has to keep another CPU out of that window; `answer_steal_requests`
+    /// is where it does.
     unsafe fn switch(&self, token: RunToken<KernelPayload>) {
         let save = token.save_ptr();
         let restore = token.restore_ptr();

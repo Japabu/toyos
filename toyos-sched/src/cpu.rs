@@ -10,6 +10,13 @@
 //! the driver executes. When the action is returned every borrow of `CpuSched`
 //! has ended, so no guard can leak across the context switch and nothing
 //! scheduler-related has anywhere to run after the switch resumes.
+//!
+//! **The corollary is that the pass ends before the switch begins**, and it is
+//! load-bearing rather than incidental: while a pass runs, and for as long
+//! afterwards as the driver takes to reach `Hw::switch`, the outgoing task's
+//! saved context still holds whatever the *previous* switch away from it left
+//! there. A pass may therefore decide anything it likes about that task except
+//! to let another CPU restore it ([`SchedPass::answer_steal_requests`]).
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -1557,9 +1564,12 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
     /// machine dies at a segment selector with an empty backtrace, and the
     /// register file is the frame rather than the context that read it.
     ///
-    /// Refusing the loaded task is the whole of the fix, and it costs nothing:
-    /// the request stays in `steal_requests` and the next pass — by which time
-    /// the switch has stored the `rsp` — answers it.
+    /// Refusing the loaded task is the whole of the fix, and it costs the thief
+    /// nothing: the loaded task occupies at most one place in the band, so the
+    /// `fair_len() <= 1` guard above already means there is another candidate
+    /// and the probe is answered from it. The one the refusal declines to send
+    /// is the *next* pass's to send, by which time the switch has stored the
+    /// `rsp` and it is an ordinary queued task like any other.
     fn answer_steal_requests(&mut self) {
         if !self.env.steal {
             self.cpu.steal_requests.clear();
