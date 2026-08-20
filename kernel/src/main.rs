@@ -680,7 +680,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         register_gpu(gpu_driver, gpu_info);
     } else {
         log!("GPU: none found, running headless");
-    };
+    }
 
     boot_phase!("devices ready", t_devices);
 
