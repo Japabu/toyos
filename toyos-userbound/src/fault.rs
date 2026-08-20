@@ -11,9 +11,10 @@
 //! disjunct held on `cr2 = 0` and a live tid, and the kernel went down the
 //! *recover* path for a null jump instead of halting on it. The `KERNEL PANIC`
 //! and the crash report that would have named the null call were therefore
-//! never written, the shared boot said nothing for the whole 88 s guard, and
-//! the defect underneath is still unbisectable
-//! (`issues/kernel/the-shared-boot-jumped-to-null-spawning-sched-stress.md`).
+//! never written, and the shared boot said nothing for the whole 88 s guard.
+//! The defect underneath was a `context_switch` restoring a task another CPU
+//! was still standing on; the reports this repair unblocked are what named it,
+//! four sightings later.
 //!
 //! [`Ring`] is the repair. It is opaque and its one constructor takes a code
 //! segment selector, so a privilege level cannot be read out of a faulting

@@ -373,6 +373,18 @@ impl<X: SchedPayload> CpuSched<X> {
         self.loaded == Loaded::Idle
     }
 
+    /// The task whose context this CPU is standing on — the one whose saved
+    /// `rsp` the *next* switch will write and which therefore does not exist
+    /// yet. `None` is the idle context, which nothing can steal.
+    ///
+    /// [`SchedPass::answer_steal_requests`] is why this is asked.
+    fn loaded_key(&self) -> Option<TaskKey> {
+        match self.loaded {
+            Loaded::Idle => None,
+            Loaded::Task(key) => Some(key),
+        }
+    }
+
     pub fn mailbox_is_empty(&self) -> bool {
         self.mailbox.is_empty()
     }
@@ -414,8 +426,11 @@ impl<X: SchedPayload> CpuSched<X> {
 /// address space already freed, and the invariant walk must catch it.
 #[cfg(feature = "protocol-port")]
 impl<X: SchedPayload> CpuSched<X> {
+    /// `None` rather than [`CpuSched::loaded_key`], deliberately: this is the
+    /// pre-cutover steal ported as it was, and a port that quietly acquired a
+    /// later fix is a negative gate that no longer reproduces what it names.
     pub fn steal_ready(&mut self) -> Option<ReadyTask<X>> {
-        self.rq.pop_surplus()
+        self.rq.pop_surplus(None)
     }
 
     pub fn install_stolen(&mut self, task: ReadyTask<X>) {
@@ -1519,6 +1534,32 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
 
     /// Answer probes from surplus only (`fair_len() > 1`), after the pick — so
     /// a CPU can never give away the task it was about to run.
+    ///
+    /// **Nor the task it is still standing on.** The pass ends before the
+    /// switch does: `finish` returns a `RunToken` and the driver's `Hw::switch`
+    /// writes the outgoing context's `rsp` *after* that — after the token has
+    /// been returned, after the driver's own bookkeeping, and after CR3, the
+    /// TSS stack and the FS base have been reloaded for the incoming task. So
+    /// between `hand_off` here and that store there is a window, microseconds
+    /// wide, in which [`CpuSched::loaded`]'s saved context does not exist yet:
+    /// the field still holds whatever it held when the task was last switched
+    /// away, and for a task that has never been switched away it still holds
+    /// the entry frame `alloc_kernel_stack` laid down — a frame the task's own
+    /// Ring 3 entries have long since overwritten.
+    ///
+    /// `hand_off` posts an `Adopt` *and kicks the thief*, so the far CPU
+    /// dispatches inside that window and restores a stack pointer this CPU is
+    /// still standing on. Both CPUs then run one kernel stack, and the thief's
+    /// `context_switch` pops whatever lies at that address — for a task that
+    /// has never been switched away, the residue of a Ring 3 interrupt entry:
+    /// `rbx` ← the saved `CS`, `rbp` ← the saved `RFLAGS`, `popfq` ← the saved
+    /// user `RSP`, and `ret` ← the saved `SS`, which on x86-64 is `0x1b`. The
+    /// machine dies at a segment selector with an empty backtrace, and the
+    /// register file is the frame rather than the context that read it.
+    ///
+    /// Refusing the loaded task is the whole of the fix, and it costs nothing:
+    /// the request stays in `steal_requests` and the next pass — by which time
+    /// the switch has stored the `rsp` — answers it.
     fn answer_steal_requests(&mut self) {
         if !self.env.steal {
             self.cpu.steal_requests.clear();
@@ -1529,7 +1570,7 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
                 self.cpu.steal_requests.clear();
                 return;
             }
-            let Some(task) = self.cpu.rq.pop_surplus() else {
+            let Some(task) = self.cpu.rq.pop_surplus(self.cpu.loaded_key()) else {
                 return;
             };
             task.share().leave_runnable(self.env.frontier);
@@ -2912,6 +2953,64 @@ mod tests {
         assert_eq!(w.handles.get(C1).surplus(), 0, "and can give away none of it");
         assert_eq!(w.handles.get(C2).load(), 1, "cpu2 gave one of its two away");
         assert_eq!(w.handles.get(C2).surplus(), 1);
+        w.abandon();
+    }
+
+    /// **The task a CPU is still standing on is not stealable surplus** — see
+    /// [`SchedPass::answer_steal_requests`] for what the far CPU restores when
+    /// it is.
+    ///
+    /// The second occupant this module's header asks for is the *third* task:
+    /// with only the loaded one and one other, refusing would be indventing
+    /// nothing to observe — `fair_len() <= 1` already declines. Three makes the
+    /// refusal a choice between two candidates, and the assertion below reads
+    /// which one was made.
+    ///
+    /// It reds on a tree without the `loaded` argument: the just-preempted task
+    /// carries the highest vruntime in the band, so `pop_surplus`'s `next_back`
+    /// names it first and every run hands over exactly the wrong one.
+    #[test]
+    fn a_cpu_does_not_hand_over_the_context_it_is_still_standing_on() {
+        let mut w = World::new(2);
+        w.steal = true;
+
+        let tasks: Vec<_> = (0..3).map(|_| w.spawn(C1)).collect();
+        w.run_a_pass(C1);
+        let loaded = w.cpus[1].running().map(|t| t.key()).expect("the pick took one");
+        let loaded_shared = tasks
+            .iter()
+            .find(|(key, _)| *key == loaded)
+            .map(|(_, shared)| shared.clone())
+            .expect("the pick took one of the three");
+
+        // An idle sibling's probe, waiting for this CPU's next pass.
+        w.cpus[1].steal_requests.push(C0);
+
+        // A quantum later: `preempt_if_due` returns the loaded task to the
+        // band, `pick` takes a fresher one, and `answer_steal_requests` runs
+        // before the driver has switched — so the loaded task's saved `rsp` is
+        // still the one from before it last ran.
+        w.run_a_pass_at(C1, Nanos(NOW.0 + QUANTUM_NS + 1));
+
+        assert_ne!(
+            w.cpus[1].running().map(|t| t.key()),
+            Some(loaded),
+            "the quantum expired, so the pick must have moved on — otherwise \
+             the loaded task never reached the band and this proves nothing",
+        );
+        assert!(
+            !matches!(loaded_shared.state(), TaskState::InTransit(_)),
+            "the CPU gave away the context it is still standing on: {:?}",
+            loaded_shared.state(),
+        );
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|(_, shared)| matches!(shared.state(), TaskState::InTransit(_)))
+                .count(),
+            1,
+            "and the probe was still answered, from the rest of the band",
+        );
         w.abandon();
     }
 }
