@@ -10,6 +10,12 @@ opened: 2026-08-20
 toolchain carrying its own cargo — "we use our own toolchain anyways" — rather
 than waiting for upstream stabilization or riding the machine's cargo.
 
+**And ruled again the same day: postponed.** Shipping our own cargo is a
+major ecosystem milestone with a lot of dependencies, and it deserves its own
+era — this track is the destination, not current work, and nothing is staffed
+on it until the owner opens that era. Until then the practice stands:
+per-worktree targets, and merged worktrees removed promptly.
+
 **The gap this closes.** The `toyos` toolchain today is our rustc and std;
 its `cargo` is a symlink to whatever the machine has — a rustup nightly if one
 exists, the host's stable otherwise (`toolchain::host_cargo`), and on every CI
