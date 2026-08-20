@@ -262,6 +262,15 @@ changes.
   alone both times` — a rate, not a classification; the redlist row carries
   the sighting.
 
+- **`console_line_atomicity`** — added 2026-08-20, the name's first sighting
+  on the CI instrument (its standing rows are the loaded dev host's, 1 of 3
+  there): PR #166 run 32364721784, `guest (10)`, `writer A declared 1000
+  whole lines and the capture carries 995`, `ALONE: GREEN` in the same job.
+  CI runs one guest per machine, so whatever loses five of a writer's
+  thousand lines there is not host contention — which sharpens this file's
+  question rather than settling it. The diff it rode on is an
+  issues-and-prose audit.
+
 - **`tlb_shootdown_waits`** — added 2026-08-20, **1 of 3** full `cargo test`
   runs on `wt/toyos-p2conv`, with `toyos-dpanic`'s suite holding guest slots
   throughout and named in that run's own `[host-slots]` lines. The other two

@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 use crate::mm::PAGE_2M;
 use crate::completion::Watch;
-use crate::io_uring::RingId;
+use crate::inbox::InboxId;
 use crate::id_map::{IdKey, IdMap};
 use crate::sync::Lock;
 use crate::user_ptr::{UserBytes, UserBytesMut};
@@ -135,7 +135,7 @@ struct Pipe {
     backing: Option<Backing>,
     readers: u32,
     writers: u32,
-    io_uring_watchers: Vec<RingId>,
+    inbox_watchers: Vec<InboxId>,
     /// This pipe end's waiter set (spec §8.6), as a completion subject. Held
     /// by `Arc` so a blocking site can clone it out from under the table lock
     /// and hold it across its own park.
@@ -161,7 +161,7 @@ impl Pipe {
             backing: None,
             readers: 0,
             writers: 0,
-            io_uring_watchers: Vec::new(),
+            inbox_watchers: Vec::new(),
             readers_watch: Arc::new(Watch::new()),
             writers_watch: Arc::new(Watch::new()),
             rt_boost_pending: false,
@@ -334,7 +334,7 @@ fn close_read(pipe_id: PipeId) {
             free_pipe(pipe);
             None // pipe freed, no one to wake
         } else if pipe.readers == 0 {
-            Some(pipe.io_uring_watchers.clone())
+            Some(pipe.inbox_watchers.clone())
         } else {
             None
         }
@@ -342,9 +342,9 @@ fn close_read(pipe_id: PipeId) {
     if let Some(watchers) = wake_writers {
         crate::scheduler::wake_pipe_writers(pipe_id);
         if !watchers.is_empty() {
-            crate::io_uring::complete_pending_for_event(
+            crate::inbox::complete_pending_for_event(
                 &watchers,
-                crate::io_uring::Source::PipeWritable(pipe_id),
+                crate::inbox::Source::PipeWritable(pipe_id),
             );
         }
     }
@@ -360,7 +360,7 @@ fn close_write(pipe_id: PipeId) {
             free_pipe(pipe);
             None // pipe freed, no one to wake
         } else if pipe.writers == 0 {
-            Some(pipe.io_uring_watchers.clone())
+            Some(pipe.inbox_watchers.clone())
         } else {
             None
         }
@@ -368,9 +368,9 @@ fn close_write(pipe_id: PipeId) {
     if let Some(watchers) = wake_readers {
         crate::scheduler::wake_pipe_readers(pipe_id);
         if !watchers.is_empty() {
-            crate::io_uring::complete_pending_for_event(
+            crate::inbox::complete_pending_for_event(
                 &watchers,
-                crate::io_uring::Source::PipeReadable(pipe_id),
+                crate::inbox::Source::PipeReadable(pipe_id),
             );
         }
     }
@@ -380,20 +380,20 @@ fn free_pipe(pipe: Pipe) {
     drop(pipe); // PhysPage freed via Drop
 }
 
-pub fn add_io_uring_watcher(pipe_id: PipeId, ring_id: RingId) {
+pub fn add_inbox_watcher(pipe_id: PipeId, inbox_id: InboxId) {
     with_pipes_mut(|pipes| {
         if let Some(pipe) = pipes.get_mut(pipe_id) {
-            if !pipe.io_uring_watchers.contains(&ring_id) {
-                pipe.io_uring_watchers.push(ring_id);
+            if !pipe.inbox_watchers.contains(&inbox_id) {
+                pipe.inbox_watchers.push(inbox_id);
             }
         }
     });
 }
 
-pub fn remove_io_uring_watcher(pipe_id: PipeId, ring_id: RingId) {
+pub fn remove_inbox_watcher(pipe_id: PipeId, inbox_id: InboxId) {
     with_pipes_mut(|pipes| {
         if let Some(pipe) = pipes.get_mut(pipe_id) {
-            pipe.io_uring_watchers.retain(|&id| id != ring_id);
+            pipe.inbox_watchers.retain(|&id| id != inbox_id);
         }
     });
 }
@@ -424,8 +424,8 @@ pub struct PipeEnd {
     pub watch: Arc<Watch>,
 }
 
-pub fn io_uring_watchers(pipe_id: PipeId) -> Vec<RingId> {
+pub fn inbox_watchers(pipe_id: PipeId) -> Vec<InboxId> {
     with_pipes(|pipes| {
-        pipes.get(pipe_id).map_or(Vec::new(), |p| p.io_uring_watchers.clone())
+        pipes.get(pipe_id).map_or(Vec::new(), |p| p.inbox_watchers.clone())
     })
 }

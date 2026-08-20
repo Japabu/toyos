@@ -1,5 +1,13 @@
 //! The record, and the bounded ring a waiter owns.
 //!
+//! **Not the same `Inbox` as [`object::inbox`](crate::object::inbox).** That
+//! one is the counted reference a process holds to the shared-memory
+//! submission/completion pair `SYS_INBOX_SETUP` installs; this one is a
+//! *task's* own bounded record ring, minted at spawn and never named by a
+//! handle. The two are unrelated today and share the name because a later
+//! chunk means to converge them — this track's chunk list says "the ring as an
+//! inbox".
+//!
 //! **This file is compiled a second time by `kernel-loom`**, so it may name
 //! only what that crate supplies: the atomics, the cell, `toyos_abi`'s error
 //! type and `crate::time`. That is a layout requirement rather than a style

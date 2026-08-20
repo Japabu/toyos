@@ -490,7 +490,7 @@ extern "C" fn body(_arg: u64) -> ! {
         //
         // It is outside `drain_inline` deliberately: that function's other two
         // callers are a producer mid-`emit` and a panicking machine, and
-        // neither may touch `IO_URINGS`.
+        // neither may touch `INBOXES`.
         super::user::post_readiness();
 
         // **The registration no longer has to come first, and the record is

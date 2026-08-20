@@ -878,22 +878,22 @@ fn service_bytes(recorded: bool) {
     let woke_kb = keys > 0;
     if woke_kb {
         crate::keyboard::wake_waiters();
-        let watchers = crate::keyboard::io_uring_watchers();
+        let watchers = crate::keyboard::inbox_watchers();
         if !watchers.is_empty() {
-            crate::io_uring::complete_pending_for_event(
+            crate::inbox::complete_pending_for_event(
                 &watchers,
-                crate::io_uring::Source::Keyboard,
+                crate::inbox::Source::Keyboard,
             );
         }
     }
     let woke_ms = motion > 0;
     if woke_ms {
         crate::mouse::wake_waiters();
-        let watchers = crate::mouse::io_uring_watchers();
+        let watchers = crate::mouse::inbox_watchers();
         if !watchers.is_empty() {
-            crate::io_uring::complete_pending_for_event(
+            crate::inbox::complete_pending_for_event(
                 &watchers,
-                crate::io_uring::Source::Mouse,
+                crate::inbox::Source::Mouse,
             );
         }
     }

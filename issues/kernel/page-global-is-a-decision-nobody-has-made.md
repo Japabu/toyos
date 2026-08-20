@@ -1,10 +1,22 @@
 ---
-status: owner
-kind: question
+status: open
+kind: track
 opened: 2026-08-19
+decided: 2026-08-20
 ---
 
-# There is no `PAGE_GLOBAL` anywhere, and that is a decision nobody has made
+# There is no `PAGE_GLOBAL` anywhere, and the owner decided: turn it on
+
+**The owner ruled on 2026-08-20: `PGE` goes on**, sequenced into the
+interrupt-distribution/scheduler performance era
+(`issues/kernel/every-interrupt-lands-on-the-boot-cpu.md`'s wave), never as a
+drive-by — because the work below is real: every `Owed::discharge` in
+`mm/paging.rs` must answer for global translations, `guard_4k`'s local full
+flush too, the bit joins `control_regs.rs`'s one declaration (never a
+read-modify-write at a use site), and the gain is measured before/after on
+the KVM instrument so the improvement is a number against a number. TCG
+cannot price it (tests/CLAUDE.md: the local guest has no such cache model),
+which is one more reason it rides the measured era.
 
 `CR4.PGE` is absent from `kernel/src/arch/control_regs.rs`'s declaration and no
 `PAGE_GLOBAL` exists in `kernel/src/mm/`. With PCID active, every address space
