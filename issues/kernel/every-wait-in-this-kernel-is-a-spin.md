@@ -30,6 +30,21 @@ did not land; what stopped it is three walls, established rather than guessed,
 recorded under "What xHCI async costs, measured against the tree" so nobody
 derives them a third time.
 
+**The third pull request is #152, and it carries the third wall's answer.**
+Owner ruling 1B is landed as `scheduler::Operation`: `Parkable::of_current` is
+deleted, the type has no public constructor, and the two doors that replace it
+each refuse the other's context. The first two walls did **not** land, and the
+reason is one sentence: **the park cannot exist before all four locks convert,
+and no partial conversion is legal.** At `wait_transfer` on the filesystem path
+the preempt count is `vfs::VFS` + `fat32_adapter::VOLUMES` + `xhci::XHCI` above
+its baseline, so `Parkable`'s assertion fails by construction until the three go
+together — which is the same argument §21.1 makes and which the borrow-chain
+rewrite (wall 1) and the per-disk claim (wall 2) both exist only to *serve*.
+Landing either of them alone is a rewrite with no park behind it and a claim
+with nothing to exclude, which is the technical debt this tree deletes. What
+#152 adds instead is the design each of them now has, below, and two findings
+the previous pass did not have.
+
 **The commitment: one completion primitive, one inbox, one park site, one
 recheck predicate, and a kill answered by `Cancelled` at the park rather than by
 discarding the stack.** This kernel does not unwind, so a killed task holding a
@@ -143,6 +158,33 @@ contain.
   that can re-derive the controller after a re-acquire, which is a rewrite of
   `wait/msc.rs`, `wait/mod.rs` and the control-transfer half of `device.rs`
   rather than a conversion of `XHCI`'s declaration.
+
+  **The shape it takes, read off the tree on 2026-08-20.** A session value
+  naming `(controller index, pool block, disk number)`, with a `with(|ctrl, dev|
+  …)` that re-acquires and re-derives for one short non-blocking critical
+  section, and a `wait` that holds none of it. The `MscDevice` copy stays on the
+  caller's stack for the whole operation rather than being written back per
+  step, which is what wall 2's claim makes safe. Every device-touching step —
+  the TRB enqueue, the doorbell, the DMA copies, the recovery commands — goes
+  inside a `with`; every wait goes outside one.
+
+  **Two things the rewrite gets for free and one it does not.** Free: the
+  outstanding-operation slot already exists and is already identity-matched and
+  deadline-carrying — `toyos_xhci::job::Outstanding<W>`, pure and host-tested,
+  is exactly "what ends the wait, when the wait stops being worth having, and
+  the answer once one arrives", and the MSC path needs one per pool block beside
+  the controller-wide one the port machine owns. Also free: something already
+  drains the event ring while a waiter is parked — `poll_if_pending` runs from
+  `drain_irqs` at the top of every pass on every CPU, on a `try_lock`, and the
+  xHCI ISR's `need_resched` is what makes a pass happen. Not free: **`Await::Transfer`
+  is `{ slot, dci }` and matches by endpoint, not by TRB.** Its own sibling arm's
+  doc says why that is wrong — "matching on anything coarser hands a command that
+  ran out its deadline and answered afterwards to whatever asked next" — and the
+  transfer arm does the coarser thing today, with `Stages::DataThenStatus`
+  standing in for the ambiguity a control transfer's two completions on one
+  endpoint create. Closing it means the arm carries the TRB address, which is a
+  change in the pure crate, its host suite, `dispatch_event`, `device.rs`,
+  `boot.rs` and both waits.
 - **There is no per-disk exclusion to drop the lock under.**
   `XhciController::with_storage` takes the `MscDevice` out of the pool block by
   `Copy`, works on the copy and writes it back — deliberately, so a command can
@@ -151,6 +193,17 @@ contain.
   `with_disk` for the same index reads the *stale* copy and enqueues its own TRBs
   on the same endpoint ring. A per-block claim is new design the chunk owes, and
   it is not implied by "convert the lock".
+
+  **And the claim has a second job the first pass did not name: it has to stop
+  the teardown.** Today `XHCI` held for the whole operation is also what stops
+  `teardown_port` → `release_blocks` reclaiming a pool block, and
+  `slot_gone`/`let_go` clearing `msc[at].disk`, underneath a transfer. Drop the
+  lock and an unplug on another CPU can do both while the session's stack copy
+  of the `MscDevice` still names the block's rings and its DMA window. So a
+  claim that only excludes a second *reader* is not enough: the unplug path has
+  to see the claim and either defer or mark, and the session has to notice on
+  its next re-derivation. Pulling the boot stick mid-write is the test that
+  exists for it (`usb_boot_stick_pulled`).
 - **Neither the token nor the deadline can be threaded to the leaf, and the
   answer has to be one answer.** `BlockAccess::read_at` (`toyos-fat32`, a pure
   host-tested crate) is the frame that takes `VOLUMES`, and `BlockDevice` is a
@@ -174,11 +227,68 @@ contain.
   header claim becomes enforced truth rather than discipline: the frame that
   owns the operation establishes parkability once, the depth reads the token and
   the deadline off the running task, and a depth that asks without an
-  establishment above it is a loud refusal. This closes the third wall.
+  establishment above it is a loud refusal. **Landed in #152 as
+  `scheduler::Operation`, and the wall is closed.** `of_current` is deleted and
+  `Parkable` has no public constructor, so the forbidden call does not compile;
+  `Parkable::at_entry` refuses inside an establishment and `Operation::parkable`
+  refuses outside one. Three things the implementation settled that the ruling
+  left open:
+
+  * **The word has two homes.** A task's is on its `TaskHandle`, so an operation
+    survives the migration a sleep-lock holder can take mid-transfer; a context
+    with no task — boot, and an idle CPU's pass — gets one slot per CPU, because
+    it has no handle and cannot be moved off its CPU. `sleeplock`'s `NOT_A_TASK`
+    is the same split.
+  * **Establishments nest and an inner one may only narrow**, which refusing to
+    nest would have forbidden. `fat32_adapter::VOLUMES` is taken *above*
+    `BlockDevice`, so the frame that must establish park permission on the
+    filesystem path sits above the frame that owns the block-device deadline:
+    the two are nested by construction. What nesting may not do is widen — an
+    inner establishment takes the earlier of the two deadlines — so nobody buys
+    device time by starting a second operation inside the first.
+  * **The deadline is the live half and the token is not.** `block::OPERATION`
+    is established by `UsbBlockDevice`'s three trait methods and recovered by
+    `msc_read`/`msc_write`/`msc_flush`, so `storage_read`, `storage_write` and
+    `storage_flush` lose an argument; `scsi` keeps its `until` parameter, which
+    is what leaves it usable by `bring_up` — an enumeration is not a
+    block-device operation, has no establishment, and passes `Deadline::never`
+    by name. `Operation::parkable` carries a named `allow(dead_code)` until the
+    conversion, in the shape `sleeplock.rs` already uses for the same reason.
+
+## What the conversion still owes, in the order it has to be done
+
+Read off the tree on 2026-08-20 with wall 3 landed. The whole of it is one pull
+request, because the baseline assertion refuses any split.
+
+1. **Wall 2's claim on the pool block**, including the teardown half above.
+2. **Wall 1's session**, including `Await::Transfer` gaining the TRB address.
+3. **The four locks together** — `vfs::VFS`, `fat32_adapter::VOLUMES`,
+   `xhci::XHCI`, `process::ProcessData`. Counted 2026-08-20: 30 `vfs::lock()`
+   sites (14 in `arch/syscall.rs`, 9 in `main.rs` which are boot and become
+   `try_lock`, 3 in `loader`, 3 in `object/`), 14 in `fat32_adapter.rs`, 4 on
+   `XHCI`, 26 on `PROCESS_TABLE`. Everything but `FatVolume::{read_at, write_at}`
+   can take a `&Parkable` by argument; those two are the ambient recovery wall 3
+   exists for, so the establishment for park permission goes at the syscall
+   boundary and `block::OPERATION`'s narrows inside it.
+4. **The park itself**, and only then the track's owed `min(the transfer bound,
+   until)`. **Not before**, and the reason is in `XhciController::scsi`'s own
+   doc: ending a *spin* at the caller's deadline abandons a transfer the device
+   is still going to answer, and the recovery then reads the wreckage as a
+   device that is not recovering — a slow disk marked permanently offline for
+   having been slow. At a park, waking on the operation's deadline is not
+   abandoning anything: the waiter wakes and *then* decides. So the owed item is
+   a property of the park and lands with it.
+
+Two findings from the 2026-08-20 pass, filed rather than fixed:
+`issues/kernel/the-nvme-wait-has-two-locks-the-four-lock-count-does-not-name.md`
+— "four locks and there is no fifth" is true of the xHCI path and not of the
+machine, because `page_cache::{BLOCK_CACHE, BLOCK_DEV}` are both held across
+`nvme::Queue::wait_completion`, which spins with no deadline at all — and
+`issues/build/kernel-clippy-runs-without-the-actuator-features.md`.
 
 `drain_zero_handles`'s derived constraint — none of its three drain sites can
 park, so no `on_zero_handles` hook may take a sleep lock — is **untouched by
-#148**, because #148 converts no lock. Its ground was checked rather than
+#148 and by #152**, because neither converts a lock. Its ground was checked rather than
 assumed: the hook that would want the VFS is a file's, and `File` is an
 `immediate` row whose hook is empty; the flush rides `OpenFileState::drop` on
 the last `Arc` instead. So the first `deferred` row that wants the VFS is still
