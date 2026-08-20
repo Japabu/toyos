@@ -806,7 +806,8 @@ pub fn get_env(buf: &mut [u8]) -> usize {
     syscall(SYS_GET_ENV, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0) as usize
 }
 
-/// Spawn a new process. The `SpawnArgs` struct contains argv, fd_map, and env.
+/// Spawn a new process. The `SpawnArgs` struct contains argv, the slot map and
+/// env.
 ///
 /// Answers a `Process` handle carrying `WAIT|MANAGE|READ|DUP|TRANSFER`. A
 /// caller that wants nothing to do with the child closes it; a caller that
