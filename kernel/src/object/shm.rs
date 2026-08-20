@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 
 use toyos_abi::syscall::SyscallError;
 
-use crate::mm::paging::CachePolicy;
+use crate::mm::paging::{CachePolicy, Prot};
 use crate::mm::{align_2m, pmm, Unmapped, PAGE_2M};
 use crate::process::{PageTables, Pid};
 use crate::sync::Lock;
@@ -129,7 +129,7 @@ impl SharedMemObject {
     }
 
     /// The kernel's own view of the pages, for a subsystem that reads them
-    /// through the direct map — an io_uring ring's headers are the one case.
+    /// through the direct map — an inbox's ring headers are the one case.
     pub fn phys(&self) -> DirectMap {
         self.region.phys
     }
@@ -145,7 +145,7 @@ impl SharedMemObject {
         }
         let (addr, _) = pt
             .lock()
-            .alloc_and_map(self.region.phys.phys(), self.region.size, true, self.region.cache)
+            .alloc_and_map(self.region.phys.phys(), self.region.size, Prot::ReadWrite, self.region.cache)
             .ok_or(SyscallError::ResourceExhausted)?;
         // A region whose memory type is not RAM's gets a line naming the
         // process, because that process is the one paying the difference and

@@ -9,12 +9,12 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-use crate::io_uring::RingId;
+use crate::inbox::InboxId;
 use crate::sync::Lock;
 pub use toyos_abi::input::{RawKeyEvent, MOD_SHIFT, MOD_CTRL, MOD_ALT, MOD_GUI, MOD_RELEASED};
 
 static KEY_BUF: Lock<VecDeque<RawKeyEvent>> = Lock::new(VecDeque::new());
-static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
+static INBOX_WATCHERS: Lock<Vec<InboxId>> = Lock::new(Vec::new());
 
 /// How many transitions the kernel holds for a reader that is not reading.
 ///
@@ -53,13 +53,13 @@ pub fn take_dump_request() -> bool {
 /// source reintroduces exactly the per-driver state this removes.
 static HELD: Lock<[u64; 4]> = Lock::new([0; 4]);
 
-pub fn add_io_uring_watcher(id: RingId) {
-    let mut w = IO_URING_WATCHERS.lock();
+pub fn add_inbox_watcher(id: InboxId) {
+    let mut w = INBOX_WATCHERS.lock();
     if !w.contains(&id) { w.push(id); }
 }
 
-pub fn remove_io_uring_watcher(id: RingId) {
-    IO_URING_WATCHERS.lock().retain(|&x| x != id);
+pub fn remove_inbox_watcher(id: InboxId) {
+    INBOX_WATCHERS.lock().retain(|&x| x != id);
 }
 
 /// Wake every thread blocked on keyboard input.
@@ -67,8 +67,8 @@ pub fn wake_waiters() {
     crate::sched::waitqs::wake_device(&crate::sched::waitqs::KEYBOARD_WATCH);
 }
 
-pub fn io_uring_watchers() -> Vec<RingId> {
-    IO_URING_WATCHERS.lock().clone()
+pub fn inbox_watchers() -> Vec<InboxId> {
+    INBOX_WATCHERS.lock().clone()
 }
 
 fn is_held(held: &[u64; 4], usage: u8) -> bool {

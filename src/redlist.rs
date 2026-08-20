@@ -1964,6 +1964,58 @@ pub const KNOWN_RED: &[Red] = &[
         source: "issues/diagnostics/the-panel-once-took-no-pixels-for-two-minutes-under-load.md",
         measured: "2026-08-19",
     },
+    Red {
+        test: "console_line_atomicity",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`writer A declared 1000 whole lines and the capture carries 995` — five lines \
+               of one writer's thousand missing from the shared capture, the name's first \
+               sighting on THIS instrument: its standing rows are the loaded dev host's \
+               (fires 1 of 3 there), and CI runs one guest per machine, so whatever loses \
+               the lines here is not host contention. `ALONE: GREEN, and it was alone both \
+               times — a rate and not a classification`. **Not about the diff it was found \
+               on**, an issues-and-prose capability audit (PR #166)",
+        evidence: "PR #166 run 32364721784, job 96411690231 (`guest (10)`), 2026-08-20; the \
+                   isolated re-run in the same job was green",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-20",
+    },
+    Red {
+        test: "exit_wait_storm",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`timed out after 12s, with the guest still talking 13s ago (245 console \
+               line(s) while it ran) — it was working and did not finish`, and the same \
+               run's `durations` job refused the 13,058 ms reading against the 10,000 ms \
+               line — correctly: the committed price is 200 ms, so the number is the \
+               partition's co-scheduling, a 65x wall stretch on a storm of exiting \
+               children, not the test's own cost. First sighting; `--known-red` answered \
+               NOT ON THE LIST. **Not about the diff it was found on**, one issue file \
+               (PR #147)",
+        evidence: "PR #147 run 32331741273, job 96313605393 (`guest (1)`), 2026-08-20; the \
+                   same run's `guest (11)` red on `screen_console_clear`, that family's \
+                   second CI sighting",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-20",
+    },
+    Red {
+        test: "tlb_shootdown_waits",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`exit code 101` at 53 ms — the guest binary's own assertion, and the \
+               2026-08-20 lock-conversion pass already recorded the sharper point when the \
+               same name red on a loaded dev host, ALONE: GREEN: the assertion that fires \
+               is the test's own *control*, so it is the one assertion in the suite that \
+               cannot tell a slow host from a broken measurement. **Not about the diff it \
+               was found on**, two issue files and a tests/CLAUDE.md bullet (PR #150)",
+        evidence: "PR #150 run 32334225614, job 96320634405 (`guest (5)`), 2026-08-20; the \
+                   dev-host sighting the same night is in the source issue",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-20",
+    },
     // ---------------------------------------------------------------------
     // `wt/toyos-purecrates`, dev host, 2026-08-18: three full `cargo test` runs
     // in one session, on a branch whose whole delta is three kernel files

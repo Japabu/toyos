@@ -14,7 +14,7 @@ use toyos_abi::syscall::{FileType, OpenFlags, SeekFrom, SyscallError};
 
 use crate::drivers::serial;
 use crate::file_cache;
-use crate::io_uring::Source;
+use crate::inbox::Source;
 use crate::pipe::{self, PipeId};
 use crate::process::PipeMap;
 use crate::user_ptr::{UserBytes, UserBytesMut};
@@ -206,7 +206,7 @@ pub fn close(
     let sources = [read_source(&object), write_source(&object)]
         .map(|s| s.and_then(Source::ended_by_its_last_handle));
     if sources.iter().any(|s| s.is_some()) {
-        crate::io_uring::cancel_by_source(&sources);
+        crate::inbox::cancel_by_source(&sources);
     }
     Ok(())
 }

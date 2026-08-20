@@ -23,15 +23,20 @@ is below, and none of it is the sweep.
 
 ## What is still owed
 
-- **The kernel's internal vocabulary.** `kernel/src/io_uring.rs` →
-  `kernel/src/object/inbox.rs`, `IoUringObject` → `InboxObject`, `IoUringOp`,
-  `IoUringInstance`, `RingId`/`RingRef`, `sys_io_uring_setup`/`sys_io_uring_enter`,
-  and the 21 `io_uring_watchers` accessors across `pipe.rs`, `keyboard.rs`,
-  `mouse.rs`, `net.rs`, `log/user.rs`, `object/port.rs` and the two audio
-  drivers. Tree-local, needs no sysroot window, and deliberately left out of
-  the finale so that landing held the machine's sysroot for one merge. The
-  header of `kernel/src/io_uring.rs` says the same thing where a reader of that
-  file will hit it. `KObjectRef::Inbox` already moved, because the variant's
+- **Done.** ~~The kernel's internal vocabulary.~~ `kernel/src/io_uring.rs` →
+  `kernel/src/inbox.rs` (the mechanism: rings, submission processing, the
+  `INBOXES` map); `IoUringObject` → `InboxObject`, moved to the new
+  `kernel/src/object/inbox.rs` beside `completion::inbox` rather than merged
+  into the mechanism file, per the section below. `IoUringOp` → `Op`,
+  `IoUringInstance` → `Inbox`, `RingId`/`RingRef` → `InboxId`/`InboxRef`,
+  `sys_io_uring_setup`/`sys_io_uring_enter` → `sys_inbox_setup`/
+  `sys_inbox_submit`, and the 21 `io_uring_watchers` accessors across
+  `pipe.rs`, `keyboard.rs`, `mouse.rs`, `net.rs`, `log/user.rs`, `object/port.rs`
+  and the two audio drivers → `inbox_watchers`. `Op::PollAdd` also went to
+  `Op::Watch` and `PollFlags`'s `IN`/`OUT` to `WatchFlags::READABLE`/
+  `WRITABLE`, matching the ABI's own `OP_WATCH`/`READABLE`/`WRITABLE` — not
+  separately tracked above, found while reading the file the rename moved.
+  `KObjectRef::Inbox` had already moved before this, because the variant's
   name *is* `OBJECT_KINDS[5]` and `CENSUS_KIND` asserts the two agree.
 - **The two renamed tests' prices.** `abuse_inbox` and `inbox_cancel_wakes`
   carry `UNMEASURED_MS` in `tests/test-durations`. The marker buys exactly one
@@ -45,13 +50,22 @@ is below, and none of it is the sweep.
   every `process` row — but not this one. std's *POSIX* surface keeps the word
   by charter; whether an `os::toyos` trait with a POSIX name is that surface or
   the extension API is unsettled, and `tests/toyos-rust-tests/src/bin/std_fs.rs`
-  is its only caller in this repository.
-- **Four issue files cite the deleted `kernel/src/fd.rs`**, one of them by line
-  number: `issues/filesystem/close-cannot-report-io-error.md`,
+  is its only caller in this repository. **The last open naming question this
+  entry leaves**, because it is a fork-repo name (`Japabu/rust`) and not this
+  tree's to rename alone: either it stays, as a deliberate mirror of std's own
+  `std::os::unix::io::{AsRawFd, FromRawFd}` convention on the (POSIX-shaped)
+  trait names an `os::toyos` caller expects to find — or it is renamed the next
+  time this trait is touched in the fork, to whatever `os::toyos` decides its
+  own non-POSIX vocabulary for a raw handle is. Nobody has ruled between the
+  two.
+- **Done.** ~~Four issue files cite the deleted `kernel/src/fd.rs`~~, two of
+  them by line number: `issues/filesystem/close-cannot-report-io-error.md`,
   `issues/kernel/ftruncate-takes-no-vfs-lock.md`,
   `issues/kernel/sys-read-doc-comments-describe-nothing.md` and
-  `issues/audio/disk-wait-pins-a-cpu.md`. Each belongs to its own entry rather
-  than to this one; the file they name has not existed since the ruling.
+  `issues/audio/disk-wait-pins-a-cpu.md` (the fourth, found by grepping the
+  bare filename rather than the full path — `disk-wait-pins-a-cpu.md` names it
+  `fd.rs:644` with no `kernel/src/` prefix). Each now cites where its content
+  lives today; the file itself has not existed since the ruling.
 
 ## The closing check, and what it is allowed to find
 

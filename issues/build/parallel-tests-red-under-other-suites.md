@@ -251,6 +251,26 @@ changes.
   from this name's 2026-08-17 CI row, which is about the seeded `i8042:` line.
   Still `Sched::Parallel`, not investigated.
 
+- **`exit_wait_storm`** — added 2026-08-20, first CI sighting: PR #147 run
+  32331741273, `guest (1)`, `timed out after 12s, with the guest still talking
+  13s ago (245 console line(s) while it ran) — it was working and did not
+  finish`, against a committed price of 200 ms — a 65x wall stretch on a storm
+  of exiting children under a loaded shard partition, the `c_capture` shape.
+  The same run's `durations` job refused the 13,058 ms reading against the
+  10,000 ms fast line, correctly: that number is the partition's, not the
+  test's. The diff it rode on is one issue file. `ALONE: GREEN, and it was
+  alone both times` — a rate, not a classification; the redlist row carries
+  the sighting.
+
+- **`console_line_atomicity`** — added 2026-08-20, the name's first sighting
+  on the CI instrument (its standing rows are the loaded dev host's, 1 of 3
+  there): PR #166 run 32364721784, `guest (10)`, `writer A declared 1000
+  whole lines and the capture carries 995`, `ALONE: GREEN` in the same job.
+  CI runs one guest per machine, so whatever loses five of a writer's
+  thousand lines there is not host contention — which sharpens this file's
+  question rather than settling it. The diff it rode on is an
+  issues-and-prose audit.
+
 - **`tlb_shootdown_waits`** — added 2026-08-20, **1 of 3** full `cargo test`
   runs on `wt/toyos-p2conv`, with `toyos-dpanic`'s suite holding guest slots
   throughout and named in that run's own `[host-slots]` lines. The other two

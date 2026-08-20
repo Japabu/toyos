@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::ptr::NonNull;
 use crate::arch::percpu;
-use crate::mm::paging::CachePolicy;
+use crate::mm::paging::{CachePolicy, Prot, WindowProt};
 use crate::mm::PAGE_2M;
 use crate::object::{ops, HandleTable};
 use crate::sync::Lock;
@@ -34,12 +34,19 @@ pub type PageTables = Arc<Lock<crate::mm::paging::AddressSpace>>;
 
 /// Allocate a virtual region and map physical memory into it.
 /// Returns the allocated virtual address, or None if out of address space.
+///
+/// **`prot` used to be the constant `true`** — every caller here got a writable
+/// mapping and, before `EFER.NXE` existed, an executable one: a TLS block, a
+/// pipe's ring and an `io_uring`'s rings were all pages a program could jump
+/// into. Each caller now says which of the three it means, and a library image
+/// — the one whose pages do not agree — does not come through here at all.
 pub fn vma_map(
     pt: &Lock<crate::mm::paging::AddressSpace>,
     phys: u64,
     size: u64,
+    prot: Prot,
 ) -> Option<(UserAddr, u64)> {
-    pt.lock().alloc_and_map(phys, size, true, CachePolicy::DeferToMtrr)
+    pt.lock().alloc_and_map(phys, size, prot, CachePolicy::DeferToMtrr)
 }
 
 // OwnedAlloc — RAII heap allocation (for kernel-only buffers < 2MB)
@@ -425,7 +432,10 @@ pub struct PageFaultRecord {
     pub page_elf_offset: u64,
     pub block_idx: u32,
     pub reloc_count: u16,
-    pub flags: u16, // bit 0: writable, bit 1: has_relocs, bit 2: anonymous, bit 3: beyond_extent
+    // bit 0: writable, bit 1: has_relocs, bit 2: anonymous, bit 3: beyond_extent,
+    // bit 4: executable. Bits 0 and 4 come from one `Prot` and are never both
+    // set — a line carrying both is a kernel that has lost W^X.
+    pub flags: u16,
     pub duration_us: u16, // microseconds spent handling this fault
 }
 
@@ -1020,7 +1030,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         // VA exhaustion is a resource failure a process can reach by spawning
         // threads until its range is gone, not a kernel bug. `tls_alloc`
         // drops on the way out, returning its pages.
-        let (tls_vaddr, _) = vma_map(addr_space, tls_phys, tls_alloc.size() as u64)?;
+        let (tls_vaddr, _) = vma_map(addr_space, tls_phys, tls_alloc.size() as u64, Prot::ReadWrite)?;
         // Rebase fs_base and internal TLS pointers from physical to virtual
         let tls_rebase = tls_vaddr.raw() as i64 - tls_phys as i64;
         let fs_base = (fs_base as i64 + tls_rebase) as u64;
@@ -1469,11 +1479,11 @@ pub fn futex_wake(addr: UserAddr, count: u64) -> u64 {
 /// Wake processes blocked on reading from a pipe that now has data.
 pub fn wake_pipe_readers(pipe_id: pipe::PipeId) {
     scheduler::wake_pipe_readers(pipe_id);
-    let watchers = pipe::io_uring_watchers(pipe_id);
+    let watchers = pipe::inbox_watchers(pipe_id);
     if !watchers.is_empty() {
-        crate::io_uring::complete_pending_for_event(
+        crate::inbox::complete_pending_for_event(
             &watchers,
-            crate::io_uring::Source::PipeReadable(pipe_id),
+            crate::inbox::Source::PipeReadable(pipe_id),
         );
     }
 }
@@ -1481,11 +1491,11 @@ pub fn wake_pipe_readers(pipe_id: pipe::PipeId) {
 /// Wake processes blocked on writing to a pipe that now has space.
 pub fn wake_pipe_writers(pipe_id: pipe::PipeId) {
     scheduler::wake_pipe_writers(pipe_id);
-    let watchers = pipe::io_uring_watchers(pipe_id);
+    let watchers = pipe::inbox_watchers(pipe_id);
     if !watchers.is_empty() {
-        crate::io_uring::complete_pending_for_event(
+        crate::inbox::complete_pending_for_event(
             &watchers,
-            crate::io_uring::Source::PipeWritable(pipe_id),
+            crate::inbox::Source::PipeWritable(pipe_id),
         );
     }
 }
@@ -1536,6 +1546,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     struct RegionSnap {
         start: u64,
         end: u64,
+        prot: Prot,
         kind: RegionSnapKind,
     }
     enum RegionSnapKind {
@@ -1543,7 +1554,7 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         FileBacked { backing: Arc<dyn crate::file_backing::FileBacking>, file_offset: u64, file_size: u64 },
     }
 
-    let (writable, regions) = {
+    let (window_prot, regions) = {
         let as_guard = addr_space.lock();
 
         match as_guard.find_region(UserAddr::new(fault_addr)) {
@@ -1569,28 +1580,42 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
             return true;
         }
 
-        let mut writable = false;
+        // **The window's protection is per 4 KiB page and not one verdict for
+        // all 512.** These regions came from `PT_LOAD` segments at 4 KiB
+        // alignment, so the window where `.text` ends and `.data` begins holds
+        // both — and OR-ing the two, which is what a single `writable` flag
+        // did, is a window that is writable *and* executable. A page no region
+        // covers is the padding past the image and gets the least of the
+        // three: `map_window` still maps the whole frame, and nothing may
+        // execute or write what nothing asked for.
+        let mut window_prot = WindowProt::uniform(Prot::Read);
         let mut snaps = Vec::new();
         for (&start_addr, region) in as_guard.overlapping_regions(UserAddr::new(region_start), UserAddr::new(region_end_full)) {
-            if region.writable { writable = true; }
-            let snap_kind = match &region.kind {
-                crate::vma::RegionKind::Anonymous => RegionSnapKind::Anonymous,
-                crate::vma::RegionKind::FileBacked { backing, file_offset, file_size } => {
+            let (snap_kind, prot) = match &region.kind {
+                crate::vma::RegionKind::Anonymous { prot } => (RegionSnapKind::Anonymous, *prot),
+                crate::vma::RegionKind::FileBacked { backing, file_offset, file_size, prot } => (
                     RegionSnapKind::FileBacked {
                         backing: Arc::clone(backing),
                         file_offset: *file_offset,
                         file_size: *file_size,
-                    }
-                }
-                crate::vma::RegionKind::Mapped => RegionSnapKind::Anonymous, // already mapped eagerly
+                    },
+                    *prot,
+                ),
+                // Already mapped eagerly, and its pages keep what was installed
+                // — this fault is not about them. It contributes zeros to the
+                // frame and the least protection to the pages it covers.
+                crate::vma::RegionKind::Mapped => (RegionSnapKind::Anonymous, Prot::Read),
             };
-            snaps.push(RegionSnap {
-                start: start_addr.raw(),
-                end: start_addr.raw() + region.size,
-                kind: snap_kind,
-            });
+            let start = start_addr.raw();
+            let end = start + region.size;
+            let mut page = region_start.max(start) & !0xFFF;
+            while page < region_end_full.min(end) {
+                window_prot.set(page - region_start, prot);
+                page += 4096;
+            }
+            snaps.push(RegionSnap { start, end, prot, kind: snap_kind });
         }
-        (writable, snaps)
+        (window_prot, snaps)
     };
 
     let mut data = data_arc.lock();
@@ -1670,10 +1695,14 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
 
     // No invalidation here, and none inside on the ordinary path: the fault got
     // here because the PDE was not present, and nothing is cached from one.
-    // `remap` derives that from the entry it replaced — this line used to call
-    // `invlpg` a second time on the kernel's hottest paging path, for an entry
-    // the first call had not needed to invalidate either.
-    addr_space.lock().remap(UserAddr::new(region_start), page_alloc.phys(), writable);
+    // `map_window` derives that from the entry it replaced — this line used to
+    // call `invlpg` a second time on the kernel's hottest paging path, for an
+    // entry the first call had not needed to invalidate either.
+    //
+    // One 2 MiB frame either way: a window whose pages agree is one PDE, and
+    // the one window per binary whose pages do not is a page table over the
+    // same frame.
+    addr_space.lock().map_window(UserAddr::new(region_start), page_alloc.phys(), &window_prot);
 
     data.demand_pages.push(page_alloc);
 
@@ -1693,13 +1722,24 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         data.accounting.fault_zero_count += 1;
     }
 
+    // The faulting page's own protection and not the window's: a window may
+    // hold a code page and a data page at once, and the trace is about the
+    // access that faulted.
+    let fault_prot = regions
+        .iter()
+        .find(|r| fault_addr >= r.start && fault_addr < r.end)
+        .map_or(Prot::Read, |r| r.prot);
     let elapsed_us = (fault_elapsed / 1000).min(u16::MAX as u64) as u16;
     data.fault_trace.record(PageFaultRecord {
         fault_addr,
         page_elf_offset: region_start.wrapping_sub(elf_base),
         block_idx: (region_start / PAGE_2M) as u32,
         reloc_count: total_relocs,
-        flags: if writable { 1 } else { 0 },
+        flags: match fault_prot {
+            Prot::Read => 0,
+            Prot::ReadWrite => 1,
+            Prot::ReadExec => 16,
+        },
         duration_us: elapsed_us,
     });
 
@@ -1733,11 +1773,14 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
         log!("  Page fault trace ({} total, last {}):", trace.total(), count);
         for rec in trace.iter_chronological() {
             if rec.fault_addr == 0 { continue; }
-            let mut flag_str = [b' '; 4];
+            let mut flag_str = [b' '; 5];
             if rec.flags & 1 != 0 { flag_str[0] = b'W'; } // writable
             if rec.flags & 2 != 0 { flag_str[1] = b'R'; } // has_relocs
             if rec.flags & 4 != 0 { flag_str[2] = b'A'; } // anonymous
             if rec.flags & 8 != 0 { flag_str[3] = b'Z'; } // beyond extent (zero)
+            // Never beside `W`: the two are the variants of one `Prot`, and a
+            // trace line carrying both would be a kernel that lost W^X.
+            if rec.flags & 16 != 0 { flag_str[4] = b'X'; } // executable
             let flags = core::str::from_utf8(&flag_str).unwrap_or("????");
             log!("    fault={:#x} elf_off={:#x} blk={} relocs={} {}us [{}]",
                 rec.fault_addr, rec.page_elf_offset, rec.block_idx,

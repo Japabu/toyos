@@ -30,6 +30,8 @@ mod mouse;
 mod input_merge_test;
 #[cfg(feature = "boot-actuators")]
 mod usb_gate;
+#[cfg(feature = "boot-actuators")]
+mod nvme_gate;
 mod block;
 mod gpt;
 mod page_cache;
@@ -59,7 +61,7 @@ mod rtc;
 mod completion;
 mod iod;
 mod object;
-mod io_uring;
+mod inbox;
 mod pipe;
 
 mod device;
@@ -494,6 +496,12 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
             let sector_size = nvme_dev.sector_size();
             gpt::probe(&mut nvme_dev, sector_size);
             page_cache::init(Box::new(nvme_dev));
+            // Before anything has mounted the device, so the one block the gate
+            // asks for is one nothing else is reading yet.
+            #[cfg(feature = "boot-actuators")]
+            if actuator::nvme_spent_budget() {
+                nvme_gate::run();
+            }
             bcachefs_adapter::open_home()
         }
         None => {
@@ -538,7 +546,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     process::init();
     scheduler::init();
     pipe::init();
-    io_uring::init();
+    inbox::init();
 
 
     // Mount initrd as read-only root filesystem (bcachefs, no extraction)

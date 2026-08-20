@@ -1,6 +1,7 @@
 use alloc::sync::Arc;
 
 use crate::file_backing::FileBacking;
+use crate::mm::paging::Prot;
 use crate::mm::PAGE_2M;
 
 /// Dynamic allocations (mmap, shared memory) grow top-down from this ceiling.
@@ -15,7 +16,7 @@ pub const ALLOC_CEILING: u64 = STACK_BASE;
 /// Why an actuator rather than a program. The shipped arena is
 /// `ALLOC_CEILING - alloc_floor()`, about 1015 GB. Every region in it costs
 /// `align_up_2m(size) + GUARD_SIZE` of address space against at least
-/// `align_up_2m(size)` of *physical* memory — mmap, shared memory, io_uring
+/// `align_up_2m(size)` of *physical* memory — mmap, shared memory, an inbox
 /// and TLS all allocate through the PMM, and `dlopen`'s shared-image arm still
 /// allocates its own writable window. The worst ratio is therefore 2:1, at a
 /// 4 KiB request: 4 MiB of address space for 2 MiB of RAM. Exhausting 1015 GB
@@ -47,16 +48,28 @@ pub const GUARD_SIZE: u64 = PAGE_2M;
 // Region — what a virtual memory area is backed by
 
 /// What backs a virtual memory region.
+///
+/// **The two demand-paged kinds carry a [`Prot`] and the eager one does not.**
+/// Only they are ever asked what to install; a `Mapped` region's pages were
+/// mapped when the region was created, and the page tables are the whole record
+/// of what they carry — a library image's are not even uniform across it. A
+/// `prot` on that kind would be a second answer nothing reads and nothing keeps
+/// true.
 pub enum RegionKind {
-    /// File-backed region. On fault: read page from backing store.
+    /// File-backed region. On fault: read the page from the backing store and
+    /// map it `prot`.
     FileBacked {
         backing: Arc<dyn FileBacking>,
         file_offset: u64,
         file_size: u64,
+        prot: Prot,
     },
-    /// Anonymous memory (stack, BSS, heap). On fault: allocate zeroed page.
-    Anonymous,
-    /// Eagerly mapped (mmap with physical backing already assigned).
+    /// Anonymous memory (stack, BSS, heap). On fault: a zeroed page, mapped
+    /// `prot`.
+    Anonymous { prot: Prot },
+    /// Eagerly mapped: `mmap` with physical backing already assigned, a library
+    /// image, a shared-memory window. A fault inside one is refused rather than
+    /// filled.
     Mapped,
 }
 
@@ -64,8 +77,7 @@ pub enum RegionKind {
 pub struct Region {
     /// Size in bytes (2MB-aligned for allocated regions, 4KB-aligned for VMAs).
     pub size: u64,
-    /// Whether userspace can write to this region.
-    pub writable: bool,
-    /// What backs this region.
+    /// What backs this region, and — for the demand-paged kinds — what a fault
+    /// in it installs.
     pub kind: RegionKind,
 }

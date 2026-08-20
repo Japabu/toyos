@@ -686,11 +686,11 @@ fn drain_irqs() {
 
     if crate::irq_ring::take(crate::irq_ring::IrqSource::Net).is_some() {
         crate::net::wake_waiters();
-        let watchers = crate::net::io_uring_watchers();
+        let watchers = crate::net::inbox_watchers();
         if !watchers.is_empty() {
-            crate::io_uring::complete_pending_for_event(
+            crate::inbox::complete_pending_for_event(
                 &watchers,
-                crate::io_uring::Source::Network,
+                crate::inbox::Source::Network,
             );
         }
     }
@@ -701,13 +701,13 @@ fn drain_irqs() {
         crate::sched::waitqs::wake_device(&crate::sched::waitqs::AUDIO_WATCH);
         for (watchers, source) in [
             (
-                crate::drivers::virtio_sound::io_uring_watchers(),
-                crate::io_uring::Source::VirtioSound,
+                crate::drivers::virtio_sound::inbox_watchers(),
+                crate::inbox::Source::VirtioSound,
             ),
-            (crate::drivers::hda::io_uring_watchers(), crate::io_uring::Source::Hda),
+            (crate::drivers::hda::inbox_watchers(), crate::inbox::Source::Hda),
         ] {
             if !watchers.is_empty() {
-                crate::io_uring::complete_pending_for_event(&watchers, source);
+                crate::inbox::complete_pending_for_event(&watchers, source);
             }
         }
     }

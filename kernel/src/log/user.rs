@@ -18,7 +18,7 @@ use alloc::vec::Vec;
 use toyos_abi::log::{LogCursor, LogRecord, RECORD_BYTES};
 use toyos_abi::syscall::SyscallError;
 
-use crate::io_uring::RingId;
+use crate::inbox::InboxId;
 use crate::sync::Lock;
 use crate::user_ptr::UserBytesMut;
 
@@ -32,27 +32,27 @@ use super::read::{drain_ordered, Cursor, RecordSink};
 /// them together. Adding a sixth instance of a mechanism that is about to be
 /// unified is the honest cost of landing first, and it is one static and one
 /// match arm.
-static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
+static INBOX_WATCHERS: Lock<Vec<InboxId>> = Lock::new(Vec::new());
 
-pub fn add_io_uring_watcher(id: RingId) {
-    let mut w = IO_URING_WATCHERS.lock();
+pub fn add_inbox_watcher(id: InboxId) {
+    let mut w = INBOX_WATCHERS.lock();
     if !w.contains(&id) {
         w.push(id);
     }
 }
 
-pub fn remove_io_uring_watcher(id: RingId) {
-    IO_URING_WATCHERS.lock().retain(|&x| x != id);
+pub fn remove_inbox_watcher(id: InboxId) {
+    INBOX_WATCHERS.lock().retain(|&x| x != id);
 }
 
-pub fn io_uring_watchers() -> Vec<RingId> {
-    IO_URING_WATCHERS.lock().clone()
+pub fn inbox_watchers() -> Vec<InboxId> {
+    INBOX_WATCHERS.lock().clone()
 }
 
 /// Tell every ring watching the log that records have moved.
 ///
 /// **Posted by `klogd` after each drain batch, and deliberately not by
-/// `emit`.** The list is a `Lock<Vec<RingId>>` and the post clones it under the
+/// `emit`.** The list is a `Lock<Vec<InboxId>>` and the post clones it under the
 /// lock, which is the one thing `emit` may not do — it runs inside `sync.rs`,
 /// inside IRQ handlers, inside the scheduler and inside every syscall's locked
 /// region. `klogd` is the context that has just observed committed records and
@@ -65,11 +65,11 @@ pub fn io_uring_watchers() -> Vec<RingId> {
 /// the shape `shard::arm_waiter` already uses on the kernel's side — submit the
 /// poll, read once more, and park only if that read was empty.
 pub fn post_readiness() {
-    let watchers = io_uring_watchers();
+    let watchers = inbox_watchers();
     if watchers.is_empty() {
         return;
     }
-    crate::io_uring::complete_pending_for_event(&watchers, crate::io_uring::Source::Log);
+    crate::inbox::complete_pending_for_event(&watchers, crate::inbox::Source::Log);
 }
 
 /// Records into a caller's buffer, at [`RECORD_BYTES`] stride.

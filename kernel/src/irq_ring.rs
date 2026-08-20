@@ -3,7 +3,7 @@
 //! source (B10): the ISR records the IRQ-time timestamp on the CPU that took
 //! the interrupt and sets `need_resched`; that CPU's next scheduler entry
 //! (`sched::driver::drain_irqs`) consumes the record and converts it into
-//! waiter wakes, io_uring CQEs, or controller polls. The audio DATA path
+//! waiter wakes, inbox completions, or controller polls. The audio DATA path
 //! (per-completion `(mask, timestamp)` records read by soundd) lives in
 //! the sound stubs and is unrelated — this module only drives *scheduling* off
 //! IRQs.
