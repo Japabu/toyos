@@ -502,7 +502,7 @@ actuators! {
     /// consulted. It cannot be staged from the host: which process closes which
     /// handle is decided inside the guest, and the claim's holder and the poll's
     /// owner need not know about each other at all, which is the whole shape of
-    /// the bug. `Source::ended_by_its_last_handle`, in `kernel/src/io_uring.rs`.
+    /// the bug. `Source::ended_by_its_last_handle`, in `kernel/src/inbox.rs`.
     keyboard_close_cancels_every_console = "keyboard-close-cancels-every-console";
 
     /// Bypass `ConsoleObject`'s line buffer: every userland `write` reaches the

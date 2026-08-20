@@ -129,7 +129,7 @@ impl SharedMemObject {
     }
 
     /// The kernel's own view of the pages, for a subsystem that reads them
-    /// through the direct map — an io_uring ring's headers are the one case.
+    /// through the direct map — an inbox's ring headers are the one case.
     pub fn phys(&self) -> DirectMap {
         self.region.phys
     }

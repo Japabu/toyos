@@ -8,9 +8,11 @@ opened: 2026-08-08
 
 Filed out of the check-and-act entry when that closed; one of its three residuals, and the one still live.
 
-`kernel/src/arch/syscall.rs` routes `ftruncate` to `fd::ftruncate`, which calls
-`file_cache::set_size` under **no** VFS acquisition (`kernel/src/fd.rs`), while
-`fsync` reaches `crate::vfs::lock().flush_file(...)`.
+`kernel/src/arch/syscall.rs:521` routes `ftruncate` to `ops::ftruncate`
+(`kernel/src/object/ops.rs:635`, formerly `fd::ftruncate` in the deleted
+`kernel/src/fd.rs`), which calls `file_cache::set_size` under **no** VFS
+acquisition, while `fsync` (`object/ops.rs:619`) reaches
+`crate::vfs::lock().flush_file(...)`.
 
 The fabricated-zeros write is closed — `flush_file` skips a page `copy_page_out`
 says is gone (`kernel/src/vfs.rs`). The window is not: `flush_file`'s

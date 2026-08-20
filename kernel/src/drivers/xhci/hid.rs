@@ -134,15 +134,15 @@ impl HidDevice {
         let (watchers, source) = match self.role {
             HidRole::Keyboard => {
                 keyboard::wake_waiters();
-                (keyboard::io_uring_watchers(), crate::io_uring::Source::Keyboard)
+                (keyboard::inbox_watchers(), crate::inbox::Source::Keyboard)
             }
             HidRole::Pointer(_) => {
                 mouse::wake_waiters();
-                (mouse::io_uring_watchers(), crate::io_uring::Source::Mouse)
+                (mouse::inbox_watchers(), crate::inbox::Source::Mouse)
             }
         };
         if !watchers.is_empty() {
-            crate::io_uring::complete_pending_for_event(&watchers, source);
+            crate::inbox::complete_pending_for_event(&watchers, source);
         }
     }
 

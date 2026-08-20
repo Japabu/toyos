@@ -18,7 +18,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 
-use crate::io_uring::RingId;
+use crate::inbox::InboxId;
 use crate::pipe::{PipeReader, PipeWriter};
 use crate::sync::Lock;
 
@@ -67,11 +67,11 @@ struct PortQueue {
 pub struct PortShared {
     queue: Lock<PortQueue>,
     /// Threads blocked in `accept`, as a completion subject. On the port rather than on
-    /// either end, for the reason the io_uring watch is: a poll a server
+    /// either end, for the reason the inbox watch is: a poll a server
     /// registered on its `Acceptor` is completed by a client connecting
     /// through a `Connector`.
     watch: crate::completion::Watch,
-    io_uring_watchers: Lock<Vec<RingId>>,
+    inbox_watchers: Lock<Vec<InboxId>>,
 }
 
 pub struct Acceptor {
@@ -95,7 +95,7 @@ pub fn create() -> (Arc<Acceptor>, Arc<Connector>) {
     let shared = Arc::new(PortShared {
         queue: Lock::new(PortQueue { closed: false, pending: VecDeque::new() }),
         watch: crate::completion::Watch::new(),
-        io_uring_watchers: Lock::new(Vec::new()),
+        inbox_watchers: Lock::new(Vec::new()),
     });
     (
         Arc::new(Acceptor { core: Acceptor::new_core(), shared: shared.clone() }),
@@ -103,7 +103,7 @@ pub fn create() -> (Arc<Acceptor>, Arc<Connector>) {
     )
 }
 
-/// **The io_uring watch names the port, not either end**, because a client
+/// **The inbox watch names the port, not either end**, because a client
 /// connecting through a `Connector` has to complete a poll a server registered
 /// on the `Acceptor` — and the two share exactly this.
 impl PortShared {
@@ -119,19 +119,19 @@ impl PortShared {
         &self.watch
     }
 
-    pub fn watchers(&self) -> Vec<RingId> {
-        self.io_uring_watchers.lock().clone()
+    pub fn watchers(&self) -> Vec<InboxId> {
+        self.inbox_watchers.lock().clone()
     }
 
-    pub fn add_watcher(&self, ring: RingId) {
-        let mut watchers = self.io_uring_watchers.lock();
+    pub fn add_watcher(&self, ring: InboxId) {
+        let mut watchers = self.inbox_watchers.lock();
         if !watchers.contains(&ring) {
             watchers.push(ring);
         }
     }
 
-    pub fn remove_watcher(&self, ring: RingId) {
-        self.io_uring_watchers.lock().retain(|&id| id != ring);
+    pub fn remove_watcher(&self, ring: InboxId) {
+        self.inbox_watchers.lock().retain(|&id| id != ring);
     }
 }
 

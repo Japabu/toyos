@@ -59,7 +59,7 @@ mod rtc;
 mod completion;
 mod iod;
 mod object;
-mod io_uring;
+mod inbox;
 mod pipe;
 
 mod device;
@@ -538,7 +538,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     process::init();
     scheduler::init();
     pipe::init();
-    io_uring::init();
+    inbox::init();
 
 
     // Mount initrd as read-only root filesystem (bcachefs, no extraction)

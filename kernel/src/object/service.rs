@@ -1,4 +1,7 @@
-//! A connection, and the ring a process submits work on.
+//! A connection: two pipes for the bytes, two handle queues for the handles.
+//!
+//! The submission/completion ring's own object moved to [`super::inbox`] with
+//! the 2026-08-20 rename — a different KObject, not a connection.
 
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -6,7 +9,6 @@ use alloc::vec::Vec;
 
 use toyos_abi::syscall::{SyscallError, MAX_QUEUED_BATCHES};
 
-use crate::io_uring::RingRef;
 use crate::pipe::{PipeId, PipeReader, PipeWriter};
 use crate::sync::Lock;
 
@@ -167,38 +169,6 @@ impl ZeroHandles for ConnectionEnd {
         // this end's to release, and what this end sent is still the peer's to
         // receive — the same rule as bytes already in the pipe.
         self.inbox.close_now();
-        self.reference.release();
-    }
-}
-
-/// A submission/completion ring.
-///
-/// The ring's pages are the instance's, keyed by [`RingId`]; this holds the one
-/// counted reference to it.
-///
-/// [`RingId`]: crate::io_uring::RingId
-pub struct IoUringObject {
-    pub(super) core: ObjectCore,
-    id: crate::io_uring::RingId,
-    reference: Held<RingRef>,
-}
-
-impl IoUringObject {
-    pub fn new(ring: RingRef) -> Arc<Self> {
-        Arc::new(Self {
-            core: Self::new_core(),
-            id: ring.id(),
-            reference: Held::new(ring),
-        })
-    }
-
-    pub fn id(&self) -> crate::io_uring::RingId {
-        self.id
-    }
-}
-
-impl ZeroHandles for IoUringObject {
-    fn on_zero_handles(&self) {
         self.reference.release();
     }
 }

@@ -1469,11 +1469,11 @@ pub fn futex_wake(addr: UserAddr, count: u64) -> u64 {
 /// Wake processes blocked on reading from a pipe that now has data.
 pub fn wake_pipe_readers(pipe_id: pipe::PipeId) {
     scheduler::wake_pipe_readers(pipe_id);
-    let watchers = pipe::io_uring_watchers(pipe_id);
+    let watchers = pipe::inbox_watchers(pipe_id);
     if !watchers.is_empty() {
-        crate::io_uring::complete_pending_for_event(
+        crate::inbox::complete_pending_for_event(
             &watchers,
-            crate::io_uring::Source::PipeReadable(pipe_id),
+            crate::inbox::Source::PipeReadable(pipe_id),
         );
     }
 }
@@ -1481,11 +1481,11 @@ pub fn wake_pipe_readers(pipe_id: pipe::PipeId) {
 /// Wake processes blocked on writing to a pipe that now has space.
 pub fn wake_pipe_writers(pipe_id: pipe::PipeId) {
     scheduler::wake_pipe_writers(pipe_id);
-    let watchers = pipe::io_uring_watchers(pipe_id);
+    let watchers = pipe::inbox_watchers(pipe_id);
     if !watchers.is_empty() {
-        crate::io_uring::complete_pending_for_event(
+        crate::inbox::complete_pending_for_event(
             &watchers,
-            crate::io_uring::Source::PipeWritable(pipe_id),
+            crate::inbox::Source::PipeWritable(pipe_id),
         );
     }
 }
