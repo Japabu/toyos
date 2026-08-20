@@ -3808,7 +3808,7 @@ fn run_screen_test(
             // that the panel is not mid-repaint before the watch starts.
             const SETTLED: Duration = Duration::from_secs(1);
             let settle_by = Instant::now() + qemu::budget(Duration::from_secs(20));
-            let mut held = last.clone();
+            let mut held = last;
             let mut stable_since = Instant::now();
             loop {
                 let Some(now) = footer(&mut qemu) else {
@@ -4848,7 +4848,7 @@ fn metal_sim_window_drag(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> 
     // The client ends on the host's second press, so the interval the drag is
     // in is still open when it exits. Waiting for the line that closes it keeps
     // a slower guest a longer run rather than a different verdict.
-    let mut text = result.serial.clone();
+    let mut text = result.serial;
     text.push_str(
         &qemu.drain_until(Duration::from_secs(10), |l| l.contains("compositor: frames=")),
     );
@@ -9798,7 +9798,7 @@ fn run_machine_test(
             // (`issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`).
             // The marker is the boundary the test knows, because the marker is
             // what the injection was timed off.
-            let capture = serial::Serial::named("i8042 capture", result.serial.clone());
+            let capture = serial::Serial::named("i8042 capture", result.serial);
             let mute = capture.must_say_after(I8042_READY, "nothing decoded").map_err(|why| {
                 format!("bytes arrived and decoded to nothing and the driver never said so: {why}")
             })?;
@@ -11810,7 +11810,9 @@ fn suspend_invalidates_a_verdict() -> Result<(), String> {
     let awake = Duration::ZERO;
     // Under the threshold on purpose: two clock reads jitter against each other
     // by microseconds, and a run must not be thrown away for that.
-    let jitter = common::clock::SUSPENDED_AT_LEAST - Duration::from_millis(1);
+    let jitter = common::clock::SUSPENDED_AT_LEAST
+        .checked_sub(Duration::from_millis(1))
+        .expect("SUSPENDED_AT_LEAST must be at least 1ms for this case to mean anything");
     let cases: [(&str, Option<&str>, Duration, Verdict); 6] = [
         ("a pass on a host that stayed up", None, awake, Verdict::Pass(None)),
         ("a fail on a host that stayed up", Some("the guest said no"), awake, Verdict::Fail(None)),
