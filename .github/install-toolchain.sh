@@ -32,29 +32,31 @@ echo "toolchain: $tag"
 cache=${TOYOS_LOCAL_CACHE:-}
 cache_entry=""
 
-# The build system intentionally verifies the literal rustup link target: an
-# installed artifact belongs to this checkout at rust/build/.../stage2. Keep
-# that path while storing the bytes once in the local cache.
+# The build system intentionally verifies the literal rustup link target and
+# uses both of the artifact's build triples. Keep the complete rust/build tree
+# at its checkout path through one symlink while storing its bytes once in the
+# local cache.
 link_toolchain() {
   source_stage2=$1
   linked_stage2=$source_stage2
   if [ -n "$cache" ]; then
-    linked_stage2="$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
-    mkdir -p "$(dirname "$linked_stage2")"
-    if [ -L "$linked_stage2" ]; then
-      rm -f "$linked_stage2"
-    elif [ -d "$linked_stage2" ]; then
+    linked_build="$PWD/rust/build"
+    linked_stage2="$linked_build/x86_64-unknown-linux-gnu/stage2"
+    mkdir -p "$PWD/rust"
+    if [ -L "$linked_build" ]; then
+      rm -f "$linked_build"
+    elif [ -d "$linked_build" ]; then
       # A pre-cache job can leave the extracted artifact here. The complete
       # cached source above is the same content-addressed toolchain, so discard
       # only this duplicate before replacing it with the stable link.
       echo "replacing duplicate workspace toolchain with the local-cache link"
-      find "$linked_stage2" -mindepth 1 -delete
-      rmdir "$linked_stage2"
-    elif [ -e "$linked_stage2" ]; then
-      echo "::error::$linked_stage2 exists and is not the local-cache link"
+      find "$linked_build" -mindepth 1 -delete
+      rmdir "$linked_build"
+    elif [ -e "$linked_build" ]; then
+      echo "::error::$linked_build exists and is not the local-cache link"
       exit 1
     fi
-    ln -s "$source_stage2" "$linked_stage2"
+    ln -s "$cache_entry" "$linked_build"
   fi
   rustup toolchain link toyos "$linked_stage2"
   "$source_stage2/bin/rustc" -vV
