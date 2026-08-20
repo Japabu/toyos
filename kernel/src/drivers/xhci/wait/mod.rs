@@ -38,11 +38,21 @@
 //! composition above it — `ceil(count / MSC_MAX_BLOCKS)` commands, each of them
 //! issued up to [`msc`]'s `MAX_TRANSPORT_ATTEMPTS` times with a Reset Recovery
 //! between the attempts — and nothing in this driver has an opinion about how
-//! long that may be. [`crate::block::OPERATION`] is that opinion, it belongs to
-//! the layer that knows one call is one operation, and it arrives here as a
-//! `Deadline` threaded from [`msc::storage_read`] down to
-//! `XhciController::scsi`, which is the one site that reads it. Its doc carries
-//! why the refusal is taken between commands and never inside one.
+//! long that may be. [`crate::block::OPERATION`] is that opinion, and it
+//! belongs to the layer that knows one call is one operation.
+//!
+//! **It arrives ambiently and is threaded from there.** Owner ruling 1B: the
+//! deadline is established on the running context above `BlockDevice` and
+//! recovered by [`msc`]'s three operation entry points — `msc_read`,
+//! `msc_write`, `msc_flush` — because the two frames in between cannot carry
+//! it. From those three down it is an ordinary argument, ending at
+//! `XhciController::scsi`, which is the one site that reads it; that is what
+//! leaves `scsi` usable by `msc::bind`'s bring-up, which is not a block-device
+//! operation, has no establishment above it, and passes [`Deadline::never`] by
+//! name. `block::OPERATION`'s doc carries why the refusal is taken between
+//! commands and never inside one.
+//!
+//! [`Deadline::never`]: crate::time::Deadline::never
 
 pub mod boot;
 pub mod msc;

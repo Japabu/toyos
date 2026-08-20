@@ -264,7 +264,10 @@ static NO_TASK_OPERATION: [OperationSlot; MAX_CPUS] =
 impl Operation {
     /// Declare the running context inside one operation, bounded by `until` or
     /// by whatever already bounds it, whichever comes first.
-    #[track_caller]
+    ///
+    /// No `#[track_caller]`, because nothing here panics: nesting is legal and
+    /// narrowing is what an inner establishment does. The two recoveries carry
+    /// it, because they are where a caller learns it got the context wrong.
     pub fn begin(until: Deadline) -> Operation {
         let task = driver::current_handle();
         let cpu = percpu::cpu_id() as usize;
