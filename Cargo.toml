@@ -29,6 +29,7 @@ members = [
     "toyos-keymap",
     "toyos-ld",
     "toyos-manifest",
+    "toyos-mixer",
     "toyos-pci",
     "toyos-ps2",
     "toyos-sched",

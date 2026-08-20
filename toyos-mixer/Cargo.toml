@@ -1,0 +1,26 @@
+# A member of the host workspace (root `Cargo.toml`), like toyos-desktop and
+# toyos-hda: its tests run on the host with no target-triple juggling, and
+# soundd depends on it by path. What lives here is every decision soundd makes
+# about *samples* — decode, channel conversion, gain, the sum on the shared bus,
+# dither and quantize — and the arithmetic those rest on.
+#
+# It is a crate because a QEMU boot cannot ask any of them. Gate A certifies the
+# device end: that periods reach the wire on time and that a client's audio is
+# not interrupted. Nothing in a guest can say whether the sample the client
+# wrote is the sample the device played, and that is the half a listener hears.
+# `fixtures/mix-corpus.txt` is that answer, captured from
+# `userland/soundd/src/main.rs` before the extraction and asserted byte for byte
+# on every host run.
+#
+# No dependencies, deliberately. `toyos-abi` is not one either: nothing here
+# names a syscall, a handle or a shared-memory layout — a period arrives as a
+# `&[u8]` and leaves as a `&mut [i16]`, and both belong to the caller.
+
+[package]
+name = "toyos-mixer"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lints.rust]
+warnings = "deny"
