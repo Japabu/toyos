@@ -1,4 +1,5 @@
 use crate::mm::PAGE_SIZE;
+use crate::scheduler::Operation;
 use crate::time::{Budget, Deadline, Duration};
 
 /// Unique identifier for a block device, used as page cache key.
@@ -44,15 +45,21 @@ pub const OPERATION: Budget = Budget::of(
      own give-up policy decides what happens next",
 );
 
-/// When an operation starting now must stop spending device time.
+/// Declare the running context inside one block-device operation, bounded by
+/// [`OPERATION`], until the guard drops.
 ///
-/// Minted by the [`BlockDevice`] implementation, which is the layer that knows
-/// one call is one operation, and honoured by the driver below it. **A
-/// [`Deadline`] because it is absolute**: it crosses into a driver that loops,
-/// and a relative duration re-based at each command would bound every command
-/// instead of the operation.
-pub fn operation_deadline() -> Deadline {
-    Deadline::at(crate::clock::now() + OPERATION.duration())
+/// Established by the [`BlockDevice`] implementation, which is the layer that
+/// knows one call is one operation, and *recovered* by the driver below it
+/// rather than handed to it: [`Operation`] carries why owner ruling 1B put the
+/// deadline on the running context instead of in an argument, and what else
+/// rides the same word.
+///
+/// **A [`Deadline`] because it is absolute**: it crosses into a driver that
+/// loops, and a relative duration re-based at each command would bound every
+/// command instead of the operation.
+#[must_use = "the operation lasts exactly as long as this guard"]
+pub fn begin_operation() -> Operation {
+    Operation::begin(Deadline::at(crate::clock::now() + OPERATION.duration()))
 }
 
 /// A transfer the device did not complete.

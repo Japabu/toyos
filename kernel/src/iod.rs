@@ -53,7 +53,7 @@ pub fn start() {
 }
 
 extern "C" fn body(_arg: u64) -> ! {
-    let parkable = scheduler::Parkable::of_current();
+    let parkable = scheduler::Parkable::at_entry();
     let handle = crate::sched::driver::current_handle().expect("iod runs as a task");
     // Armed once and held across the loop — §5.3a's edge contract: a producer
     // that pushes while this thread is draining must find the watch still

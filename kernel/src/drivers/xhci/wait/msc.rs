@@ -10,6 +10,7 @@
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
 use crate::log;
+use crate::scheduler::Operation;
 use crate::time::{Budget, Deadline, Duration};
 use super::super::device::Endpoint;
 use super::{Owed, Restart};
@@ -428,35 +429,35 @@ impl XhciController {
         Some(out)
     }
 
-    pub(super) fn msc_read(
-        &mut self,
-        at: usize,
-        lba: u64,
-        count: u32,
-        buf: &mut [u8],
-        until: Deadline,
-    ) -> bool {
+    /// The three below are this driver's **operation entry points**, and the
+    /// one place in it that recovers the caller's budget.
+    ///
+    /// Owner ruling 1B: the deadline is established by
+    /// [`crate::block::begin_operation`] above `BlockDevice` and read off the
+    /// running context here, because the two frames in between —
+    /// `toyos_fat32::BlockAccess::read_at` and `BlockDevice::read_blocks` —
+    /// cannot carry it. From here down it is an ordinary argument again, which
+    /// is what keeps [`Self::scsi`] usable by `bring_up`: an enumeration is not
+    /// a block-device operation, has no establishment above it, and passes
+    /// [`Deadline::never`] by name.
+    pub(super) fn msc_read(&mut self, at: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
+        let until = Operation::deadline();
         self.with_storage(at, |ctrl, disk| {
             ctrl.transfer_blocks(&mut disk.dev, lba, count, Host::Into(buf), until)
         })
         .unwrap_or(false)
     }
 
-    pub(super) fn msc_write(
-        &mut self,
-        at: usize,
-        lba: u64,
-        count: u32,
-        buf: &[u8],
-        until: Deadline,
-    ) -> bool {
+    pub(super) fn msc_write(&mut self, at: usize, lba: u64, count: u32, buf: &[u8]) -> bool {
+        let until = Operation::deadline();
         self.with_storage(at, |ctrl, disk| {
             ctrl.transfer_blocks(&mut disk.dev, lba, count, Host::From(buf), until)
         })
         .unwrap_or(false)
     }
 
-    pub(super) fn msc_flush(&mut self, at: usize, until: Deadline) -> bool {
+    pub(super) fn msc_flush(&mut self, at: usize) -> bool {
+        let until = Operation::deadline();
         self.with_storage(at, |ctrl, disk| {
             let number = disk.index;
             let dev = &mut disk.dev;
@@ -1271,18 +1272,21 @@ impl core::fmt::Display for Printable<'_> {
 /// Read `count` 4 KiB blocks at `lba`. `false` means the transfer failed and
 /// `buf` holds nothing the caller may believe.
 ///
-/// `until` is the caller's device-time budget for this whole operation —
-/// [`crate::block::operation_deadline`] mints it and [`XhciController::scsi`]
-/// is where it is honoured.
-pub fn storage_read(index: usize, lba: u64, count: u32, buf: &mut [u8], until: Deadline) -> bool {
-    with_disk(index, |ctrl, local| ctrl.msc_read(local, lba, count, buf, until)).unwrap_or(false)
+/// **The caller must be inside a block-device operation**
+/// ([`crate::block::begin_operation`]), because that is where the device-time
+/// budget for this one comes from: [`XhciController::msc_read`] recovers it and
+/// [`XhciController::scsi`] is where it is honoured. A call with no
+/// establishment above it is refused by name rather than served without a
+/// budget.
+pub fn storage_read(index: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
+    with_disk(index, |ctrl, local| ctrl.msc_read(local, lba, count, buf)).unwrap_or(false)
 }
 
-pub fn storage_write(index: usize, lba: u64, count: u32, buf: &[u8], until: Deadline) -> bool {
-    with_disk(index, |ctrl, local| ctrl.msc_write(local, lba, count, buf, until)).unwrap_or(false)
+pub fn storage_write(index: usize, lba: u64, count: u32, buf: &[u8]) -> bool {
+    with_disk(index, |ctrl, local| ctrl.msc_write(local, lba, count, buf)).unwrap_or(false)
 }
 
-pub fn storage_flush(index: usize, until: Deadline) -> bool {
-    with_disk(index, |ctrl, local| ctrl.msc_flush(local, until)).unwrap_or(false)
+pub fn storage_flush(index: usize) -> bool {
+    with_disk(index, |ctrl, local| ctrl.msc_flush(local)).unwrap_or(false)
 }
 

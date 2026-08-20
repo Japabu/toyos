@@ -56,7 +56,7 @@
 //! ## The two rules an acquirer has to know
 //!
 //! * **A `SleepLock` taken while a [`crate::sync::Lock`] is held must go through
-//!   [`SleepLock::try_lock`]** — [`Parkable::of_current`] asserts the context's
+//!   [`SleepLock::try_lock`]** — [`Parkable::at_entry`] asserts the context's
 //!   baseline preempt depth, so the token a park needs cannot be made at that
 //!   depth. That is §8's ordering rule and it is enforced rather than reviewed.
 //!   The converse is free: a `Lock` may be taken while a `SleepGuard` is held.

@@ -7,12 +7,19 @@
 //! geometry the device reported, so the controller lock is taken per operation
 //! and never held across one.
 //!
-//! **This is where an operation's device-time budget is minted**
-//! ([`crate::block::operation_deadline`]), because this is the layer at which
-//! one call is one operation: below here the driver batches, retries and
-//! recovers, and none of those loops knows what it is part of. The deadline is
-//! passed down rather than re-derived, so what bounds a `read_blocks` of 64
-//! blocks is the same instant that bounds its first command.
+//! **This is where an operation's device-time budget is established**
+//! ([`crate::block::begin_operation`]), because this is the layer at which one
+//! call is one operation: below here the driver batches, retries and recovers,
+//! and none of those loops knows what it is part of. What bounds a
+//! `read_blocks` of 64 blocks is therefore the same instant that bounds its
+//! first command.
+//!
+//! **Established on the running context and not passed down**, which is owner
+//! ruling 1B: the deadline crosses `BlockAccess` and `BlockDevice`, two frames
+//! that cannot carry it, so `xhci::wait/msc.rs`'s three operation entry points
+//! recover it instead. The guard is a `let _op` and not a `let _`: `let _`
+//! drops at the end of the statement, which would end the operation before the
+//! call it bounds.
 
 use crate::block::{self, BlockDevice, BlockError, BlockResult, DeviceId};
 use crate::log;
@@ -95,7 +102,8 @@ impl BlockDevice for UsbBlockDevice {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> BlockResult {
-        if xhci::storage_read(self.index, lba, count, buf, block::operation_deadline()) {
+        let _op = block::begin_operation();
+        if xhci::storage_read(self.index, lba, count, buf) {
             return Ok(());
         }
         log!("usb-storage: read of {count} blocks at {lba} failed on disk {}", self.index);
@@ -103,7 +111,8 @@ impl BlockDevice for UsbBlockDevice {
     }
 
     fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) -> BlockResult {
-        if xhci::storage_write(self.index, lba, count, buf, block::operation_deadline()) {
+        let _op = block::begin_operation();
+        if xhci::storage_write(self.index, lba, count, buf) {
             return Ok(());
         }
         log!("usb-storage: write of {count} blocks at {lba} failed on disk {}", self.index);
@@ -111,7 +120,8 @@ impl BlockDevice for UsbBlockDevice {
     }
 
     fn flush(&mut self) -> BlockResult {
-        if xhci::storage_flush(self.index, block::operation_deadline()) {
+        let _op = block::begin_operation();
+        if xhci::storage_flush(self.index) {
             return Ok(());
         }
         log!("usb-storage: cache flush failed on disk {}", self.index);
