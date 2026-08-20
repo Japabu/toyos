@@ -153,8 +153,20 @@ jobs:
       # than folded into the workspace one: the workspace command lints every
       # other host-workspace crate as well, and none of *those* unsafe blocks
       # has been reviewed, so enabling the lint there would silently gate crates
-      # nobody has looked at. The kernel (373 blocks) is measured, not gated —
-      # not tractable in one pass, and recorded as follow-up in the same issue.
+      # nobody has looked at.
+      #
+      # The kernel has no `-p` (it is one crate) and no directory scoping on
+      # the clippy command line, so a kernel *area* is gated at the source
+      # instead of the invocation: `mm::`, `object::`, `elf::` and `loader::`
+      # (measured 2026-08-20: 35 + 1 + 23 + 8 = 67 blocks, every one now
+      # carrying a `SAFETY:` comment) each open with `#![warn
+      # (clippy::undocumented_unsafe_blocks)]`, which is `allow`-by-default
+      # everywhere else in the kernel and only `warn` inside those four module
+      # trees — composing with the `-D warnings` both kernel invocations below
+      # already carry turns that `warn` into a hard error, with no new flag
+      # here. The other 322 blocks (`arch/`, `drivers/`, `sched/`, `iommu/`,
+      # `log/` and the root files) are measured, not gated — not tractable in
+      # one pass, and recorded as follow-up in the same issue.
       #
       # Measured on the dev host with three fresh `CARGO_TARGET_DIR`s and a warm
       # cargo registry: **19.2 s** for the workspace (139 crates checked),

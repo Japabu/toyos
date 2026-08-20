@@ -21,6 +21,18 @@ impl LoadedLib {
     /// Each arm asserts the bound protecting *its own* destination, which for
     /// the `Shared` arm is `rw_alloc` — a separate, smaller allocation, so the
     /// image's bounds do not cover it.
+    ///
+    /// # Safety
+    /// The bound each arm needs is checked here, at runtime, on every call —
+    /// that is this module's whole design (its own header: the asserts are
+    /// "kernel-bug asserts, not refusals", because `load_shared_lib`/
+    /// `rela::validate` already refused a malformed `r_offset` before any
+    /// `LoadedLib` existed). What is *not* checked is exclusivity: the
+    /// caller must be the only writer of this module's image (or its
+    /// `rw_alloc`) for the duration of the call — true for every current
+    /// caller, each of which runs during a module's single-threaded loading/
+    /// binding phase (spawn, `dlopen`), never concurrently with another
+    /// relocation pass over the same `LoadedLib`.
     pub(super) unsafe fn write_at<T: Copy>(&self, offset: u64, value: T) {
         let end = (offset as usize)
             .checked_add(core::mem::size_of::<T>())
@@ -90,7 +102,15 @@ impl LoadedLib {
 pub fn rebase_relative_relocs(lib: &LoadedLib, delta: i64) {
     for r in lib.relocations() {
         if r.kind == RelocKind::Relative {
+            // SAFETY: `r.offset` is a `RELATIVE` entry's offset, already
+            // checked by `rela::validate` against the writable window at
+            // `load_shared_lib` time (module header) — a range inside
+            // `image`'s own bounds, per `write_at`'s `# Safety`. No
+            // concurrent writer: this runs only on a freshly cloned window
+            // nothing else has touched yet (this function's own doc).
             let old = unsafe { lib.image.read::<u64>(r.offset as usize) };
+            // SAFETY: see `write_at`'s `# Safety` — `r.offset` was validated
+            // the same way as the read just above.
             unsafe { lib.write_at::<u64>(r.offset, (old as i64 + delta) as u64) };
         }
     }
@@ -106,6 +126,9 @@ pub fn resolve_dlopen_relocs(lib: &LoadedLib, other_libs: &[LoadedLib]) {
         let name = symbols.name(sym as usize);
         match other_libs.iter().find_map(|other| other.resolve(name)) {
             Some(addr) => {
+                // SAFETY: `offset` came from `lib.bind_entries()`, one of
+                // `load_shared_lib`'s `rela::validate`d tables — see
+                // `write_at`'s `# Safety`.
                 unsafe { lib.write_at::<u64>(offset, addr.raw()) };
                 resolved += 1;
             }
@@ -135,6 +158,8 @@ pub fn resolve_lib_bind_relocs(
             .copied()
             .or_else(|| libs.iter().find_map(|other| other.resolve(name)));
         match resolved {
+            // SAFETY: same as `resolve_dlopen_relocs` above — `offset` came
+            // from `lib.bind_entries()`, validated the same way.
             Some(addr) => unsafe { lib.write_at::<u64>(offset, addr.raw()) },
             None => log!("dynamic: lib unresolved symbol: {}", name),
         }
@@ -156,12 +181,16 @@ pub fn apply_tpoff_relocs(
     let mut count64 = 0u64;
     for (offset, sym, addend) in lib.typed_entries(RelocKind::Tpoff64, |r| &r.tpoff64) {
         let tpoff = compute_tpoff(lib, sym, addend, lib_base_offset, total_memsz, tls_info);
+        // SAFETY: `offset` came from `lib.typed_entries(RelocKind::Tpoff64,
+        // ...)`, one of `load_shared_lib`'s `rela::validate`d tables — see
+        // `write_at`'s `# Safety`.
         unsafe { lib.write_at::<u64>(offset, tpoff as u64) };
         count64 += 1;
     }
     let mut count32 = 0u64;
     for (offset, sym, addend) in lib.typed_entries(RelocKind::Tpoff32, |r| &r.tpoff32) {
         let tpoff = compute_tpoff(lib, sym, addend, lib_base_offset, total_memsz, tls_info);
+        // SAFETY: same as the TPOFF64 loop above, for `RelocKind::Tpoff32`.
         unsafe { lib.write_at::<i32>(offset, tpoff as i32) };
         count32 += 1;
     }
@@ -180,12 +209,16 @@ pub fn apply_dtpmod_relocs(lib: &LoadedLib, module_id: u64, tls_info: &TlsModule
     let mut count_mod = 0u64;
     for (offset, sym, _) in lib.typed_entries(RelocKind::DtpMod64, |r| &r.dtpmod64) {
         let mid = resolve_dtpmod(lib, sym, module_id, tls_info);
+        // SAFETY: `offset` came from `lib.typed_entries(RelocKind::DtpMod64,
+        // ...)`, one of `load_shared_lib`'s `rela::validate`d tables — see
+        // `write_at`'s `# Safety`.
         unsafe { lib.write_at::<u64>(offset, mid) };
         count_mod += 1;
     }
     let mut count_off = 0u64;
     for (offset, sym, addend) in lib.typed_entries(RelocKind::DtpOff64, |r| &r.dtpoff64) {
         let value = resolve_dtpoff(lib, sym, addend, tls_info);
+        // SAFETY: same as the DTPMOD64 loop above, for `RelocKind::DtpOff64`.
         unsafe { lib.write_at::<u64>(offset, value as u64) };
         count_off += 1;
     }

@@ -206,10 +206,26 @@ impl PageTablePage {
         super::DirectMap::phys_of(self)
     }
 
+    /// # Safety
+    /// `phys` must be the physical address of a `PageTablePage` this module
+    /// itself built and linked into a live paging structure: every present
+    /// non-leaf entry this file ever writes names a `Box<PageTablePage>`
+    /// pushed into some `AddressSpace.children`, which owns it for that
+    /// address space's whole life — the split is one-way and nothing
+    /// coalesces a child table back (module header). The caller's use of the
+    /// returned reference must not outlive that address space.
     unsafe fn from_phys<'a>(phys: u64) -> &'a PageTablePage {
         &*super::DirectMap::from_phys(phys).as_ptr::<PageTablePage>()
     }
 
+    /// # Safety
+    /// Same address requirement as [`from_phys`], plus exclusivity: the
+    /// caller must hold the only live reference into this page for as long
+    /// as the returned `&mut` is live. Every call site reaches this through
+    /// `&mut AddressSpace` (directly or via `ensure_table`/`guard_4k`, which
+    /// take `&mut self`), which is what supplies that — nothing else in this
+    /// module ever borrows a child table without going through the owning
+    /// `AddressSpace`.
     unsafe fn from_phys_mut<'a>(phys: u64) -> &'a mut PageTablePage {
         &mut *super::DirectMap::from_phys(phys).as_mut_ptr::<PageTablePage>()
     }
@@ -217,6 +233,11 @@ impl PageTablePage {
     fn child(&self, index: usize) -> Option<&PageTablePage> {
         let entry = self[index];
         if entry & PAGE_PRESENT != 0 {
+            // SAFETY: `entry`'s PRESENT bit is checked above, so `entry &
+            // ADDR_MASK` is a table `ensure_table`/`map_window`/`guard_4k`
+            // installed (see `from_phys`'s `# Safety`). `child`'s elided
+            // lifetime ties the returned `&` to `&self`, so it cannot outlive
+            // the address space that keeps the child alive.
             Some(unsafe { PageTablePage::from_phys(entry & ADDR_MASK) })
         } else {
             None
@@ -226,6 +247,10 @@ impl PageTablePage {
     fn child_mut(&mut self, index: usize) -> Option<&mut PageTablePage> {
         let entry = self[index];
         if entry & PAGE_PRESENT != 0 {
+            // SAFETY: same address argument as `child` above. `&mut self`
+            // here is exclusive over this whole table (and everything
+            // reachable from it), which is exactly the exclusivity
+            // `from_phys_mut` requires for the child it names.
             Some(unsafe { PageTablePage::from_phys_mut(entry & ADDR_MASK) })
         } else {
             None
@@ -403,6 +428,12 @@ pub fn flush_tlb_all() {
     if pcid_active() {
         crate::arch::cpu::invpcid(2, 0, 0);
     } else {
+        // SAFETY: `write_cr3` requires a valid CR3 (its own `# Safety`); the
+        // value here is exactly what `read_cr3` just read back from this
+        // same CPU, so it is already the active CR3 — writing it back
+        // changes nothing but the TLB, which is the whole point: a CR3
+        // write flushes every non-global entry (there is no `PAGE_GLOBAL`
+        // in this kernel — module header).
         unsafe {
             let cr3 = crate::arch::cpu::read_cr3();
             crate::arch::cpu::write_cr3(cr3);
@@ -493,7 +524,21 @@ pub struct AddressSpace {
     pcid: u16,
 }
 
+// SAFETY: open question, not resolved by this comment — every field here
+// (`Box<PageTablePage>`, `Vec<Box<PageTablePage>>`, `HashMap<u64, PhysPage>`,
+// `BTreeMap<UserAddr, Region>`, `u16`) is composed of types already `Send` +
+// `Sync` (transitively — `RegionKind::FileBacked` holds `Arc<dyn
+// FileBacking>` and `FileBacking: Send + Sync` is a supertrait, so the trait
+// object inherits both), and `cargo check` with both impls below deleted
+// still compiles clean (verified 2026-08-20). These look vestigial rather
+// than load-bearing — the same finding as `object::shm::Pages`, filed
+// together as issues/kernel/redundant-send-sync-impls-mm-object.md rather
+// than removed here: if that holds, a later field that broke auto-`Send`
+// would silently re-inherit these hand-written impls with no new
+// justification, which is a real hazard for a type built entirely out of
+// raw physical addresses.
 unsafe impl Send for AddressSpace {}
+// SAFETY: see the `Send` impl above — same open question, same evidence.
 unsafe impl Sync for AddressSpace {}
 
 /// What a range already in `regions` runs into — [`AddressSpace::occupancy`].
@@ -721,6 +766,13 @@ impl AddressSpace {
                     let phys = if pde & PAGE_SIZE_BIT != 0 {
                         pde & ADDR_MASK_2M
                     } else {
+                        // SAFETY: `pde & PAGE_PRESENT` was checked above and
+                        // this is the not-2-MiB branch, so `pde & ADDR_MASK`
+                        // is a page table `map_window` built and pushed into
+                        // `children` (see `from_phys`'s `# Safety`). Read
+                        // -only and dropped before `pd.write_pde` below
+                        // touches the same slot, so nothing here conflicts
+                        // with the `&mut self` this method otherwise holds.
                         let table = unsafe { PageTablePage::from_phys(pde & ADDR_MASK) };
                         table[0] & ADDR_MASK_2M
                     };
@@ -981,6 +1033,14 @@ impl AddressSpace {
             assert!(entry & PAGE_PRESENT != 0, "guard_4k: no PD over the direct map");
             entry & ADDR_MASK
         };
+        // SAFETY: `pd_phys` is `entry & ADDR_MASK` off a direct-map PDPT
+        // entry just asserted PRESENT — the direct map's page directory is
+        // built once in `init` and, being part of the kernel address space,
+        // lives forever ([`kernel`]'s doc); `map_2m` may only ever *replace*
+        // its leaf entries, never the PD itself. `&mut self` here is the
+        // kernel `AddressSpace`'s own lock (held by every caller through
+        // `kernel().lock()`), which is the exclusivity `from_phys_mut`
+        // requires.
         let pd = unsafe { PageTablePage::from_phys_mut(pd_phys) };
         let pde = pd[pd_idx];
         assert!(pde & PAGE_PRESENT != 0, "guard_4k: {phys:#x} is not in the direct map");
@@ -1007,6 +1067,14 @@ impl AddressSpace {
                 .subsumed_by_flush();
         }
 
+        // SAFETY: past the branch above, `pd[pd_idx]` names a page table and
+        // not a 2 MiB leaf either way — freshly linked just above
+        // (`self.children.push(pt)`) or already a split table from an
+        // earlier guard in the same region (the comment above the branch).
+        // A guard split is permanent (this function's own doc: "never
+        // coalesced back"), so the address stays valid for the kernel
+        // address space's whole life. Same lock-held exclusivity as the
+        // `from_phys_mut` above.
         let pt = unsafe { PageTablePage::from_phys_mut(pd[pd_idx] & ADDR_MASK) };
         let idx = ((phys >> 12) & 0x1FF) as usize;
         assert!(pt[idx] & PAGE_PRESENT != 0, "guard_4k: {phys:#x} is already unmapped");
@@ -1072,6 +1140,12 @@ impl AddressSpace {
             self.root.widen(pml4_idx, pml4_flags & TABLE_FLAGS).discharge(target);
         }
 
+        // SAFETY: the branch above just guaranteed `self.root[pml4_idx]` is
+        // PRESENT — either a fresh `child` this call linked (and pushed into
+        // `self.children`) or an entry that already was — so `& ADDR_MASK`
+        // names a table this address space owns for its whole life (see
+        // `from_phys_mut`'s `# Safety`). `&mut self` for this whole method
+        // is the exclusivity it requires.
         let pdpt = unsafe { PageTablePage::from_phys_mut(self.root[pml4_idx] & ADDR_MASK) };
 
         if pdpt[pdpt_idx] & PAGE_PRESENT == 0 {
@@ -1083,6 +1157,10 @@ impl AddressSpace {
             pdpt.widen(pdpt_idx, pdpt_flags & TABLE_FLAGS).discharge(target);
         }
 
+        // SAFETY: same argument as the `pdpt` binding above, one level down —
+        // the branch just guaranteed `pdpt[pdpt_idx]` PRESENT, naming a table
+        // this address space owns for its whole life, and the caller gets
+        // back the `&mut self` exclusivity this function was given.
         unsafe { PageTablePage::from_phys_mut(pdpt[pdpt_idx] & ADDR_MASK) }
     }
 }
@@ -1188,6 +1266,12 @@ pub(super) fn init(memory_map: &[MemoryMapEntry]) {
         published as *const _ as *mut _,
         core::sync::atomic::Ordering::Release,
     );
+    // SAFETY: `load_flush` requires page tables that are valid and live (its
+    // own `# Safety`). `cr3` names the `AddressSpace` this function just
+    // finished building — every physical page the memory map reaches was
+    // just linked in by the `map_2m` loop above, and nothing has run under
+    // it yet, so "live" reduces to "self-consistent", which that loop
+    // guarantees one 2 MiB leaf at a time.
     // Boot path: load CR3 with flush (PCID not yet enabled).
     unsafe {
         cr3.load_flush();
@@ -1211,6 +1295,19 @@ fn has(entry: u64, flag: u64) -> u8 {
 /// creation. Shared page directories propagate later `map_2m`s, but a crash
 /// handler should prove that rather than assume it.
 pub fn present_in_current_cr3(addr: u64) -> bool {
+    // SAFETY: `Cr3::current().phys()` is the address space *this CPU is
+    // executing under right now* — the MMU itself is walking this exact
+    // structure, so the physical address it names is a real, currently
+    // -linked page table by definition, and it cannot be freed while this
+    // CPU runs under it (a table lives for its address space's whole life,
+    // and this CPU is that address space's proof of life). No lock is taken,
+    // by design (this doc's own header) — a sibling CPU may be mutating an
+    // entry in the same live address space concurrently, but every entry
+    // read here is one 8-byte-aligned `u64`, atomic at the hardware level,
+    // so no read is ever torn; what a concurrent write can produce is a
+    // stale-but-consistent answer across the multi-level walk, which is
+    // exactly the caveat this function's doc already owns ("a crash handler
+    // should prove that rather than assume it").
     let mut table = unsafe { PageTablePage::from_phys(Cr3::current().phys()) };
     for level in 0..3 {
         let entry = table[((addr >> (39 - level * 9)) & 0x1FF) as usize];
@@ -1220,6 +1317,10 @@ pub fn present_in_current_cr3(addr: u64) -> bool {
         if level > 0 && entry & PAGE_SIZE_BIT != 0 {
             return true;
         }
+        // SAFETY: `entry & PAGE_PRESENT` was just checked, and `entry` came
+        // from a table this same walk already proved live — see the
+        // `SAFETY` above this loop for why a present entry under the
+        // currently-loaded CR3 always names a real, still-linked table.
         table = unsafe { PageTablePage::from_phys(entry & ADDR_MASK) };
     }
     table[((addr >> 12) & 0x1FF) as usize] & PAGE_PRESENT != 0
@@ -1228,6 +1329,12 @@ pub fn present_in_current_cr3(addr: u64) -> bool {
 /// Dump page table entries for an address. Lock-free for crash safety.
 pub fn debug_page_walk(addr: u64) {
     let cr3 = Cr3::current();
+    // SAFETY: same argument as `present_in_current_cr3` above — `cr3.phys()`
+    // is the address space this CPU is executing under right now, so it
+    // names a real, currently-linked PML4 that cannot be freed while this
+    // CPU runs under it. Lock-free by design (this function's own doc,
+    // "for crash safety"); a diagnostic dump accepts a stale-but-consistent
+    // read the same way `present_in_current_cr3` does.
     let pml4 = unsafe { PageTablePage::from_phys(cr3.phys()) };
     let pml4_idx = ((addr >> 39) & 0x1FF) as usize;
     let pdpt_idx = ((addr >> 30) & 0x1FF) as usize;
@@ -1257,6 +1364,9 @@ pub fn debug_page_walk(addr: u64) {
         return;
     }
 
+    // SAFETY: `pml4e & PAGE_PRESENT` was just checked; see the `SAFETY` on
+    // `pml4` above for why a present entry under the currently-loaded CR3
+    // always names a real, still-linked table.
     let pdpt = unsafe { PageTablePage::from_phys(pml4e & ADDR_MASK) };
     let pdpte = pdpt[pdpt_idx];
     log!(
@@ -1270,6 +1380,8 @@ pub fn debug_page_walk(addr: u64) {
         return;
     }
 
+    // SAFETY: `pdpte & PAGE_PRESENT` was just checked; same reasoning as the
+    // `pdpt` binding above, one level down.
     let pd = unsafe { PageTablePage::from_phys(pdpte & ADDR_MASK) };
     let pde = pd[pd_idx];
     log!(
@@ -1288,6 +1400,9 @@ pub fn debug_page_walk(addr: u64) {
         return;
     }
 
+    // SAFETY: `pde & PAGE_PRESENT` was just checked and the 2 MiB branch
+    // above already returned, so this is a page table `map_window` or
+    // `guard_4k` built; same reasoning as the `pdpt`/`pd` bindings above.
     let pt = unsafe { PageTablePage::from_phys(pde & ADDR_MASK) };
     let pte = pt[pt_idx];
     log!(

@@ -40,6 +40,14 @@ pub(crate) fn alloc_kernel_stack(
     // Must match context_switch: pushfq, push rbp..r15 (8 values), then the
     // return address.
     let frame = (top - 8 * 8) as *mut u64;
+    // SAFETY: `alloc` is a fresh, exclusively-owned `OwnedAlloc::new
+    // (KERNEL_STACK_SIZE, 4096)` above, and `frame = top - 64` — the eight
+    // `u64` writes below cover exactly `[frame, frame + 64)`, the top 64
+    // bytes of that allocation (`KERNEL_STACK_SIZE` is a whole kernel stack,
+    // far larger than one context-switch frame), so every `frame.add(i)`
+    // for `i in 0..8` stays in bounds. Nothing else can be writing this
+    // memory: `alloc` was just allocated and has not been published
+    // anywhere yet.
     unsafe {
         *frame.add(0) = 0; // r15
         *frame.add(1) = arg; // r14

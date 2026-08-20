@@ -124,6 +124,15 @@ impl RelocationIndex {
             }
             let within_page = (r_offset - page_offset) as usize;
             if within_page + 8 <= 4096 {
+                // SAFETY: `within_page + 8 <= 4096` was just checked, so this
+                // write lands inside the 4096-byte page `page_ptr` names —
+                // but that `page_ptr` itself is valid for a 4096-byte page at
+                // all is this function's caller's obligation, not something
+                // `apply_to_page` checks; its one call site
+                // (`process.rs`'s fault handler) passes an offset into a 2
+                // MiB buffer it owns, bounded by its own loop. See
+                // issues/kernel/raw-pointer-writers-not-marked-unsafe-in-loader.md
+                // for why that obligation is not yet type-enforced.
                 unsafe {
                     core::ptr::write_unaligned(page_ptr.add(within_page) as *mut u64, value);
                 }
@@ -138,6 +147,8 @@ impl RelocationIndex {
             }
             let within_page = (r_offset - page_offset) as usize;
             if within_page + 4 <= 4096 {
+                // SAFETY: same argument as the `entries_u64` loop above, for
+                // 4 bytes instead of 8.
                 unsafe {
                     core::ptr::write_unaligned(page_ptr.add(within_page) as *mut i32, value);
                 }
