@@ -148,7 +148,7 @@ fn debug_heap_alloc(bytes: usize, align: usize) -> u64 {
 mod canary {
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    const VALUE: [u64; 2] = [0x_C0DE_1A55_0F17_1E55, 0x_5EE7_A11_0F_17_00];
+    const VALUE: [u64; 2] = [0x_C0DE_1A55_0F17_1E55, 0x0005_EE7A_110F_1700];
 
     static WORDS: [AtomicU64; 2] =
         [AtomicU64::new(VALUE[0]), AtomicU64::new(VALUE[1])];

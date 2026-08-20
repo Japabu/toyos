@@ -145,7 +145,5 @@ extern "C" fn body(thread: u64) -> ! {
     // never removed and this thread has said everything it has to say. A
     // spinning thread here would go on competing with the reader for the whole
     // rest of the boot.
-    loop {
-        crate::completion::park_forever();
-    }
+    crate::completion::park_forever();
 }

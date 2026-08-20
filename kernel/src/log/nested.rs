@@ -76,9 +76,7 @@ mod armed {
         ARMED.store(false, Ordering::Relaxed);
         crate::log!("lognest done emitted={SHARD_RECORDS}");
 
-        loop {
-            crate::completion::park_forever();
-        }
+        crate::completion::park_forever();
     }
 
     /// Consume the one-shot and send this CPU its own IPI. `true` when it was
