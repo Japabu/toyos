@@ -26,6 +26,16 @@ use super::pmm;
 /// panic-free by the same rule.
 struct KernelPageSource;
 
+// SAFETY: `dlmalloc::Allocator` trusts its implementer to hand out memory the
+// caller owns exclusively until it comes back through `free`/`free_part`, at
+// the size `alloc` itself reported — dlmalloc never touches memory outside
+// the `(ptr, size)` pair it was given. `alloc` here always answers in whole
+// `PAGE_2M` pages from `pmm::alloc_page`, so `free`'s `PhysPage::from_raw`
+// only ever reconstructs a page `pmm` actually handed out at that address —
+// `free` is what returns it, never a bare drop. `remap`/`free_part`/
+// `can_release_part` all refuse (null or `false`), so dlmalloc can never ask
+// this source to reshape a live allocation into something that no longer
+// matches a real page's bounds.
 unsafe impl dlmalloc::Allocator for KernelPageSource {
     fn alloc(&self, size: usize) -> (*mut u8, usize, u32) {
         if size > PAGE_2M as usize {
@@ -87,6 +97,21 @@ impl KernelAllocator {
     }
 }
 
+// SAFETY: `GlobalAlloc` requires `alloc(layout)` to return either null or
+// `layout.size()` bytes valid for reads/writes at `layout.align()`, and
+// `dealloc(ptr, layout)` to only ever be called with the exact `(ptr,
+// layout)` pair a prior `alloc` on this same allocator returned — Rust's
+// allocation machinery (`Box`, `Vec`, `Arc`, …) is the caller and upholds
+// that pairing by construction. The three phases keep the contract true
+// across boot: a pointer `alloc` minted during `PHASE_EARLY` (out of
+// `EARLY_BUF`, bump-allocated) is recognized on `dealloc` by address range
+// (`is_early_ptr`), not by re-reading the current phase, so it is freed
+// correctly even after `init()` has since switched the allocator to
+// `PHASE_READY`; a `PHASE_READY` pointer is always one `dlm.malloc` itself
+// returned, freed through the same `dlmalloc` instance, per dlmalloc's own
+// bookkeeping. The struct's own DESIGN RULE is what keeps every path here
+// panic-free, which is load-bearing: `dlmalloc.lock()` cannot be poisoned
+// and recovered from.
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         match self.phase.load(Ordering::Acquire) {

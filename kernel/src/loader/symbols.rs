@@ -150,6 +150,11 @@ pub fn read_backtrace_table(
         || crate::elf::read_backing_into(
             backing,
             strs.offset,
+            // SAFETY: `pages` is `PageAlloc::new(total, ...)` with `total ==
+            // syms.size + strs.size` above, so `dst.add(syms.size)` stays
+            // inside it — this call and the one above partition the whole
+            // allocation into exactly its two halves, with nothing left
+            // over and nothing overlapping.
             unsafe { dst.add(syms.size as usize) },
             strs.size as usize,
         )
