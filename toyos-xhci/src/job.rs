@@ -4,6 +4,15 @@
 //! and to say it in a form a later pass can compare an arriving event against.
 //! That is all this is: what ends the wait, when the wait stops being worth
 //! having, and the answer once one arrives.
+//!
+//! **What it is waiting for is always a TRB address**, on the command ring and
+//! on a transfer ring alike, because that is the only name an event carries
+//! that belongs to one operation and to no other. Every coarser answer this
+//! file could give — the next command completion, the next completion on an
+//! endpoint, one more of two — is spendable by whatever arrives next, and a
+//! driver that stopped waiting for something the device is still going to
+//! answer is precisely what produces that arrival. [`Await`] carries it in
+//! full.
 
 use crate::port::Nanos;
 
