@@ -225,8 +225,8 @@ fn launch_forever<'a>(
         // so leaving `i` alone visits each connection exactly once.
         let mut i = 0;
         while i < pending.len() {
-            let fd = pending[i].conn.fd();
-            if !ready.contains(&(TOKEN_PENDING_BASE + fd.0 as u64)) {
+            let handle = pending[i].conn.fd();
+            if !ready.contains(&(TOKEN_PENDING_BASE + handle.0 as u64)) {
                 i += 1;
                 continue;
             }
@@ -246,7 +246,7 @@ fn launch_forever<'a>(
                     say!(
                         "init: launcher: dropping client {} — it sent a frame this protocol \
                          cannot describe",
-                        fd.0
+                        handle.0
                     );
                     pending.remove(i);
                 }
