@@ -25,6 +25,29 @@ if [ -z "$tag" ]; then
 fi
 echo "toolchain: $tag"
 
+# The T14 image mounts a runner-local cache here. A complete content-keyed
+# entry is linked in place without an API call, a 401 MiB download or another
+# extraction. GitHub-hosted containers do not set TOYOS_LOCAL_CACHE and retain
+# the established release-download path below.
+cache=${TOYOS_LOCAL_CACHE:-}
+cache_entry=""
+if [ -n "$cache" ]; then
+  case "$tag" in
+    toolchain-linux-x86_64-[0-9a-f][0-9a-f]*) ;;
+    *) echo "::error::refusing malformed toolchain cache tag: $tag"; exit 1 ;;
+  esac
+  cache_entry="$cache/toolchains/$tag"
+  stage2="$cache_entry/x86_64-unknown-linux-gnu/stage2"
+  if [ -f "$cache_entry/.complete" ] && [ -x "$stage2/bin/rustc" ]; then
+    echo "local toolchain cache hit: $tag"
+    rustup toolchain link toyos "$stage2"
+    "$stage2/bin/rustc" -vV
+    exit 0
+  fi
+  mkdir -p "$cache_entry"
+  find "$cache_entry" -mindepth 1 -delete
+fi
+
 api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag"
 asset=""
 for _ in $(seq 10); do
@@ -52,12 +75,14 @@ fi
 # after its own attempts are spent. The unpack is inside the loop because a
 # truncated body is a `zstd` failure rather than a `curl` one, and retrying
 # without it would install a corrupt toolchain and blame the compiler.
+extract_root=rust/build
+[ -z "$cache_entry" ] || extract_root=$cache_entry
 for attempt in 1 2 3; do
   if curl -sSL --retry 3 --retry-all-errors --retry-delay 5 \
        -H "Authorization: Bearer $GH_TOKEN" \
        -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst \
-     && mkdir -p rust/build \
-     && zstd -dc /tmp/t.tar.zst | tar -C rust/build -x; then
+     && mkdir -p "$extract_root" \
+     && zstd -dc /tmp/t.tar.zst | tar -C "$extract_root" -x; then
     break
   fi
   if [ "$attempt" = 3 ]; then
@@ -69,6 +94,11 @@ for attempt in 1 2 3; do
   rm -f /tmp/t.tar.zst
   sleep 10
 done
-stage2="$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+stage2="$extract_root/x86_64-unknown-linux-gnu/stage2"
+if [ -n "$cache_entry" ]; then
+  "$stage2/bin/rustc" -vV
+  touch "$cache_entry/.complete"
+  echo "local toolchain cache filled: $tag"
+fi
 rustup toolchain link toyos "$stage2"
 "$stage2/bin/rustc" -vV

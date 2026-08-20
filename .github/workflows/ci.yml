@@ -3,8 +3,10 @@ name: ci
 # The guest suite: twelve KVM shards on GitHub-hosted Linux x86_64, or one
 # complete 1/1 lane on the persistent T14. Both shapes own one booted kernel at
 # a time and run exactly the Fast tier as a partition — every Fast test runs
-# exactly once per run. The T14 shape pays for its container, Rust toolchain and
-# 1.5 GiB build-cache restore once instead of twelve times. `ci/**` is where
+# exactly once per run. The T14 shape pulls its prepared image from a loopback
+# registry and builds directly in content-keyed local storage; it downloads no
+# apt, Rust, custom-toolchain or build-cache payload on a warm run. `ci/**` is
+# where
 # throwaway probe branches live; they trigger their own workflows and not this
 # one.
 #
@@ -117,7 +119,7 @@ jobs:
       fail-fast: false
       # Hosted work keeps the twelve-way matrix it has always used. The T14 is
       # already one physical benchmark host, so one 1/1 lane runs the complete
-      # selection after paying setup and remote-cache costs once.
+      # selection after paying setup costs once.
       max-parallel: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 12 || 1 }}
       matrix:
         shard: ${{ fromJSON((github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '[1,2,3,4,5,6,7,8,9,10,11,12]' || '[1]') }}
@@ -131,14 +133,15 @@ jobs:
     # with no chmod: the node ships `crw-rw---- root:kvm` and root opens it.
     # `kvm_usable` opens the device and every boot follows.
     container:
-      image: debian:sid
-      options: --device=/dev/kvm
+      image: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'debian:sid' || '127.0.0.1:5000/toyos-ci@sha256:ed1b6b269e6bfe9aedd4334aaea05ee51d1c66e300c6b8fbb5a75ef5c24a241b' }}
+      options: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '--device=/dev/kvm' || '--device=/dev/kvm --volume=/home/t14/actions-runner-cache:/toyos-cache' }}
     steps:
       # Before the checkout: `actions/checkout` wants git and this image has
       # none. Three attempts, since `sid` is a rolling release and its mirror
       # is not a fixed artifact — `guest-suite` is required, so a mirror blip
       # must not be able to block a merge.
       - name: deps
+        if: runner.name != 't14'
         run: |
           got=no
           for attempt in 1 2 3; do
@@ -176,17 +179,8 @@ jobs:
                 HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)" \
             >> "$GITHUB_OUTPUT"
 
-      # A self-hosted container job's /github/home persists outside Docker.
-      # A cancelled rustup can therefore strand a directory with no manifest.
-      # Hosted runners are ephemeral and retain their established path.
-      - name: fresh Rustup state on the persistent runner
-        if: runner.name == 't14'
-        run: |
-          for dir in "$HOME/.cargo" "$HOME/.rustup"; do
-            [ ! -d "$dir" ] || find "$dir" -mindepth 1 -delete
-          done
-
       - name: rust
+        if: runner.name != 't14'
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain stable
@@ -197,6 +191,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.key.outputs.tag }}
         run: .github/install-toolchain.sh
+
+      - name: local build cache
+        if: runner.name == 't14'
+        env:
+          TAG: ${{ steps.key.outputs.tag }}
+        run: sh .github/runner/link-build-cache.sh
 
       # The key is the toolchain tag first, the lockfiles second: cargo cannot
       # see the sysroot (`toyos-abi`, `toyos`, `userland/libc`), so its
@@ -211,10 +211,9 @@ jobs:
       # third-party.
       #
       # On GitHub-hosted work `cache-writer` is the single writer and the twelve
-      # shards only read. The T14's one full lane saves its own completed build
-      # below, avoiding a second job with the same setup and restore. A nightly
-      # run never writes, and a cache written on `main` is the one every branch
-      # can restore.
+      # shards only read. The T14 uses the exact content-keyed directory linked
+      # above and updates it in place, so it neither downloads nor uploads a
+      # GitHub cache.
       #
       # `toyos-ld/target` and `toyos-cc/target` used to be on this list and are
       # not directories any more: both crates are members of the host workspace
@@ -222,6 +221,7 @@ jobs:
       # host halves and guest halves alike — into `target`, which is already
       # here. Naming a path that does not exist caches nothing and says nothing.
       - uses: actions/cache/restore@v4
+        if: runner.name != 't14'
         with:
           path: |
             ~/.cargo/registry/index
@@ -258,25 +258,6 @@ jobs:
             --shard ${{ matrix.shard }}/$SHARD_COUNT --jobs 1 --host-slots 0 \
             $SUITE_TIER_ARGS 2>&1 \
             | tee /tmp/suite.log
-
-      # The hosted matrix retains its separate writer. On the persistent T14,
-      # this is the only lane and therefore the only process that can populate
-      # this run's key; saving here avoids downloading and extracting the same
-      # cache in a second container job.
-      - uses: actions/cache/save@v4
-        if: success() && runner.name == 't14' && github.event_name != 'schedule'
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-            target
-            kernel/target
-            bootloader/target
-            userland/target
-            tests/target
-            tests/toyos-rust-tests/*/target
-          key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
 
       # `cargo test` runs several binaries and each prints a `test result:`
       # line; the line grepped here is the suite's own, the one that
@@ -354,7 +335,8 @@ jobs:
     runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || 'toyos' }}
     timeout-minutes: 60
     container:
-      image: debian:sid
+      image: 127.0.0.1:5000/toyos-ci@sha256:ed1b6b269e6bfe9aedd4334aaea05ee51d1c66e300c6b8fbb5a75ef5c24a241b
+      options: --volume=/home/t14/actions-runner-cache:/toyos-cache
     steps:
       - name: the toolchain built
         run: |
@@ -363,6 +345,7 @@ jobs:
 
       # Three attempts, for the reason the shards' own `deps` step carries.
       - name: deps
+        if: runner.name != 't14'
         run: |
           got=no
           for attempt in 1 2 3; do
@@ -398,14 +381,8 @@ jobs:
                 HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)" \
             >> "$GITHUB_OUTPUT"
 
-      - name: fresh Rustup state on the persistent runner
-        if: runner.name == 't14'
-        run: |
-          for dir in "$HOME/.cargo" "$HOME/.rustup"; do
-            [ ! -d "$dir" ] || find "$dir" -mindepth 1 -delete
-          done
-
       - name: rust
+        if: runner.name != 't14'
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain stable
@@ -417,9 +394,16 @@ jobs:
           TAG: ${{ steps.key.outputs.tag }}
         run: .github/install-toolchain.sh
 
-      # Restore only: this nightly/dispatch canary never owns the KVM build
-      # cache (`guest`'s restore and conditional save carry the full argument).
+      - name: local build cache
+        if: runner.name == 't14'
+        env:
+          TAG: ${{ steps.key.outputs.tag }}
+        run: sh .github/runner/link-build-cache.sh
+
+      # A hosted canary restores only. The T14 has already linked the same local
+      # content-keyed build directory the KVM lane uses.
       - uses: actions/cache/restore@v4
+        if: runner.name != 't14'
         with:
           path: |
             ~/.cargo/registry/index
@@ -438,9 +422,9 @@ jobs:
         run: cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats
 
   # GitHub-hosted work retains its single cache writer exactly as before. The
-  # T14's one full guest lane saves the same key itself, so starting this second
-  # container there would only repeat apt, Rust, the 401 MiB toolchain and the
-  # 1.5 GiB cache restore. Same build and the same one fast test as a hosted
+  # T14's one full guest lane updates its local content-keyed directory itself,
+  # so starting this second container there would only repeat setup. Same build
+  # and the same one fast test as a hosted
   # shard, under KVM rather than TCG — what gets cached does not depend on which
   # accelerator produced it. `guest-suite` accepts `skipped` here because that
   # means either the established nightly rule or the T14 single-lane path.
@@ -562,6 +546,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: actions/cache@v4
+        if: runner.name != 't14'
         with:
           path: |
             ~/.cargo/registry/index
@@ -588,6 +573,9 @@ jobs:
       - name: merge durations
         run: |
           set -o pipefail
+          if [ "${{ runner.name }}" = t14 ]; then
+            export CARGO_TARGET_DIR=/home/t14/actions-runner-cache/host-target
+          fi
           if ! ls /tmp/durations/*/test-durations.shard-* >/dev/null 2>&1; then
             echo "no shard left a measurement: ${{ needs.guest.result }}"
             echo "- no shard measured anything (\`guest\`: ${{ needs.guest.result }})" \

@@ -38,6 +38,7 @@ jobs:
           fetch-depth: 0
 
       - uses: actions/cache@v4
+        if: runner.name != 't14'
         with:
           path: |
             ~/.cargo/registry/index
@@ -52,6 +53,9 @@ jobs:
       # protection rule then has an opinion about.
       - name: the ABI-first rule
         run: |
+          if [ "${{ runner.name }}" = t14 ]; then
+            export CARGO_TARGET_DIR=/home/t14/actions-runner-cache/host-target
+          fi
           if [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "not a pull request: this rule is about a branch against its base."
             exit 0

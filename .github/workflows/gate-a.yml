@@ -1,8 +1,8 @@
 name: gate A, thorough
 
-# `tests/audio-baseline.toml`'s thorough tier, one audio test per job. N boots
-# per config taken strictly one at a time, and each job's guest has a runner to
-# itself — the quiet host the recorded sample was attested on.
+# `tests/audio-baseline.toml`'s thorough tier, N boots per config taken strictly
+# one at a time in one full partition. The job's guest has the runner to itself
+# — the quiet host the recorded sample was attested on.
 #
 # Same `debian:sid`/QEMU 11.1.0 container the twelve shards run, since a QEMU
 # version this job does not share with the rest of CI and the dev host would
@@ -42,12 +42,12 @@ jobs:
       # another runner is later given the `toyos` label.
       max-parallel: 1
       matrix:
-        shard: [1, 2]
+        shard: [1]
     # `--device=/dev/kvm` and root inside the container, exactly as the shards:
     # the node ships `crw-rw---- root:kvm` and root opens it, with no chmod.
     container:
-      image: debian:sid
-      options: --device=/dev/kvm
+      image: 127.0.0.1:5000/toyos-ci@sha256:ed1b6b269e6bfe9aedd4334aaea05ee51d1c66e300c6b8fbb5a75ef5c24a241b
+      options: --device=/dev/kvm --volume=/home/t14/actions-runner-cache:/toyos-cache
     steps:
       # Before the checkout: `actions/checkout` wants git and this image has
       # none. Three attempts, for the reason `ci.yml`'s own `deps` carries:
@@ -55,6 +55,7 @@ jobs:
       # `ovmf` package: the firmware is `ovmf/` in this repository on every
       # host.
       - name: deps
+        if: runner.name != 't14'
         run: |
           got=no
           for attempt in 1 2 3; do
@@ -83,18 +84,20 @@ jobs:
       - name: the instrument
         run: .github/instrument.sh
 
-      - name: fresh Rustup state on the persistent runner
-        if: runner.name == 't14'
-        run: |
-          for dir in "$HOME/.cargo" "$HOME/.rustup"; do
-            [ ! -d "$dir" ] || find "$dir" -mindepth 1 -delete
-          done
-
       - name: rust
+        if: runner.name != 't14'
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - id: key
+        name: the toolchain this tree needs
+        run: |
+          git config --global --add safe.directory "$PWD"
+          echo "tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)" \
+            >> "$GITHUB_OUTPUT"
 
       # This workflow builds no toolchain and never waits for one: a dispatch
       # runs after the branch's pull request already went through
@@ -104,7 +107,13 @@ jobs:
       - name: install the toolchain
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.key.outputs.tag }}
         run: .github/install-toolchain.sh
+
+      - name: local build cache
+        env:
+          TAG: ${{ steps.key.outputs.tag }}
+        run: sh .github/runner/link-build-cache.sh
 
       # `inputs.iterations || '30'`: a `schedule` event carries no `inputs`,
       # where `workflow_dispatch`'s `required: true, default: '30'` always
@@ -114,7 +123,7 @@ jobs:
         run: |
           cargo test --test toyos-build -- \
             --audio-gate ${{ inputs.iterations || '30' }} \
-            --shard ${{ matrix.shard }}/2 --host-slots 0 2>&1 | tee /tmp/gate-a.log
+            --shard ${{ matrix.shard }}/1 --host-slots 0 2>&1 | tee /tmp/gate-a.log
           exit "${PIPESTATUS[0]}"
 
       - name: gate sample
