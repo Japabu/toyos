@@ -96,6 +96,12 @@ impl Rights {
     /// band do: what can cut the power is exactly what `/bin/init` endowed, and
     /// there is nothing a program can name to reach it otherwise.
     ///
+    /// The kernel mints one capability carrying it, at boot, for `/bin/init`
+    /// (`kernel::loader::spawn_init`). `/bin/toybox` holds a narrowed duplicate
+    /// because `/bin/shutdown` is that binary under another name, and
+    /// `test-runner` holds one because `run shutdown` is how the suite ends a
+    /// guest and reads what reached the volume.
+    ///
     /// [`SYS_SHUTDOWN`]: crate::syscall::SYS_SHUTDOWN
     pub const POWER: Rights = Rights(1 << 10);
 
