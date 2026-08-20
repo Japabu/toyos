@@ -149,13 +149,100 @@ const DIAG_TICK_NS: u64 = 100_000_000;
 
 /// Which context each CPU last switched onto.
 ///
-/// One relaxed store per switch, and the whole of what it buys is the line
-/// `switch_frame_is_wrong` prints: **is a sibling standing on this same
-/// context right now.** That question is the difference between a report and a
-/// diagnosis — nothing else the crash path can reach answers it, because a
-/// `CpuSched` is `!Sync` and a sibling's is unreadable by construction.
+/// One relaxed store per switch, and the whole of what it buys is the question
+/// [`report_contexts`] answers: **is a sibling standing on this same context —
+/// or on this same stack — right now.** That is the difference between a report
+/// and a diagnosis, and nothing else the crash path can reach answers it,
+/// because a `CpuSched` is `!Sync` and a sibling's is unreadable by
+/// construction.
 static RUNNING_CTX: [core::sync::atomic::AtomicU64; crate::sched::MAX_CPUS] =
     [const { core::sync::atomic::AtomicU64::new(0) }; crate::sched::MAX_CPUS];
+
+/// Which CPU is standing on which context, printed on **every** kernel crash.
+///
+/// **The question this answers is the one the whole `BTreeMap`-inside-its-own-
+/// insert class turns on, and until now only one crash in the kernel could ask
+/// it.** A per-CPU scheduler container reading as a value no sequence of
+/// operations on it produces says "something wrote this record"; it does not say
+/// *what*, and the one mechanism anyone has written down for it — two CPUs
+/// executing on one kernel stack — is decided by exactly two facts: whether two
+/// CPUs name one `KernelCtx`, and whether the crashing stack pointer lies inside
+/// a stack that belongs to some other CPU's task. Both are here, and neither
+/// needs a register dump, so a *Rust panic* can now settle what previously only
+/// a `context_switch` fault could hint at.
+///
+/// `rsp` is the crashing frame's stack pointer — the exception frame's for a
+/// fault, the address of a local for a panic; the containment test only needs it
+/// to be somewhere in the stack the crash is running on.
+///
+/// `subject` is the context the flag is asked about: the *incoming* one at
+/// [`switch_frame_is_wrong`], which is the pointer #149's diagnosis found two
+/// CPUs naming, and this CPU's own everywhere else. `None` means the latter.
+///
+/// **It reads a sibling's `KernelCtx` and that is deliberate.** The pointers came
+/// from this kernel's own switch path and address boxed records in the direct
+/// map, which stays mapped whether or not the record has since been freed; the
+/// guard is `is_kernel_addr` plus alignment, the same one `check_switch_frame`
+/// takes before it reads a frame. Nothing here allocates, locks or formats
+/// anything but integers.
+///
+/// A CPU on its **idle** context contributes no stack range: `idle_ctx`'s
+/// `kernel_stack_top` is zero by construction (it is per-CPU and not knowable at
+/// the boot-time init that builds the context), so the containment test simply
+/// does not fire for one. That is a gap in this report and not a claim.
+pub fn report_contexts(rsp: u64, subject: Option<u64>) {
+    let me = percpu::cpu_id() as usize;
+    let count = (crate::arch::smp::cpu_count() as usize).min(crate::sched::MAX_CPUS);
+    let mine = RUNNING_CTX
+        .get(me)
+        .map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Relaxed));
+    let subject = subject.unwrap_or(mine);
+    crate::log!("  Contexts: cpu{me} crashed at rsp={rsp:#018x}, asking about ctx {subject:#x}");
+    for (cpu, slot) in RUNNING_CTX.iter().enumerate().take(count) {
+        let held = slot.load(core::sync::atomic::Ordering::Relaxed);
+        if !crate::mm::is_kernel_addr(held) || !held.is_multiple_of(8) {
+            crate::log!("  cpu{cpu} is on ctx {held:#x} (never switched, or not a context)");
+            continue;
+        }
+        // SAFETY: `held` is a pointer this kernel's own `Hw::switch` stored, to
+        // a boxed `KernelCtx` in the direct map — mapped for the machine's life
+        // whether or not the record it belongs to has since been released.
+        let ctx = unsafe { &*(held as *const KernelCtx) };
+        let top = ctx.kernel_stack_top;
+        let same = held == subject && cpu != me;
+        let on_its_stack = cpu != me
+            && top != 0
+            && rsp <= top
+            && rsp > top.wrapping_sub(crate::process::KERNEL_STACK_SIZE as u64);
+        // **The idle context is named and not numbered.** Its `id` is `None` and
+        // its `kernel_stack_top` is zero by construction, so rendering it as a
+        // task gives `pid=4294967295 stack_top=0x0` — which reads exactly like a
+        // record something has overwritten, and was misread that way the first
+        // time this report was used on a storm capture.
+        match ctx.id {
+            // And a *nonzero* stack top on one is a finding rather than a
+            // rendering detail: nothing in the kernel writes that field after
+            // `idle_ctx` builds it, so a value there is a write that had no
+            // business landing.
+            None => crate::log!(
+                "  cpu{cpu} is on ctx {held:#x} (its idle context) stack_top={top:#018x} \
+                 saved_rsp={:#018x}{}{}",
+                ctx.rsp,
+                if same { "  <== THE SAME CONTEXT" } else { "" },
+                if top == 0 { "" } else { "  <== AN IDLE CONTEXT'S STACK TOP IS ZERO BY CONSTRUCTION" },
+            ),
+            Some(id) => crate::log!(
+                "  cpu{cpu} is on ctx {held:#x} pid={} tid={} stack_top={top:#018x} \
+                 saved_rsp={:#018x}{}{}",
+                id.0.raw(),
+                id.1.raw(),
+                ctx.rsp,
+                if same { "  <== THE SAME CONTEXT" } else { "" },
+                if on_its_stack { "  <== AND THIS CRASH IS ON THAT STACK" } else { "" },
+            ),
+        }
+    }
+}
 
 /// The frame `context_switch` is about to pop, when its return slot is not a
 /// return address.
@@ -191,15 +278,7 @@ fn switch_frame_is_wrong(ctx: &KernelCtx, token: &RunToken<KernelPayload>) -> ! 
         token.incoming().map(|k| k.0),
         token.outgoing().map(|k| k.0),
     );
-    let me = ctx as *const KernelCtx as u64;
-    for (cpu, slot) in RUNNING_CTX.iter().enumerate().take(crate::arch::smp::cpu_count() as usize)
-    {
-        let held = slot.load(core::sync::atomic::Ordering::Relaxed);
-        crate::log!(
-            "  cpu{cpu} is on ctx {held:#x}{}",
-            if held == me { "  <== THE SAME CONTEXT" } else { "" }
-        );
-    }
+    report_contexts(rsp, Some(ctx as *const KernelCtx as u64));
     if crate::mm::is_kernel_addr(rsp) && rsp.is_multiple_of(8) {
         const NAMES: [&str; 8] =
             ["r15", "r14", "r13", "r12", "rbx", "rbp", "rflags", "ret"];

@@ -207,6 +207,11 @@ pub fn in_pass() -> bool {
 
 /// The only accessor. Panics on reentry: the busy flag is the typed
 /// replacement for `IN_SCHEDULE`, and a nested pass would alias `&mut`.
+///
+/// **It is also the whole of the window the tripwire watches.** Nothing else in
+/// the kernel writes `SCHEDS`: `init` fills it before any AP is released and
+/// [`try_with_cpu`] only reads, so between one exit from here and the next entry
+/// the record is a thing no code may change. `sched-tripwire` holds it to that.
 fn with_cpu<R>(f: impl FnOnce(&mut CpuSched<KernelPayload>) -> R) -> R {
     let cpu = percpu::cpu_id() as usize;
     assert!(
@@ -217,9 +222,182 @@ fn with_cpu<R>(f: impl FnOnce(&mut CpuSched<KernelPayload>) -> R) -> R {
     // this slot.
     let sched = unsafe { (*SCHEDS[cpu].0.get()).as_mut() }
         .unwrap_or_else(|| panic!("cpu {cpu} has no CpuSched"));
-    let result = f(sched);
+    #[cfg(feature = "sched-tripwire")]
+    tripwire::verify(cpu, sched);
+    let result = f(&mut *sched);
+    #[cfg(feature = "sched-tripwire")]
+    tripwire::record(cpu, sched);
     IN_PASS[cpu].store(false, Ordering::Release);
     result
+}
+
+/// The stray-write tripwire's storage and its two halves.
+///
+/// **What it is for.** Four kernel deaths are on record — 2026-08-19 and
+/// 2026-08-20, all under a loaded boot — whose entire content is a per-CPU
+/// scheduler record reading as a value no operation on it produces: a `BTreeMap`
+/// walked with `root == None` and `length != 0`, a `BTreeMap` node whose `len`
+/// overran its own key storage, and twice this file's own
+/// `cpu {n} has no CpuSched` on a CPU that had already completed a pass. Each is
+/// a *word that changed*, and the reports say only that one did. This says which
+/// word, in which field, from what to what — and prints
+/// [`crate::hw::report_contexts`] beside it, which is the other half of the one
+/// mechanism anyone has written down for the class.
+///
+/// **The shadow is per CPU and touched by that CPU alone**, inside `with_cpu`'s
+/// exclusive region, which is why an `UnsafeCell` is enough and no lock is
+/// wanted: this runs on the path a pass takes.
+#[cfg(feature = "sched-tripwire")]
+mod tripwire {
+    use super::{CpuSched, KernelPayload, MAX_CPUS};
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    /// Words of shadow per CPU, checked against the record it shadows below.
+    const WORDS: usize = 96;
+    const _: () = assert!(
+        core::mem::size_of::<CpuSched<KernelPayload>>().div_ceil(8) <= WORDS,
+        "the CpuSched outgrew its shadow: raise WORDS",
+    );
+
+    struct Shadow {
+        words: UnsafeCell<[u64; WORDS]>,
+        taken: AtomicBool,
+    }
+
+    // SAFETY: each element is read and written by the CPU whose index it is and
+    // by no other, inside `with_cpu`'s exclusive region.
+    unsafe impl Sync for Shadow {}
+
+    static SHADOW: [Shadow; MAX_CPUS] = [const {
+        Shadow {
+            words: UnsafeCell::new([0; WORDS]),
+            taken: AtomicBool::new(false),
+        }
+    }; MAX_CPUS];
+
+    /// The record's bytes as little-endian words, with the words covering the
+    /// one remotely-written field read back as zero.
+    ///
+    /// Byte reads rather than word reads, so a record whose size is not a
+    /// multiple of eight is not read past its own end. Volatile, because what
+    /// this wants is what is in the memory and not what the abstract machine
+    /// says should be.
+    fn snapshot(sched: &CpuSched<KernelPayload>, out: &mut [u64; WORDS]) {
+        let base = (sched as *const CpuSched<KernelPayload>).cast::<u8>();
+        let size = core::mem::size_of::<CpuSched<KernelPayload>>();
+        let (lo, hi) = CpuSched::<KernelPayload>::tripwire_remote_range();
+        for (i, word) in out.iter_mut().enumerate().take(size.div_ceil(8)) {
+            let off = i * 8;
+            if off < hi && off + 8 > lo {
+                *word = 0;
+                continue;
+            }
+            let mut bytes = [0u8; 8];
+            for (k, byte) in bytes.iter_mut().enumerate() {
+                if off + k >= size {
+                    break;
+                }
+                // SAFETY: `off + k < size`, so this addresses a byte of the very
+                // record `sched` borrows.
+                *byte = unsafe { core::ptr::read_volatile(base.add(off + k)) };
+            }
+            *word = u64::from_le_bytes(bytes);
+        }
+    }
+
+    /// Leaving the exclusive region: this is what the record is expected to
+    /// still look like when it is next entered.
+    pub fn record(cpu: usize, sched: &CpuSched<KernelPayload>) {
+        // Walked at *both* ends, which is what makes a red say when. A container
+        // that walks straight here and crookedly at the next entry was broken
+        // while no pass held the record; one that walks straight at entry and
+        // crookedly here was broken by the pass in between. Neither statement is
+        // available from one end alone.
+        walk(cpu, sched);
+        // SAFETY: this CPU's own slot, inside the exclusive region.
+        let slot = unsafe { &mut *SHADOW[cpu].words.get() };
+        snapshot(sched, slot);
+        SHADOW[cpu].taken.store(true, Ordering::Relaxed);
+    }
+
+    /// Entering it: anything that differs was written by something with no
+    /// business writing it.
+    pub fn verify(cpu: usize, sched: &CpuSched<KernelPayload>) {
+        if !SHADOW[cpu].taken.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut now = [0u64; WORDS];
+        snapshot(sched, &mut now);
+        // SAFETY: as `record`.
+        let was = unsafe { &*SHADOW[cpu].words.get() };
+        let words = CpuSched::<KernelPayload>::tripwire_words();
+        let mut hit = false;
+        for i in 0..words {
+            if was[i] == now[i] {
+                continue;
+            }
+            if !hit {
+                crate::log!("A STRAY WRITE REACHED cpu{cpu}'s CpuSched while no pass held it:");
+                hit = true;
+            }
+            crate::log!(
+                "  +{:#05x} {} was {:#018x}, is {:#018x}",
+                i * 8,
+                CpuSched::<KernelPayload>::tripwire_field(i * 8),
+                was[i],
+                now[i],
+            );
+        }
+        if hit {
+            let here = 0u64;
+            crate::hw::report_contexts(core::ptr::addr_of!(here) as u64, None);
+            panic!("cpu {cpu}: a stray write reached its CpuSched");
+        }
+        walk(cpu, sched);
+    }
+
+    /// The shadow covers this record's own bytes and says nothing about the heap
+    /// its three containers hang off — and the deaths this exists for are a
+    /// `BTreeMap` **node** as often as a `BTreeMap` header. So the containers are
+    /// walked here too.
+    ///
+    /// **What a red here buys is the moment.** A walk that panics or disagrees at
+    /// the *entry* to a pass proves the container was already broken before that
+    /// pass ran a single statement, which is what separates "this pass did it"
+    /// from "something wrote it while no pass held the record" — and combined
+    /// with a clean byte diff one line above, it says the write landed in the
+    /// heap rather than in the record.
+    /// **Every element is touched, and `count()` alone would not have been a
+    /// walk.** `RunQueue::tasks` is a `Chain` of two `ExactSizeIterator`s, so a
+    /// bare `.count()` is free for the optimiser to fold into the two lengths —
+    /// which is precisely the number the assertion would then be comparing it
+    /// against. Reading each task's key forces the traversal and the deref of
+    /// the record behind it, which is where a broken node is met.
+    fn walk(cpu: usize, sched: &CpuSched<KernelPayload>) {
+        let mut walked = 0usize;
+        let mut fingerprint = 0u64;
+        for task in sched.rq().tasks() {
+            walked += 1;
+            fingerprint ^= task.key().0;
+        }
+        assert_eq!(
+            walked,
+            sched.rq().len(),
+            "cpu {cpu}: the ready band walks {walked} tasks and calls itself {} long",
+            sched.rq().len(),
+        );
+        // Walked for the walk's sake: a corrupt node fails inside the iterator,
+        // which is the report wanted, and neither of these publishes a second
+        // length to disagree with.
+        for parked in sched.parked() {
+            fingerprint ^= parked.key().0;
+        }
+        for dying in sched.dying() {
+            fingerprint ^= dying.key().0;
+        }
+        core::hint::black_box(fingerprint);
+    }
 }
 
 /// A read-only peek for diagnostics that must not fail while a pass runs.
