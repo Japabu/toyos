@@ -42,10 +42,13 @@ link_target kernel/target
 link_target bootloader/target
 link_target userland/target
 link_target tests/target
+link_target tests/toyos-rust-tests/target
 
 find tests/toyos-rust-tests -mindepth 1 -maxdepth 1 -type d -print \
   | LC_ALL=C sort \
-  | while IFS= read -r crate; do link_target "$crate/target"; done
+  | while IFS= read -r crate; do
+      [ -f "$crate/Cargo.toml" ] || continue
+      link_target "$crate/target"
+    done
 
 echo "local build cache: $key"
-

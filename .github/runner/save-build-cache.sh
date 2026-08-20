@@ -54,9 +54,13 @@ save_target kernel/target
 save_target bootloader/target
 save_target userland/target
 save_target tests/target
+save_target tests/toyos-rust-tests/target
 
 find tests/toyos-rust-tests -mindepth 1 -maxdepth 1 -type d -print \
   | LC_ALL=C sort \
-  | while IFS= read -r crate; do save_target "$crate/target"; done
+  | while IFS= read -r crate; do
+      [ -f "$crate/Cargo.toml" ] || continue
+      save_target "$crate/target"
+    done
 
 touch "$root/.last-used"
