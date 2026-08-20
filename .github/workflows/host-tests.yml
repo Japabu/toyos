@@ -96,9 +96,8 @@ jobs:
       # guest the harness boots is built with `boot-actuators`, and several
       # configs add `test-actuators`, so a clippy pass over the default set
       # alone never sees the code behind either `cfg` — six findings, in six
-      # files, went unlinted this way until
-      # `issues/build/kernel-clippy-runs-without-the-actuator-features.md`
-      # measured it. The fix is a second kernel invocation naming both
+      # files, went unlinted this way until the gap was measured and closed
+      # (2026-08-20). The fix is a second kernel invocation naming both
       # features, in the same step rather than a new job, for the reason
       # above. `boot-actuators,test-actuators` is the whole of what default
       # clippy was missing: `kernel/Cargo.toml` declares twelve more features

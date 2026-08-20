@@ -162,6 +162,21 @@ actuators! {
     /// See `kernel/src/usb_gate.rs`.
     usb_storage_gate = "usb-storage-gate";
 
+    /// Ask the NVMe disk for a block with the caller's operation budget already
+    /// spent, once, as soon as the page cache has the device — under both of
+    /// its locks, which is where every real caller asks from.
+    ///
+    /// `block::OPERATION` bounds a controller that answers every command and
+    /// takes too long over the composition above them, and nothing on the host
+    /// side reaches that state: QEMU's NVMe answers in microseconds and
+    /// `rerror`/`werror` fail a command rather than delaying one, so a disk slow
+    /// enough to reach two seconds cannot be staged and an injection that faked
+    /// one would have to spend the two seconds. An operation that is already
+    /// over is established instead. Armed by `cache_eviction`, which is the
+    /// registered name that already boots this kernel on a real namespace.
+    /// See `kernel/src/nvme_gate.rs`.
+    nvme_spent_budget = "nvme-spent-budget";
+
     /// Answer SYNCHRONIZE CACHE with the ILLEGAL REQUEST / INVALID COMMAND
     /// OPERATION CODE a stick with no write cache gives. QEMU's `scsi-disk`
     /// implements 0x35 for every front end that reaches it, so the difference

@@ -9067,13 +9067,32 @@ fn run_machine_test(
                 .join(format!("test-nvme-{}.img", qemu::NVME_T14_BYTES));
             let _ = fs::remove_file(&stale);
 
+            // `nvme-spent-budget` rides this boot rather than buying a
+            // registered name of its own: it needs the test kernel and a real
+            // NVMe namespace, which is what this test already boots, and what
+            // it costs is one refused read before anything mounts the device —
+            // no command issued, no cache slot taken, and so nothing the
+            // eviction series below can see.
             let options = BootOptions {
                 profile: qemu::Profile::MetalDisk,
-                kernel_params: &["test-small-caches"],
+                kernel_params: &["test-small-caches", "nvme-spent-budget"],
                 ..Default::default()
             };
             let mut qemu = QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
             let boot = qemu.boot_log().to_string();
+
+            // The NVMe half of `block::OPERATION`. `usb-storage-gate` asserts
+            // the same refusal on the USB path; this is the one taken with both
+            // page-cache locks held, which is what made a missing deadline a
+            // wedged CPU rather than a slow read.
+            //
+            // Both lines, and the second is the one easy to leave out: a driver
+            // that refused by abandoning a command in flight would pass the
+            // first and fail here, because the queue would still be owed a
+            // completion and the DMA window still owed a write.
+            let console = serial::Serial::named("boot console", boot.as_str());
+            console.must_say("nvme-gate: read with a spent budget refused=true")?;
+            console.must_say("nvme-gate: the same block read afterwards ok=true")?;
 
             let Some(file_budget) = parse_cache_budget(&boot, "file cache: budget ") else {
                 return Err(format!("the file cache printed no budget:\n{boot}"));
