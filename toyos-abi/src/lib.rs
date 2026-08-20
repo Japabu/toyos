@@ -7,8 +7,8 @@ pub mod audio;
 pub mod boot;
 pub mod handle;
 pub mod hda;
+pub mod inbox;
 pub mod input;
-pub mod io_uring;
 pub mod log;
 pub mod net;
 pub mod ring;
@@ -17,7 +17,7 @@ pub mod virtio_sound;
 
 pub use handle::{RawHandle, Rights, HANDLE_INVALID};
 
-/// A process ID. Identifies a process — owns address space, FDs, vruntime.
+/// A process ID. Identifies a process — owns address space, handles, vruntime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Pid(pub u32);
 

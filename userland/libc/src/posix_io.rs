@@ -494,9 +494,9 @@ pub unsafe extern "C" fn poll(fds: *mut pollfd, nfds: u32, timeout: i32) -> i32 
     for i in 0..n {
         let pfd = &*fds.add(i);
         let mut flags = 0u32;
-        if pfd.events & POLLIN != 0 { flags |= toyos::poller::IORING_POLL_IN; }
-        if pfd.events & POLLOUT != 0 { flags |= toyos::poller::IORING_POLL_OUT; }
-        poller.poll_add_fd(toyos_abi::RawHandle(pfd.fd as u32), flags, i as u64);
+        if pfd.events & POLLIN != 0 { flags |= toyos::poller::READABLE; }
+        if pfd.events & POLLOUT != 0 { flags |= toyos::poller::WRITABLE; }
+        poller.watch_raw(toyos_abi::RawHandle(pfd.fd as u32), flags, i as u64);
     }
 
     let mut ready_set = alloc::vec![false; n];

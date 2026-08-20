@@ -1,6 +1,6 @@
 //! Wire-format types for HID input devices (keyboard, mouse).
 //!
-//! These cross the kernel→userland boundary via file descriptor reads.
+//! These cross the kernel→userland boundary as reads on a device handle.
 
 /// Keyboard modifier flags.
 pub const MOD_SHIFT: u8 = 1;
@@ -9,7 +9,7 @@ pub const MOD_ALT: u8 = 4;
 pub const MOD_GUI: u8 = 8;
 pub const MOD_RELEASED: u8 = 0x10;
 
-/// One key transition, as the kernel delivers it through the keyboard fd.
+/// One key transition, as the kernel delivers it through the keyboard handle.
 ///
 /// The whole of what the kernel knows about a key: which physical key moved,
 /// which way, and what the machine's modifiers were when it did. There is no
@@ -50,7 +50,7 @@ impl RawKeyEvent {
     }
 }
 
-/// A mouse/tablet event as delivered by the kernel through the mouse fd.
+/// A mouse/tablet event as delivered by the kernel through the mouse handle.
 /// Carries absolute coordinates (0–32767) from the USB tablet.
 #[repr(C)]
 #[derive(Clone, Copy)]

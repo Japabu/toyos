@@ -3,7 +3,8 @@ pub mod framebuffer;
 pub use framebuffer::{Color, Framebuffer, Screen, Traffic};
 
 use toyos::ipc;
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::AsHandle;
+use toyos::poller::{Poller, READABLE};
 use toyos::endow::{self, EndowError};
 use toyos::surface;
 use toyos::Connection;
@@ -506,7 +507,7 @@ impl Window {
         if self.closed {
             return None;
         }
-        self.poller.poll_add(&self.conn, IORING_POLL_IN, 0);
+        self.poller.watch(&self.conn, READABLE, 0);
         let mut ready = false;
         self.poller.wait(1, timeout_nanos, |_| ready = true);
         if !ready {
@@ -603,7 +604,7 @@ impl Window {
     }
 
     pub fn handle(&self) -> toyos_abi::RawHandle {
-        self.conn.fd()
+        self.conn.as_handle()
     }
 
     pub fn width(&self) -> u32 {

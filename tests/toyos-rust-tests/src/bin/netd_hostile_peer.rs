@@ -20,6 +20,7 @@ use std::process::exit;
 use std::time::{Duration, Instant};
 
 use toyos::endow;
+use toyos::AsHandle;
 use toyos::ipc::{self, RxStep};
 use toyos::net::{MsgType, RespType};
 use toyos::Connection;
@@ -97,7 +98,7 @@ fn main() {
         let conn = endow::service("netd")
             .unwrap_or_else(|e| panic!("[{}] netd is not serving: {e:?}", case.name));
         if !case.bytes.is_empty() {
-            let written = syscall::write(conn.fd(), &case.bytes)
+            let written = syscall::write(conn.as_handle(), &case.bytes)
                 .unwrap_or_else(|e| panic!("[{}] could not write the frame: {e:?}", case.name));
             assert_eq!(written, case.bytes.len(), "[{}] partial frame write", case.name);
         }
