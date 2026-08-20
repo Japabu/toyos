@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 use super::entry::{restore_user_state, ring3_naked_asm, save_user_state, Ring3Entry};
-use super::{cpu, gdt};
+use super::{cpu, percpu};
 use crate::drivers::acpi;
 use crate::mm::paging::{CachePolicy, Occupancy};
 use crate::user_ptr::{SyscallContext, UserBytes, UserBytesMut};
@@ -164,7 +164,7 @@ pub fn init() {
     let efer = cpu::rdmsr(MSR_EFER);
     cpu::wrmsr(MSR_EFER, efer | 1);
 
-    let star = ((gdt::STAR_SYSRET_BASE as u64) << 48) | ((gdt::KERNEL_CS as u64) << 32);
+    let star = ((percpu::STAR_SYSRET_BASE as u64) << 48) | ((percpu::KERNEL_CS as u64) << 32);
     cpu::wrmsr(MSR_STAR, star);
     // `LSTAR` is an IDT slot by another name: the one thing `syscall` can reach.
     cpu::wrmsr(MSR_LSTAR, Ring3Entry::new(syscall_entry).addr());

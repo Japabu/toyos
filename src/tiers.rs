@@ -628,6 +628,23 @@ pub const RELEGATED: &[Relegated] = &[
                  to run rather than sitting on one side of it: 9,355 ms committed, 10,568 ms \
                  in nightly run 31680778730, 11,073 ms in run 31704997228.",
     },
+    // 2026-08-19: PR #132's run measured it over the line while PR #125's run,
+    // minutes apart on the same main, measured 4,774 ms — the price is the
+    // partition's, not the code's, and Fast's promise has to hold under every
+    // legal partition.
+    Relegated {
+        test: "c_capture_ignores_daemon_lines",
+        ci_ms: 12_612,
+        why: Why::Cost,
+        guards: "A C program's capture is stripped of other processes' lines before the \
+                 comparison, on the boot config's own list of who may speak, with the \
+                 filter turned off as the control. Its own work is two `echo`s and string \
+                 comparisons — no clock in it — so the price is Sched::Parallel \
+                 co-scheduling: 5,241 ms committed, 12,612 ms in run 32301181725 and \
+                 4,774 ms in run 32301828122 the same evening, straddling the 10,000 ms \
+                 line run to run. The next KVM measurements decide whether it returns to \
+                 Fast.",
+    },
 ];
 
 /// The names [`RELEGATED`] holds, which is what `tests/toyos.rs` checks its own

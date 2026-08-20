@@ -4,7 +4,6 @@ pub mod cpu;
 pub mod debug;
 pub mod entry;
 pub mod fpu;
-pub mod gdt;
 pub mod idt;
 pub mod mtrr;
 pub mod pat;

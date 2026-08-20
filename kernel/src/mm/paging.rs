@@ -2,6 +2,32 @@
 //
 // The only code that writes page table entries. Manages the kernel direct map
 // (all physical memory at PHYS_OFFSET) and per-process user address spaces.
+//
+// **An invalidation is derived from the entry that was replaced, never chosen
+// by the caller.** Every write into a paging structure the hardware may already
+// be walking goes through `PageTablePage::write` or `widen`, both of which
+// return the `Owed` their prior value implies; `Owed` is `#[must_use]` and the
+// three ways to end one are the three answers there are. The rule is the SDM's:
+// a not-present entry creates no TLB entry and no paging-structure-cache entry
+// (Vol. 3A §4.10.2.3), so a write over one can leave nothing stale and an
+// `invlpg` there is pure cost — §4.10.4.3 says so as a permission. A write over
+// a present entry is invalidated whatever the caller believes, because a missing
+// invalidation is silent and a redundant one is only slow.
+//
+// **What is discharged here reaches this CPU and no other.** Telling the rest of
+// the machine is `arch::tlb::shootdown`, and it stays the caller's: which other
+// CPUs hold a translation is not knowable from the entry.
+//
+// **No mapping in this kernel is global.** There is no `PAGE_GLOBAL` and
+// `CR4.PGE` is not in `arch::control_regs`'s declaration, which is what makes
+// the single-address forms complete here: INVPCID type 0 and INVLPG both leave
+// global translations alone. Adding PGE means revisiting every `discharge`.
+//
+// **The tagged branches are not exercised on the dev host.** Its QEMU is
+// `-cpu qemu64`, which offers no PCID, so `pcid_active()` is false and a guest
+// there boots holding `cr4=0x00310668` — read out of a harness UART log on
+// 2026-08-19. Only a KVM runner with `-cpu host` executes an `INVPCID` at all,
+// so what answers for those branches is the derivation and not the harness.
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -109,29 +135,123 @@ impl PageTablePage {
         }
     }
 
-    /// Set a leaf PDE (2MB page) and invalidate the TLB entry.
-    /// This is the ONLY way to write a user-space PDE.
-    fn set_pde(&mut self, idx: usize, value: u64, va: u64) {
+    /// Write one entry of a table the hardware may already be walking, and say
+    /// what the write owes the TLB.
+    ///
+    /// The only way to change a live entry, leaf or not: the answer to "does
+    /// this need an invalidation" is the prior value, and this is the only place
+    /// that still has it. `va` is any address the entry covers — for a 2 MiB PDE
+    /// that is the page's own address, for an upper level any address below it.
+    fn write(&mut self, idx: usize, va: u64, value: u64) -> Owed {
+        Owed::of(core::mem::replace(&mut self.0[idx], value), va)
+    }
+
+    /// Widen an upper-level entry, which x86-64 requires to be at least as
+    /// permissive as any leaf below it.
+    ///
+    /// A widening that changes nothing owes nothing, and today none of them
+    /// changes anything: [`AddressSpace::ensure_table`] masks to `TABLE_FLAGS`
+    /// and every live upper entry was created carrying them. One that did would
+    /// owe a flush rather than a hope — a stale narrower paging-structure-cache
+    /// entry raises a spurious fault, which this kernel resolves against no
+    /// region and turns into a dead process.
+    fn widen(&mut self, idx: usize, flags: u64) -> Owed {
+        let before = self.0[idx];
+        self.0[idx] = before | flags;
+        if self.0[idx] == before { Owed::Nothing } else { Owed::Context }
+    }
+
+    /// Write into a table no CPU can be walking yet, because it has not been
+    /// linked into a live paging structure. Nothing can be stale, so nothing is
+    /// returned to discharge.
+    fn init_entry(&mut self, idx: usize, value: u64) {
         self.0[idx] = value;
-        invlpg(va);
+    }
+}
+
+/// What a write into a live paging structure owes this CPU's TLB.
+///
+/// A pure consequence of the entry that was there — [`Owed::of`] is the whole
+/// decision, and it takes the prior entry and nothing else. The caller cannot
+/// pick: it can only say which of the three true things is true, and each of the
+/// three is a claim the site has to be able to defend.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[must_use = "an invalidation that is owed and not discharged is silent"]
+enum Owed {
+    /// Nothing. The slot held a not-present entry, from which no TLB entry and
+    /// no paging-structure-cache entry is ever created (SDM Vol. 3A §4.10.2.3),
+    /// or the write changed no bit.
+    Nothing,
+    /// One linear address, whose leaf changed under it.
+    Address { va: u64, prior: u64 },
+    /// Everything under an upper-level entry whose permissions widened.
+    Context,
+}
+
+impl Owed {
+    /// The decision, as a function of the prior entry alone.
+    fn of(prior: u64, va: u64) -> Self {
+        if prior & PAGE_PRESENT == 0 {
+            Self::Nothing
+        } else {
+            Self::Address { va, prior }
+        }
     }
 
-    /// Clear a leaf PDE and invalidate the TLB entry.
-    fn clear_pde(&mut self, idx: usize, va: u64) {
-        self.0[idx] = 0;
-        invlpg(va);
+    /// Pay it, on this CPU, in the address space the entry belongs to.
+    ///
+    /// `target` is the written address space's `CR3` and never the live one.
+    /// With PCID a TLB entry carries the tag of the address space it came from,
+    /// and `INVPCID` names that tag directly (SDM Vol. 3A §4.10.4.1) — so a
+    /// kernel writing a *child's* tables from the parent's CPU, which
+    /// `loader::map_libs` does on every spawn, invalidates the child's entries
+    /// and not the parent's live ones. Reading `CR3` here instead did the
+    /// opposite of what the site meant on exactly that path.
+    ///
+    /// Without PCID there is no tag to name and none is needed: every `CR3`
+    /// write flushes the whole TLB, so a CPU holds entries for the address space
+    /// it has loaded and for no other, and there is nothing to invalidate for
+    /// one it has not.
+    fn discharge(self, target: Cr3) {
+        match self {
+            Self::Nothing => {}
+            Self::Address { va, .. } => {
+                if pcid_active() {
+                    crate::arch::cpu::invpcid(0, target.pcid() as u64, va);
+                } else if Cr3::current().phys() == target.phys() {
+                    crate::arch::cpu::invlpg(va);
+                }
+            }
+            Self::Context => {
+                if pcid_active() {
+                    crate::arch::cpu::invpcid(1, target.pcid() as u64, 0);
+                } else if Cr3::current().phys() == target.phys() {
+                    flush_tlb_all();
+                }
+            }
+        }
     }
 
-    /// Set a non-leaf entry (PML4E, PDPTE) or kernel entry. No TLB invalidation —
-    /// caller is responsible for flushing when needed (e.g. flush_tlb_all after batch).
-    fn set_entry(&mut self, idx: usize, value: u64) {
-        self.0[idx] = value;
+    /// The write installed into a slot the caller has already proven empty, and
+    /// an empty slot owes nothing.
+    ///
+    /// The proof is this value rather than a check the caller makes and throws
+    /// away: `map_range` used to read the slot, assert it was absent, and then
+    /// invalidate anyway.
+    fn expect_install(self, what: &str) {
+        match self {
+            Self::Nothing => {}
+            Self::Address { va, prior } => {
+                panic!("{what}: an install at {va:#x} found the present entry {prior:#x}")
+            }
+            Self::Context => panic!("{what}: an install widened an upper-level entry"),
+        }
     }
 
-    /// OR flags into an existing non-leaf entry (e.g. adding PAGE_WRITE to a PML4E).
-    fn or_flags(&mut self, idx: usize, flags: u64) {
-        self.0[idx] |= flags;
-    }
+    /// The caller flushes more than this entry could owe before the mapping is
+    /// used — a machine-wide shootdown, or a local full flush for an address
+    /// space only this CPU can be holding. Both subsume a single address.
+    fn subsumed_by_flush(self) {}
 }
 
 impl core::ops::Index<usize> for PageTablePage {
@@ -170,16 +290,6 @@ pub fn flush_tlb_all() {
             let cr3 = crate::arch::cpu::read_cr3();
             crate::arch::cpu::write_cr3(cr3);
         }
-    }
-}
-
-/// Invalidate a single TLB entry for the given address.
-pub fn invlpg(addr: u64) {
-    if pcid_active() {
-        let pcid = crate::arch::cpu::read_cr3() & 0xFFF;
-        crate::arch::cpu::invpcid(0, pcid, addr);
-    } else {
-        crate::arch::cpu::invlpg(addr);
     }
 }
 
@@ -299,7 +409,7 @@ impl AddressSpace {
 
         for i in 256..512 {
             if kernel_as.root[i] & PAGE_PRESENT != 0 {
-                pml4.set_entry(i, kernel_as.root[i]);
+                pml4.init_entry(i, kernel_as.root[i]);
             }
         }
 
@@ -318,6 +428,9 @@ impl AddressSpace {
 
     /// Map a contiguous physical region into user space as 2MB pages.
     /// Asserts: vaddr and phys are 2MB-aligned, all PDE slots are empty.
+    ///
+    /// The empty slots are what makes this free of the TLB: nothing was present,
+    /// so nothing anywhere can be stale, and no CPU is told anything.
     pub fn map_range(
         &mut self,
         vaddr: UserAddr,
@@ -342,15 +455,11 @@ impl AddressSpace {
             if writable {
                 flags |= PAGE_WRITE;
             }
-            let (pml4_idx, pdpt_idx, pd_idx) = indices(va);
+            let pd_idx = indices(va).2;
             let user_flags = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
-            let pd = self.ensure_table(pml4_idx, user_flags, pdpt_idx, user_flags);
-            let existing = pd[pd_idx];
-            assert!(
-                existing & PAGE_PRESENT == 0,
-                "map_range: PDE already present at vaddr {va:#x} (existing={existing:#x})"
-            );
-            pd.set_pde(pd_idx, pa | flags | PAGE_SIZE_BIT, va);
+            let pd = self.ensure_table(va, user_flags, user_flags);
+            pd.write(pd_idx, va, pa | flags | PAGE_SIZE_BIT)
+                .expect_install("map_range");
             offset += PAGE_2M;
         }
     }
@@ -370,6 +479,15 @@ impl AddressSpace {
 
     /// Map a single 2MB page, replacing any existing mapping.
     /// Used by demand paging and shared library RW overlay.
+    ///
+    /// **The invalidation is this method's, and it is derived.** A demand-paging
+    /// fault replaces a not-present PDE — the kernel's hottest paging path — and
+    /// pays nothing for the TLB; a replacement of a live mapping is invalidated
+    /// in *this* address space, whatever this CPU happens to have loaded. What
+    /// the other CPUs are owed is not derivable from the entry and stays with the
+    /// caller: `sys_dlopen` replaces a mapping a sibling thread can be running
+    /// on and shoots down, `loader::map_libs` writes a child no CPU has ever
+    /// loaded and does not.
     pub fn remap(&mut self, vaddr: UserAddr, phys: u64, writable: bool) {
         let va = vaddr.raw();
         assert!(
@@ -386,10 +504,11 @@ impl AddressSpace {
             flags |= PAGE_WRITE;
         }
 
-        let (pml4_idx, pdpt_idx, pd_idx) = indices(va);
+        let pd_idx = indices(va).2;
         let user_flags = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
-        let pd = self.ensure_table(pml4_idx, user_flags, pdpt_idx, user_flags);
-        pd.set_pde(pd_idx, phys | flags | PAGE_SIZE_BIT, va);
+        let target = self.cr3();
+        let pd = self.ensure_table(va, user_flags, user_flags);
+        pd.write(pd_idx, va, phys | flags | PAGE_SIZE_BIT).discharge(target);
     }
 
     /// Unmap one 2MB page and free its physical memory.
@@ -401,12 +520,13 @@ impl AddressSpace {
         );
 
         let (pml4_idx, pdpt_idx, pd_idx) = indices(va);
+        let target = self.cr3();
 
         if let Some(pdpt) = self.root.child_mut(pml4_idx) {
             if let Some(pd) = pdpt.child_mut(pdpt_idx) {
                 let pde = pd[pd_idx];
                 if pde & PAGE_PRESENT != 0 {
-                    pd.clear_pde(pd_idx, va);
+                    pd.write(pd_idx, va, 0).discharge(target);
                     let phys = pde & ADDR_MASK_2M;
                     // Remove the page from our owned list — Drop frees it.
                     // No-op for shared memory pages (not in this map).
@@ -652,17 +772,20 @@ impl AddressSpace {
             );
             let mut pt = Box::new(PageTablePage([0; 512]));
             for i in 0..512 {
-                pt.set_entry(i, (base + i as u64 * 4096) | flags);
+                pt.init_entry(i, (base + i as u64 * 4096) | flags);
             }
             let pt_phys = pt.phys();
             self.children.push(pt);
-            pd.set_entry(pd_idx, pt_phys | PAGE_PRESENT | PAGE_WRITE);
+            // Both writes are covered by the flush below, which is this CPU's
+            // whole TLB and so wider than either could owe.
+            pd.write(pd_idx, virt, pt_phys | PAGE_PRESENT | PAGE_WRITE)
+                .subsumed_by_flush();
         }
 
         let pt = unsafe { PageTablePage::from_phys_mut(pd[pd_idx] & ADDR_MASK) };
         let idx = ((phys >> 12) & 0x1FF) as usize;
         assert!(pt[idx] & PAGE_PRESENT != 0, "guard_4k: {phys:#x} is already unmapped");
-        pt.set_entry(idx, 0);
+        pt.write(idx, virt, 0).subsumed_by_flush();
 
         // This CPU only, and that is sufficient rather than lucky: the page is
         // one CPU's guard, `alloc_idle_stack` runs on the BSP for every CPU,
@@ -684,8 +807,8 @@ impl AddressSpace {
     /// table.
     fn map_2m(&mut self, phys: u64, flags: u64) {
         let virt = super::DirectMap::from_phys(phys).as_ptr::<u8>() as u64;
-        let (pml4_idx, pdpt_idx, pd_idx) = indices(virt);
-        let pd = self.ensure_table(pml4_idx, flags, pdpt_idx, flags);
+        let pd_idx = indices(virt).2;
+        let pd = self.ensure_table(virt, flags, flags);
         let entry = phys | flags | PAGE_SIZE_BIT;
         let existing = pd[pd_idx];
         assert!(
@@ -695,7 +818,11 @@ impl AddressSpace {
                     && CachePolicy::from_pde(existing) == CachePolicy::DeferToMtrr),
             "map_2m: {phys:#x} is mapped {existing:#x} and cannot also be {entry:#x}"
         );
-        pd.set_entry(pd_idx, entry);
+        // Neither caller wants the single address this could owe. [`map_mmio`]
+        // flushes every CPU because the memory type may have changed under a
+        // sibling, which the entry cannot tell it; `init` runs before any TLB
+        // exists and ends by loading `CR3` with a flush.
+        pd.write(pd_idx, virt, entry).subsumed_by_flush();
     }
 
     /// Everything an upper-level entry may carry besides the address of the
@@ -703,32 +830,32 @@ impl AddressSpace {
     /// of a PML4E or PDPTE is part of the next table's physical address, not
     /// the PAT bit it is in a 2 MiB PDE — so both branches below mask, and a
     /// caller passing leaf flags cannot move a page table 4 KiB.
-    fn ensure_table(
-        &mut self,
-        pml4_idx: usize,
-        pml4_flags: u64,
-        pdpt_idx: usize,
-        pdpt_flags: u64,
-    ) -> &mut PageTablePage {
+    fn ensure_table(&mut self, va: u64, pml4_flags: u64, pdpt_flags: u64) -> &mut PageTablePage {
         const TABLE_FLAGS: u64 = PAGE_PRESENT | PAGE_WRITE | PAGE_USER;
+        let (pml4_idx, pdpt_idx, _) = indices(va);
+        let target = self.cr3();
+
         if self.root[pml4_idx] & PAGE_PRESENT == 0 {
             let child = Box::new(PageTablePage([0; 512]));
-            self.root.set_entry(pml4_idx, child.phys() | (pml4_flags & TABLE_FLAGS));
+            self.root
+                .write(pml4_idx, va, child.phys() | (pml4_flags & TABLE_FLAGS))
+                .expect_install("ensure_table: pml4");
             self.children.push(child);
         } else {
             // x86-64: upper-level entries must be at least as permissive as any
             // leaf entry below them. Widen only (OR), never narrow.
-            self.root.or_flags(pml4_idx, pml4_flags & TABLE_FLAGS);
+            self.root.widen(pml4_idx, pml4_flags & TABLE_FLAGS).discharge(target);
         }
 
         let pdpt = unsafe { PageTablePage::from_phys_mut(self.root[pml4_idx] & ADDR_MASK) };
 
         if pdpt[pdpt_idx] & PAGE_PRESENT == 0 {
             let child = Box::new(PageTablePage([0; 512]));
-            pdpt.set_entry(pdpt_idx, child.phys() | (pdpt_flags & TABLE_FLAGS));
+            pdpt.write(pdpt_idx, va, child.phys() | (pdpt_flags & TABLE_FLAGS))
+                .expect_install("ensure_table: pdpt");
             self.children.push(child);
         } else {
-            pdpt.or_flags(pdpt_idx, pdpt_flags & TABLE_FLAGS);
+            pdpt.widen(pdpt_idx, pdpt_flags & TABLE_FLAGS).discharge(target);
         }
 
         unsafe { PageTablePage::from_phys_mut(pdpt[pdpt_idx] & ADDR_MASK) }

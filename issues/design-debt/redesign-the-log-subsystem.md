@@ -1,16 +1,29 @@
 ---
-status: owner
-kind: question
+status: open
+kind: track
 opened: 2026-08-08
+decided: 2026-08-19
 ---
 
-# Redesign the log subsystem, and re-shape `kernel/src`?
+# Redesign the log subsystem, and re-shape `kernel/src`
 
-Recorded verbatim because it is the owner asking, not the owner deciding, and
-because an agent must not answer it on his behalf: *"should we redesign and
-rewrite the log subsystem and rethink if the current file/folder structure of
-the kernel makes sense?"* (`kernel/src/log.rs`). What follows is the evidence
-that makes it decidable, and nothing else.
+**The owner decided on 2026-08-19: go.** Both halves are approved as planned
+work. Sequencing, set by the orchestrator with the ruling: the log core waits
+until pipeline 2's second pull request (the lock conversions behind
+`issues/kernel/every-wait-in-this-kernel-is-a-spin.md`) has landed — the two
+touch the same scheduler-adjacent paths and land one at a time. The directory
+re-shape is a scheduling matter exactly as priced below: one clean pass in a
+window with few worktrees in flight, and never interleaved with a code change.
+
+The target shape stands as reviewed: a log core (ring + context stamping,
+once) with serial, file and screen as independent sinks carrying explicit
+backpressure — a slow sink drops-and-counts, never blocks, does no unbounded
+work in a scheduler-adjacent path, and fails alone.
+
+The original question, recorded verbatim because it was the owner asking:
+*"should we redesign and rewrite the log subsystem and rethink if the current
+file/folder structure of the kernel makes sense?"* (`kernel/src/log.rs`). What
+follows is the evidence that made it decidable.
 
 **The log subsystem, as it exists.** Six places, no core:
 

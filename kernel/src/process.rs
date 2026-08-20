@@ -1635,8 +1635,12 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     }
 
 
+    // No invalidation here, and none inside on the ordinary path: the fault got
+    // here because the PDE was not present, and nothing is cached from one.
+    // `remap` derives that from the entry it replaced — this line used to call
+    // `invlpg` a second time on the kernel's hottest paging path, for an entry
+    // the first call had not needed to invalidate either.
     addr_space.lock().remap(UserAddr::new(region_start), page_alloc.phys(), writable);
-    crate::mm::paging::invlpg(region_start);
 
     data.demand_pages.push(page_alloc);
 

@@ -75,8 +75,8 @@ pub(crate) extern "C" fn process_start() {
         "push r12",         // RIP: entry point
         "iretq",
         unlock = sym crate::sched::driver::trampoline_entry,
-        user_ss = const crate::arch::gdt::USER_DS,
-        user_cs = const crate::arch::gdt::USER_CS,
+        user_ss = const crate::arch::percpu::USER_DS,
+        user_cs = const crate::arch::percpu::USER_CS,
     );
 }
 
@@ -101,8 +101,8 @@ pub(crate) extern "C" fn thread_start() {
         "push r12",
         "iretq",
         unlock = sym crate::sched::driver::trampoline_entry,
-        user_ss = const crate::arch::gdt::USER_DS,
-        user_cs = const crate::arch::gdt::USER_CS,
+        user_ss = const crate::arch::percpu::USER_DS,
+        user_cs = const crate::arch::percpu::USER_CS,
     );
 }
 

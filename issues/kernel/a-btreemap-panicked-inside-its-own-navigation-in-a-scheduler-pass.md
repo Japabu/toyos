@@ -66,7 +66,10 @@ sightings before it are
 `issues/kernel/the-shared-boot-jumped-to-null-spawning-sched-stress.md`,
 `issues/kernel/ring0-jump-to-zero-under-port-polls.md` and
 `issues/kernel/a-ring-0-fetch-at-0x1b-during-a-loaded-boot.md`. Two kernel deaths
-in three runs of one tree, both under host contention, both `ALONE … GREEN`, and
-neither of them a verdict any test wrote. **Whether they are one defect is not
-decided here** — this one has a corrupted container and a name for it, which is
+in the first three of that session's five runs, both under host contention, both
+`ALONE … GREEN`, and neither of them a verdict any test wrote; the fourth run
+died a third way, and
+`issues/kernel/a-ring-0-fetch-at-0x1b-with-the-stack-pointer-on-a-page-boundary.md`
+carries that one together with the session's table. **Whether they are one defect
+is not decided here** — this one has a corrupted container and a name for it, which is
 the first of the family to carry that much.
