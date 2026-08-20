@@ -460,7 +460,7 @@ extern "C" fn body(_arg: u64) -> ! {
         panic!("klogd-panic: the console drainer died");
     }
 
-    let parkable = scheduler::Parkable::of_current();
+    let parkable = scheduler::Parkable::at_entry();
     let handle = crate::sched::driver::current_handle().expect("klogd runs as a task");
     // The producer signals here, without a lock and without a watch list —
     // `post_wake` says why it may not write a record instead.

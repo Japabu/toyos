@@ -949,7 +949,7 @@ fn sys_write(h: RawHandle, buf: &UserBytes) -> u64 {
             }
             Err(WriteBlock::Pipe(id)) => match pipe::writers_queue(id) {
                 Some(end) => {
-                    let parkable = crate::scheduler::Parkable::of_current();
+                    let parkable = crate::scheduler::Parkable::at_entry();
                     if completion::wait_until(
                         &parkable,
                         completion::Subject::of(&end.watch),
@@ -1147,7 +1147,7 @@ fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
                 return n;
             }
             Err(ReadBlock::Pipe(end, id)) => {
-                let parkable = crate::scheduler::Parkable::of_current();
+                let parkable = crate::scheduler::Parkable::at_entry();
                 if completion::wait_until(
                     &parkable,
                     completion::Subject::of(&end.watch),
@@ -1162,7 +1162,7 @@ fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
                 }
             }
             Err(ReadBlock::VirtioSound) => {
-                let parkable = crate::scheduler::Parkable::of_current();
+                let parkable = crate::scheduler::Parkable::at_entry();
                 if completion::wait_until(
                     &parkable,
                     completion::Subject::of(&crate::sched::waitqs::AUDIO_WATCH),
@@ -1177,7 +1177,7 @@ fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
                 }
             }
             Err(ReadBlock::Hda) => {
-                let parkable = crate::scheduler::Parkable::of_current();
+                let parkable = crate::scheduler::Parkable::at_entry();
                 if completion::wait_until(
                     &parkable,
                     completion::Subject::of(&crate::sched::waitqs::AUDIO_WATCH),
@@ -1192,7 +1192,7 @@ fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
                 }
             }
             Err(ReadBlock::Keyboard(deadline)) => {
-                let parkable = crate::scheduler::Parkable::of_current();
+                let parkable = crate::scheduler::Parkable::at_entry();
                 if completion::wait_until(
                     &parkable,
                     completion::Subject::of(&crate::sched::waitqs::KEYBOARD_WATCH),
@@ -1556,7 +1556,7 @@ fn sys_process_wait(h: RawHandle, flags: u64) -> u64 {
         Err(e) => return e.refuse(),
     };
     if flags & WNOHANG == 0 {
-        let parkable = crate::scheduler::Parkable::of_current();
+        let parkable = crate::scheduler::Parkable::at_entry();
         if completion::wait_until(
             &parkable,
             completion::Subject::of(object.watch()),
@@ -2005,7 +2005,7 @@ fn sys_accept(h: RawHandle) -> u64 {
         if acceptor.closed() {
             return SyscallError::Gone.to_u64();
         }
-        let parkable = crate::scheduler::Parkable::of_current();
+        let parkable = crate::scheduler::Parkable::at_entry();
         if completion::wait_until(
             &parkable,
             completion::Subject::of(acceptor.watch()),
@@ -2387,7 +2387,7 @@ fn sys_thread_join(tid: u64) -> u64 {
     // Resolved once. `None` is a thread that never existed or is already
     // collected, and the predicate below answers both.
     let target = process::thread_sched(caller, tid);
-    let parkable = crate::scheduler::Parkable::of_current();
+    let parkable = crate::scheduler::Parkable::at_entry();
     loop {
         match process::wait_thread_zombie(tid, caller) {
             Ok(Some(_)) => return 0,
@@ -2557,7 +2557,7 @@ fn sys_nanosleep(nanos: u64) -> u64 {
     // **Armed on nothing but time.** A sleep has no subject — what ends it is
     // the deadline the caller chose — so it arms on its own thread, where
     // nothing posts, and the park's own deadline is the whole of the wait.
-    let parkable = crate::scheduler::Parkable::of_current();
+    let parkable = crate::scheduler::Parkable::at_entry();
     let Some(handle) = crate::sched::driver::current_handle() else {
         return 0;
     };

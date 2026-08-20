@@ -57,7 +57,7 @@ extern "C" fn body(_arg: u64) -> ! {
         panic!("usbd-panic: the device thread died");
     }
 
-    let parkable = scheduler::Parkable::of_current();
+    let parkable = scheduler::Parkable::at_entry();
     let handle = crate::sched::driver::current_handle().expect("usbd runs as a task");
     // Armed once and held across the loop, which is §5.3a's edge contract: a
     // post that lands while this thread is doing its step must find the watch

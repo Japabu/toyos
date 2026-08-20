@@ -251,6 +251,32 @@ changes.
   from this name's 2026-08-17 CI row, which is about the seeded `i8042:` line.
   Still `Sched::Parallel`, not investigated.
 
+- **`tlb_shootdown_waits`** — added 2026-08-20, **1 of 3** full `cargo test`
+  runs on `wt/toyos-p2conv`, with `toyos-dpanic`'s suite holding guest slots
+  throughout and named in that run's own `[host-slots]` lines. The other two
+  runs were 270/270 on a tree differing from the red one by two doc comments and
+  one removed `#[track_caller]`; the branch's kernel delta touches no TLB, no
+  shootdown and no `munmap` path. `ALONE … GREEN` in 145 ms, and
+  `cargo run -- --known-red tlb_shootdown_waits` answered `NOT ON THE LIST`, so
+  this is its first recorded sighting. `screen_early_panic` failed in the same
+  run and is already this file's and the redlist's, `ALONE … GREEN` there too.
+
+  **Its shape is this file's, in the one form worth naming separately: the
+  assertion that went red is the test's own control.** The message is `munmap
+  still took 11740090ns with the delay disarmed, so the numbers above measured
+  something other than the wait` — the test arms an injected shootdown delay,
+  measures, disarms it, and then requires the *baseline* to be small, because
+  that is what proves the armed numbers measured the wait and not the host.
+  Which makes it the one assertion in the suite that cannot tell a slow host
+  from a broken measurement: on a machine carrying two suites, 11.7 ms for a
+  disarmed `munmap` is the load, and the control has no way to say so. Widening
+  it is exactly what this file forbids — a control that tolerates 12 ms proves
+  nothing about the armed arm either. Making the verdict independent of the rate
+  here means comparing armed against disarmed *within the run* rather than each
+  against an absolute, which is the first of the two legitimate fix shapes below
+  and is the one thing this test already has both samples for. Still
+  `Sched::Parallel`, not investigated further.
+
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits
 twelve guests across every worktree. It recurred on 2026-08-07: **eight

@@ -10,7 +10,8 @@
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
 use crate::log;
-use crate::time::{Budget, Duration};
+use crate::scheduler::Operation;
+use crate::time::{Budget, Deadline, Duration};
 use super::super::device::Endpoint;
 use super::{Owed, Restart};
 use super::super::{with_disk, Disk, StorageGeometry, Trb, TrbRing, XhciController, PAGE};
@@ -428,21 +429,35 @@ impl XhciController {
         Some(out)
     }
 
+    /// The three below are this driver's **operation entry points**, and the
+    /// one place in it that recovers the caller's budget.
+    ///
+    /// Owner ruling 1B: the deadline is established by
+    /// [`crate::block::begin_operation`] above `BlockDevice` and read off the
+    /// running context here, because the two frames in between —
+    /// `toyos_fat32::BlockAccess::read_at` and `BlockDevice::read_blocks` —
+    /// cannot carry it. From here down it is an ordinary argument again, which
+    /// is what keeps [`Self::scsi`] usable by `bring_up`: an enumeration is not
+    /// a block-device operation, has no establishment above it, and passes
+    /// [`Deadline::never`] by name.
     pub(super) fn msc_read(&mut self, at: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
+        let until = Operation::deadline();
         self.with_storage(at, |ctrl, disk| {
-            ctrl.transfer_blocks(&mut disk.dev, lba, count, Host::Into(buf))
+            ctrl.transfer_blocks(&mut disk.dev, lba, count, Host::Into(buf), until)
         })
         .unwrap_or(false)
     }
 
     pub(super) fn msc_write(&mut self, at: usize, lba: u64, count: u32, buf: &[u8]) -> bool {
+        let until = Operation::deadline();
         self.with_storage(at, |ctrl, disk| {
-            ctrl.transfer_blocks(&mut disk.dev, lba, count, Host::From(buf))
+            ctrl.transfer_blocks(&mut disk.dev, lba, count, Host::From(buf), until)
         })
         .unwrap_or(false)
     }
 
     pub(super) fn msc_flush(&mut self, at: usize) -> bool {
+        let until = Operation::deadline();
         self.with_storage(at, |ctrl, disk| {
             let number = disk.index;
             let dev = &mut disk.dev;
@@ -452,7 +467,7 @@ impl XhciController {
             // LBA 0, block count 0: the whole medium, which is the only thing
             // a cache flush above a block device can mean.
             let cdb = [0x35u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-            let issued = ctrl.scsi(dev, &cdb, 10, 0, 0, false);
+            let issued = ctrl.scsi(dev, &cdb, 10, 0, 0, false, until);
             let outcome = match flush_sense() {
                 Some((key, asc, ascq)) => Scsi::Refused { key, asc, ascq },
                 None => issued,
@@ -484,12 +499,17 @@ impl XhciController {
     }
 
     /// Move `count` 4 KiB blocks between the caller's buffer and the disk.
+    ///
+    /// `until` bounds the whole of it and not one command: the loop below is
+    /// `ceil(count / MSC_MAX_BLOCKS)` commands, and it is [`Self::scsi`] that
+    /// refuses to start one past the deadline.
     fn transfer_blocks(
         &mut self,
         dev: &mut MscDevice,
         lba: u64,
         count: u32,
         mut host: Host<'_>,
+        until: Deadline,
     ) -> bool {
         let write = matches!(host, Host::From(_));
         // The caller is the kernel and the trait states this contract, so a
@@ -547,7 +567,7 @@ impl XhciController {
                 }
             }
 
-            match self.scsi(dev, &cdb, 10, data_phys, bytes as u32, !write) {
+            match self.scsi(dev, &cdb, 10, data_phys, bytes as u32, !write, until) {
                 Scsi::Ok { delivered } if delivered as usize == bytes => {}
                 // Short of what was asked, and reported as success. Nothing
                 // above here has a way to say "these blocks arrived and those
@@ -588,6 +608,30 @@ impl XhciController {
     /// idempotent, and the caller's bytes are still in the same DMA window
     /// nothing between two attempts touches, so an attempt is a genuine
     /// re-issue of the same command and not an approximation of one.
+    ///
+    /// # The caller's budget, and why it is spent *here*
+    ///
+    /// `until` is [`crate::block::OPERATION`]'s deadline for the whole
+    /// operation this command is part of, and this is the one place in the
+    /// driver that reads it. Not because it is convenient: it is the only place
+    /// where a refusal costs the device nothing. Between two commands there is
+    /// no TRB on a ring, no endpoint owing a completion and no phase half done,
+    /// so refusing here is a decision about the *caller's* time and never a
+    /// verdict about the disk — nothing is abandoned, [`MscDevice::failed`]
+    /// stays clear, and the next operation finds the transport exactly as this
+    /// one left it. Taking the same decision one level down, inside
+    /// [`Self::bot`] or its recovery, would abandon a transfer the device is
+    /// still going to answer and then read the wreckage as a device that is not
+    /// recovering — a slow disk marked permanently offline for having been slow.
+    ///
+    /// So what this bounds is a device that *answers*, which is exactly the
+    /// failure `USB_TIMEOUT_NS` cannot see: that bound is only ever reached by a
+    /// device that has stopped answering, and a stick that completes every
+    /// transfer in 2 ms can still hold one `read_blocks` for as long as the
+    /// batching, the retries and the recoveries take. The overshoot is the
+    /// command in flight when the deadline passes, which the transfer bound
+    /// covers.
+    #[allow(clippy::too_many_arguments)]
     fn scsi(
         &mut self,
         dev: &mut MscDevice,
@@ -596,6 +640,7 @@ impl XhciController {
         data_phys: u64,
         data_len: u32,
         data_in: bool,
+        until: Deadline,
     ) -> Scsi {
         let opcode = cdb.first().copied().unwrap_or(0);
         // Which disk this command is on, in every line the retry writes. A
@@ -606,6 +651,11 @@ impl XhciController {
         // the disk under test (`issues/hardware/`).
         let slot = self.slot(dev.slot_id);
         for attempt in 1..=MAX_TRANSPORT_ATTEMPTS {
+            if until.reached(crate::clock::now()) {
+                log!("usb-storage: {slot} SCSI {opcode:#04x} not issued: {}",
+                    crate::block::OPERATION);
+                return Scsi::Broken;
+            }
             match self.bot(dev, cdb, cdb_len, data_phys, data_len, data_in) {
                 Ok(Bot::Done { delivered }) => {
                     if attempt > 1 {
@@ -1091,6 +1141,15 @@ fn bring_up(ctrl: &mut XhciController, dev: &mut MscDevice) -> bool {
 
     let dma = ctrl.dma();
     let scratch_phys = dma.phys() + (dev.block + MSC_SCRATCH) as u64;
+    // **No caller's budget here, and that is not an omission.**
+    // [`crate::block::OPERATION`] bounds one *block-device operation*, and a
+    // bring-up is not one: nobody has asked for anything yet, there is no
+    // `BlockDevice` handle to hand an `Err` to, and the two bounds this
+    // sequence does answer to are its own — `READY_BUDGET` above and the
+    // transport's `USB_TIMEOUT_NS` under every transfer. A device that never
+    // finishes bring-up is refused by name and never becomes a disk, which is
+    // the give-up policy at this layer.
+    let until = Deadline::never();
     let read_scratch = |ctrl: &mut XhciController,
                         dev: &mut MscDevice,
                         cdb: &[u8],
@@ -1098,7 +1157,7 @@ fn bring_up(ctrl: &mut XhciController, dev: &mut MscDevice) -> bool {
                         want: u32,
                         out: &mut [u8]| {
         unsafe { write_bytes(dma.ptr_at(dev.block + MSC_SCRATCH), 0, MSC_SCRATCH_LEN); }
-        match ctrl.scsi(dev, cdb, cdb_len, scratch_phys, want, true) {
+        match ctrl.scsi(dev, cdb, cdb_len, scratch_phys, want, true, until) {
             Scsi::Ok { delivered } if delivered as usize >= out.len() => {
                 unsafe {
                     copy_nonoverlapping(
@@ -1212,6 +1271,13 @@ impl core::fmt::Display for Printable<'_> {
 }
 /// Read `count` 4 KiB blocks at `lba`. `false` means the transfer failed and
 /// `buf` holds nothing the caller may believe.
+///
+/// **The caller must be inside a block-device operation**
+/// ([`crate::block::begin_operation`]), because that is where the device-time
+/// budget for this one comes from: [`XhciController::msc_read`] recovers it and
+/// [`XhciController::scsi`] is where it is honoured. A call with no
+/// establishment above it is refused by name rather than served without a
+/// budget.
 pub fn storage_read(index: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
     with_disk(index, |ctrl, local| ctrl.msc_read(local, lba, count, buf)).unwrap_or(false)
 }
