@@ -188,6 +188,26 @@ mod tests {
         );
     }
 
+    /// **A generation past the field wraps here silently, in every profile** —
+    /// which is why retirement has to be a state the kernel's table keeps and
+    /// can never be an overflow it would notice.
+    ///
+    /// `<<` checks its shift *amount* and never the value, so the top bits go
+    /// without a panic even with debug assertions on. A counter stepped one past
+    /// `MAX_GENERATION` is therefore not a large generation, and not a trapped
+    /// one: it is generation 0 again, the very number every handle a slot was
+    /// first issued at carries.
+    #[test]
+    fn a_generation_past_the_field_is_generation_zero_again() {
+        for slot in [0u16, 900, 4095] {
+            assert_eq!(
+                RawHandle::new(slot, RawHandle::MAX_GENERATION + 1),
+                RawHandle::new(slot, 0),
+                "slot {slot} one past the last generation",
+            );
+        }
+    }
+
     #[test]
     fn rights_only_shrink() {
         let full = Rights::READ.union(Rights::WRITE).union(Rights::DUP);
