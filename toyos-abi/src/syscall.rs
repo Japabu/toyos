@@ -592,6 +592,11 @@ pub struct Stat {
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     let ret: u64;
+    // SAFETY: a plain register-to-register `syscall` instruction — every
+    // input is a `u64` value, not a pointer this function dereferences, so
+    // its soundness rests on the callee (the kernel's syscall dispatcher)
+    // and on every typed wrapper in this file passing `num`/`a1..a4` that
+    // match the syscall it names, not on anything checkable here.
     unsafe {
         core::arch::asm!(
             "syscall",
@@ -612,6 +617,8 @@ fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
 #[inline(always)]
 fn syscall(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     let ret: u64;
+    // SAFETY: see the x86_64 `syscall` above — same shape, `svc #0` in place
+    // of `syscall`, same reasoning.
     unsafe {
         core::arch::asm!(
             "svc #0",
@@ -1493,9 +1500,16 @@ pub fn dl_open(path: &[u8]) -> Result<u64, SyscallError> {
     let init_array_ptr = init_info[0];
     let init_count = init_info[1];
     if init_array_ptr != 0 && init_count > 0 {
+        // SAFETY: `init_array_ptr`/`init_count` are not userland's to make
+        // up — `SYS_DLOPEN` wrote them, naming the `.init_array` table it
+        // just built from the loaded ELF's own section headers, so they name
+        // `init_count` valid `usize`-sized, `usize`-aligned entries.
         let entries = unsafe { core::slice::from_raw_parts(init_array_ptr as *const usize, init_count as usize) };
         for &entry in entries {
             if entry != 0 {
+                // SAFETY: a non-zero `.init_array` entry is the address of a
+                // constructor the loader placed there — by the ELF `DT_INIT_ARRAY`
+                // contract every entry is a valid `extern "C" fn()`, never data.
                 let f: extern "C" fn() = unsafe { core::mem::transmute(entry) };
                 f();
             }
