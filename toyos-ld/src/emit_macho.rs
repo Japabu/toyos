@@ -765,7 +765,7 @@ pub(crate) fn emit_macho_bytes(
     let codesig_off = linkedit_cursor;
     let code_limit = codesig_off as u32;
     let cs_block_size: u32 = 4096;
-    let n_code_slots = (code_limit + cs_block_size - 1) / cs_block_size;
+    let n_code_slots = code_limit.div_ceil(cs_block_size);
     let ident = b"_main\0";
     let all_headers = (size_of::<CsCodeDirectory>() + ident.len() + 15) & !15;
     let hash_offset = all_headers as u32;
@@ -1073,7 +1073,9 @@ fn build_bind_opcodes(layout: &MachOLayout, entries: &[(String, u64)]) -> Vec<u8
         let macho_name = macho_mangle(sym_name);
         // Set dylib ordinal (1 = first LC_LOAD_DYLIB = libSystem)
         ops.push(BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | 1);
-        // Set symbol name
+        // Set symbol name. The immediate is the symbol flags nibble and it is
+        // zero here, written as the OR every other opcode below is written as.
+        #[allow(clippy::identity_op)]
         ops.push(BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM | 0);
         ops.extend_from_slice(macho_name.as_bytes());
         ops.push(0); // null terminator

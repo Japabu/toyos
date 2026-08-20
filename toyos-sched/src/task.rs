@@ -630,7 +630,7 @@ impl<X: SchedPayload> Task<X> {
     /// The stable address of the saved context, for [`crate::cpu::RunToken`]:
     /// the record is boxed, so it outlives every container move the task makes.
     pub(crate) fn ctx_ptr(&mut self) -> *mut X::Ctx {
-        addr_of_mut!((*self.0).ctx)
+        addr_of_mut!(self.0.ctx)
     }
 
     pub(crate) fn adopt_node(&self) -> &MailboxNode<Msg<X>> {
@@ -640,10 +640,7 @@ impl<X: SchedPayload> Task<X> {
     /// Lend the borrowed RT window (spec §8.5). Called by the wake path and
     /// by a client consuming already-signalled data.
     pub(crate) fn boost(&mut self, until: Nanos) {
-        let extended = match self.0.rt.inherited {
-            Some(cur) if cur >= until => false,
-            _ => true,
-        };
+        let extended = !matches!(self.0.rt.inherited, Some(cur) if cur >= until);
         if extended {
             self.0.rt.inherited = Some(until);
             self.0.rt.lends = self.0.rt.lends.wrapping_add(1);

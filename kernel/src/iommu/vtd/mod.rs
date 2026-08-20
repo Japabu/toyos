@@ -231,7 +231,7 @@ impl Unit {
 /// would read plausible garbage as a capability register, which costs a wrong
 /// log line and, from I2 on, a register write into somebody's heap.
 fn window(base: u64) -> Option<Mmio> {
-    if base == 0 || base % REGISTER_WINDOW != 0 || base >= MAX_PHYS {
+    if base == 0 || !base.is_multiple_of(REGISTER_WINDOW) || base >= MAX_PHYS {
         return None;
     }
     Some(

@@ -102,7 +102,7 @@ pub struct PageAlloc(Vec<crate::mm::pmm::PhysPage>);
 impl PageAlloc {
     /// Allocate `size` bytes as contiguous 2MB pages.
     pub fn new(size: usize, cat: crate::mm::pmm::Category) -> Option<Self> {
-        let count = (size + PAGE_2M as usize - 1) / PAGE_2M as usize;
+        let count = size.div_ceil(PAGE_2M as usize);
         Some(Self(crate::mm::pmm::alloc_contiguous(count, cat)?))
     }
 
@@ -1020,9 +1020,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         // VA exhaustion is a resource failure a process can reach by spawning
         // threads until its range is gone, not a kernel bug. `tls_alloc`
         // drops on the way out, returning its pages.
-        let Some((tls_vaddr, _)) = vma_map(addr_space, tls_phys, tls_alloc.size() as u64) else {
-            return None;
-        };
+        let (tls_vaddr, _) = vma_map(addr_space, tls_phys, tls_alloc.size() as u64)?;
         // Rebase fs_base and internal TLS pointers from physical to virtual
         let tls_rebase = tls_vaddr.raw() as i64 - tls_phys as i64;
         let fs_base = (fs_base as i64 + tls_rebase) as u64;
@@ -1096,6 +1094,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
 /// Called in two phases:
 /// - Phase 1 (resource cleanup): ProcessData lock held, table lock NOT held.
 /// - Phase 2 (scheduling): table lock held through context switch.
+///
 /// Returns (syscall_total, syscall_total_ns) for the main thread, needed by the accounting snapshot.
 fn teardown_resources(
     process_data_arc: &Arc<Lock<ProcessData>>,
@@ -1421,7 +1420,7 @@ pub fn thread_sched(pid: Pid, tid: Tid) -> Option<ThreadSched> {
 /// `AddressSpace::unmap` ends the waits it orphans, and `scheduler::futex_wait`
 /// re-derives this translation on every check rather than trusting it.
 fn futex_word(addr: UserAddr) -> Option<crate::mm::DirectMap> {
-    if addr.raw() % 4 != 0 {
+    if !addr.raw().is_multiple_of(4) {
         return None;
     }
     crate::user_ptr::translate_user(addr)
@@ -1452,11 +1451,11 @@ pub fn futex_wait(addr: UserAddr, expected: u32, timeout_ns: u64) -> u64 {
         return toyos_abi::syscall::SyscallError::BadAddress.to_u64();
     };
 
-    if scheduler::futex_wait(addr, phys_addr, expected, deadline) {
-        0 // blocked and woken
-    } else {
-        0 // value mismatch, returned immediately
-    }
+    // Both outcomes answer 0: a thread that blocked and was woken and one whose
+    // word did not match and never blocked are the same answer to the caller,
+    // which re-checks the word either way.
+    scheduler::futex_wait(addr, phys_addr, expected, deadline);
+    0
 }
 
 /// Wake up to `count` threads blocked on the same physical address as `addr`.
@@ -1752,7 +1751,7 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
     // Read a u64 from a user virtual address via page table translation.
     // Reads via the kernel direct map (no USER bit) to avoid SMAP faults.
     let read_user = |virt: u64| -> Option<u64> {
-        if virt % 8 != 0 { return None; }
+        if !virt.is_multiple_of(8) { return None; }
         let phys = addr_space.lock().translate(UserAddr::new(virt))?;
         Some(unsafe { *phys.as_ptr::<u64>() })
     };

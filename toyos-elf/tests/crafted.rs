@@ -6,6 +6,11 @@
 //! userland-triggered kernel panic, which is exactly what several of these
 //! used to be.
 
+// `common` is one builder shared by two test binaries, and each drives a
+// different half of it: this one builds whole files, `tables.rs` builds the
+// tables inside them. Every item is used by one of the two, so the unused half
+// is dead only from here.
+#[allow(dead_code)]
 mod common;
 
 use common::*;

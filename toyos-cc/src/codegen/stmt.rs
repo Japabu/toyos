@@ -58,10 +58,8 @@ impl Codegen {
             }
             Expr::StmtExpr(items) => {
                 for item in items {
-                    if let BlockItem::Stmt(s) = item {
-                        if let Statement::Expr(Some(e)) = s {
-                            self.preresolve_expr_types(e);
-                        }
+                    if let BlockItem::Stmt(Statement::Expr(Some(e))) = item {
+                        self.preresolve_expr_types(e);
                     }
                 }
             }

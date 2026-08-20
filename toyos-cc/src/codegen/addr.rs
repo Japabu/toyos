@@ -125,7 +125,7 @@ impl Codegen {
                 ctx.builder.append_block_param(merge, I64);
                 ctx.builder.switch_to_block(merge);
                 ctx.builder.seal_block(merge);
-                return ctx.builder.block_params(merge)[0];
+                ctx.builder.block_params(merge)[0]
             }
             Expr::IntLit(_) | Expr::UIntLit(_) | Expr::FloatLit(..) | Expr::CharLit(_)
             | Expr::StringLit(_) | Expr::WideStringLit(_) | Expr::Binary(..)

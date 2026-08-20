@@ -209,6 +209,12 @@ const _: () = assert!(core::mem::offset_of!(Shard, head) == 0);
 impl Shard {
     #[cfg(not(feature = "loom"))]
     pub const fn new() -> Self {
+        // A `const` holding atomics is copied at each use, so a write through
+        // one would go nowhere. This one is never written and never borrowed —
+        // its single use is the array repeat below, which is what "one zeroed
+        // slot per record" is spelled as. `borrow_interior_mutable_const`, the
+        // lint that fires on the losing-a-write shape, is silent here.
+        #[allow(clippy::declare_interior_mutable_const)]
         const EMPTY: Slot = Slot {
             seq: AtomicU64::new(0),
             body: [const { AtomicU64::new(0) }; BODY_WORDS],
@@ -218,6 +224,9 @@ impl Shard {
 
     /// Loom's atomics have no `const` constructor, so the model builds shards at
     /// run time.
+    // No `Default` beside it: the arm above is the one the kernel builds, it
+    // has to stay `const` for the `static`, and `Default::default` cannot be.
+    #[allow(clippy::new_without_default)]
     #[cfg(feature = "loom")]
     pub fn new() -> Self {
         Self {

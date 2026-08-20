@@ -5,6 +5,11 @@
 //! chose ever reach past that buffer, and does anything here panic instead of
 //! answering.
 
+// `common` is one builder shared by two test binaries, and each drives a
+// different half of it: this one builds the tables, `crafted.rs` builds the
+// whole files that point at them. Every item is used by one of the two, so the
+// unused half is dead only from here.
+#[allow(dead_code)]
 mod common;
 
 use common::*;

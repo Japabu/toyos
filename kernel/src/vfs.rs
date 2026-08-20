@@ -286,7 +286,7 @@ impl Vfs {
     /// gate.
     pub fn user_may_modify(&self, path: &str) -> bool {
         let (mount, _) = self.resolve_path("/", path);
-        self.mounts.get(&mount).map_or(true, |m| m.access == UserAccess::ReadWrite)
+        self.mounts.get(&mount).is_none_or(|m| m.access == UserAccess::ReadWrite)
     }
 
     fn resolve_fs(&mut self, mount: &str, file: &str) -> Option<(&mut dyn FileSystem, String)> {

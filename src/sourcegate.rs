@@ -1,15 +1,22 @@
 //! Identifiers a tree may not name, and the exceptions that are named instead.
 //!
-//! The first scan bans, over `kernel/src` and `toyos-sched/src`, the methods
-//! that take an object's lifetime out of its `Arc`'s hands — `Arc::into_raw`,
-//! `Arc::from_raw`, the two strong-count adjusters — and `mem::forget`. The
-//! natural home for that would be
-//! `kernel/clippy.toml`'s `disallowed-methods`, but **nothing in this
-//! repository runs clippy** — not CI, not `cargo test`, not the build — so a
-//! `clippy.toml` would be a wall with nothing behind it. A scan in
-//! `cargo test --lib` runs on every machine that builds this tree, in
-//! milliseconds, and can carry its exceptions with the reason each one is
-//! allowed.
+//! **Clippy runs now, and these scans are what it cannot say.** The `host` job
+//! in `.github/workflows/host-tests.yml` runs default clippy with warnings
+//! denied over three trees on every pull request — the host workspace
+//! (`--workspace --all-targets`), the kernel (`--target x86_64-unknown-none`)
+//! and the bootloader (`--target x86_64-unknown-uefi`) — so a `clippy.toml` is
+//! no longer a wall with nothing behind it.
+//!
+//! What is behind it is still not these three scans. `disallowed-methods` could
+//! take the first one, and would lose what makes it useful: the exceptions
+//! below are per file *and per line count*, so an added `mem::forget` beside a
+//! permitted one reds, which a name-based allow list cannot express. The second
+//! and third scans ask whether an identifier is absent from the tree, which is
+//! not a question any lint asks at all. So the first scan bans, over
+//! `kernel/src` and `toyos-sched/src`, the methods that take an object's
+//! lifetime out of its `Arc`'s hands — `Arc::into_raw`, `Arc::from_raw`, the
+//! two strong-count adjusters — and `mem::forget`. It runs in
+//! `cargo test --lib`, on every machine that builds this tree, in milliseconds.
 //!
 //! The exceptions are per file and per line count, so an *added* `forget`
 //! beside a permitted one is a red rather than a silence.
@@ -138,7 +145,7 @@ fn rel(root: &Path, path: &Path) -> String {
     path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/")
 }
 
-fn rust_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut entries: Vec<_> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
     entries.sort();
@@ -147,7 +154,7 @@ fn rust_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
             if path.file_name().is_some_and(|n| n == "target") {
                 continue;
             }
-            rust_files(root, &path, out);
+            rust_files(&path, out);
         } else if path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
         }
@@ -159,7 +166,7 @@ fn occurrences(needle: &str) -> Vec<(String, usize)> {
     let root = repo_root();
     let mut files = Vec::new();
     for tree in TREES {
-        rust_files(&root, &root.join(tree), &mut files);
+        rust_files(&root.join(tree), &mut files);
     }
     let mut found = Vec::new();
     for path in files {
@@ -256,7 +263,7 @@ fn named_in_code(needle: &str) -> Vec<String> {
     let root = repo_root();
     let mut files = Vec::new();
     for tree in GUEST_TREES {
-        rust_files(&root, &root.join(tree), &mut files);
+        rust_files(&root.join(tree), &mut files);
     }
     let mut found = Vec::new();
     for path in files {
@@ -274,7 +281,7 @@ fn named_in_code(needle: &str) -> Vec<String> {
 fn kernel_lines() -> Vec<(String, usize, String)> {
     let root = repo_root();
     let mut files = Vec::new();
-    rust_files(&root, &root.join("kernel/src"), &mut files);
+    rust_files(&root.join("kernel/src"), &mut files);
     let mut out = Vec::new();
     for path in files {
         let Ok(text) = std::fs::read_to_string(&path) else { continue };
@@ -494,7 +501,7 @@ mod tests {
         let root = repo_root();
         for tree in TREES {
             let mut files = Vec::new();
-            rust_files(&root, &root.join(tree), &mut files);
+            rust_files(&root.join(tree), &mut files);
             assert!(!files.is_empty(), "{tree} has no .rs files — the walk is looking elsewhere");
         }
         assert!(

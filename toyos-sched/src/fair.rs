@@ -29,6 +29,9 @@ pub struct NotRunnable;
 pub struct Frontier(AtomicU64);
 
 impl Frontier {
+    /// No `Default` beside it: every frontier in this tree is a `static`, which
+    /// only a `const fn` can build, and `Default::default` cannot be one.
+    #[allow(clippy::new_without_default)]
     pub const fn new() -> Self {
         Self(AtomicU64::new(0))
     }

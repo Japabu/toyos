@@ -70,7 +70,7 @@ pub fn nic_info() -> Option<(NicInfo, crate::object::shm::Region)> {
 }
 
 pub fn has_packet() -> bool {
-    NIC.lock().as_ref().map_or(false, |nic| nic.has_packet())
+    NIC.lock().as_ref().is_some_and(|nic| nic.has_packet())
 }
 
 pub fn poll_rx() -> Option<(usize, usize)> {

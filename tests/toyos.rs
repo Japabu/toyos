@@ -3180,7 +3180,7 @@ fn run_screen_test(
             let churn_line = |i: usize| -> String {
                 let body = 5 + (i * 37) % cols + cols * wraps[i % wraps.len()];
                 let fill = char::from(b'a' + (i % 26) as u8);
-                let mid: String = std::iter::repeat(fill).take(body).collect();
+                let mid: String = std::iter::repeat_n(fill, body).collect();
                 format!("L{i:04} {mid} E{i:04}")
             };
             // A logical line wider than the panel occupies more than one row.
@@ -6642,7 +6642,7 @@ fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
             // many bytes through the framer. Refilling the window on every
             // arrival is what keeps the stream continuous under the pacing.
             while burst < BURST && injected.get() < arrived.get() + MOUSE_LEAD {
-                input.mouse(if burst % 2 == 0 { 1 } else { -1 }, 0, None);
+                input.mouse(if burst.is_multiple_of(2) { 1 } else { -1 }, 0, None);
                 burst += 1;
                 injected.set(injected.get() + 1);
             }
@@ -6776,8 +6776,7 @@ fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
     let counters = result
         .serial
         .lines()
-        .filter(|l| l.contains("discarded"))
-        .next_back()
+        .rfind(|l| l.contains("discarded"))
         .ok_or_else(|| format!("the driver never reported its counters:\n{}", result.serial))?;
     for owed in ["0 discarded", "0 overruns", "0 dropped", "0 lost edges"] {
         if !counters.contains(owed) {
@@ -9202,7 +9201,7 @@ fn run_machine_test(
                 rust_bins,
                 BootOptions { smp: CPUS, ..Default::default() },
             );
-            control_regs(&qemu.boot_log().to_string(), CPUS)
+            control_regs(qemu.boot_log(), CPUS)
         }
         "control_regs_negative" => control_regs_negative(test_config, c_bins, rust_bins),
         "input_merge" => {
@@ -10653,7 +10652,7 @@ fn parse_xhci_binds(log: &str) -> Vec<XhciBind> {
             let (_slot, rest) = rest.split_once(", int_ring +0x")?;
             Some(XhciBind {
                 kind: kind.to_string(),
-                int_ring: usize::from_str_radix(rest.trim().split_whitespace().next()?, 16).ok()?,
+                int_ring: usize::from_str_radix(rest.split_whitespace().next()?, 16).ok()?,
             })
         })
         .collect()
@@ -11204,7 +11203,7 @@ fn parse_pointer_sources(log: &str) -> Vec<(u32, u32)> {
             let (slot, source) = rest.split_once(" merges as source ")?;
             Some((
                 slot.parse().ok()?,
-                source.trim().split_whitespace().next()?.parse().ok()?,
+                source.split_whitespace().next()?.parse().ok()?,
             ))
         })
         .collect()
@@ -13623,7 +13622,7 @@ fn main() {
         let mut audio_to_run: Vec<&str> = AUDIO_TESTS
             .iter()
             .map(|(name, _)| *name)
-            .filter(|n| filter.map_or(true, |f| n.contains(f)))
+            .filter(|n| filter.is_none_or(|f| n.contains(f)))
             .collect();
         assert!(!audio_to_run.is_empty(), "no audio test matches filter {filter:?}");
         // Sharded too, and this is the tier it buys the most for: the thorough
@@ -13681,7 +13680,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    let keep = |name: &str| filter.map_or(true, |f| name.contains(f));
+    let keep = |name: &str| filter.is_none_or(|f| name.contains(f));
     // The tier filter, and it is not conditional on the name filter: a rule with
     // an exception for filtered runs is two rules, and the second one is the one
     // nobody remembers. `cargo test -- desktop_window_child` refuses below and

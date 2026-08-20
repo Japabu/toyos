@@ -208,6 +208,18 @@ changes.
   console is not printed, and by the time the re-runs were green the capture was
   gone. **What the next sighting owes is that console**, and the way to get it is
   a full suite beside a second worktree's — not a search of a passing boot.
+- **`xhci_full_speed_device`** — added 2026-08-19, **1 of 2** full `cargo test`
+  runs on `wt/toyos-clippygate`. `"PANIC:" during the USB gate boot`,
+  `ALONE … GREEN`, and `cargo run -- --known-red xhci_full_speed_device`
+  answers `NOT ON THE LIST`. The two runs are the measurement: the red one was
+  the branch's *first* suite after a full rebuild and its parallel phase took
+  103.9 s, the green one minutes later on a warm tree took 32.0 s — so the phase
+  that failed was carrying this worktree's own twelve kernel builds, which is
+  the load `build_slot` bounds and the section below describes. The branch's
+  kernel delta in `drivers/xhci/` is two comment blocks, two `#[allow]`
+  attributes and two pairs of parentheses that spell out the precedence Rust
+  already applied (`+` and `*` bind tighter than `|`), so no instruction in that
+  driver moved. Still `Sched::Parallel`.
 - **`diskless_boot`** — added 2026-08-19, one full `cargo test` on
   `wt/toyos-i8042deep`, whose whole delta is host-side harness code
   (`tests/toyos.rs`, `src/redlist.rs`) and no kernel file at all. Twelve wide

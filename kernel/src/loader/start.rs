@@ -48,7 +48,7 @@ pub(crate) fn alloc_kernel_stack(
         *frame.add(4) = 0; // rbx
         *frame.add(5) = 0; // rbp
         *frame.add(6) = 0x002; // RFLAGS (IF=0, AC=0)
-        *frame.add(7) = trampoline as u64; // return address
+        *frame.add(7) = trampoline as usize as u64; // return address
     }
     Some((alloc, frame as u64))
 }
@@ -353,7 +353,7 @@ pub fn build_child_handles(
     drop(data);
     drop(displaced);
 
-    let mut raw = alloc::vec![0u8; endow.len() as usize];
+    let mut raw = alloc::vec![0u8; endow.len()];
     endow.read_at(0, &mut raw);
     Ok(PendingHandles::Moving { table: handles, endow: raw, labels: labels.to_vec() })
 }

@@ -150,7 +150,7 @@ fn report_initrd(image: Vec<u8>) {
     );
 
     let mut by_size: Vec<_> = entries.iter().collect();
-    by_size.sort_by(|a, b| b.1.cmp(&a.1));
+    by_size.sort_by_key(|e| std::cmp::Reverse(e.1));
     println!("\n  largest entries:");
     for (name, size) in by_size.iter().take(20) {
         println!("      {size:>12}  {name}");

@@ -304,13 +304,13 @@ pub fn try_write(pipe_id: PipeId, buf: &UserBytes) -> Option<PipeWrite> {
 
 pub fn has_data(pipe_id: PipeId) -> bool {
     with_pipes(|pipes| {
-        pipes.get(pipe_id).map_or(false, |p| p.available() > 0 || p.writers == 0)
+        pipes.get(pipe_id).is_some_and(|p| p.available() > 0 || p.writers == 0)
     })
 }
 
 pub fn has_space(pipe_id: PipeId) -> bool {
     with_pipes(|pipes| {
-        pipes.get(pipe_id).map_or(false, |p| p.space() > 0 || p.readers == 0)
+        pipes.get(pipe_id).is_some_and(|p| p.space() > 0 || p.readers == 0)
     })
 }
 

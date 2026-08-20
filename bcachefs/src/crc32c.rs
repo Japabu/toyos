@@ -1,8 +1,8 @@
-/// Software CRC-32c (Castagnoli) implementation.
-///
-/// Uses the polynomial 0x1EDC6F41. This is the same CRC used by iSCSI, ext4,
-/// btrfs, and bcachefs. On x86 with SSE4.2, the hardware `crc32` instruction
-/// computes this same polynomial.
+//! Software CRC-32c (Castagnoli) implementation.
+//!
+//! Uses the polynomial 0x1EDC6F41. This is the same CRC used by iSCSI, ext4,
+//! btrfs, and bcachefs. On x86 with SSE4.2, the hardware `crc32` instruction
+//! computes this same polynomial.
 
 const CRC32C_TABLE: [u32; 256] = {
     let mut table = [0u32; 256];

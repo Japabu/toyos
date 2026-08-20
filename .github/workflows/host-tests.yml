@@ -65,8 +65,73 @@ jobs:
             ~/.cargo/git/db
             target
             userland/target
+            kernel/target
+            bootloader/target
           key: host-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: host-${{ runner.os }}-
+
+      # **Default clippy, warnings denied, on every pull request.** A step of
+      # this job rather than a job of its own, and that is the whole reason it
+      # binds: `landing.yml`'s `gate-stage` reads main's required checks back out
+      # of GitHub and reds on a name this repository claims that the ruleset does
+      # not require. A new job would be a check nobody has required yet — visible
+      # on the pull request, and skipped straight past by `gh pr merge --auto`.
+      # Inside `host`, which is required today, a clippy finding blocks a merge
+      # today.
+      #
+      # Three invocations because there are three resolutions, not because there
+      # are three opinions. The lint set is default clippy everywhere: no
+      # `pedantic`, no `nursery`, no `restriction`. Those are adopted one lint at
+      # a time with each one's finding count measured first
+      # (`issues/build/clippy-has-never-run-here.md` records why, and that
+      # `pedantic` + `nursery` alone was 1,684 findings on the kernel).
+      #
+      # `rustup run stable` on all three, and no ToyOS toolchain: the kernel's
+      # `x86_64-unknown-none` and the bootloader's `x86_64-unknown-uefi` are
+      # both built-in targets, which is what makes this cost nothing. The reason
+      # usually given for skipping the kernel — that the `toyos` toolchain ships
+      # no clippy — was about the wrong toolchain.
+      #
+      # **Userland is not here, and cannot be yet**: `x86_64-unknown-toyos` is a
+      # custom target, so linting `userland/` needs the fork's clippy and the
+      # bootstrapped sysroot this job deliberately does not wait for.
+      #
+      # `--all-targets` on the workspace and *not* on the other two: it is what
+      # reaches `tests/`, `examples/` and every crate's test targets, and on the
+      # bootloader it fails outright, because a test target links `std` whose
+      # `panic_impl` collides with the one `uefi_services` provides. The kernel
+      # is the same shape.
+      #
+      # `--keep-going` so the report is the whole tree. Without it a crate that
+      # fails stops every crate behind it, and the first measurement taken here
+      # was a prefix, not a workspace: `toyos-ld` failed and hid `toyos-cc`,
+      # `toyos-build`'s own targets and the entire QEMU harness.
+      #
+      # The other two run from their own directory rather than by
+      # `--manifest-path`, because `.cargo/config.toml` is found from the working
+      # directory: `cd kernel` is what applies that file's `-Dwarnings`, and the
+      # `-- -D warnings` here is deliberately the same wall said twice.
+      #
+      # Measured on the dev host with three fresh `CARGO_TARGET_DIR`s and a warm
+      # cargo registry: **19.2 s** for the workspace (139 crates checked),
+      # **2.2 s** for the kernel (19), **3.7 s** for the bootloader (20) — 25 s
+      # of wall clock for all three, against this job's 398 s cold. It is placed
+      # before the test steps so a lint finding answers without waiting for
+      # them, and it pays for the three target directories the cache now keeps.
+      - name: clippy
+        run: |
+          set -e -o pipefail
+          rustup component add clippy
+          rustup target add x86_64-unknown-none x86_64-unknown-uefi
+          echo "=== clippy: host workspace" | tee -a /tmp/host.log
+          cargo clippy --workspace --all-targets --keep-going -- -D warnings 2>&1 \
+            | tee -a /tmp/host.log
+          echo "=== clippy: kernel (x86_64-unknown-none)" | tee -a /tmp/host.log
+          (cd kernel && cargo clippy --target x86_64-unknown-none -- -D warnings) 2>&1 \
+            | tee -a /tmp/host.log
+          echo "=== clippy: bootloader (x86_64-unknown-uefi)" | tee -a /tmp/host.log
+          (cd bootloader && cargo clippy --target x86_64-unknown-uefi -- -D warnings) 2>&1 \
+            | tee -a /tmp/host.log
 
       # The build system's own gates: the two lock scopes, the landing
       # protocol, the sysroot witness, and the format check on the two volumes

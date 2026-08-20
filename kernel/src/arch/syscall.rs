@@ -3091,7 +3091,7 @@ fn sys_query_modules(out: &mut UserBytesMut) -> u64 {
 
         let exe_path_bytes = data.exe_path.as_bytes();
         let total_path_bytes: usize = exe_path_bytes.len()
-            + data.elf.lib_paths.iter().map(|p| p.as_bytes().len()).sum::<usize>();
+            + data.elf.lib_paths.iter().map(|p| p.len()).sum::<usize>();
 
         let required = module_count * info_size + total_path_bytes;
         if out.len() < required {

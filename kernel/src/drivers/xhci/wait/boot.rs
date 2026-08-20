@@ -430,7 +430,11 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
     op_base.write_u64(OP_DCBAAP, dma.phys() + OFF_DCBAA as u64);
 
     let cmd_ring = TrbRing::init(dma.subslice(OFF_CMD_RING, PAGE));
-    op_base.write_u64(OP_CRCR, dma.phys() + OFF_CMD_RING as u64 | 1);
+    // CRCR bit 0 is RCS, the cycle state the controller starts on, and the
+    // pointer above it is 64-byte aligned — so the OR lands in that bit and
+    // nowhere else (xHCI 1.2 §5.4.5). Parenthesised because `+` binds tighter
+    // than `|`, and this should not need that table to read.
+    op_base.write_u64(OP_CRCR, (dma.phys() + OFF_CMD_RING as u64) | 1);
 
     let evt_ring_buf = dma.subslice(OFF_EVT_RING, PAGE);
     let erst = dma.ptr_at(OFF_ERST) as *mut ErstEntry;

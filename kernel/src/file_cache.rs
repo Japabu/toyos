@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use alloc::collections::btree_map::Entry;
 use alloc::collections::BTreeMap;
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
@@ -190,8 +191,8 @@ pub fn read_page(
     {
         let Some(file) = cache.files.get_mut(&file_id) else { return Ok(()) };
         let is_cache = file.is_cache();
-        if !file.pages.contains_key(&page_idx) {
-            file.pages.insert(page_idx, CachedPage::new(fetched));
+        if let Entry::Vacant(slot) = file.pages.entry(page_idx) {
+            slot.insert(CachedPage::new(fetched));
             added = is_cache as usize;
         }
         let file_size = file.size;
@@ -260,9 +261,10 @@ pub fn write_page<S: ByteSource + ?Sized>(
     let mut added = 0;
     {
         let Some(file) = cache.files.get_mut(&file_id) else { return Ok(()) };
-        if !file.pages.contains_key(&page_idx) {
-            file.pages.insert(page_idx, CachedPage::new(fetched));
-            added = file.is_cache() as usize;
+        let is_cache = file.is_cache();
+        if let Entry::Vacant(slot) = file.pages.entry(page_idx) {
+            slot.insert(CachedPage::new(fetched));
+            added = is_cache as usize;
         }
         apply_write(file, page_idx, offset, data);
     }

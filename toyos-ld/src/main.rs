@@ -1,5 +1,5 @@
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::{env, fs, process};
 
@@ -77,7 +77,7 @@ fn main() {
     }
 }
 
-fn generate_map(output: &[u8], output_path: &PathBuf, inputs: &[(String, Vec<u8>)]) -> String {
+fn generate_map(output: &[u8], output_path: &Path, inputs: &[(String, Vec<u8>)]) -> String {
     use object::read::{Object, ObjectSection, ObjectSymbol};
 
     let mut map = String::new();
@@ -95,7 +95,7 @@ fn generate_map(output: &[u8], output_path: &PathBuf, inputs: &[(String, Vec<u8>
     if let Ok(elf) = object::read::elf::ElfFile64::<object::Endianness>::parse(output) {
         // Sections
         let _ = writeln!(map, "Sections:");
-        let _ = writeln!(map, "  {:>16}  {:>16}  {:>10}  {}", "Address", "Offset", "Size", "Name");
+        let _ = writeln!(map, "  {:>16}  {:>16}  {:>10}  Name", "Address", "Offset", "Size");
         for section in elf.sections() {
             let name = section.name().unwrap_or("<unknown>");
             if name.is_empty() { continue; }
@@ -107,7 +107,7 @@ fn generate_map(output: &[u8], output_path: &PathBuf, inputs: &[(String, Vec<u8>
 
         // Symbols
         let _ = writeln!(map, "Symbols:");
-        let _ = writeln!(map, "  {:>16}  {:>8}  {}", "Value", "Bind", "Name");
+        let _ = writeln!(map, "  {:>16}  {:>8}  Name", "Value", "Bind");
         let mut syms: Vec<_> = elf.symbols().collect();
         syms.sort_by_key(|s| s.address());
         for sym in syms {
@@ -121,6 +121,10 @@ fn generate_map(output: &[u8], output_path: &PathBuf, inputs: &[(String, Vec<u8>
     map
 }
 
+// The prefix is the PE/COFF spec's own: these are `IMAGE_SUBSYSTEM_EFI_*`, and
+// a name that drops it names nothing.
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Copy)]
 enum PeSubsystem {
     EfiApplication,
     EfiBootServiceDriver,

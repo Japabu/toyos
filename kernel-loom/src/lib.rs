@@ -188,6 +188,12 @@ pub mod completion {
         }
     }
 
+    impl Default for Watch {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     #[derive(Clone, Copy)]
     pub struct Subject<'a>(#[allow(dead_code)] &'a Watch);
 

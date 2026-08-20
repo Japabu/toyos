@@ -752,7 +752,7 @@ impl<'q> Vm<'q> {
             if self.cpus[cpu].running().is_some()
                 && !need_resched[cpu]
                 && !delivery_owed
-                && unwind_owed.map_or(true, |owed| owed == cpu)
+                && unwind_owed.is_none_or(|owed| owed == cpu)
             {
                 steps.push(Step::Exec(cpu));
             }
@@ -773,6 +773,9 @@ impl<'q> Vm<'q> {
         }
 
         if self.scenario.protocol == Protocol::OldSteal {
+            // A CPU number, not a walk of `halted`: it indexes three containers
+            // and names the `Step` this builds.
+            #[allow(clippy::needless_range_loop)]
             for thief in 0..self.scenario.cpus {
                 if halted[thief] {
                     continue;
@@ -824,6 +827,9 @@ impl<'q> Vm<'q> {
         };
         self.execute_inner(step, choices);
         let owed = self.hw.with(|s| s.need_resched.clone());
+        // A CPU number: it reads `owed` and writes `self.resched_at` at the
+        // same index, which is the pairing this loop is about.
+        #[allow(clippy::needless_range_loop)]
         for cpu in 0..self.scenario.cpus {
             match (owed[cpu], self.resched_at[cpu]) {
                 (true, None) => self.resched_at[cpu] = Some(self.clock),

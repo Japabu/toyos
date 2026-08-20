@@ -432,9 +432,8 @@ pub fn init(devices: &[PciDevice]) {
 
     let mut live: alloc::vec::Vec<(&PciDevice, Mmio, u16, u16)> = alloc::vec::Vec::new();
     for pci in &controllers {
-        match probe(pci) {
-            Some((regs, gcap, statests)) => live.push((pci, regs, gcap, statests)),
-            None => {}
+        if let Some((regs, gcap, statests)) = probe(pci) {
+            live.push((pci, regs, gcap, statests));
         }
     }
 

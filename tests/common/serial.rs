@@ -378,7 +378,10 @@ pub fn self_check() -> Result<(), String> {
         "[kernel 0.001 cpu0] NVMe: found\n[kernel 0.002 cpu0] PANIC: nope\n",
     );
 
-    let cases: &[(&str, bool, &dyn Fn() -> Result<(), String>)] = &[
+    /// One row: what it is called, whether it must pass, and the call itself.
+    type Case<'a> = (&'a str, bool, &'a dyn Fn() -> Result<(), String>);
+
+    let cases: &[Case] = &[
         // must_say
         ("must_say finds a line", true, &|| live.must_say("NVMe: found").map(|_| ())),
         ("must_say on an absent line", false, &|| live.must_say("no such line").map(|_| ())),

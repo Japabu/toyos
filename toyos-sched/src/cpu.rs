@@ -2723,6 +2723,10 @@ mod tests {
     /// that quietly widened `DYING_AGE_NS` would leave the gate above green
     /// while making that tripwire wrong.
     #[test]
+    // Deliberately asserts on constants: the test exists to state the
+    // relations between them, with messages a `const` block's bare assert
+    // could not carry.
+    #[allow(clippy::assertions_on_constants)]
     fn an_unwind_under_saturated_rt_is_stretched_by_the_age_ratio() {
         let stretch = (DYING_AGE_NS + DYING_CHUNK_NS) / DYING_CHUNK_NS;
         assert_eq!(

@@ -210,6 +210,12 @@ pub struct Inbox {
 // and the mechanism each rests on.
 unsafe impl Sync for Inbox {}
 
+impl Default for Inbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Inbox {
     #[cfg(not(feature = "loom"))]
     pub const fn new() -> Self {

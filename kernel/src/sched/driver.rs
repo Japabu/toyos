@@ -231,6 +231,10 @@ pub fn init() {
     let count = crate::arch::smp::cpu_count() as usize;
     assert!(count <= MAX_CPUS, "cpu count {count} exceeds MAX_CPUS");
     let mut handles = Vec::with_capacity(count);
+    // A CPU number rather than a walk of `SCHEDS`: it becomes the `CpuId` each
+    // mailbox and handle is built for, and `SCHEDS` is `MAX_CPUS` long whatever
+    // `count` is.
+    #[allow(clippy::needless_range_loop)]
     for cpu in 0..count {
         let (tx, rx) = mailbox::<KMsg>();
         handles.push(CpuHandle::new(CpuId(cpu as u32), tx));
