@@ -12,15 +12,23 @@ at five separate reap-in-place arms, and the parked arm is the one that strands
 a held lock. Every duration in the kernel is a bare number. None of that is true
 on `main`.
 
-**Held by `wt/toyos-p2impl`, pull request #91.** That branch carries the first
-five chunks below — duration kinds, the completion core, the one park site with
-the cancellable kill, the sleep lock, and `usbd`/`iod` — and is not merged.
-**Owner ruling 2026-08-16: this work lands as two pull requests, split after the
-kernel-thread chunk**, so #91 is the first and everything from xHCI async
-onwards is the second. The split is at the last boundary where no lock has
-converted yet; taking it anywhere later means landing a tree in which one of the
-four locks is a sleep lock and the other three are not, which the baseline
-assertion refuses by design.
+**The first five chunks landed 2026-08-19 as #91** (`a5ccf14`): duration kinds,
+the completion core, the one park site with the cancellable kill, the sleep
+lock, and `usbd`/`iod`. **Owner ruling 2026-08-16: this work lands as two pull
+requests, split after the kernel-thread chunk**, so #91 was the first and
+everything from xHCI async onwards is the second. The split is at the last
+boundary where no lock has converted yet; taking it anywhere later means landing
+a tree in which one of the four locks is a sleep lock and the other three are
+not, which the baseline assertion refuses by design.
+
+**The second pull request is #148, and it carries the owed tripwire rather than
+the chunk.** `block::OPERATION` is landed — a two-second budget over one whole
+block-device operation, minted by `UsbBlockDevice` and honoured between commands
+in `XhciController::scsi` — which discharges the open decision recorded below
+and is what has to exist before a transfer bound can go. The conversion itself
+did not land; what stopped it is three walls, established rather than guessed,
+recorded under "What xHCI async costs, measured against the tree" so nobody
+derives them a third time.
 
 **The commitment: one completion primitive, one inbox, one park site, one
 recheck predicate, and a kill answered by `Cancelled` at the park rather than by
@@ -102,8 +110,72 @@ both before any lock conversion; the order is forced, not preferred.
   deleted** — the reset-recovery path's only trigger *is* that bound. So the
   largest open decision is a tripwire on the transfer against a budget at the
   filesystem layer, and deleting the bound with nothing in its place makes a
-  shipped daemon's give-up policy silently unreachable.
+  shipped daemon's give-up policy silently unreachable. **Decided and landed in
+  #148**, and the shape it took corrects the premise in one place: the budget
+  belongs to the *block-device operation* and not to a filesystem operation,
+  because that is the layer at which one call is one operation and the layer
+  above it cannot reach the driver at all (see the third wall below).
+  `block::OPERATION` bounds the composition `USB_TIMEOUT_NS` cannot see — the
+  batching, the retries and the recoveries one `read_blocks` is made of — and
+  the daemon it decides is `/bin/logd`, whose `LOG_WRITE_BUDGET` is measured in
+  userland around a syscall and so is reachable only if the syscall returns. Its
+  doc named `USB_TIMEOUT_NS` as what made that so, which was true of a dead
+  device and never of a slow one; both bounds are now named there. **What is
+  still owed at the conversion**: the park in `wait_transfer` takes its
+  `Deadline` from `min(the transfer bound, until)`, so the operation's budget
+  becomes the canceller rather than merely the refuser of the *next* command.
 - Owner ruling on order: endowment, then the log, then completions.
+
+## What xHCI async costs, measured against the tree
+
+Read off the tree on 2026-08-20 while #148 was being written, so that the next
+attempt starts from these rather than from the chunk list's one sentence. None
+of the three is an argument against the chunk; each is work the chunk has to
+contain.
+
+- **The borrow chain is the refactor.** "The lock is dropped before the park"
+  means the `&mut XhciController` the guard hands out may not be live across the
+  park — and at the moment a transfer is waited for it is live eight frames
+  below the acquire: `with_disk` → `msc_read` → `with_storage` →
+  `transfer_blocks` → `scsi` → `bot` → `framed_phase` → `bulk` →
+  `wait_transfer`. Every one of those takes `&mut self` (or hands one on).
+  Making the park legal means they stop taking it and take a handle
+  that can re-derive the controller after a re-acquire, which is a rewrite of
+  `wait/msc.rs`, `wait/mod.rs` and the control-transfer half of `device.rs`
+  rather than a conversion of `XHCI`'s declaration.
+- **There is no per-disk exclusion to drop the lock under.**
+  `XhciController::with_storage` takes the `MscDevice` out of the pool block by
+  `Copy`, works on the copy and writes it back — deliberately, so a command can
+  borrow the controller and the device's rings at once. Today the `XHCI` guard
+  is what makes that safe. Drop it mid-transfer and a second CPU entering
+  `with_disk` for the same index reads the *stale* copy and enqueues its own TRBs
+  on the same endpoint ring. A per-block claim is new design the chunk owes, and
+  it is not implied by "convert the lock".
+- **Neither the token nor the deadline can be threaded to the leaf, and the
+  answer has to be one answer.** `BlockAccess::read_at` (`toyos-fat32`, a pure
+  host-tested crate) is the frame that takes `VOLUMES`, and `BlockDevice` is a
+  kernel trait but its implementors are reached from a `&mut self` that knows
+  nothing of the caller. So a leaf acquire cannot receive a `&Parkable` by
+  argument. It can still *mint* one — after the conversion a `SleepGuard` raises
+  no preempt count, so `Parkable::of_current` at that depth asserts exactly the
+  right thing and succeeds — but `scheduler::Parkable`'s own header claims the
+  opposite ("a function with no `Parkable` in scope cannot park… none of them
+  can make one"), which is a discipline rule and not a compile-time one, since
+  `of_current` is `pub`. **The owner's call, and it is one decision covering
+  both values**: either the leaves mint and that header is corrected to say what
+  it really buys, or the leaves recover both the token and the operation's
+  deadline from the running task, which needs a word on `TaskHandle` and makes
+  the ambient recovery explicit. #148 sidestepped it by minting the deadline one
+  frame *above* the trait, in `UsbBlockDevice`, which works for a value and
+  cannot work for the park token.
+
+`drain_zero_handles`'s derived constraint — none of its three drain sites can
+park, so no `on_zero_handles` hook may take a sleep lock — is **untouched by
+#148**, because #148 converts no lock. Its ground was checked rather than
+assumed: the hook that would want the VFS is a file's, and `File` is an
+`immediate` row whose hook is empty; the flush rides `OpenFileState::drop` on
+the last `Arc` instead. So the first `deferred` row that wants the VFS is still
+hypothetical, and the constraint still costs nothing to keep.
 
 Measured, and worth carrying: a 2 ms-per-transfer stick takes the worst wake
 from **7,117 µs to 165,948 µs** at smp=1, and 6,174 µs to 250,912 µs under load
