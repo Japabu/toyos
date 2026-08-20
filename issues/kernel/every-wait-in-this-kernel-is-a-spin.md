@@ -293,15 +293,15 @@ request, because the baseline assertion refuses any split.
    abandoning anything: the waiter wakes and *then* decides. So the owed item is
    a property of the park and lands with it.
 
-One finding from the 2026-08-20 pass, filed rather than fixed:
-`issues/build/kernel-clippy-runs-without-the-actuator-features.md`. The other —
-the two page-cache locks the count above did not name — is now the paragraph
-under "Four locks convert and there is no fifth", and the deadline half of it
-landed the same day: `nvme::Queue::wait_completion` spun with nothing bounding
-it at all, and now takes `drivers/nvme.rs`'s `COMMAND` inside a command and
-`block::OPERATION` between two, exactly as the USB path does. The **conversion**
-of `BLOCK_CACHE` and `BLOCK_DEV` did not land and is not in the list above; it
-is the NVMe chunk's, and it is owed on top of the four.
+Both findings from the 2026-08-20 pass are closed. Kernel clippy runs with the
+actuator features on. The other — the two page-cache locks the count above did
+not name — is now the paragraph under "Four locks convert and there is no
+fifth", and the deadline half of it landed the same day:
+`nvme::Queue::wait_completion` spun with nothing bounding it at all, and now
+takes `drivers/nvme.rs`'s `COMMAND` inside a command and `block::OPERATION`
+between two, exactly as the USB path does. The **conversion** of `BLOCK_CACHE`
+and `BLOCK_DEV` did not land and is not in the list above; it is the NVMe
+chunk's, and it is owed on top of the four.
 
 `drain_zero_handles`'s derived constraint — none of its three drain sites can
 park, so no `on_zero_handles` hook may take a sleep lock — is **untouched by
