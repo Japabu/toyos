@@ -325,28 +325,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             let path = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
             sys_delete(&path)
         }
-        SYS_SHUTDOWN => {
-            log!("Syncing filesystems...");
-            crate::vfs::lock().sync_all();
-            log!("Shutting down.");
-            // **§6.3, in order, and the order is the whole of it.** At the
-            // moment they are written these last two lines exist nowhere but
-            // the shards, and `acpi::shutdown` does not come back — so a
-            // shutdown that loses its own last lines is the one nobody can
-            // diagnose, and on a machine with no serial port they exist nowhere
-            // else at all.
-            //
-            // 1. Wait, bounded, for `/bin/logd` to make them durable. **This is
-            //    ordinary thread context**, so it yields rather than spins: at
-            //    `--smp 1` logd and this caller are the same CPU and a spin here
-            //    would guarantee the bound expired every time.
-            crate::log::wait_for_durable();
-            // 2. The console, after logd has answered, so the last record —
-            //    including logd's own — is on the wire before the power goes.
-            //    Inline, because `klogd` has no guarantee of another turn.
-            crate::log::console::drain_inline();
-            acpi::shutdown();
-        }
+        SYS_SHUTDOWN => sys_shutdown(RawHandle(a1 as u32)),
         SYS_CHDIR => {
             let path = match ctx.user_str(UserAddr::new(a1), a2) { Ok(s) => s, Err(e) => return e.to_u64() };
             sys_chdir(&path)
@@ -480,6 +459,13 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_CLOCK_EPOCH => {
             crate::clock::utc_secs().map_or(SyscallError::NotSupported.to_u64(), |secs| secs)
         }
+        // **Demands nothing because nobody has decided it should**, and not
+        // because the answer is the caller's own: the header is a machine fact
+        // like `SYS_CPU_COUNT`, but the entries name and size every process in
+        // the machine to a caller holding an empty handle table.
+        // `issues/isolation/sysinfo-enumerates-every-process.md` is the open
+        // question and it is the owner's; this line says the silence here is
+        // that and not a judgement anyone made at this arm.
         SYS_SYSINFO => {
             let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a1), a2) else { return bad_addr };
             sys_sysinfo(&mut buf)
@@ -1696,6 +1682,49 @@ fn sys_log_read(
         Ok(()) => count as u64,
         Err(e) => e.to_u64(),
     }
+}
+
+/// Power the machine off, presenting a `SysCap` that carries
+/// [`Rights::POWER`].
+///
+/// **The largest authority this kernel has, and the last one that was free.**
+/// It took no argument at all: any process that could make a syscall could end
+/// every other one, and a daemon endowed exactly one connector held this too.
+/// It is checked the way the four beside it are — resolve the handle, demand
+/// the right, refuse otherwise — so what can cut the power is exactly what
+/// `/bin/init` endowed from `system.toml`, as minting a device claim, entering
+/// the RT band, opening a process by pid and reading the log already were.
+///
+/// The refusal is `HandleError`'s ordinary one and not a special case: a
+/// capability that resolves without the bit is `PermissionDenied` and the
+/// caller carries on, and a handle the caller does not hold ends it.
+///
+/// Everything below the check is unchanged and does not come back.
+fn sys_shutdown(syscap: RawHandle) -> u64 {
+    if let Err(e) = process::with_process_data(|data| {
+        data.handles.get::<crate::object::syscap::SysCap>(syscap, Rights::POWER)
+    }) {
+        return e.refuse();
+    }
+    log!("Syncing filesystems...");
+    crate::vfs::lock().sync_all();
+    log!("Shutting down.");
+    // **§6.3, in order, and the order is the whole of it.** At the moment they
+    // are written these last two lines exist nowhere but the shards, and
+    // `acpi::shutdown` does not come back — so a shutdown that loses its own
+    // last lines is the one nobody can diagnose, and on a machine with no
+    // serial port they exist nowhere else at all.
+    //
+    // 1. Wait, bounded, for `/bin/logd` to make them durable. **This is
+    //    ordinary thread context**, so it yields rather than spins: at
+    //    `--smp 1` logd and this caller are the same CPU and a spin here would
+    //    guarantee the bound expired every time.
+    crate::log::wait_for_durable();
+    // 2. The console, after logd has answered, so the last record — including
+    //    logd's own — is on the wire before the power goes. Inline, because
+    //    `klogd` has no guarantee of another turn.
+    crate::log::console::drain_inline();
+    acpi::shutdown();
 }
 
 /// Answer this process's endowment table.
