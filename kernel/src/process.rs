@@ -1287,7 +1287,7 @@ fn release_process(code: i32) {
             drop(guard);
             unsafe { crate::mm::paging::kernel_cr3().activate(); }
             return;
-        };
+        }
         let other_tids: Vec<Tid> = proc.threads.iter()
             .map(|(t, _)| t)
             .filter(|&t| t != tid)
