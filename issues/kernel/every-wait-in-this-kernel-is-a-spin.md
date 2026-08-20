@@ -321,8 +321,13 @@ Read off the tree 2026-08-20. `object::file::OpenFileState::drop`
 (`kernel/src/object/file.rs:27-39`) takes `vfs::lock()` and, for a modified
 file, calls `Vfs::flush_file` — which for a FAT mount is a device round trip.
 Its own doc has said so since it was written: *"**This takes the VFS lock** —
-flushing needs it."* Three facts make that fatal to `vfs::VFS`'s conversion, and
-none of them is one of the first three walls.
+flushing needs it."* It is load-bearing rather than incidental, and the evidence
+is that an unrelated file already has to reason about it: `loader::spawn` scopes
+its own `vfs::lock()` to a single statement and says why — *"every `return` past
+this point drops `pending`, and releasing a file object takes the VFS lock
+(`object::file::OpenFileState::drop`)"* (`loader/mod.rs:442-445`). Three facts
+make it fatal to `vfs::VFS`'s conversion, and none of them is one of the first
+three walls.
 
 * **A `Drop` impl cannot receive a `Parkable`**, and the two contexts this drop
   actually runs in cannot let it make one either. `ops::close` runs inside
