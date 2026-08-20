@@ -15,6 +15,15 @@
 //! killer's CPU. The stranded `Arc` leaks memory: bounded, visible in the
 //! [`census`], and unable to delay a semantic event.
 
+// Every unsafe block under `object::` carries a `SAFETY:` comment —
+// measured and documented in full by
+// `issues/build/clippy-has-never-run-here.md`'s per-area plan.
+// `host-tests.yml`'s kernel clippy step already runs with `-D warnings`, so
+// `warn` here is what actually gates: a new undocumented block anywhere in
+// this module tree fails CI, while the rest of the kernel (not yet swept)
+// stays silent.
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::num::NonZeroU64;

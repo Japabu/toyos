@@ -69,12 +69,29 @@ pub fn setup_combined_tls(
     let page_alloc = PageAlloc::new(plan.alloc_size, crate::mm::pmm::Category::InitTls)?;
     let block = page_alloc.ptr();
 
+    // SAFETY: `block` is `page_alloc.ptr()`, a fresh `PageAlloc::new
+    // (plan.alloc_size, ...)` immediately above — valid and exclusively
+    // owned for exactly `plan.alloc_size` bytes, and not yet published
+    // anywhere else.
     unsafe {
         core::ptr::write_bytes(block, 0, plan.alloc_size);
     }
 
     for module in modules.iter().filter(|m| m.is_static) {
         if let Some(template) = &module.template {
+            // SAFETY: `template.base()` is valid for `template.size()` bytes
+            // (a `KernelSlice`, bounds-checked when it was built — see
+            // `KernelSlice::as_slice`'s `# Safety` for the same class of
+            // guarantee). The destination stays inside `block`'s
+            // `plan.alloc_size`-byte allocation by `toyos_elf::tls`'s own
+            // contract, chained: `template.size() <= module.memsz` (ELF's
+            // own `filesz <= memsz`), `module.base_offset + module.memsz <=
+            // total_memsz` (`place_module`'s contract, see
+            // `build_tls_layout`'s doc), and `plan.tls_start + total_memsz
+            // <= plan.alloc_size` (`plan`'s own formula: `tls_start =
+            // (alloc_size - block_size) & !(align - 1) <= alloc_size -
+            // block_size`, and `block_size >= total_memsz`). `block` is
+            // freshly zeroed above and not yet published.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     template.base(),
@@ -87,13 +104,28 @@ pub fn setup_combined_tls(
 
     let block_phys = DirectMap::from_ptr(block).phys();
     let tp_user = block_phys + plan.tp_offset as u64;
+    // SAFETY: `plan.tp_offset = tls_start + total_memsz` (the crate's own
+    // field doc: "Where the thread pointer goes") is where the TCB starts,
+    // and `plan()`'s `alloc_size` formula reserves `TCB_SIZE` bytes after it
+    // — so `block.add(plan.tp_offset)` plus the 16 bytes the block below
+    // writes through it stays inside `block`'s allocation.
     let tp_kernel = unsafe { block.add(plan.tp_offset) } as *mut u64;
+    // SAFETY: `tp_kernel`'s bound was just established above; two `u64`
+    // writes (16 of the `TCB_SIZE` = 64 bytes reserved there). Same
+    // exclusivity as the zero/copy above — `block` is not yet published.
     unsafe {
         *tp_kernel = tp_user;
         *tp_kernel.add(1) = block_phys;
     }
 
     let dtv = block as *mut u64;
+    // SAFETY: `dtv = block`, and every write below lands in `[0,
+    // DTV_BYTES)` (`DTV_HEADER_SIZE` plus `DTV_INITIAL_CAPACITY` eight-byte
+    // slots — exactly the `dtv_bytes` `plan()` was called with above).
+    // `plan()`'s own formula (`alloc_size = align_up(block_size + dtv_bytes
+    // + align, granule)`) guarantees at least that much room at the front of
+    // `block`. The per-module loop checks `idx <= DTV_INITIAL_CAPACITY`
+    // before every write. Same exclusivity as the rest of this function.
     unsafe {
         *dtv = 1;
         *dtv.add(1) = DTV_INITIAL_CAPACITY as u64;
@@ -136,6 +168,19 @@ pub fn map_block(
         crate::mm::paging::Prot::ReadWrite)?;
     let rebase = vaddr.raw() as i64 - phys as i64;
     let fs_base = (fs_base as i64 + rebase) as u64;
+    // SAFETY: `phys`/`alloc` are the block `setup_combined_tls`/`setup_tls`
+    // just built and zeroed — `(fs_base - vaddr.raw())` reduces to the same
+    // `plan.tp_offset` that function already bounded against `alloc_size`
+    // (algebraically: `fs_base = block_phys + plan.tp_offset + rebase`,
+    // `rebase = vaddr - phys`, and `block_phys == phys`, so `fs_base -
+    // vaddr.raw() == plan.tp_offset`), and `dtv`/its length-prefixed entries
+    // are the same `[0, DTV_BYTES)` region that function wrote. The direct
+    // map (`DirectMap::from_phys`) is the kernel's own view of these
+    // physical pages; `vma_map` just mapped the same pages into the child's
+    // address space, but the child has not been scheduled yet (this runs on
+    // the spawning thread, before `SYS_SPAWN` hands the new process to the
+    // scheduler), so nothing else can be reading or writing through either
+    // view concurrently.
     unsafe {
         let block = DirectMap::from_phys(phys).as_mut_ptr::<u8>();
         let tp = block.add((fs_base - vaddr.raw()) as usize) as *mut u64;
