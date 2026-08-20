@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use crate::arch::entry::{initial_user_state, ring3_trampoline_asm};
 use crate::object::{HandleTable, Refusal};
 use crate::process::{
-    fd_owner_data, Endowments, OwnedAlloc, ENDOW_ENTRY_LEN, KERNEL_STACK_SIZE,
+    process_data, Endowments, OwnedAlloc, ENDOW_ENTRY_LEN, KERNEL_STACK_SIZE,
 };
 use crate::scheduler;
 use crate::user_ptr::UserBytes;
@@ -183,7 +183,7 @@ impl PendingHandles {
             Self::Ready(table, endowments) => return Ok((table, endowments)),
             Self::Moving { table, endow, labels } => (table, endow, labels),
         };
-        let data_arc = fd_owner_data();
+        let data_arc = process_data();
         let mut data = data_arc.lock();
 
         let count = endow.len() / ENDOW_ENTRY_LEN;
@@ -280,7 +280,7 @@ pub fn build_child_handles(
     if labels.len() > MAX_LABELS_LEN {
         return Err(SyscallError::InvalidArgument.into());
     }
-    let data_arc = fd_owner_data();
+    let data_arc = process_data();
     let data = data_arc.lock();
     let mut handles = HandleTable::new();
     // Carried out of the guard rather than dropped inside it. Every entry a

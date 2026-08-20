@@ -3,8 +3,9 @@
 //!
 //! Every method here is an effect. The decisions they act on come from
 //! `toyos_desktop` and are host-tested there; what is left is claiming the
-//! devices, draining the fds without ever blocking on a client, allocating and
-//! granting the shared buffers, and handing finished rectangles to the panel.
+//! devices, draining the client connections without ever blocking on one,
+//! allocating and granting the shared buffers, and handing finished rectangles
+//! to the panel.
 
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -32,7 +33,7 @@ use crate::client::{
 use crate::render::{self, Assets, BackBuffer, SystemStats, TitleBarIcons};
 use crate::stats::FrameStats;
 use crate::{
-    CURSOR_PX, DOUBLE_CLICK_TIME, DRAIN_BUDGET, FIXED_POLL_FDS, FLAG_HARDWARE_CURSOR,
+    CURSOR_PX, DOUBLE_CLICK_TIME, DRAIN_BUDGET, FIXED_POLL_HANDLES, FLAG_HARDWARE_CURSOR,
     FRAME_INTERVAL, LAUNCHER_APPS, MAX_WINDOW_SLOTS, STATS_INTERVAL,
 };
 
@@ -107,7 +108,7 @@ pub struct Session {
     cursor: Point,
     prev_buttons: u8,
     grab: Grab,
-    last_click_fd: Option<RawHandle>,
+    last_click_handle: Option<RawHandle>,
     last_click_at: Instant,
     clipboard: String,
     launcher_open: bool,
@@ -213,10 +214,11 @@ impl Session {
         );
 
         // Sized for the slot ceiling rather than for `max_windows`: the batch
-        // between two `wait` calls is the three fixed fds, one per live window
+        // between two `wait` calls is the three fixed registrations, one per
+        // live window
         // and one per pending connection, and `MSG_SET_RESOLUTION` can raise
         // `max_windows` mid-run.
-        let poller = Poller::new(FIXED_POLL_FDS + MAX_WINDOW_SLOTS + MAX_PENDING_CONNS);
+        let poller = Poller::new(FIXED_POLL_HANDLES + MAX_WINDOW_SLOTS + MAX_PENDING_CONNS);
         poller.poll_add(&kb, IORING_POLL_IN, kb.fd().0 as u64);
         poller.poll_add(&mouse, IORING_POLL_IN, mouse.fd().0 as u64);
         poller.poll_add(&acceptor, IORING_POLL_IN, acceptor.as_handle().0 as u64);
@@ -259,7 +261,7 @@ impl Session {
             cursor,
             prev_buttons: 0,
             grab: Grab::None,
-            last_click_fd: None,
+            last_click_handle: None,
             last_click_at: now,
             clipboard: String::new(),
             launcher_open: false,
@@ -291,8 +293,8 @@ impl Session {
             }
             waited = true;
             // The clause that keeps one client from owning the loop: a peer
-            // with something to send on every pass keeps its fd ready forever,
-            // and a drain that only ended when nothing was ready would never
+            // with something to send on every pass keeps its handle ready
+            // forever, and a drain that only ended when nothing was ready would never
             // composite.
             if Instant::now() >= drain_until {
                 break;
@@ -350,8 +352,8 @@ impl Session {
         true
     }
 
-    fn is_ready(&self, fd: RawHandle) -> bool {
-        self.ready.contains(&(fd.0 as u64))
+    fn is_ready(&self, handle: RawHandle) -> bool {
+        self.ready.contains(&(handle.0 as u64))
     }
 
     fn pixel_format(&self) -> u32 {
@@ -510,15 +512,15 @@ impl Session {
                 self.damage.add(self.stack[i].frame(&self.desk.chrome));
 
                 let now = Instant::now();
-                let fd = self.stack[i].client.conn.fd();
-                let double = Some(fd) == self.last_click_fd
+                let handle = self.stack[i].client.conn.fd();
+                let double = Some(handle) == self.last_click_handle
                     && now.duration_since(self.last_click_at) < DOUBLE_CLICK_TIME;
                 if double {
                     self.retarget(i, toggled(self.stack[i].mode));
-                    self.last_click_fd = None;
+                    self.last_click_handle = None;
                     self.last_click_at = now - DOUBLE_CLICK_TIME;
                 } else {
-                    self.last_click_fd = Some(fd);
+                    self.last_click_handle = Some(handle);
                     self.last_click_at = now;
                     self.grab = Grab::on_title(self.stack[i].id, self.stack[i].mode, at);
                 }
@@ -619,7 +621,7 @@ impl Session {
 
     fn accept(&mut self) {
         // `accept` installs a descriptor, so it answers `ResourceExhausted` on
-        // a full fd table — and clients drive that table, one fd per
+        // a full handle table — and clients drive that table, one handle per
         // connection. The connection is lost either way; the desktop is not.
         match self.acceptor.accept() {
             Err(e) => eprintln!("compositor: a connection could not be accepted ({e:?})"),
@@ -637,7 +639,7 @@ impl Session {
         }
     }
 
-    /// Every whole frame that arrived, off the fds and in memory.
+    /// Every whole frame that arrived, off the connections and in memory.
     ///
     /// Collected before anything acts on one: the read side is finished by the
     /// time a message is dispatched, so no branch of [`dispatch`](Self::dispatch)
@@ -653,15 +655,15 @@ impl Session {
                 let p = &mut self.pending[i];
                 p.rx.pump(&p.conn)
             };
-            let fd = self.pending[i].conn.fd();
+            let handle = self.pending[i].conn.fd();
             match step {
                 RxStep::Idle => {}
-                RxStep::Eof => mark_dead(&mut self.dead, fd, DropReason::Gone),
+                RxStep::Eof => mark_dead(&mut self.dead, handle, DropReason::Gone),
                 RxStep::Malformed => {
-                    mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol)
+                    mark_dead(&mut self.dead, handle, DropReason::OutOfProtocol)
                 }
                 RxStep::Frame { msg_type, payload_len } => {
-                    let mut frame = ClientFrame::new(fd, msg_type);
+                    let mut frame = ClientFrame::new(handle, msg_type);
                     frame.set_payload(self.pending[i].rx.payload(payload_len));
                     // A connection is identified by its first frame and by
                     // nothing else. `MSG_CREATE_WINDOW` promotes it to a
@@ -685,15 +687,15 @@ impl Session {
             }
             let win = &mut self.stack[i];
             let step = win.client.rx.pump(&win.client.conn);
-            let fd = win.client.conn.fd();
+            let handle = win.client.conn.fd();
             match step {
                 RxStep::Idle => {}
-                RxStep::Eof => mark_dead(&mut self.dead, fd, DropReason::Gone),
+                RxStep::Eof => mark_dead(&mut self.dead, handle, DropReason::Gone),
                 RxStep::Malformed => {
-                    mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol)
+                    mark_dead(&mut self.dead, handle, DropReason::OutOfProtocol)
                 }
                 RxStep::Frame { msg_type, payload_len } => {
-                    let mut frame = ClientFrame::new(fd, msg_type);
+                    let mut frame = ClientFrame::new(handle, msg_type);
                     frame.set_payload(win.client.rx.payload(payload_len));
                     out.push(frame);
                 }
@@ -704,22 +706,22 @@ impl Session {
 
     fn dispatch(&mut self, frames: Vec<ClientFrame>) {
         for frame in frames {
-            let fd = frame.fd;
+            let handle = frame.handle;
             match frame.msg_type {
                 window::MSG_CREATE_WINDOW => self.create_window(frame),
                 window::MSG_PRESENT => {
                     let Ok(rect) = ipc::decode_payload::<window::Rect>(frame.payload()) else {
-                        mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol);
+                        mark_dead(&mut self.dead, handle, DropReason::OutOfProtocol);
                         continue;
                     };
-                    if let Some(i) = self.stack.find(|w| w.client.conn.fd() == fd) {
+                    if let Some(i) = self.stack.find(|w| w.client.conn.fd() == handle) {
                         self.stack[i].presented = true;
                         let claim = Rect::from_wire(rect.x, rect.y, rect.w, rect.h);
                         self.damage.add(self.stack[i].present_damage(claim));
                     }
                 }
                 window::MSG_DESTROY_WINDOW => {
-                    if let Some(i) = self.stack.find(|w| w.client.conn.fd() == fd) {
+                    if let Some(i) = self.stack.find(|w| w.client.conn.fd() == handle) {
                         let gone = self.stack.remove(i);
                         note_closed("the client itself", gone.client.conn.fd(), self.stack.len());
                         self.damage.add(gone.frame(&self.desk.chrome));
@@ -745,7 +747,7 @@ impl Session {
                     let Ok(info) =
                         ipc::decode_payload::<window::ClipboardShmMsg>(frame.payload())
                     else {
-                        mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol);
+                        mark_dead(&mut self.dead, handle, DropReason::OutOfProtocol);
                         continue;
                     };
                     // The length is the client's claim about how much of the
@@ -759,26 +761,26 @@ impl Session {
                             "compositor: refusing {} bytes of clipboard from client {}, max \
                              {MAX_CLIPBOARD_BYTES}",
                             info.len,
-                            fd.0
+                            handle.0
                         );
                         continue;
                     }
-                    let Some([buffer]) = ipc::recv_handles_exact::<1>(fd) else {
-                        mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol);
+                    let Some([buffer]) = ipc::recv_handles_exact::<1>(handle) else {
+                        mark_dead(&mut self.dead, handle, DropReason::OutOfProtocol);
                         continue;
                     };
                     let Ok(shm) = SharedMemory::adopt(buffer, info.len as usize) else {
-                        mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol);
+                        mark_dead(&mut self.dead, handle, DropReason::OutOfProtocol);
                         continue;
                     };
                     self.clipboard = String::from_utf8_lossy(shm.as_slice()).into_owned();
                 }
                 window::MSG_SET_CURSOR => {
                     let Ok(style) = ipc::decode_payload::<u32>(frame.payload()) else {
-                        mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol);
+                        mark_dead(&mut self.dead, handle, DropReason::OutOfProtocol);
                         continue;
                     };
-                    if let Some(i) = self.stack.find(|w| w.client.conn.fd() == fd) {
+                    if let Some(i) = self.stack.find(|w| w.client.conn.fd() == handle) {
                         self.stack[i].cursor_style = cursor_from_wire(style);
                     }
                 }
@@ -786,25 +788,25 @@ impl Session {
                     let Ok(req) =
                         ipc::decode_payload::<window::ResolutionRequest>(frame.payload())
                     else {
-                        mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol);
+                        mark_dead(&mut self.dead, handle, DropReason::OutOfProtocol);
                         continue;
                     };
                     self.set_resolution(req.width, req.height);
-                    self.answer_resolution(fd);
+                    self.answer_resolution(handle);
                 }
                 // The one message a client can ask for faster than it can read
                 // the answer: eight bytes in, sixteen out. Blocking here is a
                 // client filling its own pipe and taking the desktop with it.
-                window::MSG_GET_RESOLUTION => self.answer_resolution(fd),
+                window::MSG_GET_RESOLUTION => self.answer_resolution(handle),
                 _ => {}
             }
         }
     }
 
     fn create_window(&mut self, frame: ClientFrame) {
-        let fd = frame.fd;
+        let handle = frame.handle;
         // `frame.conn` is dropped by every early return here, which closes the
-        // fd: there is no window to remove yet.
+        // handle: there is no window to remove yet.
         let Ok(req) = ipc::decode_payload::<window::CreateWindowRequest>(frame.payload()) else {
             return;
         };
@@ -814,7 +816,7 @@ impl Session {
         // rather than as a protocol error made one message from any client
         // fatal.
         let Some(conn) = frame.conn else {
-            mark_dead(&mut self.dead, fd, DropReason::OutOfProtocol);
+            mark_dead(&mut self.dead, handle, DropReason::OutOfProtocol);
             return;
         };
 
@@ -836,12 +838,12 @@ impl Session {
                  {reason}",
                 req.width,
                 req.height,
-                fd.0,
+                handle.0,
                 self.stack.len(),
                 self.max_windows
             );
             let _ =
-                ipc::try_send(fd, window::MSG_WINDOW_REFUSED, &window::WindowRefused { reason });
+                ipc::try_send(handle, window::MSG_WINDOW_REFUSED, &window::WindowRefused { reason });
             return;
         }
 
@@ -858,10 +860,10 @@ impl Session {
                      for it ({e:?})",
                     content.w(),
                     content.h(),
-                    fd.0
+                    handle.0
                 );
                 let _ = ipc::try_send(
-                    fd,
+                    handle,
                     window::MSG_WINDOW_REFUSED,
                     &window::WindowRefused { reason: window::REFUSED_NO_MEMORY },
                 );
@@ -878,10 +880,10 @@ impl Session {
                 eprintln!(
                     "compositor: refusing a window to client {} — its buffer cannot be shared \
                      ({e:?})",
-                    fd.0
+                    handle.0
                 );
                 let _ = ipc::try_send(
-                    fd,
+                    handle,
                     window::MSG_WINDOW_REFUSED,
                     &window::WindowRefused { reason: window::REFUSED_NO_MEMORY },
                 );
@@ -902,7 +904,7 @@ impl Session {
             CursorStyle::Default,
         ));
 
-        self.poller.poll_add(&self.stack[at].client.conn, IORING_POLL_IN, fd.0 as u64);
+        self.poller.poll_add(&self.stack[at].client.conn, IORING_POLL_IN, handle.0 as u64);
         let pixel_format = self.pixel_format();
         deliver_with_handles(
             &mut self.dead,
@@ -919,11 +921,11 @@ impl Session {
         self.damage_all();
     }
 
-    fn answer_resolution(&mut self, fd: RawHandle) {
+    fn answer_resolution(&mut self, handle: RawHandle) {
         let reply =
             window::ResolutionInfo { width: self.fb_info.width, height: self.fb_info.height };
-        if ipc::try_send(fd, window::MSG_RESOLUTION_CHANGED, &reply).is_err() {
-            mark_dead(&mut self.dead, fd, DropReason::NotReading);
+        if ipc::try_send(handle, window::MSG_RESOLUTION_CHANGED, &reply).is_err() {
+            mark_dead(&mut self.dead, handle, DropReason::NotReading);
         }
     }
 
@@ -981,12 +983,12 @@ impl Session {
         let vacated: Vec<Rect> = self
             .stack
             .iter()
-            .filter(|w| self.dead.iter().any(|(fd, _)| *fd == w.client.conn.fd()))
+            .filter(|w| self.dead.iter().any(|(handle, _)| *handle == w.client.conn.fd()))
             .map(|w| w.frame(&self.desk.chrome))
             .collect();
         let dead = std::mem::take(&mut self.dead);
-        self.stack.retain(|w| !dead.iter().any(|(fd, _)| *fd == w.client.conn.fd()));
-        self.pending.retain(|p| !dead.iter().any(|(fd, _)| *fd == p.conn.fd()));
+        self.stack.retain(|w| !dead.iter().any(|(handle, _)| *handle == w.client.conn.fd()));
+        self.pending.retain(|p| !dead.iter().any(|(handle, _)| *handle == p.conn.fd()));
         self.dead = dead;
         if self.stack.len() != before {
             for rect in vacated {
@@ -996,7 +998,7 @@ impl Session {
         }
     }
 
-    /// Re-arm the one-shot poll registrations for every fd that fired.
+    /// Re-arm the one-shot poll registrations for every handle that fired.
     fn rearm(&mut self, kb: bool, mouse: bool, acceptor: bool) {
         if kb {
             self.poller.poll_add(&self.kb, IORING_POLL_IN, self.kb.fd().0 as u64);
@@ -1009,15 +1011,15 @@ impl Session {
             self.poller.poll_add(&self.acceptor, IORING_POLL_IN, h.0 as u64);
         }
         for win in self.stack.iter() {
-            let fd = win.client.conn.fd();
-            if self.is_ready(fd) {
-                self.poller.poll_add(&win.client.conn, IORING_POLL_IN, fd.0 as u64);
+            let handle = win.client.conn.fd();
+            if self.is_ready(handle) {
+                self.poller.poll_add(&win.client.conn, IORING_POLL_IN, handle.0 as u64);
             }
         }
         for p in self.pending.iter() {
-            let fd = p.conn.fd();
-            if self.is_ready(fd) {
-                self.poller.poll_add(&p.conn, IORING_POLL_IN, fd.0 as u64);
+            let handle = p.conn.fd();
+            if self.is_ready(handle) {
+                self.poller.poll_add(&p.conn, IORING_POLL_IN, handle.0 as u64);
             }
         }
     }
@@ -1163,11 +1165,11 @@ impl Session {
             return;
         }
         for win in
-            self.stack.iter().filter(|w| dead.iter().any(|(fd, _)| *fd == w.client.conn.fd()))
+            self.stack.iter().filter(|w| dead.iter().any(|(h, _)| *h == w.client.conn.fd()))
         {
             self.damage.add(win.frame(&self.desk.chrome));
         }
-        self.stack.retain(|w| !dead.iter().any(|(fd, _)| *fd == w.client.conn.fd()));
+        self.stack.retain(|w| !dead.iter().any(|(handle, _)| *handle == w.client.conn.fd()));
         self.damage_all();
     }
 

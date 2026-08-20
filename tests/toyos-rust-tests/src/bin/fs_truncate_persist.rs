@@ -22,7 +22,7 @@ fn seed() -> Vec<u8> {
 }
 
 /// Grow, shrink, and check across a close in every case — an in-memory size
-/// that never reached the filesystem looks correct until the fd goes away.
+/// that never reached the filesystem looks correct until the handle goes away.
 fn truncate_round_trip(path: &str) {
     {
         let mut f = fs::File::create(path).unwrap_or_else(|e| panic!("create {path}: {e}"));

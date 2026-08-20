@@ -215,14 +215,14 @@ pub struct ConsoleObject {
     /// `serial::BackendGuard` — so the backend's spinlock is held *underneath*
     /// this one, once per line, for as long as the device write takes.
     ///
-    /// The order is **`fd_owner_data` → `line` → `BackendGuard`**, and it is
+    /// The order is **`process_data` → `line` → `BackendGuard`**, and it is
     /// consistent because nothing takes those three in any other order:
     ///
     /// - Only two things take `line`: this type's `write`, reached from
-    ///   `ops::try_write` under the writing process's own `fd_owner_data`, and
+    ///   `ops::try_write` under the writing process's own `process_data`, and
     ///   its `Drop`, which runs where the last handle did — also under that
     ///   lock, and holding nothing below it yet.
-    /// - Nothing that holds `BackendGuard` takes `line` or `fd_owner_data`. The
+    /// - Nothing that holds `BackendGuard` takes `line` or `process_data`. The
     ///   other three producers write the *backend* and never an object:
     ///   `klogd`'s drain, `panic_flush`/`flush_final`, and the input path. That
     ///   is §4.1's split, and it is what makes a console object something a

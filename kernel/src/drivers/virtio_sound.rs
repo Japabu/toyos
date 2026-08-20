@@ -244,7 +244,7 @@ fn pop_completion() -> Option<AudioCompletionRecord> {
     Some(rec)
 }
 
-/// Readiness: are completion records pending? Lock-free — fd readiness,
+/// Readiness: are completion records pending? Lock-free — handle readiness,
 /// io_uring poll and the scheduler's park-time recheck all ask this.
 pub fn has_pending() -> bool {
     RECORDS.head.load(Ordering::Acquire) != RECORDS.tail.load(Ordering::Acquire)

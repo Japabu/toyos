@@ -4292,7 +4292,7 @@ const METAL_SIM_DESKTOP: &str = "metal-sim desktop";
 const I8042_TRACE: &str = "i8042 trace";
 
 /// The line `tests/toyos-rust-tests/src/bin/i8042_keyboard.rs` prints once it
-/// holds the keyboard fd, and the line every injection into that binary is
+/// holds the keyboard claim, and the line every injection into that binary is
 /// timed off. Eight callers wait for it, and one — `i8042_undecoded_bytes` —
 /// also reads its capture *from* it: it is the boundary between what the
 /// machine did on its own and what this test staged.
@@ -5239,7 +5239,7 @@ fn swiss_german_layout(qemu: &mut QemuInstance) -> Result<(), String> {
 /// whole timeout for a test that finished. Escape presses after the wizard has
 /// gone are discarded by the next reader, and each one is an i8042 interrupt
 /// that keeps the ring draining. `i8042_no_spurious_wake` records the same
-/// property from the other side: a guest polling its fd keeps it moving.
+/// property from the other side: a guest polling its handle keeps it moving.
 fn keep_the_ring_moving(input: &mut qemu::QmpInput) {
     for _ in 0..4 {
         thread::sleep(Duration::from_millis(150));
@@ -6415,7 +6415,7 @@ fn soundd_clients_since(log: &str, from: usize, verb: &str) -> usize {
 /// It drives the same in-guest reader as [`i8042_keyboard`], and not only for
 /// the userland half of the assertion: on a fully idle machine the kernel's
 /// log ring flushes one line behind, so the last trace line would never reach
-/// the console (filed in `issues/`). A guest polling its fd keeps the ring
+/// the console (filed in `issues/`). A guest polling its handle keeps the ring
 /// moving.
 ///
 /// **The zero-event drain is arranged, not hoped for.** What a drain carries is
@@ -6677,7 +6677,7 @@ fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
                 return;
             }
             // The driver reports its counters from a scheduler pass, and the
-            // client polling its fd is what keeps passes running: the line has
+            // client polling its handle is what keeps passes running: the line has
             // to arrive before the client is told to stop.
             if !counted {
                 return;
@@ -9397,7 +9397,7 @@ fn run_machine_test(
                 return Err(format!("the PS/2 keyboard never came up:\n{}", qemu.boot_log()));
             }
             // One key, a silence several periods long, then one more key. The
-            // guest program holds the keyboard fd for 5 s and the period is
+            // guest program holds the keyboard claim for 5 s and the period is
             // 500 ms, so the quiet stretch is nine periods with nothing to say.
             let result = qemu.run_test_hooked(
                 "test_rs_i8042_keyboard",
@@ -10132,7 +10132,7 @@ fn run_machine_test(
             // The owner froze his desktop twice by plugging a mouse in and
             // pulling it out again, and the second freeze landed on the fourth
             // cycle's enumeration. The compositor holds the merged pointer's
-            // fd across all of it, so every cycle is a source binding and
+            // handle across all of it, so every cycle is a source binding and
             // releasing underneath a claim it never made and cannot see.
             //
             // The liveness signal is `compositor: frames=`, for the reason it

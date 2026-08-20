@@ -172,11 +172,11 @@ pub enum Source {
 
 /// A source whose whole lifetime is one object's.
 ///
-/// **[`remove_fd`] takes only these, and that is what makes the mistake it
+/// **[`cancel_by_source`] takes only these, and that is what makes the mistake it
 /// exists to stop a compile error rather than a review note.** Cancellation is
 /// by source across every ring in the machine, which is what a pipe needs — a
-/// client closing its end must complete the server's poll on the other, and an
-/// fd number means nothing outside the process that owns it. Handing it a
+/// client closing its end must complete the server's poll on the other, and a
+/// handle means nothing outside the process that owns it. Handing it a
 /// source the closing object does *not* own cancels polls that belong to
 /// processes which were never consulted, and there is now no way to write that:
 /// [`Source::ended_by_its_last_handle`] is the only constructor.
@@ -329,7 +329,8 @@ fn take_poll(instance: &mut IoUringInstance, index: usize) -> PendingPoll {
 }
 
 /// Hard cap on pending polls per ring. With dedup this should never be reached
-/// (bounded by number of open fds), but guards against future bugs.
+/// (bounded by the number of handles a process holds), but guards against
+/// future bugs.
 const MAX_PENDING_POLLS: usize = 1024;
 
 struct IoUringInstance {
@@ -568,7 +569,7 @@ pub fn enter(
         // waiter for `min_complete` CQEs that cancelled on the first one would
         // spin instead of parking. It runs *after* the arm, inside
         // `completion::wait_until`, which is what closes the window a sibling
-        // thread closing this ring's fd opens.
+        // thread closing this ring's handle opens.
         let parkable = scheduler::Parkable::of_current();
         if completion::wait_until(
             &parkable,
@@ -681,7 +682,7 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
 
     // Readiness first, on the process's table rather than the thread's: a ring
     // is process-wide.
-    let resolved = process::with_fd_owner_data(|data| {
+    let resolved = process::with_process_data(|data| {
         let object = data.handles.get_ref(handle, Rights::WAIT)?;
         let readable = flags.readable() && ops::has_data(object);
         let writable = flags.writable() && ops::has_space(object);
@@ -691,7 +692,7 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
     });
     let (ready, read_source, write_source) = match resolved {
         Ok(seen) => seen,
-        // Nothing is held here: `with_fd_owner_data` has given the guard up.
+        // Nothing is held here: `with_process_data` has given the guard up.
         Err(e) => {
             let refusal = e.refuse_as_error();
             post_cqe_locked(ring_id, user_data, -(refusal as i32), 0);
@@ -780,13 +781,13 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
 fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
     let user_data = sqe.user_data;
 
-    let acceptor = process::with_fd_owner_data(|data| {
+    let acceptor = process::with_process_data(|data| {
         data.handles.get::<crate::object::port::Acceptor>(sqe.fd, Rights::READ)
     });
 
     let acceptor = match acceptor {
         Ok(a) => a,
-        // Nothing held: `with_fd_owner_data` has given the guard up.
+        // Nothing held: `with_process_data` has given the guard up.
         Err(e) => {
             let refusal = e.refuse_as_error();
             post_cqe_locked(ring_id, user_data, -(refusal as i32), 0);
@@ -796,7 +797,7 @@ fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
 
     match acceptor.pop() {
         Some(conn) => {
-            let installed = process::with_fd_owner_data(|data| {
+            let installed = process::with_process_data(|data| {
                 ops::install(
                     &mut data.handles,
                     KObjectRef::Connection(crate::object::service::ConnectionEnd::new(
@@ -878,23 +879,24 @@ fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPol
 }
 
 /// Cancel every pending poll on a source that is going away, in every ring
-/// that was watching it. Called by the fd close path.
+/// that was watching it. Called by the handle close path.
 ///
-/// **Selected by source and never by fd number.** The rings this reaches
+/// **Selected by source and never by handle.** The rings this reaches
 /// belong to *other* processes — that is the whole point of walking the
-/// source's watcher list — and an fd number means nothing outside the process
+/// source's watcher list — and a handle means nothing outside the process
 /// that owns it. Matching on it cancelled a poll the closing process had never
-/// heard of: a client exiting with its connection on fd 3 posted `-NotFound`
-/// for whatever the server had on *its* fd 3, and a server whose listener sat
-/// there then read ready with nothing queued and blocked in `accept` forever.
-/// Found in the layout wizard's gate, where the wizard's fd 3 was the gate's
-/// listener; the compositor is exposed to exactly the same shape.
+/// heard of: a client exiting with its connection on handle 3 posted
+/// `-NotFound` for whatever the server had on *its* handle 3, and a server
+/// whose listener sat there then read ready with nothing queued and blocked in
+/// `accept` forever. Found in the layout wizard's gate, where the wizard's
+/// handle 3 was the gate's listener; the compositor is exposed to exactly the
+/// same shape.
 ///
 /// **Every cancellation is woken.** The ring belongs to a thread parked in
 /// `enter` on it — that is what a pending `POLL_ADD` means — and nothing else
 /// can end that park: the poll is gone, so the source's own close-path wake
 /// finds no watcher for it, and a `u64::MAX` wait never returns.
-pub fn remove_fd(sources: &[Option<EndedSource>]) {
+pub fn cancel_by_source(sources: &[Option<EndedSource>]) {
     let mut affected: Vec<RingId> = Vec::new();
     for EndedSource(source) in sources.iter().flatten() {
         for &id in source.watchers().iter() {

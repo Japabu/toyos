@@ -108,7 +108,7 @@ mod handle {
 }
 
 // Pipe internals — owns physical memory, tracks refcounts only.
-// Mapping into user address spaces is managed by the FD layer.
+// Mapping into user address spaces is managed by the handle layer.
 
 pub const PIPE_SIZE: usize = PAGE_2M as usize;
 
