@@ -25,6 +25,7 @@ use crate::sync::Lock;
 pub mod device;
 pub mod file;
 pub mod handle;
+pub mod inbox;
 pub mod namespace;
 pub mod ops;
 pub mod pipe;
@@ -69,7 +70,7 @@ impl<T: Clone> Held<T> {
 
 /// A kernel object's identity.
 ///
-/// For diagnostics and for kernel-internal keys — an io_uring watch names the
+/// For diagnostics and for kernel-internal keys — an inbox watch names the
 /// object it watches by this, because a handle means nothing in another
 /// process's table. **Never an authority**: no syscall turns a koid into
 /// access to anything.
@@ -282,9 +283,8 @@ kobject! {
     deferred Device => device::DeviceClaim,
     deferred Acceptor => port::Acceptor,
     // The kind name is the ABI's: `toyos_abi::syscall::OBJECT_KINDS` carries it
-    // and `CENSUS_KIND` asserts the two lists agree name for name. The object
-    // type keeps the old spelling until the tree-local vocabulary PR renames it.
-    deferred Inbox => service::IoUringObject,
+    // and `CENSUS_KIND` asserts the two lists agree name for name.
+    deferred Inbox => inbox::InboxObject,
     // Every mapping goes with the last handle, and the flush that makes that
     // safe waits for every other CPU — so it runs from the queue, with nothing
     // held, and never inline at a `close`.

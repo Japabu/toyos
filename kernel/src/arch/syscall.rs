@@ -685,9 +685,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_namespace_open(RawHandle(a1 as u32), &name)
         }
         SYS_TLS_ALLOC_BLOCK => sys_tls_alloc_block(a1),
-        SYS_INBOX_SETUP => sys_io_uring_setup(&ctx, a1 as u32, a2),
+        SYS_INBOX_SETUP => sys_inbox_setup(&ctx, a1 as u32, a2),
         SYS_INBOX_SUBMIT => {
-            sys_io_uring_enter(RawHandle(a1 as u32), a2 as u32, a3 as u32, a4)
+            sys_inbox_submit(RawHandle(a1 as u32), a2 as u32, a3 as u32, a4)
         }
         SYS_QUERY_MODULES => {
             let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a1), a2) else { return bad_addr };
@@ -1246,7 +1246,7 @@ fn sys_open(path: &str, flags: OpenFlags) -> u64 {
 /// that knows whether the writer is gone — and the release that gets there runs
 /// off this call's own zero-handle drain. A second wake here fired on *every*
 /// close, so a pipe with a live writer and no bytes in it was announced
-/// readable; a one-shot io_uring poll consumed on that never fires again.
+/// readable; a one-shot inbox watch consumed on that never fires again.
 fn sys_close(h: RawHandle) -> u64 {
     let result = process::with_process_data(|data| {
         ops::close(&mut data.handles, h, &mut data.pipe_maps)
@@ -1921,9 +1921,9 @@ fn connect_through(connector: &port::Connector) -> u64 {
     );
     let watchers = port.watchers();
     if !watchers.is_empty() {
-        crate::io_uring::complete_pending_for_event(
+        crate::inbox::complete_pending_for_event(
             &watchers,
-            crate::io_uring::Source::Port(port),
+            crate::inbox::Source::Port(port),
         );
     }
     h.0 as u64
@@ -2954,21 +2954,21 @@ fn sys_dlsym(handle: u64, name: &str) -> u64 {
     }
 }
 
-/// Make a ring and tell the caller where it is.
+/// Make an inbox and tell the caller where it is.
 ///
-/// The ring owns its page and this maps it. A ring is not something two
+/// The inbox owns its page and this maps it. An inbox is not something two
 /// processes share, so nothing else may name that page.
-fn sys_io_uring_setup(ctx: &SyscallContext, depth: u32, out: u64) -> u64 {
+fn sys_inbox_setup(ctx: &SyscallContext, depth: u32, out: u64) -> u64 {
     let out = match UserAddr::checked(out) {
         Some(addr) => addr,
         None => return SyscallError::InvalidArgument.to_u64(),
     };
-    let (ring, vaddr) = match crate::io_uring::create(depth) {
+    let (inbox, vaddr) = match crate::inbox::create(depth) {
         Ok(v) => v,
         Err(e) => return e.to_u64(),
     };
-    // A refused install drops the reference, which tears the ring down again.
-    let object = KObjectRef::Inbox(crate::object::service::IoUringObject::new(ring));
+    // A refused install drops the reference, which tears the inbox down again.
+    let object = KObjectRef::Inbox(crate::object::inbox::InboxObject::new(inbox));
     let installed = process::with_process_data(|data| ops::install(&mut data.handles, object));
     let handle = match installed {
         Ok(h) => h,
@@ -2980,36 +2980,36 @@ fn sys_io_uring_setup(ctx: &SyscallContext, depth: u32, out: u64) -> u64 {
         Err(e) => {
             process::with_process_data(|data| {
                 ops::close(&mut data.handles, handle, &mut data.pipe_maps)
-                    .expect("the ring this call installed a moment ago");
+                    .expect("the inbox this call installed a moment ago");
             });
             e.to_u64()
         }
     }
 }
 
-fn sys_io_uring_enter(
-    ring_h: RawHandle,
+fn sys_inbox_submit(
+    inbox_h: RawHandle,
     to_submit: u32,
     min_complete: u32,
     timeout_nanos: u64,
 ) -> u64 {
     // The table's own words, not one invented here: a handle that is gone is
     // `NotFound` and one of the wrong type is `PermissionDenied`, the same as
-    // every other call. Collapsing both into `InvalidArgument` made "this ring
-    // was closed" indistinguishable from "this argument is nonsense".
-    let ring_id = process::with_process_data(|data| {
+    // every other call. Collapsing both into `InvalidArgument` made "this
+    // inbox was closed" indistinguishable from "this argument is nonsense".
+    let inbox_id = process::with_process_data(|data| {
         data.handles
-            .get::<crate::object::service::IoUringObject>(
-                ring_h,
+            .get::<crate::object::inbox::InboxObject>(
+                inbox_h,
                 Rights::READ.union(Rights::WRITE),
             )
             .map(|r| r.id())
     });
-    let ring_id = match ring_id {
+    let inbox_id = match inbox_id {
         Ok(id) => id,
         Err(e) => return e.refuse(),
     };
-    match crate::io_uring::enter(ring_id, to_submit, min_complete, timeout_nanos) {
+    match crate::inbox::submit(inbox_id, to_submit, min_complete, timeout_nanos) {
         Ok(n) => n as u64,
         Err(e) => e.to_u64(),
     }

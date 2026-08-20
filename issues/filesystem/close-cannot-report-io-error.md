@@ -8,8 +8,9 @@ opened: 2026-08-08
 
 Filed out of the `vfs::FileSystem` error-channel entry when that closed; the chain is honest everywhere except here.
 
-`Drop for OpenFile` (`kernel/src/fd.rs`) logs `warning: flush failed on close`
-and has nothing to return, so a process whose last write the device refused is
+`Drop for OpenFileState` (`kernel/src/object/file.rs:32`, formerly `Drop for
+OpenFile` in the deleted `kernel/src/fd.rs`) logs `warning: flush failed on
+close` and has nothing to return, so a process whose last write the device refused is
 **never told**. Every other way of asking is honest — `fsync`, and a `write`
 whose page was refused — and no doc comment anywhere says `close` is not.
 

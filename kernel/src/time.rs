@@ -168,7 +168,7 @@ impl fmt::Display for Duration {
 ///
 /// That is the whole reason this is not a `u64` newtype with a public
 /// constructor. `scheduler::block_on`'s contract used to be "`deadline = 0`
-/// means no timeout", and `io_uring::enter` carried a *third* reading of the
+/// means no timeout", and `inbox::submit` carried a *third* reading of the
 /// same word — relative `0` mapped to absolute `1`, and `1` mapped back to `0`.
 /// A site left passing `0` through a change of that convention goes from "block
 /// forever" to "return immediately", which is a busy loop and not a compile

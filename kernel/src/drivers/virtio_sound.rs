@@ -245,7 +245,7 @@ fn pop_completion() -> Option<AudioCompletionRecord> {
 }
 
 /// Readiness: are completion records pending? Lock-free — handle readiness,
-/// io_uring poll and the scheduler's park-time recheck all ask this.
+/// an inbox watch and the scheduler's park-time recheck all ask this.
 pub fn has_pending() -> bool {
     RECORDS.head.load(Ordering::Acquire) != RECORDS.tail.load(Ordering::Acquire)
         || SPILL.mask.load(Ordering::Acquire) != 0
@@ -276,22 +276,22 @@ pub fn drain_completed(buf: &mut crate::user_ptr::UserBytesMut) -> usize {
     written
 }
 
-static IO_URING_WATCHERS: Lock<alloc::vec::Vec<crate::io_uring::RingId>> =
+static INBOX_WATCHERS: Lock<alloc::vec::Vec<crate::inbox::InboxId>> =
     Lock::new(alloc::vec::Vec::new());
 
-pub fn add_io_uring_watcher(id: crate::io_uring::RingId) {
-    let mut watchers = IO_URING_WATCHERS.lock();
+pub fn add_inbox_watcher(id: crate::inbox::InboxId) {
+    let mut watchers = INBOX_WATCHERS.lock();
     if !watchers.contains(&id) {
         watchers.push(id);
     }
 }
 
-pub fn remove_io_uring_watcher(id: crate::io_uring::RingId) {
-    IO_URING_WATCHERS.lock().retain(|&x| x != id);
+pub fn remove_inbox_watcher(id: crate::inbox::InboxId) {
+    INBOX_WATCHERS.lock().retain(|&x| x != id);
 }
 
-pub fn io_uring_watchers() -> alloc::vec::Vec<crate::io_uring::RingId> {
-    IO_URING_WATCHERS.lock().clone()
+pub fn inbox_watchers() -> alloc::vec::Vec<crate::inbox::InboxId> {
+    INBOX_WATCHERS.lock().clone()
 }
 
 // --- the controller ---

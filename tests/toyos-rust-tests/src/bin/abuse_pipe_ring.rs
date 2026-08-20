@@ -8,7 +8,7 @@
 //! `PIPES` lock, and a large capacity with a matching cursor turned the
 //! caller's own buffer into a kernel write at an offset the caller chose.
 //!
-//! `kernel/src/io_uring.rs` states the rule this gates — the kernel must not
+//! `kernel/src/inbox.rs` states the rule this gates — the kernel must not
 //! read its own bounds back out of a page the process can write.
 
 use std::mem::size_of;
