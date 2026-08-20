@@ -682,8 +682,8 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_namespace_open(RawHandle(a1 as u32), &name)
         }
         SYS_TLS_ALLOC_BLOCK => sys_tls_alloc_block(a1),
-        SYS_IO_URING_SETUP => sys_io_uring_setup(&ctx, a1 as u32, a2),
-        SYS_IO_URING_ENTER => {
+        SYS_INBOX_SETUP => sys_io_uring_setup(&ctx, a1 as u32, a2),
+        SYS_INBOX_SUBMIT => {
             sys_io_uring_enter(RawHandle(a1 as u32), a2 as u32, a3 as u32, a4)
         }
         SYS_QUERY_MODULES => {
@@ -2975,13 +2975,13 @@ fn sys_io_uring_setup(ctx: &SyscallContext, depth: u32, out: u64) -> u64 {
         Err(e) => return e.to_u64(),
     };
     // A refused install drops the reference, which tears the ring down again.
-    let object = KObjectRef::IoUring(crate::object::service::IoUringObject::new(ring));
+    let object = KObjectRef::Inbox(crate::object::service::IoUringObject::new(ring));
     let installed = process::with_process_data(|data| ops::install(&mut data.handles, object));
     let handle = match installed {
         Ok(h) => h,
         Err(e) => return e.to_u64(),
     };
-    let answer = toyos_abi::syscall::IoUringSetup { handle, _pad: 0, vaddr };
+    let answer = toyos_abi::syscall::InboxSetup { handle, _pad: 0, vaddr };
     match ctx.copy_out(out, &answer) {
         Ok(()) => 0,
         Err(e) => {

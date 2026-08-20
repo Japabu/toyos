@@ -1,11 +1,23 @@
-//! Kernel io_uring implementation — shared-memory submission/completion rings.
+//! The kernel side of an [inbox](toyos_abi::inbox) — shared-memory submission
+//! and completion rings.
 //!
-//! Two syscalls: `io_uring_setup` (create ring) and `io_uring_enter` (submit + wait).
-//! The SQ/CQ/SQE arrays live in a single 2MB shared page accessible to both
-//! kernel (via direct map) and userspace (via page table mapping).
+//! Two syscalls: `inbox_setup` (create one) and `inbox_submit` (submit + wait).
+//! The submission ring, the completion ring and the submission array live in a
+//! single 2MB shared page accessible to both kernel (via direct map) and
+//! userspace (via page table mapping).
 //!
-//! One-shot POLL_ADD: each fires once, then the pending poll is consumed.
-//! Userspace must re-submit POLL_ADD to re-arm.
+//! One-shot `OP_WATCH`: each fires once, then the pending poll is consumed.
+//! Userspace must re-submit to re-arm.
+//!
+//! **This file still speaks the old vocabulary and the ABI no longer does.**
+//! The rename that made `toyos_abi::io_uring` into `toyos_abi::inbox` on
+//! 2026-08-20 had to land in one merge with the rust submodule and both fork
+//! pins, so it stopped at the ABI boundary: `IoUringInstance`, `IoUringOp`,
+//! `IoUringObject`, `RingId` and the `io_uring_watchers` accessors on every
+//! source are tree-local, need no quiet window, and move on their own pull
+//! request. The one exception is `KObjectRef::Inbox`, whose name is the ABI's:
+//! `toyos_abi::syscall::OBJECT_KINDS` carries it and `CENSUS_KIND` asserts the
+//! two lists agree name for name.
 //!
 //! Lock ordering: the wake path copies watcher lists under source locks (PIPES,
 //! LISTENERS, device locks), releases them, then acquires IO_URINGS.
@@ -30,9 +42,9 @@ use crate::completion::{self, Watch};
 use crate::time::{Deadline, Duration};
 use crate::DirectMap;
 
-use toyos_abi::io_uring::{
-    IoUringCqe, IoUringParams, IoUringRingHeader, IoUringSqe,
-    SQ_RING_OFF, CQ_RING_OFF, SQES_OFF,
+use toyos_abi::inbox::{
+    Completion, RingLayout, RingHeader, Submission,
+    SUBMISSION_RING_OFF, COMPLETION_RING_OFF, SUBMISSIONS_OFF,
 };
 use toyos_abi::handle::{RawHandle, Rights};
 use toyos_abi::syscall::SyscallError;
@@ -110,7 +122,7 @@ pub enum IoUringOp {
 
 impl IoUringOp {
     fn from_raw(raw: u8) -> Result<Self, SyscallError> {
-        // 2 is retired (`toyos_abi::io_uring`, formerly IORING_OP_POLL_REMOVE)
+        // 2 is retired (`toyos_abi::inbox`, formerly IORING_OP_POLL_REMOVE)
         // and falls to the refusal like every other number nothing declares.
         match raw {
             0 => Ok(Self::Nop),
@@ -369,25 +381,25 @@ struct IoUringInstance {
 }
 
 impl IoUringInstance {
-    fn sq_header(&self) -> &IoUringRingHeader {
-        unsafe { &*(self.shm_phys.as_mut_ptr::<u8>().add(SQ_RING_OFF as usize) as *const IoUringRingHeader) }
+    fn sq_header(&self) -> &RingHeader {
+        unsafe { &*(self.shm_phys.as_mut_ptr::<u8>().add(SUBMISSION_RING_OFF as usize) as *const RingHeader) }
     }
 
-    fn cq_header(&self) -> &IoUringRingHeader {
-        unsafe { &*(self.shm_phys.as_mut_ptr::<u8>().add(CQ_RING_OFF as usize) as *const IoUringRingHeader) }
+    fn cq_header(&self) -> &RingHeader {
+        unsafe { &*(self.shm_phys.as_mut_ptr::<u8>().add(COMPLETION_RING_OFF as usize) as *const RingHeader) }
     }
 
-    fn sqe_at(&self, index: u32) -> &IoUringSqe {
+    fn sqe_at(&self, index: u32) -> &Submission {
         let ptr = self.shm_phys.as_mut_ptr::<u8>();
-        unsafe { &*(ptr.add(SQES_OFF as usize + index as usize * core::mem::size_of::<IoUringSqe>()) as *const IoUringSqe) }
+        unsafe { &*(ptr.add(SUBMISSIONS_OFF as usize + index as usize * core::mem::size_of::<Submission>()) as *const Submission) }
     }
 
     /// The address of one completion entry. A pointer and not a `&mut`: this
     /// takes `&self`, and a `&mut` minted from a shared borrow is one two
     /// callers could hold at once over a page the process also maps.
-    fn cqe_at(&self, index: u32) -> *mut IoUringCqe {
+    fn cqe_at(&self, index: u32) -> *mut Completion {
         let ptr = self.shm_phys.as_mut_ptr::<u8>();
-        unsafe { ptr.add(CQ_RING_OFF as usize + 16 + index as usize * core::mem::size_of::<IoUringCqe>()) as *mut IoUringCqe }
+        unsafe { ptr.add(COMPLETION_RING_OFF as usize + 16 + index as usize * core::mem::size_of::<Completion>()) as *mut Completion }
     }
 
     /// Post a CQE, or record a drop if the ring reports itself full.
@@ -408,7 +420,7 @@ impl IoUringInstance {
         // One write of the whole entry, before the tail below publishes it.
         // SAFETY: `idx` is masked to the ring's size, and the whole instance is
         // touched under the `IO_URINGS` lock, so nothing else is writing here.
-        unsafe { self.cqe_at(idx).write(IoUringCqe { user_data, result, flags }) };
+        unsafe { self.cqe_at(idx).write(Completion { token: user_data, result, flags }) };
         self.cq_tail.set(tail.wrapping_add(1));
         cq.tail.store(tail.wrapping_add(1), Ordering::Release);
     }
@@ -457,22 +469,22 @@ pub fn create(depth: u32) -> Result<(RingRef, u64), SyscallError> {
 
     // Zero the entire page first (alloc_zeroed does this, but be explicit)
     // Write params at offset 0
-    let params = unsafe { &mut *(base as *mut IoUringParams) };
-    params.sq_off = SQ_RING_OFF;
-    params.cq_off = CQ_RING_OFF;
-    params.sqes_off = SQES_OFF;
-    params.sq_ring_size = sq_size;
-    params.cq_ring_size = cq_size;
+    let params = unsafe { &mut *(base as *mut RingLayout) };
+    params.submission_ring_off = SUBMISSION_RING_OFF;
+    params.completion_ring_off = COMPLETION_RING_OFF;
+    params.submissions_off = SUBMISSIONS_OFF;
+    params.submission_ring_size = sq_size;
+    params.completion_ring_size = cq_size;
     params.features = 0;
     params._pad = 0;
 
-    let sq_header = unsafe { &mut *(base.add(SQ_RING_OFF as usize) as *mut IoUringRingHeader) };
+    let sq_header = unsafe { &mut *(base.add(SUBMISSION_RING_OFF as usize) as *mut RingHeader) };
     sq_header.head = core::sync::atomic::AtomicU32::new(0);
     sq_header.tail = core::sync::atomic::AtomicU32::new(0);
     sq_header.ring_size = sq_size;
     sq_header.dropped = core::sync::atomic::AtomicU32::new(0);
 
-    let cq_header = unsafe { &mut *(base.add(CQ_RING_OFF as usize) as *mut IoUringRingHeader) };
+    let cq_header = unsafe { &mut *(base.add(COMPLETION_RING_OFF as usize) as *mut RingHeader) };
     cq_header.head = core::sync::atomic::AtomicU32::new(0);
     cq_header.tail = core::sync::atomic::AtomicU32::new(0);
     cq_header.ring_size = cq_size;
@@ -614,7 +626,7 @@ fn submit_sqes(ring_id: RingId, count: u32) -> Result<(), SyscallError> {
 /// One SQE at a time under the lock rather than a batch copied into a `Vec`
 /// whose capacity userland picks; processing needs the lock released between
 /// entries either way.
-fn claim_sqe(ring_id: RingId) -> Result<Option<IoUringSqe>, SyscallError> {
+fn claim_sqe(ring_id: RingId) -> Result<Option<Submission>, SyscallError> {
     with_instance(ring_id, |instance| {
         let sq = instance.sq_header();
         let head = sq.head.load(Ordering::Acquire);
@@ -639,18 +651,18 @@ fn with_instance<R>(ring_id: RingId, f: impl FnOnce(&IoUringInstance) -> R) -> R
 }
 
 /// Process a single SQE.
-fn process_sqe(ring_id: RingId, sqe: &IoUringSqe) {
+fn process_sqe(ring_id: RingId, sqe: &Submission) {
     let op = match IoUringOp::from_raw(sqe.op) {
         Ok(op) => op,
         Err(_) => {
-            post_cqe_locked(ring_id, sqe.user_data, -(SyscallError::InvalidArgument as i32), 0);
+            post_cqe_locked(ring_id, sqe.token, -(SyscallError::InvalidArgument as i32), 0);
             return;
         }
     };
 
     match op {
         IoUringOp::Nop => {
-            post_cqe_locked(ring_id, sqe.user_data, 0, 0);
+            post_cqe_locked(ring_id, sqe.token, 0, 0);
         }
         IoUringOp::PollAdd => {
             process_poll_add(ring_id, sqe);
@@ -675,10 +687,10 @@ fn process_sqe(ring_id: RingId, sqe: &IoUringSqe) {
 /// and a right it does not carry is a word it may see. The three fatal kinds
 /// are refused *outside* the table's guard, which is what `refuse_as_error`
 /// requires — it does not come back.
-fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
-    let handle = sqe.fd;
+fn process_poll_add(ring_id: RingId, sqe: &Submission) {
+    let handle = sqe.handle;
     let flags = PollFlags::from_raw(sqe.op_flags);
-    let user_data = sqe.user_data;
+    let user_data = sqe.token;
 
     // Readiness first, on the process's table rather than the thread's: a ring
     // is process-wide.
@@ -778,11 +790,11 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
 /// argument was "nonsense" — where the syscall form of the same mistake ends
 /// the process. `get` answers `WrongType` for a pipe presented as an acceptor,
 /// which is why the type is asked of it rather than matched here.
-fn process_accept(ring_id: RingId, sqe: &IoUringSqe) {
-    let user_data = sqe.user_data;
+fn process_accept(ring_id: RingId, sqe: &Submission) {
+    let user_data = sqe.token;
 
     let acceptor = process::with_process_data(|data| {
-        data.handles.get::<crate::object::port::Acceptor>(sqe.fd, Rights::READ)
+        data.handles.get::<crate::object::port::Acceptor>(sqe.handle, Rights::READ)
     });
 
     let acceptor = match acceptor {

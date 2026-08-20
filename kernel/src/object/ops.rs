@@ -49,7 +49,7 @@ pub fn initial_rights(object: &KObjectRef) -> Rights {
         }
         KObjectRef::Console(_) => BASE.union(Rights::READ).union(Rights::WRITE),
         KObjectRef::Acceptor(_) => BASE.union(Rights::READ),
-        KObjectRef::IoUring(_) => {
+        KObjectRef::Inbox(_) => {
             BASE.union(Rights::READ).union(Rights::WRITE).union(Rights::MAP)
         }
         // Every bit on a `SysCap` is an authority init decides per program, so
@@ -227,7 +227,7 @@ pub fn pipe_id_read(object: &KObjectRef) -> Option<PipeId> {
         KObjectRef::PipeRead(r) => Some(r.id()),
         KObjectRef::Connection(c) => Some(c.rx()),
         KObjectRef::PipeWrite(_) | KObjectRef::File(_) | KObjectRef::Device(_)
-        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
+        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::Inbox(_)
         | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => None,
@@ -239,7 +239,7 @@ pub fn pipe_id_write(object: &KObjectRef) -> Option<PipeId> {
         KObjectRef::PipeWrite(w) => Some(w.id()),
         KObjectRef::Connection(c) => Some(c.tx()),
         KObjectRef::PipeRead(_) | KObjectRef::File(_) | KObjectRef::Device(_)
-        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
+        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::Inbox(_)
         | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => None,
@@ -271,7 +271,7 @@ pub fn read_source(object: &KObjectRef) -> Option<Source> {
         // the one program whose whole loop is read-then-park would be trapped
         // by a name that granted only the first.
         KObjectRef::SysCap(_) => Some(Source::Log),
-        KObjectRef::PipeWrite(_) | KObjectRef::File(_) | KObjectRef::IoUring(_)
+        KObjectRef::PipeWrite(_) | KObjectRef::File(_) | KObjectRef::Inbox(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => None,
     }
@@ -282,7 +282,7 @@ pub fn write_source(object: &KObjectRef) -> Option<Source> {
         KObjectRef::PipeWrite(w) => Some(Source::PipeWritable(w.id())),
         KObjectRef::Connection(c) => Some(Source::PipeWritable(c.tx())),
         KObjectRef::PipeRead(_) | KObjectRef::File(_) | KObjectRef::Device(_)
-        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
+        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::Inbox(_)
         | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => None,
@@ -432,7 +432,7 @@ pub fn try_read(object: &KObjectRef, buf: &mut UserBytesMut) -> Option<u64> {
             }
             Some(count as u64)
         }
-        KObjectRef::PipeWrite(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
+        KObjectRef::PipeWrite(_) | KObjectRef::Acceptor(_) | KObjectRef::Inbox(_)
         | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => Some(SyscallError::PermissionDenied.to_u64()),
@@ -501,7 +501,7 @@ pub fn try_write(object: &KObjectRef, buf: &UserBytes) -> Option<u64> {
             Some(buf.len() as u64)
         }
         KObjectRef::PipeRead(_) | KObjectRef::Device(_) | KObjectRef::Acceptor(_)
-        | KObjectRef::IoUring(_) | KObjectRef::SharedMem(_) | KObjectRef::SysCap(_)
+        | KObjectRef::Inbox(_) | KObjectRef::SharedMem(_) | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::Process(_) => {
             Some(SyscallError::PermissionDenied.to_u64())
@@ -563,7 +563,7 @@ pub fn fstat(object: &KObjectRef) -> Stat {
             size: m.size(),
             mtime: 0,
         },
-        KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
+        KObjectRef::Inbox(_) | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::Process(_) => plain(FileType::Unknown),
         KObjectRef::Device(d) => plain(match d.class() {
@@ -666,7 +666,7 @@ pub fn has_data(object: &KObjectRef) -> bool {
                 !d.info_read() || crate::drivers::virtio_sound::has_pending()
             }
         },
-        KObjectRef::PipeWrite(_) | KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
+        KObjectRef::PipeWrite(_) | KObjectRef::Inbox(_) | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => false,
     }
@@ -678,7 +678,7 @@ pub fn has_space(object: &KObjectRef) -> bool {
         KObjectRef::Connection(c) => pipe::has_space(c.tx()),
         KObjectRef::File(_) | KObjectRef::Console(_) => true,
         KObjectRef::PipeRead(_) | KObjectRef::Device(_) | KObjectRef::Acceptor(_)
-        | KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
+        | KObjectRef::Inbox(_) | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => false,
     }
@@ -701,7 +701,7 @@ pub fn mark_tty(object: &KObjectRef) -> u64 {
             0
         }
         KObjectRef::Connection(_) | KObjectRef::File(_) | KObjectRef::Device(_)
-        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
+        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::Inbox(_)
         | KObjectRef::SysCap(_) | KObjectRef::SharedMem(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::Process(_) => SyscallError::InvalidArgument.to_u64(),
