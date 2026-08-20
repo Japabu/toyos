@@ -33,6 +33,20 @@ pub struct TableFull;
 /// correct program can do. Fail-fast is for bugs, so [`refuse`] takes the
 /// process down for those three rather than handing back a word it can ignore.
 ///
+/// **The rule has exactly one named exception, and by owner ruling of
+/// 2026-08-19 there is not a second.** The exception is the connector argument
+/// to `SYS_NAMESPACE_BUILD`: an added connector is routinely one a *peer*
+/// transferred, so `WrongType` there is not provably the caller's bug, and
+/// faulting on it let any process holding the `launcher` connector end
+/// `/bin/init` by sending it a pipe (`arch::syscall::sys_namespace_build`).
+/// A spawn's slot map was the candidate for a second — it skipped a parent
+/// handle that did not resolve, so the child started without a capability its
+/// parent had named and could not tell that from having asked for nothing, and
+/// the parent was told its spawn happened as asked. The owner ruled that
+/// strictness wins: a parent naming a handle it does not hold has made exactly
+/// the mistake this rule is about, and it now ends like every other
+/// (`loader::start::build_child_handles`).
+///
 /// [`refuse`]: Self::refuse
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum HandleError {
