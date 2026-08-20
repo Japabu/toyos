@@ -2201,6 +2201,47 @@ pub const KNOWN_RED: &[Red] = &[
         source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-19",
     },
+    // ---------------------------------------------------------------------
+    // `wt/toyos-killwrite`, dev host, 2026-08-20, on `e4c2c8ff` — `main`'s own
+    // tip, unmodified. The row
+    // `issues/kernel/a-killed-peer-still-takes-a-write.md` said was owed: the
+    // name answered `NOT ON THE LIST` when that file was written, so a landing
+    // gate that hit it had nothing to check the red against. Two rows, because
+    // one name measured on two instruments in one session is two measurements.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "kill_while_blocked",
+        instrument: Instrument::DevHostAlone,
+        finding: Finding::fires(2, 53),
+        standing: Standing::Stands,
+        what: "`a pipe whose only reader was killed mid-read still took a write` (arm 1) once, \
+               and `a connection whose peer was killed mid-read still took a write`, \
+               `left: Ok(22)` `right: Err(NotFound)` (arm 2) once — **one red on each of the two \
+               arms**, which is what says they are one mechanism rather than two paths of \
+               different speeds. It is not a classification: `ALONE … GREEN` both times, and \
+               `Sched::Serial` would retire it no better than it retired `handle_lifetime`. The \
+               release a peer's answer rides runs from `object::drain_zero_handles`, and the \
+               killing syscall's own drain site can be robbed of the batch by any other CPU's",
+        evidence: "53 × `cargo test --test toyos-build -- kill_while_blocked` in one session, the \
+                   host reporting 1.68x–2.70x width throughout; the same session staged the \
+                   mechanism at 4 of 5 by removing the syscall-exit drain",
+        source: "issues/kernel/a-killed-peer-still-takes-a-write.md",
+        measured: "2026-08-20",
+    },
+    Red {
+        test: "kill_while_blocked",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::quiet(4),
+        standing: Standing::Stands,
+        what: "four consecutive full fast tiers, 272 tests each, and it did not fire in any of \
+               them. **This retires nothing and is here so that it cannot be read as retiring \
+               anything**: the first sighting of this defect was inside a 272-test run, and four \
+               runs is not a denominator that reaches a rate of two in fifty-three",
+        evidence: "4 × `cargo test --test toyos-build`, same tree and session as this name's \
+                   dev-host-alone rate",
+        source: "issues/kernel/a-killed-peer-still-takes-a-write.md",
+        measured: "2026-08-20",
+    },
 ];
 
 // ---------------------------------------------------------------------------

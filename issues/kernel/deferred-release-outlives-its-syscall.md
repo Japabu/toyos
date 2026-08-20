@@ -83,10 +83,36 @@ loaded, 1 of 3, 2026-08-18) with a contention reading, and it is **not touched
 here** — this entry records the mechanism, and re-adjudicating that row is its
 owner's to do with a measurement rather than with this argument.
 
+## A syscall answering the wrong word, 2026-08-20
+
+**The three witnesses above are quantities that settle. This one is not.**
+`kill_while_blocked` kills a child parked in a blocking read and asks the peer
+end whether it knows; the answer must be `NotFound` and is `Ok(22)`.
+`issues/kernel/a-killed-peer-still-takes-a-write.md` carries the reproduction,
+and the chain is this queue end to end: the victim's handle goes at
+`ops::close_all`, `HandleEntry`'s drop queues the object, and the object's
+`on_zero_handles` — `PipeReadEnd`'s or `ConnectionEnd`'s — is the only thing
+that calls `Held::release` and gives the `PipeReader` back. `pipe.readers` is
+what `pipe::try_write` reads, and it is still 1 while the batch is in flight on
+another CPU, so the write is accepted into a ring nobody will ever read.
+
+Measured on `e4c2c8ff`, dev host: **2 red of 53** one-name runs, one on each of
+the two arms that ask a peer; **4 of 5** with
+the syscall-exit drain removed, which stages the same state a stolen batch
+leaves. The trace is a kill returning on cpu0 at 0.542 s and the victim's read
+end being released on cpu1 at 0.544 s.
+
+So the sentence below is no longer the whole of it: this is a *semantic* event
+riding a release the caller cannot wait for, which is what
+`kernel/src/object/mod.rs`'s own header says must never happen — *"every
+userland-visible lifecycle event rides `handle_count`"* — and the same shape
+reaches soundd, whose cpal clients spend their lives parked in a signal-pipe
+read.
+
 ## Why it matters beyond a test
 
-The visible consequence today is only that two harness binaries had to learn to
-settle (`handle_lifetime`, `shm_release_reclaims`; `issues/build/free-memory-verdicts-share-a-boot.md`
+Two harness binaries had to learn to settle (`handle_lifetime`,
+`shm_release_reclaims`; `issues/build/free-memory-verdicts-share-a-boot.md`
 carries that story). The consequence that is not a test is a process which kills
 a child to make room and immediately allocates: the pages it just freed are not
 free yet, and `SYS_SHM_CREATE`/`io_uring_setup` can answer `ResourceExhausted`
@@ -121,3 +147,32 @@ from this queue is allowed to do. The constraint that track's own reasoning
 derived, and which anything touching this queue must not lose: **none of the
 three drain sites can park, so no `on_zero_handles` hook may take a sleep lock
 at all.** It belongs with that track, not beside it.
+
+### What "give the batch an owner" costs, worked out 2026-08-20
+
+An owner has to be the *thread*, not the CPU. `kill_process` phase 2 calls
+`scheduler::retire_task`, which parks the killer until the victim's record is
+released, so the killing thread can be moved to another CPU between the
+`close_all` that queues its objects and the syscall exit that would drain them —
+a per-CPU list would strand exactly the batch it was added to own.
+
+A per-thread list cannot live behind `ThreadData`'s lock either:
+`teardown_resources` holds `ProcessData` across `close_all`, and its own first
+line is that the two locks are never held together. So the list has to be on the
+kernel stack, threaded through `close_all` to a caller that runs the hooks once
+its guard is gone.
+
+**That is the part that is not a patch.** `HandleEntry`'s drop is where the
+enqueue happens today, and the comment on that statement is the whole argument
+for the design — *"this is the one statement that makes 'a hook cannot run under
+a lock' structural"*. A `close_all` that hands its objects back for the caller
+to run re-opens, for that one call site, precisely the guard-outlives-the-drop
+trap the queue exists to make unwritable. Any owner-shaped fix has to pay for
+that property somewhere else rather than spend it, which is why this is the
+track's work and not a fix at the site.
+
+`kernel-loom` is not the instrument for it, and that is worth writing down so
+nobody re-derives it: the models compile the real kernel files with
+`feature = "loom"`, and `object/mod.rs` pulls in `alloc::sync::Arc`, the whole
+`kobject!` set and every subsystem those hooks reach. A transliteration is what
+that crate's header exists to refuse.
