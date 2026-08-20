@@ -1,12 +1,15 @@
 name: ci
 
-# The guest suite: twelve KVM shards on Linux x86_64, which own the booted
-# kernel on native silicon and run exactly the Fast tier as a partition — every
-# Fast test runs exactly once per run. `ci/**` is where throwaway probe branches
-# live; they trigger their own workflows and not this one.
+# The guest suite: twelve KVM shards on GitHub-hosted Linux x86_64, or one
+# complete 1/1 lane on the persistent T14. Both shapes own one booted kernel at
+# a time and run exactly the Fast tier as a partition — every Fast test runs
+# exactly once per run. The T14 shape pays for its container, Rust toolchain and
+# 1.5 GiB build-cache restore once instead of twelve times. `ci/**` is where
+# throwaway probe branches live; they trigger their own workflows and not this
+# one.
 #
 # `main` moves only through a merged pull request, so a branch push and the pull
-# request on it are two runs of the same twelve shards. `main`'s own run is what
+# request on it are two runs of the same guest partition. `main`'s own run is what
 # `landing.yml`'s `gate-stage` reads, and its `actions/cache` entries are the
 # only ones every branch can restore.
 #
@@ -109,15 +112,15 @@ jobs:
     # A wedge guard, not a budget: the harness answers a dead shared boot with
     # a new one, so a shard that cannot finish inside this ceiling measures
     # nothing.
-    timeout-minutes: 60
+    timeout-minutes: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 60 || 120 }}
     strategy:
       fail-fast: false
-      # Each shard measures one guest alone. Keep that true even if another
-      # runner is later given the `toyos` label. Fork and merge-queue work stays
-      # on GitHub-hosted runners, where the ordinary parallel matrix is safe.
+      # Hosted work keeps the twelve-way matrix it has always used. The T14 is
+      # already one physical benchmark host, so one 1/1 lane runs the complete
+      # selection after paying setup and remote-cache costs once.
       max-parallel: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 12 || 1 }}
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        shard: ${{ fromJSON((github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '[1,2,3,4,5,6,7,8,9,10,11,12]' || '[1]') }}
     # `debian:sid` ships the QEMU `.github/qemu-version` declares, the dev
     # host's version too; `ubuntu-24.04` ships 8.2.2 and the two were measured
     # disagreeing about test outcomes on the same tree. The firmware, boot
@@ -162,7 +165,7 @@ jobs:
       # must be read against.
       - name: the instrument
         env:
-          MATRIX_LABEL: shard ${{ matrix.shard }}/12
+          MATRIX_LABEL: shard ${{ matrix.shard }}/${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 12 || 1 }}
         run: .github/instrument.sh
 
       - id: key
@@ -197,11 +200,11 @@ jobs:
       # compiles against a cold one's 177, and all 167 of the difference are
       # third-party.
       #
-      # `cache-writer` is the single writer, one per run; the twelve shards only
-      # read. `actions/cache/save` never overwrites an existing key, so a second
-      # writer could not benefit a sibling and a nightly writer could
-      # permanently win the key with a tree several merges behind. A cache
-      # written on `main` is the one every branch can restore.
+      # On GitHub-hosted work `cache-writer` is the single writer and the twelve
+      # shards only read. The T14's one full lane saves its own completed build
+      # below, avoiding a second job with the same setup and restore. A nightly
+      # run never writes, and a cache written on `main` is the one every branch
+      # can restore.
       #
       # `toyos-ld/target` and `toyos-cc/target` used to be on this list and are
       # not directories any more: both crates are members of the host workspace
@@ -237,13 +240,33 @@ jobs:
       # pull request.
       - name: suite
         env:
+          SHARD_COUNT: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 12 || 1 }}
           SUITE_TIER_ARGS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '--nightly' || '' }}
         run: |
           set -o pipefail
           cargo test --test toyos-build -- \
-            --shard ${{ matrix.shard }}/12 --jobs 1 --host-slots 0 \
+            --shard ${{ matrix.shard }}/$SHARD_COUNT --jobs 1 --host-slots 0 \
             $SUITE_TIER_ARGS 2>&1 \
             | tee /tmp/suite.log
+
+      # The hosted matrix retains its separate writer. On the persistent T14,
+      # this is the only lane and therefore the only process that can populate
+      # this run's key; saving here avoids downloading and extracting the same
+      # cache in a second container job.
+      - uses: actions/cache/save@v4
+        if: success() && runner.name == 't14' && github.event_name != 'schedule'
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+            kernel/target
+            bootloader/target
+            userland/target
+            tests/target
+            tests/toyos-rust-tests/*/target
+          key: guest-${{ steps.key.outputs.tag }}-${{ hashFiles('**/Cargo.lock') }}
 
       # `cargo test` runs several binaries and each prints a `test result:`
       # line; the line grepped here is the suite's own, the one that
@@ -273,8 +296,8 @@ jobs:
       # never the profile it partitioned on, so this writes
       # `test-durations.shard-<i>-of-<n>`, which `load_durations` never reads.
       # `--merge-durations` is the one step per run that writes
-      # `tests/test-durations`, and the deliberate act that turns the twelve
-      # into it.
+      # `tests/test-durations`, and the deliberate act that turns the one or
+      # twelve partition files into it.
       - name: shard durations
         if: always()
         uses: actions/upload-artifact@v4
@@ -310,8 +333,7 @@ jobs:
   #
   # Nightly and dispatch only: across its history as a required check this job
   # never named a tree defect, so the class moved to a whole TCG shard in the
-  # nightly tier instead. It no longer writes the cache the twelve shards
-  # read — that write must happen on every run, so it is `cache-writer`, below.
+  # nightly tier instead. It no longer writes the cache the hosted shards read.
   #
   # `if: always()` and a guard step, kept from when this was required: a
   # nightly run that silently skipped instead of naming why the toolchain
@@ -378,8 +400,8 @@ jobs:
           TAG: ${{ steps.key.outputs.tag }}
         run: .github/install-toolchain.sh
 
-      # Restore only: `cache-writer` below is the single writer (`guest`'s own
-      # restore step has the full argument).
+      # Restore only: this nightly/dispatch canary never owns the KVM build
+      # cache (`guest`'s restore and conditional save carry the full argument).
       - uses: actions/cache/restore@v4
         with:
           path: |
@@ -398,17 +420,16 @@ jobs:
       - name: one test, emulated
         run: cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats
 
-  # The cache's single writer — exactly one job per run writes the shared build
-  # cache, and it must run on every pull-request run, so it runs on every
-  # non-nightly one. `if:` is that rule written as code rather than only as
-  # prose beside `guest`'s restore step. Same build and the same one fast test
-  # as a shard, under KVM rather than TCG — what gets cached does not depend on
-  # which accelerator produced it, and KVM is the accelerator every reader of
-  # this cache uses. `guest-suite` needs this job and reds if it did not
-  # succeed: a build that cannot produce what it caches is a real defect.
+  # GitHub-hosted work retains its single cache writer exactly as before. The
+  # T14's one full guest lane saves the same key itself, so starting this second
+  # container there would only repeat apt, Rust, the 401 MiB toolchain and the
+  # 1.5 GiB cache restore. Same build and the same one fast test as a hosted
+  # shard, under KVM rather than TCG — what gets cached does not depend on which
+  # accelerator produced it. `guest-suite` accepts `skipped` here because that
+  # means either the established nightly rule or the T14 single-lane path.
   cache-writer:
     needs: [toolchain-ready]
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository))
     runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || 'toyos' }}
     timeout-minutes: 60
     container:
@@ -500,12 +521,12 @@ jobs:
   # 10,000 ms measured on this instrument, with no tolerance band. Every test
   # selected for Fast CI must measure at or under it, and this job is what
   # enforces the tier declaration against the profile rather than letting it go
-  # stale. It also refuses any duplicate execution label: the twelve shards are
-  # a partition, so a duplicate is a cross-shard partition defect as much as a
-  # same-shard one.
+  # stale. It also refuses any duplicate execution label: whether the run is
+  # one T14 shard or twelve hosted shards, it is one partition and a duplicate
+  # is a partition defect.
   #
-  # `guest`'s `SUITE_TIER_ARGS` widens the twelve shards to include `RELEGATED`
-  # on a nightly run, so their `test-durations.shard-*` files carry fresh
+  # `guest`'s `SUITE_TIER_ARGS` widens its one-or-twelve shards to include
+  # `RELEGATED` on a nightly run, so their `test-durations.shard-*` files carry fresh
   # Nightly measurements the same way an ordinary run's carry Fast ones — this
   # job does not need to know which trigger produced them.
   durations:
@@ -600,7 +621,7 @@ jobs:
       - name: aggregate
         run: |
           echo "toolchain: ${{ needs.toolchain-ready.result }}"
-          echo "twelve shards: ${{ needs.guest.result }}"
+          echo "guest partition: ${{ needs.guest.result }}"
           echo "fast-tier durations: ${{ needs.durations.result }}"
           echo "cache writer: ${{ needs.cache-writer.result }}"
           if [ "${{ needs.toolchain-ready.result }}" != success ]; then
@@ -616,16 +637,16 @@ jobs:
           if [ "${{ needs.durations.result }}" != success ]; then
             echo "::error::the merged duration profile reported \
               ${{ needs.durations.result }}. Fast CI may contain a test over ten seconds, \
-              or the twelve shards did not leave a complete measurement."
+              or the guest partition did not leave a complete measurement."
             exit 1
           fi
-          # `cache-writer` is `if: github.event_name != 'schedule'`, so a
-          # nightly run reports it `skipped` by design; anything else means the
-          # write itself failed.
+          # `cache-writer` runs only for hosted, non-nightly work. A nightly or
+          # T14 run reports it `skipped` by design; anything else means the
+          # hosted write itself failed.
           if [ "${{ needs.cache-writer.result }}" != success ] \
              && [ "${{ needs.cache-writer.result }}" != skipped ]; then
             echo "::error::cache-writer reported ${{ needs.cache-writer.result }}. Its build is"
-            echo "::error::the same one the twelve shards run, so this is a real defect, not"
+            echo "::error::the same one the hosted shards run, so this is a real defect, not"
             echo "::error::cache hygiene — see the job's own log."
             exit 1
           fi
