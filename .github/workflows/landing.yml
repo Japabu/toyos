@@ -15,6 +15,8 @@ concurrency:
   group: landing-${{ github.ref }}
   cancel-in-progress: true
 
+# Trusted Linux events select the persistent `toyos` runner. Fork PRs and
+# merge-queue refs stay on GitHub-hosted machines.
 jobs:
   # A sysroot change may not be merged with the work that depends on it:
   # `toyos-abi/src`, `toyos/src` and `userland/libc/src` compile into the one
@@ -22,7 +24,7 @@ jobs:
   # The same function answers here and at `cargo run -- --pr`, so a branch that
   # skipped the preflight gets the identical refusal from this check.
   abi-split:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'toyos' }}
     timeout-minutes: 20
     steps:
       # The merge commit, the default: the build system that runs below must
@@ -71,7 +73,7 @@ jobs:
   # every merge until a workflow catches up; a context this file names and
   # GitHub does not is a gate quietly dropped, and that reds.
   gate-stage:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'toyos' }}
     timeout-minutes: 10
     steps:
       - name: branch protection

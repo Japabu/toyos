@@ -29,9 +29,11 @@ concurrency:
 permissions:
   contents: write
 
+# Trusted Linux events select the persistent `toyos` runner. Fork PRs and
+# merge-queue refs stay on GitHub-hosted machines.
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || 'toyos' }}
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
@@ -54,19 +56,31 @@ jobs:
           fi
 
       - name: reclaim runner disk
-        if: steps.have.outputs.build == 'yes'
+        if: steps.have.outputs.build == 'yes' && runner.name != 't14'
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
                       /usr/local/share/boost /usr/local/.ghcup
           df -h /
 
-      - name: deps
-        if: steps.have.outputs.build == 'yes'
+      - name: GitHub-hosted deps
+        if: steps.have.outputs.build == 'yes' && runner.name != 't14'
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             cmake ninja-build build-essential pkg-config libssl-dev zstd \
             qemu-system-x86 ovmf
+
+      - name: self-hosted deps
+        if: steps.have.outputs.build == 'yes' && runner.name == 't14'
+        run: |
+          command -v cmake
+          command -v ninja
+          command -v cc
+          command -v pkg-config
+          command -v zstd
+          command -v qemu-system-x86_64
+          pkg-config --exists openssl
+          test -d /usr/share/OVMF
 
       # Full history, deliberately: bootstrap finds the upstream commit whose
       # prebuilt LLVM to download by walking back to the newest bors commit,

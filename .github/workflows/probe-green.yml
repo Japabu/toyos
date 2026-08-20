@@ -14,9 +14,11 @@ on:
     branches: ['ci/probe-green']
   workflow_dispatch:
 
+# Trusted Linux events select the persistent `toyos` runner. Fork PRs and
+# merge-queue refs stay on GitHub-hosted machines.
 jobs:
   green:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || 'toyos' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false

@@ -42,6 +42,9 @@ concurrency:
   group: portability-${{ github.ref }}
   cancel-in-progress: false
 
+# Trusted Linux events select the persistent `toyos` runner. Fork PRs and
+# merge-queue refs stay on GitHub-hosted machines; macOS and Windows keep their
+# platform-native GitHub-hosted runners below.
 jobs:
   # What this proves today: inside the same minimal `debian:sid` container
   # `ci.yml`'s guest shards run in — not a GitHub-hosted image — installing
@@ -82,7 +85,7 @@ jobs:
   # No `actions/cache`: caching a "fresh machine" build is a contradiction —
   # what is measured below is what a from-scratch run costs, every time.
   linux:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || 'toyos' }}
     container:
       image: debian:sid
     # A wedge guard, not a fresh measurement: this ceiling is carried over
@@ -337,7 +340,7 @@ jobs:
   nightly-red-portability:
     needs: [linux, macos]
     if: ${{ !cancelled() && github.event_name == 'schedule' && (needs.linux.result != 'success' || needs.macos.result != 'success') }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'toyos' }}
     permissions:
       contents: read
       issues: write

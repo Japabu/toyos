@@ -30,9 +30,11 @@ on:
 concurrency:
   group: gate-a-${{ github.ref }}
 
+# Trusted Linux events select the persistent `toyos` runner. Fork PRs and
+# merge-queue refs stay on GitHub-hosted machines.
 jobs:
   gate:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || 'toyos' }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -121,7 +123,7 @@ jobs:
   nightly-red-gate-a:
     needs: [gate]
     if: ${{ !cancelled() && github.event_name == 'schedule' && needs.gate.result != 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'toyos' }}
     permissions:
       contents: read
       issues: write

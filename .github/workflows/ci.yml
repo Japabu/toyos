@@ -33,6 +33,8 @@ concurrency:
   group: ci-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# Trusted Linux events select the persistent `toyos` runner. Fork PRs and
+# merge-queue refs stay on GitHub-hosted machines.
 jobs:
   # Nothing here may run against a tree whose toolchain does not build.
   # `toolchain.yml` is a separate workflow because it must never be cancelled
@@ -41,7 +43,7 @@ jobs:
   # release instead of depending on it directly, once, so a broken toolchain
   # strands one runner rather than every shard.
   toolchain-ready:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'toyos' }}
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
@@ -103,7 +105,7 @@ jobs:
 
   guest:
     needs: [toolchain-ready]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || 'toyos' }}
     # A wedge guard, not a budget: the harness answers a dead shared boot with
     # a new one, so a shard that cannot finish inside this ceiling measures
     # nothing.
@@ -313,7 +315,7 @@ jobs:
   tcg:
     needs: [toolchain-ready]
     if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || 'toyos' }}
     timeout-minutes: 60
     container:
       image: debian:sid
@@ -403,7 +405,7 @@ jobs:
   cache-writer:
     needs: [toolchain-ready]
     if: github.event_name != 'schedule'
-    runs-on: ubuntu-24.04
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || 'toyos' }}
     timeout-minutes: 60
     container:
       image: debian:sid
@@ -505,7 +507,7 @@ jobs:
   durations:
     needs: [guest]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'toyos' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -586,7 +588,7 @@ jobs:
   guest-suite:
     needs: [toolchain-ready, guest, durations, cache-writer]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'toyos' }}
     steps:
       # `toolchain-ready` is named here as well as in the shards' `needs:`,
       # since a skipped `guest` says nothing about why it was skipped and this
@@ -632,7 +634,7 @@ jobs:
   nightly-red:
     needs: [tcg, guest-suite]
     if: ${{ !cancelled() && github.event_name == 'schedule' && (needs.tcg.result != 'success' || needs.guest-suite.result != 'success') }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'toyos' }}
     permissions:
       contents: read
       issues: write
@@ -664,7 +666,7 @@ jobs:
   # `durations` above installs neither.
   merge-health:
     if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'toyos' }}
     timeout-minutes: 15
     permissions:
       contents: read

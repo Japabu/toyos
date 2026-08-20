@@ -32,6 +32,8 @@ concurrency:
   group: host-tests-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# The Linux reporting job selects the persistent `toyos` runner for trusted
+# events. Fork PRs and merge-queue refs stay GitHub-hosted, as does macOS.
 jobs:
   host:
     runs-on: macos-latest
@@ -598,7 +600,7 @@ jobs:
   nightly-red-host:
     needs: [host]
     if: ${{ !cancelled() && github.event_name == 'schedule' && needs.host.result != 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'toyos' }}
     permissions:
       contents: read
       issues: write
