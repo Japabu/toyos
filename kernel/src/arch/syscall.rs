@@ -14,8 +14,9 @@ use crate::{DirectMap, UserAddr};
 
 use toyos_untrusted::Untrusted;
 
-// MSR addresses
-const MSR_EFER: u32 = 0xC000_0080;
+// MSR addresses. `IA32_EFER` is not among them: `SCE` is one bit of a register
+// `arch::control_regs` declares whole, and reading it back to OR a bit in here
+// was the second place deciding what one register held.
 const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
 const MSR_FMASK: u32 = 0xC000_0084;
@@ -164,10 +165,12 @@ mod canary {
     }
 }
 
+/// Point `SYSCALL` at [`syscall_entry`] on this CPU.
+///
+/// `EFER.SCE` — the bit that makes the instruction exist at all — is not set
+/// here: it is `arch::control_regs`', applied and asserted on this CPU before
+/// this call on both the BSP's path and an AP's.
 pub fn init() {
-    let efer = cpu::rdmsr(MSR_EFER);
-    cpu::wrmsr(MSR_EFER, efer | 1);
-
     let star = ((percpu::STAR_SYSRET_BASE as u64) << 48) | ((percpu::KERNEL_CS as u64) << 32);
     cpu::wrmsr(MSR_STAR, star);
     // `LSTAR` is an IDT slot by another name: the one thing `syscall` can reach.
