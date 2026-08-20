@@ -25,7 +25,8 @@ pub fn sysinfo(buf: &mut [u8]) -> usize {
     syscall::sysinfo(buf)
 }
 
-pub fn shutdown() -> ! {
-    syscall::shutdown()
-}
+// Powering the machine off used to be a free function here, over a syscall that
+// took no argument. It is [`crate::syscap::SysCap::shutdown`] now: it is an
+// authority over the whole machine, and every one of those is a bit on a
+// capability rather than a call anything can make.
 

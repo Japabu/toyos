@@ -67,6 +67,11 @@ const SYSCAP_RIGHTS: &[(&str, Rights)] = &[
     // holder that has to spin — a name that looks complete and traps the one
     // program whose whole loop is read-then-park.
     ("logread", Rights::LOG.union(Rights::WAIT)),
+    // Power the machine off. The largest authority on the list — it ends every
+    // process there is, including the ones that hold the other four — and the
+    // last one to have been free: `SYS_SHUTDOWN` took no handle at all, so a
+    // program endowed exactly one connector could halt the machine with it.
+    ("power", Rights::POWER),
 ];
 
 /// The whole right set a program's `syscap` list asks for.
@@ -96,8 +101,9 @@ pub struct Program {
     pub receives: Vec<String>,
     pub devices: Vec<String>,
     /// Rights on the `SysCap` duplicate init endows this program, by the names
-    /// [`syscap_rights`] takes. Empty for all but two programs: nothing else in
-    /// the system may enter the RT band or mint a device claim.
+    /// [`syscap_rights`] takes. Empty for all but a handful: nothing else in
+    /// the system may enter the RT band, mint a device claim, read the machine
+    /// log or power the machine off.
     pub syscap: Vec<String>,
 }
 

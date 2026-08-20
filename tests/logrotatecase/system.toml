@@ -56,9 +56,13 @@ receives = ["netd", "launcher"]
 # `logread` is the log gate's own: a spawned test binary does not inherit a
 # `SysCap` dup, so the gate that reads the kernel's records runs inside
 # `test-runner` itself.
+# `power` is what `run shutdown` below needs and `dup` is what carries it to
+# the applet: test-runner holds no `launcher` connector, so it spawns
+# `/bin/shutdown` directly and endows it a duplicate of this cap — which a cap
+# without `dup` refuses to make, leaving the applet with no capability at all.
 [programs.test-runner]
 receives = ["compositor", "soundd", "netd"]
-syscap = ["logread"]
+syscap = ["dup", "logread", "power"]
 
 # `run shutdown` is what closes `kernel_log_file`'s second arm, and it spawns
 # `/bin/shutdown`. metalcase carries no toybox and therefore no such name, so
