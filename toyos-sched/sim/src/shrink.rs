@@ -47,7 +47,7 @@ pub fn shrink(scenario: &Scenario, decisions: Vec<usize>) -> Vec<usize> {
     // Binary-search the shortest failing prefix.
     let (mut low, mut high) = (0usize, best.len());
     while low < high {
-        let mid = (low + high) / 2;
+        let mid = usize::midpoint(low, high);
         if fails(&best[..mid]) {
             high = mid;
         } else {
