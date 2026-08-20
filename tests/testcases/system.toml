@@ -23,9 +23,13 @@ syscap = ["rt"]
 # `logread` because the log gate reads the kernel's own records and cannot be
 # a spawned binary: a `SysCap` dup is not part of the namespace test-runner
 # hands down.
+# `power` because `run shutdown` is how a dozen host-side gates end their guest
+# and read what reached the volume, and test-runner spawns `/bin/shutdown`
+# directly — it holds no `launcher` connector, so the applet's authority is the
+# dup it is endowed here rather than the `toybox` row.
 [programs.test-runner]
 receives = ["soundd"]
-syscap = ["device", "dup", "logread"]
+syscap = ["device", "dup", "logread", "power"]
 
 [programs.toybox]
 receives = ["soundd"]
