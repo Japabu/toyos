@@ -1,5 +1,5 @@
 ---
-status: open
+status: assigned
 kind: track
 opened: 2026-08-12
 ---
@@ -9,8 +9,18 @@ opened: 2026-08-12
 Four wait sites still spin — two in xHCI, one in NVMe, one in virtio — so a CPU
 waits for a device. A kill is answered by throwing the task's kernel stack away
 at five separate reap-in-place arms, and the parked arm is the one that strands
-a held lock. Every duration in the kernel is a bare number. None of the work
-below is on this branch; a branch carries the first part of it and is not merged.
+a held lock. Every duration in the kernel is a bare number. None of that is true
+on `main`.
+
+**Held by `wt/toyos-p2impl`, pull request #91.** That branch carries the first
+five chunks below — duration kinds, the completion core, the one park site with
+the cancellable kill, the sleep lock, and `usbd`/`iod` — and is not merged.
+**Owner ruling 2026-08-16: this work lands as two pull requests, split after the
+kernel-thread chunk**, so #91 is the first and everything from xHCI async
+onwards is the second. The split is at the last boundary where no lock has
+converted yet; taking it anywhere later means landing a tree in which one of the
+four locks is a sleep lock and the other three are not, which the baseline
+assertion refuses by design.
 
 **The commitment: one completion primitive, one inbox, one park site, one
 recheck predicate, and a kill answered by `Cancelled` at the park rather than by

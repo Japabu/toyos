@@ -10,6 +10,7 @@ use crate::object::{ops, HandleTable};
 use crate::sync::Lock;
 use crate::symbols::SymbolTable;
 use crate::sched::payload::ThreadSched;
+use crate::time::{Deadline, Duration};
 use crate::{elf, pipe, scheduler};
 use crate::{DirectMap, UserAddr};
 use crate::loader::{
@@ -853,7 +854,10 @@ pub fn collect_thread_zombie(table: &mut ProcessTable, tid: Tid, parent_pid: Pid
 /// performed here, because both must happen with the table lock given up.
 #[must_use = "a poisoned thread's waiter must be woken"]
 pub enum PoisonWake {
-    /// A child thread died: its own process's `thread_join` is what waits.
+    /// A child thread died. **The pair names the thread that died**, which is
+    /// what a `thread_join` arms on now — it used to name the process's main
+    /// thread, because the wake was by name into a shared parking lot and
+    /// whoever was woken re-checked.
     Joiner(Pid, Tid),
     /// The main thread died, so the process is over. The exit is published on
     /// the object — outside the table lock, like every other publish — and
@@ -873,7 +877,7 @@ pub fn zombify_poisoned(table: &mut ProcessTable, pid: Pid, tid: Tid) -> Option<
         if !matches!(thread.state, ThreadLocation::Zombie(_)) {
             thread.state = ThreadLocation::Zombie(-1);
         }
-        return Some(PoisonWake::Joiner(pid, proc.main_tid));
+        return Some(PoisonWake::Joiner(pid, tid));
     }
     // The same claim every exit and kill takes, for the same reason: exactly
     // one path publishes one exit.
@@ -991,7 +995,10 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         if proc.tearing_down() {
             return None;
         }
-        let addr_space = scheduler::current_address_space();
+        // A thread is spawned by a running thread, which by construction has an
+        // address space: `None` here is "no task is running", and this is one.
+        let addr_space = scheduler::current_address_space()
+            .expect("spawn_thread: the spawning thread runs in an address space");
         (addr_space, Arc::clone(&proc.process_data))
     };
     let (tls_template, tls_memsz, tls_modules, tls_total_memsz, tls_max_align) = {
@@ -1007,7 +1014,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         setup_tls(tls_template, tls_memsz, tls_max_align)?
     };
     let (tls_alloc, fs_base) = {
-        let addr_space = parent_addr_space.as_ref().expect("spawn_thread: no address space");
+        let addr_space = &parent_addr_space;
         let parent_data = process_data_arc.lock();
         let tls_phys = tls_alloc.phys();
         // VA exhaustion is a resource failure a process can reach by spawning
@@ -1040,8 +1047,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
     let (ks_alloc, ks_rsp) = match alloc_kernel_stack(thread_start, entry, stack_ptr, arg) {
         Some(ks) => ks,
         None => {
-            let pt = parent_addr_space.as_ref().expect("spawn_thread: no address space");
-            tls_alloc.release(pt);
+            tls_alloc.release(&parent_addr_space);
             return None;
         }
     };
@@ -1339,8 +1345,15 @@ pub fn thread_exit(code: i32) -> ! {
         exit(code);
     }
 
-    let parent_main_tid = release_thread(process_pid, tid, code);
-    scheduler::wake_task(TaskId(process_pid, parent_main_tid));
+    let _parent_main_tid = release_thread(process_pid, tid, code);
+    // Whoever joined this thread armed on it. Posted before the exit pass,
+    // because after it this thread does not run again.
+    if let Some(handle) = crate::sched::driver::current_handle() {
+        crate::completion::post(
+            crate::completion::Subject::of(handle.watch()),
+            crate::completion::Outcome::Gone(crate::completion::Reason::Closed),
+        );
+    }
     scheduler::exit_current(code);
 }
 
@@ -1400,6 +1413,12 @@ pub fn thread_sched(pid: Pid, tid: Tid) -> Option<ThreadSched> {
 /// alignment is not the caller's manners: a word four bytes below a 2 MiB
 /// boundary would have its tail read out of the next *physical* page, which
 /// belongs to somebody else.
+///
+/// For the same reason the answer is not a *lease*: nothing here pins the
+/// frame, and a sibling's `munmap` can hand it back to the PMM while the wait
+/// is still parked on it. What makes that safe is at the two ends —
+/// `AddressSpace::unmap` ends the waits it orphans, and `scheduler::futex_wait`
+/// re-derives this translation on every check rather than trusting it.
 fn futex_word(addr: UserAddr) -> Option<crate::mm::DirectMap> {
     if !addr.raw().is_multiple_of(4) {
         return None;
@@ -1417,10 +1436,14 @@ fn futex_word(addr: UserAddr) -> Option<crate::mm::DirectMap> {
 /// `pub fn` in another file, which a third caller would not have known to
 /// repeat.
 pub fn futex_wait(addr: UserAddr, expected: u32, timeout_ns: u64) -> u64 {
+    // The ABI's relative `u64::MAX` means "no timeout" and every other value is
+    // a relative span, turned absolute exactly once, here. C11 makes the ABI
+    // itself absolute; until then this is where the two meanings meet, and the
+    // [`Deadline`] is what stops the sentinel travelling any further in.
     let deadline = if timeout_ns != u64::MAX {
-        crate::clock::nanos_since_boot().saturating_add(timeout_ns)
+        Deadline::at(crate::clock::now() + Duration::from_nanos(timeout_ns))
     } else {
-        0
+        Deadline::never()
     };
 
     // Physical, so a futex in shared memory works across processes.
@@ -1431,7 +1454,7 @@ pub fn futex_wait(addr: UserAddr, expected: u32, timeout_ns: u64) -> u64 {
     // Both outcomes answer 0: a thread that blocked and was woken and one whose
     // word did not match and never blocked are the same answer to the caller,
     // which re-checks the word either way.
-    scheduler::futex_wait(phys_addr, expected, deadline);
+    scheduler::futex_wait(addr, phys_addr, expected, deadline);
     0
 }
 
@@ -1480,6 +1503,17 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     let t0 = crate::clock::nanos_since_boot();
     let tid = current_tid();
     if tid == Tid::MAX {
+        return false;
+    }
+    // **A kernel thread's fault is fatal, said out loud rather than fallen
+    // into.** It used to be answered by `current_address_space()` returning
+    // `None` two lines below; since C6 a kernel thread names the kernel address
+    // space, so that arm no longer catches it and the walk beneath would look
+    // for a user region in a `ProcessData` that has none — reaching the same
+    // `false` by accident. Nothing here can resolve a kernel fault: demand
+    // paging is a user mapping's mechanism, and the kernel's direct map is
+    // complete from `paging::init`.
+    if crate::sched::kthread::current_is_kernel_thread() {
         return false;
     }
 
@@ -1634,8 +1668,12 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
     }
 
 
+    // No invalidation here, and none inside on the ordinary path: the fault got
+    // here because the PDE was not present, and nothing is cached from one.
+    // `remap` derives that from the entry it replaced — this line used to call
+    // `invlpg` a second time on the kernel's hottest paging path, for an entry
+    // the first call had not needed to invalidate either.
     addr_space.lock().remap(UserAddr::new(region_start), page_alloc.phys(), writable);
-    crate::mm::paging::invlpg(region_start);
 
     data.demand_pages.push(page_alloc);
 

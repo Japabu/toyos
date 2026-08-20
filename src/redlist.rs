@@ -1897,6 +1897,43 @@ pub const KNOWN_RED: &[Red] = &[
         source: "tests/toyos.rs QEMU_PS2_QUEUE",
         measured: "2026-08-19",
     },
+    Red {
+        test: "screen_console_panic",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`the fatal report never took the screen back from the console — which would make \
+               /bin/console a downgrade on the machine it is for`, at 96 s against the suite's \
+               usual seconds, so the shape is a handoff waited for and never observed. First \
+               sighting: `--known-red` answered `NOT ON THE LIST`. **Not about the diff it was \
+               found on**, which is PR #141's merge-queue package — workflow triggers and \
+               CLAUDE.md prose, no kernel byte. `ALONE: GREEN, and it was alone both times — \
+               nothing the harness controls differed, so it failed once and passed once. That is \
+               a rate and not a classification`",
+        evidence: "PR #141 run 32306139422, job 96239259411 (`guest (3)`), 2026-08-19; the \
+                   isolated re-run in the same job was green",
+        source: "issues/panic-path/the-fatal-report-once-left-the-screen-to-the-console.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "log_poll_outlives_a_close",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`kernel panic: DOUBLE PANIC — the guest went quiet because every CPU is halted, \
+               not because it was still working. The panic is the finding and the guard never \
+               got to be one`. The kernel's complete last words were `[kernel 0.991 cpu0] DOUBLE \
+               PANIC` — no first-panic text, no location, which is the second finding. `ALONE: \
+               GREEN — it fails only beside other guests`; the load was two worktrees' full \
+               suites interleaved over the shared twelve guest slots. **Not about the diff it \
+               was found on**, a census-settling change inside `handle_kill_policy`'s own guest \
+               binary",
+        evidence: "dev host, 2026-08-19 22:21 UTC, `cargo test` in wt/toyos-hkpfix beside \
+                   wt/toyos-freshness's suite; 267 of 268 passed, this one red at 25 s in the \
+                   parallel phase, green alone in the same run",
+        source: "issues/panic-path/a-double-panic-at-boots-edge-says-nothing-but-its-name.md",
+        measured: "2026-08-19",
+    },
     // ---------------------------------------------------------------------
     // `wt/toyos-purecrates`, dev host, 2026-08-18: three full `cargo test` runs
     // in one session, on a branch whose whole delta is three kernel files
@@ -1958,6 +1995,95 @@ pub const KNOWN_RED: &[Red] = &[
         evidence: "the same session's first run, twelve wide",
         source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-18",
+    },
+    // ---------------------------------------------------------------------
+    // `wt/toyos-spawnrule`, dev host, 2026-08-19: three full `cargo test` runs
+    // in one session on a branch whose whole behaviour change is one line of
+    // `SYS_SPAWN`'s slot-map resolution. **Two kernel deaths and one clean
+    // run**, at three different host widths: 1.02x red, 1.07x green 268 of 268,
+    // 1.41x red — and the kernel source under the first and third differs from
+    // the green one's by comments alone, so no statement compiled differently
+    // between them. Both names answered `NOT ON THE LIST` when they were asked,
+    // and both re-ran `ALONE … GREEN`; adjudicated here rather than re-run
+    // away, per the root CLAUDE.md.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "process_lifecycle",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 3),
+        standing: Standing::Stands,
+        what: "`kernel panic: KERNEL PANIC: execute unmapped address at 0x0` — a Ring 0 \
+               instruction fetch at zero (`cs=0x0008`, `user=false`, `err=0x10`) inside \
+               `SYS_READ`, on cpu1, 15 s against the 491 ms the same name took passing alone \
+               straight after. **A kernel death and not a verdict**, and the fourth of its \
+               class: the first report to arrive with a syscall number under it, and the first \
+               whose restored frame is not all zeros — so the reissued-kernel-stack reading of \
+               the 2026-08-09 sighting does not carry over to it",
+        evidence: "the session's first run, twelve wide, contended with another worktree's \
+                   suite holding all twelve guest slots; `fastest boot 1341 ms against the \
+                   reference 1320 ms`, and `ALONE process_lifecycle: GREEN`",
+        source: "issues/kernel/a-ring-0-fetch-at-zero-inside-sys-read.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "sched_stress",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 3),
+        standing: Standing::Stands,
+        what: "`QEMU disconnected` — the kernel panicked at \
+               `alloc/src/collections/btree/navigate.rs:161`, `Option::unwrap()` on `None` \
+               **inside `BTreeMap`'s own immutable iterator**, walking a CPU's `parked` map \
+               from `SchedPass::apply_timer`. A map whose length disagrees with its nodes, not \
+               an absent deadline. It took the shared boot with it: 129 further names in the \
+               same run answered `Failed to flush QEMU stdin: … BrokenPipe`, so 130 of that \
+               run's reds are one event and only this one is a measurement",
+        evidence: "the same session's third run and the most loaded of the three, `fastest boot \
+                   1867 ms against the reference 1320 ms`; `ALONE sched_stress: GREEN` and \
+                   `PASS (2s)` in the same run",
+        source: "issues/kernel/a-btreemap-panicked-inside-its-own-navigation-in-a-scheduler-pass.md",
+        measured: "2026-08-19",
+    },
+    // ---------------------------------------------------------------------
+    // The same session's last two runs, after the branch merged `origin/main`
+    // at `bf54143`. Both red, both `ALONE … GREEN`, neither about the diff —
+    // and with the two above them that is **three kernel deaths of three
+    // different shapes in four contended suites, against one clean run**. The
+    // one file that carries the table is this pair's write-up.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "i8042_kbd_echo",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 2),
+        standing: Standing::Stands,
+        what: "`kernel panic: KERNEL PANIC: execute unmapped address at 0x1b` at 850 ms of \
+               boot, `cs=0x0008`, `user=false` — the **fourth** instance of the shifted-frame \
+               half of the `0x1b` class, agreeing with the other three on `rax`, `rbx`, an \
+               `RF`-set flags word in `rbp` and a page-aligned `rsp`, and **disagreeing on the \
+               syscall**: `num=49` (`SYS_NANOSLEEP`) from a `rip` inside `gimli`, where both \
+               sightings that printed the line are `num=90` from one instruction on the spawn \
+               path. That is the one claim the class file's newest paragraph makes, and this \
+               row is the counter-example. `ALONE i8042_kbd_echo: GREEN`",
+        evidence: "the fourth of five full `cargo test` runs of `wt/toyos-spawnrule` in one \
+                   session, the first after merging `origin/main` at `bf54143`; `fastest boot \
+                   2165 ms against the reference 1320 ms`, 1.64x width",
+        source: "issues/kernel/a-ring-0-fetch-at-0x1b-with-the-stack-pointer-on-a-page-boundary.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "screen_console_shell",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 2),
+        standing: Standing::Stands,
+        what: "`typed \\`echo zqjxk\\` at the prompt and no row of the panel is its output` — a \
+               **different assertion** from this name's 2026-08-17 CI row, which is about the \
+               seeded `i8042:` line. 786 s against `PASS (2s)` alone in the same run, and the \
+               panel it decoded carries only the first frames of boot, so the guest never \
+               reached the prompt inside the window. The one red of this session's five that \
+               is not a kernel death",
+        evidence: "the fifth run of the same session, `fastest boot 1622 ms against the \
+                   reference 1320 ms`, 1.23x width; `ALONE screen_console_shell: GREEN`",
+        source: "issues/kernel/a-ring-0-fetch-at-0x1b-with-the-stack-pointer-on-a-page-boundary.md",
+        measured: "2026-08-19",
     },
     // ---------------------------------------------------------------------
     // `wt/toyos-i8042deep`, dev host, 2026-08-19. Adjudicated here rather than

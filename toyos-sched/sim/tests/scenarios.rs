@@ -9,7 +9,7 @@
 //!    decoration.
 //! 2. **Every scenario passes**, over a seed sweep and a fuzz-byte sweep.
 //!
-//! # The nine negative gates, and the two controls
+//! # The ten negative gates, and the two controls
 //!
 //! Each is a `scenarios::` constructor that *is* a broken scheduler, and each
 //! has a `#[test]` below asserting both that it is caught and which invariant
@@ -22,6 +22,7 @@
 //! | `old_commit_before_pass` | the pre-`8508b37` blocking shape | I1, on every seed |
 //! | `old_preemptible_window` | preemption left on in the registration window | an abort inside `check_cpu` |
 //! | `old_migrate_kept_the_corpse` | the balance path handing on a killed task | I14 |
+//! | `old_rt_starved_the_corpse` | the RT band outranking the dying list without a bound | I14, on every seed |
 //! | `old_park_kept_the_lend` | commit `9c2fc4d`'s park keeping a lapsed lend | I9 |
 //! | `fair_share_per_thread` | one fair share per thread, not per process | I5, and nothing else |
 //! | `fair_double_charge` | a share charged twice for what it runs | I5, in the opposite direction |
@@ -52,7 +53,7 @@
 //!
 //! The budgets here are what a `cargo test` can afford. The full criterion —
 //! 10⁴ seeds and 10⁷ fuzz steps per scenario class — runs from the CLI, where
-//! `gate` carries all nine gates and both controls:
+//! `gate` carries all ten gates and both controls:
 //!
 //! ```text
 //! cargo run --release -p toyos-sched-sim -- gate 10000
@@ -269,6 +270,53 @@ fn old_migrate_keeping_the_corpse_is_caught() {
     );
 }
 
+/// **The other direction of the same law, and the one the first fix created.**
+/// The gate above is a corpse handed away and left waiting; this is a corpse
+/// never dispatched at all, because the pick asked only `rq.has_rt()` and one
+/// permanently-RT thread that never parks answered yes for ever.
+///
+/// That shape shipped on this branch between the two fixes, and its failure is
+/// not a slow retire: `scheduler::retire_task` blocks behind a wall-clock
+/// tripwire and **panics the kernel**, from a workload that only needs
+/// `Rights::RT` — which `soundd` holds and `SYS_RT_ENTER` never gives back.
+///
+/// It must be caught by **I14**, on every seed: nothing in this scenario is a
+/// race. The corpse is queued, the RT thread runs, and the only question is
+/// whether the pick ever takes the dying list. `rt_saturated_retire` is the
+/// positive half and is in `all()`.
+#[test]
+fn rt_starving_the_corpse_is_caught() {
+    let scenario = scenarios::old_rt_starved_the_corpse();
+    let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+    let mut caught = 0;
+    for seed in 0..SEEDS {
+        let mut choices = if seed % 2 == 0 {
+            ChoiceStream::from_seed(seed)
+        } else {
+            ChoiceStream::pct(seed, scenario.cpus, 3)
+        };
+        let outcome = run(scenario.clone(), &mut choices);
+        if outcome.passed() {
+            continue;
+        }
+        caught += 1;
+        for violation in &outcome.violations {
+            let id = violation.split(':').next().unwrap_or("?").to_string();
+            *kinds.entry(id).or_default() += 1;
+        }
+    }
+    assert_eq!(
+        caught, SEEDS as usize,
+        "a corpse held off for ever by the RT band went undetected in \
+         {}/{SEEDS} schedules — and the tree that does it panics the kernel",
+        SEEDS as usize - caught,
+    );
+    assert!(
+        kinds.contains_key("I14"),
+        "expected a retire-promptness violation; got {kinds:?}",
+    );
+}
+
 /// The positive half of the same pair: with the kill bit read, no schedule of
 /// that workload puts a corpse in transit, and every retire completes well
 /// inside the derived bound.
@@ -302,6 +350,63 @@ fn a_retire_completes_inside_its_derived_bound() {
          in, so I14's latency half never measured anything",
     );
     println!("I14: worst retire {worst} ns against a {bound} ns bound");
+}
+
+/// **A fidelity gate, not a scheduler gate**: the model's own unwind deferral
+/// lasts one chunk plus what the model can prove it owes elsewhere, which is
+/// what its doc promises and what the code did not do.
+///
+/// [`toyos_sched_sim::vm::Vm::unwind_at`] closes `Vm::enabled`'s gate on every
+/// *other* CPU's `Exec` while one CPU owes an unwind step. Stamped only on the
+/// false→true transition, and read with a `find` that named one owed CPU and
+/// denied the step to every other, that gate stayed shut for a CPU's whole
+/// teardown window — several consecutive corpses — and every other CPU was
+/// frozen for all of it: 17,000,000 ns measured, 17 x `RUN_CHUNK_NS`, against a
+/// doc saying "the same grace" as the one-chunk `resched_at`.
+///
+/// That is not a scheduler defect; it is the explorer being denied exactly the
+/// interleavings the surrounding chunk is about, over exactly the window I14 is
+/// measured across. So the promise is asserted as a number, term by term, for a
+/// stamp taken at T on a scenario of `cpus` CPUs:
+///
+/// 1. **one chunk** — the grace itself. The gate does not close until the clock
+///    reaches `T + RUN_CHUNK_NS`, and until it does every CPU may step freely.
+/// 2. **one chunk** — the step that carries the clock past that threshold, which
+///    is somebody's execution step and may be a whole chunk long. (An
+///    `Op::KernelSection` advances by its own length instead; the largest in the
+///    suite is `MS / 2`, half a chunk, so a chunk is the wider price.)
+/// 3. **`cpus - 1` chunks** — the other CPUs whose own stamp is no later than
+///    this one. Debts are discharged oldest first, ties by CPU number, and a CPU
+///    that takes its step restamps to *now* — so each peer can go ahead of this
+///    one at most once. A workload-shaped term in a derived bound, exactly as
+///    invariant I14's `(1 + peers)` is.
+/// 4. **one chunk** — the step that discharges it.
+#[test]
+fn the_unwind_gate_lasts_one_chunk_and_not_one_unwind() {
+    let scenario = scenarios::retire_under_balance();
+    let bound = (2 + scenario.cpus as u64) * toyos_sched_sim::vm::RUN_CHUNK_NS;
+    let mut worst = 0;
+    for seed in 0..SEEDS {
+        let mut choices = if seed % 2 == 0 {
+            ChoiceStream::from_seed(seed)
+        } else {
+            ChoiceStream::pct(seed, scenario.cpus, 3)
+        };
+        let outcome = run(scenario.clone(), &mut choices);
+        assert!(outcome.passed(), "{}", outcome.report());
+        worst = worst.max(outcome.unwind_gate_ns);
+    }
+    assert!(
+        worst > 0,
+        "in {SEEDS} schedules no CPU ever held an unwind across a step, so this \
+         measured nothing at all",
+    );
+    assert!(
+        worst <= bound,
+        "the unwind gate stood for {worst} ns against a derived {bound} ns — the \
+         explorer was frozen over the very window I14 is measured across",
+    );
+    println!("unwind gate: worst {worst} ns against a {bound} ns bound");
 }
 
 /// A `Retire` that lands inside the registration window, and the fact that the

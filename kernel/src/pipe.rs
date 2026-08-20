@@ -5,11 +5,9 @@ use toyos_abi::ring::Ring;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use toyos_sched::task::WaitClass;
 
 use crate::mm::PAGE_2M;
-use crate::sched::payload::KWaitQueue;
-use crate::sched::waitqs::new_queue;
+use crate::completion::Watch;
 use crate::io_uring::RingId;
 use crate::id_map::{IdKey, IdMap};
 use crate::sync::Lock;
@@ -138,12 +136,15 @@ struct Pipe {
     readers: u32,
     writers: u32,
     io_uring_watchers: Vec<RingId>,
-    /// This pipe end's waiter set (spec §8.6). Held by `Arc` so a blocking
-    /// site can clone it out from under the table lock and hold it across its
-    /// own park — the ticket and the registration borrow the queue, not the
-    /// table.
-    readers_wq: Arc<KWaitQueue>,
-    writers_wq: Arc<KWaitQueue>,
+    /// This pipe end's waiter set (spec §8.6), as a completion subject. Held
+    /// by `Arc` so a blocking site can clone it out from under the table lock
+    /// and hold it across its own park.
+    ///
+    /// **One list per end where there were two.** The `KWaitQueue` beside each
+    /// of these went with the park it served: after §5.6 a reader arms here
+    /// and parks on its own queue.
+    readers_watch: Arc<Watch>,
+    writers_watch: Arc<Watch>,
     /// An RT thread wrote to this pipe and the boost has not been claimed
     /// yet. The next thread to consume data inherits transient RT priority —
     /// covering readers that were runnable (not blocked) at write time,
@@ -161,8 +162,8 @@ impl Pipe {
             readers: 0,
             writers: 0,
             io_uring_watchers: Vec::new(),
-            readers_wq: new_queue(WaitClass::Pipe),
-            writers_wq: new_queue(WaitClass::Pipe),
+            readers_watch: Arc::new(Watch::new()),
+            writers_watch: Arc::new(Watch::new()),
             rt_boost_pending: false,
         }
     }
@@ -399,12 +400,28 @@ pub fn remove_io_uring_watcher(pipe_id: PipeId, ring_id: RingId) {
 
 /// The waiter set of this pipe's read end, cloned out for a blocking site or a
 /// wake path to hold on its own stack.
-pub fn readers_queue(pipe_id: PipeId) -> Option<Arc<KWaitQueue>> {
-    with_pipes(|pipes| pipes.get(pipe_id).map(|p| p.readers_wq.clone()))
+pub fn readers_queue(pipe_id: PipeId) -> Option<PipeEnd> {
+    with_pipes(|pipes| {
+        pipes.get(pipe_id).map(|p| PipeEnd {
+            watch: p.readers_watch.clone(),
+        })
+    })
 }
 
-pub fn writers_queue(pipe_id: PipeId) -> Option<Arc<KWaitQueue>> {
-    with_pipes(|pipes| pipes.get(pipe_id).map(|p| p.writers_wq.clone()))
+pub fn writers_queue(pipe_id: PipeId) -> Option<PipeEnd> {
+    with_pipes(|pipes| {
+        pipes.get(pipe_id).map(|p| PipeEnd {
+            watch: p.writers_watch.clone(),
+        })
+    })
+}
+
+/// One end of a pipe, as a blocking site sees it: the queue it registers on
+/// and the subject it arms. Cloned out of the table together, because two
+/// lookups would be two acquisitions of `PIPES` on the path a pipe write
+/// already pays for.
+pub struct PipeEnd {
+    pub watch: Arc<Watch>,
 }
 
 pub fn io_uring_watchers(pipe_id: PipeId) -> Vec<RingId> {

@@ -501,6 +501,20 @@ actuators! {
     /// principle — there is no process to kill and no syscall to make.
     klogd_panic = "klogd-panic";
 
+    /// Panic inside `usbd`, the second kernel thread, on its first instruction.
+    ///
+    /// **`klogd-panic`'s other half, and it is the half nothing has ever run.**
+    /// The two threads carry opposite rows in `sched::kthread`: `klogd`'s panic
+    /// halts the machine, `usbd`'s kills the thread and the machine carries on.
+    /// Until this actuator existed only the halting branch had ever been taken
+    /// by a kernel thread, so "recoverable" was a value in a table rather than a
+    /// path anything had walked — and the recovery it names runs through
+    /// `poison_tid`, the idle loop's `reap_poisoned` and `zombify_poisoned`,
+    /// none of which had ever seen a task with no address space of its own. The
+    /// host has no stimulus for it even in principle: there is no process to
+    /// kill and no syscall to make.
+    usbd_panic = "usbd-panic";
+
     /// Stop the boot dead in phase 3, with interrupts off, before anything that
     /// could ever have drained a log.
     ///

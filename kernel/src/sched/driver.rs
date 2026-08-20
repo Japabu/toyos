@@ -34,8 +34,8 @@ use toyos_sched::fair::Frontier;
 use toyos_sched::hw::{CpuId, Hw, Kicker, Machine, Nanos};
 use toyos_sched::mailbox::{mailbox, Kick, PreemptGuard, Urgency};
 use toyos_sched::msg::Msg;
-use toyos_sched::task::{RtState, TaskBuilder, TaskKey};
-use toyos_sched::waitq::{Cancelled, Commit, CurrentTask};
+use toyos_sched::task::{RtState, TaskBuilder, TaskKey, WaitClass};
+use toyos_sched::waitq::{Cancel, Cancelled, Commit, CurrentTask};
 
 use crate::arch::percpu;
 use crate::hw::HW;
@@ -294,16 +294,18 @@ fn placement() -> CpuId {
 /// Everything a new thread needs. `entry_rsp` points at the trampoline frame
 /// `alloc_kernel_stack` built.
 ///
-/// **`address_space: None` is a kernel thread and not an error.** It was one
-/// until `klogd`, this kernel's first kernel thread, arrived: `spawn` expected
-/// the `Option` and the field has always been one, so the whole of "the
-/// scheduler cannot host a kernel task" was a single `.expect` in the line
-/// below.
+/// **`address_space` is not an `Option`, and the history is worth one
+/// sentence.** "The scheduler cannot host a kernel task" was a single `.expect`
+/// here until `klogd` arrived; that became a two-armed `match` naming the
+/// kernel's `cr3` for a task that named no address space, and the second arm is
+/// gone because every kernel thread now names `mm::paging::kernel` itself. One
+/// declaration decides a task's `cr3`, which is the rule the root `CLAUDE.md`
+/// states for control registers and is the same rule here.
 pub struct NewTask {
     pub id: TaskId,
     pub kernel_stack: OwnedAlloc,
     pub entry_rsp: u64,
-    pub address_space: Option<PageTables>,
+    pub address_space: PageTables,
     pub fs_base: u64,
     pub share: Arc<KShare>,
 }
@@ -311,15 +313,12 @@ pub struct NewTask {
 /// Place a new task by message — never by reaching into the destination's
 /// queue (spec §9.4). Returns what the process table keeps.
 pub fn spawn(new: NewTask) -> ThreadSched {
-    // A task with no address space of its own runs in the kernel's, which is
-    // the address space every CPU is already in between two user threads —
-    // `idle_ctx` above names the same `cr3` for the same reason. There is
-    // nothing to take a reference to and nothing to release: the kernel's
-    // page tables outlive every task by construction.
-    let cr3 = match new.address_space.as_ref() {
-        Some(space) => space.lock().cr3(),
-        None => crate::mm::paging::kernel_cr3(),
-    };
+    // A kernel thread's is the kernel address space — the one every CPU is
+    // already in between two user threads, which is why `idle_ctx` above names
+    // the same `cr3`. Nothing is released when the task ends: that `Arc` is a
+    // clone of a leaked one, and the kernel's page tables outlive every task by
+    // construction.
+    let cr3 = new.address_space.lock().cr3();
     let kernel_stack_top = new.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64;
     let ctx = KernelCtx {
         rsp: new.entry_rsp,
@@ -473,11 +472,15 @@ impl<'q> Ticket<'q> {
     /// preemption between reading the task and registering it would leave
     /// `CurrentTask` naming a CPU the thread no longer runs on, and
     /// `begin_commit` asserts on exactly that.
-    pub fn register(queue: &'q KWaitQueue) -> Self {
+    pub fn register(queue: &'q KWaitQueue, cancel: Cancel, class: WaitClass) -> Self {
         crate::preempt::disable();
         let shared = current_shared().expect("prepare_wait: no running thread");
         let current = CurrentTask::new(&shared, current_cpu());
-        Self(queue.prepare_wait(&current))
+        // **The class is the wait's and not the queue's**, because the queue is
+        // this thread's own parking place and has no subject —
+        // `WaitQueue::prepare_wait_as` carries the argument, and the blocked-time
+        // breakdown in `ProcessStats` is what it buys.
+        Self(queue.prepare_wait_as(&current, cancel, class))
     }
 
     /// The condition became true after registering: withdraw, and take the
@@ -508,9 +511,12 @@ impl<'q> Ticket<'q> {
 /// arrives behind the drain and is handled by the next pass, which finds the
 /// task parked.
 ///
-/// Returns once the thread runs again, whatever ended the park — or not at
-/// all, if a retire caught the thread mid-registration and the commit turned
-/// the block into an exit.
+/// **Returns on every path, and one of them changed.** A retire that catches a
+/// thread mid-registration used to turn the block into an exit and never come
+/// back; since the cancellable kill the `Commit::Killed` arm below is
+/// `dispose_none` — the thread keeps its stack, unwinds it, and takes the
+/// cancel from its next `completion::wait`. There is no disposition here that
+/// does not return.
 pub fn pass_block(ticket: Ticket<'_>, deadline: Option<Nanos>) {
     // No `preempt::disable()` of its own: the ticket has held the count raised
     // since the registration published `Committing`, and that guard *is* this
@@ -536,11 +542,14 @@ pub fn pass_block(ticket: Ticket<'_>, deadline: Option<Nanos>) {
             // not switch (spec §8.1). The pass still runs to its disposition,
             // because the quantum may have expired while we were deciding.
             Commit::AlreadyWoken => (pass.dispose_none().finish(), None),
-            // A retire landed while this thread was deciding to park. Parking
-            // is a safe point, so the kill is honoured here (spec §6.3, §7.6)
-            // — the registration is already withdrawn, and this switch does
-            // not return.
-            Commit::Killed => (pass.dispose_exit().finish(), None),
+            // A retire landed while this thread was deciding to park. **The
+            // thread keeps running and unwinds** — it does not exit here, and
+            // that is §7.2: this kernel does not unwind, so a switch that
+            // never returns abandons every guard on this stack. The
+            // registration is already withdrawn by `commit`, the word is back
+            // at `Running`, and the caller's next `completion::wait` reports
+            // the cancel that sends it home.
+            Commit::Killed => (pass.dispose_none().finish(), None),
         }
     });
     charge_cpu_time(now);
@@ -681,7 +690,7 @@ fn drain_irqs() {
         // One wait queue for both backends: an over-wake costs a recheck, and a
         // second queue would have to be chosen by whichever driver bound —
         // which is a fact the parking side does not have.
-        crate::sched::waitqs::wake_all(&crate::sched::waitqs::AUDIO);
+        crate::sched::waitqs::wake_device(&crate::sched::waitqs::AUDIO_WATCH);
         for (watchers, source) in [
             (
                 crate::drivers::virtio_sound::io_uring_watchers(),
@@ -768,16 +777,32 @@ pub fn current_shared() -> Option<Arc<KShared>> {
     try_with_cpu(|cpu| cpu.running().map(|t| t.shared().clone())).flatten()
 }
 
+/// The running task's cross-CPU face, which is where its completion inbox
+/// lives. `None` on a CPU with no task: boot, and the idle loop.
+pub fn current_handle() -> Option<Arc<crate::sched::payload::TaskHandle>> {
+    try_with_cpu(|cpu| cpu.running().map(|t| t.ext().handle.clone())).flatten()
+}
+
+/// Whether the running task has been killed — one relaxed load, no clone.
+///
+/// Read on every return to Ring 3, which is why it takes no `Arc`: a refcount
+/// on that path is the read-modify-write §16.2 prices at hundreds of
+/// microseconds under TCG.
+pub fn current_kill_pending() -> bool {
+    try_with_cpu(|cpu| cpu.running().is_some_and(|t| t.shared().kill_pending())).unwrap_or(false)
+}
+
 pub fn current_cpu() -> CpuId {
     CpuId(percpu::cpu_id())
 }
 
+/// The address space the running task runs in.
+///
+/// **`None` means "no task is running", never "this task has no address
+/// space"** — the second reading stopped existing when the payload's field did
+/// (`KernelPayload::address_space`). Boot and an idle CPU are the two answers.
 pub fn current_address_space() -> Option<PageTables> {
-    try_with_cpu(|cpu| {
-        cpu.running()
-            .and_then(|t| t.ext().address_space.clone())
-    })
-    .flatten()
+    try_with_cpu(|cpu| cpu.running().map(|t| t.ext().address_space.clone())).flatten()
 }
 
 pub fn with_current_acct<R>(
@@ -804,6 +829,29 @@ pub fn ready_len() -> usize {
 
 pub fn parked_len() -> usize {
     try_with_cpu(|cpu| cpu.parked().count()).unwrap_or(0)
+}
+
+/// Killed threads on this CPU that are unwinding or waiting to.
+///
+/// **The dump's fourth container, and it had no caller at all.**
+/// `CpuSched::dying_len`'s own doc says it exists "for a dump that has to say
+/// where every task is", and until this one nothing asked: a dying task's state
+/// word reads `Ready`, so the process-table census counted it, the CPU half
+/// could not see it, and `unheld = claimed − scheduled` reported a task nothing
+/// would ever run — on a healthy machine, for up to a quantum, on every thread
+/// teardown. That verdict is the whole reason the dump exists.
+pub fn dying_len() -> usize {
+    try_with_cpu(|cpu| cpu.dying_len()).unwrap_or(0)
+}
+
+/// Every dying thread on this CPU, in the order the pick will take them.
+pub fn for_each_dying(mut f: impl FnMut(TaskId)) -> bool {
+    try_with_cpu(|cpu| {
+        for task in cpu.dying() {
+            f(task.ext().id);
+        }
+    })
+    .is_some()
 }
 
 /// The thread this CPU has loaded, if any.

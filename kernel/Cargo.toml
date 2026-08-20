@@ -19,6 +19,12 @@ loom = []
 # with either fence removed behaves identically, which is the whole reason the
 # obligation is a model.
 wake-fence-off = []
+# The same arrangement for the completion core: `kernel-loom` turns it on to
+# make `completion::inbox`'s record publication relaxed, and
+# `kernel-loom/tests/inbox.rs` must red when it does. On x86 a build with the
+# release removed behaves identically, which is the whole reason the obligation
+# is a model.
+inbox-release-off = []
 # The same arrangement, five more times, one per `kernel-loom` model that had
 # no control of its own until 2026-08-17. Each is declared here and never
 # enabled here; `kernel-loom` turns exactly one on at a time and the named
@@ -38,6 +44,14 @@ log-commit-release-off = []
 # `src/log/registry.rs`'s pointer store and load go `Relaxed`, and
 # `log_publish` reds.
 shard-publish-relaxed = []
+# The same arrangement for the sleep lock's acquire edge, and it is the first
+# *contended*-acquire model this tree has: `src/sleeplock.rs`'s two loads of
+# `now` — the ones that decide whose turn it is — go `Relaxed`, so the previous
+# holder's writes are unordered against the next holder's reads, and
+# `kernel-loom/tests/sleep_lock.rs` reds. `Lock::lock`'s spin is unreachable by
+# loom (`issues/kernel/lock-spin-unreachable-by-loom.md`); a parking acquire has
+# no unbounded branch, which is what makes this one modellable at all.
+sleeplock-acquire-off = []
 # **Every actuator, and which one is armed comes from the boot parameter.**
 # `kernel/src/actuator.rs` declares all 47 with the claim each rests on; this
 # name is the whole of what a build decides about them. A kernel without it has

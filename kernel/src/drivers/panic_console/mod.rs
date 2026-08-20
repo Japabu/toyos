@@ -68,6 +68,7 @@ use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
 use toyos_ps2::{KeyDecoder, KeyOutcome};
 
 use crate::log;
+use crate::time::{Budget, Cadence, Duration};
 use crate::mm::paging::CachePolicy;
 use crate::mm::{self, DirectMap, align_2m};
 
@@ -109,24 +110,36 @@ const ALERT_WORDS: usize = SNAPSHOT_CAP.div_ceil(64);
 
 /// How long each page stays up. Long enough to photograph, short enough that
 /// a five-page report cycles inside a 15-second video.
-const PAGE_HOLD_NS: u64 = 3_000_000_000;
+///
+/// A [`Cadence`] under §3.4's widened reading: it is the rate the halted
+/// pager advances at, and nothing expires.
+const PAGE_HOLD: Cadence = Cadence::every(
+    Duration::from_secs(3),
+    "a five-page report cycles inside a 15-second video",
+);
 
 /// How long Ctrl+Alt+D's report keeps the panel. Policy, and the two ends of it
 /// are a reader and a desktop: he has to notice the panel changed and raise a
-/// camera, which is several of [`PAGE_HOLD_NS`], while a machine that is still
+/// camera, which is several of [`PAGE_HOLD`], while a machine that is still
 /// scheduling has to get its own screen back without being switched off.
 ///
 /// The two do not fight continuously. A compositor repaints on damage, and the
 /// kernel drawing over the scanout behind its back is not damage in its model,
 /// so each client frame costs one paint and an idle desktop produces about one
 /// of those a second.
-const REPORT_HOLD_NS: u64 = 15_000_000_000;
+const REPORT_HOLD: Budget = Budget::of(
+    Duration::from_secs(15),
+    "the report stops being put back and the desktop keeps its screen",
+);
 
 /// The longest the panel may carry somebody else's paint before the report goes
 /// back on it. It bounds what a photograph taken at the wrong instant loses,
 /// and it is not a repaint rate: a panel nothing else draws on is *checked*
 /// this often and repainted never.
-const REPORT_CHECK_NS: u64 = 20_000_000;
+const REPORT_CHECK: Cadence = Cadence::every(
+    Duration::from_millis(20),
+    "PROBES uncached reads per check, on the CPU that took an interrupt anyway",
+);
 
 /// The bootloader identity+high maps the first 4 GiB, and `paging::init`
 /// re-maps at least that much. A framebuffer below this line is therefore
@@ -337,7 +350,7 @@ static LIVE: RenderedCell = RenderedCell(UnsafeCell::new(Rendered::EMPTY));
 ///
 /// A third buffer and not a third reader of the shards, because the report has
 /// to survive being repainted: [`hold_report`] puts it back on the panel for
-/// [`REPORT_HOLD_NS`], and by then the ring holds whatever the machine has said
+/// [`REPORT_HOLD`], and by then the ring holds whatever the machine has said
 /// since. A screenful is all a repaint can show and `SNAPSHOT_CAP` is five of
 /// those, so nothing here is sized for the paging the report does not do.
 static REPORT: RenderedCell = RenderedCell(UnsafeCell::new(Rendered::EMPTY));
@@ -414,7 +427,11 @@ pub fn screen_claimed_by_userland() {
     // Bounded because a CPU that died holding the latch must not take the
     // display down with it; one paint is the honest ceiling and this is twice
     // the slowest one measured.
-    let deadline = crate::clock::nanos_since_boot() + 2_000_000_000;
+    const CHECKPOINT: Budget = Budget::of(
+        Duration::from_secs(2),
+        "the claimer proceeds and says so, rather than the display going down with a dead CPU",
+    );
+    let deadline = crate::clock::nanos_since_boot() + CHECKPOINT.nanos();
     while PAINTING.load(Ordering::SeqCst) {
         if crate::clock::nanos_since_boot() > deadline {
             log!("panic console: claim waited 2s for a checkpoint that never finished");
@@ -720,7 +737,7 @@ pub fn page_forever() {
     // page he stopped on is the one he is photographing.
     let mut steered = false;
     loop {
-        let step = hold((!steered).then_some(PAGE_HOLD_NS), &mut keys);
+        let step = hold((!steered).then_some(PAGE_HOLD.nanos()), &mut keys);
         steered |= step.is_some();
         let next = match (shown, step.unwrap_or(PageKey::Down)) {
             (None, PageKey::Down) => 0,
@@ -823,7 +840,7 @@ pub fn paint_report(from: u64, to: u64) {
     let into = unsafe { &mut *REPORT.0.get() };
     into.render(from, to);
     HOLD_UNTIL.store(
-        crate::clock::nanos_since_boot().saturating_add(REPORT_HOLD_NS),
+        crate::clock::nanos_since_boot().saturating_add(REPORT_HOLD.nanos()),
         Ordering::Relaxed,
     );
     paint_held_report();
@@ -848,7 +865,7 @@ fn paint_held_report() {
 ///
 /// It repaints on evidence rather than on a timer, and the difference is the
 /// photograph. A machine that has genuinely stopped has nobody to draw over the
-/// report, so this costs it [`PROBES`] uncached reads every [`REPORT_CHECK_NS`]
+/// report, so this costs it [`PROBES`] uncached reads every [`REPORT_CHECK`]
 /// and never a paint — where a timer would blank and redraw the panel every
 /// tick, and a camera that caught the fill would come away with a black frame.
 /// A machine whose compositor is still running pays a paint per overwrite until
@@ -868,7 +885,7 @@ pub fn hold_report() {
         || HOLD_CHECK_AT
             .compare_exchange(
                 due,
-                now.saturating_add(REPORT_CHECK_NS),
+                now.saturating_add(REPORT_CHECK.nanos()),
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             )

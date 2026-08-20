@@ -88,6 +88,13 @@ const BANS: &[Ban] = &[
             ("kernel/src/drivers/gop.rs", 1),
             // dlmalloc owns the page from here on.
             ("kernel/src/mm/alloc.rs", 1),
+            // Both in `cpu.rs`'s test module, and both are the drop bomb
+            // rather than a leak: `Task`'s "the only legal death is
+            // `DeadTask::finalize`" is a scheduler invariant, so a test that
+            // deliberately ends with a live task — which is most of the arms
+            // §7.2 rewrote — may not drop its world, and a registration held
+            // past a park it staged by hand is the same statement.
+            ("toyos-sched/src/cpu.rs", 2),
         ],
     },
     // `toyos_untrusted::Untrusted` has no accessor, no cast, no arithmetic and
@@ -499,8 +506,8 @@ mod tests {
         }
         assert!(
             !occurrences("mem::forget").is_empty(),
-            "the two permitted `mem::forget` call sites are not being found, so a \
-             third would not be either",
+            "the permitted `mem::forget` call sites are not being found, so one \
+             more would not be either",
         );
     }
 }

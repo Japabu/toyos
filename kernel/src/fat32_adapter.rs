@@ -836,7 +836,7 @@ impl FileSystem for FatFs {
 /// same stick and the same image, which is a race and not a defect in anything
 /// downstream of here.
 ///
-/// The asymmetry is the same one `xhci::EMPTY_BUS_NS` is written around, and it
+/// The asymmetry is the same one `xhci::EMPTY_BUS` is written around, and it
 /// is what keeps this free: a machine whose boot volume has already been
 /// resolved — every QEMU boot, every machine that boots off NVMe, and the T14 on
 /// a good boot — leaves after one pass, because `gpt::boot_volume()` answers.
@@ -850,7 +850,7 @@ impl FileSystem for FatFs {
 /// silently — which is what a bare `continue` did, three times over — spends the
 /// one chance anybody has to find out why.
 pub fn probe_boot_disks() {
-    let deadline = crate::clock::nanos_since_boot() + xhci::PORT_SETTLE_CEILING_NS;
+    let deadline = crate::clock::nanos_since_boot() + xhci::PORT_SETTLE_CEILING.nanos();
     let mut probed = 0;
     loop {
         probed = probe_announced(probed);
@@ -867,14 +867,14 @@ pub fn probe_boot_disks() {
             log!(
                 "usb-storage: {probed} disk(s) on this machine and none carries the boot \
                  partition after {} ms of looking — this boot has no /boot and no /log",
-                xhci::PORT_SETTLE_CEILING_NS / 1_000_000
+                xhci::PORT_SETTLE_CEILING.duration().millis()
             );
             return;
         }
         // Paced rather than spun, at the cadence the connect settle already
         // reads port registers on: each pass is one MMIO read per port under
         // the controller lock, and the thing being waited for is physical.
-        let next = crate::clock::nanos_since_boot() + xhci::PORT_POLL_NS;
+        let next = crate::clock::nanos_since_boot() + xhci::PORT_POLL.nanos();
         while crate::clock::nanos_since_boot() < next {
             core::hint::spin_loop();
         }

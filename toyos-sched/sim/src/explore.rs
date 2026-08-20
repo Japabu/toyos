@@ -53,6 +53,12 @@ pub struct Outcome {
     /// clock is a backstop or a coin flip.
     pub retire_latency: u64,
     pub retire_bound: u64,
+    /// The longest one CPU's unwind gate held every other CPU still — see
+    /// [`crate::vm::Vm::unwind_gate_ns`]. Reported rather than only asserted,
+    /// because it is a statement about the *model's* fidelity and not about the
+    /// scheduler: a gate wider than one chunk means the explorer was not free
+    /// to interleave over the teardown window I14 is measured across.
+    pub unwind_gate_ns: u64,
     /// Invariant I5's measurement: the widest service spread seen over one
     /// contention window, and the bound in force when it was seen. A number
     /// rather than a verdict, because spec §11 Stage 9 compares a per-CPU
@@ -217,6 +223,7 @@ fn outcome_of(scenario: &'static str, vm: &Vm<'_>, choices: &ChoiceStream) -> Ou
         killed_at_park: vm.killed_at_park,
         retire_latency: vm.retire_latency,
         retire_bound: vm.retire_bound,
+        unwind_gate_ns: vm.unwind_gate_ns,
         fair_spread: vm.fair_spread,
         fair_bound: vm.fair_bound,
         fair_over_bound: vm.fair_over_bound,

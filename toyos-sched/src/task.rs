@@ -157,8 +157,10 @@ const GEN_BITS: u32 = 32;
 const GEN_MASK: u64 = (1 << GEN_BITS) - 1;
 
 /// Sticky: set by the retirer before it posts, never cleared. Any CPU that
-/// adopts the task converts it to a dead task on arrival, which is what makes
-/// the retire chase terminate (spec §7.6).
+/// adopts the task *dispatches* it on arrival — into its own dying list — and
+/// the task dies by its own `die` at the first safe point its unwind reaches,
+/// which is what makes the retire chase terminate (spec §7.6, and the
+/// cancellable kill for why it is a dispatch and no longer a conversion).
 const KILL: u64 = 1 << 62;
 /// Sticky: exactly one retirer may post the retire node (spec §7.6).
 const RETIRE_QUEUED: u64 = 1 << 63;
@@ -225,7 +227,10 @@ fn legal(from: TaskState, to: TaskState) -> bool {
         // Dispositions of the running task; the home CPU never changes here.
         (Running(a), Ready(b)) | (Running(a), Committing(b, _)) => a == b,
         (Running(_), Dead) => true,
-        // Pick, migrate, reap.
+        // Pick and migrate. `Ready → Dead` is not a reap any more: since the
+        // cancellable kill nothing converts a ready task to a dead one, and
+        // the edge survives for the *panic* path, where `schedule_no_return`
+        // buries a context that cannot be resumed.
         (Ready(a), Running(b)) => a == b,
         (Ready(_), InTransit(_)) | (Ready(_), Dead) => true,
         // The two-phase wait handshake.
@@ -524,13 +529,17 @@ impl RtState {
     /// the lend: the task falls out of the RT band, behind exactly the
     /// normal-priority work the lend existed to jump, and nothing re-grants it.
     ///
-    /// Re-arming cannot compound into an unbounded RT hold, because both ways
-    /// out of `Running` end the lend. A boosted task is RT, so `preempt_if_due`
-    /// only preempts it at its quantum end, and that quantum starts at the same
-    /// dispatch this arms from — so `now >= until` holds there and
-    /// [`RtState::expire`] clears it; a `park` clears it whatever the clock
-    /// says. A second arm therefore needs a *new* lend, and one lend buys at
-    /// most one quantum at the borrowed priority (spec §8.5, invariant I9).
+    /// Re-arming cannot compound into an unbounded RT hold, because **all
+    /// three** ways out of `Running` end the lend. A boosted task is RT, so
+    /// `preempt_if_due` only preempts it at its quantum end, and that quantum
+    /// starts at the same dispatch this arms from — so `now >= until` holds
+    /// there and [`RtState::expire`] clears it; a `park` clears it whatever the
+    /// clock says; and the third, which the cancellable kill added and this
+    /// sentence once predated, is the dying list — [`ReadyTask::end_lend`] and
+    /// [`RunningTask::end_lend`] are called on every route into it, and their
+    /// docs carry why. A second arm therefore needs a *new* lend, and one lend
+    /// buys at most one quantum at the borrowed priority (spec §8.5, invariant
+    /// I9).
     fn arm(&mut self, now: Nanos) {
         if let Some(until) = self.inherited {
             if now >= until {
@@ -680,6 +689,29 @@ macro_rules! linear_state {
                 self.0.rt()
             }
 
+            /// Whether this task competes **in the real-time band** right now,
+            /// which is not the same question as [`RtState::is_rt`].
+            ///
+            /// A killed task unwinding its own stack is normal-band work, and
+            /// that is a statement about what it is *doing*, not about a right
+            /// it holds. `RtState::release`
+            /// ends an inherited lend and deliberately leaves the permanent
+            /// flag alone, so a thread that called `SYS_RT_ENTER` and was then
+            /// killed still answers `is_rt()`. Asking `is_rt()` where the band
+            /// is meant let that corpse hold its CPU for a full quantum against
+            /// a ready real-time sibling, and made `SchedPass::pick` and
+            /// `SchedPass::preempt_if_due` disagree about one task: the pick
+            /// gates the dying list on `rq.has_rt()` whatever the corpse is,
+            /// while the preemption exempted it.
+            ///
+            /// It is not a right revoked, either: the thread is dying, its
+            /// unwind is not real-time work, and the bounded deferral
+            /// ([`crate::cpu::DYING_AGE_NS`]) is what keeps that from starving
+            /// it. `a_killed_rt_thread_unwinds_in_the_normal_band` is the gate.
+            pub fn serves_rt_band(&self) -> bool {
+                self.0.rt().is_rt() && !self.0.shared().kill_pending()
+            }
+
             pub fn ext(&self) -> &X {
                 self.0.ext()
             }
@@ -746,25 +778,22 @@ impl<X: SchedPayload> TaskBuilder<X> {
 }
 
 impl<X: SchedPayload> TransitTask<X> {
-    /// Arrival at the destination CPU. A task killed while in flight is
-    /// converted here — which is exactly why the retire chase terminates
-    /// (spec §7.6): whoever ends up owning the task reaps it.
-    pub(crate) fn adopt(self, cpu: CpuId, now: Nanos) -> Result<ReadyTask<X>, DeadTask<X>> {
+    /// Arrival at the destination CPU.
+    ///
+    /// **A task killed in flight is adopted like any other**, where it used to
+    /// be converted straight to a corpse. The retire chase still terminates,
+    /// and its argument is sharper for the change: whoever ends up owning the
+    /// task *dispatches* it, and it dies by its own `die` once its kernel
+    /// stack has unwound. Discarding the value here discarded that stack.
+    pub(crate) fn adopt(self, cpu: CpuId, now: Nanos) -> ReadyTask<X> {
         let mut task = self.0;
         task.0.since = now;
-        if task.0.shared.kill_pending() {
-            assert!(
-                task.0.shared.transition(TaskState::InTransit(cpu), TaskState::Dead),
-                "adopt of a task that is not in transit to this CPU",
-            );
-            return Err(DeadTask(task));
-        }
         assert!(
             task.0.shared.transition(TaskState::InTransit(cpu), TaskState::Ready(cpu)),
             "adopt of a task that is not in transit to this CPU: {:?}",
             task.0.shared.state(),
         );
-        Ok(ReadyTask(task))
+        ReadyTask(task)
     }
 
     pub(crate) fn adopt_node(&self) -> &MailboxNode<Msg<X>> {
@@ -773,10 +802,34 @@ impl<X: SchedPayload> TransitTask<X> {
 }
 
 impl<X: SchedPayload> ReadyTask<X> {
+    /// Entering the dying list: a borrowed RT window ends here, unconditionally
+    /// and exactly as a park ends one.
+    ///
+    /// **Priority inheritance is about the producer's work, and a killed
+    /// consumer will never do it** (spec §8.5): the lend was granted so this
+    /// task would run *the thing the producer is waiting for* promptly, and
+    /// what it will do instead is unwind and die. Spending the window on that
+    /// puts a corpse in the RT band ahead of real real-time work, off a lend
+    /// nobody can benefit from.
+    ///
+    /// It is also what keeps [`RtState::arm`]'s argument true. The cancellable
+    /// kill added a third way out of `Running` — the dying list — and `arm`'s
+    /// enumeration was written when there were two. It names all three now.
+    /// Without this the re-arm at the next dispatch hands the corpse a fresh
+    /// window for its whole unwind, and invariant I9 sees one lend buy more
+    /// than one quantum. It does: the sim found it at 12,500,000 ns against a
+    /// 12,000,000 ns bound as soon as `Vm::UNWIND_NS` made an unwind cost
+    /// anything.
+    pub(crate) fn end_lend(&mut self) {
+        self.0 .0.rt.release();
+    }
+
     /// Pick. The kill bit is *not* asserted absent here: it is set by a remote
-    /// CPU at any instant, so an assert would be a race, not a check. The
-    /// pass reaps a killed task instead of dispatching it (`CpuSched::pick`),
-    /// which is the same guarantee without the false positive.
+    /// CPU at any instant, so an assert would be a race, not a check — and
+    /// since §7.2 there is nothing to assert, because a killed task **is**
+    /// dispatched: it runs its own unwind on its own stack and dies by its own
+    /// `die`. What decides *when* is `CpuSched::pick`, which takes the dying
+    /// list ahead of the fair band and behind the RT one.
     pub(crate) fn dispatch(self, cpu: CpuId, now: Nanos) -> RunningTask<X> {
         let mut task = self.0;
         task.charge_residency(now, Residency::Ready);
@@ -806,18 +859,6 @@ impl<X: SchedPayload> ReadyTask<X> {
         TransitTask(task)
     }
 
-    /// The kill bit was observed at pick or a `Retire` message arrived.
-    pub(crate) fn reap(self, cpu: CpuId, now: Nanos) -> DeadTask<X> {
-        let mut task = self.0;
-        task.charge_residency(now, Residency::Ready);
-        assert!(
-            task.0.shared.transition(TaskState::Ready(cpu), TaskState::Dead),
-            "reap of a task that is not ready on this CPU: {:?}",
-            task.0.shared.state(),
-        );
-        DeadTask(task)
-    }
-
     pub(crate) fn is_rt(&self) -> bool {
         self.0.rt().is_rt()
     }
@@ -825,6 +866,14 @@ impl<X: SchedPayload> ReadyTask<X> {
 }
 
 impl<X: SchedPayload> RunningTask<X> {
+    /// A retire found this task running: it will unwind and die on this stack,
+    /// so its borrowed RT window ends now. [`ReadyTask::end_lend`] carries the
+    /// argument; this is the arm where the victim never passes through the
+    /// dying list at all, because nothing takes the CPU away from it.
+    pub(crate) fn end_lend(&mut self) {
+        self.0 .0.rt.release();
+    }
+
     /// Quantum expiry or an explicit yield.
     pub(crate) fn preempt(self, cpu: CpuId, now: Nanos) -> ReadyTask<X> {
         let mut task = self.0;
@@ -880,6 +929,13 @@ impl<X: SchedPayload> RunningTask<X> {
     }
 
     /// Exit, or a kill honoured at a safe point.
+    ///
+    /// **The only death there is**, since the cancellable kill:
+    /// `ReadyTask::reap` and `BlockedTask::reap` are gone with the arms that
+    /// called them, so a task can only become a corpse on the CPU it is
+    /// running on, by its own hand, with its kernel stack already unwound.
+    /// Everything a reap-in-place used to discard is now released by the
+    /// ordinary return path.
     pub(crate) fn die(self, cpu: CpuId, now: Nanos) -> DeadTask<X> {
         let mut task = self.0;
         task.charge_residency(now, Residency::Running);
@@ -941,18 +997,6 @@ impl<X: SchedPayload> BlockedTask<X> {
         ReadyTask(task)
     }
 
-    /// `Msg::Retire` found the task parked.
-    pub(crate) fn reap(self, cpu: CpuId, class: WaitClass, now: Nanos) -> DeadTask<X> {
-        let mut task = self.0;
-        task.charge_residency(now, Residency::Blocked(class));
-        let from = task.0.shared.state();
-        assert!(
-            matches!(from, TaskState::Blocked(c) | TaskState::WakeQueued(c) if c == cpu),
-            "reap of a task that is not parked on this CPU: {from:?}",
-        );
-        assert!(task.0.shared.transition(from, TaskState::Dead));
-        DeadTask(task)
-    }
 }
 
 impl<X: SchedPayload> DeadTask<X> {

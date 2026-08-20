@@ -10,6 +10,7 @@
 use core::ptr::{copy_nonoverlapping, write_bytes};
 
 use crate::log;
+use crate::time::{Budget, Duration};
 use super::super::device::Endpoint;
 use super::{Owed, Restart};
 use super::super::{with_disk, Disk, StorageGeometry, Trb, TrbRing, XhciController, PAGE};
@@ -31,7 +32,10 @@ const HOST_BLOCK: u32 = 4096;
 /// tries, and one that answers nothing at all has already spent the transfer
 /// timeout and must not be given three more of them. Boot time is what is
 /// being protected, and boot time is what this measures.
-const READY_BUDGET_NS: u64 = 500_000_000;
+const READY_BUDGET: Budget = Budget::of(
+    Duration::from_millis(500),
+    "the device is reported as not becoming ready and the boot goes on without it",
+);
 
 /// How many times one SCSI command is issued when the transport breaks under
 /// it.
@@ -1058,7 +1062,7 @@ fn bring_up(ctrl: &mut XhciController, dev: &mut MscDevice) -> bool {
     // that answers NOT READY is expected rather than an error, so it must not
     // produce a log line per attempt, and the sense fetch that reports it is
     // also what clears the condition on a stick still spinning up.
-    let give_up = crate::clock::nanos_since_boot() + READY_BUDGET_NS;
+    let give_up = crate::clock::nanos_since_boot() + READY_BUDGET.nanos();
     let mut sense = (0u8, 0u8, 0u8);
     let mut ready = false;
     loop {

@@ -33,6 +33,16 @@
 //! closed was therefore neither answered nor ended: it went quiet. A submission
 //! does have an error channel — the CQE — and these arms are what say so, one
 //! per kind, plus the direction in which an object has no readiness at all.
+//!
+//! **`spawn-stale` is the one arm that is not a call refusing its own
+//! argument.** A slot map is a parent deciding what its child is born holding,
+//! and the kernel skipped a pair it could not resolve — so the child started
+//! without a capability its parent had named and could not tell that from
+//! having asked for nothing, while the parent was told its spawn happened as
+//! asked. That is silent degradation of a capability, which is the one thing
+//! this policy exists to remove, and the owner ruled it a kill on 2026-08-19.
+//! The rule keeps exactly one exception and this is not it
+//! (`kernel/src/object/handle.rs`).
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -42,7 +52,7 @@ use toyos::census::Census;
 use toyos::poller::{Poller, IORING_POLL_IN, IORING_POLL_OUT};
 use toyos::AsHandle;
 use toyos_abi::handle::Rights;
-use toyos_abi::syscall::{self, SyscallError};
+use toyos_abi::syscall::{self, MmapFlags, MmapProt, SpawnArgs, SyscallError};
 use toyos_abi::RawHandle;
 
 const SELF_PATH: &str = "/bin/test_rs_handle_kill_policy";
@@ -70,6 +80,10 @@ const UNHELD_SLOT: u32 = 3000;
 /// enough that one leaked object per round is a number no drain lag can hide.
 const CHURN_ROUNDS: usize = 16;
 
+/// The most 10 ms census samples `settled_census` takes before answering with
+/// what it last saw. `fd_lifetime`'s bound, for the same deferred queues.
+const SETTLE_SAMPLES: usize = 100;
+
 /// The three kinds that end the caller. Each is a role this binary runs as, and
 /// the description is what the kernel is being asked to refuse.
 const FATAL: &[(&str, &str)] = &[
@@ -89,6 +103,13 @@ const FATAL: &[(&str, &str)] = &[
     // "this machine has no such device" were one word — and the second is a
     // fact a driver acts on.
     ("device-reg-bad-handle", "a device register read on a slot this process never held"),
+    // The fourth, and the one that is not a call refusing its own argument: a
+    // spawn's slot map is a parent deciding what its child is born holding.
+    // The kernel skipped a pair it could not resolve, so the child started
+    // without a capability its parent had named and could not tell that from
+    // having asked for nothing — and the parent was told its spawn happened as
+    // asked. Ruled a kill on 2026-08-19 (`object::HandleError`).
+    ("spawn-stale", "a spawn's slot map naming a handle this process closed"),
 ];
 
 fn main() {
@@ -243,6 +264,16 @@ fn a_full_table_is_a_word() {
 /// lag — it accumulates — so no *kind* may be higher after the second round of
 /// rounds than after the first. Per kind and not in total, because a total
 /// hides a leak of one kind behind churn in another.
+///
+/// And each sample is a *settled* census, because the two-sample design alone
+/// still loses to the lag it describes: on a loaded CI shard the last corpse's
+/// own `Process` object outlived the parent's `wait` into the second census —
+/// `[("Process", 6, 7)]`, twice on one shard, green alone both times (PR #141
+/// run 32307331537, the same deferral `fd_lifetime` measured decaying across
+/// eight back-to-back reads). The kernel half is
+/// `issues/kernel/deferred-release-outlives-its-syscall.md`; here it is a lag
+/// and not a leak exactly when settling converges, which is what
+/// `settled_census` requires before it answers.
 fn the_kills_release_what_they_held() {
     let after_first = churn(CHURN_ROUNDS);
     let after_second = churn(CHURN_ROUNDS);
@@ -266,7 +297,26 @@ fn churn(rounds: usize) -> Census {
             .expect("spawn a holder");
         assert_eq!(status.code(), Some(HANDLE_FAULT), "a holder did not die on its bad handle");
     }
-    Census::now()
+    settled_census()
+}
+
+/// The census once the deferred queues have finished giving back what the
+/// kills released. `fd_lifetime`'s `settled_free_bytes`, for object counts:
+/// sample until two readings ten milliseconds apart agree, which is the
+/// machine saying it has finished. **A liveness bound and not a margin** — a
+/// kernel that leaks holds a stable, elevated census, is quiescent on the
+/// first pair, and the grown-kinds assertion above reds exactly as before.
+fn settled_census() -> Census {
+    let mut last = Census::now();
+    for _ in 0..SETTLE_SAMPLES {
+        std::thread::sleep(Duration::from_millis(10));
+        let next = Census::now();
+        if next == last {
+            return next;
+        }
+        last = next;
+    }
+    last
 }
 
 /// Fill every slot and require the refusal to be a word. Exits 0, which is the
@@ -286,6 +336,52 @@ fn fill_the_table() -> ! {
     let line = format!("ResourceExhausted at slot {slot}, and the process is still here\n");
     syscall::write(RawHandle(1), line.as_bytes()).expect("say so through the filled slot");
     syscall::exit(0)
+}
+
+/// `SYS_SPAWN` with `[[3, handle]]` as its slot map.
+///
+/// **The program is one no image carries, and that is deliberate.** The slot
+/// map is read before the path is resolved, so a kernel that holds the ruling
+/// never looks at it — and a kernel that put the skip back is refused for the
+/// path instead, which reaches the caller's `panic!` with the wrong exit code
+/// rather than starting a second copy of this test.
+///
+/// One mmap region for both blobs: `user_bytes` reads a physically contiguous
+/// window, so a stack buffer straddling a page would be refused on
+/// `BadAddress` without ever reaching `build_child_handles`.
+fn spawn_naming(handle: RawHandle) -> Result<RawHandle, SyscallError> {
+    const REGION: usize = 4096;
+    const SLOT_MAP_OFF: usize = 2048;
+    const ARGV: &str = "/bin/no-such-program\0";
+
+    let region = unsafe {
+        syscall::mmap(
+            core::ptr::null_mut(),
+            REGION,
+            MmapProt::READ | MmapProt::WRITE,
+            MmapFlags::ANONYMOUS | MmapFlags::PRIVATE,
+        )
+    };
+    assert!(!region.is_null(), "mmap a region for the spawn blobs");
+    let pair = [3u32.to_ne_bytes(), handle.0.to_ne_bytes()].concat();
+    unsafe {
+        core::ptr::copy_nonoverlapping(ARGV.as_ptr(), region, ARGV.len());
+        core::ptr::copy_nonoverlapping(pair.as_ptr(), region.add(SLOT_MAP_OFF), pair.len());
+    }
+    unsafe {
+        syscall::spawn(&SpawnArgs {
+            argv_ptr: region as u64,
+            argv_len: ARGV.len() as u64,
+            slot_map_ptr: region as u64 + SLOT_MAP_OFF as u64,
+            slot_map_count: 1,
+            env_ptr: 0,
+            env_len: 0,
+            endow_ptr: 0,
+            endow_count: 0,
+            labels_ptr: 0,
+            labels_len: 0,
+        })
+    }
 }
 
 fn fatal_role(role: &str) -> ! {
@@ -351,6 +447,17 @@ fn fatal_role(role: &str) -> ! {
                 toyos_abi::syscall::RegWidth::U32,
             );
             panic!("a device register read on a slot this process never held answered {read:?}");
+        }
+        // A parent naming a handle it does not hold in a spawn's slot map. The
+        // pipe is closed before the spawn, which is the shape a real parent
+        // reaches — a program that closed a stdio slot and then spawned a
+        // child asking to inherit it.
+        "spawn-stale" => {
+            let (read, _write) = toyos::pipe_pair().expect("a pipe to close");
+            let closed = read.as_handle();
+            drop(read);
+            let started = spawn_naming(closed);
+            panic!("a spawn naming a handle this process closed answered {started:?}");
         }
         // The kill is the process's, not the thread's: a handle fault raised on
         // any thread ends every thread. Asserted from the exit code, which the

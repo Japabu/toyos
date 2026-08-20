@@ -1,10 +1,14 @@
 use alloc::vec::Vec;
 use super::entry::{restore_user_state, ring3_naked_asm, save_user_state, Ring3Entry};
-use super::{cpu, gdt};
+use super::{cpu, percpu};
 use crate::drivers::acpi;
 use crate::mm::paging::{CachePolicy, Occupancy};
 use crate::user_ptr::{SyscallContext, UserBytes, UserBytesMut};
+use toyos_sched::task::WaitClass;
+
+use crate::completion;
 use crate::object::{ops, port, KObjectRef};
+use crate::time::{Cadence, Deadline, Duration};
 use crate::{device, log, pipe, process, vfs};
 use crate::{DirectMap, UserAddr};
 
@@ -164,7 +168,7 @@ pub fn init() {
     let efer = cpu::rdmsr(MSR_EFER);
     cpu::wrmsr(MSR_EFER, efer | 1);
 
-    let star = ((gdt::STAR_SYSRET_BASE as u64) << 48) | ((gdt::KERNEL_CS as u64) << 32);
+    let star = ((percpu::STAR_SYSRET_BASE as u64) << 48) | ((percpu::KERNEL_CS as u64) << 32);
     cpu::wrmsr(MSR_STAR, star);
     // `LSTAR` is an IDT slot by another name: the one thing `syscall` can reach.
     cpu::wrmsr(MSR_LSTAR, Ring3Entry::new(syscall_entry).addr());
@@ -236,6 +240,17 @@ extern "sysv64" fn syscall_entry() {
 
 extern "sysv64" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u64) -> u64 {
     syscall_dispatch(num, a1, a2, a3, a4)
+}
+
+/// What a syscall answers when its wait was cancelled.
+///
+/// **Nothing ever reads it.** The thread has been killed, so the return path
+/// it is on ends at `kernel_exit_to_user_check`, which sees the kill bit and
+/// exits instead of returning to Ring 3 (§7.2). The word exists because the
+/// unwind has to carry *something* through the `u64` every syscall answers in,
+/// and `Interrupted` is what it would mean if anything could read it.
+fn cancelled() -> u64 {
+    SyscallError::Gone.to_u64()
 }
 
 fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -933,7 +948,21 @@ fn sys_write(h: RawHandle, buf: &UserBytes) -> u64 {
                 return n;
             }
             Err(WriteBlock::Pipe(id)) => match pipe::writers_queue(id) {
-                Some(q) => crate::scheduler::wait_until(&q, 0, || pipe::has_space(id)),
+                Some(end) => {
+                    let parkable = crate::scheduler::Parkable::of_current();
+                    if completion::wait_until(
+                        &parkable,
+                        completion::Subject::of(&end.watch),
+                        completion::Token::new(0),
+                        WaitClass::Pipe,
+                        Deadline::never(),
+                        || pipe::has_space(id),
+                    )
+                    .is_err()
+                    {
+                        return cancelled();
+                    }
+                }
                 None => return SyscallError::NotFound.to_u64(),
             },
             Err(WriteBlock::Refused(word)) => return word,
@@ -956,10 +985,12 @@ enum WriteBlock {
 /// carries what its own re-check needs — the queue is registered on *before*
 /// the condition is re-read, which is what closes the check-then-block window.
 enum ReadBlock {
-    Pipe(alloc::sync::Arc<crate::sched::payload::KWaitQueue>, pipe::PipeId),
+    Pipe(pipe::PipeEnd, pipe::PipeId),
     VirtioSound,
     Hda,
-    Keyboard(u64),
+    /// A console read re-polls, because nothing posts a serial key; a claimed
+    /// keyboard is woken by its own IRQ and waits with [`Deadline::never`].
+    Keyboard(Deadline),
     /// Nothing to wait for: the answer is this word.
     Refused(u64),
     /// Carried out of the process's lock rather than answered inside it:
@@ -1046,7 +1077,7 @@ fn sys_device_reg(handle: RawHandle, offset: u64, width: u64, value: Option<u64>
 /// and what their holders already build around.
 fn read_block_device(claim: &crate::object::device::DeviceClaim) -> ReadBlock {
     match claim.class() {
-        device::DeviceType::Keyboard => ReadBlock::Keyboard(0),
+        device::DeviceType::Keyboard => ReadBlock::Keyboard(Deadline::never()),
         device::DeviceType::VirtioSound if claim.info_read() => ReadBlock::VirtioSound,
         device::DeviceType::HdaAudio if claim.info_read() => ReadBlock::Hda,
         _ => ReadBlock::Refused(SyscallError::NotFound.to_u64()),
@@ -1057,10 +1088,22 @@ fn read_block(object: &KObjectRef) -> ReadBlock {
     match object {
         KObjectRef::Device(_) => unreachable!("a device claim blocks via `read_block_device`"),
         KObjectRef::Console(_) => {
-            ReadBlock::Keyboard(crate::clock::nanos_since_boot() + 10_000_000)
+            /// **The only reason a serial-console read ever returns.**
+            /// The park is on `waitqs::KEYBOARD`, whose only waker is the
+            /// i8042/USB keyboard — a *different* device from the one this
+            /// read is about. The 16550's IER is written to zero and
+            /// `virtio_console` has no handler at all, so nothing posts a
+            /// serial key and what ends this wait is the re-poll and nothing
+            /// else. It is the [`Cadence`] of a poll on
+            /// `serial::has_data`, which C10 makes explicit.
+            const CONSOLE_REPOLL: Cadence = Cadence::every(
+                Duration::from_millis(10),
+                "nothing posts a serial-console key, so this rate is the whole of the wake",
+            );
+            ReadBlock::Keyboard(Deadline::at(crate::clock::now() + CONSOLE_REPOLL.duration()))
         }
         _ => match ops::pipe_id_read(object).and_then(|id| {
-            pipe::readers_queue(id).map(|q| ReadBlock::Pipe(q, id))
+            pipe::readers_queue(id).map(|end| ReadBlock::Pipe(end, id))
         }) {
             Some(block) => block,
             None => ReadBlock::Refused(SyscallError::NotFound.to_u64()),
@@ -1102,24 +1145,66 @@ fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
                 if let Some(id) = pipe_id { process::wake_pipe_writers(id); }
                 return n;
             }
-            Err(ReadBlock::Pipe(queue, id)) => {
-                crate::scheduler::wait_until(&queue, 0, || pipe::has_data(id))
+            Err(ReadBlock::Pipe(end, id)) => {
+                let parkable = crate::scheduler::Parkable::of_current();
+                if completion::wait_until(
+                    &parkable,
+                    completion::Subject::of(&end.watch),
+                    completion::Token::new(0),
+                    WaitClass::Pipe,
+                    Deadline::never(),
+                    || pipe::has_data(id),
+                )
+                .is_err()
+                {
+                    return cancelled();
+                }
             }
-            Err(ReadBlock::VirtioSound) => crate::scheduler::wait_until(
-                &crate::sched::waitqs::AUDIO,
-                0,
-                crate::drivers::virtio_sound::has_pending,
-            ),
-            Err(ReadBlock::Hda) => crate::scheduler::wait_until(
-                &crate::sched::waitqs::AUDIO,
-                0,
-                crate::drivers::hda::has_pending,
-            ),
-            Err(ReadBlock::Keyboard(deadline)) => crate::scheduler::wait_until(
-                &crate::sched::waitqs::KEYBOARD,
-                deadline,
-                crate::keyboard::has_data,
-            ),
+            Err(ReadBlock::VirtioSound) => {
+                let parkable = crate::scheduler::Parkable::of_current();
+                if completion::wait_until(
+                    &parkable,
+                    completion::Subject::of(&crate::sched::waitqs::AUDIO_WATCH),
+                    completion::Token::new(0),
+                    WaitClass::Io,
+                    Deadline::never(),
+                    crate::drivers::virtio_sound::has_pending,
+                )
+                .is_err()
+                {
+                    return cancelled();
+                }
+            }
+            Err(ReadBlock::Hda) => {
+                let parkable = crate::scheduler::Parkable::of_current();
+                if completion::wait_until(
+                    &parkable,
+                    completion::Subject::of(&crate::sched::waitqs::AUDIO_WATCH),
+                    completion::Token::new(0),
+                    WaitClass::Io,
+                    Deadline::never(),
+                    crate::drivers::hda::has_pending,
+                )
+                .is_err()
+                {
+                    return cancelled();
+                }
+            }
+            Err(ReadBlock::Keyboard(deadline)) => {
+                let parkable = crate::scheduler::Parkable::of_current();
+                if completion::wait_until(
+                    &parkable,
+                    completion::Subject::of(&crate::sched::waitqs::KEYBOARD_WATCH),
+                    completion::Token::new(0),
+                    WaitClass::Io,
+                    deadline,
+                    crate::keyboard::has_data,
+                )
+                .is_err()
+                {
+                    return cancelled();
+                }
+            }
             Err(ReadBlock::Refused(word)) => return word,
             Err(ReadBlock::BadHandle(e)) => return e.refuse(),
         }
@@ -1470,8 +1555,19 @@ fn sys_process_wait(h: RawHandle, flags: u64) -> u64 {
         Err(e) => return e.refuse(),
     };
     if flags & WNOHANG == 0 {
-        let queue = object.waiters();
-        crate::scheduler::wait_until(&queue, 0, || object.finished());
+        let parkable = crate::scheduler::Parkable::of_current();
+        if completion::wait_until(
+            &parkable,
+            completion::Subject::of(object.watch()),
+            completion::Token::new(0),
+            WaitClass::Other,
+            Deadline::never(),
+            || object.finished(),
+        )
+        .is_err()
+        {
+            return cancelled();
+        }
     }
     match object.exit_code() {
         // Zero-extended: an exit code is an `i32`, and sign-extending -1 would
@@ -1813,7 +1909,10 @@ fn connect_through(connector: &port::Connector) -> u64 {
         };
     }
     let port = connector.port();
-    crate::sched::waitqs::wake_all(&port.waiters());
+    completion::post(
+        completion::Subject::of(port.watch()),
+        completion::Outcome::Ready,
+    );
     let watchers = port.watchers();
     if !watchers.is_empty() {
         crate::io_uring::complete_pending_for_event(
@@ -1905,10 +2004,19 @@ fn sys_accept(h: RawHandle) -> u64 {
         if acceptor.closed() {
             return SyscallError::Gone.to_u64();
         }
-        let queue = acceptor.waiters();
-        crate::scheduler::wait_until(&queue, 0, || {
-            acceptor.has_pending() || acceptor.closed()
-        });
+        let parkable = crate::scheduler::Parkable::of_current();
+        if completion::wait_until(
+            &parkable,
+            completion::Subject::of(acceptor.watch()),
+            completion::Token::new(0),
+            WaitClass::Ipc,
+            Deadline::never(),
+            || acceptor.has_pending() || acceptor.closed(),
+        )
+        .is_err()
+        {
+            return cancelled();
+        }
     }
 }
 
@@ -2265,22 +2373,43 @@ fn sys_thread_spawn(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> u6
         .map_or(SyscallError::ResourceExhausted.to_u64(), |t| t.raw() as u64)
 }
 
+/// Wait for a thread of this process to die.
+///
+/// **It arms on the thread it names**, which is what replaced the parking lot:
+/// the target's own `TaskHandle` carries the watch, `thread_exit` posts to it,
+/// and the `ThreadSched` held across the park is what keeps that watch alive.
+/// A `wake_task(TaskId)` to the process's main thread — a wake by name, into a
+/// hashed bucket, re-checked by whoever happened to be woken — is gone with it.
 fn sys_thread_join(tid: u64) -> u64 {
     let tid = process::Tid::from_raw(tid as u32);
     let caller = process::current_process();
-    let queue = crate::scheduler::park_lot();
+    // Resolved once. `None` is a thread that never existed or is already
+    // collected, and the predicate below answers both.
+    let target = process::thread_sched(caller, tid);
+    let parkable = crate::scheduler::Parkable::of_current();
     loop {
-        let ticket = crate::scheduler::prepare_wait(queue);
         match process::wait_thread_zombie(tid, caller) {
-            Ok(Some(_)) => {
-                ticket.cancel();
-                return 0;
-            }
-            Ok(None) => crate::scheduler::block_on(ticket, 0),
-            Err(()) => {
-                ticket.cancel();
-                return SyscallError::NotFound.to_u64();
-            }
+            Ok(Some(_)) => return 0,
+            Ok(None) => {}
+            Err(()) => return SyscallError::NotFound.to_u64(),
+        }
+        let Some(sched) = target.as_ref() else {
+            // Nothing to arm on and the zombie is not there: the thread is
+            // gone in a way `wait_thread_zombie` will keep answering the same
+            // way, so waiting cannot change it.
+            return SyscallError::NotFound.to_u64();
+        };
+        if completion::wait_until(
+            &parkable,
+            completion::Subject::of(sched.handle.watch()),
+            completion::Token::new(tid.raw() as u64),
+            WaitClass::Other,
+            Deadline::never(),
+            || matches!(process::wait_thread_zombie(tid, caller), Ok(Some(_)) | Err(())),
+        )
+        .is_err()
+        {
+            return cancelled();
         }
     }
 }
@@ -2418,12 +2547,26 @@ fn sys_sysinfo(out: &mut UserBytesMut) -> u64 {
 }
 
 fn sys_nanosleep(nanos: u64) -> u64 {
-    let deadline = crate::clock::nanos_since_boot().saturating_add(nanos);
+    // The caller's own arithmetic, which is exactly what a `Deadline` is: the
+    // ABI still carries a relative span, and this is the one place it becomes
+    // an instant.
+    let deadline = Deadline::at(crate::clock::now() + Duration::from_nanos(nanos));
     // No condition to re-check: the deadline is the wake, and one that has
     // already passed fires at the next scheduler entry.
-    crate::scheduler::block_on(
-        crate::scheduler::prepare_wait(crate::scheduler::park_lot()),
+    // **Armed on nothing but time.** A sleep has no subject — what ends it is
+    // the deadline the caller chose — so it arms on its own thread, where
+    // nothing posts, and the park's own deadline is the whole of the wait.
+    let parkable = crate::scheduler::Parkable::of_current();
+    let Some(handle) = crate::sched::driver::current_handle() else {
+        return 0;
+    };
+    let _ = completion::wait_until(
+        &parkable,
+        completion::Subject::of(handle.watch()),
+        completion::Token::new(0),
+        WaitClass::Other,
         deadline,
+        || false,
     );
     0
 }

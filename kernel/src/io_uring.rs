@@ -25,9 +25,9 @@ use crate::id_map::{IdKey, IdMap};
 use crate::pipe::{self, PipeId};
 use crate::process::{self, Pid};
 use crate::scheduler;
-use crate::sched::payload::KWaitQueue;
-use crate::sched::waitqs::{new_queue, wake_all};
 use crate::sync::Lock;
+use crate::completion::{self, Watch};
+use crate::time::{Deadline, Duration};
 use crate::DirectMap;
 
 use toyos_abi::io_uring::{
@@ -344,8 +344,21 @@ struct IoUringInstance {
     sq_size: u32,
     cq_size: u32,
     pending_polls: Vec<PendingPoll>,
-    /// Threads waiting on this ring's completion queue (spec §8.6).
-    waiters: Arc<KWaitQueue>,
+    /// Threads armed on this ring's completion queue (spec §8.6), cloned out
+    /// of the table because `enter` holds it across its park.
+    ///
+    /// **It was half of a `Wakeable` pair, and the other half was dead.** An
+    /// `Arc<KWaitQueue>` stood beside it — minted at setup, cloned at five wake
+    /// sites and walked on every CQE — with nothing registered on it since
+    /// `enter` started parking through `completion::wait_until` on the calling
+    /// thread's own queue. The pair's own doc said it existed "so a site cannot
+    /// take one and forget the other", which is a real hazard
+    /// (`issues/kernel/io-uring-source-half-a-wake-pair.md` records losing
+    /// it twice) and was not that type's to prevent: §5.6's answer is that there
+    /// is **no pair**, and a type minted to enforce one is the pair surviving
+    /// under a new name. Both the alias and the `wakeable()` accessor are gone
+    /// with it, because a synonym for one field earns nothing.
+    watch: Arc<Watch>,
     /// The authoritative CQ tail. The copy in the shared header is a
     /// publication for userspace, which only ever reads it — the kernel must
     /// not read its own tail back out of a page the process can write. Only
@@ -475,7 +488,7 @@ pub fn create(depth: u32) -> Result<(RingRef, u64), SyscallError> {
             sq_size,
             cq_size,
             pending_polls: Vec::new(),
-            waiters: new_queue(WaitClass::Io),
+            watch: Arc::new(Watch::new()),
             cq_tail: core::cell::Cell::new(0),
             owner_pid: pid,
         })
@@ -504,12 +517,21 @@ pub fn enter(
     min_complete: u32,
     timeout_nanos: u64,
 ) -> Result<u32, SyscallError> {
-    let deadline = if timeout_nanos == 0 {
-        1 // sentinel for non-blocking
+    // **Three readings of one word, and this is where they stop.** The relative
+    // `timeout_nanos` still arrives from userland with `0` meaning non-blocking
+    // and `u64::MAX` meaning forever — that is the ABI until C11 — but inside
+    // the kernel each becomes a named `Deadline`: `passed()` is evaluate-once,
+    // `never()` arms no timer, and anything else is an instant. What this
+    // replaces mapped relative `0` onto absolute `1` and `1` back onto `0` —
+    // the motivating example for why the absolute form may not be a bare
+    // `u64`.
+    let non_blocking = timeout_nanos == 0;
+    let deadline = if non_blocking {
+        Deadline::passed()
     } else if timeout_nanos == u64::MAX {
-        0 // block forever
+        Deadline::never()
     } else {
-        crate::clock::nanos_since_boot().saturating_add(timeout_nanos)
+        Deadline::at(crate::clock::now() + Duration::from_nanos(timeout_nanos))
     };
 
     if to_submit > 0 {
@@ -526,7 +548,7 @@ pub fn enter(
             return Ok(count);
         }
 
-        if deadline == 1 {
+        if non_blocking {
             return Ok(count);
         }
 
@@ -538,33 +560,34 @@ pub fn enter(
             return Ok(count);
         }
 
-        if deadline > 0 && crate::clock::nanos_since_boot() >= deadline {
+        if deadline.reached(crate::clock::now()) {
             return Ok(count);
         }
 
         // The re-check is this ring's own condition, not mere readiness: a
         // waiter for `min_complete` CQEs that cancelled on the first one would
-        // spin instead of parking.
-        //
-        // The ticket must be consumed on every path out of here, `?` included.
-        // A sibling thread closing this ring's fd removes it from IO_URINGS in
-        // exactly this window, and a ticket dropped still armed is a panic.
-        let ticket = scheduler::prepare_wait(&queue);
-        let recheck = match cq_count(ring_id) {
-            Ok(n) => n,
-            Err(e) => { ticket.cancel(); return Err(e); }
-        };
-        if recheck >= min_complete {
-            ticket.cancel();
-            continue;
+        // spin instead of parking. It runs *after* the arm, inside
+        // `completion::wait_until`, which is what closes the window a sibling
+        // thread closing this ring's fd opens.
+        let parkable = scheduler::Parkable::of_current();
+        if completion::wait_until(
+            &parkable,
+            completion::Subject::of(&queue),
+            completion::Token::new(ring_id.0 as u64),
+            WaitClass::Io,
+            deadline,
+            || cq_count(ring_id).map_or(true, |n| n >= min_complete),
+        )
+        .is_err()
+        {
+            return Err(SyscallError::Gone);
         }
-        scheduler::block_on(ticket, if deadline == 1 { 0 } else { deadline });
     }
 }
 
 /// This ring's completion waiter set, cloned out of the table.
-fn waiters_of(ring_id: RingId) -> Result<Arc<KWaitQueue>, SyscallError> {
-    with_instance(ring_id, |inst| inst.waiters.clone())
+fn waiters_of(ring_id: RingId) -> Result<Arc<Watch>, SyscallError> {
+    with_instance(ring_id, |inst| inst.watch.clone())
 }
 
 /// Read and process SQEs from the submission ring.
@@ -699,7 +722,7 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
     // Not ready — insert pending poll.
     // The old poll on this handle goes first, so its unregistration cannot
     // undo the registration this one is about to make.
-    let mut woken: Option<Arc<KWaitQueue>> = None;
+    let mut woken: Option<Arc<Watch>> = None;
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
     if let Some(instance) = map.get_mut(ring_id) {
@@ -713,9 +736,9 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
         // it was full.
         if instance.pending_polls.len() >= MAX_PENDING_POLLS {
             instance.post_cqe(user_data, -(SyscallError::ResourceExhausted as i32), 0);
-            let queue = instance.waiters.clone();
+            let watch = instance.watch.clone();
             drop(guard);
-            wake_all(&queue);
+            completion::post(completion::Subject::of(&watch), completion::Outcome::Ready);
             return;
         }
 
@@ -737,13 +760,13 @@ fn process_poll_add(ring_id: RingId, sqe: &IoUringSqe) {
                 if pp.flags.readable() { result_flags |= PollFlags::IN.raw(); }
                 if pp.flags.writable() { result_flags |= PollFlags::OUT.raw(); }
                 instance.post_cqe(pp.user_data, result_flags as i32, 0);
-                woken = Some(instance.waiters.clone());
+                woken = Some(instance.watch.clone());
             }
         }
     }
     drop(guard);
-    if let Some(queue) = woken {
-        wake_all(&queue);
+    if let Some(watch) = woken {
+        completion::post(completion::Subject::of(&watch), completion::Outcome::Ready);
     }
 }
 
@@ -805,11 +828,11 @@ fn post_cqe_locked(ring_id: RingId, user_data: u64, result: i32, flags: u32) {
     let map = guard.as_ref().expect("io_uring not initialized");
     let woken = map.get(ring_id).map(|instance| {
         instance.post_cqe(user_data, result, flags);
-        instance.waiters.clone()
+        instance.watch.clone()
     });
     drop(guard);
-    if let Some(queue) = woken {
-        wake_all(&queue);
+    if let Some(watch) = woken {
+        completion::post(completion::Subject::of(&watch), completion::Outcome::Ready);
     }
 }
 
@@ -826,7 +849,7 @@ fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPol
 
     // Collect the queues, wake after the table lock is gone: a wake posts
     // mailbox messages and may send a kick IPI, and neither needs IO_URINGS.
-    let mut to_wake: Vec<Arc<KWaitQueue>> = Vec::new();
+    let mut to_wake: Vec<Arc<Watch>> = Vec::new();
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
 
@@ -846,11 +869,11 @@ fn complete_pending_for_source(watchers: &[RingId], matches: impl Fn(&PendingPol
             }
         }
 
-        to_wake.push(instance.waiters.clone());
+        to_wake.push(instance.watch.clone());
     }
     drop(guard);
-    for queue in to_wake {
-        wake_all(&queue);
+    for watch in to_wake {
+        completion::post(completion::Subject::of(&watch), completion::Outcome::Ready);
     }
 }
 
@@ -886,7 +909,7 @@ pub fn remove_fd(sources: &[Option<EndedSource>]) {
     let watches_a_closing_source =
         |pp: &PendingPoll| sources.iter().flatten().any(|EndedSource(s)| pp.watches(s));
 
-    let mut to_wake: Vec<Arc<KWaitQueue>> = Vec::new();
+    let mut to_wake: Vec<Arc<Watch>> = Vec::new();
     let mut guard = IO_URINGS.lock();
     let map = guard.as_mut().expect("io_uring not initialized");
     for ring_id in affected {
@@ -904,13 +927,13 @@ pub fn remove_fd(sources: &[Option<EndedSource>]) {
                 }
             }
             if cancelled {
-                to_wake.push(instance.waiters.clone());
+                to_wake.push(instance.watch.clone());
             }
         }
     }
     drop(guard);
-    for queue in to_wake {
-        wake_all(&queue);
+    for watch in to_wake {
+        completion::post(completion::Subject::of(&watch), completion::Outcome::Ready);
     }
 }
 
