@@ -155,7 +155,7 @@ diskless_boot 4506
 doom_music 7543
 doom_sound_flood 5714
 double_fault_stack 4323
-double_panic_names_the_first 18446744073709551615
+double_panic_names_the_fault 18446744073709551615
 dump_nmi_probe 24625
 empty_dir_stat 12
 endowment_denied 69
@@ -245,6 +245,7 @@ process_lifecycle 293
 process_stats 66
 query_modules_size 18
 readdir_bound 4520
+reentry_names_the_first_panic 18446744073709551615
 sched_check_build 5685
 sched_stress 1293
 screen_blocked_dump 4679

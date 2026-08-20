@@ -511,11 +511,16 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // nightly until the split the relegation row names.
     ("klogd_hosted", Sched::Parallel, Tier::Nightly),
     // The two dead ends of the panic path, each staged on purpose and read for
-    // what the machine manages to say on its way out. Two boots, both dying
-    // inside the boot phases at the marker the harness waits for, so neither
-    // pays for a userland. Parallel and Fast: every verdict is a substring of a
-    // report the guest wrote, and there is no clock in any of it.
-    ("double_panic_names_the_first", Sched::Parallel, Tier::Fast),
+    // what the machine manages to say on its way out. **Two names because one
+    // over two boots measured 12 s twelve-wide on the dev host**, against
+    // `screen_late_panic`'s 5 s there for one boot of the same shape and its
+    // 3,782 ms in CI — a single name would have arrived at the fast tier's line
+    // with nothing to spare. Each boot dies inside the boot phases at the marker
+    // the harness waits for, so neither pays for a userland. Parallel and Fast:
+    // every verdict is a substring of a report the guest wrote, and there is no
+    // clock in any of it.
+    ("reentry_names_the_first_panic", Sched::Parallel, Tier::Fast),
+    ("double_panic_names_the_fault", Sched::Parallel, Tier::Fast),
     // §9.1's conservation law across `SYS_LOG_READ`, one registered name per
     // width, and §9.2's nesting gate at one CPU. **Three names because one over
     // three boots measured 17,112 ms in CI** — over the fast tier's line, and
@@ -8743,7 +8748,7 @@ fn run_machine_test(
             eprintln!("  [usbd] a kernel thread's panic killed the thread and the machine booted");
             Ok(())
         }
-        "double_panic_names_the_first" => {
+        "reentry_names_the_first_panic" => {
             // **The one class of crash that is by definition two bugs deep, and
             // the one class that used to leave no evidence.** A machine two
             // crashes deep said `DOUBLE PANIC` and nothing else — not what the
@@ -8755,22 +8760,20 @@ fn run_machine_test(
             // first crash's own words rather than whatever the log path
             // survived.
             //
-            // **Both arms, because they are reached by different accidents.**
-            // The reentry guard fires when the panic *report* panics, on a CPU
-            // whose panic depth is already one; `DOUBLE PANIC` fires when a
-            // panic lands on a CPU that a *fault* had, whose depth is zero. The
-            // second is the one the sighting was, and no test in this tree had
-            // ever executed it: a Ring 0 exception is not something a guest
-            // program or a QEMU property can produce.
-
-            // **The first arm: the panic path panics.** `test-late-panic` is a
-            // real panic with a literal message at a fixed site, and
+            // **Two names because the two dead ends are reached by different
+            // accidents**, and `double_panic_names_the_fault` is the other. The
+            // reentry guard fires when the panic *report* panics, on a CPU whose
+            // panic depth is already one; `DOUBLE PANIC` fires when a panic
+            // lands on a CPU that a *fault* had, whose depth is zero.
+            //
+            // **This one: the panic path panics.** `test-late-panic` is a real
+            // panic with a literal message at a fixed site, and
             // `panic-in-report` kills the report of it before it says a word —
             // so everything on the wire about the first panic came out of the
             // capture. The reentry guard writes straight to the 16550 with no
             // lock, deliberately, because the record path is exactly what has
-            // just failed: the marker and the verdict are both in the UART
-            // file rather than on the console.
+            // just failed: the marker and the verdict are both in the UART file
+            // rather than on the console.
             const REENTRY: &str = "PANIC REENTRY";
             let qemu = QemuInstance::boot_with_options(
                 test_config,
@@ -8810,15 +8813,23 @@ fn run_machine_test(
                 ));
             }
             eprintln!("  [reentry] {}", second.trim());
-            drop(qemu);
-
-            // **The second arm: a panic on top of a fault.** `test-kernel-fault`
-            // takes a Ring 0 `#UD` with nothing current, so `fatal_exception`
-            // runs its kernel arm; `panic-in-report` panics it before the
-            // `FAULT rip=…` line, which is the shape the sighting had — a fault
-            // whose report died before saying anything at all. This one says it
-            // as a record too, because a machine with no serial port has no
-            // other channel, so the verdict is on the console.
+            Ok(())
+        }
+        "double_panic_names_the_fault" => {
+            // **A panic on top of a fault, which is what the sighting was and
+            // what no test in this tree had ever executed**: a Ring 0 exception
+            // is not something a guest program or a QEMU property can produce,
+            // so `fatal_exception`'s kernel arm — and the `DOUBLE PANIC` branch
+            // only reachable through it — had never run under a test at all.
+            // `reentry_names_the_first_panic` is the other dead end and carries
+            // the shared argument.
+            //
+            // `test-kernel-fault` takes the `#UD` with nothing current, so
+            // `fatal_exception` runs its kernel arm; `panic-in-report` panics it
+            // before the `FAULT rip=…` line, which is the shape the sighting had
+            // — a fault whose report died before saying anything at all. This
+            // dead end says it as a record too, because a machine with no serial
+            // port has no other channel, so the verdict is on the console.
             let qemu = QemuInstance::boot_with_options(
                 test_config,
                 c_bins,
