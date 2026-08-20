@@ -490,7 +490,7 @@ pub fn self_check() -> Result<(), String> {
         (
             "[kernel 2.000 cpu1] DOUBLE PANIC: the cpu was already in Fatal; first: invalid \
              opcode rip=0x0000000000401234 cr2=0x0000000000000000 err=0x0000000000000000; \
-             second: panic at kernel/src/mm/paging.rs:41:5: the page is not there",
+             second: panic at src/mm/paging.rs:41:5: the page is not there",
             Some(Died::Kernel),
         ),
         // No prefix, and still the kernel's: the reentry line goes out the UART

@@ -130,15 +130,16 @@ pub fn depth_slot() -> &'static AtomicU32 {
 
 /// How much of a crash site this keeps.
 ///
-/// **96 bytes of path, and the *tail* of it.** The longest source path in this
-/// tree is 44 characters (`toyos-sched/sim/tests/deadline_claim_race.rs`) and
-/// the longest the kernel itself can name is 39
-/// (`kernel/src/drivers/panic_console/mod.rs`), but `file!()` is whatever
-/// rustc was handed: CI captures carry
-/// `/__w/toyos/toyos/toyos-sched/src/cpu.rs` and a `core` panic names the
-/// fork's own `library/core/src/…` under whatever directory the checkout is in.
-/// The head of such a path is the build host and the tail is the identity, so
-/// what overflows is cut off the front and marked.
+/// **96 bytes of path, and the *tail* of it.** `file!()` is whatever rustc was
+/// handed, and the two shapes differ by an order of magnitude. The kernel's own
+/// files are crate-relative, because `build.rs` runs cargo *in* `kernel/`:
+/// `src/main.rs`, and 32 characters at the longest this crate has
+/// (`src/drivers/panic_console/mod.rs`). Everything else is absolute — a
+/// dependency's, a `core` panic's — and its length is the checkout's: 39 for
+/// the `/__w/toyos/toyos/toyos-sched/src/cpu.rs` a CI capture carries, more on
+/// a dev host with a deep worktree. The head of such a path is the build host
+/// and the tail is the identity, so what overflows is cut off the front and
+/// marked.
 ///
 /// **128 bytes of message.** A record's own bound is `MAX_RECORD_MESSAGE`, 992,
 /// and this is not a record: it holds a panic literal, which in this kernel's

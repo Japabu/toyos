@@ -8792,7 +8792,9 @@ fn run_machine_test(
             let header = reentry.must_say(REENTRY)?;
             eprintln!("  [reentry] {}", header.trim());
             let first = reentry.must_say("first (apic")?;
-            for want in ["panic at ", "kernel/src/main.rs:", "test-late-panic: on-screen console check"] {
+            // `src/main.rs` and not `kernel/src/main.rs`: `build.rs` runs cargo
+            // in `kernel/`, so the kernel's own `file!()` is crate-relative.
+            for want in ["panic at ", "src/main.rs:", "test-late-panic: on-screen console check"] {
                 if !first.contains(want) {
                     return Err(format!(
                         "the reentry report does not carry {want:?} — the first panic's own \
