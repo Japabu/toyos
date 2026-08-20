@@ -2090,14 +2090,31 @@ pub const KNOWN_RED: &[Red] = &[
     // The first of those two deaths was `process_lifecycle`'s Ring 0 fetch at
     // `0x0` inside `SYS_READ`, and its row is gone with the defect: it was a
     // `context_switch` restoring a task another CPU was still standing on, and
-    // a red under that name now is a new measurement rather than this one. What
-    // stays is the second death, which is not yet accounted for.
+    // a red under that name now is a new measurement rather than this one. The
+    // second is the row below, and it was the last of the session still
+    // unaccounted for; it is the same defect, and the row's `Retired` reason
+    // carries what decided that.
     // ---------------------------------------------------------------------
     Red {
         test: "sched_stress",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(1, 3),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the same defect as the four Ring 0 fetches filed beside it, and it was fixed \
+             before this row was ever re-measured: `navigate.rs:161` is `init_front().unwrap()`, \
+             which `BTreeMap::iter` reaches only when the map's `root` reads `None` and its \
+             `length` does not — a pair no sequence of inserts and removes produces, so the \
+             panic reports corruption of the record rather than a scheduler decision. That \
+             record is `CpuSched` in `static SCHEDS`, and `SchedPass`'s own `&mut CpuSched` is \
+             a local on the kernel stack the pre-fix `pop_surplus` handed to two CPUs at once, \
+             a few hundred instructions before `apply_timer` walks the map. Measured \
+             2026-08-20, same host, one-word A/B: 0 kernel deaths in 3,600 boots on this tree, \
+             2 in 3,120 with `pop_surplus(None)` restored — both of them `cpu 7 has no \
+             CpuSched` at `sched/driver.rs:219`, the same static reading as a value only a \
+             stray write produces, and both after cpu7 had already completed a pass. 20 loaded \
+             `sched_stress` runs green at 4.27x-8.00x host width against the 1.41x that took \
+             this one. A red under this name now is a new measurement",
+        ),
         what: "`QEMU disconnected` — the kernel panicked at \
                `alloc/src/collections/btree/navigate.rs:161`, `Option::unwrap()` on `None` \
                **inside `BTreeMap`'s own immutable iterator**, walking a CPU's `parked` map \
@@ -2108,7 +2125,7 @@ pub const KNOWN_RED: &[Red] = &[
         evidence: "the same session's third run and the most loaded of the three, `fastest boot \
                    1867 ms against the reference 1320 ms`; `ALONE sched_stress: GREEN` and \
                    `PASS (2s)` in the same run",
-        source: "issues/kernel/a-btreemap-panicked-inside-its-own-navigation-in-a-scheduler-pass.md",
+        source: "src/redlist.rs",
         measured: "2026-08-19",
     },
     // ---------------------------------------------------------------------
