@@ -652,3 +652,49 @@ jobs:
           export TITLE="nightly is red"
           export BODY="Run: $RUN_URL"$'\n'"Failed jobs:$failed"
           .github/nightly-red.sh
+
+  # A report, never a gate: `issues/build/the-eased-merge-law-carries-a-threshold.md`
+  # fixed a threshold for what the eased merge law trades — near-zero
+  # red-`main` incidents — in advance, and this reads the rate back nightly.
+  # Schedule only, no `needs:` names it, and it never enters `nightly-red`
+  # above: a breach is a fact about the trade over the past week, not about
+  # tonight's tree, and conflating the two would misattribute one to the
+  # other. `cargo run -- --merge-health` needs no ToyOS toolchain, only `gh`
+  # and stable `cargo` — both already on this runner, the same reason
+  # `durations` above installs neither.
+  merge-health:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: landing-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: landing-${{ runner.os }}-
+
+      - name: merge health
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cargo run -- --merge-health 2>&1 | tee /tmp/merge-health.log
+          {
+            echo "### merge health"
+            echo ""
+            echo '```'
+            cat /tmp/merge-health.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if grep -q 'THRESHOLD BREACHED' /tmp/merge-health.log; then
+            echo "::warning::merge-health: threshold breached — see the step summary and \
+              issues/build/the-eased-merge-law-carries-a-threshold.md"
+          fi

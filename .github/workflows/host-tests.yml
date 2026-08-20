@@ -23,10 +23,14 @@ on:
     - cron: '5 3 * * *'
 
 # The nightly run gets its own group, same reason as `ci.yml`'s: a push to
-# `main` must not be cancelled by, or wait behind, a scheduled run.
+# `main` must not be cancelled by, or wait behind, a scheduled run. And a push
+# to `main` must not cancel the previous push's validation either — the
+# merge-health backfill measured 8 of 27 landings whose required run this
+# unconditional cancel killed before it started, which is how a red tip hides.
+# Same guard `ci.yml` already carries.
 concurrency:
   group: host-tests-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   host:

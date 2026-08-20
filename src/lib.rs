@@ -8,6 +8,7 @@ pub mod forkcheck;
 pub mod hostws;
 pub mod image;
 pub mod libc;
+pub mod mergehealth;
 pub mod pr;
 pub mod redlist;
 pub mod soundfont;

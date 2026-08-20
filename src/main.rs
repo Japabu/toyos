@@ -121,6 +121,13 @@ fn main() {
         toyos_build::redlist::dispatch(&root, &args);
         return;
     }
+    // Asks `gh`, not the toolchain, so it runs on the bare `ubuntu-latest`
+    // runner the nightly schedule gives it — no QEMU, no ToyOS toolchain.
+    // Same reason as the two above: before `check_prerequisites`.
+    if args.iter().any(|a| a == "--merge-health") {
+        toyos_build::mergehealth::dispatch(&root, &args);
+        return;
+    }
 
     check_prerequisites(&root);
     env::set_current_dir(&root).expect("Failed to cd to project root");

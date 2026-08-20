@@ -1570,6 +1570,18 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
     /// and the probe is answered from it. The one the refusal declines to send
     /// is the *next* pass's to send, by which time the switch has stored the
     /// `rsp` and it is an ordinary queued task like any other.
+    ///
+    /// **The window is this pass's own remainder, not the thief's first
+    /// instruction.** The kick returns here and the pass runs on to
+    /// [`SchedPass::apply_timer`] still standing on the loaded task's kernel
+    /// stack, where its own [`SchedPass`] — the `&mut CpuSched` inside it
+    /// included — is a local that a thief landing in the window is writing
+    /// over. A residue frame whose return slot happens to be kernel text
+    /// restores without faulting, so the death need be neither at a segment
+    /// selector nor on the thief nor even on the stack: two CPUs on one stack
+    /// write through whatever pointer-shaped residue they pick up, and a
+    /// per-CPU scheduler record reading as a value no operation on it can
+    /// produce is inside what that yields.
     fn answer_steal_requests(&mut self) {
         if !self.env.steal {
             self.cpu.steal_requests.clear();
