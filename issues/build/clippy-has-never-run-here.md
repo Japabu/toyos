@@ -6,6 +6,18 @@ opened: 2026-08-19
 
 # Stage two: `pedantic`/`nursery`, one lint at a time, plus `undocumented_unsafe_blocks` per area
 
+**The owner ruled on 2026-08-20, and it governs every remaining area sweep:
+reduction before documentation.** Each `unsafe` block's first question is
+whether it can stop existing — a safe abstraction, an existing type, a
+restructure — and the work of removing it is worth doing, not dodged for a
+comment. Only what proves irreducible gets the SAFETY comment, and that
+comment states *why* it is irreducible, not just why it is sound. An area's
+report counts blocks REMOVED beside blocks documented; a sweep that removed
+nothing explains why nothing was removable. The first sweep's own best
+findings — two removable `unsafe impl`s discovered by trying to justify
+them — are the precedent: the already-swept areas' filed reduction findings
+execute under this ruling too.
+
 Stage one (#132) put default clippy on every PR — kernel, host workspace,
 bootloader, `-D warnings`. This entry now carries stage two: every
 `pedantic`/`nursery` lint measured on all three trees, adopted or rejected
