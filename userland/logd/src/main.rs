@@ -87,12 +87,23 @@ const BATCH: usize = 64;
 /// volume dead (§5.4).
 ///
 /// **A policy number, and it says so**: nothing about the device supplies one.
-/// The transport already bounds a single transfer — `USB_TIMEOUT_NS` is 2 s in
-/// `kernel/src/drivers/xhci`, which is what turns a stick that stopped
-/// answering into an `Err` here rather than an unbounded park. Five seconds:
-/// long enough that a slow stick under a boot's worth of other I/O is not
-/// called dead, short enough that a person watching the console learns about it
-/// while they are still watching.
+/// Five seconds: long enough that a slow stick under a boot's worth of other
+/// I/O is not called dead, short enough that a person watching the console
+/// learns about it while they are still watching.
+///
+/// **It is measured around a syscall, so it is reachable only if the syscall
+/// returns** — every bound below it is what decides whether this policy runs at
+/// all. There are two of them and they answer different failures. The transport
+/// bounds one device round trip (`USB_TIMEOUT_NS`, 2 s in
+/// `kernel/src/drivers/xhci`), which is what turns a stick that *stopped
+/// answering* into an `Err` here rather than an unbounded wait; that bound is
+/// never reached by a device that answers, so on its own it says nothing about
+/// how long a call may take. `kernel/src/block.rs`'s `OPERATION` is the other,
+/// 2 s over one whole block-device operation — the batching, the retries and
+/// the recoveries a single `read_blocks` composes — and it is what bounds a
+/// device that answers every transfer and takes too long over the work. Two
+/// plus one command's overshoot is what leaves this constant a second to notice
+/// with.
 ///
 /// **What it bounds is slowness and not errors, and that split is measured
 /// rather than chosen.** §5.4 called it "a policy over repeated errors and a

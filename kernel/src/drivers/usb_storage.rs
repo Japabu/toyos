@@ -6,8 +6,15 @@
 //! is the handle: one per bound disk, holding nothing but an index and the
 //! geometry the device reported, so the controller lock is taken per operation
 //! and never held across one.
+//!
+//! **This is where an operation's device-time budget is minted**
+//! ([`crate::block::operation_deadline`]), because this is the layer at which
+//! one call is one operation: below here the driver batches, retries and
+//! recovers, and none of those loops knows what it is part of. The deadline is
+//! passed down rather than re-derived, so what bounds a `read_blocks` of 64
+//! blocks is the same instant that bounds its first command.
 
-use crate::block::{BlockDevice, BlockError, BlockResult, DeviceId};
+use crate::block::{self, BlockDevice, BlockError, BlockResult, DeviceId};
 use crate::log;
 use super::xhci;
 
@@ -88,7 +95,7 @@ impl BlockDevice for UsbBlockDevice {
     }
 
     fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> BlockResult {
-        if xhci::storage_read(self.index, lba, count, buf) {
+        if xhci::storage_read(self.index, lba, count, buf, block::operation_deadline()) {
             return Ok(());
         }
         log!("usb-storage: read of {count} blocks at {lba} failed on disk {}", self.index);
@@ -96,7 +103,7 @@ impl BlockDevice for UsbBlockDevice {
     }
 
     fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) -> BlockResult {
-        if xhci::storage_write(self.index, lba, count, buf) {
+        if xhci::storage_write(self.index, lba, count, buf, block::operation_deadline()) {
             return Ok(());
         }
         log!("usb-storage: write of {count} blocks at {lba} failed on disk {}", self.index);
@@ -104,7 +111,7 @@ impl BlockDevice for UsbBlockDevice {
     }
 
     fn flush(&mut self) -> BlockResult {
-        if xhci::storage_flush(self.index) {
+        if xhci::storage_flush(self.index, block::operation_deadline()) {
             return Ok(());
         }
         log!("usb-storage: cache flush failed on disk {}", self.index);

@@ -137,6 +137,32 @@ fn check(index: usize, disk: &mut usb_storage::UsbBlockDevice) {
     let past_end = disk.read_blocks(blocks, 1, &mut buf).is_err();
     log!("usb-gate: read past the last block refused={past_end}");
 
+    // A read whose *caller's* budget was already spent when it arrived — the
+    // other half of the error channel, and the half no device state can
+    // produce. `crate::block::OPERATION` is what bounds a device that answers
+    // every transfer and takes too long over the work; no property of a host
+    // device and no injection in this driver can stage a disk slow enough to
+    // reach two seconds, so the deadline is handed in already past instead.
+    // What that proves is the plumbing and the verdict together: the deadline
+    // reaches `XhciController::scsi` from above the driver, no command is
+    // issued, and the disk is untouched — every assertion after this one runs
+    // against a device this read must not have disturbed, which is why it sits
+    // here and not at the end.
+    //
+    // Straight to the driver rather than through `BlockDevice`, because the
+    // budget is minted inside `UsbBlockDevice::read_blocks` and a handle has no
+    // way to hand one in. That is the layering working rather than being
+    // dodged: the number belongs to the caller of the trait, and this file is
+    // standing in for one.
+    let spent = !crate::drivers::xhci::storage_read(
+        index,
+        at(blocks, HOST_BLOCKS[0]),
+        1,
+        &mut buf,
+        crate::time::Deadline::passed(),
+    );
+    log!("usb-gate: read with a spent budget refused={spent}");
+
     // A read the controller cut short while the device's own CSW claims it
     // moved everything. Armed here rather than by a boot-wide count so the
     // transfer it lands on is a known one, and issued against a block the host
