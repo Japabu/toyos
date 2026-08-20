@@ -1919,7 +1919,7 @@ fn connect_through(connector: &port::Connector) -> u64 {
     if !watchers.is_empty() {
         crate::io_uring::complete_pending_for_event(
             &watchers,
-            crate::io_uring::Source::Port(port.clone()),
+            crate::io_uring::Source::Port(port),
         );
     }
     h.0 as u64
