@@ -121,3 +121,35 @@ from this queue is allowed to do. The constraint that track's own reasoning
 derived, and which anything touching this queue must not lose: **none of the
 three drain sites can park, so no `on_zero_handles` hook may take a sleep lock
 at all.** It belongs with that track, not beside it.
+
+## What the sleep lock decided, 2026-08-20
+
+That track's lock-conversion pass reached this and could not answer it, and why
+is worth recording here, because it changes what "give the batch an owner" has
+to cover.
+
+**The kind that most needs a release site is `File`, and `File` is not on this
+queue.** `object/mod.rs` makes it an `immediate` row deliberately — *"A file's
+flush and its cache reference ride the last `Arc`"* — so its release is
+`OpenFileState::drop` (`kernel/src/object/file.rs:27-39`), which takes
+`vfs::lock()` and flushes. Once `vfs::VFS` is a sleep lock that `Drop` has no
+legal way to acquire it: a `Drop` impl cannot be handed a `Parkable`, and the
+two contexts it actually runs in — `ops::close` inside
+`process::with_process_data` (`arch/syscall.rs:1250`) and `ops::close_all`
+inside `teardown_resources`'s Phase 2 (`process.rs:1126`–`1149`) — hold a
+`Lock<ProcessData>` guard, so the baseline assertion refuses one level before
+the discipline rule does. `try_lock` is not an answer either: the holder it
+would lose to is a thread inside a device round trip, so the failure is routine,
+and what it loses is a modified file's write-back.
+
+So the two constraints meet. **The hook queue may not park, and the row that
+would want to is not on the hook queue but in a `Drop` that also may not.**
+Moving `File` to `deferred` swaps one illegal site for another. The second shape
+above is still right for the `deferred` rows, and by itself it reaches neither
+`File` nor `close_all` — that one is also called from `recover_or_halt`'s
+`Blame::Process` arm (`arch/idt/exceptions.rs:348`), which has no syscall to
+return through.
+
+The track carries this as **wall 4**, with the three shapes the owner has to
+choose between. Nothing here should be built before that choice, because all
+three of them move this queue.
