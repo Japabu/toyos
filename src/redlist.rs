@@ -2013,28 +2013,14 @@ pub const KNOWN_RED: &[Red] = &[
     // run**, at three different host widths: 1.02x red, 1.07x green 268 of 268,
     // 1.41x red — and the kernel source under the first and third differs from
     // the green one's by comments alone, so no statement compiled differently
-    // between them. Both names answered `NOT ON THE LIST` when they were asked,
-    // and both re-ran `ALONE … GREEN`; adjudicated here rather than re-run
-    // away, per the root CLAUDE.md.
+    // between them.
+    //
+    // The first of those two deaths was `process_lifecycle`'s Ring 0 fetch at
+    // `0x0` inside `SYS_READ`, and its row is gone with the defect: it was a
+    // `context_switch` restoring a task another CPU was still standing on, and
+    // a red under that name now is a new measurement rather than this one. What
+    // stays is the second death, which is not yet accounted for.
     // ---------------------------------------------------------------------
-    Red {
-        test: "process_lifecycle",
-        instrument: Instrument::DevHostLoaded,
-        finding: Finding::fires(1, 3),
-        standing: Standing::Stands,
-        what: "`kernel panic: KERNEL PANIC: execute unmapped address at 0x0` — a Ring 0 \
-               instruction fetch at zero (`cs=0x0008`, `user=false`, `err=0x10`) inside \
-               `SYS_READ`, on cpu1, 15 s against the 491 ms the same name took passing alone \
-               straight after. **A kernel death and not a verdict**, and the fourth of its \
-               class: the first report to arrive with a syscall number under it, and the first \
-               whose restored frame is not all zeros — so the reissued-kernel-stack reading of \
-               the 2026-08-09 sighting does not carry over to it",
-        evidence: "the session's first run, twelve wide, contended with another worktree's \
-                   suite holding all twelve guest slots; `fastest boot 1341 ms against the \
-                   reference 1320 ms`, and `ALONE process_lifecycle: GREEN`",
-        source: "issues/kernel/a-ring-0-fetch-at-zero-inside-sys-read.md",
-        measured: "2026-08-19",
-    },
     Red {
         test: "sched_stress",
         instrument: Instrument::DevHostLoaded,
@@ -2055,30 +2041,12 @@ pub const KNOWN_RED: &[Red] = &[
     },
     // ---------------------------------------------------------------------
     // The same session's last two runs, after the branch merged `origin/main`
-    // at `bf54143`. Both red, both `ALONE … GREEN`, neither about the diff —
-    // and with the two above them that is **three kernel deaths of three
-    // different shapes in four contended suites, against one clean run**. The
-    // one file that carries the table is this pair's write-up.
+    // at `bf54143`. Both red, both `ALONE … GREEN`, neither about the diff.
+    // The first was `i8042_kbd_echo`'s Ring 0 fetch at `0x1b`, and its row is
+    // gone with the defect for the reason the block above gives. The second is
+    // below, and it is the only one of that session's five reds that was never
+    // a kernel death.
     // ---------------------------------------------------------------------
-    Red {
-        test: "i8042_kbd_echo",
-        instrument: Instrument::DevHostLoaded,
-        finding: Finding::fires(1, 2),
-        standing: Standing::Stands,
-        what: "`kernel panic: KERNEL PANIC: execute unmapped address at 0x1b` at 850 ms of \
-               boot, `cs=0x0008`, `user=false` — the **fourth** instance of the shifted-frame \
-               half of the `0x1b` class, agreeing with the other three on `rax`, `rbx`, an \
-               `RF`-set flags word in `rbp` and a page-aligned `rsp`, and **disagreeing on the \
-               syscall**: `num=49` (`SYS_NANOSLEEP`) from a `rip` inside `gimli`, where both \
-               sightings that printed the line are `num=90` from one instruction on the spawn \
-               path. That is the one claim the class file's newest paragraph makes, and this \
-               row is the counter-example. `ALONE i8042_kbd_echo: GREEN`",
-        evidence: "the fourth of five full `cargo test` runs of `wt/toyos-spawnrule` in one \
-                   session, the first after merging `origin/main` at `bf54143`; `fastest boot \
-                   2165 ms against the reference 1320 ms`, 1.64x width",
-        source: "issues/kernel/a-ring-0-fetch-at-0x1b-with-the-stack-pointer-on-a-page-boundary.md",
-        measured: "2026-08-19",
-    },
     Red {
         test: "screen_console_shell",
         instrument: Instrument::DevHostLoaded,
@@ -2092,7 +2060,7 @@ pub const KNOWN_RED: &[Red] = &[
                is not a kernel death",
         evidence: "the fifth run of the same session, `fastest boot 1622 ms against the \
                    reference 1320 ms`, 1.23x width; `ALONE screen_console_shell: GREEN`",
-        source: "issues/kernel/a-ring-0-fetch-at-0x1b-with-the-stack-pointer-on-a-page-boundary.md",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-19",
     },
     // ---------------------------------------------------------------------
@@ -2100,43 +2068,14 @@ pub const KNOWN_RED: &[Red] = &[
     // re-run away: each answered `NOT ON THE LIST` when it was asked, and the
     // branch they appeared on touches no kernel file at all — its whole delta
     // is `tests/toyos.rs` and this file.
+    //
+    // Two of the three were `i8042_budget_expiry` and `nvme_large_device`,
+    // machine-wide Ring 0 deaths at `0x1b` that reded whichever guest was
+    // booting. Their rows are gone with the defect — a `context_switch`
+    // restoring a task another CPU was still standing on — so a red under
+    // either name now is a new measurement and must be read as one. The one
+    // that stays below is not a kernel death.
     // ---------------------------------------------------------------------
-    Red {
-        test: "i8042_budget_expiry",
-        instrument: Instrument::DevHostAlone,
-        finding: Finding::Seen,
-        standing: Standing::Stands,
-        what: "`[qemu] Init process crashed during boot: KERNEL PANIC: execute unmapped address \
-               at 0x1b`, `cs=0x0008` with `rsp` in the direct map, on `num=90` from \
-               `<std::sys::process::toyos::Command>::spawn`. **The name is the workload and not \
-               the cause** — a machine-wide kernel death reds whichever test was booting. Third \
-               sighting of a filed class and the second of its *shifted*-frame half: `rbp` is \
-               `0x10246` (RFLAGS with RF set) and `rax`/`rbx`/`rflags`/`rsp` are identical to \
-               the 2026-08-15 one. `ALONE: GREEN`",
-        evidence: "`cargo test --test toyos-build -- i8042_ --jobs 1 --host-slots 0`, one guest \
-                   on the machine and no other suite on the host — so this row is the first of \
-                   its class taken with nothing to blame contention for. The run's other eight \
-                   guests were green",
-        source: "issues/kernel/a-ring-0-fetch-at-0x1b-during-a-loaded-boot.md",
-        measured: "2026-08-19",
-    },
-    Red {
-        test: "nvme_large_device",
-        instrument: Instrument::DevHostLoaded,
-        finding: Finding::Seen,
-        standing: Standing::Stands,
-        what: "`[qemu] Init process crashed during boot: KERNEL PANIC: execute unmapped address \
-               at 0x1b`, ring 0, on `num=90` — **the name is the workload and not the cause**. \
-               Fourth sighting of the same filed class and the third of its shifted-frame half, \
-               and the one that ties them together: `user_rip=0x1000003d598` is the same \
-               instruction as the `i8042_budget_expiry` row above, in a different guest booting \
-               a different configuration, with `rax` and `rbx` identical again. `ALONE: GREEN`",
-        evidence: "one full `cargo test` twelve wide, 79 guests, `fastest boot 1356 ms against \
-                   the reference 1320 ms`, with `toyos-spawnrule`'s suite holding guest slots \
-                   throughout — named in the run's own `[host-slots]` lines",
-        source: "issues/kernel/a-ring-0-fetch-at-0x1b-during-a-loaded-boot.md",
-        measured: "2026-08-19",
-    },
     Red {
         test: "diskless_boot",
         instrument: Instrument::DevHostLoaded,

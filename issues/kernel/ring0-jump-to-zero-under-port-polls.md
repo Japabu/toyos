@@ -186,6 +186,26 @@ chunk 6 changes). That is fifteen samples of a thing seen once in a suite, so it
 says nothing except that the window is not trivially reachable. The binary stays
 in the suite.
 
+---
+
+## 2026-08-20: the class this was filed under has been diagnosed, and this
+sighting is not settled by it
+
+Four later sightings of a Ring 0 instruction fetch at a tiny address were one
+defect and it is fixed: a CPU could hand a thief the task **whose context it was
+still standing on**, because a scheduler pass ends before the context switch it
+decided on has run. `SchedPass::answer_steal_requests` in
+`toyos-sched/src/cpu.rs` carries the derivation.
+
+The mechanism is the same `ret` this sighting died at — `context_switch`'s, after
+six pops and a `popfq` — and the diagnosis rests on a register the report above
+does not carry: `rsi` still holding `new_rsp`, i.e. `rsp - 0x40`. **The one thing
+that does not transfer is the frame.** Every one of the four restored a frame
+with live values in it; this one restored eight zero quadwords, which
+`OwnedAlloc::new`'s `alloc_zeroed` produces and a stack another CPU is walking
+does not. So the reissued-kernel-stack reading in §1 above still stands on its
+own evidence, and the first fault's cause is still what this file wants.
+
 ### What remains open
 
 - **The first fault's cause.** Everything above says the `rip=0` is downstream
