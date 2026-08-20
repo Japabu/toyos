@@ -290,8 +290,10 @@ extern "C" fn ap_entry() -> ! {
     // GS base was set by the trampoline; finish percpu init (GDT, CR4).
     percpu::init_ap(percpu::percpu_ptr());
     syscall::init();
+    // Calibration is one global measurement done on the BSP; `arm_one_shot`
+    // programs divide and LVT per call, so there is nothing left for an AP to
+    // do here.
     apic::init_ap();
-    apic::init_timer_ap();
 
     AP_STARTED.store(true, Ordering::Release);
 

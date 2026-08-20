@@ -903,6 +903,17 @@ fn home_of(state: TaskState) -> Option<CpuId> {
 /// observes and what no workload scales, so the cost of a pass is recorded as a
 /// distribution ([`PassCosts`]) and judged where composed quantities are judged:
 /// in the harness and the simulator.
+///
+/// **And the harness's line is no longer this number, on a measurement.** Host
+/// load moves *every* order statistic of the recorded distribution and not only
+/// its tail — 2026-08-18, twelve CPU-runs an arm, quiet against loaded: median
+/// 65 536 → 131 072 ns and 90th percentile 131 072 → 262 144 ns on one
+/// unchanged tree. So `tests/common/passcost.rs` holds a run to what its own
+/// accelerator has been recorded producing instead. This constant stays the
+/// policy number, stays what `over` is counted against, and stays reported on
+/// every run; it has only stopped being the threshold. What that measurement
+/// also says about *this* number: across sixteen CI runs on KVM, 7 612 passes,
+/// **not one reached it** and the largest single pass was 173 906 ns.
 pub const MAX_PASS_NS: u64 = 200_000;
 
 /// How long the real-time band may defer one corpse's unwind before that

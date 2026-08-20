@@ -323,9 +323,6 @@ pub fn init_timer() {
     log!("LAPIC timer: {} ticks/10ms", ticks_10ms);
 }
 
-/// AP timer init — calibration was done on the BSP, nothing to start.
-pub fn init_timer_ap() {}
-
 /// The shortest interval this kernel will ask the one-shot for, and therefore
 /// the resolution of every deadline in the system.
 ///

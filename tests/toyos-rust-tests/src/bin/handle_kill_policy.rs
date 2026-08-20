@@ -19,21 +19,43 @@
 //! while still printing the marker, and a tree that killed for all five reds on
 //! the two survivable arms.
 //!
-//! The last arm is the census. `handle_count` reaching zero is what releases an
+//! The census arm is next. `handle_count` reaching zero is what releases an
 //! object, and a kill is the path where nothing unwinds — so a leak per killed
 //! process is exactly the defect this policy could introduce and the only place
 //! it is visible is the kernel's own live-object count.
+//!
+//! **The last arms are the same matrix asked through a `POLL_ADD`, which is
+//! where the kernel had a third answer nobody had written down.**
+//! `process_poll_add` resolved its handle through one `let … else` that
+//! swallowed `BadHandle`, `Stale` and a missing `Rights::WAIT` alike, and then
+//! pushed a pending poll carrying no source — which no event site can reach and
+//! no recheck can complete. A program that polled a handle it had already
+//! closed was therefore neither answered nor ended: it went quiet. A submission
+//! does have an error channel — the CQE — and these arms are what say so, one
+//! per kind, plus the direction in which an object has no readiness at all.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use toyos::census::Census;
+use toyos::poller::{Poller, IORING_POLL_IN, IORING_POLL_OUT};
 use toyos::AsHandle;
 use toyos_abi::handle::Rights;
 use toyos_abi::syscall::{self, SyscallError};
 use toyos_abi::RawHandle;
 
 const SELF_PATH: &str = "/bin/test_rs_handle_kill_policy";
+
+/// How long a `POLL_ADD` that cannot ever fire is given to say so.
+///
+/// **A liveness bound and never a verdict.** Every arm below submits a poll the
+/// kernel can answer without waiting for anything — a refusal, or an object
+/// with no readiness in the direction asked for — so the answer is due in the
+/// submitting syscall itself. What this number separates is "answered" from
+/// "waits forever", which is the whole defect, and four orders of magnitude
+/// above a syscall is enough to do that on any machine this suite runs on.
+const POLL_ANSWER: Duration = Duration::from_secs(2);
 
 /// `process::HANDLE_FAULT_EXIT_CODE`. The shell convention for "died on
 /// SIGSEGV", which is the same class of mistake with a pointer instead of a
@@ -48,6 +70,10 @@ const UNHELD_SLOT: u32 = 3000;
 /// enough that one leaked object per round is a number no drain lag can hide.
 const CHURN_ROUNDS: usize = 16;
 
+/// The most 10 ms census samples `settled_census` takes before answering with
+/// what it last saw. `fd_lifetime`'s bound, for the same deferred queues.
+const SETTLE_SAMPLES: usize = 100;
+
 /// The three kinds that end the caller. Each is a role this binary runs as, and
 /// the description is what the kernel is being asked to refuse.
 const FATAL: &[(&str, &str)] = &[
@@ -55,6 +81,18 @@ const FATAL: &[(&str, &str)] = &[
     ("stale", "a slot this process closed"),
     ("wrong-type", "a pipe where the call takes an acceptor"),
     ("faulting-thread", "a bad handle named by a thread that is not the main one"),
+    // The same two mistakes made through a submission queue. They are separate
+    // roles rather than a loop over the first two because what has to be
+    // asserted is the same in both places and the *call* is what differs: a
+    // syscall refuses where it stands, a `POLL_ADD` is refused inside
+    // `io_uring_enter` on the submitting thread.
+    ("poll-bad-handle", "a POLL_ADD on a slot this process never held"),
+    ("poll-stale", "a POLL_ADD on a slot this process closed"),
+    // The third site the same audit found. It answered `NotFound` for every
+    // way the handle could fail, so "you named a handle you do not hold" and
+    // "this machine has no such device" were one word — and the second is a
+    // fact a driver acts on.
+    ("device-reg-bad-handle", "a device register read on a slot this process never held"),
 ];
 
 fn main() {
@@ -89,8 +127,63 @@ fn test() {
     rights_are_a_word();
     a_full_table_is_a_word();
     the_kills_release_what_they_held();
+    a_poll_without_wait_is_a_word();
+    a_poll_with_no_source_is_answered();
 
     println!("three handle failures end the caller, two answer it, and neither leaks");
+}
+
+/// A `POLL_ADD` on a handle that does not carry `Rights::WAIT` is a word.
+///
+/// **The direction the fix must not overshoot.** A process may legitimately
+/// hold an attenuated handle and ask what it can still do with it, so this may
+/// never be a kill — and the kernel's old answer was neither: the poll was
+/// registered on nothing and the caller waited for a completion that could not
+/// exist. A region is the honest subject, because `Rights::WAIT` is not in what
+/// `SYS_SHM_CREATE` mints (`object::ops::initial_rights`), so nothing is
+/// narrowed here to stage it.
+fn a_poll_without_wait_is_a_word() {
+    let region = toyos::shm::SharedMemory::create(4096).expect("a region to poll");
+    let answered = answered_within(POLL_ANSWER, region.as_handle(), IORING_POLL_IN);
+    assert!(
+        answered.is_some(),
+        "a POLL_ADD on a handle carrying no WAIT was neither answered nor refused in \
+         {POLL_ANSWER:?} — it was registered on nothing",
+    );
+    println!("  poll without WAIT: answered in {:?}, and the process is still here", answered.unwrap());
+}
+
+/// A `POLL_ADD` in a direction the object has no readiness in is answered.
+///
+/// **Not a refusal, and that is why it is its own arm.** The handle resolves,
+/// it carries `WAIT`, and the caller is entitled to ask — a pipe's read end
+/// simply has no writability, so there is no source to register on and nothing
+/// that could ever complete the poll. `POSIX poll(fd, POLLOUT)` on a read end is
+/// exactly this call, so it is a mistake real programs make, and the answer the
+/// kernel gave was silence.
+fn a_poll_with_no_source_is_answered() {
+    let (read, _write) = toyos::pipe_pair().expect("a pipe with a read end");
+    let answered = answered_within(POLL_ANSWER, read.as_handle(), IORING_POLL_OUT);
+    assert!(
+        answered.is_some(),
+        "a POLL_ADD for writability on a pipe's read end went unanswered for \
+         {POLL_ANSWER:?} — the poll was pushed with no source behind it",
+    );
+    println!("  poll with no source: answered in {:?}", answered.unwrap());
+}
+
+/// How long a poll on `handle` took to complete, or `None` if it never did.
+///
+/// The result word is deliberately not asserted on: `Poller::wait` hands back
+/// the token and not the CQE, and what these arms are about is that an answer
+/// arrives at all. Which word it is belongs to the kernel's own matrix.
+fn answered_within(bound: Duration, handle: RawHandle, flags: u32) -> Option<Duration> {
+    let poller = Poller::new(1);
+    poller.poll_add_fd(handle, flags, 0);
+    let started = Instant::now();
+    let mut seen = 0usize;
+    poller.wait(1, bound.as_nanos() as u64, |_| seen += 1);
+    (seen > 0).then(|| started.elapsed())
 }
 
 /// A right the handle does not carry is refused and the process carries on.
@@ -154,6 +247,16 @@ fn a_full_table_is_a_word() {
 /// lag — it accumulates — so no *kind* may be higher after the second round of
 /// rounds than after the first. Per kind and not in total, because a total
 /// hides a leak of one kind behind churn in another.
+///
+/// And each sample is a *settled* census, because the two-sample design alone
+/// still loses to the lag it describes: on a loaded CI shard the last corpse's
+/// own `Process` object outlived the parent's `wait` into the second census —
+/// `[("Process", 6, 7)]`, twice on one shard, green alone both times (PR #141
+/// run 32307331537, the same deferral `fd_lifetime` measured decaying across
+/// eight back-to-back reads). The kernel half is
+/// `issues/kernel/deferred-release-outlives-its-syscall.md`; here it is a lag
+/// and not a leak exactly when settling converges, which is what
+/// `settled_census` requires before it answers.
 fn the_kills_release_what_they_held() {
     let after_first = churn(CHURN_ROUNDS);
     let after_second = churn(CHURN_ROUNDS);
@@ -177,7 +280,26 @@ fn churn(rounds: usize) -> Census {
             .expect("spawn a holder");
         assert_eq!(status.code(), Some(HANDLE_FAULT), "a holder did not die on its bad handle");
     }
-    Census::now()
+    settled_census()
+}
+
+/// The census once the deferred queues have finished giving back what the
+/// kills released. `fd_lifetime`'s `settled_free_bytes`, for object counts:
+/// sample until two readings ten milliseconds apart agree, which is the
+/// machine saying it has finished. **A liveness bound and not a margin** — a
+/// kernel that leaks holds a stable, elevated census, is quiescent on the
+/// first pair, and the grown-kinds assertion above reds exactly as before.
+fn settled_census() -> Census {
+    let mut last = Census::now();
+    for _ in 0..SETTLE_SAMPLES {
+        std::thread::sleep(Duration::from_millis(10));
+        let next = Census::now();
+        if next == last {
+            return next;
+        }
+        last = next;
+    }
+    last
 }
 
 /// Fill every slot and require the refusal to be a word. Exits 0, which is the
@@ -228,6 +350,40 @@ fn fatal_role(role: &str) -> ! {
             let (read, _write) = toyos::pipe_pair().expect("a pipe to mistype");
             let taken = syscall::accept(read.as_handle());
             panic!("a pipe accepted a connection: {taken:?}");
+        }
+        // The submission form of `bad-handle`. The kill lands inside
+        // `io_uring_enter`, on this thread, while it is processing the SQE —
+        // so a tree that answers instead of ending comes back from `wait` and
+        // reaches the panic below with the wrong exit code.
+        "poll-bad-handle" => {
+            let poller = Poller::new(1);
+            poller.poll_add_fd(RawHandle(UNHELD_SLOT), IORING_POLL_IN, 0);
+            let mut seen = 0usize;
+            poller.wait(1, POLL_ANSWER.as_nanos() as u64, |_| seen += 1);
+            panic!("a POLL_ADD on a slot this process never held left it running ({seen} CQEs)");
+        }
+        // And of `stale`. The pipe is closed before the poll is submitted, so
+        // the handle names a slot at an earlier generation — the one case a
+        // program reaches by forgetting the order of its own close and poll.
+        "poll-stale" => {
+            let (read, _write) = toyos::pipe_pair().expect("a pipe to close");
+            let closed = read.as_handle();
+            drop(read);
+            let poller = Poller::new(1);
+            poller.poll_add_fd(closed, IORING_POLL_IN, 0);
+            let mut seen = 0usize;
+            poller.wait(1, POLL_ANSWER.as_nanos() as u64, |_| seen += 1);
+            panic!("a POLL_ADD on a handle this process closed left it running ({seen} CQEs)");
+        }
+        // No capability needed: the handle never resolves, so the call is
+        // refused before anything asks what device it names.
+        "device-reg-bad-handle" => {
+            let read = syscall::device_reg_read(
+                RawHandle(UNHELD_SLOT),
+                0,
+                toyos_abi::syscall::RegWidth::U32,
+            );
+            panic!("a device register read on a slot this process never held answered {read:?}");
         }
         // The kill is the process's, not the thread's: a handle fault raised on
         // any thread ends every thread. Asserted from the exit code, which the

@@ -372,6 +372,15 @@ enum Standing {
 /// what this branch added and answers nothing for a checkout that is only
 /// behind, whose whole answer is to merge.
 ///
+/// **Against [`main_ref`], not the literal `main` ref.** Until 2026-08-19 this
+/// asked `main...HEAD` by name, and in a linked worktree `main` is the primary
+/// checkout's branch — current only as of its last `--sync`. A worktree merged
+/// past a primary that had not synced saw every commit `origin/main` gained
+/// meanwhile attributed to itself as `Diverged`, which skips [`staleness`]
+/// entirely and hands out the destructive instruction `Resolution::Claim`
+/// carries. Asking [`main_ref`] instead is the same fix `sysroot_content_landed`
+/// already applies to the sibling question.
+///
 /// The working tree is asked separately and with `status` rather than `diff`,
 /// because a new file in `toyos-abi/src` changes the witness and no `diff`
 /// against a commit reports an untracked one.
@@ -392,7 +401,11 @@ const CLAIM_WINDOW: &str = "\
     minutes of eight agents' time on 2026-08-07.";
 
 fn standing(root: &Path) -> Standing {
-    let mut ahead = vec!["diff", "--quiet", "main...HEAD", "--"];
+    let Some(main) = main_ref(root) else {
+        return Standing::Unknown;
+    };
+    let range = format!("{main}...HEAD");
+    let mut ahead = vec!["diff", "--quiet", range.as_str(), "--"];
     ahead.extend(SYSROOT_SOURCES);
     let committed =
         Command::new("git").args(&ahead).current_dir(root).status().ok().and_then(|s| s.code());
@@ -1892,6 +1905,39 @@ mod tests {
             standing(&root),
             Standing::MatchesMain,
             "a worktree that has not merged main is not diverged from it"
+        );
+    }
+
+    /// **A stale local `main` must not stand in for `origin/main`.** In a
+    /// linked worktree, `main` is the primary checkout's branch and moves only
+    /// on `--sync`; a worktree merged past a primary that has not synced would
+    /// see every commit `origin/main` gained meanwhile attributed to itself.
+    /// Reproduces the geometry measured on 2026-08-19 (`wt/toyos-dfault`, PR
+    /// #125): the branch is byte-identical to `origin/main` in the witnessed
+    /// trees, but the primary's local `main` still lags behind it.
+    #[test]
+    fn a_worktree_past_a_stale_local_main_has_no_standing_to_claim() {
+        let root = scratch("stale-main-ref");
+        let base = git_stdout(&root, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+        // Somebody else's ABI change, landed on the real main upstream.
+        fs::write(root.join("toyos-abi/src/lib.rs"), b"pub struct A(pub u64);\n").unwrap();
+        git(&root, &["commit", "-qam", "somebody else's ABI change, landed upstream"]);
+
+        // The worktree merged up to that landed change.
+        git(&root, &["checkout", "-qb", "wt/lags"]);
+        let landed = git_stdout(&root, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+
+        // `origin/main` — the local remote-tracking ref — reflects the landing.
+        git(&root, &["update-ref", "refs/remotes/origin/main", &landed]);
+        // The primary checkout's local `main` does not: it is still where it
+        // was before the landing, exactly as an un-synced primary is.
+        git(&root, &["branch", "-f", "main", &base]);
+
+        assert_eq!(
+            standing(&root),
+            Standing::MatchesMain,
+            "a worktree matching origin/main must not be told it diverges from a stale local main"
         );
     }
 

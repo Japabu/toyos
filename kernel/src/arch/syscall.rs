@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 use super::entry::{restore_user_state, ring3_naked_asm, save_user_state, Ring3Entry};
-use super::{cpu, gdt};
+use super::{cpu, percpu};
 use crate::drivers::acpi;
 use crate::mm::paging::{CachePolicy, Occupancy};
 use crate::user_ptr::{SyscallContext, UserBytes, UserBytesMut};
@@ -11,6 +11,8 @@ use crate::object::{ops, port, KObjectRef};
 use crate::time::{Cadence, Deadline, Duration};
 use crate::{device, log, pipe, process, vfs};
 use crate::{DirectMap, UserAddr};
+
+use toyos_untrusted::Untrusted;
 
 // MSR addresses
 const MSR_EFER: u32 = 0xC000_0080;
@@ -166,7 +168,7 @@ pub fn init() {
     let efer = cpu::rdmsr(MSR_EFER);
     cpu::wrmsr(MSR_EFER, efer | 1);
 
-    let star = ((gdt::STAR_SYSRET_BASE as u64) << 48) | ((gdt::KERNEL_CS as u64) << 32);
+    let star = ((percpu::STAR_SYSRET_BASE as u64) << 48) | ((percpu::KERNEL_CS as u64) << 32);
     cpu::wrmsr(MSR_STAR, star);
     // `LSTAR` is an IDT slot by another name: the one thing `syscall` can reach.
     cpu::wrmsr(MSR_LSTAR, Ring3Entry::new(syscall_entry).addr());
@@ -821,7 +823,17 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_process_stats(&ctx, RawHandle(a1 as u32), addr)
         },
         SYS_SET_THREAD_NAME => {
-            let len = (a2 as usize).min(process::THREAD_NAME_LEN);
+            // `a2` used to be clamped to `THREAD_NAME_LEN` with `.min`, which
+            // silently set the truncated prefix of a name too long to fit
+            // rather than telling the caller its name did not fit —
+            // `issues/isolation/untrusted-sites-not-yet-adopted.md`'s
+            // pattern for the whole file. Refused by name instead: a length
+            // past the bound is the caller's argument being wrong, not a
+            // shorter name to go write.
+            let Ok(len) = Untrusted::new(a2).at_most(process::THREAD_NAME_LEN as u64) else {
+                return SyscallError::InvalidArgument.to_u64();
+            };
+            let len = len as usize;
             let Some(bytes) = ctx.user_bytes(UserAddr::new(a1), len as u64) else {
                 return bad_addr;
             };
@@ -1005,18 +1017,31 @@ fn sys_device_reg(handle: RawHandle, offset: u64, width: u64, value: Option<u64>
     let Some(width) = toyos_abi::syscall::RegWidth::from_raw(width) else {
         return SyscallError::InvalidArgument.to_u64();
     };
+    // **The table's own rule, and not one invented here.** This answered
+    // `NotFound` for every way the handle could fail to resolve, so a process
+    // naming a slot it never held — or one it had closed — was told its device
+    // was missing, where `SYS_DEVICE_CLAIM` beside it ends the caller for the
+    // same mistake (`object::HandleError::refuse_as_error`). `get` is asked
+    // for the type, so a pipe presented here is the `WrongType` that it is.
     let target = process::with_fd_owner_data(|data| {
-        match data.handles.get_ref(handle, Rights::NONE) {
-            Ok(KObjectRef::Device(d)) => match d.class() {
+        data.handles
+            .get::<crate::object::device::DeviceClaim>(handle, Rights::NONE)
+            .map(|claim| match claim.class() {
                 device::DeviceType::HdaAudio => Some(RegTarget::Hda),
                 device::DeviceType::VirtioSound => Some(RegTarget::VirtioSound),
                 _ => None,
-            },
-            _ => None,
-        }
+            })
     });
+    // Nothing held: `with_fd_owner_data` has given the guard up, which is what
+    // `refuse` requires of the three kinds that do not come back from it.
+    let target = match target {
+        Ok(t) => t,
+        Err(e) => return e.refuse(),
+    };
+    // A claim of a class with no register window. A different fact from "no
+    // such device", and the one word left here that is not a lie.
     let Some(target) = target else {
-        return SyscallError::NotFound.to_u64();
+        return SyscallError::NotSupported.to_u64();
     };
     match value {
         None => {

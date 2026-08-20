@@ -280,6 +280,17 @@ actuators! {
     /// See `xhci/device.rs`'s `selftest`.
     xhci_descriptor_selftest = "xhci-descriptor-selftest";
 
+    /// Run `Virtqueue::poll_used` over eleven crafted used-ring elements at
+    /// init. Both fields of a used-ring element are written by the device, and
+    /// every virtio device QEMU implements writes correct ones — no device
+    /// property, machine property or backend makes one report a head
+    /// descriptor it was never given or a length past the buffer it was
+    /// posted. So without this the parse's refusals would ship never having
+    /// executed. The queue and its DMA page are real and the shipped
+    /// `poll_used` is what runs; only the writer of the ring is the kernel
+    /// instead of a device. See `drivers/virtio.rs`'s `used_selftest`.
+    virtio_used_selftest = "virtio-used-selftest";
+
     /// Leave every AP holding the CR0 and CR4 that INIT left it, which is what
     /// every boot before `arch/control_regs.rs` was: caching disabled, WP clear,
     /// NE clear. `control_regs_negative` boots it and holds the verdict against
@@ -431,8 +442,8 @@ actuators! {
     /// See `arch::percpu_fetch_add`.
     log_shared_reservation = "log-shared-reservation";
 
-    /// Let a `SysCap` or a `Console` close cancel every poll in the machine on
-    /// the source it names — the log's readiness and the keyboard's.
+    /// Let a handle close cancel every poll in the machine on `Source::Log` —
+    /// which is every `SysCap`'s.
     ///
     /// **A real prior behaviour and the defect `/bin/logd` would have lived
     /// under.** `ops::close` cancelled by source across every ring, which is
@@ -441,7 +452,29 @@ actuators! {
     /// poll. It cannot be staged from the host — which process closes which
     /// handle is decided inside the guest, and the two processes involved need
     /// not know about each other at all, which is the whole shape of the bug.
+    ///
+    /// It used to cover the keyboard too, because the question was asked of the
+    /// object and one switch answered for both of the objects that got it
+    /// wrong. The question is the *source*'s now
+    /// (`Source::ended_by_its_last_handle`), so the keyboard has its own name
+    /// below and this one restores exactly the log half.
     log_close_cancels_any_syscap = "log-close-cancels-any-syscap";
+
+    /// Let a handle close cancel every poll in the machine on
+    /// `Source::Keyboard` — the keyboard claim's, and every `Console`'s.
+    ///
+    /// **The keyboard half of the row above, and a live cross-cancellation
+    /// rather than an invented one.** While `object::ops` asked the question of
+    /// the object, `Device(_)` answered "this ends its sources" unconditionally,
+    /// so the one process holding the keyboard claim closing its handle posted
+    /// `-NotFound` into every pending `POLL_ADD` on stdin in the machine —
+    /// libc's terminal read is what arms them, so the blast radius was every
+    /// program waiting for a keystroke, none of which holds a device or was
+    /// consulted. It cannot be staged from the host: which process closes which
+    /// handle is decided inside the guest, and the claim's holder and the poll's
+    /// owner need not know about each other at all, which is the whole shape of
+    /// the bug. `Source::ended_by_its_last_handle`, in `kernel/src/io_uring.rs`.
+    keyboard_close_cancels_every_console = "keyboard-close-cancels-every-console";
 
     /// Bypass `ConsoleObject`'s line buffer: every userland `write` reaches the
     /// backend as it arrives.

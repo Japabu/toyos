@@ -67,12 +67,93 @@ zeros. Whatever this frame is, it is not a page that came back from
 full suite green on this test immediately before and passed it `ALONE`
 immediately after.
 
+## 2026-08-19, 22:03 UTC: a third sighting — shifted the same way, and **not under load**
+
+`wt/toyos-i8042deep`, dev host, `cargo test --test toyos-build -- i8042_ --jobs
+1 --host-slots 0`: **one guest on the machine**, which is what this heading's
+"under a wide suite" no longer covers. The red's name was `i8042_budget_expiry`
+and that is the workload, not the cause — `ALONE: GREEN` in the same session, and
+the same kernel booted the run's other eight guests green. The branch's whole
+delta is host-side harness code (`tests/toyos.rs`, `src/redlist.rs`); no kernel
+file is touched.
+
+```
+FAIL i8042_budget_expiry: [qemu] Init process crashed during boot:
+[kernel 0.322 cpu1] KERNEL PANIC: execute unmapped address at 0x1b
+[kernel 0.323 cpu1]     rax=0x000000ffff5fff90  rbx=0x0000000000000023
+[kernel 0.323 cpu1]     rbp=0x0000000000010246  rsp=0xffff800002673000
+[kernel 0.323 cpu1]     cs=0x0008  ss=0x0010  rflags=0x0000000000257842
+[kernel 0.323 cpu1]   Syscall: num=90 user_rip=0x1000003d598 user_rsp=0xffffffdac0
+[kernel 0.323 cpu1]   User backtrace:
+[kernel 0.325 cpu1]     0x1000003d598  <std::sys::process::toyos::Command>::spawn+0x398
+[kernel 0.325 cpu1]   Stack (from RSP):
+[kernel 0.325 cpu1]     [0xffff800002673000] = 0x0000000000000000
+[kernel 0.325 cpu1]     [0xffff800002673008] = 0x000000000000c983
+[kernel 0.325 cpu1]     [0xffff800002673010] = 0x000000000016e000
+[kernel 0.325 cpu1]     [0xffff800002673018] = 0x000001000008dd80
+```
+
+Three things it adds, and one it takes away:
+
+- **The frame is shifted, not zeroed, and by the same amount.** `rbp` is
+  `0x10246` again — `RFLAGS` with `RF` set — `rsp` is the same 4 KiB boundary
+  `0xffff800002673000`, and `rax`, `rbx` and `rflags` are identical to the
+  sighting above. The first four stack words agree too: `0`, `0xc983` against
+  `0xc943`, `0x16e000` exactly, and a user address in slot 3. Same mechanism,
+  second instance; the zeroed-page one still has one.
+- **It names the syscall and the caller**, which the earlier report had no line
+  for: `num=90` from `<std::sys::process::toyos::Command>::spawn+0x398`. The
+  faulting context is a process spawn.
+- **`0xc983`/`0xc943` is not an address and not a flags word**, and it sits one
+  slot above `rsp` in both. Whatever writes this frame writes that too, and it
+  moved by `0x40` between the two.
+- **"Under load" comes off the description.** One guest, no width, no other
+  suite on the host. This does not need contention.
+
+## 2026-08-19, 22:40 UTC: a fourth sighting — **the same user `rip`**
+
+Same worktree, same session, the full `cargo test` twelve wide with another
+worktree's suite on the host (`toyos-spawnrule` holding guest slots). The red's
+name was `nvme_large_device`; `ALONE: GREEN`.
+
+```
+FAIL nvme_large_device: [qemu] Init process crashed during boot:
+[kernel 0.936 cpu1] KERNEL PANIC: execute unmapped address at 0x1b
+[kernel 0.936 cpu1]     rax=0x000000ffff5fff90  rbx=0x0000000000000023
+[kernel 0.936 cpu1]     rbp=0x0000000000010297  rsp=0xffff800001de9000
+[kernel 0.936 cpu1]     cs=0x0008  ss=0x0010  rflags=0x0000000000257bc2
+[kernel 0.936 cpu1]   Syscall: num=90 user_rip=0x1000003d598 user_rsp=0xfffec007b0
+[kernel 0.937 cpu1]   Stack (from RSP):
+[kernel 0.937 cpu1]     [0xffff800001de9000] = 0x0000000000000000
+[kernel 0.937 cpu1]     [0xffff800001de9008] = 0x0000000000016fb1
+[kernel 0.937 cpu1]     [0xffff800001de9010] = 0xffff800001de9000
+[kernel 0.937 cpu1]     [0xffff800001de9018] = 0xffff800001de9000
+```
+
+**`user_rip=0x1000003d598` is the same address as the sighting above it**, in a
+different guest booting a different configuration — a PIE loaded at the same
+base, so the same instruction. The symbol printed differs
+(`GCC_except_table275+0x4` here, `<std::sys::process::toyos::Command>::spawn+0x398`
+there) because the two images carry different symbol tables, not because the
+call site moved. **Both of the sightings that printed a `Syscall:` line at all
+are `num=90` from that one `rip`** — the 2026-08-15 report predates the line and
+says nothing either way — and `rax`/`rbx` are identical across all three.
+
+What differs: `rbp` is `0x10297` rather than `0x10246` and `rflags` is
+`0x257bc2` rather than `0x257842` — still `RF`-set flags words, one slot off —
+and the stack under it holds two copies of `rsp` itself rather than the
+`0x16e000`/user-address pair. So the frame is shifted again, but not by the same
+distance and not over the same contents.
+
 ## What to do with it
 
 Not reproducible on demand, so nothing here is a repro recipe. The value is the
-register state: **the next sighting should be compared against this one on
-whether the frame is zeroed or shifted**, because those are two different
-mechanisms and the tree now has one instance of each. `issues/kernel/poison-set-holds-one-thread-per-cpu.md`
-is the other open thread the first sighting pulled on.
+register state: **each sighting is compared against the others on whether the
+frame is zeroed or shifted**, because those are two different mechanisms and the
+tree now has one instance of the first and three of the second. The shared user
+`rip` is the newest thread to pull: every shifted-frame sighting is a
+`spawn`-path syscall from the same instruction.
+`issues/kernel/poison-set-holds-one-thread-per-cpu.md` is the other open thread
+the first sighting pulled on.
 
 Do not close this on green runs.

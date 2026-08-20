@@ -271,7 +271,19 @@ fn read_protocols(
 fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
     log!("xHCI: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
 
-    let bar_addr = pci_dev.read_bar_64(0);
+    // Refused for the same reason the missing-interrupt path just below is:
+    // leave the controller exactly as firmware left it, with nothing
+    // enumerated on it to claim otherwise, and say what the machine has. xHCI
+    // 1.2 §5.2.1 puts the capability registers in a memory BAR 0, so a
+    // controller answering otherwise is one this driver cannot address.
+    let bar_addr = match pci_dev.memory_bar(0) {
+        Ok(memory) => memory.address(),
+        Err(why) => {
+            log!("xHCI: NOT INITIALISED at PCI {:02x}:{:02x}.{} — its capability registers are in \
+                 BAR 0 and {}", pci_dev.bus, pci_dev.dev, pci_dev.func, why);
+            return None;
+        }
+    };
     pci_dev.enable_bus_master();
     log!("xHCI: BAR0={:#x}", bar_addr);
 

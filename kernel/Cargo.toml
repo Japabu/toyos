@@ -149,6 +149,7 @@ toyos-hda = { path = "../toyos-hda" }
 toyos-pci = { path = "../toyos-pci" }
 toyos-ps2 = { path = "../toyos-ps2" }
 toyos-sched = { path = "../toyos-sched" }
+toyos-untrusted = { path = "../toyos-untrusted" }
 toyos-userbound = { path = "../toyos-userbound" }
 toyos-wallclock = { path = "../toyos-wallclock" }
 toyos-xhci = { path = "../toyos-xhci" }

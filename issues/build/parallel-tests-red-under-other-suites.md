@@ -147,15 +147,38 @@ changes.
   reaping processes. One extra `Process` between two samples is another test's
   reap that had not landed yet, and nothing in that boot arranges for it not to
   be. Still `Sched::Parallel`.
-  **Seen again 2026-08-18** on `wt/toyos-purecrates`, whose whole delta is three
+
+  **It has since fired on CI, byte-identical, which is what this bullet said it
+  had not done.** Run `32047352064`, job `95438242676` (`guest (2)`),
+  `wt/toyos-invariantp` at its merge of `origin/main`, 2026-08-17: the same
+  `[("Process", 6, 7)]`, the same `ALONE … GREEN`, shard 2's other twelve names
+  passing. The sentence above recording it "green on all twelve KVM shards"
+  stays true of the tree it was taken on and is no longer true of the name.
+
+  **That cuts against half of this bullet's explanation and leaves the other
+  half standing.** A CI shard is one guest per machine with `--jobs 1`, so
+  "another worktree's suite on the host" cannot be what did it there. What
+  survives, and is the half that was always the load-bearing one, is the
+  *shared boot*: the census is machine-wide and a shard runs its whole tier
+  through one guest, so a co-resident test's unreaped `Process` perturbs it
+  whatever else the host is doing. **Consistent with that mechanism, not
+  established as it** — nothing in the capture identifies which process the
+  extra object belonged to, and the assertion prints a type and a count rather
+  than an owner. Making it print the owner is the cheap next step if this
+  recurs, and it is what would turn a consistent story into a measured one.
+
+  **And again 2026-08-18** on `wt/toyos-purecrates`, whose whole delta is three
   kernel files moving into two pure crates with no line of their logic changed —
-  and the message is byte-identical to the one above, numbers included: `16 more
-  killed processes left more live objects behind: [("Process", 6, 7)]`.
+  the message byte-identical to both above, numbers included: `16 more killed
+  processes left more live objects behind: [("Process", 6, 7)]`.
   `cargo test --test toyos-build -- handle_kill_policy` on the same tree
-  immediately afterwards: `PASS handle_kill_policy (615ms)`. A second sighting
-  of the same census on an unrelated branch is what the mechanism above
-  predicts. `cargo run -- --known-red handle_kill_policy` still answers `NOT ON
-  THE LIST`, so this entry remains the whole record of it.
+  immediately afterwards: `PASS handle_kill_policy (615ms)`. A third sighting of
+  the same census, on a third unrelated branch, is what the mechanism above
+  predicts — and the three together are why it is no longer only this file's
+  record: `src/redlist.rs` carries an `Instrument::Ci` row for
+  `handle_kill_policy` as of the CI sighting, so `cargo run -- --known-red
+  handle_kill_policy` now answers it.
+
 - **`wall_clock_file`** — added 2026-08-17, same session, **1 of 6**,
   `ALONE … GREEN`, green on all twelve shards of the same tree. Not
   investigated further.
@@ -166,6 +189,44 @@ changes.
   `[host-slots]` lines. `the close probe exited Some(1)`, `ALONE … GREEN`, and
   `cargo run -- --known-red log_poll_outlives_a_close` answers `NOT ON THE
   LIST`, so this is its first recorded sighting. Not investigated.
+- **`metal_sim_input`** — added 2026-08-18, **1 of 4** runs on
+  `wt/toyos-lifecycle` (kernel delta: `process_poll_add`'s refusal split and
+  `Source::ended_by_its_last_handle`, neither of them on a boot path), inside a
+  window whose own console lines are `[build-lock] waiting for the artifact lock
+  … 26s so far` — another worktree staging an image throughout. `kernel panic:
+  DOUBLE PANIC … after 0 of the sequence`, so it died **before the first
+  injection**, which is the boot and not the test. `ALONE … GREEN` in 2 s
+  against 20 s under load, then green 3 of 3 more alone.
+  `cargo run -- --known-red metal_sim_input` answers `NOT ON THE LIST`.
+
+  **Its mechanism is not this file's census race and it is filed here for want
+  of a better register.** A kernel panic during a loaded boot is
+  `issues/kernel/a-ring-0-fetch-at-0x1b-during-a-loaded-boot.md` and
+  `issues/kernel/the-shared-boot-jumped-to-null-spawning-sched-stress.md`,
+  each of which is one sighting carrying the *guest's own panic text*. This one
+  has none: `TestResult::error` carried the verdict, a failing test's guest
+  console is not printed, and by the time the re-runs were green the capture was
+  gone. **What the next sighting owes is that console**, and the way to get it is
+  a full suite beside a second worktree's — not a search of a passing boot.
+- **`diskless_boot`** — added 2026-08-19, one full `cargo test` on
+  `wt/toyos-i8042deep`, whose whole delta is host-side harness code
+  (`tests/toyos.rs`, `src/redlist.rs`) and no kernel file at all. Twelve wide
+  with `toyos-spawnrule`'s suite holding guest slots throughout, named in that
+  run's own `[host-slots]` lines. `[qemu] QEMU died before ===READY=== (status:
+  Ok(ExitStatus(unix_wait_status(0))))` — **QEMU exited zero**, so this is
+  neither a guest that panicked nor a wall-clock guard reporting the content it
+  was going to assert; it is the process going away cleanly before the guest was
+  ready, which nothing here explains. 7 s under load, `ALONE: GREEN` in 3 s, and
+  `cargo run -- --known-red diskless_boot` answered `NOT ON THE LIST`. Not
+  investigated.
+- **`nvme_large_device`** — same run, same session, and **its mechanism is not
+  this file's**: a machine-wide `KERNEL PANIC: execute unmapped address at 0x1b`
+  in ring 0 on a `spawn` syscall, which is
+  `issues/kernel/a-ring-0-fetch-at-0x1b-during-a-loaded-boot.md`'s class and is
+  recorded there with its registers — the console `metal_sim_input` above owes,
+  paid by a different name. Listed here only so this register resolves the name
+  too: the red is the panic and `nvme_large_device` is the workload it
+  interrupted. `ALONE: GREEN`.
 
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits

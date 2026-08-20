@@ -117,6 +117,18 @@ Two consequences, both landed:
 - **The `Instrument::DevHostAlone` row in `src/redlist.rs` is retired** and a
   `DevHostLoaded` one takes its place. The dev host, alone and quiet, is green.
 
+**Both rows are retired now, on 2026-08-18, and the second one by the experiment
+this file's numbers argued for.** Quiet and loaded arms interleaved in one
+session, twelve CPU-runs each: 0 of 12 quiet over the budget at the 90th
+percentile against 9 of 12 loaded, 6 of 6 runs green against 6 of 6 red, with the
+arms separated by boot width alone. The whole distribution translates one
+power-of-two bucket under host load — so the harness stopped drawing a line over
+this distribution on this accelerator at all. Cross-arch TCG now *reports* its
+pass costs and judges no magnitude; `tests/common/passcost.rs` holds the
+experiment and both recorded samples. The three things `sched_check_build` still
+gates here are unchanged: a clean boot, the check-build asserts not firing, and
+`sched_stress` running to completion.
+
 With the reclassification in, the whole suite came back **263 of 263 green**, and
 the serial tail's own report is the strongest single statement this file can
 make:

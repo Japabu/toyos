@@ -458,6 +458,9 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // Every verdict is a line of text or a device property, and no clock is in
     // any of them.
     ("virtio_net_no_msix", Sched::Parallel, Tier::Fast),
+    // One boot, and its verdict is a line the kernel printed before any device
+    // was brought up. No clock and no device in it.
+    ("virtio_used_ring", Sched::Parallel, Tier::Fast),
     ("xhci_many_devices", Sched::Parallel, Tier::Fast),
     // Its whole assertion is that a keystroke injected from the host crossed a
     // USB keyboard on the *second* controller, and `input_events_run` sends
@@ -532,15 +535,24 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // What the C family is allowed to conclude from the line above being whole:
     // a guest writes a daemon-shaped line into a real capture window on purpose
     // and the real comparison ignores it, with the filter turned off as the
-    // control. Parallel and Fast: one boot, two `echo`s, and every verdict is a
-    // string comparison the host makes over a capture — no clock in it.
-    ("c_capture_ignores_daemon_lines", Sched::Parallel, Tier::Fast),
+    // control. One boot, two `echo`s, and every verdict is a string comparison
+    // the host makes over a capture — no clock in it; Nightly because its
+    // *wall* clock is whatever the partition co-schedules, and it straddles the
+    // fast line run to run (`src/tiers.rs` has the two measurements).
+    ("c_capture_ignores_daemon_lines", Sched::Parallel, Tier::Nightly),
     // A poll on the machine's log against a *handle* going away. Parallel and
     // Fast: both halves are verdicts the guest computes — a completion count
     // immediately after a close, retried against a record arriving in the same
     // microseconds, and a completion afterwards bounded far above the two
     // scheduler passes it needs.
     ("log_poll_outlives_a_close", Sched::Parallel, Tier::Fast),
+    // The same question asked of the keyboard, where two *kinds* of object name
+    // one source: a poll on stdin against the keyboard claim going away, a poll
+    // on the mouse claim against its own, and an injected keystroke to show the
+    // first was still armed. Parallel and Fast: two of the three verdicts are
+    // counts the guest takes immediately after a close on its own thread, and
+    // the third is bounded far above the one interrupt it waits for.
+    ("keyboard_claim_close_spares_stdin", Sched::Parallel, Tier::Fast),
     // One boot that stops dead in phase 3, read for what it managed to say.
     ("pre_idle_wedge_speaks", Sched::Parallel, Tier::Fast),
     ("i8042_health", Sched::Parallel, Tier::Nightly),
@@ -548,12 +560,18 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // three carry the answer the last of them needs.
     //
     // None of the three measures a rate. All three keep fewer bytes in flight
-    // than QEMU's PS/2 device holds — `i8042_mouse` by pacing against the
-    // guest's own report, within [`MOUSE_LEAD`] — so a guest with less of the
-    // host is a longer run and not a smaller count. `i8042_keyboard` itself
-    // held the group Nightly on a cost that was really the fixed 5 s
-    // collection deadline in `test_rs_i8042_keyboard`; now that the binary
-    // exits on a sentinel instead, all three return.
+    // than QEMU's PS/2 device holds, and all three do it the same way: nothing
+    // goes out until the guest has reported what the injection before it
+    // produced — `i8042_mouse` within [`MOUSE_LEAD`], the two keyboard ones a
+    // group at a time. So a guest with less of the host is a longer run and not
+    // a smaller count. **A wall clock cannot buy that bound**: the two keyboard
+    // tests spaced their injections with `thread::sleep` and put 26 and 20
+    // bytes against a sixteen-byte device queue, which held only as long as the
+    // guest kept draining, and a stalled guest lost bytes with nothing anywhere
+    // reporting a loss. `i8042_keyboard` itself held the group Nightly on a cost
+    // that was really the fixed 5 s collection deadline in
+    // `test_rs_i8042_keyboard`; now that the binary exits on a sentinel instead,
+    // all three return.
     ("i8042_keyboard", Sched::Parallel, Tier::Fast),
     ("i8042_no_spurious_wake", Sched::Parallel, Tier::Fast),
     ("i8042_mouse", Sched::Parallel, Tier::Fast),
@@ -1942,7 +1960,7 @@ fn measure_audio_run(
 
     let result = qemu.run_test(&format!("test_rs_{name}"), Duration::from_secs(30));
     if let Some(err) = &result.error {
-        return Err(err.clone());
+        return Err(err.to_string());
     }
     match result.exit_code {
         Some(0) => {}
@@ -4813,9 +4831,17 @@ fn metal_sim_window_drag(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> 
     );
 
     if result.error.is_some() || result.exit_code != Some(0) {
+        // **`{:?}` on the verdict is what this arm used to say**, and a `Debug`
+        // of a multi-line report is one line of `\n` escapes — the kernel's own
+        // account of a death, rendered unreadable by a format specifier. It is
+        // printed as itself now.
+        let why = match &result.error {
+            Some(err) => err.to_string(),
+            None => String::from("it finished and its exit code is the finding"),
+        };
         return Err(format!(
-            "window_drag exited {:?} ({:?}):\n{}",
-            result.exit_code, result.error, result.stdout
+            "window_drag exited {:?}: {why}\n{}",
+            result.exit_code, result.stdout
         ));
     }
 
@@ -4917,18 +4943,59 @@ fn compositor_screen_size(console: &str) -> Result<(u32, u32), String> {
 }
 
 /// End's release: the sentinel `test_rs_i8042_keyboard` exits on
-/// (`tests/toyos-rust-tests/src/bin/i8042_keyboard.rs`). No caller of that
-/// binary injects End itself, so every caller but `i8042_health_cadence` —
-/// whose verdict is a report cadence over a real span, not a delivered key —
-/// sends this after its last injection instead of running out the binary's
-/// fallback deadline.
+/// (`tests/toyos-rust-tests/src/bin/i8042_keyboard.rs`). Every caller that
+/// injects through a fresh connection sends this after its last injection
+/// instead of running out the binary's fallback deadline, except
+/// `i8042_health_cadence` — whose verdict is a report cadence over a real span,
+/// not a delivered key. The two callers that hold one connection open for the
+/// whole run ([`i8042_keyboard`], [`i8042_no_spurious_wake`]) send the same two
+/// transitions as the last group of their own script: a `-qmp …,server` socket
+/// serves one monitor at a time, so a second one opened here would block.
 fn send_i8042_sentinel(socket: &Path) {
     qemu::qmp_send_keys(socket, &[("end", true), ("end", false)]);
 }
 
+/// What [`i8042_keyboard`] types, as the groups it may have in flight at once,
+/// each with the number of `kev` lines the guest owes for it.
+///
+/// **A group is the unit of pacing, and its size is bounded by
+/// [`QEMU_PS2_QUEUE`].** The device holds sixteen set-1 bytes and
+/// `ps2_queue()` drops the seventeenth *silently and one byte at a time*; the
+/// kernel never learns of it, so its `dropped`/`lost edges`/`overruns`
+/// counters all read zero on a stream with a hole in it. What a lost byte
+/// costs is not one transition: a lost make leaves its break to be filtered by
+/// `handle_key` — a break for a usage nothing holds queues nothing — so the
+/// whole key disappears, and a lost `0xE0` leaves the break to decode as an
+/// unrelated keypad code that also holds nothing, so a press survives with no
+/// release. Sending the script on a wall clock and hoping the guest keeps up
+/// is what put 26 bytes against those 16 and produced both of those shapes on
+/// CI. The largest group below is four bytes.
+const KEYBOARD_SCRIPT: &[(&[(&str, bool)], usize)] = &[
+    (&[("h", true), ("h", false)], 2),
+    (&[("e", true), ("e", false)], 2),
+    (&[("l", true), ("l", false)], 2),
+    (&[("l", true), ("l", false)], 2),
+    (&[("o", true), ("o", false)], 2),
+    // One command, so the chord arrives as a chord rather than as a race.
+    (&[("shift", true), ("b", true), ("b", false), ("shift", false)], 4),
+    (&[("left", true), ("left", false)], 2),
+    (&[("esc", true), ("esc", false)], 2),
+    // A modifier on its own, so a stuck one is visible.
+    (&[("shift", true)], 1),
+    (&[("shift", false)], 1),
+    // The sentinel the guest exits on; see [`send_i8042_sentinel`].
+    (&[("end", true), ("end", false)], 2),
+];
+
 /// A key injected at the controller, decoded, mapped and delivered to a
 /// userland process — IRQ delivery, set-1 decode, the HID mapping and the
 /// shared translate/layout path, in one run.
+///
+/// **Paced against the guest's own report**, for [`i8042_mouse`]'s reason and
+/// [`KEYBOARD_SCRIPT`]'s: a group goes out only once every `kev` line the one
+/// before it owed has come back, so at most four bytes are ever outstanding at
+/// a device that holds sixteen. A guest that stalls costs this test wall clock
+/// and never a verdict.
 fn i8042_keyboard(boot: &mut Boot) -> Result<(), String> {
     let qemu = &mut boot.qemu;
     let boot = qemu.boot_log().to_string();
@@ -4936,34 +5003,49 @@ fn i8042_keyboard(boot: &mut Boot) -> Result<(), String> {
         return Err(format!("the PS/2 keyboard never came up:\n{boot}"));
     }
 
-    let result = qemu.run_test_hooked(
-        "test_rs_i8042_keyboard",
-        Duration::from_secs(20),
-        I8042_READY,
-        |socket| {
-            for key in ["h", "e", "l", "l", "o"] {
-                qemu::qmp_send_keys(socket, &[(key, true), (key, false)]);
-                thread::sleep(Duration::from_millis(20));
-            }
-            qemu::qmp_send_keys(
-                socket,
-                &[("shift", true), ("b", true), ("b", false), ("shift", false)],
-            );
-            thread::sleep(Duration::from_millis(20));
-            for key in ["left", "esc"] {
-                qemu::qmp_send_keys(socket, &[(key, true), (key, false)]);
-                thread::sleep(Duration::from_millis(20));
-            }
-            // A modifier on its own, so a stuck one is visible.
-            qemu::qmp_send_keys(socket, &[("shift", true)]);
-            thread::sleep(Duration::from_millis(20));
-            qemu::qmp_send_keys(socket, &[("shift", false)]);
-            thread::sleep(Duration::from_millis(20));
-            send_i8042_sentinel(socket);
-        },
-    );
+    let sent = std::cell::Cell::new(0usize);
+    let seen = std::cell::Cell::new(0usize);
+    let result = {
+        let mut input: Option<qemu::QmpInput> = None;
+        qemu.run_test_paced(
+            "test_rs_i8042_keyboard",
+            Duration::from_secs(20),
+            |socket, line| {
+                if line.contains(I8042_READY) {
+                    input = Some(qemu::QmpInput::open(
+                        socket.expect("i8042_keyboard needs BootOptions { qmp }"),
+                    ));
+                }
+                if line.contains("kev usage=") {
+                    seen.set(seen.get() + 1);
+                }
+                let Some(input) = input.as_mut() else { return };
+                // What everything already sent owes. Nothing new goes out
+                // until the guest has reported all of it, which is what bounds
+                // the bytes outstanding at the device to one group's worth.
+                let owed: usize = KEYBOARD_SCRIPT[..sent.get()].iter().map(|(_, n)| n).sum();
+                if seen.get() < owed {
+                    return;
+                }
+                if let Some((keys, _)) = KEYBOARD_SCRIPT.get(sent.get()) {
+                    input.keys(keys);
+                    sent.set(sent.get() + 1);
+                }
+            },
+        )
+    };
+    let (sent, seen) = (sent.get(), seen.get());
     if let Some(err) = &result.error {
-        return Err(format!("{err}\n{}", result.stdout));
+        // The guard, not the verdict: under the pacing the host is *waiting*
+        // for the guest when this fires, so what it establishes is that the run
+        // stopped and never that the machine dropped a key.
+        let owed: usize = KEYBOARD_SCRIPT.iter().map(|(_, n)| n).sum();
+        return Err(format!(
+            "{STALLED} {err} — {sent} of {} groups sent and {seen} of {owed} key events back \
+             when the host gave up waiting for the next\n{}",
+            KEYBOARD_SCRIPT.len(),
+            result.stdout
+        ));
     }
 
     let events = parse_key_events(&result.stdout);
@@ -4992,8 +5074,13 @@ fn i8042_keyboard(boot: &mut Boot) -> Result<(), String> {
             return Err(format!("no event for HID usage {want:#04x} in {events:?}"));
         }
     }
-    // Every press is matched by a release.
-    for usage in [0x0Bu8, 0x08, 0x0F, 0x12, 0x05, 0x29, 0x50, 0xE1] {
+    // Every press is matched by a release — **the sentinel's included**. `0x4D`
+    // is End, and the guest exits on its release, so a run that never receives
+    // it runs out that binary's own five-second fallback instead and every
+    // assertion above still passes: a green test six seconds slower than its
+    // price, which is what a lost sentinel used to look like and why it was read
+    // off the `durations` gate rather than off a verdict.
+    for usage in [0x0Bu8, 0x08, 0x0F, 0x12, 0x05, 0x29, 0x50, 0xE1, 0x4D] {
         let presses = events.iter().filter(|e| e.usage == usage && e.modifiers & 0x10 == 0).count();
         let releases = events.iter().filter(|e| e.usage == usage && e.modifiers & 0x10 != 0).count();
         if presses == 0 || presses != releases {
@@ -5018,7 +5105,11 @@ fn i8042_keyboard(boot: &mut Boot) -> Result<(), String> {
     if drained == 0 {
         return Err("no i8042 drain reported a key event".to_string());
     }
-    eprintln!("  [i8042] {} events to userland, {drained} from the driver", events.len());
+    eprintln!(
+        "  [i8042] {} events to userland, {drained} from the driver; {sent} groups, none sent \
+         before the one before it came back",
+        events.len()
+    );
     Ok(())
 }
 
@@ -6315,24 +6406,87 @@ fn soundd_clients_since(log: &str, from: usize, verb: &str) -> usize {
 /// log ring flushes one line behind, so the last trace line would never reach
 /// the console (filed in `issues/`). A guest polling its fd keeps the ring
 /// moving.
+///
+/// **The zero-event drain is arranged, not hoped for.** What a drain carries is
+/// whatever the ISR found in the ring, so a host that injects on a wall clock
+/// is asserting on a batching it does not control: a guest that does not drain
+/// between the Pause and the key that follows it takes both in one drain, and
+/// this test's whole precondition is gone. It also puts more bytes in flight
+/// than [`QEMU_PS2_QUEUE`] holds — twenty against sixteen — and the device
+/// drops the excess silently, one byte at a time. So each piece goes out only
+/// once the guest has reported what the piece before it produced: the Pause is
+/// paid by a drain the driver logged, a real key by its two `kev` lines. Six
+/// bytes outstanding at most, and a slow guest costs wall clock.
 fn i8042_no_spurious_wake(boot: &mut Boot) -> Result<(), String> {
+    /// What the guest owes for one injected group before the next goes out.
+    enum Owed {
+        /// A drain the driver reported. The only thing a swallowed sequence
+        /// produces, and therefore the only thing that can pay for one.
+        Drain,
+        /// `n` `kev` lines: a real key's make and break.
+        Keys(usize),
+    }
+
+    const SCRIPT: &[(&[(&str, bool)], Owed)] = &[
+        (&[("pause", true), ("pause", false)], Owed::Drain),
+        (&[("a", true), ("a", false)], Owed::Keys(2)),
+        (&[("pause", true), ("pause", false)], Owed::Drain),
+        (&[("a", true), ("a", false)], Owed::Keys(2)),
+        // The sentinel the guest exits on; see [`send_i8042_sentinel`].
+        (&[("end", true), ("end", false)], Owed::Keys(2)),
+    ];
+
     let qemu = &mut boot.qemu;
-    let result = qemu.run_test_hooked(
-        "test_rs_i8042_keyboard",
-        Duration::from_secs(20),
-        I8042_READY,
-        |socket| {
-            for _ in 0..2 {
-                qemu::qmp_send_keys(socket, &[("pause", true), ("pause", false)]);
-                thread::sleep(Duration::from_millis(50));
-                qemu::qmp_send_keys(socket, &[("a", true), ("a", false)]);
-                thread::sleep(Duration::from_millis(50));
-            }
-            send_i8042_sentinel(socket);
-        },
-    );
+    let sent = std::cell::Cell::new(0usize);
+    let result = {
+        let mut input: Option<qemu::QmpInput> = None;
+        let mut drains = 0usize;
+        let mut keys = 0usize;
+        // The counters as they stood when the group still outstanding was sent.
+        let mut at_drains = 0usize;
+        let mut at_keys = 0usize;
+        qemu.run_test_paced(
+            "test_rs_i8042_keyboard",
+            Duration::from_secs(20),
+            |socket, line| {
+                if line.contains(I8042_READY) {
+                    input = Some(qemu::QmpInput::open(
+                        socket.expect("i8042_no_spurious_wake needs BootOptions { qmp }"),
+                    ));
+                }
+                if trace_keys(line).is_some() {
+                    drains += 1;
+                }
+                if line.contains("kev usage=") {
+                    keys += 1;
+                }
+                let Some(input) = input.as_mut() else { return };
+                let paid = match SCRIPT.get(sent.get().wrapping_sub(1)) {
+                    None => true,
+                    Some((_, Owed::Drain)) => drains > at_drains,
+                    Some((_, Owed::Keys(n))) => keys >= at_keys + n,
+                };
+                if !paid {
+                    return;
+                }
+                if let Some((group, _)) = SCRIPT.get(sent.get()) {
+                    input.keys(group);
+                    at_drains = drains;
+                    at_keys = keys;
+                    sent.set(sent.get() + 1);
+                }
+            },
+        )
+    };
+    let sent = sent.get();
     if let Some(err) = &result.error {
-        return Err(format!("{err}\n{}", result.stdout));
+        // The guard, not the verdict: the host is waiting on the guest here.
+        return Err(format!(
+            "{STALLED} {err} — {sent} of {} groups sent when the host gave up waiting for what \
+             the last one owed\n{}",
+            SCRIPT.len(),
+            result.stdout
+        ));
     }
 
     let mut zero_event_drains = 0;
@@ -6353,8 +6507,13 @@ fn i8042_no_spurious_wake(boot: &mut Boot) -> Result<(), String> {
         }
     }
     if zero_event_drains == 0 {
+        // Not "the stimulus never landed": every Pause above was paid for by a
+        // drain before the next injection went out, so one *did* land and one
+        // drain did report it. What is left is a drain that took the Pause and
+        // produced an event out of it — which is the readiness defect itself.
         return Err(format!(
-            "no drain produced zero events — the stimulus never landed:\n{}",
+            "{sent} groups sent, each after the last was reported, and no drain produced zero \
+             events — every drain that took a swallowed Pause claimed an event:\n{}",
             result.serial
         ));
     }
@@ -6370,7 +6529,8 @@ fn i8042_no_spurious_wake(boot: &mut Boot) -> Result<(), String> {
         return Err(format!("the real key never arrived: {events:?}"));
     }
     eprintln!(
-        "  [i8042] {zero_event_drains} zero-event drains, none woke; {key_drains} real ones, all did"
+        "  [i8042] {zero_event_drains} zero-event drains, none woke; {key_drains} real ones, all \
+         did; {sent} groups, each paid for before the next"
     );
     Ok(())
 }
@@ -6378,7 +6538,34 @@ fn i8042_no_spurious_wake(boot: &mut Boot) -> Result<(), String> {
 /// QEMU's `PS2_QUEUE_SIZE` (`hw/input/ps2.c`) — what the device will hold. Not
 /// the 256-byte `PS2_BUFFER_SIZE` array behind it, which is a migration format
 /// and not a capacity.
+///
+/// **Past it the device drops, silently and one byte at a time.** Measured on
+/// QEMU 11.1: twenty-two key transitions in a single `input-send-event` — one
+/// QMP command, so the BQL is held for the whole of it and no vCPU can read
+/// port 0x60 while it runs — is 26 set-1 bytes, and the guest's driver reported
+/// `drain bytes=16` and nothing else, with `0 dropped, 0 overruns, 0 lost
+/// edges, 0 discarded`. A key sequence is *not* queued atomically the way a
+/// command reply is (`ps2_queue_2`/`_3`/`_4` refuse to split; `ps2_put_keycode`
+/// does not), so the hole lands mid-sequence: the run above delivered Left's
+/// `0xE0 0x4B` make and lost its `0xE0 0xCB` break. Nothing on the guest side
+/// can see this, which is why every injection test here is paced against the
+/// guest's own report rather than against a wall clock.
 const QEMU_PS2_QUEUE: usize = 16;
+
+/// No group of [`KEYBOARD_SCRIPT`] may outrun the device queue even if every
+/// transition in it is an `0xE0`-prefixed two-byte one, which is the widest a
+/// non-Pause set-1 transition gets.
+const _: () = {
+    let mut i = 0;
+    while i < KEYBOARD_SCRIPT.len() {
+        assert!(
+            KEYBOARD_SCRIPT[i].0.len() * 2 <= QEMU_PS2_QUEUE,
+            "an i8042_keyboard group can outrun QEMU's PS/2 queue, which drops what it \
+             cannot hold one byte at a time and says nothing"
+        );
+        i += 1;
+    }
+};
 
 /// A PS/2 pointer packet. Three bytes, because the driver's aux init sends no
 /// IntelliMouse knock and QEMU therefore frames a plain mouse.
@@ -7304,6 +7491,9 @@ fn run_machine_test(
         }
         "console_line_atomicity" => {
             common::console::console_line_atomicity(test_config, c_bins, rust_bins)
+        }
+        "keyboard_claim_close_spares_stdin" => {
+            common::console::keyboard_claim_close_spares_stdin(test_config, c_bins, rust_bins)
         }
         "iommu_context_absent" => common::iommu::iommu_context_absent(test_config, c_bins, rust_bins),
         "iommu_empty_domain" => common::iommu::iommu_empty_domain(test_config, c_bins, rust_bins),
@@ -8332,14 +8522,18 @@ fn run_machine_test(
             // compiles and counts, not what a real pass on real silicon costs.
             // Only a booted kernel reads a TSC.
             //
-            // **And the cost half is gated here rather than in the kernel.**
-            // What a pass measures is wall clock across the pass, and a guest's
-            // wall clock runs while the host has taken its vCPU away — so the
-            // quantity includes a term the host's scheduler sets. The check
-            // build publishes the distribution and `common::passcost` judges it;
-            // `passcost`'s own two-directions self-check runs first, because a
-            // gate that must stay green under host descheduling has to be shown
-            // doing so on a case no booted machine can stage.
+            // **And the cost half is gated here rather than in the kernel, and
+            // against a recorded sample rather than against the budget.** What
+            // a pass measures is wall clock across the pass, and a guest's wall
+            // clock runs while the host has taken its vCPU away — so the
+            // quantity includes a term the host's scheduler sets. Measured
+            // 2026-08-18, that term moves *every* order statistic and not only
+            // the tail, so `common::passcost` judges each accelerator against
+            // what that accelerator has been recorded producing, and takes no
+            // verdict at all where the recorded sample supports none. Its own
+            // two-directions self-check runs first, because a gate that must
+            // stay green under host descheduling has to be shown doing so on a
+            // case no booted machine can stage.
             //
             // **The workload is `sched_stress`** because the asserts are dense
             // on exactly what it does: it spawns burners that drive vruntime,
@@ -8408,11 +8602,17 @@ fn run_machine_test(
                     capture.text(),
                 ));
             }
+            // Which recorded sample this run is judged against, before the
+            // numbers it judges: a verdict taken against a sample is
+            // unreadable without naming the sample, and a run that judged
+            // nothing has to say so where a reader cannot miss it.
+            let baseline = common::passcost::baseline();
+            eprintln!("  [sched-check] {}", common::passcost::judgement_line(baseline));
             for report in &reports {
                 eprintln!("  [sched-check] {}", common::passcost::describe(report));
             }
             for report in &reports {
-                common::passcost::verdict(report)?;
+                common::passcost::verdict(report, baseline)?;
             }
             Ok(())
         }
@@ -9210,6 +9410,60 @@ fn run_machine_test(
             eprintln!("  [i8042] {}", quiet.trim());
             eprintln!("  [i8042] {}", line.trim());
             eprintln!("  [i8042] {health} idle-health lines — the CPU still halts");
+            Ok(())
+        }
+        "virtio_used_ring" => {
+            // Both fields of a virtqueue used-ring element are written by the
+            // device, and on virtio-sound's control and event queues the ring
+            // is inside a page a userland process maps writable. Every virtio
+            // device QEMU implements writes correct elements and no device or
+            // machine property makes one report a head descriptor it was never
+            // given, so a boot certifies the correct case and nothing else.
+            // The driver therefore runs the shipped `poll_used` over eleven
+            // crafted elements at init under this parameter — a real queue on a
+            // real DMA page, with the kernel writing the ring where the device
+            // would.
+            let qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    kernel_params: &["virtio-used-selftest"],
+                    ..Default::default()
+                },
+            );
+            let log = qemu.boot_log().to_string();
+            if let Some(bad) = log.lines().find(|l| l.contains("used-ring selftest FAILED")) {
+                return Err(format!("{bad}\n{log}"));
+            }
+            let Some(verdict) = log.lines().find(|l| l.contains("used-ring selftest")) else {
+                return Err(format!("the parse's self-test never ran:\n{log}"));
+            };
+            // `11/11`, not "no failures": a self-test that ran zero cases would
+            // satisfy the absence of a FAILED line just as well.
+            if !verdict.contains("11/11") {
+                return Err(format!("not every used-ring element was parsed as required: {verdict}"));
+            }
+            // Once for the machine. It touches no device, so a run per virtio
+            // driver would be four verdicts about the same eleven elements.
+            let ran = log.matches("used-ring selftest").count();
+            if ran != 1 {
+                return Err(format!("the self-test ran {ran} times, wanted once\n{log}"));
+            }
+            // And the legal direction, on the same boot and not by assertion:
+            // this log arrived over virtio-console, whose TX path is
+            // `submit_and_wait` around the same `poll_used`. A parse that
+            // refused a correct element would have produced no capture to
+            // search — but virtio-net says so in its own words, so that the
+            // legal case is *named* rather than inferred from the test running
+            // at all.
+            if !log.contains("VirtIO net:") {
+                return Err(format!("the NIC did not come up on this boot\n{log}"));
+            }
+            if let Some(bad) = log.lines().find(|l| l.contains("refused") && l.contains("RX used-ring")) {
+                return Err(format!("a correct completion was refused on the ordinary path: {bad}"));
+            }
+            eprintln!("  [virtio] {}", verdict.trim());
             Ok(())
         }
         "xhci_descriptor_walk" => {
@@ -12562,7 +12816,8 @@ fn run_task(task: Task<'_>, bins: &Bins<'_>, report: &std::sync::mpsc::Sender<Ou
                     let reason = (!(test.check)(&result)).then(|| {
                         result
                             .error
-                            .clone()
+                            .as_ref()
+                            .map(ToString::to_string)
                             .unwrap_or_else(|| format!("exit code {:?}", result.exit_code))
                     });
                     done += 1;

@@ -211,9 +211,9 @@ pub fn panic_recovers_here() -> Option<bool> {
 /// through the `shared` half without going near the process table.
 ///
 /// Panics on failure. Every caller is kernel init: a machine that cannot
-/// allocate a 16 KiB stack at boot has nothing to fall back to, and a kernel
-/// thread that silently did not start is the failure this whole subsystem
-/// exists to make impossible.
+/// allocate a [`crate::process::KERNEL_STACK_SIZE`] stack at boot has nothing
+/// to fall back to, and a kernel thread that silently did not start is the
+/// failure this whole subsystem exists to make impossible.
 pub fn spawn(name: &str, body: extern "C" fn(u64) -> !, arg: u64, on_panic: OnPanic) -> ThreadSched {
     let (stack, entry_rsp) = crate::loader::alloc_kernel_stack(
         crate::loader::kernel_start,

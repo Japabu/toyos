@@ -1,3 +1,5 @@
+use crate::mm::PAGE_SIZE;
+
 /// Unique identifier for a block device, used as page cache key.
 pub type DeviceId = u32;
 
@@ -57,20 +59,19 @@ pub trait BlockDevice: Send {
     fn flush(&mut self) -> BlockResult;
 }
 
-/// How much of RAM the two caches above this trait may hold, in 4 KiB pages.
-///
-/// Both numbers are hard ceilings, not targets. Linux lets its page cache take
-/// the whole machine because it has a pressure signal and a reclaim path to
-/// give it back on demand; ToyOS has neither (`issues/isolation/no-physical-memory-fairness.md` ("No physical
-/// memory fairness"), so a cache that grows to fit the workload is a cache
-/// that starves userland with no way to stop it. Until there is a pressure
-/// signal, the ceiling has to be a number the machine can lose outright.
-///
-/// The `test-small-caches` overrides exist because the honest ceilings are
-/// tens of megabytes: a test that reached them by doing real I/O would spend
-/// minutes proving what 256 KiB proves in a second. The eviction code they
-/// drive is the shipped code — only the bound moves.
-const PAGE_SIZE: u64 = 4096;
+// How much of RAM the two caches above this trait may hold, in 4 KiB pages.
+//
+// Both numbers are hard ceilings, not targets. Linux lets its page cache take
+// the whole machine because it has a pressure signal and a reclaim path to
+// give it back on demand; ToyOS has neither (`issues/isolation/no-physical-memory-fairness.md` ("No physical
+// memory fairness"), so a cache that grows to fit the workload is a cache
+// that starves userland with no way to stop it. Until there is a pressure
+// signal, the ceiling has to be a number the machine can lose outright.
+//
+// The `test-small-caches` overrides exist because the honest ceilings are
+// tens of megabytes: a test that reached them by doing real I/O would spend
+// minutes proving what 256 KiB proves in a second. The eviction code they
+// drive is the shipped code — only the bound moves.
 
 /// Blocks the filesystem metadata cache may hold.
 ///

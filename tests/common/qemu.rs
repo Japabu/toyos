@@ -428,6 +428,66 @@ fn kernel_died_here(line: &str) -> String {
     )
 }
 
+/// The heading a verdict puts the guest's own account under.
+///
+/// One spelling, so an issue file, a redlist row and a CI log all quote the
+/// same words when they quote a report.
+pub const DIED_SAYING: &str = "--- what the kernel said as it died ---";
+
+/// Why a wait ended badly, carrying the guest's own account of it.
+///
+/// **A newtype, because what this closes is an omission and an omission cannot
+/// be gated by review.** Fifty-two sites in this suite format
+/// [`TestResult::error`] and thirty-six of them printed no capture beside it
+/// (counted on the tree, 2026-08-18), and on
+/// 2026-08-18 that is what a `DOUBLE FAULT on CPU 1` cost — the wait named the
+/// death in one sentence, the kernel's report sat in `TestResult::serial`, and
+/// the arm printed `stdout`
+/// (`issues/kernel/a-double-fault-on-cpu-1-under-a-wide-suite.md`). Fixing
+/// the arms would have fixed the arms. What is fixed here is that the sentence
+/// cannot be built without the capture: [`Self::new`] is the only constructor
+/// there is and the capture is one of its two arguments, so a wait that reports
+/// a kernel death and no report is not expressible.
+///
+/// It carries nothing when the capture carries no kernel death, and that half
+/// matters as much: an ordinary ceiling on a live guest, or a guest binary
+/// reporting its own error, must not start pasting a boot's serial log into
+/// somebody's terminal. [`ceiling_self_check`] asserts both directions.
+#[derive(Clone, Debug)]
+pub struct WaitVerdict(String);
+
+impl WaitVerdict {
+    /// The sentence a wait reached, and the capture it reached it on.
+    ///
+    /// `capture` is the window in the order the guest wrote it — for a test,
+    /// [`TestResult::before`] and then [`TestResult::serial`], which is where
+    /// the two halves of one window live — because the first kernel death in it
+    /// is the one this verdict is about. An empty slice is a claim that there
+    /// was no capture at all, and it is a visible one rather than an omission.
+    pub fn new(sentence: String, capture: &[&str]) -> Self {
+        let Some(report) = capture.iter().find_map(|c| super::serial::death_report(c)) else {
+            return Self(sentence);
+        };
+        Self(format!("{sentence}\n{DIED_SAYING}\n{report}"))
+    }
+
+    /// The sentence, without the account under it.
+    ///
+    /// What `headline` in `tests/toyos.rs` reads off a red's reason and what
+    /// `alone_line` compares two runs of one defect on — so the first line is
+    /// still one line, and the report below it can differ between two boots of
+    /// the same panic without reading as a second defect.
+    pub fn sentence(&self) -> &str {
+        self.0.lines().next().unwrap_or_default()
+    }
+}
+
+impl std::fmt::Display for WaitVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// What a test's ceiling caught — the panic, the stall, or the slow test.
 ///
 /// Pure, and every input a parameter, so [`ceiling_self_check`] can stage all
@@ -481,13 +541,18 @@ pub fn ceiling_verdict(
     })
 }
 
-/// The three verdicts a ceiling reaches, staged with no guest at all.
+/// The three verdicts a ceiling reaches and what each carries, staged with no
+/// guest at all.
 ///
 /// The gate for [`ceiling_verdict`], and it runs in both directions on each:
 /// the panic must be named *and* not read as a stall, the stall must still read
 /// as one, and a program's own panic must not end anybody's run. That last one
 /// is the case the obvious patch breaks — a bare panic spelling in the read
 /// loop matches a guest binary's panic, and a guest binary is allowed to die.
+///
+/// The fourth section is [`WaitVerdict`]: naming a death is not the same as
+/// keeping the report, and a suite that had the first without the second lost a
+/// double fault's whole account on 2026-08-18.
 pub fn ceiling_self_check() -> Result<(), String> {
     const CEILING: Duration = Duration::from_secs(380);
     const KERNEL: &str =
@@ -581,9 +646,60 @@ pub fn ceiling_self_check() -> Result<(), String> {
         return Err(String::from("a healthy run was given a verdict"));
     }
 
+    // 4. **What the verdict carries, which is the half that was missing.** Every
+    //    arm above names a death in one sentence; until 2026-08-18 that sentence
+    //    was the whole of what a failure arm had, and a `DOUBLE FAULT on CPU 1`
+    //    went into the record with its report — written, on IST1, 6688 bytes of
+    //    it — never printed. Both directions, because the second is what keeps a
+    //    stall or a slow test from pasting a boot's console at somebody.
+    const DF: &str = "[kernel 6.204 cpu1] DOUBLE FAULT on CPU 1 (pid=Some(Pid(2)) tid=Some(Tid(0)))";
+    let window_before = "[kernel 6.201 cpu0] spawn: /bin/test_rs_console_line_atomicity pid=41\n";
+    let window_serial = format!(
+        "AAAAAAAA\n{DF}\n\
+         [kernel 6.204 cpu1]   cr2=0xffff800002672ff8 (address that caused the fault chain)\n\
+         [kernel 6.204 cpu1]   rip=0xffffffff80121a40  rsp=0xffff800002673000  rbp=0x0\n"
+    );
+    let died_verdict = ceiling_verdict(Some(DF), early, CEILING, quiet, 40)
+        .ok_or("a staged double fault reached no verdict at all")?;
+    let carried = WaitVerdict::new(died_verdict.clone(), &[window_before, &window_serial]);
+    for want in [DIED_SAYING, "cr2=0xffff800002672ff8", "rip=0xffffffff80121a40"] {
+        if !carried.to_string().contains(want) {
+            return Err(format!(
+                "the verdict names the death and drops {want:?}, which is the defect \
+                 `issues/kernel/a-double-fault-on-cpu-1-under-a-wide-suite.md` is \
+                 about:\n{carried}"
+            ));
+        }
+    }
+    // The sentence is still one line and still the sentence — `headline` in
+    // `tests/toyos.rs` reads it off a red's reason and `alone_line` compares two
+    // runs of one defect on it, so a report under it must not become part of it.
+    if carried.sentence() != died_verdict {
+        return Err(format!(
+            "the report changed the sentence a summary quotes:\n{}\n{died_verdict}",
+            carried.sentence()
+        ));
+    }
+    // The other direction. A guest still talking at its ceiling has nothing to
+    // account for, and a verdict that grew a serial log would be a second defect
+    // dressed as a fix.
+    let quiet_capture = WaitVerdict::new(slow.clone(), &["[kernel 0.377 cpu0] NVMe: found\n"]);
+    if quiet_capture.to_string() != slow {
+        return Err(format!(
+            "a verdict on a capture nothing died in grew a report:\n{quiet_capture}"
+        ));
+    }
+    // And the capture being handed over at all is the argument, not a habit: an
+    // empty slice is what a wait with nothing to show says, and it says it.
+    if WaitVerdict::new(died_verdict.clone(), &[]).to_string() != died_verdict {
+        return Err(String::from("a verdict built on no capture invented a report"));
+    }
+
     eprintln!(
         "  [ceiling] the panic, the stall, the slow test and the healthy run, each named apart \
-         from the other three"
+         from the other three; the panic's verdict carries the kernel's own {} lines and the \
+         other three carry nothing",
+        carried.to_string().lines().count() - 1,
     );
     Ok(())
 }
@@ -630,8 +746,17 @@ pub fn await_guest(
     // whole signature is stated in (`a total freeze of the guest`, judged by a
     // periodic line that stopped arriving), so what this says decides how the
     // next occurrence is read.
-    if let Some(line) = super::serial::kernel_death(&log[from..]) {
-        return Err(format!("{} It was waiting for {doing}", kernel_died_here(line)));
+    let since = &log[from..];
+    if let Some(line) = super::serial::kernel_death(since) {
+        // Through [`WaitVerdict`] for the reason that type exists: this caller
+        // owns the capture and usually prints it, and `usually` is what the
+        // arms that do not have in common with the one that lost a double
+        // fault's report.
+        return Err(WaitVerdict::new(
+            format!("{} It was waiting for {doing}", kernel_died_here(line)),
+            &[since],
+        )
+        .to_string());
     }
     Err(format!("{STALLED} waiting for {doing} — {}", live.why()))
 }
@@ -1695,7 +1820,13 @@ pub struct TestResult {
     /// capture. It is separate from `serial` because `serial` means "while this
     /// test ran" and audio gates count lines in it.
     pub before: String,
-    pub error: Option<String>,
+    /// Why the run did not finish, when it did not.
+    ///
+    /// A [`WaitVerdict`] and not a `String`, so that the sentence and the
+    /// kernel's own account of its death cannot come apart — see that type.
+    /// Every arm that formats this gets the report for free, and there are
+    /// fifty-two of them that were never going to be edited one at a time.
+    pub error: Option<WaitVerdict>,
     /// Whether the guest ever announced *this* test.
     ///
     /// The in-guest runner reads one command, prints `===TEST_START <name>` and
@@ -2331,6 +2462,12 @@ impl QemuInstance {
                 last_line.elapsed(),
                 lines,
             ) {
+                // The window in the order the guest wrote it: `before` holds
+                // every line up to `===TEST_START===` and `serial` everything
+                // after, so a kernel that died before this test announced
+                // itself has its report found in the first and one that died
+                // during it in the second.
+                let error = WaitVerdict::new(error, &[&before, &serial]);
                 return TestResult {
                     name: name.to_string(),
                     exit_code: None,
@@ -2403,6 +2540,11 @@ impl QemuInstance {
                         } else {
                             (None, None)
                         };
+                        // The guest's runner said this one, so the capture is
+                        // handed over for the same reason: a runner reporting
+                        // an error on a machine whose kernel had already died
+                        // is reporting the smaller of the two facts.
+                        let error = error.map(|e| WaitVerdict::new(e, &[&before, &serial]));
                         return TestResult {
                             name: name.to_string(),
                             exit_code,
@@ -2425,13 +2567,18 @@ impl QemuInstance {
                 }
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
+                    // QEMU going away is a sentence about the host process, and
+                    // a guest whose kernel panicked on the way out wrote down
+                    // the reason first.
+                    let error =
+                        WaitVerdict::new(String::from("QEMU disconnected"), &[&before, &serial]);
                     return TestResult {
                         name: name.to_string(),
                         exit_code: None,
                         stdout,
                         serial,
                         before,
-                        error: Some("QEMU disconnected".to_string()),
+                        error: Some(error),
                         started: in_test,
                     };
                 }

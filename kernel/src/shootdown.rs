@@ -30,7 +30,14 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use loom::sync::atomic::{AtomicU64, Ordering};
 
 /// Matches `sched::MAX_CPUS`. Kept as its own constant because this file has no
-/// `crate::` references at all — that is what lets loom compile it.
+/// `crate::` references at all — that is what lets loom compile it, in *every*
+/// feature state: `kernel-loom`'s own CI build turns its `loom` feature off to
+/// build this file's tests without loom (`cargo test --manifest-path
+/// kernel-loom/Cargo.toml --no-default-features`), and `crate::sched` does not
+/// exist in that crate regardless of the feature — a `cfg(not(feature =
+/// "loom"))` guard here once tried to assert the two constants equal and broke
+/// exactly that build. The pin lives at `sched::MAX_CPUS`'s own definition
+/// instead, in a file `kernel-loom` never compiles.
 pub const MAX_CPUS: usize = 8;
 
 /// The load a target reads what it owes with, and what it carries.

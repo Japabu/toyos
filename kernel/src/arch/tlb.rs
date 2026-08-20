@@ -100,11 +100,16 @@ const SPINS_PER_DEADLINE_CHECK: u32 = 1024;
 /// shoot down, then free. [`crate::mm::Unmapped`] is the type that makes the
 /// pairing hard to get wrong; this is what it calls.
 ///
-/// The local flush is the whole TLB rather than the `invlpg` the unmap already
-/// did, and that is the fix for the wrong-PCID half of the defect: `invlpg`
-/// tags the *current* CR3's PCID, while `shared_memory` and `virtio_gpu` unmap
-/// from a process that is not the one running here. A CPU-wide flush is correct
-/// under every PCID configuration and is what the targets do anyway.
+/// The local flush is the whole TLB and not the one address the caller changed,
+/// because a shootdown answers mutations that are not one address: a direct-map
+/// leaf changing memory type is a 2 MiB window this CPU may hold under any tag,
+/// and a recycled PCID is every address there is. It is also exactly what the
+/// targets do, so the initiator and its siblings end in the same state.
+///
+/// The single address is `mm::paging`'s own and it is derived there, in the
+/// address space that was written — which until 2026-08-19 was whatever `CR3`
+/// held instead, and on `shared_memory`'s and `virtio_gpu`'s cross-process
+/// unmaps that is the caller's process rather than the one being unmapped.
 pub fn shootdown() {
     let cpus = smp::cpu_count();
     if !SIBLINGS_ANSWER.load(Ordering::Acquire) || cpus <= 1 {
