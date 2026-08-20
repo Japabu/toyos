@@ -15,7 +15,7 @@ use uefi::{
     proto::console::gop::{GraphicsOutput, PixelFormat},
     proto::device_path::{media::{PartitionFormat, PartitionSignature}, DevicePath, DevicePathNode, DeviceType, DeviceSubType},
     proto::loaded_image::LoadedImage,
-    proto::media::file::{File, FileInfo, FileMode},
+    proto::media::file::{File, FileAttribute, FileInfo, FileMode},
     table::{boot::{MemoryType, PAGE_SIZE}, cfg::ACPI2_GUID},
 };
 use uefi_services::println;
@@ -66,7 +66,7 @@ fn load_file_bytes(handle: Handle, system_table: &SystemTable<Boot>, path: &CStr
     let mut file = fs
         .open_volume()
         .expect("Failed to open volume")
-        .open(path, FileMode::Read, Default::default())
+        .open(path, FileMode::Read, FileAttribute::default())
         .expect("Failed to open file")
         .into_regular_file()
         .expect("Failed to convert to regular file");
