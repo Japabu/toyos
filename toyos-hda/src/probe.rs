@@ -232,7 +232,7 @@ mod tests {
                     })
                     .collect();
                 let first = *fgs.first()?;
-                return Some(((first as u32) << 16) | fgs.len() as u32 / 2);
+                return Some(((first as u32) << 16) | (fgs.len() as u32 / 2));
             }
             let line = self
                 .text

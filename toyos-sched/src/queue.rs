@@ -141,8 +141,20 @@ impl<X: SchedPayload> RunQueue<X> {
     /// *last* fair task, i.e. the one whose turn is furthest away. Handing
     /// over the next-to-run task instead would trade a cache-warm local
     /// dispatch for a two-hop transfer.
-    pub fn pop_surplus(&mut self) -> Option<ReadyTask<X>> {
-        let key = *self.fair.keys().next_back()?;
+    ///
+    /// **`loaded` is skipped, and that is a correctness rule and not a policy
+    /// one** — [`crate::cpu::SchedPass::answer_steal_requests`] carries the
+    /// derivation. It is also the *most likely* candidate here rather than an
+    /// unlikely one: a task `preempt_if_due` has just returned to the band was
+    /// charged for the quantum it spent, so its vruntime is the band's highest
+    /// and `next_back` names it first.
+    pub fn pop_surplus(&mut self, loaded: Option<TaskKey>) -> Option<ReadyTask<X>> {
+        let key = *self
+            .fair
+            .iter()
+            .rev()
+            .find(|(_, task)| Some(task.key()) != loaded)?
+            .0;
         self.fair.remove(&key)
     }
 

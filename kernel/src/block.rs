@@ -1,5 +1,66 @@
+use crate::mm::PAGE_SIZE;
+use crate::scheduler::Operation;
+use crate::time::{Budget, Deadline, Duration};
+
 /// Unique identifier for a block device, used as page cache key.
 pub type DeviceId = u32;
+
+/// How long one operation on a block device may spend inside the device before
+/// it is refused.
+///
+/// **The number is the caller's and not the driver's, and that split is the
+/// whole point.** A driver's own bound covers *one* device round trip —
+/// `USB_TIMEOUT_NS` is 2 s in `drivers/xhci` — and says nothing about the
+/// composition above it: one `read_blocks` of N blocks is `ceil(N / 8)` SCSI
+/// commands, each of which may be issued three times with a Reset Recovery
+/// between the attempts, and each of those is three phases with a bound of its
+/// own. So a device that answers *every* transfer, just slowly, holds a caller
+/// for as long as the work takes and there is nothing above the driver that
+/// says how long that may be. This is that number.
+///
+/// **It is what makes a shipped daemon's give-up policy reachable**, which is
+/// the reason it exists rather than a consequence of it. `/bin/logd`'s
+/// `LOG_WRITE_BUDGET` is 5 s and it is measured in userland *around the
+/// syscall*: a syscall that has not returned cannot be given up on, so every
+/// bound below it is what decides whether that policy runs at all. Its own doc
+/// used to name `USB_TIMEOUT_NS` as the thing that turns a stick that stopped
+/// answering into an `Err` — true of a dead device and never true of a slow
+/// one, because that bound is never reached by a device that answers.
+///
+/// **2 s, and the derivation is two terms.** Below: one whole
+/// `USB_TIMEOUT_NS`, so a caller that has spent more than a single transfer's
+/// entire allowance on commands that are *completing* is talking to a device
+/// too slow to serve, and no healthy device can reach it. Above: the refusal is
+/// taken between commands and never inside one, so the overshoot is the command
+/// in flight — one more transfer bound at worst — and `2 + 2` leaves a second
+/// of the daemon's 5 s for it to notice with.
+///
+/// **A [`Budget`] and not a [`crate::time::Tripwire`]**: expiry is a degraded
+/// answer, named. The operation is refused, the device is *not* marked failed —
+/// nothing was in flight when the refusal was taken — and the caller gets the
+/// `Err` every other refused transfer produces.
+pub const OPERATION: Budget = Budget::of(
+    Duration::from_secs(2),
+    "the block-device operation is refused with an I/O error, and the caller's \
+     own give-up policy decides what happens next",
+);
+
+/// Declare the running context inside one block-device operation, bounded by
+/// [`OPERATION`], until the guard drops.
+///
+/// Established by the [`BlockDevice`] implementation, which is the layer that
+/// knows one call is one operation, and *recovered* by the driver below it
+/// rather than handed to it: [`Operation`] carries why owner ruling 1B put the
+/// deadline on the running context instead of in an argument, and what else
+/// rides the same word.
+///
+/// **A [`Deadline`] because it is absolute**: it crosses into a driver that
+/// loops, and a relative duration re-based at each command would bound every
+/// command instead of the operation.
+#[must_use = "the operation lasts exactly as long as this guard"]
+pub fn begin_operation() -> Operation {
+    Operation::begin(Deadline::at(crate::clock::now() + OPERATION.duration()))
+}
 
 /// A transfer the device did not complete.
 ///
@@ -57,20 +118,19 @@ pub trait BlockDevice: Send {
     fn flush(&mut self) -> BlockResult;
 }
 
-/// How much of RAM the two caches above this trait may hold, in 4 KiB pages.
-///
-/// Both numbers are hard ceilings, not targets. Linux lets its page cache take
-/// the whole machine because it has a pressure signal and a reclaim path to
-/// give it back on demand; ToyOS has neither (`issues/isolation/no-physical-memory-fairness.md` ("No physical
-/// memory fairness"), so a cache that grows to fit the workload is a cache
-/// that starves userland with no way to stop it. Until there is a pressure
-/// signal, the ceiling has to be a number the machine can lose outright.
-///
-/// The `test-small-caches` overrides exist because the honest ceilings are
-/// tens of megabytes: a test that reached them by doing real I/O would spend
-/// minutes proving what 256 KiB proves in a second. The eviction code they
-/// drive is the shipped code — only the bound moves.
-const PAGE_SIZE: u64 = 4096;
+// How much of RAM the two caches above this trait may hold, in 4 KiB pages.
+//
+// Both numbers are hard ceilings, not targets. Linux lets its page cache take
+// the whole machine because it has a pressure signal and a reclaim path to
+// give it back on demand; ToyOS has neither (`issues/isolation/no-physical-memory-fairness.md` ("No physical
+// memory fairness"), so a cache that grows to fit the workload is a cache
+// that starves userland with no way to stop it. Until there is a pressure
+// signal, the ceiling has to be a number the machine can lose outright.
+//
+// The `test-small-caches` overrides exist because the honest ceilings are
+// tens of megabytes: a test that reached them by doing real I/O would spend
+// minutes proving what 256 KiB proves in a second. The eviction code they
+// drive is the shipped code — only the bound moves.
 
 /// Blocks the filesystem metadata cache may hold.
 ///

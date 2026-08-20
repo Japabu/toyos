@@ -1,9 +1,9 @@
 //! A `Poller` cannot lose a completion inside the capacity it declared.
 //!
 //! `Poller::new(handles)` used to round the request up and *clamp* it, and
-//! `poll_add_fd` used to flush a full submission ring mid-registration. Those
+//! `watch_raw` used to flush a full submission ring mid-registration. Those
 //! two together are the loss: the flush makes the kernel process registrations
-//! while the caller is still registering, so fds that are already ready post
+//! while the caller is still registering, so handles that are already ready post
 //! completions into a ring sized for a set the caller never actually declared.
 //! Past `cq_size` the kernel increments `dropped` and returns, and the caller
 //! blocks forever on readiness that was thrown away.
@@ -17,7 +17,7 @@
 
 use std::process::Command;
 
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos_abi::syscall;
 
 const SELF_PATH: &str = "/bin/test_rs_poller_capacity";
@@ -60,7 +60,7 @@ fn full_capacity_delivers_everything() {
 
     let poller = Poller::new(CAP);
     for (i, p) in pipes.iter().enumerate() {
-        poller.poll_add_fd(p.read, IORING_POLL_IN, i as u64);
+        poller.watch_raw(p.read, READABLE, i as u64);
     }
 
     let mut seen = vec![false; CAP as usize];
@@ -103,11 +103,11 @@ fn over_register() {
         pipes.push(p);
     }
     for (i, p) in pipes.iter().enumerate().take(SMALL as usize) {
-        poller.poll_add_fd(p.read, IORING_POLL_IN, i as u64);
+        poller.watch_raw(p.read, READABLE, i as u64);
     }
     println!("{ABOUT_TO}");
-    poller.poll_add_fd(pipes[SMALL as usize].read, IORING_POLL_IN, SMALL as u64);
-    println!("poll_add_fd accepted registration {} of a {SMALL}-handle poller", SMALL + 1);
+    poller.watch_raw(pipes[SMALL as usize].read, READABLE, SMALL as u64);
+    println!("watch_raw accepted registration {} of a {SMALL}-handle poller", SMALL + 1);
 }
 
 /// Run this binary again with `arg` and require that it died at the contract

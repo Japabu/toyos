@@ -28,7 +28,7 @@ use std::os::toyos::process::CommandExt;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 use terminal::Console;
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::shm::SharedMemory;
 use toyos::endow;
 use toyos::port::{self, Connector};
@@ -140,12 +140,12 @@ fn main() {
     const TOKEN_CLIENT: u64 = 4;
 
     loop {
-        poller.poll_add_fd(toyos::RawHandle(shell.stdout.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDOUT);
-        poller.poll_add_fd(toyos::RawHandle(shell.stderr.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDERR);
-        poller.poll_add(&kb, IORING_POLL_IN, TOKEN_KEYBOARD);
-        poller.poll_add_fd(host.acceptor_fd(), IORING_POLL_IN, TOKEN_LISTEN);
-        for fd in host.client_fds() {
-            poller.poll_add_fd(fd, IORING_POLL_IN, TOKEN_CLIENT);
+        poller.watch_raw(toyos::RawHandle(shell.stdout.as_raw_fd() as u32), READABLE, TOKEN_STDOUT);
+        poller.watch_raw(toyos::RawHandle(shell.stderr.as_raw_fd() as u32), READABLE, TOKEN_STDERR);
+        poller.watch(&kb, READABLE, TOKEN_KEYBOARD);
+        poller.watch_raw(host.acceptor_handle(), READABLE, TOKEN_LISTEN);
+        for client in host.client_handles() {
+            poller.watch_raw(client, READABLE, TOKEN_CLIENT);
         }
 
         let mut ready = [false; 5];

@@ -64,7 +64,7 @@ pub fn remove_io_uring_watcher(id: RingId) {
 
 /// Wake every thread blocked on keyboard input.
 pub fn wake_waiters() {
-    crate::sched::waitqs::wake_all(&crate::sched::waitqs::KEYBOARD);
+    crate::sched::waitqs::wake_device(&crate::sched::waitqs::KEYBOARD_WATCH);
 }
 
 pub fn io_uring_watchers() -> Vec<RingId> {
@@ -193,15 +193,13 @@ pub fn handle_report(state: &mut [u8; 8], report: &[u8]) -> usize {
         }
     }
 
-    for i in 2..8 {
-        let usage = prev[i];
+    for &usage in &prev[2..8] {
         if usage >= 4 && !report[2..8].contains(&usage) && handle_key(usage, false) {
             queued += 1;
         }
     }
 
-    for i in 2..8 {
-        let usage = report[i];
+    for &usage in &report[2..8] {
         if usage >= 4 && !prev[2..8].contains(&usage) && handle_key(usage, true) {
             queued += 1;
         }

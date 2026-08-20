@@ -1,7 +1,7 @@
 //! A pending poll on stdin outlives the keyboard *claim* being closed.
 //!
 //! **The defect this is aimed at was cancellation by an object that did not own
-//! the source.** `io_uring::remove_fd` cancels by source across every ring in
+//! the source.** `io_uring::cancel_by_source` cancels by source across every ring in
 //! the machine — right for a pipe, whose other end really has gone — and
 //! `object::ops::close` decided whether to call it by asking the *object*:
 //! `Device(_)` answered "this ends its sources", on the argument that a claim
@@ -14,7 +14,8 @@
 //! never consulted.
 //!
 //! It runs inside `test-runner` because a spawned binary's stdin is a pipe: this
-//! process's fd 0 is the `Console` that names `Source::Keyboard`, and the claim
+//! process's handle 0 is the `Console` that names `Source::Keyboard`, and the
+//! claim
 //! it closes is minted from the capability the estate holds. Both objects are in
 //! one process, which is the smallest machine the collision exists on; the real
 //! failure needs two, and neither has to know about the other.
@@ -32,7 +33,7 @@
 //! 3. an injected keystroke completes the stdin poll — so what survived arm 1
 //!    was a live registration and not an absent one.
 
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::syscap::SysCap;
 use toyos::{Keyboard, Mouse};
 use toyos_abi::syscall::DeviceType;
@@ -89,11 +90,11 @@ fn probe(cap: &SysCap) -> Result<(), String> {
     let mut seen = Seen::default();
 
     // **Submitted before anything is closed, and that is the whole of what this
-    // has to get right.** `poll_add_fd` only queues a submission entry; `wait`
+    // has to get right.** `watch_raw` only queues a submission entry; `wait`
     // is what enters the kernel. A probe that closed first would stage nothing
     // — the ring is not a watcher of the keyboard yet, so there is nothing for
     // a cancellation to reach, and it would pass on a tree with the defect.
-    poller.poll_add_fd(STDIN, IORING_POLL_IN, STDIN_TOKEN);
+    poller.watch_raw(STDIN, READABLE, STDIN_TOKEN);
     drain(&poller, &mut seen);
     if poller.pending() != 0 {
         return Err(format!("{} submission(s) never reached the kernel", poller.pending()));
@@ -112,7 +113,7 @@ fn probe(cap: &SysCap) -> Result<(), String> {
     let mouse: Mouse = cap
         .claim(DeviceType::Mouse)
         .map_err(|e| format!("the mouse must be claimable and answered {e:?}"))?;
-    poller.poll_add(&mouse, IORING_POLL_IN, MOUSE_TOKEN);
+    poller.watch(&mouse, READABLE, MOUSE_TOKEN);
     drain(&poller, &mut seen);
     if seen.mouse != 0 {
         return Err("the mouse reported input; this gate needs an idle pointer".to_string());

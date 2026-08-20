@@ -29,6 +29,7 @@
 
 use crate::log;
 use crate::mm::Mmio;
+use crate::time::{Budget, Duration};
 
 /// Capability ID 1 — USB Legacy Support (spec §7.1.1).
 const CAP_ID_LEGACY: u8 = 1;
@@ -52,7 +53,14 @@ const SMI_STATUS: u32 = (1 << 29) | (1 << 30) | (1 << 31);
 /// handoff wait: long enough that a machine which was going to release has,
 /// short enough that one which never will costs the boot a second rather than
 /// the controller.
-const HANDOFF_TIMEOUT_NS: u64 = 1_000_000_000;
+///
+/// A [`Budget`]: expiry is not fatal and deliberately so — the driver resets
+/// the controller anyway and logs what to suspect, which is a degraded answer
+/// and not a refusal.
+const HANDOFF_TIMEOUT: Budget = Budget::of(
+    Duration::from_secs(1),
+    "the controller is reset out from under firmware, with a line naming the semaphore",
+);
 
 /// Capabilities the walk will visit before deciding the list is not a list.
 /// Every shipping controller publishes a handful; the bound is here because
@@ -175,7 +183,7 @@ pub fn take_ownership(bar: &Mmio, bar_size: u64, hccparams1: u32) {
     bar.write_u32(legsup, before | LEGSUP_OS_OWNED);
 
     let started = crate::clock::nanos_since_boot();
-    let deadline = started + HANDOFF_TIMEOUT_NS;
+    let deadline = started + HANDOFF_TIMEOUT.nanos();
     let mut now = bar.read_u32(legsup);
     while now & LEGSUP_BIOS_OWNED != 0 && crate::clock::nanos_since_boot() < deadline {
         core::hint::spin_loop();
@@ -189,7 +197,7 @@ pub fn take_ownership(bar: &Mmio, bar_size: u64, hccparams1: u32) {
         // certainly does not boot.
         log!(
             "xHCI: firmware still owns the controller after {}ms (USBLEGSUP {before:#010x} -> {now:#010x}) — resetting it anyway",
-            HANDOFF_TIMEOUT_NS / 1_000_000
+            HANDOFF_TIMEOUT.duration().millis()
         );
     } else if before & LEGSUP_BIOS_OWNED != 0 {
         log!("xHCI: firmware released the controller in {waited_us}us (USBLEGSUP {before:#010x} -> {now:#010x})");
@@ -241,7 +249,7 @@ fn selftest() {
     // capability registers occupy the first few, so no list starts at zero.
     fn windowed(cells: &[u32; 16]) -> impl Fn(u64) -> Option<u32> + '_ {
         move |offset: u64| -> Option<u32> {
-            if offset % 4 != 0 || offset.checked_add(4)? > WINDOW {
+            if !offset.is_multiple_of(4) || offset.checked_add(4)? > WINDOW {
                 return None;
             }
             Some(cells[(offset / 4) as usize])

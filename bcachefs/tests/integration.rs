@@ -273,7 +273,7 @@ fn many_files_with_large_data() {
         let name = format!("bin/program_{}", i);
         let size = (i + 1) * 1024; // 1KB to 50KB
         let data: Vec<u8> = (0..size).map(|j| ((i + j) % 256) as u8).collect();
-        fs.create(&name, &data, i as u64 * 1000).expect(&format!("create {}", name));
+        fs.create(&name, &data, i as u64 * 1000).unwrap_or_else(|_| panic!("create {name}"));
         expected.push((name, data));
     }
 

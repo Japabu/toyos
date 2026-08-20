@@ -157,7 +157,7 @@ fn over_ceiling_kills_only_the_caller() {
 /// Reaching this line is already most of the evidence — `status()` above only
 /// returns once the kernel has reaped the dead child, which takes the idle
 /// loop through `reap_poisoned`. A spawn is the loudest confirmation userland
-/// can give: process table entry, fd table, ELF load and the whole teardown,
+/// can give: process table entry, handle table, ELF load and the whole teardown,
 /// all of it kernel heap traffic, and on this guest all of it on the one CPU
 /// that recovered.
 fn heap_still_works() {

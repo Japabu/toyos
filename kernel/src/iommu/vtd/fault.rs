@@ -64,6 +64,12 @@ struct FaultUnit {
 }
 
 impl FaultUnit {
+    // A `const` holding atomics is copied at each use, so a write through one
+    // would go nowhere. This one is never written and never borrowed: its single
+    // use is the array repeat below, and every store in this file names
+    // `UNITS[index]`, which is the `static`. `borrow_interior_mutable_const`,
+    // the lint that fires on the losing-a-write shape, is silent here.
+    #[allow(clippy::declare_interior_mutable_const)]
     const EMPTY: Self =
         Self { regs: AtomicU64::new(0), records: AtomicU64::new(0), count: AtomicU32::new(0) };
 }

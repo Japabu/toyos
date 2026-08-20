@@ -17,11 +17,9 @@ use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use toyos_abi::syscall::ProcessStats;
-use toyos_sched::task::WaitClass;
 
 use crate::process::Pid;
-use crate::sched::payload::KWaitQueue;
-use crate::sched::waitqs::{new_queue, wake_all};
+use crate::completion::{self, Outcome, Subject, Watch};
 use crate::sync::Lock;
 
 use super::{KObjectVariant, ObjectCore};
@@ -42,7 +40,14 @@ pub struct ProcessObject {
     /// predicate runs on every wake, and a `Lock` there is a `fetch_add` on a
     /// path that already has one.
     finished: AtomicBool,
-    waiters: Arc<KWaitQueue>,
+    /// What a `SYS_PROCESS_WAIT` arms on. The object is what the waiter holds
+    /// across its park, so the watch it names cannot outlive its subject.
+    ///
+    /// **One waiter set where there were two.** The `KWaitQueue` beside this
+    /// went with the park it served: after §5.6 a thread arms here and parks
+    /// on its own queue, so a second list on the object had nothing left in
+    /// it.
+    watch: Watch,
 }
 
 impl ProcessObject {
@@ -52,7 +57,7 @@ impl ProcessObject {
             pid,
             exit: Lock::new(None),
             finished: AtomicBool::new(false),
-            waiters: new_queue(WaitClass::Other),
+            watch: Watch::new(),
         })
     }
 
@@ -75,8 +80,8 @@ impl ProcessObject {
         self.exit.lock().as_ref().map(|e| e.stats)
     }
 
-    pub fn waiters(&self) -> Arc<KWaitQueue> {
-        self.waiters.clone()
+    pub fn watch(&self) -> &Watch {
+        &self.watch
     }
 
     /// Publish the exit and release every waiter.
@@ -104,6 +109,6 @@ impl ProcessObject {
         }
         self.finished.store(true, Ordering::Release);
         crate::scheduler::note_reapable();
-        wake_all(&self.waiters);
+        completion::post(Subject::of(&self.watch), Outcome::Ready);
     }
 }

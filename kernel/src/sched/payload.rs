@@ -10,7 +10,7 @@
 //! payload, which only `Hw::release` ever consumes.
 
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use toyos_sched::fair::{FairShare, ShareState};
 use toyos_sched::hw::Nanos;
@@ -19,7 +19,9 @@ use toyos_sched::sync::LeafLock;
 use toyos_sched::task::{SchedPayload, TaskAccounting, TaskShared, WaitClass};
 use toyos_sched::waitq::{WaitList, WaitQueue, WaitTicket};
 
+use crate::completion::{Inbox, Watch};
 use crate::mm::paging::Cr3;
+use crate::scheduler::OperationSlot;
 use crate::process::{OwnedAlloc, PageTables, ProcessAccounting, TaskId};
 use crate::sync::Lock;
 
@@ -81,7 +83,13 @@ pub struct KernelCtx {
 pub struct KernelPayload {
     pub id: TaskId,
     pub kernel_stack: OwnedAlloc,
-    pub address_space: Option<PageTables>,
+    /// The address space this task runs in. **Not an `Option`**: a kernel thread
+    /// runs in the kernel's, and `mm::paging::kernel` hands that out in the same
+    /// `PageTables` shape a process's has — so there is no task without one and
+    /// no second answer for `driver::spawn` to choose between. The `Option`
+    /// went when the kernel-thread work made a kernel thread able to name an
+    /// address space at all.
+    pub address_space: PageTables,
     /// The cross-CPU-readable face of this task. A `CpuSched` is `!Sync`, so a
     /// remote `ps` cannot walk it; what it can read is here.
     pub handle: Arc<TaskHandle>,
@@ -114,11 +122,48 @@ pub struct TaskHandle {
     /// retirer needs: the thread is off every CPU and its kernel stack and
     /// address-space reference are gone.
     released: AtomicBool,
-    /// Whoever is waiting for that (spec §8.6: a waitable object owns its
-    /// queue). At most one waiter exists — retiring is single-retirer — but a
-    /// queue costs the same as a slot and makes the wait the ordinary
-    /// register/re-check/park shape instead of a bespoke handshake.
-    released_wait: KWaitQueue,
+    /// Where this thread parks.
+    ///
+    /// **Its own queue, one waiter, and never woken as a queue.** The
+    /// rendezvous protocol needs a `WaitQueue` to register on — that is what
+    /// closes the check-then-block window — but after the completion work
+    /// nothing is *woken* by queue: a post writes a record into the inbox and
+    /// then claims this task's rendezvous word directly. So the queue is a
+    /// parking place and
+    /// nothing else, which is what `waitqs::PARK_BUCKETS` was, without the
+    /// hashing: 32 shared buckets whose `Registration::finish` had to scan
+    /// past every unrelated sleeper are one list of one.
+    park: KWaitQueue,
+    /// What another thread arms on to be told this one moved — its exit, for
+    /// `SYS_THREAD_JOIN`, and its release, for the retirer.
+    watch: Watch,
+    /// Cancels reported to this thread, for RT4.
+    ///
+    /// One is the design: `completion::wait` answers `Cancelled`, the caller
+    /// propagates it, guards drop on the way out and the thread dies at the
+    /// syscall boundary. **Two is a caller that swallowed the first**, and it
+    /// panics at the call site that asked rather than spinning — which is what
+    /// a loop that re-waits instead of returning would otherwise do.
+    cancels: AtomicU32,
+    /// This thread's completions — the first of the two inboxes.
+    ///
+    /// **Here rather than in a thread table, and the reason is the same one
+    /// this struct exists for**: it is the cross-CPU-readable face of a task,
+    /// already `Arc`'d, already released with the task, and already what a
+    /// remote CPU may hold. A poster lends itself a clone of that `Arc` when
+    /// the waiter arms, so a post reaches the inbox without asking the process
+    /// table anything — which a park on a hot path could not afford.
+    inbox: Inbox,
+    /// The operation this thread is inside, if it is inside one — owner ruling
+    /// 1B's word.
+    ///
+    /// **On the handle and not on the `CpuSched`**, for the reason the two
+    /// fields above it are here: a `CpuSched` is `!Sync` and cannot be walked,
+    /// and this word has to survive the migration a sleep-lock-holding thread
+    /// can take mid-operation. It travels with the thread because the handle
+    /// does. `scheduler::Operation` owns every rule about it; nothing here
+    /// reads it.
+    operation: OperationSlot,
 }
 
 impl TaskHandle {
@@ -128,7 +173,11 @@ impl TaskHandle {
             running_since: AtomicU64::new(0),
             acct: Lock::new(TaskAccounting::default()),
             released: AtomicBool::new(false),
-            released_wait: static_queue(WaitClass::Other),
+            park: static_queue(WaitClass::Other),
+            watch: Watch::new(),
+            cancels: AtomicU32::new(0),
+            inbox: Inbox::new(),
+            operation: OperationSlot::new(),
         }
     }
 
@@ -150,7 +199,13 @@ impl TaskHandle {
     /// ordering is the whole guarantee a retirer buys with its park.
     pub(crate) fn publish_released(&self) {
         self.released.store(true, Ordering::Release);
-        super::waitqs::wake_all(&self.released_wait);
+        // The retirer is armed on this thread's own watch — the same subject a
+        // joiner uses, and the reason the release no longer needs a queue of
+        // its own.
+        crate::completion::post(
+            crate::completion::Subject::of(&self.watch),
+            crate::completion::Outcome::Gone(crate::completion::Reason::Closed),
+        );
     }
 
     /// Has `Hw::release` run for this thread? The retire wait's condition.
@@ -158,8 +213,38 @@ impl TaskHandle {
         self.released.load(Ordering::Acquire)
     }
 
-    pub fn released_wait(&self) -> &KWaitQueue {
-        &self.released_wait
+    pub fn inbox(&self) -> &Inbox {
+        &self.inbox
+    }
+
+    /// Where this thread's establishment lives. Read and written only by
+    /// `scheduler::Operation`, which is where every rule about it is stated.
+    pub fn operation(&self) -> &OperationSlot {
+        &self.operation
+    }
+
+    pub fn park_queue(&self) -> &KWaitQueue {
+        &self.park
+    }
+
+    /// What this thread's own transitions are posted to.
+    pub fn watch(&self) -> &Watch {
+        &self.watch
+    }
+
+    /// Report a cancel to this thread, once. `false` means it is not killed.
+    #[track_caller]
+    pub fn take_cancel(&self, killed: bool) -> bool {
+        if !killed {
+            return false;
+        }
+        let reported = self.cancels.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            reported == 0,
+            "completion: a second cancel reported to one thread — the first was \
+             swallowed by a caller that waited again instead of returning",
+        );
+        true
     }
 
     pub fn cpu_ns(&self) -> u64 {

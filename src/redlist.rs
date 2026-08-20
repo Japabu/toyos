@@ -1176,8 +1176,18 @@ pub const KNOWN_RED: &[Red] = &[
         source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-07",
     },
+    // ---------------------------------------------------------------------
+    // **`fd_lifetime` is `handle_lifetime` since 2026-08-20.** The rename is
+    // the fd/inbox wave's
+    // (`issues/design-debt/fd-is-libc-jargon-and-the-tree-still-speaks-it.md`).
+    // Every reading in the three rows below was taken before it, so the harness
+    // lines they quote and the command they name printed and spelled
+    // `fd_lifetime` at the time; all three have been re-spelled to the live
+    // name, because a row naming a test that no longer exists matches nothing,
+    // adjudicates nothing, and hands whoever re-runs it a command that fails.
+    // ---------------------------------------------------------------------
     Red {
-        test: "fd_lifetime",
+        test: "handle_lifetime",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(4, 7),
         standing: Standing::Retired(
@@ -1223,7 +1233,7 @@ pub const KNOWN_RED: &[Red] = &[
     // three instruments and no one of them says what the others do.
     // ---------------------------------------------------------------------
     Red {
-        test: "fd_lifetime",
+        test: "handle_lifetime",
         instrument: Instrument::Ci,
         finding: Finding::Seen,
         standing: Standing::Retired(
@@ -1234,7 +1244,7 @@ pub const KNOWN_RED: &[Red] = &[
         ),
         what: "`a killed process kept 16777216 bytes of its io_urings` — the **whole** 16 MiB \
                the holder allocated, against a 6 MiB threshold, so the release had made no \
-               progress at all when the reading was taken. `ALONE fd_lifetime: red again, the \
+               progress at all when the reading was taken. `ALONE handle_lifetime: red again, the \
                same failure both times`, which on a shared-block name is a fresh boot carrying \
                that binary and nothing else",
         evidence: "CI run 32237424649 (PR #126, job `guest (1)`); `main` red at `8e9f851` on \
@@ -1243,7 +1253,7 @@ pub const KNOWN_RED: &[Red] = &[
         measured: "2026-08-19",
     },
     Red {
-        test: "fd_lifetime",
+        test: "handle_lifetime",
         instrument: Instrument::DevHostAlone,
         finding: Finding::quiet(20),
         standing: Standing::Stands,
@@ -1251,7 +1261,7 @@ pub const KNOWN_RED: &[Red] = &[
                why every dev-host sighting of this name had said `ALONE … GREEN` and why the \
                defect was read as its neighbours' page churn. The dev host is two CPUs under \
                TCG; CI is four under KVM, and the race widens with the CPU count",
-        evidence: "20 × `cargo test --test toyos-build -- fd_lifetime` on one quiet dev host, \
+        evidence: "20 × `cargo test --test toyos-build -- handle_lifetime` on one quiet dev host, \
                    `wt/toyos-fdleak` at `8e9f851`",
         source: "issues/build/free-memory-verdicts-share-a-boot.md",
         measured: "2026-08-19",
@@ -1841,7 +1851,18 @@ pub const KNOWN_RED: &[Red] = &[
         test: "i8042_keyboard",
         instrument: Instrument::Ci,
         finding: Finding::Seen,
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the script outran QEMU's sixteen-byte PS/2 queue. 26 set-1 bytes went out on a \
+             `thread::sleep` clock, so the bound held only while the guest kept draining, and \
+             past the queue `ps2_queue()` drops one byte at a time and says nothing — a lost \
+             make takes its break with it (`handle_key` queues nothing for a usage nothing \
+             holds), which is exactly `0x29` missing entirely, and a lost `0xE0` leaves a press \
+             with no release, which is exactly the `usage 0x50: 1 presses, 0 releases` the \
+             isolated re-run produced. Reproduced deterministically by putting the same 26 bytes \
+             into one `input-send-event`: `i8042: drain bytes=16 keys=15` and `0 dropped, 0 \
+             overruns, 0 lost edges`. The test is paced against the guest's own `kev` lines now \
+             — one group outstanding, four bytes at most",
+        ),
         what: "`no event for HID usage 0x29 in [KeyLine { usage: 11, modifiers: 0, translated: \
                \"h\" }, …]` — twenty `KeyLine`s carrying the rest of the scripted sequence and \
                translating it: `h e l l o`, shift-`B` (`usage: 5`, `modifiers: 1`, `\"B\"`), then \
@@ -1855,14 +1876,22 @@ pub const KNOWN_RED: &[Red] = &[
                    phase `i8042_mouse` passed with `0 keys, 0 undecoded` in its tally where both \
                    re-run boots reported `28 keys, 12 undecoded` — three separate boots, so an \
                    accompanying observation and not a shared-guest claim",
-        source: "issues/kernel/two-i8042-verdicts-red-together-on-one-ci-shard.md",
+        source: "tests/toyos.rs QEMU_PS2_QUEUE",
         measured: "2026-08-19",
     },
     Red {
         test: "i8042_no_spurious_wake",
         instrument: Instrument::Ci,
         finding: Finding::Seen,
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the same over-subscription — twenty bytes against a sixteen-byte queue — and the \
+             same missing bound. What a drain carries is whatever the ISR found in the ring, so \
+             a host injecting on a wall clock was asserting on a batching it did not control: \
+             the capture's own `bytes=8 keys=2` is the Pause and the key that followed it 50 ms \
+             later taken together, which is a guest that did not drain for 50 ms. Each piece is \
+             paid for now before the next goes out — a Pause by a drain the driver logged, a key \
+             by its two `kev` lines — so the zero-event drain is arranged rather than hoped for",
+        ),
         what: "`no drain produced zero events — the stimulus never landed` — **and the capture it \
                prints contradicts its second clause**: the kernel names all six bytes of the \
                test's own Pause, `no event from [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5]`, so the \
@@ -1875,7 +1904,44 @@ pub const KNOWN_RED: &[Red] = &[
         evidence: "PR #128 run 32249152467, job `guest (2)`, the same shard and phase as this \
                    run's `i8042_keyboard` row; re-run as its group twice in the same job, \
                    `PASS (227ms)` and `PASS (222ms)`",
-        source: "issues/kernel/two-i8042-verdicts-red-together-on-one-ci-shard.md",
+        source: "tests/toyos.rs QEMU_PS2_QUEUE",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "screen_console_panic",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`the fatal report never took the screen back from the console — which would make \
+               /bin/console a downgrade on the machine it is for`, at 96 s against the suite's \
+               usual seconds, so the shape is a handoff waited for and never observed. First \
+               sighting: `--known-red` answered `NOT ON THE LIST`. **Not about the diff it was \
+               found on**, which is PR #141's merge-queue package — workflow triggers and \
+               CLAUDE.md prose, no kernel byte. `ALONE: GREEN, and it was alone both times — \
+               nothing the harness controls differed, so it failed once and passed once. That is \
+               a rate and not a classification`",
+        evidence: "PR #141 run 32306139422, job 96239259411 (`guest (3)`), 2026-08-19; the \
+                   isolated re-run in the same job was green",
+        source: "issues/panic-path/the-fatal-report-once-left-the-screen-to-the-console.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "log_poll_outlives_a_close",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`kernel panic: DOUBLE PANIC — the guest went quiet because every CPU is halted, \
+               not because it was still working. The panic is the finding and the guard never \
+               got to be one`. The kernel's complete last words were `[kernel 0.991 cpu0] DOUBLE \
+               PANIC` — no first-panic text, no location, which is the second finding. `ALONE: \
+               GREEN — it fails only beside other guests`; the load was two worktrees' full \
+               suites interleaved over the shared twelve guest slots. **Not about the diff it \
+               was found on**, a census-settling change inside `handle_kill_policy`'s own guest \
+               binary",
+        evidence: "dev host, 2026-08-19 22:21 UTC, `cargo test` in wt/toyos-hkpfix beside \
+                   wt/toyos-freshness's suite; 267 of 268 passed, this one red at 25 s in the \
+                   parallel phase, green alone in the same run",
+        source: "issues/panic-path/a-double-panic-at-boots-edge-says-nothing-but-its-name.md",
         measured: "2026-08-19",
     },
     Red {
@@ -1959,6 +2025,90 @@ pub const KNOWN_RED: &[Red] = &[
         evidence: "the same session's first run, twelve wide",
         source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-18",
+    },
+    // ---------------------------------------------------------------------
+    // `wt/toyos-spawnrule`, dev host, 2026-08-19: three full `cargo test` runs
+    // in one session on a branch whose whole behaviour change is one line of
+    // `SYS_SPAWN`'s slot-map resolution. **Two kernel deaths and one clean
+    // run**, at three different host widths: 1.02x red, 1.07x green 268 of 268,
+    // 1.41x red — and the kernel source under the first and third differs from
+    // the green one's by comments alone, so no statement compiled differently
+    // between them.
+    //
+    // The first of those two deaths was `process_lifecycle`'s Ring 0 fetch at
+    // `0x0` inside `SYS_READ`, and its row is gone with the defect: it was a
+    // `context_switch` restoring a task another CPU was still standing on, and
+    // a red under that name now is a new measurement rather than this one. What
+    // stays is the second death, which is not yet accounted for.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "sched_stress",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 3),
+        standing: Standing::Stands,
+        what: "`QEMU disconnected` — the kernel panicked at \
+               `alloc/src/collections/btree/navigate.rs:161`, `Option::unwrap()` on `None` \
+               **inside `BTreeMap`'s own immutable iterator**, walking a CPU's `parked` map \
+               from `SchedPass::apply_timer`. A map whose length disagrees with its nodes, not \
+               an absent deadline. It took the shared boot with it: 129 further names in the \
+               same run answered `Failed to flush QEMU stdin: … BrokenPipe`, so 130 of that \
+               run's reds are one event and only this one is a measurement",
+        evidence: "the same session's third run and the most loaded of the three, `fastest boot \
+                   1867 ms against the reference 1320 ms`; `ALONE sched_stress: GREEN` and \
+                   `PASS (2s)` in the same run",
+        source: "issues/kernel/a-btreemap-panicked-inside-its-own-navigation-in-a-scheduler-pass.md",
+        measured: "2026-08-19",
+    },
+    // ---------------------------------------------------------------------
+    // The same session's last two runs, after the branch merged `origin/main`
+    // at `bf54143`. Both red, both `ALONE … GREEN`, neither about the diff.
+    // The first was `i8042_kbd_echo`'s Ring 0 fetch at `0x1b`, and its row is
+    // gone with the defect for the reason the block above gives. The second is
+    // below, and it is the only one of that session's five reds that was never
+    // a kernel death.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "screen_console_shell",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 2),
+        standing: Standing::Stands,
+        what: "`typed \\`echo zqjxk\\` at the prompt and no row of the panel is its output` — a \
+               **different assertion** from this name's 2026-08-17 CI row, which is about the \
+               seeded `i8042:` line. 786 s against `PASS (2s)` alone in the same run, and the \
+               panel it decoded carries only the first frames of boot, so the guest never \
+               reached the prompt inside the window. The one red of this session's five that \
+               is not a kernel death",
+        evidence: "the fifth run of the same session, `fastest boot 1622 ms against the \
+                   reference 1320 ms`, 1.23x width; `ALONE screen_console_shell: GREEN`",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-19",
+    },
+    // ---------------------------------------------------------------------
+    // `wt/toyos-i8042deep`, dev host, 2026-08-19. Adjudicated here rather than
+    // re-run away: each answered `NOT ON THE LIST` when it was asked, and the
+    // branch they appeared on touches no kernel file at all — its whole delta
+    // is `tests/toyos.rs` and this file.
+    //
+    // Two of the three were `i8042_budget_expiry` and `nvme_large_device`,
+    // machine-wide Ring 0 deaths at `0x1b` that reded whichever guest was
+    // booting. Their rows are gone with the defect — a `context_switch`
+    // restoring a task another CPU was still standing on — so a red under
+    // either name now is a new measurement and must be read as one. The one
+    // that stays below is not a kernel death.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "diskless_boot",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`[qemu] QEMU died before ===READY=== (status: Ok(ExitStatus(unix_wait_status(0))))`. \
+               **QEMU exited zero**, so this is neither a panicked guest nor a wall-clock guard \
+               reporting the content it meant to assert — the process went away cleanly before \
+               the guest was ready, which nothing in the register explains. 7 s under load \
+               against 3 s alone; `ALONE: GREEN`. Not investigated",
+        evidence: "the same run as this session's `nvme_large_device` row",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-19",
     },
 ];
 

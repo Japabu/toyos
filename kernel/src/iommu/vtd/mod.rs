@@ -32,6 +32,7 @@ use crate::iommu::{AddressWidth, StreamId};
 use crate::mm::paging::CachePolicy;
 use crate::mm::Mmio;
 use crate::sync::Lock;
+use crate::time::{Duration, Tripwire};
 
 use dmar::{Dmar, Malformed, Scope, Scopes, Structure};
 use queue::Queue;
@@ -71,7 +72,10 @@ const ROOT_TABLE_SET: u32 = 1 << 30;
 /// hardware that is not answering. Expiry is a panic for the same reason §5.5
 /// gives for an unacknowledged invalidation — a unit half-way through being
 /// enabled is a unit whose reach nothing can state.
-const COMMAND_TIMEOUT_NS: u64 = 1_000_000_000;
+const COMMAND_TIMEOUT: Tripwire = Tripwire::absurd(
+    Duration::from_secs(1),
+    "a unit half-way through being enabled is a unit whose reach nothing can state",
+);
 
 /// x86-64's architectural physical-address ceiling is 52 bits, so a register
 /// base at or above this is not an address at all. It is also what stops
@@ -203,7 +207,7 @@ impl Unit {
         if persistent {
             self.gcmd |= bit;
         }
-        let deadline = crate::clock::nanos_since_boot() + COMMAND_TIMEOUT_NS;
+        let deadline = crate::clock::nanos_since_boot() + COMMAND_TIMEOUT.nanos();
         loop {
             let gsts = self.regs.read_u32(GSTS_REG);
             if gsts & status != 0 {
@@ -227,7 +231,7 @@ impl Unit {
 /// would read plausible garbage as a capability register, which costs a wrong
 /// log line and, from I2 on, a register write into somebody's heap.
 fn window(base: u64) -> Option<Mmio> {
-    if base == 0 || base % REGISTER_WINDOW != 0 || base >= MAX_PHYS {
+    if base == 0 || !base.is_multiple_of(REGISTER_WINDOW) || base >= MAX_PHYS {
         return None;
     }
     Some(

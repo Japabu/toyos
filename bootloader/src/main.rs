@@ -15,7 +15,7 @@ use uefi::{
     proto::console::gop::{GraphicsOutput, PixelFormat},
     proto::device_path::{media::{PartitionFormat, PartitionSignature}, DevicePath, DevicePathNode, DeviceType, DeviceSubType},
     proto::loaded_image::LoadedImage,
-    proto::media::file::{File, FileInfo, FileMode},
+    proto::media::file::{File, FileAttribute, FileInfo, FileMode},
     table::{boot::{MemoryType, PAGE_SIZE}, cfg::ACPI2_GUID},
 };
 use uefi_services::println;
@@ -37,8 +37,16 @@ const MAX_ESP_FILE: u64 = 1024 * 1024 * 1024;
 fn alloc_kernel_memory(size: usize) -> vec::Vec<u8> {
     const KERNEL_ALIGN: usize = 2 * 1024 * 1024; // 2MB
     let layout = Layout::from_size_align(size, KERNEL_ALIGN).expect("invalid layout");
+    // SAFETY: `layout` has non-zero size — `size` is `vaddr_max + stack_size`
+    // at the one call site, and `stack_size` alone is a fixed 8 MiB — so
+    // `alloc_zeroed`'s "layout must have non-zero size" precondition always
+    // holds.
     let ptr = unsafe { alloc::alloc::alloc_zeroed(layout) };
     assert!(!ptr.is_null(), "kernel allocation failed");
+    // SAFETY: `ptr` was just returned by the global allocator for exactly
+    // `layout`, so it is non-null (asserted above), currently allocated, and
+    // sized and aligned for `size` bytes. `len == capacity == size` is the
+    // allocation's own size, not a separate claim.
     unsafe { vec::Vec::from_raw_parts(ptr, size, size) }
 }
 
@@ -58,7 +66,7 @@ fn load_file_bytes(handle: Handle, system_table: &SystemTable<Boot>, path: &CStr
     let mut file = fs
         .open_volume()
         .expect("Failed to open volume")
-        .open(path, FileMode::Read, Default::default())
+        .open(path, FileMode::Read, FileAttribute::default())
         .expect("Failed to open file")
         .into_regular_file()
         .expect("Failed to convert to regular file");
@@ -100,9 +108,21 @@ fn load_file_bytes(handle: Handle, system_table: &SystemTable<Boot>, path: &CStr
 /// 0.26's allocator implements only `alloc`/`dealloc`, so it falls through to
 /// `GlobalAlloc`'s default of `alloc` plus `write_bytes(ptr, 0, size)`.
 fn alloc_uninit(size: usize) -> vec::Vec<u8> {
+    // `\toyos\cmdline` is legitimately empty on a machine with no boot
+    // arguments, so `size` reaches here as 0 in real boots, not just in
+    // theory. `alloc`'s "layout must have non-zero size" precondition would
+    // not hold for it, and there is nothing to allocate anyway.
+    if size == 0 {
+        return vec::Vec::new();
+    }
     let layout = Layout::from_size_align(size, 1).expect("invalid layout");
+    // SAFETY: `layout` has non-zero size, guaranteed by the early return above.
     let ptr = unsafe { alloc::alloc::alloc(layout) };
     assert!(!ptr.is_null(), "file buffer allocation failed ({size} bytes)");
+    // SAFETY: `ptr` was just returned by the global allocator for exactly
+    // `layout`, so it is non-null (asserted above), currently allocated, and
+    // sized and aligned for `size` bytes. `len == capacity == size` is the
+    // allocation's own size, not a separate claim.
     unsafe { vec::Vec::from_raw_parts(ptr, size, size) }
 }
 
@@ -344,13 +364,24 @@ fn load_kernel_elf(kernel_elf_bytes: &[u8]) -> LoadedKernel {
                         (0..=mem_size as i64).contains(&addend),
                         "kernel.elf: relocation addend {addend:#x} is outside the {mem_size:#x}-byte image"
                     );
+                    // SAFETY: `addend` is asserted above to be in `0..=mem_size`,
+                    // so this is at most one byte past the end of `process_mem`'s
+                    // allocation — in bounds for pointer arithmetic, and never
+                    // dereferenced: only the resulting address is used.
                     let value = PHYS_OFFSET + unsafe { process_mem.as_ptr().add(addend as usize) } as u64;
                     unsafe {
+                        // SAFETY: `offset + 8 <= mem_size` is asserted above, so
+                        // the 8-byte write lands fully inside `process_mem`'s
+                        // allocation. `write_unaligned`, not `write`: an
+                        // `r_offset` from the file is not guaranteed 8-byte
+                        // aligned by anything checked here, only by toyos-ld
+                        // always emitting `R_X86_64_RELATIVE` against aligned
+                        // slots — a fact this reader has no way to verify.
                         process_mem
                             .as_mut_ptr()
                             .add(offset as usize)
                             .cast::<u64>()
-                            .write(value);
+                            .write_unaligned(value);
                     }
                     reloc_count += 1;
                 }
@@ -453,7 +484,7 @@ unsafe fn build_boot_page_tables(pt_mem: *mut u8, size: u64) -> u64 {
     let identity_pdpt = alloc_page(pt_mem);
     let high_pdpt = alloc_page(pt_mem);
 
-    let num_gb = ((size + GB - 1) / GB) as usize;
+    let num_gb = size.div_ceil(GB) as usize;
     for gi in 0..num_gb {
         let pd = alloc_page(pt_mem);
         for pdi in 0..512u64 {
@@ -474,6 +505,9 @@ unsafe fn build_boot_page_tables(pt_mem: *mut u8, size: u64) -> u64 {
     pml4 as u64
 }
 
+// Ten arguments because this is the handoff and they are what firmware leaves:
+// every one is moved into `KernelArgs` below and nothing else calls it.
+#[allow(clippy::too_many_arguments)]
 fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: vec::Vec<u8>, cmdline: vec::Vec<u8>, rsdp_addr: u64, gop: Option<GopInfo>, boot_part: Option<BootPartition>, log_partition_guid: [u8; 16], rtc_utc_offset: Option<i32>, system_table: SystemTable<Boot>) -> ! {
     let mms = system_table.boot_services().memory_map_size();
     let memory_map_entry_count = mms.map_size / mms.entry_size + 8;
@@ -484,6 +518,9 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
     // Allocate as a flat array and split into 512-entry pages.
     const PT_PAGES: usize = 12;
     let pt_layout = Layout::from_size_align(PT_PAGES * 4096, 4096).unwrap();
+    // SAFETY: `layout` has non-zero size (`PT_PAGES` is a fixed 12) and its
+    // 4096 alignment is what every page-table page below needs — the low 12
+    // bits of an entry are flags, not address bits.
     let pt_mem = unsafe { alloc::alloc::alloc_zeroed(pt_layout) };
     assert!(!pt_mem.is_null(), "page table allocation failed");
 
@@ -492,7 +529,7 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
     uefi_memory_map.entries().for_each(|entry| {
         memory_map.push(MemoryMapEntry {
             uefi_type: entry.ty.0,
-            start: entry.phys_start as u64,
+            start: entry.phys_start,
             end: entry.phys_start + entry.page_count * PAGE_SIZE as u64,
         });
     });
@@ -542,12 +579,31 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
     };
 
     // Build boot page tables: identity map + high-half map for first 4GB.
-    let pml4_phys = unsafe { build_boot_page_tables(pt_mem, 4 * 1024 * 1024 * 1024) };
+    const BOOT_MAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    // SAFETY: `pt_mem` is the `PT_PAGES * 4096`-byte, 4096-aligned, zeroed
+    // allocation above, and `PT_PAGES` (12) covers what `BOOT_MAP_BYTES` (4
+    // GiB) needs: 1 PML4 + 2 PDPTs + up to 8 PDs, one PD per GiB — `size`
+    // here is `BOOT_MAP_BYTES` exactly, so `num_gb` inside is 4, well under
+    // the 8 the allocation has room for.
+    let pml4_phys = unsafe { build_boot_page_tables(pt_mem, BOOT_MAP_BYTES) };
     kernel_args.boot_pml4_addr = pml4_phys;
 
-    // Switch to new page tables (identity map keeps us alive)
+    // Switch to new page tables. SAFETY: `pml4_phys` is the table just built,
+    // identity-mapping low memory (so the code and stack this instruction
+    // itself runs from stay mapped across the switch) and high-half-mapping
+    // the same range at `PHYS_OFFSET` for the jump below.
     unsafe { core::arch::asm!("mov cr3, {}", in(reg) pml4_phys, options(nostack)) };
 
+    // The boot map above covers only `BOOT_MAP_BYTES` — everything the entry
+    // jump below needs mapped, not everything `KernelArgs` names. The kernel
+    // reaches the rest (initrd, cmdline, its own stack) through the page
+    // tables it builds for itself once it is running; only the entry point
+    // has to be live under *these* transient ones.
+    assert!(
+        kernel_phys.checked_add(kernel.memory.len() as u64).is_some_and(|end| end <= BOOT_MAP_BYTES),
+        "kernel image at {kernel_phys:#x}..+{:#x} does not fit the {BOOT_MAP_BYTES:#x}-byte boot map",
+        kernel.memory.len()
+    );
     let entry_virt = PHYS_OFFSET + kernel_phys + kernel.entry_offset as u64;
 
     mem::forget(memory_map);
@@ -556,6 +612,13 @@ fn start_kernel(kernel: LoadedKernel, kernel_elf_bytes: vec::Vec<u8>, initrd: ve
     mem::forget(initrd);
     mem::forget(cmdline);
 
+    // SAFETY: `entry_virt` is `kernel_phys + entry_offset` read through the
+    // high-half mapping just switched to, which the assert above proved
+    // covers the whole kernel image. `kernel.elf`'s entry point is `extern
+    // "sysv64" fn(&KernelArgs) -> !` by the boot protocol `toyos-abi::boot`
+    // and the kernel side of it define between them — this bootloader has no
+    // way to check the callee's signature, only to keep its own side of that
+    // contract.
     let entry: extern "sysv64" fn(&KernelArgs) -> ! = unsafe { mem::transmute(entry_virt) };
     entry(&kernel_args);
 }

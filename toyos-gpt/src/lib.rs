@@ -343,7 +343,7 @@ fn parse_header(lba1: &[u8], lba_bytes: u32, lba_count: u64, header_lba: u64) ->
     if entry_bytes < MIN_ENTRY_BYTES
         || !entry_bytes.is_power_of_two()
         || entry_bytes > lba_bytes
-        || lba_bytes % entry_bytes != 0
+        || !lba_bytes.is_multiple_of(entry_bytes)
     {
         return Err(GptError::EntrySize(entry_bytes));
     }

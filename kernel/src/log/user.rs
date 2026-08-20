@@ -144,7 +144,7 @@ pub fn read(
     drain_ordered(&mut walk, &mut sink);
     let written = sink.written;
 
-    walk.into_reader(cursor);
+    walk.write_into(cursor);
     // The one field the kernel writes without being asked: a caller passes a
     // zeroed cursor the first time and reads back how many shards it is
     // reading.

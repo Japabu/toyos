@@ -146,6 +146,165 @@ pub mod log_registry;
 #[path = "../../kernel/src/sched/reap_gate.rs"]
 pub mod reap_gate;
 
+/// The duration kinds and the two time types. It names nothing outside `core`,
+/// which is what lets a record carry an `Instant` into a model at all — and it
+/// is compiled here so that constraint is checked rather than remembered.
+#[path = "../../kernel/src/time.rs"]
+pub mod time;
+
+/// The completion core's record and inbox. It reaches `crate::time` and
+/// `crate::cell` and nothing else, and that narrowness is load-bearing: a file
+/// that named a pipe end or a device claim could not be compiled here at all,
+/// and the ordering would stop being checked by anything.
+#[path = "../../kernel/src/completion/inbox.rs"]
+pub mod inbox;
+
+/// What `sleeplock.rs` names of the completion core, and nothing more.
+///
+/// **The park is shimmed, and that is the scope statement for
+/// `tests/sleep_lock.rs`.** Loom has no scheduler, so there is nothing here to
+/// park *on*; [`completion::wait_uncancellable_until`] yields instead, which is
+/// what lets the model drive the real contended acquire at all. What the model
+/// therefore proves is the ticket arithmetic and the acquire/release edge —
+/// mutual exclusion, ordering, and the order contenders are served in. What it
+/// does **not** prove is the wake handshake: the record-then-claim pair that
+/// makes a post reach a parked waiter is `tests/inbox.rs`'s, and it is modelled
+/// there against the real `Inbox`.
+///
+/// `Watch` is a stand-in for the same reason: nothing arms here, so [`post_n`]
+/// has nobody to tell and answers zero. The kernel's `Watch` owns a `Lock<Vec<_>>`
+/// and could not be compiled into this crate anyway.
+pub mod completion {
+    pub use crate::inbox::{Outcome, Record, Token};
+    use crate::scheduler::Parkable;
+
+    /// The waiters armed on one object — a stand-in, because the park above it
+    /// is shimmed and nothing ever arms.
+    pub struct Watch;
+
+    impl Watch {
+        pub const fn new() -> Self {
+            Self
+        }
+    }
+
+    impl Default for Watch {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct Subject<'a>(#[allow(dead_code)] &'a Watch);
+
+    impl<'a> Subject<'a> {
+        pub const fn of(watch: &'a Watch) -> Self {
+            Self(watch)
+        }
+    }
+
+    /// Nobody is armed here, so nobody is told. The kernel's answer is how many
+    /// waiters this call claimed; the models never read it.
+    pub fn post_n(_subject: Subject<'_>, _outcome: Outcome, _token: Token, _limit: usize) -> usize {
+        0
+    }
+
+    /// The shimmed park. `yield_now` is loom's own way of saying "another
+    /// thread may run here", which is exactly what a park is from the schedule
+    /// explorer's point of view — and unlike `core::hint::spin_loop`, which is
+    /// what makes `Lock::lock`'s spin unmodellable, it is a branch loom can
+    /// bound.
+    pub fn wait_uncancellable_until(
+        _p: &Parkable,
+        _subject: Subject<'_>,
+        _token: Token,
+        ready: impl Fn() -> bool,
+    ) {
+        while !ready() {
+            #[cfg(feature = "loom")]
+            loom::thread::yield_now();
+            #[cfg(not(feature = "loom"))]
+            std::hint::spin_loop();
+        }
+    }
+}
+
+/// What `sleeplock.rs` names of the scheduler: the right to park, and who is
+/// asking.
+///
+/// Three items, and the arithmetic in [`TaskId`] is the whole of what is
+/// restated here rather than compiled — `kernel/src/scheduler.rs` names the
+/// process table, the `toyos-sched` driver and half the kernel besides, so it
+/// cannot be a `#[path]` module the way `sync.rs` and `inbox.rs` are.
+pub mod scheduler {
+    /// The right to give the CPU back. In the kernel its constructor asserts
+    /// the context's baseline preempt depth; here there is no preempt count and
+    /// no context, so the type carries only the fact that a caller had one.
+    pub struct Parkable(());
+
+    impl Parkable {
+        pub fn at_entry() -> Self {
+            Self(())
+        }
+    }
+
+    /// Process-scoped thread identity, as the two halves of the word the lock
+    /// stores.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct TaskId(pub u32, pub u32);
+
+    impl TaskId {
+        pub fn pack(self) -> u64 {
+            u64::from(self.1) | (u64::from(self.0) << 32)
+        }
+
+        pub fn unpack(value: u64) -> Self {
+            Self((value >> 32) as u32, value as u32)
+        }
+    }
+
+    impl core::fmt::Display for TaskId {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "{}:{}", self.0, self.1)
+        }
+    }
+
+    // Who this thread is, so the lock's holder word and its self-deadlock
+    // refusal mean something. The model says; the kernel reads the same fact
+    // out of two per-CPU words. A `//` comment and not a doc one: rustdoc
+    // documents no item a macro invocation produces, and `///` here is a
+    // warning rather than documentation.
+    //
+    // **`loom::thread_local!` under loom and `std::thread_local!` without it**,
+    // and the split is not cosmetic: loom's threads are coroutines on one OS
+    // thread, so a `std` slot would be one cell shared by all of them and every
+    // task in the model would be the last one to speak.
+    #[cfg(feature = "loom")]
+    loom::thread_local! {
+        static WHO: core::cell::Cell<Option<TaskId>> = core::cell::Cell::new(None);
+    }
+    #[cfg(not(feature = "loom"))]
+    std::thread_local! {
+        static WHO: core::cell::Cell<Option<TaskId>> = const { core::cell::Cell::new(None) };
+    }
+
+    /// Say who the current thread is. No kernel counterpart: there, the answer
+    /// is whatever the CPU is running.
+    pub fn become_task(id: TaskId) {
+        WHO.with(|who| who.set(Some(id)));
+    }
+
+    pub fn current_task() -> Option<TaskId> {
+        WHO.with(|who| who.get())
+    }
+}
+
+/// The sleep lock, compiled a second time against loom's atomics. Its
+/// dependency surface is the two shim modules above and nothing else — the same
+/// narrowness `inbox.rs` carries, and for the same reason.
+#[path = "../../kernel/src/sleeplock.rs"]
+pub mod sleeplock;
+
 /// The i8042's interrupt tally. `tests/i8042_tally.rs` is the only model whose
 /// subject is a *driver*, and it is here for the reason the others are: the
 /// property is "no reader ever sees this pair disagree", which is a claim about

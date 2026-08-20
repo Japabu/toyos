@@ -6,7 +6,7 @@ use toyos::audio::{
 };
 use toyos::endow::{self, Endowments};
 use toyos::ipc::{self, RxStep};
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::port::Acceptor;
 use toyos::shm::SharedMemory;
 use toyos::syscap::SysCap;
@@ -345,7 +345,7 @@ struct ClientStream {
     /// read end to the client, so §5.7's crash detection is by construction:
     /// the moment the client's table goes, the read end goes with it and the
     /// next signal breaks.
-    signal_write_fd: RawHandle,
+    signal_write: RawHandle,
     gain: GainRamp,
     client_channels: u16,
     client_period_frames: u32,
@@ -395,8 +395,8 @@ impl ClientStream {
 /// single poller and io_uring rings are powers of two, so the limit is a ring
 /// size minus one. 64 costs the same 2 MiB page as 32; 63 simultaneous streams
 /// is already past what the mixer renders inside one 2.9 ms period, and costs
-/// 189 of the kernel's 1024 fds (a control connection plus both signal pipe
-/// ends per client).
+/// 189 of the kernel's 4096 handle slots (a control connection plus both signal
+/// pipe ends per client).
 const MAX_CONTROL_CLIENTS: usize = 63;
 
 /// Deep enough that one pass of the control loop can never fill it: a pass
@@ -742,7 +742,7 @@ fn open_stream(
     // is that order, and a client reading the frame is guaranteed to find
     // them. Both are moved whether or not this succeeds.
     if control.send_with_handles(
-        &[client_shm, signal_read.into_fd()],
+        &[client_shm, signal_read.into_raw()],
         MSG_STREAM_OPENED,
         &StreamOpenResponse {
             client_period_frames,
@@ -790,7 +790,7 @@ fn open_stream(
     Some(ClientStream {
         client_id,
         slot_reader,
-        signal_write_fd: signal_write.into_fd(),
+        signal_write: signal_write.into_raw(),
         gain,
         client_channels: req.channels,
         client_period_frames,
@@ -897,7 +897,7 @@ fn mix_client(
 fn signal_clients(streams: &mut [ClientStream], ramp_frames: u32) {
     for stream in streams.iter_mut() {
         let gone = matches!(
-            syscall::write_nonblock(stream.signal_write_fd, &[1]),
+            syscall::write_nonblock(stream.signal_write, &[1]),
             Err(syscall::SyscallError::NotFound)
         );
         if gone {
@@ -914,7 +914,7 @@ fn apply_commands(cmd_ring: &CommandRing, streams: &mut Vec<ClientStream>, ramp_
         match cmd {
             MixCommand::AddClient(client) => {
                 say!("soundd: client {} connected (id={})", streams.len(), client.client_id);
-                let _ = syscall::write_nonblock(client.signal_write_fd, &[1]);
+                let _ = syscall::write_nonblock(client.signal_write, &[1]);
                 streams.push(*client);
             }
             MixCommand::RemoveClient { client_id, departure } => {
@@ -942,7 +942,7 @@ fn retain_active(streams: &mut Vec<ClientStream>) {
     streams.retain(|s| match s.departure {
         Some(how) if s.gain.is_idle() => {
             say!("soundd: client {} removed ({how})", s.client_id);
-            syscall::close(s.signal_write_fd);
+            syscall::close(s.signal_write);
             false
         }
         _ => true,
@@ -1205,8 +1205,8 @@ fn mix_thread(
             }
         };
 
-        poller.poll_add_fd(backend.handle(), IORING_POLL_IN, TOKEN_AUDIO);
-        poller.poll_add_fd(cmd_pipe_read, IORING_POLL_IN, TOKEN_CMD);
+        poller.watch_raw(backend.handle(), READABLE, TOKEN_AUDIO);
+        poller.watch_raw(cmd_pipe_read, READABLE, TOKEN_CMD);
 
         let mut cmd_ready = false;
         poller.wait(1, timeout, |token| match token {
@@ -1568,7 +1568,7 @@ fn null_sink_thread(
             next_period_ns.saturating_sub(syscall::clock_nanos()).max(1)
         };
 
-        poller.poll_add_fd(cmd_pipe_read, IORING_POLL_IN, TOKEN_CMD);
+        poller.watch_raw(cmd_pipe_read, READABLE, TOKEN_CMD);
         let mut cmd_ready = false;
         poller.wait(1, timeout, |token| match token {
             TOKEN_CMD => cmd_ready = true,
@@ -1838,9 +1838,9 @@ fn control_thread(
     const TOKEN_ACCEPT: u64 = u64::MAX;
 
     loop {
-        poller.poll_add(&acceptor, IORING_POLL_IN, TOKEN_ACCEPT);
+        poller.watch(&acceptor, READABLE, TOKEN_ACCEPT);
         for (i, client) in clients.iter().enumerate() {
-            poller.poll_add(&client.conn, IORING_POLL_IN, i as u64);
+            poller.watch(&client.conn, READABLE, i as u64);
         }
 
         let mut ready: Vec<u64> = Vec::new();
@@ -1906,7 +1906,7 @@ fn control_thread(
                     RxStep::Frame { msg_type, payload_len } => (msg_type, payload_len),
                 };
                 // The payload travels with the frame instead of being read off
-                // the fd during dispatch: the read side is finished before
+                // the connection during dispatch: the read side is finished before
                 // anything below acts on the message.
                 let mut payload = [0u8; MAX_KEPT_PAYLOAD];
                 payload[..payload_len].copy_from_slice(clients[i].rx.payload(payload_len));

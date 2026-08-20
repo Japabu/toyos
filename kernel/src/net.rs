@@ -50,7 +50,7 @@ pub fn remove_io_uring_watcher(id: RingId) {
 
 /// Wake every thread blocked on an incoming frame.
 pub fn wake_waiters() {
-    crate::sched::waitqs::wake_all(&crate::sched::waitqs::NETWORK);
+    crate::sched::waitqs::wake_device(&crate::sched::waitqs::NETWORK_WATCH);
 }
 
 pub fn io_uring_watchers() -> Vec<RingId> {
@@ -70,7 +70,7 @@ pub fn nic_info() -> Option<(NicInfo, crate::object::shm::Region)> {
 }
 
 pub fn has_packet() -> bool {
-    NIC.lock().as_ref().map_or(false, |nic| nic.has_packet())
+    NIC.lock().as_ref().is_some_and(|nic| nic.has_packet())
 }
 
 pub fn poll_rx() -> Option<(usize, usize)> {

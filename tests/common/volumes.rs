@@ -921,7 +921,7 @@ pub fn log_on_device(
 /// - the failure is **reported** (`serving zeros`, the marker triage greps for,
 ///   which this path could not emit at all);
 /// - the failure **propagates** to the caller — `FatBacking` →
-///   `file_cache::write_page` → `fd::write` → the process, every one of which
+///   `file_cache::write_page` → `ops::try_write` → the process, every one of which
 ///   returned `()` or swallowed on some link of the chain;
 /// - the file on the device is **not corrupted**, checked on the host against
 ///   the bytes the host itself wrote. This is the claim the other two exist to
@@ -1016,7 +1016,7 @@ pub fn log_backing_read_error(
     //    know its bytes went into a page invented out of a failed read.
     if !log.contains("reread: the write failed") {
         return Err(format!(
-            "the process was not told: a refused page has to reach `fd::write` as an error \
+            "the process was not told: a refused page has to reach `ops::try_write` as an error \
              instead of being merged into zeros\n{log}"
         ));
     }
@@ -1395,6 +1395,10 @@ const FORGED: [u8; 16] = [
 /// As `Guid`'s Display prints it: three little-endian fields then raw bytes.
 const FORGED_TEXT: &str = "33221100-5544-7766-8899-AABBCCDDEEFF";
 
+/// An image on disk and the `(offset, len)` of its ESP and its log partition,
+/// in that order.
+pub type ImageWithExtents = (PathBuf, (usize, usize), (usize, usize));
+
 /// A stick as the build made it, with one file changed: the sixteen bytes of
 /// `\toyos\log.guid` now name a partition no machine has.
 ///
@@ -1410,7 +1414,7 @@ pub fn image_with_unnamed_log_partition(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
-) -> Result<(PathBuf, (usize, usize), (usize, usize)), String> {
+) -> Result<ImageWithExtents, String> {
     let image_path = test_dir().join(name);
     let mut image = qemu::build_boot_image(test_config, c_bins, rust_bins, &[]);
     std::fs::write(&image_path, &image).map_err(|e| format!("write the boot image: {e}"))?;

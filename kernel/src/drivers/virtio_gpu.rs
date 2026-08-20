@@ -422,7 +422,7 @@ impl GpuController {
     /// whether that is fatal.
     fn alloc_framebuffer(&mut self, fb_size: u32) -> Option<FbAlloc> {
         let fb_size = fb_size as usize;
-        let fb_pages = (fb_size + PAGE_2M as usize - 1) / PAGE_2M as usize;
+        let fb_pages = fb_size.div_ceil(PAGE_2M as usize);
         let fb_aligned = (fb_pages * PAGE_2M as usize) as u64;
         let mut phys_addrs = [0u64; 2];
         let all_pages =

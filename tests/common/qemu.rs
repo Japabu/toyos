@@ -2384,7 +2384,7 @@ impl QemuInstance {
     /// `run_test`, with `action` run once the guest prints `ready_line`.
     ///
     /// The hook is inside the read loop because that is the only place the
-    /// two facts meet: the guest is holding the keyboard fd, and the host has
+    /// two facts meet: the guest is holding the keyboard claim, and the host has
     /// not injected yet. A sleep would be a guess in both directions.
     pub fn run_test_hooked(
         &mut self,

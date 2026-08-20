@@ -1,4 +1,5 @@
 use alloc::boxed::Box;
+use alloc::collections::btree_map::Entry;
 use alloc::collections::BTreeMap;
 use alloc::collections::BTreeSet;
 use alloc::sync::Arc;
@@ -111,7 +112,7 @@ pub fn has_backing(file_id: FileId) -> bool {
     FILE_CACHE.lock().files.get(&file_id).is_some_and(|f| f.backing.is_some())
 }
 
-/// Increment ref_count for an open fd.
+/// Increment ref_count for one more open handle.
 pub fn open(file_id: FileId) {
     let mut cache = FILE_CACHE.lock();
     if let Some(file) = cache.files.get_mut(&file_id) {
@@ -190,8 +191,8 @@ pub fn read_page(
     {
         let Some(file) = cache.files.get_mut(&file_id) else { return Ok(()) };
         let is_cache = file.is_cache();
-        if !file.pages.contains_key(&page_idx) {
-            file.pages.insert(page_idx, CachedPage::new(fetched));
+        if let Entry::Vacant(slot) = file.pages.entry(page_idx) {
+            slot.insert(CachedPage::new(fetched));
             added = is_cache as usize;
         }
         let file_size = file.size;
@@ -260,9 +261,10 @@ pub fn write_page<S: ByteSource + ?Sized>(
     let mut added = 0;
     {
         let Some(file) = cache.files.get_mut(&file_id) else { return Ok(()) };
-        if !file.pages.contains_key(&page_idx) {
-            file.pages.insert(page_idx, CachedPage::new(fetched));
-            added = file.is_cache() as usize;
+        let is_cache = file.is_cache();
+        if let Entry::Vacant(slot) = file.pages.entry(page_idx) {
+            slot.insert(CachedPage::new(fetched));
+            added = is_cache as usize;
         }
         apply_write(file, page_idx, offset, data);
     }
@@ -362,14 +364,14 @@ pub fn set_size(file_id: FileId, new_size: u64) {
 /// What the cache holds for a file after an operation that may have freed it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Residency {
-    /// Open fds still hold it, so its pages and its id are still live.
+    /// Open handles still hold it, so its pages and its id are still live.
     Held,
     /// The cache holds nothing for this id, and a filesystem may drop whatever
     /// it keeps alongside.
     Gone,
 }
 
-/// Mark a file as deleted (unlink). If no fds hold it, free immediately.
+/// Mark a file as deleted (unlink). If no handles hold it, free immediately.
 ///
 /// The verdict is returned rather than left to be re-derived from a refcount,
 /// because a refcount read after the unlock is a different question asked at a
@@ -447,7 +449,7 @@ fn evict_if_needed(cache: &mut FileCache) {
     let before = cache.evictions;
     while cache.cached_pages > cache.max_pages {
         if !evict_one(cache) {
-            // Everything resident is dirty. Write-back is the fd layer's job
+            // Everything resident is dirty. Write-back is the handle layer's job
             // (`vfs::flush_file` on fsync and on close), so the only bound on
             // dirty pages is the writer's un-flushed working set.
             break;

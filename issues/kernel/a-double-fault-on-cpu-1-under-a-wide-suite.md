@@ -186,10 +186,16 @@ samples against one observation and it establishes no rate whatsoever; it is
 recorded so nobody counts it as evidence in either direction.
 
 Nothing here is a repro recipe, and there is no cheap one to offer: a `#DF`
-reached only beside eleven other guests does not reproduce alone, and this file
-would be the third in this tree (with
-`issues/kernel/ring0-jump-to-zero-under-port-polls.md` and
-`issues/kernel/a-ring-0-fetch-at-0x1b-during-a-loaded-boot.md`) to say so.
+reached only beside eleven other guests does not reproduce alone, and
+`issues/kernel/ring0-jump-to-zero-under-port-polls.md` says the same of its own.
+
+**One recipe was cheap for the neighbouring class and nobody had tried it**,
+which is worth a sentence here because the move transfers: booting the ordinary
+`target/bootable.img` twelve at a time in a loop, five seconds a boot, killing
+each guest and grepping its console. That reproduced the Ring 0 fetch at `0x1b`
+at roughly one boot in a hundred and diagnosed it. A machine-wide death *during
+boot* does not need a suite — it needs boots, and a suite is an expensive way to
+get 79 of them.
 
 Do not close this on green runs. What retires it is a second sighting that names
 its own cause — which it now will.

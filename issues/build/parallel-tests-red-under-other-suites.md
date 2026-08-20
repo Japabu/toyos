@@ -140,7 +140,7 @@ changes.
   with a second worktree's suite on the host throughout. `16 more killed
   processes left more live objects behind: [("Process", 6, 7)]`, `ALONE …
   GREEN`, and green on all twelve KVM shards of the same tree (run
-  `32023797195`). **Its mechanism is `fd_lifetime`'s and not the terminal
+  `32023797195`). **Its mechanism is `handle_lifetime`'s and not the terminal
   race's**: both are shared-boot binaries whose verdict is a *machine-wide*
   census either side of a kill — free bytes there, live objects by type here —
   taken on a guest where a hundred and fifty other tests are also starting and
@@ -200,14 +200,82 @@ changes.
   `cargo run -- --known-red metal_sim_input` answers `NOT ON THE LIST`.
 
   **Its mechanism is not this file's census race and it is filed here for want
-  of a better register.** A kernel panic during a loaded boot is
-  `issues/kernel/a-ring-0-fetch-at-0x1b-during-a-loaded-boot.md` and
-  `issues/kernel/the-shared-boot-jumped-to-null-spawning-sched-stress.md`,
-  each of which is one sighting carrying the *guest's own panic text*. This one
-  has none: `TestResult::error` carried the verdict, a failing test's guest
-  console is not printed, and by the time the re-runs were green the capture was
-  gone. **What the next sighting owes is that console**, and the way to get it is
-  a full suite beside a second worktree's — not a search of a passing boot.
+  of a better register.** A kernel panic during a loaded boot was a filed class
+  of its own — five sightings, each carrying the *guest's own panic text* — and
+  that class has since been diagnosed and fixed: a CPU could hand a thief the
+  task whose context it was still standing on, so two CPUs ran one kernel stack
+  (`SchedPass::answer_steal_requests`, `toyos-sched/src/cpu.rs`). This sighting
+  carried no console at all — `TestResult::error` held the verdict, a failing
+  test's guest console is not printed, and by the time the re-runs were green
+  the capture was gone — so it can be neither confirmed as that class nor ruled
+  out. **What the next sighting owes is that console.** The way to get one is
+  cheaper than a suite: boot `target/bootable.img` twelve at a time in a loop
+  and grep each guest's output, which is what reproduced the class above at
+  roughly one boot in a hundred.
+- **`xhci_full_speed_device`** — added 2026-08-19, **1 of 2** full `cargo test`
+  runs on `wt/toyos-clippygate`. `"PANIC:" during the USB gate boot`,
+  `ALONE … GREEN`, and `cargo run -- --known-red xhci_full_speed_device`
+  answers `NOT ON THE LIST`. The two runs are the measurement: the red one was
+  the branch's *first* suite after a full rebuild and its parallel phase took
+  103.9 s, the green one minutes later on a warm tree took 32.0 s — so the phase
+  that failed was carrying this worktree's own twelve kernel builds, which is
+  the load `build_slot` bounds and the section below describes. The branch's
+  kernel delta in `drivers/xhci/` is two comment blocks, two `#[allow]`
+  attributes and two pairs of parentheses that spell out the precedence Rust
+  already applied (`+` and `*` bind tighter than `|`), so no instruction in that
+  driver moved. Still `Sched::Parallel`.
+- **`diskless_boot`** — added 2026-08-19, one full `cargo test` on
+  `wt/toyos-i8042deep`, whose whole delta is host-side harness code
+  (`tests/toyos.rs`, `src/redlist.rs`) and no kernel file at all. Twelve wide
+  with `toyos-spawnrule`'s suite holding guest slots throughout, named in that
+  run's own `[host-slots]` lines. `[qemu] QEMU died before ===READY=== (status:
+  Ok(ExitStatus(unix_wait_status(0))))` — **QEMU exited zero**, so this is
+  neither a guest that panicked nor a wall-clock guard reporting the content it
+  was going to assert; it is the process going away cleanly before the guest was
+  ready, which nothing here explains. 7 s under load, `ALONE: GREEN` in 3 s, and
+  `cargo run -- --known-red diskless_boot` answered `NOT ON THE LIST`. Not
+  investigated.
+- **`nvme_large_device`** — same run, same session, and **its mechanism was not
+  this file's**: a machine-wide `KERNEL PANIC: execute unmapped address at 0x1b`
+  in ring 0 on a `spawn` syscall — the console `metal_sim_input` above owes,
+  paid by a different name. That was the stolen-loaded-context defect, since
+  diagnosed and fixed, so this bullet is closed: the red was the panic and
+  `nvme_large_device` was only the workload it interrupted. `ALONE: GREEN`.
+- **`screen_console_shell`** — added 2026-08-19, **1 of 2** full `cargo test`
+  runs on `wt/toyos-spawnrule`, 1.23x width with another worktree's suite on the
+  host. `typed \`echo zqjxk\` at the prompt and no row of the panel is its
+  output` — **786 s** against `PASS (2s)` alone in the same run, and the panel it
+  decoded carries only the first frames of boot, so the guest never reached the
+  prompt inside the window. Exactly this file's shape: a wall-clock guard
+  reporting the content it was going to assert. It is a *different* assertion
+  from this name's 2026-08-17 CI row, which is about the seeded `i8042:` line.
+  Still `Sched::Parallel`, not investigated.
+
+- **`tlb_shootdown_waits`** — added 2026-08-20, **1 of 3** full `cargo test`
+  runs on `wt/toyos-p2conv`, with `toyos-dpanic`'s suite holding guest slots
+  throughout and named in that run's own `[host-slots]` lines. The other two
+  runs were 270/270 on a tree differing from the red one by two doc comments and
+  one removed `#[track_caller]`; the branch's kernel delta touches no TLB, no
+  shootdown and no `munmap` path. `ALONE … GREEN` in 145 ms, and
+  `cargo run -- --known-red tlb_shootdown_waits` answered `NOT ON THE LIST`, so
+  this is its first recorded sighting. `screen_early_panic` failed in the same
+  run and is already this file's and the redlist's, `ALONE … GREEN` there too.
+
+  **Its shape is this file's, in the one form worth naming separately: the
+  assertion that went red is the test's own control.** The message is `munmap
+  still took 11740090ns with the delay disarmed, so the numbers above measured
+  something other than the wait` — the test arms an injected shootdown delay,
+  measures, disarms it, and then requires the *baseline* to be small, because
+  that is what proves the armed numbers measured the wait and not the host.
+  Which makes it the one assertion in the suite that cannot tell a slow host
+  from a broken measurement: on a machine carrying two suites, 11.7 ms for a
+  disarmed `munmap` is the load, and the control has no way to say so. Widening
+  it is exactly what this file forbids — a control that tolerates 12 ms proves
+  nothing about the armed arm either. Making the verdict independent of the rate
+  here means comparing armed against disarmed *within the run* rather than each
+  against an absolute, which is the first of the two legitimate fix shapes below
+  and is the one thing this test already has both samples for. Still
+  `Sched::Parallel`, not investigated further.
 
 **The eight-landing regime, and what it does to the paragraph above.** That
 paragraph says the four-suite regime "cannot recur" now that `guest_slot` admits

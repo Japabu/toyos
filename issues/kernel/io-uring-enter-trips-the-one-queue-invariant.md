@@ -67,3 +67,24 @@ only in `src/testargs.rs`, `tests/toyos.rs` and one deleted issue file — the
 kernel is the same kernel in the green run and the red one. A KVM shard runs
 one guest per machine at `--jobs 1`, so host contention is not available as an
 explanation either.
+
+## 2026-08-16: the capture's path no longer exists, and the invariant is narrower
+
+The completion work's one-park-site change took every blocking site off the
+shared queues. `io_uring::enter` no longer registers on the ring's queue — it
+arms on the ring as a *completion subject* and parks on the calling thread's
+own `TaskHandle::park_queue`, one waiter per queue, machine-wide. The
+`Ticket::register ← io_uring::enter` frame in the capture above is gone with
+`enter`'s ticket, and so is the shape the assertion is about: with one queue
+per task, "a task waits on at most one queue" can no longer be violated by two
+*different* queues holding one task's node.
+
+**The entry stays open, because that is not the same as the root cause.** What
+the assertion actually reports is a `waiting` flag left set by a previous wait
+of that thread, and the capture does not establish which wait that was. With
+one park site the search is much smaller — the only queue a task can be on is
+its own, and
+every exit from `completion::wait` either commits (and `pass_block` finishes
+the registration) or cancels (which dequeues) — but "smaller" is not "proved
+absent", and no reproduction has been run against the new shape. Whoever sees
+it again should re-read this: the backtrace will not look like the one above.

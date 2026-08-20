@@ -8,6 +8,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -117,14 +118,18 @@ jobs:
               *) echo "::error::main has no \`$want\` rule"; bad=1 ;;
             esac
           done
-          # Strict is what makes a check on this head a check on the merged
-          # result — the property `--land`'s `git merge --no-ff main` used to
-          # carry.
-          if [ "$strict" != true ]; then
-            echo "::error::required checks are not strict, so a branch could merge without"
-            echo "::error::containing main and its checks would not be about the merged result"
-            bad=1
-          fi
+          # What a merge's checks are about is the owner's law, and it eased on
+          # 2026-08-20: strict up-to-date branches taxed every landing with one
+          # fresh CI cycle for every other open PR, and GitHub's merge queue —
+          # the configuration that keeps the merged-result property without the
+          # tax — exists only for organization-owned repositories, which this
+          # one is not yet. So a branch's checks are its own, `main`'s
+          # push-triggered run is the merged-result check, and a red on
+          # `main`'s tip is adjudicated at once like any other red. The gate
+          # still reads the regime back and reports it; a required merge
+          # queue, when the repository can carry one, restores the stronger
+          # property for free and this gate already recognises it.
+          queued=$(case " $rules " in *" merge_queue "*) echo true;; *) echo false;; esac)
           # CLAUDE.md's "never rewrite history", said at the remote.
           [ "$methods" = merge ] \
             || { echo "::error::main allows merge methods \`$methods\`, not just \`merge\`"; bad=1; }
@@ -134,7 +139,7 @@ jobs:
             echo ""
             echo "- rules: \`$rules\`"
             echo "- required checks: \`$live\`"
-            echo "- strict: \`$strict\`, merge methods: \`$methods\`"
+            echo "- strict: \`$strict\`, merge queue: \`$queued\`, merge methods: \`$methods\`"
           } >> "$GITHUB_STEP_SUMMARY"
           for have in $live; do
             case " $required " in
@@ -145,5 +150,6 @@ jobs:
           done
 
           test "$bad" = 0
-          echo "main is protected: the five checks above are required and strict,"
-          echo "merge is the only method, and neither deletion nor a force-push is allowed."
+          echo "main is protected: the five checks above are required (strict=$strict,"
+          echo "queue=$queued); merge is the only method, and neither deletion nor a"
+          echo "force-push is allowed."

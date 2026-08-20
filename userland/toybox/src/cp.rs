@@ -106,7 +106,8 @@ fn stream(reader: &mut File, source: &Path, partial: &Path) -> Result<(), String
     sync(&writer, partial)
 }
 
-/// `close` in `kernel/src/fd.rs` discards the flush error, so a copy that never
+/// The kernel's close path discards the flush error
+/// (`issues/filesystem/close-cannot-report-io-error.md`), so a copy that never
 /// asks is a copy that cannot be told the volume was full.
 fn sync(writer: &File, partial: &Path) -> Result<(), String> {
     writer.sync_all().map_err(|e| format!("flushing {}: {e}", partial.display()))

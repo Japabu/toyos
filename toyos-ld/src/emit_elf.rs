@@ -237,11 +237,12 @@ pub(crate) fn build_eh_frame_hdr(state: &LinkState, layout: &ElfLayout) -> Vec<u
     fdes.sort_by_key(|&(loc, _)| loc);
 
     // Build .eh_frame_hdr
-    let mut hdr = Vec::new();
-    hdr.push(1); // version
-    hdr.push(0x1B); // eh_frame_ptr encoding: DW_EH_PE_pcrel | DW_EH_PE_sdata4
-    hdr.push(0x03); // fde_count encoding: DW_EH_PE_udata4
-    hdr.push(0x3B); // table encoding: DW_EH_PE_datarel | DW_EH_PE_sdata4
+    let mut hdr = vec![
+        1u8,  // version
+        0x1B, // eh_frame_ptr encoding: DW_EH_PE_pcrel | DW_EH_PE_sdata4
+        0x03, // fde_count encoding: DW_EH_PE_udata4
+        0x3B, // table encoding: DW_EH_PE_datarel | DW_EH_PE_sdata4
+    ];
 
     // eh_frame_ptr: PC-relative offset from this field to .eh_frame start
     let eh_frame_ptr = (layout.eh_frame_vaddr as i64 - (hdr_vaddr as i64 + 4)) as i32;
@@ -425,7 +426,7 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
         tls_cursor += sec.size;
     }
     cursor = tls_cursor;
-    let tls_filesz = if tls_cursor > tls_start { tls_cursor - tls_start } else { 0 };
+    let tls_filesz = tls_cursor.saturating_sub(tls_start);
 
     let rw_filesz = cursor - rw_start;
 
@@ -446,7 +447,7 @@ pub(crate) fn layout_elf(state: &mut LinkState, base_addr: u64, entry_name: Opti
         sec.vaddr = Some(tls_cursor);
         tls_cursor += sec.size;
     }
-    let tls_memsz = if tls_cursor > tls_start { tls_cursor - tls_start } else { 0 };
+    let tls_memsz = tls_cursor.saturating_sub(tls_start);
 
     let rw_end = align_up(cursor, PAGE_SIZE);
 
@@ -729,11 +730,11 @@ pub(crate) fn emit_elf(
     let has_eh_frame_hdr = !eh_frame_hdr.is_empty();
     let has_build_id = layout.build_id_note_vaddr != 0;
     let has_plt = (is_pie || is_shared) && !layout.plt_data.is_empty();
-    let has_rela = relocs.map_or(false, |r| !r.relatives.is_empty())
-        || relocs.map_or(false, |r| !r.glob_dats.is_empty())
-        || relocs.map_or(false, |r| !r.tpoff64s.is_empty())
-        || relocs.map_or(false, |r| !r.named_tpoff64s.is_empty())
-        || relocs.map_or(false, |r| !r.tpoff32s.is_empty());
+    let has_rela = relocs.is_some_and(|r| !r.relatives.is_empty())
+        || relocs.is_some_and(|r| !r.glob_dats.is_empty())
+        || relocs.is_some_and(|r| !r.tpoff64s.is_empty())
+        || relocs.is_some_and(|r| !r.named_tpoff64s.is_empty())
+        || relocs.is_some_and(|r| !r.tpoff32s.is_empty());
     let file_rw_end = layout.rw_start + layout.rw_filesz;
 
     let mut buf = Vec::new();
@@ -743,9 +744,7 @@ pub(crate) fn emit_elf(
 
     let text_name = w.add_section_name(b".text");
     let data_name = w.add_section_name(b".data");
-    let rela_name = if has_rela || is_pie {
-        Some(w.add_section_name(b".rela.dyn"))
-    } else if is_shared {
+    let rela_name = if has_rela || is_pie || is_shared {
         Some(w.add_section_name(b".rela.dyn"))
     } else {
         None
@@ -856,10 +855,8 @@ pub(crate) fn emit_elf(
     if is_pie {
         w.reserve_section_index(); // .rela.dyn
     }
-    if has_dynamic_libs || (is_pie && needs_dynamic) {
-        if needs_dynamic && !is_shared {
-            w.reserve_dynamic_section_index();
-        }
+    if (has_dynamic_libs || (is_pie && needs_dynamic)) && needs_dynamic && !is_shared {
+        w.reserve_dynamic_section_index();
     }
     if is_shared {
         w.reserve_dynstr_section_index();
@@ -893,6 +890,11 @@ pub(crate) fn emit_elf(
     };
     if dynsym_count > 0 || is_shared {
         w.reserve_null_dynamic_symbol_index();
+        // Not a walk of `import_str_ids`: `dynsym_count` counts the exports and
+        // the shared imports too, and `import_str_ids` is indexed only on the
+        // `has_dynamic_libs` arm. Iterating that vector instead would end the
+        // loop early for a shared object, which is a different file.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..dynsym_count {
             let idx = w.reserve_dynamic_symbol_index();
             if has_dynamic_libs {
@@ -1079,9 +1081,7 @@ pub(crate) fn emit_elf(
         });
     }
     if needs_dynamic {
-        let dyn_load_start = if has_dynamic_libs {
-            dynsym_off
-        } else if is_shared {
+        let dyn_load_start = if has_dynamic_libs || is_shared {
             dynsym_off
         } else if rela_count > 0 {
             rela_off
@@ -1355,36 +1355,36 @@ pub(crate) fn emit_elf(
         w.write_align_dynamic();
         if has_dynamic_libs {
             for &str_id in &needed_str_ids {
-                w.write_dynamic_string(elf::DT_NEEDED as u32, str_id);
+                w.write_dynamic_string(elf::DT_NEEDED, str_id);
             }
-            w.write_dynamic(elf::DT_SYMTAB as u32, dynsym_off);
-            w.write_dynamic(elf::DT_STRTAB as u32, dynstr_off);
+            w.write_dynamic(elf::DT_SYMTAB, dynsym_off);
+            w.write_dynamic(elf::DT_STRTAB, dynstr_off);
             let strsz = w.dynstr_len() as u64;
-            w.write_dynamic(elf::DT_STRSZ as u32, strsz);
-            w.write_dynamic(elf::DT_SYMENT as u32, 24);
+            w.write_dynamic(elf::DT_STRSZ, strsz);
+            w.write_dynamic(elf::DT_SYMENT, 24);
         }
         if is_shared {
-            w.write_dynamic(elf::DT_SYMTAB as u32, dynsym_off);
-            w.write_dynamic(elf::DT_STRTAB as u32, dynstr_off);
+            w.write_dynamic(elf::DT_SYMTAB, dynsym_off);
+            w.write_dynamic(elf::DT_STRTAB, dynstr_off);
             let strsz = w.dynstr_len() as u64;
-            w.write_dynamic(elf::DT_STRSZ as u32, strsz);
-            w.write_dynamic(elf::DT_SYMENT as u32, 24);
-            w.write_dynamic(elf::DT_GNU_HASH as u32, gnu_hash_off);
+            w.write_dynamic(elf::DT_STRSZ, strsz);
+            w.write_dynamic(elf::DT_SYMENT, 24);
+            w.write_dynamic(elf::DT_GNU_HASH, gnu_hash_off);
         }
         if rela_count > 0 {
-            w.write_dynamic(elf::DT_RELA as u32, rela_off);
-            w.write_dynamic(elf::DT_RELASZ as u32, rela_size);
-            w.write_dynamic(elf::DT_RELAENT as u32, 24);
+            w.write_dynamic(elf::DT_RELA, rela_off);
+            w.write_dynamic(elf::DT_RELASZ, rela_size);
+            w.write_dynamic(elf::DT_RELAENT, 24);
         }
         if layout.init_array_size > 0 {
-            w.write_dynamic(elf::DT_INIT_ARRAY as u32, layout.init_array_vaddr);
-            w.write_dynamic(elf::DT_INIT_ARRAYSZ as u32, layout.init_array_size);
+            w.write_dynamic(elf::DT_INIT_ARRAY, layout.init_array_vaddr);
+            w.write_dynamic(elf::DT_INIT_ARRAYSZ, layout.init_array_size);
         }
         if layout.fini_array_size > 0 {
-            w.write_dynamic(elf::DT_FINI_ARRAY as u32, layout.fini_array_vaddr);
-            w.write_dynamic(elf::DT_FINI_ARRAYSZ as u32, layout.fini_array_size);
+            w.write_dynamic(elf::DT_FINI_ARRAY, layout.fini_array_vaddr);
+            w.write_dynamic(elf::DT_FINI_ARRAYSZ, layout.fini_array_size);
         }
-        w.write_dynamic(elf::DT_NULL as u32, 0);
+        w.write_dynamic(elf::DT_NULL, 0);
         w.pad_until(dyn_segment_end as usize);
     }
 
@@ -1482,7 +1482,7 @@ pub(crate) fn emit_elf(
             sh_addr: if needs_dynamic { rela_off } else { 0 },
             sh_offset: rela_off,
             sh_size: rela_size,
-            sh_link: if dynsym_sec_idx.is_some() { dynsym_sec_idx.unwrap().0 } else { 0 },
+            sh_link: dynsym_sec_idx.map_or(0, |i| i.0),
             sh_info: 0,
             sh_addralign: 8,
             sh_entsize: 24,

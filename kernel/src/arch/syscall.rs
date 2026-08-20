@@ -1,10 +1,14 @@
 use alloc::vec::Vec;
 use super::entry::{restore_user_state, ring3_naked_asm, save_user_state, Ring3Entry};
-use super::{cpu, gdt};
+use super::{cpu, percpu};
 use crate::drivers::acpi;
 use crate::mm::paging::{CachePolicy, Occupancy};
 use crate::user_ptr::{SyscallContext, UserBytes, UserBytesMut};
+use toyos_sched::task::WaitClass;
+
+use crate::completion;
 use crate::object::{ops, port, KObjectRef};
+use crate::time::{Cadence, Deadline, Duration};
 use crate::{device, log, pipe, process, vfs};
 use crate::{DirectMap, UserAddr};
 
@@ -144,7 +148,7 @@ fn debug_heap_alloc(bytes: usize, align: usize) -> u64 {
 mod canary {
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    const VALUE: [u64; 2] = [0x_C0DE_1A55_0F17_1E55, 0x_5EE7_A11_0F_17_00];
+    const VALUE: [u64; 2] = [0x_C0DE_1A55_0F17_1E55, 0x0005_EE7A_110F_1700];
 
     static WORDS: [AtomicU64; 2] =
         [AtomicU64::new(VALUE[0]), AtomicU64::new(VALUE[1])];
@@ -164,7 +168,7 @@ pub fn init() {
     let efer = cpu::rdmsr(MSR_EFER);
     cpu::wrmsr(MSR_EFER, efer | 1);
 
-    let star = ((gdt::STAR_SYSRET_BASE as u64) << 48) | ((gdt::KERNEL_CS as u64) << 32);
+    let star = ((percpu::STAR_SYSRET_BASE as u64) << 48) | ((percpu::KERNEL_CS as u64) << 32);
     cpu::wrmsr(MSR_STAR, star);
     // `LSTAR` is an IDT slot by another name: the one thing `syscall` can reach.
     cpu::wrmsr(MSR_LSTAR, Ring3Entry::new(syscall_entry).addr());
@@ -236,6 +240,17 @@ extern "sysv64" fn syscall_entry() {
 
 extern "sysv64" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u64) -> u64 {
     syscall_dispatch(num, a1, a2, a3, a4)
+}
+
+/// What a syscall answers when its wait was cancelled.
+///
+/// **Nothing ever reads it.** The thread has been killed, so the return path
+/// it is on ends at `kernel_exit_to_user_check`, which sees the kill bit and
+/// exits instead of returning to Ring 3 (§7.2). The word exists because the
+/// unwind has to carry *something* through the `u64` every syscall answers in,
+/// and `Interrupted` is what it would mean if anything could read it.
+fn cancelled() -> u64 {
+    SyscallError::Gone.to_u64()
 }
 
 fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
@@ -390,7 +405,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_PROCESS_WAIT => sys_process_wait(RawHandle(a1 as u32), a2),
         SYS_PROCESS_KILL => {
-            match process::with_fd_owner_data(|data| {
+            match process::with_process_data(|data| {
                 data.handles
                     .get::<crate::object::process::ProcessObject>(RawHandle(a1 as u32), Rights::MANAGE)
             }) {
@@ -540,7 +555,7 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         SYS_EXIT => sys_exit(a1 as i32),
         SYS_GET_ENV => {
-            let env = process::with_fd_owner_data(|d| d.env.clone());
+            let env = process::with_process_data(|d| d.env.clone());
             if a2 == 0 {
                 env.len() as u64
             } else {
@@ -667,8 +682,8 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             sys_namespace_open(RawHandle(a1 as u32), &name)
         }
         SYS_TLS_ALLOC_BLOCK => sys_tls_alloc_block(a1),
-        SYS_IO_URING_SETUP => sys_io_uring_setup(&ctx, a1 as u32, a2),
-        SYS_IO_URING_ENTER => {
+        SYS_INBOX_SETUP => sys_io_uring_setup(&ctx, a1 as u32, a2),
+        SYS_INBOX_SUBMIT => {
             sys_io_uring_enter(RawHandle(a1 as u32), a2 as u32, a3 as u32, a4)
         }
         SYS_QUERY_MODULES => {
@@ -865,7 +880,7 @@ fn with_object_ref<R>(
     need: Rights,
     f: impl FnOnce(&KObjectRef) -> R,
 ) -> Result<R, crate::object::HandleError> {
-    process::with_fd_owner_data(|data| data.handles.get_ref(h, need).map(f))
+    process::with_process_data(|data| data.handles.get_ref(h, need).map(f))
 }
 
 /// The gate on every syscall that drives a claimed device.
@@ -914,7 +929,7 @@ fn with_object(h: RawHandle, need: Rights, f: impl FnOnce(&KObjectRef) -> u64) -
 
 fn sys_write(h: RawHandle, buf: &UserBytes) -> u64 {
     loop {
-        let action = process::with_fd_owner_data(|data| {
+        let action = process::with_process_data(|data| {
             let object = match data.handles.get_ref(h, Rights::WRITE) {
                 Ok(object) => object,
                 Err(e) => return Err(WriteBlock::BadHandle(e)),
@@ -933,7 +948,21 @@ fn sys_write(h: RawHandle, buf: &UserBytes) -> u64 {
                 return n;
             }
             Err(WriteBlock::Pipe(id)) => match pipe::writers_queue(id) {
-                Some(q) => crate::scheduler::wait_until(&q, 0, || pipe::has_space(id)),
+                Some(end) => {
+                    let parkable = crate::scheduler::Parkable::at_entry();
+                    if completion::wait_until(
+                        &parkable,
+                        completion::Subject::of(&end.watch),
+                        completion::Token::new(0),
+                        WaitClass::Pipe,
+                        Deadline::never(),
+                        || pipe::has_space(id),
+                    )
+                    .is_err()
+                    {
+                        return cancelled();
+                    }
+                }
                 None => return SyscallError::NotFound.to_u64(),
             },
             Err(WriteBlock::Refused(word)) => return word,
@@ -952,14 +981,16 @@ enum WriteBlock {
     BadHandle(crate::object::HandleError),
 }
 
-/// What `sys_read` parks on when the fd has nothing to give. Each variant
+/// What `sys_read` parks on when the handle has nothing to give. Each variant
 /// carries what its own re-check needs — the queue is registered on *before*
 /// the condition is re-read, which is what closes the check-then-block window.
 enum ReadBlock {
-    Pipe(alloc::sync::Arc<crate::sched::payload::KWaitQueue>, pipe::PipeId),
+    Pipe(pipe::PipeEnd, pipe::PipeId),
     VirtioSound,
     Hda,
-    Keyboard(u64),
+    /// A console read re-polls, because nothing posts a serial key; a claimed
+    /// keyboard is woken by its own IRQ and waits with [`Deadline::never`].
+    Keyboard(Deadline),
     /// Nothing to wait for: the answer is this word.
     Refused(u64),
     /// Carried out of the process's lock rather than answered inside it:
@@ -968,7 +999,7 @@ enum ReadBlock {
     BadHandle(crate::object::HandleError),
 }
 
-/// Which stub a claimed fd names, and nothing about what it drives.
+/// Which stub a claimed device handle names, and nothing about what it drives.
 enum RegTarget {
     Hda,
     VirtioSound,
@@ -976,7 +1007,8 @@ enum RegTarget {
 
 /// One register of a claimed device, read or written.
 ///
-/// The fd is the authorization and the device behind it owns the allow-list, so
+/// The handle is the authorization and the device behind it owns the
+/// allow-list, so
 /// this function knows nothing about codecs or virtqueues — which is the test
 /// for it being a device-register call rather than a device protocol smuggled
 /// back into the syscall table. Two stubs answer it
@@ -992,7 +1024,7 @@ fn sys_device_reg(handle: RawHandle, offset: u64, width: u64, value: Option<u64>
     // was missing, where `SYS_DEVICE_CLAIM` beside it ends the caller for the
     // same mistake (`object::HandleError::refuse_as_error`). `get` is asked
     // for the type, so a pipe presented here is the `WrongType` that it is.
-    let target = process::with_fd_owner_data(|data| {
+    let target = process::with_process_data(|data| {
         data.handles
             .get::<crate::object::device::DeviceClaim>(handle, Rights::NONE)
             .map(|claim| match claim.class() {
@@ -1001,7 +1033,7 @@ fn sys_device_reg(handle: RawHandle, offset: u64, width: u64, value: Option<u64>
                 _ => None,
             })
     });
-    // Nothing held: `with_fd_owner_data` has given the guard up, which is what
+    // Nothing held: `with_process_data` has given the guard up, which is what
     // `refuse` requires of the three kinds that do not come back from it.
     let target = match target {
         Ok(t) => t,
@@ -1023,19 +1055,21 @@ fn sys_device_reg(handle: RawHandle, offset: u64, width: u64, value: Option<u64>
                 Err(e) => e.to_u64(),
             }
         }
-        Some(value) if value <= u32::MAX as u64 => {
-            let written = match target {
-                RegTarget::Hda => crate::drivers::hda::reg_write(offset, width, value as u32),
-                RegTarget::VirtioSound => {
-                    crate::drivers::virtio_sound::reg_write(offset, width, value as u32)
+        Some(value) => match u32::try_from(value) {
+            Ok(value) => {
+                let written = match target {
+                    RegTarget::Hda => crate::drivers::hda::reg_write(offset, width, value),
+                    RegTarget::VirtioSound => {
+                        crate::drivers::virtio_sound::reg_write(offset, width, value)
+                    }
+                };
+                match written {
+                    Ok(()) => 0,
+                    Err(e) => e.to_u64(),
                 }
-            };
-            match written {
-                Ok(()) => 0,
-                Err(e) => e.to_u64(),
             }
-        }
-        Some(_) => SyscallError::InvalidArgument.to_u64(),
+            Err(_) => SyscallError::InvalidArgument.to_u64(),
+        },
     }
 }
 
@@ -1046,7 +1080,7 @@ fn sys_device_reg(handle: RawHandle, offset: u64, width: u64, value: Option<u64>
 /// and what their holders already build around.
 fn read_block_device(claim: &crate::object::device::DeviceClaim) -> ReadBlock {
     match claim.class() {
-        device::DeviceType::Keyboard => ReadBlock::Keyboard(0),
+        device::DeviceType::Keyboard => ReadBlock::Keyboard(Deadline::never()),
         device::DeviceType::VirtioSound if claim.info_read() => ReadBlock::VirtioSound,
         device::DeviceType::HdaAudio if claim.info_read() => ReadBlock::Hda,
         _ => ReadBlock::Refused(SyscallError::NotFound.to_u64()),
@@ -1057,10 +1091,22 @@ fn read_block(object: &KObjectRef) -> ReadBlock {
     match object {
         KObjectRef::Device(_) => unreachable!("a device claim blocks via `read_block_device`"),
         KObjectRef::Console(_) => {
-            ReadBlock::Keyboard(crate::clock::nanos_since_boot() + 10_000_000)
+            /// **The only reason a serial-console read ever returns.**
+            /// The park is on `waitqs::KEYBOARD`, whose only waker is the
+            /// i8042/USB keyboard — a *different* device from the one this
+            /// read is about. The 16550's IER is written to zero and
+            /// `virtio_console` has no handler at all, so nothing posts a
+            /// serial key and what ends this wait is the re-poll and nothing
+            /// else. It is the [`Cadence`] of a poll on
+            /// `serial::has_data`, which C10 makes explicit.
+            const CONSOLE_REPOLL: Cadence = Cadence::every(
+                Duration::from_millis(10),
+                "nothing posts a serial-console key, so this rate is the whole of the wake",
+            );
+            ReadBlock::Keyboard(Deadline::at(crate::clock::now() + CONSOLE_REPOLL.duration()))
         }
         _ => match ops::pipe_id_read(object).and_then(|id| {
-            pipe::readers_queue(id).map(|q| ReadBlock::Pipe(q, id))
+            pipe::readers_queue(id).map(|end| ReadBlock::Pipe(end, id))
         }) {
             Some(block) => block,
             None => ReadBlock::Refused(SyscallError::NotFound.to_u64()),
@@ -1070,7 +1116,7 @@ fn read_block(object: &KObjectRef) -> ReadBlock {
 
 fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
     loop {
-        let action = process::with_fd_owner_data(|data| {
+        let action = process::with_process_data(|data| {
             let object = match data.handles.get_ref(h, Rights::READ) {
                 Ok(object) => object,
                 Err(e) => return Err(ReadBlock::BadHandle(e)),
@@ -1102,24 +1148,66 @@ fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
                 if let Some(id) = pipe_id { process::wake_pipe_writers(id); }
                 return n;
             }
-            Err(ReadBlock::Pipe(queue, id)) => {
-                crate::scheduler::wait_until(&queue, 0, || pipe::has_data(id))
+            Err(ReadBlock::Pipe(end, id)) => {
+                let parkable = crate::scheduler::Parkable::at_entry();
+                if completion::wait_until(
+                    &parkable,
+                    completion::Subject::of(&end.watch),
+                    completion::Token::new(0),
+                    WaitClass::Pipe,
+                    Deadline::never(),
+                    || pipe::has_data(id),
+                )
+                .is_err()
+                {
+                    return cancelled();
+                }
             }
-            Err(ReadBlock::VirtioSound) => crate::scheduler::wait_until(
-                &crate::sched::waitqs::AUDIO,
-                0,
-                crate::drivers::virtio_sound::has_pending,
-            ),
-            Err(ReadBlock::Hda) => crate::scheduler::wait_until(
-                &crate::sched::waitqs::AUDIO,
-                0,
-                crate::drivers::hda::has_pending,
-            ),
-            Err(ReadBlock::Keyboard(deadline)) => crate::scheduler::wait_until(
-                &crate::sched::waitqs::KEYBOARD,
-                deadline,
-                crate::keyboard::has_data,
-            ),
+            Err(ReadBlock::VirtioSound) => {
+                let parkable = crate::scheduler::Parkable::at_entry();
+                if completion::wait_until(
+                    &parkable,
+                    completion::Subject::of(&crate::sched::waitqs::AUDIO_WATCH),
+                    completion::Token::new(0),
+                    WaitClass::Io,
+                    Deadline::never(),
+                    crate::drivers::virtio_sound::has_pending,
+                )
+                .is_err()
+                {
+                    return cancelled();
+                }
+            }
+            Err(ReadBlock::Hda) => {
+                let parkable = crate::scheduler::Parkable::at_entry();
+                if completion::wait_until(
+                    &parkable,
+                    completion::Subject::of(&crate::sched::waitqs::AUDIO_WATCH),
+                    completion::Token::new(0),
+                    WaitClass::Io,
+                    Deadline::never(),
+                    crate::drivers::hda::has_pending,
+                )
+                .is_err()
+                {
+                    return cancelled();
+                }
+            }
+            Err(ReadBlock::Keyboard(deadline)) => {
+                let parkable = crate::scheduler::Parkable::at_entry();
+                if completion::wait_until(
+                    &parkable,
+                    completion::Subject::of(&crate::sched::waitqs::KEYBOARD_WATCH),
+                    completion::Token::new(0),
+                    WaitClass::Io,
+                    deadline,
+                    crate::keyboard::has_data,
+                )
+                .is_err()
+                {
+                    return cancelled();
+                }
+            }
             Err(ReadBlock::Refused(word)) => return word,
             Err(ReadBlock::BadHandle(e)) => return e.refuse(),
         }
@@ -1130,7 +1218,7 @@ fn sys_read(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
 ///
 /// `WRITE` alone is not the question: `CREATE` makes a file, `TRUNCATE`
 /// destroys one's contents, and `APPEND` is a write position. A read-only open
-/// of a `KernelOnly` mount is fine and stays fine — the fd it hands back has
+/// of a `KernelOnly` mount is fine and stays fine — the handle it hands back has
 /// `writable` false, so nothing downstream needs a second check.
 fn open_modifies(flags: OpenFlags) -> bool {
     flags.contains(OpenFlags::WRITE)
@@ -1140,12 +1228,12 @@ fn open_modifies(flags: OpenFlags) -> bool {
 }
 
 fn sys_open(path: &str, flags: OpenFlags) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
     if open_modifies(flags) && !vfs::lock().user_may_modify(&resolved) {
         return SyscallError::PermissionDenied.to_u64();
     }
-    process::with_fd_owner_data(|data| ops::open(&mut data.handles, &resolved, flags))
+    process::with_process_data(|data| ops::open(&mut data.handles, &resolved, flags))
 }
 
 /// **Closing a handle wakes nobody, and that is the whole of it.**
@@ -1157,7 +1245,7 @@ fn sys_open(path: &str, flags: OpenFlags) -> u64 {
 /// close, so a pipe with a live writer and no bytes in it was announced
 /// readable; a one-shot io_uring poll consumed on that never fires again.
 fn sys_close(h: RawHandle) -> u64 {
-    let result = process::with_fd_owner_data(|data| {
+    let result = process::with_process_data(|data| {
         ops::close(&mut data.handles, h, &mut data.pipe_maps)
     });
     match result {
@@ -1203,7 +1291,7 @@ fn sys_random(out: &mut UserBytesMut) -> u64 {
 /// Refusing to write a partial answer is the point — a caller that ignores
 /// the return still gets zeroes rather than a plausible short listing.
 fn sys_readdir(path: &str, out: &mut UserBytesMut) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let entries = match vfs::lock().list(&cwd, path) {
         Ok(e) => e,
         Err(e) => return e.to_u64(),
@@ -1234,7 +1322,7 @@ fn sys_readdir(path: &str, out: &mut UserBytesMut) -> u64 {
 }
 
 fn sys_delete(path: &str) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     if !vfs.user_may_modify(&resolved) {
@@ -1247,10 +1335,10 @@ fn sys_delete(path: &str) -> u64 {
 }
 
 fn sys_chdir(path: &str) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     match vfs::lock().cd(&cwd, path) {
         Ok(new_cwd) => {
-            process::with_fd_owner_data(|d| d.cwd = new_cwd);
+            process::with_process_data(|d| d.cwd = new_cwd);
             0
         }
         Err(e) => e.to_u64(),
@@ -1281,7 +1369,7 @@ fn sys_chdir(path: &str) -> u64 {
 /// `vfs::MAX_PATH` bounds `cwd`, so the required length is always far below the
 /// range `SyscallError` encodes and can never be misread as one.
 fn sys_getcwd(out: &mut UserBytesMut) -> u64 {
-    process::with_fd_owner_data(|data| {
+    process::with_process_data(|data| {
         let cwd = data.cwd.as_bytes();
         if cwd.len() <= out.len() {
             out.write_at(0, cwd);
@@ -1301,7 +1389,7 @@ fn sys_pipe() -> u64 {
     let (reader, writer) = pipe::create();
     let read_end = KObjectRef::PipeRead(crate::object::pipe::PipeReadEnd::new(reader));
     let write_end = KObjectRef::PipeWrite(crate::object::pipe::PipeWriteEnd::new(writer));
-    process::with_fd_owner_data(|data| {
+    process::with_process_data(|data| {
         let Ok(read_h) = ops::install(&mut data.handles, read_end) else {
             return SyscallError::ResourceExhausted.to_u64();
         };
@@ -1318,7 +1406,7 @@ fn sys_pipe() -> u64 {
 ///
 /// The window is recorded against the pipe (`process::PipeMap`) so that
 /// closing the last descriptor for it takes the mapping away. It used to be
-/// recorded nowhere: `SYS_PIPE`, `SYS_PIPE_MAP`, close both fds freed the ring
+/// recorded nowhere: `SYS_PIPE`, `SYS_PIPE_MAP`, close both ends freed the ring
 /// page back to the PMM with the caller's writable mapping of it still live,
 /// and whatever the PMM handed that page to next — another process's pipe, a
 /// kernel heap region, a DMA buffer — was readable and writable by a process
@@ -1328,7 +1416,7 @@ fn sys_pipe() -> u64 {
 /// rather than a second window onto the same page. That is what keeps
 /// `pipe_maps` bounded by the descriptor table.
 fn sys_pipe_map(h: RawHandle) -> u64 {
-    let mapped = process::with_fd_owner_data(|data| {
+    let mapped = process::with_process_data(|data| {
         let pipe_id = match data.handles.get_ref(h, Rights::MAP) {
             Ok(object) => ops::pipe_id_read(object).or_else(|| ops::pipe_id_write(object)),
             Err(e) => return Err(e),
@@ -1368,7 +1456,7 @@ fn sys_pipe_map(h: RawHandle) -> u64 {
 /// `std`'s `TcpStream` is one handle and netd's data path is two pipes, and
 /// that is the whole of why this exists.
 fn sys_connection_join(rx_h: RawHandle, tx_h: RawHandle) -> u64 {
-    let ends = process::with_fd_owner_data(|data| {
+    let ends = process::with_process_data(|data| {
         let rx = data.handles.get::<crate::object::pipe::PipeReadEnd>(rx_h, Rights::READ)?;
         let tx = data.handles.get::<crate::object::pipe::PipeWriteEnd>(tx_h, Rights::WRITE)?;
         Ok::<_, crate::object::HandleError>((rx.reference(), tx.reference()))
@@ -1378,11 +1466,11 @@ fn sys_connection_join(rx_h: RawHandle, tx_h: RawHandle) -> u64 {
         Err(e) => return e.refuse(),
     };
     let object = KObjectRef::Connection(crate::object::service::ConnectionEnd::joined(rx, tx));
-    process::with_fd_owner_data(|data| handle_result(ops::install(&mut data.handles, object)))
+    process::with_process_data(|data| handle_result(ops::install(&mut data.handles, object)))
 }
 
 fn sys_read_nonblock(h: RawHandle, buf: &mut UserBytesMut) -> u64 {
-    let result = process::with_fd_owner_data(|data| {
+    let result = process::with_process_data(|data| {
         let object = match data.handles.get_ref(h, Rights::READ) {
             Ok(object) => object,
             Err(e) => return Err(e),
@@ -1436,7 +1524,7 @@ fn sys_spawn(
     env: alloc::vec::Vec<u8>,
 ) -> u64 {
     let args: Vec<&str> = text.split('\0').filter(|s| !s.is_empty()).collect();
-    let cwd = process::with_fd_owner_data(|data| data.cwd.clone());
+    let cwd = process::with_process_data(|data| data.cwd.clone());
     // Refused with this frame holding nothing: `spawn`'s own frame owned the
     // child's address space and its stacks, and the three handle kinds that end
     // the caller do so from `refuse`.
@@ -1444,7 +1532,7 @@ fn sys_spawn(
         Ok(object) => object,
         Err(e) => return e.refuse(),
     };
-    let installed = process::with_fd_owner_data(|data| {
+    let installed = process::with_process_data(|data| {
         ops::install(&mut data.handles, KObjectRef::Process(object.clone()))
     });
     match installed {
@@ -1463,15 +1551,26 @@ fn sys_spawn(
 /// process is gone gets it too. `WNOHANG` is the same question with the park
 /// taken out.
 fn sys_process_wait(h: RawHandle, flags: u64) -> u64 {
-    let object = match process::with_fd_owner_data(|data| {
+    let object = match process::with_process_data(|data| {
         data.handles.get::<crate::object::process::ProcessObject>(h, Rights::WAIT)
     }) {
         Ok(object) => object,
         Err(e) => return e.refuse(),
     };
     if flags & WNOHANG == 0 {
-        let queue = object.waiters();
-        crate::scheduler::wait_until(&queue, 0, || object.finished());
+        let parkable = crate::scheduler::Parkable::at_entry();
+        if completion::wait_until(
+            &parkable,
+            completion::Subject::of(object.watch()),
+            completion::Token::new(0),
+            WaitClass::Other,
+            Deadline::never(),
+            || object.finished(),
+        )
+        .is_err()
+        {
+            return cancelled();
+        }
     }
     match object.exit_code() {
         // Zero-extended: an exit code is an `i32`, and sign-extending -1 would
@@ -1496,7 +1595,7 @@ fn sys_process_wait(h: RawHandle, flags: u64) -> u64 {
 /// exactly one cap that carries the right — so what can reach a process it did
 /// not start is exactly what init endowed.
 fn sys_process_open(syscap: RawHandle, pid: process::Pid) -> u64 {
-    if let Err(e) = process::with_fd_owner_data(|data| {
+    if let Err(e) = process::with_process_data(|data| {
         data.handles.get::<crate::object::syscap::SysCap>(syscap, Rights::MANAGE)
     }) {
         return e.refuse();
@@ -1504,7 +1603,7 @@ fn sys_process_open(syscap: RawHandle, pid: process::Pid) -> u64 {
     let Some(object) = process::process_object(pid) else {
         return SyscallError::NotFound.to_u64();
     };
-    process::with_fd_owner_data(|data| {
+    process::with_process_data(|data| {
         handle_result(ops::install(&mut data.handles, KObjectRef::Process(object)))
     })
 }
@@ -1521,7 +1620,7 @@ fn sys_device_claim(syscap: RawHandle, class: u64) -> u64 {
     let Some(class) = device::DeviceType::from_raw(class) else {
         return SyscallError::InvalidArgument.to_u64();
     };
-    if let Err(e) = process::with_fd_owner_data(|data| {
+    if let Err(e) = process::with_process_data(|data| {
         data.handles.get::<crate::object::syscap::SysCap>(syscap, Rights::DEVICE)
     }) {
         return e.refuse();
@@ -1534,7 +1633,7 @@ fn sys_device_claim(syscap: RawHandle, class: u64) -> u64 {
         Err(device::ClaimError::Absent) => return SyscallError::NotFound.to_u64(),
         Err(device::ClaimError::Owned) => return SyscallError::AlreadyExists.to_u64(),
     };
-    process::with_fd_owner_data(|data| {
+    process::with_process_data(|data| {
         handle_result(ops::install(&mut data.handles, KObjectRef::Device(claim)))
     })
 }
@@ -1549,7 +1648,7 @@ fn sys_device_claim(syscap: RawHandle, class: u64) -> u64 {
 /// with it. This is the privilege that comment asked for, and it is endowed
 /// per manifest rather than won.
 fn sys_rt_enter(syscap: RawHandle) -> u64 {
-    if let Err(e) = process::with_fd_owner_data(|data| {
+    if let Err(e) = process::with_process_data(|data| {
         data.handles.get::<crate::object::syscap::SysCap>(syscap, Rights::RT)
     }) {
         return e.refuse();
@@ -1577,7 +1676,7 @@ fn sys_log_read(
     out: &mut UserBytesMut,
     capacity: usize,
 ) -> u64 {
-    if let Err(e) = process::with_fd_owner_data(|data| {
+    if let Err(e) = process::with_process_data(|data| {
         data.handles.get::<crate::object::syscap::SysCap>(syscap, Rights::LOG)
     }) {
         return e.refuse();
@@ -1603,7 +1702,7 @@ fn sys_log_read(
 /// endowment table is not a smaller endowment table, it is a caller that would
 /// go on to look up a label that is not in what it got.
 fn sys_endowments(out: &mut crate::user_ptr::UserBytesMut) -> u64 {
-    let data_arc = process::fd_owner_data();
+    let data_arc = process::process_data();
     let data = data_arc.lock();
     let needed = data.endowments.encoded_len();
     if out.is_empty() {
@@ -1628,7 +1727,7 @@ fn sys_endowments(out: &mut crate::user_ptr::UserBytesMut) -> u64 {
 /// [`SYS_PORT_CREATE`].
 fn sys_port_create() -> u64 {
     let (acceptor, connector) = port::create();
-    process::with_fd_owner_data(|data| {
+    process::with_process_data(|data| {
         let Ok(a) = ops::install(&mut data.handles, KObjectRef::Acceptor(acceptor)) else {
             return SyscallError::ResourceExhausted.to_u64();
         };
@@ -1677,7 +1776,7 @@ fn sys_namespace_build(ctx: &SyscallContext, args: &NamespaceBuild) -> u64 {
         else {
             return SyscallError::BadAddress.to_u64();
         };
-        let base = match process::with_fd_owner_data(|data| {
+        let base = match process::with_process_data(|data| {
             data.handles.get::<crate::object::namespace::Namespace>(args.base, Rights::READ)
         }) {
             Ok(base) => base,
@@ -1717,7 +1816,7 @@ fn sys_namespace_build(ctx: &SyscallContext, args: &NamespaceBuild) -> u64 {
             let Some(name) = name_at(off, len) else {
                 return SyscallError::InvalidArgument.to_u64();
             };
-            let connector = match process::with_fd_owner_data(|data| {
+            let connector = match process::with_process_data(|data| {
                 data.handles.get::<port::Connector>(handle, Rights::TRANSFER)
             }) {
                 Ok(c) => c,
@@ -1745,7 +1844,7 @@ fn sys_namespace_build(ctx: &SyscallContext, args: &NamespaceBuild) -> u64 {
             return SyscallError::AlreadyExists.to_u64()
         }
     };
-    process::with_fd_owner_data(|data| {
+    process::with_process_data(|data| {
         handle_result(ops::install(&mut data.handles, KObjectRef::Namespace(namespace)))
     })
 }
@@ -1757,7 +1856,7 @@ fn sys_namespace_build(ctx: &SyscallContext, args: &NamespaceBuild) -> u64 {
 /// `Gone` — a statement about the machine. Only the kernel can tell them apart,
 /// so only the kernel may collapse them, and it does not.
 fn sys_namespace_open(ns_h: RawHandle, name: &str) -> u64 {
-    let connector = match process::with_fd_owner_data(|data| {
+    let connector = match process::with_process_data(|data| {
         let ns = data
             .handles
             .get::<crate::object::namespace::Namespace>(ns_h, Rights::READ)?;
@@ -1791,7 +1890,7 @@ fn connect_through(connector: &port::Connector) -> u64 {
         to_client.clone(),  // and receives what the server sent
         to_server.clone(),
     ));
-    let h = match process::with_fd_owner_data(|data| ops::install(&mut data.handles, object)) {
+    let h = match process::with_process_data(|data| ops::install(&mut data.handles, object)) {
         Ok(h) => h,
         Err(e) => return e.to_u64(),
     };
@@ -1803,7 +1902,7 @@ fn connect_through(connector: &port::Connector) -> u64 {
         outbox: to_client,
     });
     if let Err(e) = queued {
-        process::with_fd_owner_data(|data| {
+        process::with_process_data(|data| {
             ops::close(&mut data.handles, h, &mut data.pipe_maps)
                 .expect("the connection this call installed a moment ago");
         });
@@ -1813,12 +1912,15 @@ fn connect_through(connector: &port::Connector) -> u64 {
         };
     }
     let port = connector.port();
-    crate::sched::waitqs::wake_all(&port.waiters());
+    completion::post(
+        completion::Subject::of(port.watch()),
+        completion::Outcome::Ready,
+    );
     let watchers = port.watchers();
     if !watchers.is_empty() {
         crate::io_uring::complete_pending_for_event(
             &watchers,
-            crate::io_uring::Source::Port(port.clone()),
+            crate::io_uring::Source::Port(port),
         );
     }
     h.0 as u64
@@ -1854,7 +1956,7 @@ fn sys_gpu_reset_scanout(
         cursor,
     };
     device::set_framebuffer_info(screen.clone());
-    let minted = process::with_fd_owner_data(|data| {
+    let minted = process::with_process_data(|data| {
         let claim = data
             .handles
             .get::<crate::object::device::DeviceClaim>(claim_h, Rights::WRITE)?;
@@ -1874,7 +1976,7 @@ fn sys_gpu_reset_scanout(
 }
 
 fn sys_accept(h: RawHandle) -> u64 {
-    let acceptor = match process::with_fd_owner_data(|data| {
+    let acceptor = match process::with_process_data(|data| {
         data.handles.get::<port::Acceptor>(h, Rights::READ)
     }) {
         Ok(a) => a,
@@ -1893,7 +1995,7 @@ fn sys_accept(h: RawHandle) -> u64 {
                     conn.outbox,
                 ),
             );
-            let installed = process::with_fd_owner_data(|data| {
+            let installed = process::with_process_data(|data| {
                 ops::install(&mut data.handles, object)
             });
             return handle_result(installed);
@@ -1905,10 +2007,19 @@ fn sys_accept(h: RawHandle) -> u64 {
         if acceptor.closed() {
             return SyscallError::Gone.to_u64();
         }
-        let queue = acceptor.waiters();
-        crate::scheduler::wait_until(&queue, 0, || {
-            acceptor.has_pending() || acceptor.closed()
-        });
+        let parkable = crate::scheduler::Parkable::at_entry();
+        if completion::wait_until(
+            &parkable,
+            completion::Subject::of(acceptor.watch()),
+            completion::Token::new(0),
+            WaitClass::Ipc,
+            Deadline::never(),
+            || acceptor.has_pending() || acceptor.closed(),
+        )
+        .is_err()
+        {
+            return cancelled();
+        }
     }
 }
 
@@ -1922,11 +2033,11 @@ fn sys_shm_create(size: u64) -> u64 {
         Ok(shm) => KObjectRef::SharedMem(shm),
         Err(e) => return e.to_u64(),
     };
-    process::with_fd_owner_data(|data| handle_result(ops::install(&mut data.handles, object)))
+    process::with_process_data(|data| handle_result(ops::install(&mut data.handles, object)))
 }
 
 fn sys_shm_map(h: RawHandle) -> u64 {
-    let shm = match process::with_fd_owner_data(|data| {
+    let shm = match process::with_process_data(|data| {
         data.handles.get::<crate::object::shm::SharedMemObject>(h, Rights::MAP)
     }) {
         Ok(shm) => shm,
@@ -1964,7 +2075,7 @@ fn sys_handle_send(conn_h: RawHandle, handles: &crate::user_ptr::UserBytes, coun
     }
     let wanted = &wanted[..count];
 
-    let sent = process::with_fd_owner_data(|data| {
+    let sent = process::with_process_data(|data| {
         let conn = data
             .handles
             .get::<crate::object::service::ConnectionEnd>(conn_h, Rights::TRANSFER)?;
@@ -2008,7 +2119,7 @@ fn sys_handle_recv(
     out: &mut crate::user_ptr::UserBytesMut,
     cap: usize,
 ) -> u64 {
-    let taken = process::with_fd_owner_data(|data| {
+    let taken = process::with_process_data(|data| {
         let conn = data
             .handles
             .get::<crate::object::service::ConnectionEnd>(conn_h, Rights::READ)?;
@@ -2119,8 +2230,8 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
         let pt = process::current_address_space();
         let start = UserAddr::new(start);
         // Both ledgers move together, under both locks, in the order the
-        // arm below established: the fd-owner data, then the address space.
-        let replaced = process::with_fd_owner_data(|data| {
+        // arm below established: the process data, then the address space.
+        let replaced = process::with_process_data(|data| {
             let mut as_guard = pt.lock();
             // A placed mapping names its own range, so the question `find_gap`
             // answers for every other mapping has to be asked here — and it
@@ -2203,7 +2314,7 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
         }
     } else {
         let pt = process::current_address_space();
-        let vaddr = process::with_fd_owner_data(|data| {
+        let vaddr = process::with_process_data(|data| {
             let placed = match &pages {
                 Some(pages) => pt.lock().alloc_and_map(pages.phys(), aligned as u64, writable, CachePolicy::DeferToMtrr).map(|(v, _)| v),
                 None => pt.lock().alloc_region(aligned as u64, crate::vma::RegionKind::Mapped, false),
@@ -2233,7 +2344,7 @@ fn sys_mmap(req_addr: u64, size: u64, prot: MmapProt, flags: MmapFlags) -> u64 {
 /// half of the FIXED defect that outlived the mapping.
 fn sys_munmap(addr: u64, _size: u64) -> u64 {
     let pt = process::current_address_space();
-    let taken = process::with_fd_owner_data(|data| {
+    let taken = process::with_process_data(|data| {
         let idx = data.mmap_regions.iter().position(|r| r.addr.raw() == addr)?;
         let region = data.mmap_regions.swap_remove(idx);
         data.free_count += 1;
@@ -2246,7 +2357,7 @@ fn sys_munmap(addr: u64, _size: u64) -> u64 {
         return SyscallError::NotFound.to_u64();
     };
     // Dropped out here, not inside the closure: the drop shoots down and waits,
-    // and the fd-owner lock the closure holds is one a sibling can be spinning
+    // and the process-data lock the closure holds is one a sibling can be spinning
     // on with `IF` clear.
     drop(unmapped);
     0
@@ -2265,22 +2376,43 @@ fn sys_thread_spawn(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> u6
         .map_or(SyscallError::ResourceExhausted.to_u64(), |t| t.raw() as u64)
 }
 
+/// Wait for a thread of this process to die.
+///
+/// **It arms on the thread it names**, which is what replaced the parking lot:
+/// the target's own `TaskHandle` carries the watch, `thread_exit` posts to it,
+/// and the `ThreadSched` held across the park is what keeps that watch alive.
+/// A `wake_task(TaskId)` to the process's main thread — a wake by name, into a
+/// hashed bucket, re-checked by whoever happened to be woken — is gone with it.
 fn sys_thread_join(tid: u64) -> u64 {
     let tid = process::Tid::from_raw(tid as u32);
     let caller = process::current_process();
-    let queue = crate::scheduler::park_lot();
+    // Resolved once. `None` is a thread that never existed or is already
+    // collected, and the predicate below answers both.
+    let target = process::thread_sched(caller, tid);
+    let parkable = crate::scheduler::Parkable::at_entry();
     loop {
-        let ticket = crate::scheduler::prepare_wait(queue);
         match process::wait_thread_zombie(tid, caller) {
-            Ok(Some(_)) => {
-                ticket.cancel();
-                return 0;
-            }
-            Ok(None) => crate::scheduler::block_on(ticket, 0),
-            Err(()) => {
-                ticket.cancel();
-                return SyscallError::NotFound.to_u64();
-            }
+            Ok(Some(_)) => return 0,
+            Ok(None) => {}
+            Err(()) => return SyscallError::NotFound.to_u64(),
+        }
+        let Some(sched) = target.as_ref() else {
+            // Nothing to arm on and the zombie is not there: the thread is
+            // gone in a way `wait_thread_zombie` will keep answering the same
+            // way, so waiting cannot change it.
+            return SyscallError::NotFound.to_u64();
+        };
+        if completion::wait_until(
+            &parkable,
+            completion::Subject::of(sched.handle.watch()),
+            completion::Token::new(tid.raw() as u64),
+            WaitClass::Other,
+            Deadline::never(),
+            || matches!(process::wait_thread_zombie(tid, caller), Ok(Some(_)) | Err(())),
+        )
+        .is_err()
+        {
+            return cancelled();
         }
     }
 }
@@ -2418,30 +2550,44 @@ fn sys_sysinfo(out: &mut UserBytesMut) -> u64 {
 }
 
 fn sys_nanosleep(nanos: u64) -> u64 {
-    let deadline = crate::clock::nanos_since_boot().saturating_add(nanos);
+    // The caller's own arithmetic, which is exactly what a `Deadline` is: the
+    // ABI still carries a relative span, and this is the one place it becomes
+    // an instant.
+    let deadline = Deadline::at(crate::clock::now() + Duration::from_nanos(nanos));
     // No condition to re-check: the deadline is the wake, and one that has
     // already passed fires at the next scheduler entry.
-    crate::scheduler::block_on(
-        crate::scheduler::prepare_wait(crate::scheduler::park_lot()),
+    // **Armed on nothing but time.** A sleep has no subject — what ends it is
+    // the deadline the caller chose — so it arms on its own thread, where
+    // nothing posts, and the park's own deadline is the whole of the wait.
+    let parkable = crate::scheduler::Parkable::at_entry();
+    let Some(handle) = crate::sched::driver::current_handle() else {
+        return 0;
+    };
+    let _ = completion::wait_until(
+        &parkable,
+        completion::Subject::of(handle.watch()),
+        completion::Token::new(0),
+        WaitClass::Other,
         deadline,
+        || false,
     );
     0
 }
 
-/// A second descriptor for the object `fd_num` names.
+/// A second handle to the same object, carrying no more than the first.
 ///
 /// `PermissionDenied` is the answer for a device claim: it is the one object
-/// that admits a single descriptor, and `Descriptor::duplicate` says so at the
-/// only place that can. Before this, `dup` handed back a claim's exclusivity
-/// while leaving the caller a working descriptor.
-/// A second handle to the same object, carrying no more than the first.
+/// that admits a single handle, and `ops::initial_rights` says so by
+/// withholding `Rights::DUP` — exclusivity is a property of the type rather
+/// than of a check here. Before that, `dup` handed back a claim's exclusivity
+/// while leaving the caller a working handle.
 ///
 /// `want` is the wire form of `Option<Rights>` — [`RIGHTS_UNCHANGED`] for the
 /// source's own set — decoded here and nowhere else. A set with a bit no right
 /// uses is a caller with a bug, and so is one the source does not hold: rights
 /// only shrink, and the refusal names which.
 fn sys_handle_dup(h: RawHandle, want: u64) -> u64 {
-    let duplicated = process::with_fd_owner_data(|data| {
+    let duplicated = process::with_process_data(|data| {
         let held = data.handles.rights_of(h)?;
         let rights = if want == RIGHTS_UNCHANGED {
             held
@@ -2472,7 +2618,7 @@ fn sys_dup2(old: RawHandle, slot: u64) -> u64 {
     let Ok(slot) = u16::try_from(slot) else {
         return SyscallError::ResourceExhausted.to_u64();
     };
-    let result = process::with_fd_owner_data(|data| {
+    let result = process::with_process_data(|data| {
         let rights = data.handles.rights_of(old)?;
         let entry = data.handles.duplicate_entry(old, rights)?;
         data.handles
@@ -2511,7 +2657,7 @@ fn sys_dup2(old: RawHandle, slot: u64) -> u64 {
 struct Displaced(Option<crate::object::HandleEntry>);
 
 fn sys_rename(old: &str, new: &str) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let old_abs = vfs.resolve_absolute(&cwd, old);
     let new_abs = vfs.resolve_absolute(&cwd, new);
@@ -2525,7 +2671,7 @@ fn sys_rename(old: &str, new: &str) -> u64 {
 }
 
 fn sys_mkdir(path: &str) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     if !vfs.user_may_modify(&resolved) {
@@ -2538,7 +2684,7 @@ fn sys_mkdir(path: &str) -> u64 {
 }
 
 fn sys_rmdir(path: &str) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     if !vfs.user_may_modify(&resolved) {
@@ -2549,7 +2695,7 @@ fn sys_rmdir(path: &str) -> u64 {
 }
 
 fn sys_symlink(target: &str, link: &str) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, link);
     if !vfs.user_may_modify(&resolved) {
@@ -2565,7 +2711,7 @@ fn sys_symlink(target: &str, link: &str) -> u64 {
 }
 
 fn sys_readlink(path: &str, out: &mut UserBytesMut) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let mut vfs = vfs::lock();
     let resolved = vfs.resolve_absolute(&cwd, path);
     match vfs.read_link(&resolved) {
@@ -2581,7 +2727,7 @@ fn sys_readlink(path: &str, out: &mut UserBytesMut) -> u64 {
 }
 
 fn sys_dlopen(ctx: &crate::user_ptr::SyscallContext, path: &str, init_out: Option<UserAddr>) -> u64 {
-    let cwd = process::with_fd_owner_data(|d| d.cwd.clone());
+    let cwd = process::with_process_data(|d| d.cwd.clone());
     let resolved = vfs::lock().resolve_absolute(&cwd, path);
 
     let lib = crate::elf::try_clone_cached(&resolved);
@@ -2613,7 +2759,7 @@ fn sys_dlopen(ctx: &crate::user_ptr::SyscallContext, path: &str, init_out: Optio
     // so exhausting it is a loop any process can write. Exhaustion is an error
     // return, not an `.expect` in syscall context.
     let pt = process::current_address_space();
-    let mapped = process::with_fd_owner_data(|_data| {
+    let mapped = process::with_process_data(|_data| {
         match &lib.memory {
             crate::elf::LibMemory::Owned(alloc) => {
                 let phys = DirectMap::phys_of(alloc.ptr());
@@ -2657,7 +2803,7 @@ fn sys_dlopen(ctx: &crate::user_ptr::SyscallContext, path: &str, init_out: Optio
 
     let lib_has_tls = lib.tls_memsz > 0;
 
-    let data_arc = process::fd_owner_data();
+    let data_arc = process::process_data();
     {
         let mut data = data_arc.lock();
         crate::elf::resolve_dlopen_relocs(&lib, &data.elf.loaded_libs);
@@ -2749,7 +2895,7 @@ fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
         return Err(SyscallError::ResourceExhausted);
     }
 
-    let owner_arc = process::fd_owner_data();
+    let owner_arc = process::process_data();
     let (tls_memsz, tls_template) = {
         let data = owner_arc.lock();
         let m = data.elf.tls_modules.iter().find(|m| m.module_id == module_id)
@@ -2763,7 +2909,7 @@ fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
     // first mapping stays present, USER and writable, over whatever the PMM
     // hands out next.
     let tid = process::current_tid();
-    let existing = process::with_fd_owner_data(|data| {
+    let existing = process::with_process_data(|data| {
         data.elf.dynamic_tls_blocks.get(&(tid, module_id)).map(|b| b.vaddr())
     });
 
@@ -2780,7 +2926,7 @@ fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
 
             let block_phys = page_alloc.phys();
             let pt = process::current_address_space();
-            process::with_fd_owner_data(|data| {
+            process::with_process_data(|data| {
                 let (vaddr, _) = process::vma_map(&pt, block_phys, page_alloc.size() as u64)
                     .ok_or(SyscallError::ResourceExhausted)?;
                 data.alloc_count += 1;
@@ -2803,7 +2949,7 @@ fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
 }
 
 fn sys_dlsym(handle: u64, name: &str) -> u64 {
-    let data_arc = process::fd_owner_data();
+    let data_arc = process::process_data();
     let data = data_arc.lock();
     let idx = handle as usize;
     if idx >= data.elf.loaded_libs.len() {
@@ -2829,17 +2975,17 @@ fn sys_io_uring_setup(ctx: &SyscallContext, depth: u32, out: u64) -> u64 {
         Err(e) => return e.to_u64(),
     };
     // A refused install drops the reference, which tears the ring down again.
-    let object = KObjectRef::IoUring(crate::object::service::IoUringObject::new(ring));
-    let installed = process::with_fd_owner_data(|data| ops::install(&mut data.handles, object));
+    let object = KObjectRef::Inbox(crate::object::service::IoUringObject::new(ring));
+    let installed = process::with_process_data(|data| ops::install(&mut data.handles, object));
     let handle = match installed {
         Ok(h) => h,
         Err(e) => return e.to_u64(),
     };
-    let answer = toyos_abi::syscall::IoUringSetup { handle, _pad: 0, vaddr };
+    let answer = toyos_abi::syscall::InboxSetup { handle, _pad: 0, vaddr };
     match ctx.copy_out(out, &answer) {
         Ok(()) => 0,
         Err(e) => {
-            process::with_fd_owner_data(|data| {
+            process::with_process_data(|data| {
                 ops::close(&mut data.handles, handle, &mut data.pipe_maps)
                     .expect("the ring this call installed a moment ago");
             });
@@ -2858,7 +3004,7 @@ fn sys_io_uring_enter(
     // `NotFound` and one of the wrong type is `PermissionDenied`, the same as
     // every other call. Collapsing both into `InvalidArgument` made "this ring
     // was closed" indistinguishable from "this argument is nonsense".
-    let ring_id = process::with_fd_owner_data(|data| {
+    let ring_id = process::with_process_data(|data| {
         data.handles
             .get::<crate::object::service::IoUringObject>(
                 ring_h,
@@ -2898,7 +3044,7 @@ fn sys_process_stats(
     h: RawHandle,
     out: UserAddr,
 ) -> u64 {
-    let object = match process::with_fd_owner_data(|data| {
+    let object = match process::with_process_data(|data| {
         data.handles.get::<crate::object::process::ProcessObject>(h, Rights::READ)
     }) {
         Ok(object) => object,
@@ -2943,12 +3089,12 @@ fn sys_query_modules(out: &mut UserBytesMut) -> u64 {
         unsafe { core::mem::transmute_copy(info) }
     }
 
-    process::with_fd_owner_data(|data| {
+    process::with_process_data(|data| {
         let module_count = 1 + data.elf.loaded_libs.len();
 
         let exe_path_bytes = data.exe_path.as_bytes();
         let total_path_bytes: usize = exe_path_bytes.len()
-            + data.elf.lib_paths.iter().map(|p| p.as_bytes().len()).sum::<usize>();
+            + data.elf.lib_paths.iter().map(|p| p.len()).sum::<usize>();
 
         let required = module_count * info_size + total_path_bytes;
         if out.len() < required {

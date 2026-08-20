@@ -36,6 +36,10 @@ const PORT: u16 = 0x3f8; // COM1
 /// here and every UART access is gated on it.
 static UART_PRESENT: AtomicBool = AtomicBool::new(false);
 
+// Every line is `PORT + <register number>`, which is how a 16550's registers
+// are named; writing the data register as bare `PORT` would make three of these
+// lines a different kind of statement from the other eight.
+#[allow(clippy::identity_op)]
 pub fn init() {
     outb(PORT + 1, 0x00); // Disable all interrupts
     outb(PORT + 3, 0x80); // Enable DLAB (set baud rate divisor)
@@ -531,9 +535,10 @@ impl Csi {
 /// the last thing standing when the backend lock holder is already wedged. So
 /// the one mechanism designed for "everything else has failed" could itself
 /// hang forever, on the machine where it matters most: a laptop, where nothing
-/// is watching the console to notice. `panic_raw_uart` in `main.rs` has always
-/// bounded its wait; this is the same bound, applied where the bytes actually
-/// go. Losing a byte to a dead UART beats losing the machine to it.
+/// is watching the console to notice. The panic path's own port writer has
+/// always bounded its wait; this is the same bound, applied where the bytes
+/// actually go — and since `kernel/src/panic.rs` took that writer over, it is
+/// the only one. Losing a byte to a dead UART beats losing the machine to it.
 const THRE_SPIN_LIMIT: u32 = 100_000;
 
 fn uart_write_bytes(bytes: &[u8]) {
@@ -554,12 +559,25 @@ fn uart_write_bytes(bytes: &[u8]) {
 /// Write straight to the 16550, bypassing the ring, the backend lock and the
 /// virtio console.
 ///
-/// For the two callers that have to report something *about* the machinery
-/// they would otherwise report through: the panic-reentry line, and the IST1
-/// stack verdict, which is meaningless if it travels through a ring that may
-/// be what the overflow corrupted. No lock, no allocation, bounded per byte.
+/// For the callers that have to report something *about* the machinery they
+/// would otherwise report through: `panic::last_words`, which is what a machine
+/// two crashes deep has left, and the IST1 stack verdict, which is meaningless
+/// if it travels through a ring that may be what the overflow corrupted. No
+/// lock, no allocation, bounded per byte.
 pub fn panic_raw(bytes: &[u8]) {
     uart_write_bytes(bytes);
+}
+
+/// `panic_raw` for an address or an error code, in the `{:#018x}` the rest of
+/// the crash report writes them in.
+pub fn panic_raw_hex(v: u64) {
+    let mut out = [b'0'; 18];
+    out[1] = b'x';
+    for (i, byte) in out[2..].iter_mut().enumerate() {
+        let nibble = (v >> (60 - 4 * i)) as u8 & 0xF;
+        *byte = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+    }
+    uart_write_bytes(&out);
 }
 
 /// `panic_raw` for a number, since the callers cannot format one.

@@ -57,3 +57,22 @@ marker should say why — whether it never got its arguments, could not open a
 device, or was reaped by something — and the harness should keep whatever it did
 write. Today the test's name is all the evidence there is, which is how a real
 one-in-N boot failure would be indistinguishable from a host hiccup.
+
+**A sixth name, 2026-08-19, and the first one with a controlled comparison.**
+`hda_two_live_refused` on `wt/toyos-tlb`, parallel phase of a full `cargo test`,
+the identical message and `ALONE: GREEN`, in a run that was 267 passed and 1
+failed. What this one adds is not another load proxy but three runs of one
+machine: the failing run was the cold one, compiling 110 C tests and three
+kernels beside the guests (parallel phase 113.3 s); the same tree with its diff
+stashed was 268 of 268 warm (52.9 s), and the diff restored was 268 of 268 again
+(47.6 s). On this host it followed what else was building and not what was in the
+tree — which agrees with the ciwall reading that what is shared is another build
+on the machine.
+
+**And the diagnosis is still exactly as this file left it**, including after
+#125. `TestResult::error` carries a kernel's death report now, but this panic is
+not that field: it is `wait_for_ready`'s own `RecvTimeoutError::Disconnected`
+arm in `tests/common/qemu.rs`, which formats the exit status and drops both
+`seen` — every line the guest had already written, held in that same function —
+and the UART log the guest's early boot goes to. Both exist at the moment it
+fires, and neither reaches the message.

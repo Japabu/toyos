@@ -46,12 +46,13 @@
 //! driver waiting on a device register inside a handler. Those are latency, not
 //! deadlock, because each carries its own deadline — but the deadline can be
 //! seconds (`issues/kernel/`, xHCI inside `drain_irqs`), so
-//! [`ACK_TIMEOUT_NS`] is set above the largest of them and a CPU past it is
+//! [`ACK_TIMEOUT`] is set above the largest of them and a CPU past it is
 //! named in a panic rather than waited for forever.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::shootdown::{Generation, Shootdown};
+use crate::time::{Duration, Tripwire};
 
 use super::{apic, percpu, smp};
 
@@ -78,7 +79,15 @@ static SIBLINGS_ANSWER: AtomicBool = AtomicBool::new(false);
 /// (`issues/kernel/`). Anything past that is not a slow CPU, it is a
 /// CPU that will never answer, and a panic naming it is worth more than a hang
 /// that looks like every other freeze.
-const ACK_TIMEOUT_NS: u64 = 5_000_000_000;
+///
+/// A [`Tripwire`]: it panics below, and neither a register nor a specification
+/// publishes it. Its *derivation* is `USB_TIMEOUT_NS`, which splits at C10 —
+/// so the number owes a new reason to whichever chunk does that, and the kind
+/// does not change with it.
+const ACK_TIMEOUT: Tripwire = Tripwire::absurd(
+    Duration::from_secs(5),
+    "above the longest IF-clear device spin a target can be inside",
+);
 
 /// Spins between deadline checks. `nanos_since_boot` is an HPET read on the
 /// machines that have no invariant TSC, and reading it every iteration would
@@ -91,11 +100,16 @@ const SPINS_PER_DEADLINE_CHECK: u32 = 1024;
 /// shoot down, then free. [`crate::mm::Unmapped`] is the type that makes the
 /// pairing hard to get wrong; this is what it calls.
 ///
-/// The local flush is the whole TLB rather than the `invlpg` the unmap already
-/// did, and that is the fix for the wrong-PCID half of the defect: `invlpg`
-/// tags the *current* CR3's PCID, while `shared_memory` and `virtio_gpu` unmap
-/// from a process that is not the one running here. A CPU-wide flush is correct
-/// under every PCID configuration and is what the targets do anyway.
+/// The local flush is the whole TLB and not the one address the caller changed,
+/// because a shootdown answers mutations that are not one address: a direct-map
+/// leaf changing memory type is a 2 MiB window this CPU may hold under any tag,
+/// and a recycled PCID is every address there is. It is also exactly what the
+/// targets do, so the initiator and its siblings end in the same state.
+///
+/// The single address is `mm::paging`'s own and it is derived there, in the
+/// address space that was written — which until 2026-08-19 was whatever `CR3`
+/// held instead, and on `shared_memory`'s and `virtio_gpu`'s cross-process
+/// unmaps that is the caller's process rather than the one being unmapped.
 pub fn shootdown() {
     let cpus = smp::cpu_count();
     if !SIBLINGS_ANSWER.load(Ordering::Acquire) || cpus <= 1 {
@@ -134,10 +148,11 @@ fn wait_for(me: usize, cpu: u32, generation: Generation) {
             spins = 0;
             let now = crate::clock::nanos_since_boot();
             match deadline {
-                None => deadline = Some(now.saturating_add(ACK_TIMEOUT_NS)),
+                None => deadline = Some(now.saturating_add(ACK_TIMEOUT.nanos())),
                 Some(at) if now >= at => panic!(
-                    "tlb: cpu {cpu} has not flushed for generation {generation:?} in \
-                     {ACK_TIMEOUT_NS}ns — it is not taking interrupts",
+                    "tlb: cpu {cpu} has not flushed for generation {generation:?} in {}ns — \
+                     it is not taking interrupts",
+                    ACK_TIMEOUT.nanos(),
                 ),
                 Some(_) => {}
             }

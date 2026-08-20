@@ -17,6 +17,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
   workflow_dispatch:
   schedule:
     - cron: '5 3 * * *'
@@ -64,8 +65,122 @@ jobs:
             ~/.cargo/git/db
             target
             userland/target
+            kernel/target
+            bootloader/target
           key: host-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: host-${{ runner.os }}-
+
+      # **Default clippy, warnings denied, on every pull request.** A step of
+      # this job rather than a job of its own, and that is the whole reason it
+      # binds: `landing.yml`'s `gate-stage` reads main's required checks back out
+      # of GitHub and reds on a name this repository claims that the ruleset does
+      # not require. A new job would be a check nobody has required yet — visible
+      # on the pull request, and skipped straight past by `gh pr merge --auto`.
+      # Inside `host`, which is required today, a clippy finding blocks a merge
+      # today.
+      #
+      # Three trees, five invocations — the kernel runs twice and `toyos-abi`
+      # once more, both explained below; neither is a second opinion. The lint
+      # set is default clippy everywhere, plus a short, individually-adopted list from
+      # `pedantic`/`nursery` — never the groups themselves, and never
+      # `restriction` as a group.
+      # `issues/build/clippy-has-never-run-here.md` carries the full ledger:
+      # every `pedantic`/`nursery` lint measured, each adoption or rejection
+      # with its count and reason (`pedantic` + `nursery` together were 1,684
+      # findings on the kernel alone — almost all of it stayed rejected).
+      # Adopted so far, each earning its place on a *measured* finding, not a
+      # guess: `checked_conversions`, `default_trait_access`, `manual_midpoint`,
+      # `redundant_clone`, `unchecked_time_subtraction`, `unnecessary_semicolon`.
+      #
+      # **The kernel's default feature set is not what any guest boots.** Every
+      # guest the harness boots is built with `boot-actuators`, and several
+      # configs add `test-actuators`, so a clippy pass over the default set
+      # alone never sees the code behind either `cfg` — six findings, in six
+      # files, went unlinted this way until
+      # `issues/build/kernel-clippy-runs-without-the-actuator-features.md`
+      # measured it. The fix is a second kernel invocation naming both
+      # features, in the same step rather than a new job, for the reason
+      # above. `boot-actuators,test-actuators` is the whole of what default
+      # clippy was missing: `kernel/Cargo.toml` declares twelve more features
+      # and no kernel build may ever enable any of them — `loom` and the eight
+      # other `kernel-loom` model controls, `debug-wait`, `sched-check` and
+      # `fpu-save-nothing` — so `cargo test --lib`, `kernel-loom`'s own suites
+      # and `--debug` already close that set, and this gate has no business in
+      # it. Measured against a warm kernel target (`cargo clean -p kernel`,
+      # then both invocations back to back, 2026-08-20): the added invocation
+      # costs about **1.6 s** more — the same tree, checked twice, not a
+      # second target directory.
+      #
+      # `rustup run stable` on all three, and no ToyOS toolchain: the kernel's
+      # `x86_64-unknown-none` and the bootloader's `x86_64-unknown-uefi` are
+      # both built-in targets, which is what makes this cost nothing. The reason
+      # usually given for skipping the kernel — that the `toyos` toolchain ships
+      # no clippy — was about the wrong toolchain.
+      #
+      # **Userland is not here, and cannot be yet**: `x86_64-unknown-toyos` is a
+      # custom target, so linting `userland/` needs the fork's clippy and the
+      # bootstrapped sysroot this job deliberately does not wait for. The fork's
+      # `toyos` toolchain has no `cargo-clippy` component at all today — a
+      # custom `rustup toolchain link` target can't `rustup component add` one,
+      # it would need building from `rust/` by hand — so userland's
+      # `undocumented_unsafe_blocks` count is still unmeasured, not measured
+      # and deferred (`issues/build/clippy-has-never-run-here.md`).
+      #
+      # `--all-targets` on the workspace and *not* on the other two: it is what
+      # reaches `tests/`, `examples/` and every crate's test targets, and on the
+      # bootloader it fails outright, because a test target links `std` whose
+      # `panic_impl` collides with the one `uefi_services` provides. The kernel
+      # is the same shape.
+      #
+      # `--keep-going` so the report is the whole tree. Without it a crate that
+      # fails stops every crate behind it, and the first measurement taken here
+      # was a prefix, not a workspace: `toyos-ld` failed and hid `toyos-cc`,
+      # `toyos-build`'s own targets and the entire QEMU harness.
+      #
+      # The other two run from their own directory rather than by
+      # `--manifest-path`, because `.cargo/config.toml` is found from the working
+      # directory: `cd kernel` is what applies that file's `-Dwarnings`, and the
+      # `-- -D warnings` here is deliberately the same wall said twice.
+      #
+      # `undocumented_unsafe_blocks` (a `restriction` lint, cherry-picked, never
+      # the group) is adopted per area as each area's justifications land — the
+      # plan `issues/build/clippy-has-never-run-here.md` records. The bootloader
+      # (10 blocks) is documented and gated below, inline. `toyos-abi` (19
+      # blocks) is documented too, but gated as its own `-p` invocation rather
+      # than folded into the workspace one: the workspace command lints every
+      # other host-workspace crate as well, and none of *those* unsafe blocks
+      # has been reviewed, so enabling the lint there would silently gate crates
+      # nobody has looked at. The kernel (373 blocks) is measured, not gated —
+      # not tractable in one pass, and recorded as follow-up in the same issue.
+      #
+      # Measured on the dev host with three fresh `CARGO_TARGET_DIR`s and a warm
+      # cargo registry: **19.2 s** for the workspace (139 crates checked),
+      # **2.2 s** for the kernel (19), **3.7 s** for the bootloader (20) — 25 s
+      # of wall clock for all three, against this job's 398 s cold. It is placed
+      # before the test steps so a lint finding answers without waiting for
+      # them, and it pays for the three target directories the cache now keeps.
+      - name: clippy
+        run: |
+          set -e -o pipefail
+          rustup component add clippy
+          rustup target add x86_64-unknown-none x86_64-unknown-uefi
+          ADOPTED="-W clippy::checked_conversions -W clippy::default_trait_access -W clippy::manual_midpoint -W clippy::redundant_clone -W clippy::unchecked_time_subtraction -W clippy::unnecessary_semicolon"
+          echo "=== clippy: host workspace" | tee -a /tmp/host.log
+          cargo clippy --workspace --all-targets --keep-going -- $ADOPTED -D warnings 2>&1 \
+            | tee -a /tmp/host.log
+          echo "=== clippy: kernel (x86_64-unknown-none)" | tee -a /tmp/host.log
+          (cd kernel && cargo clippy --target x86_64-unknown-none -- $ADOPTED -D warnings) 2>&1 \
+            | tee -a /tmp/host.log
+          echo "=== clippy: kernel (x86_64-unknown-none, boot-actuators+test-actuators)" | tee -a /tmp/host.log
+          (cd kernel && cargo clippy --target x86_64-unknown-none \
+            --features boot-actuators,test-actuators -- $ADOPTED -D warnings) 2>&1 \
+            | tee -a /tmp/host.log
+          echo "=== clippy: bootloader (x86_64-unknown-uefi)" | tee -a /tmp/host.log
+          (cd bootloader && cargo clippy --target x86_64-unknown-uefi -- $ADOPTED -W clippy::undocumented_unsafe_blocks -D warnings) 2>&1 \
+            | tee -a /tmp/host.log
+          echo "=== clippy: toyos-abi unsafe blocks" | tee -a /tmp/host.log
+          cargo clippy -p toyos-abi --all-targets --keep-going -- -W clippy::undocumented_unsafe_blocks -D warnings 2>&1 \
+            | tee -a /tmp/host.log
 
       # The build system's own gates: the two lock scopes, the landing
       # protocol, the sysroot witness, and the format check on the two volumes
@@ -264,6 +379,82 @@ jobs:
           if ! grep -q 'a_reader_that_finds_a_shard_finds_it_built \.\.\. FAILED' \
                /tmp/shard-publish-relaxed.log; then
             echo "the shard-publish-relaxed build failed without a_reader_that_finds_a_shard_finds_it_built reaching a verdict: this step proved nothing" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+
+      # **The completion core's three controls, arriving with the code they
+      # stage.** `inbox.rs` and `sleep_lock.rs` are new models, and each ships
+      # with the feature that makes it red rather than with a comment claiming
+      # it would — the rule the five steps above exist to have enforced from the
+      # start. Every step below is `wake-fence-off`'s shape exactly: a pass is
+      # "the model has no teeth", and a failure that never reached the named
+      # verdict line is "this step proved nothing".
+      - name: kernel-loom inbox publication has teeth
+        run: |
+          set -o pipefail
+          echo "=== kernel-loom --features inbox-release-off --test inbox (must red)" \
+            | tee -a /tmp/host.log
+          if cargo test --manifest-path kernel-loom/Cargo.toml \
+               --features inbox-release-off --test inbox 2>&1 \
+               | tee /tmp/inbox-release-off.log | tee -a /tmp/host.log; then
+            echo "inbox passed with the record's publication relaxed: the model has no teeth" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+          if ! grep -q 'a_record_reaches_its_taker_intact \.\.\. FAILED' \
+               /tmp/inbox-release-off.log; then
+            echo "the inbox-release-off build failed without a_record_reaches_its_taker_intact reaching a verdict: this step proved nothing" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+
+      # The log's producer is the one path that posts to an inbox holding no
+      # lock, so `Inbox::signal` is a single atomic store where `post` is a
+      # sequence of plain writes. This control puts the producer back on `post`
+      # — the shape that shipped before it — and loom answers with the data race
+      # x86's TSO hides from every guest test in the tree.
+      - name: kernel-loom lock-free post has teeth
+        run: |
+          set -o pipefail
+          echo "=== kernel-loom --features inbox-signal-as-post --test inbox (must red)" \
+            | tee -a /tmp/host.log
+          if cargo test --manifest-path kernel-loom/Cargo.toml \
+               --features inbox-signal-as-post --test inbox 2>&1 \
+               | tee /tmp/inbox-signal-as-post.log | tee -a /tmp/host.log; then
+            echo "inbox passed with two unlocked producers on Inbox::post: the model has no teeth" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+          if ! grep -q 'two_unlocked_producers_are_a_race_and_a_signal_is_not \.\.\. FAILED' \
+               /tmp/inbox-signal-as-post.log; then
+            echo "the inbox-signal-as-post build failed without two_unlocked_producers_are_a_race_and_a_signal_is_not reaching a verdict: this step proved nothing" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+
+      # **Two verdict lines demanded, not one.** Relaxing the sleep lock's
+      # acquire reds all four of `sleep_lock.rs`'s models, and the two named
+      # here are the ones the *ordering* breaks rather than the ticket
+      # arithmetic: the contended parking acquire, which is the path
+      # `ticket_lock.rs` cannot reach at all, and mutual exclusion itself.
+      - name: kernel-loom sleep lock's acquire edge has teeth
+        run: |
+          set -o pipefail
+          echo "=== kernel-loom --features sleeplock-acquire-off --test sleep_lock (must red)" \
+            | tee -a /tmp/host.log
+          if cargo test --manifest-path kernel-loom/Cargo.toml \
+               --features sleeplock-acquire-off --test sleep_lock 2>&1 \
+               | tee /tmp/sleeplock-acquire-off.log | tee -a /tmp/host.log; then
+            echo "sleep_lock passed with the acquire relaxed: the model has no teeth" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+          if ! grep -q 'a_parking_contender_observes_the_holders_writes \.\.\. FAILED' \
+               /tmp/sleeplock-acquire-off.log \
+             || ! grep -q 'two_holders_never_overlap \.\.\. FAILED' \
+               /tmp/sleeplock-acquire-off.log; then
+            echo "the sleeplock-acquire-off build failed without both named sleep_lock models reaching a verdict: this step proved nothing" \
               | tee -a /tmp/host.log
             exit 1
           fi

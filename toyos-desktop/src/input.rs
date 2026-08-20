@@ -94,7 +94,7 @@ pub fn key_action(ev: RawKeyEvent, focused: Option<WindowMode>, launcher_open: b
     KeyAction::Forward
 }
 
-/// One report off the mouse fd.
+/// One report off the mouse claim.
 pub const MOUSE_EVENT_LEN: usize = 6;
 
 const _: () = {
@@ -114,7 +114,7 @@ fn decode(b: &[u8]) -> MouseEvent {
     }
 }
 
-/// A whole read of the mouse fd, folded into the one thing that happened.
+/// A whole read of the mouse claim, folded into the one thing that happened.
 ///
 /// The kernel queues reports and one read drains them, so a batch can contain
 /// a press and its release, several scroll notches and a dozen positions. The
@@ -139,7 +139,7 @@ impl MouseSample {
     }
 }
 
-/// Fold a read of the mouse fd, given what the buttons were before it.
+/// Fold a read of the mouse claim, given what the buttons were before it.
 ///
 /// A trailing partial report is ignored rather than being decoded from
 /// whatever follows it in the buffer.

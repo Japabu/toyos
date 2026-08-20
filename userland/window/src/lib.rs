@@ -3,7 +3,8 @@ pub mod framebuffer;
 pub use framebuffer::{Color, Framebuffer, Screen, Traffic};
 
 use toyos::ipc;
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::AsHandle;
+use toyos::poller::{Poller, READABLE};
 use toyos::endow::{self, EndowError};
 use toyos::surface;
 use toyos::Connection;
@@ -496,7 +497,7 @@ impl Window {
     ///
     /// **`Close` is the last element of this stream, and it is delivered
     /// exactly once.** Without the latch a closed window is an infinite source
-    /// of it: the compositor drops the connection, the fd is then permanently
+    /// of it: the compositor drops the connection, the handle is then permanently
     /// read-ready at EOF, and every call returns `Some(Event::Close)` again.
     /// A caller that drains until `None` — which is the ordinary shape, and is
     /// what `winit`'s ToyOS backend does — never leaves that loop, so closing
@@ -506,7 +507,7 @@ impl Window {
         if self.closed {
             return None;
         }
-        self.poller.poll_add(&self.conn, IORING_POLL_IN, 0);
+        self.poller.watch(&self.conn, READABLE, 0);
         let mut ready = false;
         self.poller.wait(1, timeout_nanos, |_| ready = true);
         if !ready {
@@ -602,8 +603,8 @@ impl Window {
         let _ = self.conn.send(MSG_PRESENT, &damage);
     }
 
-    pub fn fd(&self) -> toyos_abi::RawHandle {
-        self.conn.fd()
+    pub fn handle(&self) -> toyos_abi::RawHandle {
+        self.conn.as_handle()
     }
 
     pub fn width(&self) -> u32 {

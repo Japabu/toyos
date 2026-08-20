@@ -22,3 +22,10 @@ pub mod waitqs;
 
 /// Ceiling on CPUs the percpu arrays are sized for.
 pub const MAX_CPUS: usize = 8;
+
+/// `shootdown::MAX_CPUS` is a second copy, kept for the reason its own doc
+/// comment gives — `kernel-loom` compiles that file with no `crate::`
+/// reference at all, in every feature state it builds that file under. This
+/// file is never one of the files `kernel-loom` compiles, so it is where the
+/// two constants can be pinned together without a `cfg`.
+const _: () = assert!(MAX_CPUS == crate::shootdown::MAX_CPUS);

@@ -1,6 +1,7 @@
 mod device;
 mod hid;
 mod legacy;
+pub mod usbd;
 mod wait;
 
 use wait::msc;
@@ -8,7 +9,7 @@ use wait::msc;
 /// The driver's whole surface to the rest of the kernel. Everything that waits
 /// lives under [`wait`] — see its own documentation for why that is a module
 /// boundary and not a type.
-pub use wait::boot::{init, PORT_POLL_NS, PORT_SETTLE_CEILING_NS};
+pub use wait::boot::{init, PORT_POLL, PORT_SETTLE_CEILING};
 pub use wait::msc::{storage_flush, storage_read, storage_write};
 
 use alloc::vec::Vec;
@@ -561,8 +562,12 @@ impl TrbRing {
     }
 
     /// Where the controller should resume, with the cycle state it must expect.
+    ///
+    /// A TRB is 16 bytes, so the address is 16-byte aligned and bit 0 is free
+    /// for the cycle state. Parenthesised because `+` and `*` both bind tighter
+    /// than `|`, and this should not need that table to read.
     fn dequeue(&self) -> u64 {
-        self.base_phys + (self.tail as u64) * 16 | (self.cycle as u64)
+        (self.base_phys + (self.tail as u64) * 16) | (self.cycle as u64)
     }
 
     /// Put `trb` on the ring and answer with **where it landed**, which for the
@@ -601,7 +606,11 @@ const PAGE: usize = 0x1000;
 // The pool's fixed head. Everything here is either the controller's own state
 // or enumeration scratch, and there is exactly one of each because enumeration
 // is serial — see `device::init_device`.
+// The whole table is `N * PAGE` and reads as one column of page numbers; the
+// two that reduce are not written differently from the four that do not.
+#[allow(clippy::erasing_op)]
 const OFF_DCBAA: usize     = 0 * PAGE; // (max_slots + 1) * 8, 2 KiB at most
+#[allow(clippy::identity_op)]
 const OFF_CMD_RING: usize  = 1 * PAGE;
 const OFF_ERST: usize      = 2 * PAGE;
 const OFF_EVT_RING: usize  = 3 * PAGE;
@@ -1847,7 +1856,7 @@ static XHCI: Lock<Vec<XhciController>> = Lock::new(Vec::new());
 /// `XHCI`, which is a ticket spinlock and therefore preemption off for its
 /// whole life. Called from a syscall, it makes that syscall's thread the
 /// driver's engine and stops the CPU rescheduling for as long as the bus takes.
-/// `fd::try_read` called it for `Descriptor::{Keyboard, Mouse}` so a read would
+/// The read path called it for the keyboard and mouse claims so a read would
 /// see a report that had just landed; on the T14 that made the compositor's own
 /// mouse read the hot-plug engine and froze the desktop for seconds at a time,
 /// with a live kernel and nothing dropped. A caller that wants fresh input

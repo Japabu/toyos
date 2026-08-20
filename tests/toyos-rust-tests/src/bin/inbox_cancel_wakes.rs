@@ -1,6 +1,6 @@
-//! A cancelled `POLL_ADD` must wake the thread that is waiting for it.
+//! A cancelled `OP_WATCH` must wake the thread that is waiting for it.
 //!
-//! `io_uring::remove_fd` cancels every pending poll on a source that is going
+//! `io_uring::cancel_by_source` cancels every pending poll on a source that is going
 //! away and posts `-NotFound` for each, so the caller knows to look at the
 //! handle again. It posted them into the ring and woke nobody — and nothing
 //! else can end that wait: the poll is gone, so the source's own wake path
@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos_abi::syscall;
 
 const TOKEN: u64 = 7;
@@ -38,13 +38,13 @@ static RETURNED: AtomicBool = AtomicBool::new(false);
 
 fn main() {
     let pipe = syscall::pipe().expect("the pipe the waiter parks on");
-    // The second descriptor. Closing this one is what `remove_fd` acts on,
+    // The second descriptor. Closing this one is what `cancel_by_source` acts on,
     // while `pipe.read` keeps the pipe's reader count above zero.
     let dup = syscall::dup(pipe.read).expect("dup the read end");
 
     let waiter = thread::spawn(move || {
         let poller = Poller::new(4);
-        poller.poll_add_fd(pipe.read, IORING_POLL_IN, TOKEN);
+        poller.watch_raw(pipe.read, READABLE, TOKEN);
         // A non-blocking enter, so the poll is registered in the kernel before
         // anything is closed. Without it the close could reach a ring with
         // nothing pending in it and cancel nothing at all, which is a

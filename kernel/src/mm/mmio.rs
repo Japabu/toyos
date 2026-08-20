@@ -53,7 +53,7 @@ impl Mmio {
     #[inline]
     pub fn write_u8(self, offset: u64, val: u8) {
         self.check(offset, 1);
-        unsafe { write_volatile(self.base.add(offset as usize) as *mut u8, val) }
+        unsafe { write_volatile(self.base.add(offset as usize), val) }
     }
 
     #[inline]

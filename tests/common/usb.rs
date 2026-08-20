@@ -254,6 +254,17 @@ pub fn usb_storage_gate(
     if !log.contains("usb-gate: disk done reads=ok writes=ok refusal=true wr_err=0 healthy=true") {
         return Err(format!("the guest did not report a clean pass\n{log}"));
     }
+    // The caller's own device-time budget, spent before the operation started.
+    // Distinct from `refusal=true`, which is a *device* that cannot serve the
+    // read: this one is the driver declining to issue a command the caller has
+    // run out of time for, and the clean pass asserted above is what says the
+    // disk was left exactly as it was by it. `kernel/src/block.rs`'s
+    // `OPERATION` carries the number and why a device that answers needs one.
+    if !log.contains("usb-gate: read with a spent budget refused=true") {
+        return Err(format!(
+            "the driver issued a command past the caller's budget\n{log}"
+        ));
+    }
     verify(&image, bytes, nonce)?;
     serial::Serial::named("boot console", log.as_str()).must_be_clean()?;
     let _ = std::fs::remove_file(&image);

@@ -507,7 +507,7 @@ struct OpenFile {
 ///
 /// Path identity makes delete-and-recreate produce a *new* `FileId`, because
 /// `delete` drops the name; and it survives a rename, because `rename`
-/// re-keys. What it cannot survive is an fd held across an unlink — see
+/// re-keys. What it cannot survive is a handle held across an unlink — see
 /// [`FileSystem::delete`].
 ///
 /// [`by_name`]: FatFs::by_name
@@ -690,20 +690,21 @@ impl FileSystem for FatFs {
         }
     }
 
-    /// Unlink, and drop the write handle whether or not an fd still holds the
-    /// file.
+    /// Unlink, and drop the write handle whether or not a process still holds
+    /// the file open.
     ///
     /// Unconditionally, unlike the bcachefs adapters, and that is the point.
     /// `remove` below frees the chain and erases the entry, so the cached
     /// `toyos_fat32::File` now names clusters the allocator is free to hand to
     /// the next file — and a later `write_page` through it would put one
     /// process's bytes inside another's. Dropping it turns that into
-    /// `NotFound` from `write_page`, so an fd held across an unlink can no
+    /// `NotFound` from `write_page`, so a handle held across an unlink can no
     /// longer write the file back — and closing it says so in the log rather
     /// than discarding the error. That is the right answer: the file it would
     /// write back does not exist.
     ///
-    /// The read side is not closed here — the `FatBacking` an open fd already
+    /// The read side is not closed here — the `FatBacking` an open handle
+    /// already
     /// holds still names those byte ranges, which is the same live
     /// cross-process leak `issues/isolation/tmpfs-backing-outlives-deletion.md`
     /// records for `/home`. This closes the
@@ -836,7 +837,7 @@ impl FileSystem for FatFs {
 /// same stick and the same image, which is a race and not a defect in anything
 /// downstream of here.
 ///
-/// The asymmetry is the same one `xhci::EMPTY_BUS_NS` is written around, and it
+/// The asymmetry is the same one `xhci::EMPTY_BUS` is written around, and it
 /// is what keeps this free: a machine whose boot volume has already been
 /// resolved — every QEMU boot, every machine that boots off NVMe, and the T14 on
 /// a good boot — leaves after one pass, because `gpt::boot_volume()` answers.
@@ -850,7 +851,7 @@ impl FileSystem for FatFs {
 /// silently — which is what a bare `continue` did, three times over — spends the
 /// one chance anybody has to find out why.
 pub fn probe_boot_disks() {
-    let deadline = crate::clock::nanos_since_boot() + xhci::PORT_SETTLE_CEILING_NS;
+    let deadline = crate::clock::nanos_since_boot() + xhci::PORT_SETTLE_CEILING.nanos();
     let mut probed = 0;
     loop {
         probed = probe_announced(probed);
@@ -867,14 +868,14 @@ pub fn probe_boot_disks() {
             log!(
                 "usb-storage: {probed} disk(s) on this machine and none carries the boot \
                  partition after {} ms of looking — this boot has no /boot and no /log",
-                xhci::PORT_SETTLE_CEILING_NS / 1_000_000
+                xhci::PORT_SETTLE_CEILING.duration().millis()
             );
             return;
         }
         // Paced rather than spun, at the cadence the connect settle already
         // reads port registers on: each pass is one MMIO read per port under
         // the controller lock, and the thing being waited for is physical.
-        let next = crate::clock::nanos_since_boot() + xhci::PORT_POLL_NS;
+        let next = crate::clock::nanos_since_boot() + xhci::PORT_POLL.nanos();
         while crate::clock::nanos_since_boot() < next {
             core::hint::spin_loop();
         }

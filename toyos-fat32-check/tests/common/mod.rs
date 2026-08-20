@@ -107,7 +107,7 @@ pub struct Volume {
 pub fn checksum(name: &[u8; 11]) -> u8 {
     let mut sum: u8 = 0;
     for &c in name {
-        sum = (sum >> 1) | (sum << 7);
+        sum = sum.rotate_right(1);
         sum = sum.wrapping_add(c);
     }
     sum
@@ -246,7 +246,7 @@ impl Volume {
                 }
             }
             let next = self.fat(cluster);
-            assert!(next >= 2 && next < CLUSTERS + 2, "the fixture's directory is full");
+            assert!((2..CLUSTERS + 2).contains(&next), "the fixture's directory is full");
             cluster = next;
         }
     }

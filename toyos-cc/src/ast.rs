@@ -259,6 +259,9 @@ pub enum Expr {
     Assign(AssignOp, Box<Expr>, Box<Expr>),
     Comma(Box<Expr>, Box<Expr>),
     CompoundLiteral(Box<TypeName>, Vec<InitializerItem>),
+    /// GCC's statement expression, `({ ... })`. Named for the construct it is;
+    /// a variant called `Stmt` inside `Expr` would name the opposite of it.
+    #[allow(clippy::enum_variant_names)]
     StmtExpr(Vec<BlockItem>),
     VaArg(Box<Expr>, Box<TypeName>),
     Builtin(String, Vec<Expr>),

@@ -131,16 +131,20 @@ pub const RELEGATED: &[Relegated] = &[
         test: "klogd_hosted",
         ci_ms: 11_805,
         why: Why::Cost,
-        guards: "The kernel-thread machinery: klogd spawns with a process-table row, \
-                 `ps` and the census name it, and a deliberate panic in it halts the \
-                 machine instead of being recovered off a stale `syscall_rip` — the \
-                 nondeterminism §4.3 exists to forbid. Two boots, and the second (the \
-                 `klogd-panic` actuator) is the cost; the spawn half alone is one \
-                 cheap boot, and \
+        guards: "The kernel-thread machinery, now for all three of them: klogd, usbd \
+                 and iod spawn with process-table rows, `ps` and the census name them, \
+                 and a deliberate panic takes the row's own branch instead of being \
+                 decided by a stale `syscall_rip` — a verdict that depended on which \
+                 syscall ran last. Both branches, which is the only way two rows are \
+                 two rows: klogd's panic halts the machine, usbd's kills the thread and \
+                 the machine boots. Three boots, and the two actuator arms \
+                 (`klogd-panic`, `usbd-panic`) are the cost; the spawn half alone is \
+                 one cheap boot, and \
                  issues/build/klogd-hosted-pays-two-boots-for-one-fast-verdict.md \
                  is the split that puts it back in the fast tier. What still runs per \
                  pull request: every boot's console output is klogd's drain, so the \
-                 thread starving or dying is visible in any test that reads a line.",
+                 thread starving or dying is visible in any test that reads a line, and \
+                 `blocked_dump` names all three in the fast tier.",
     },
     Relegated {
         test: "desktop_window_child",
@@ -326,7 +330,7 @@ pub const RELEGATED: &[Relegated] = &[
         ci_ms: 260_607,
         why: Why::Cost,
         guards: "Eight plug-and-pull cycles of a pointer under a compositor holding the \
-                 merged pointer's fd across all of them. The owner froze his desktop this \
+                 merged pointer's handle across all of them. The owner froze his desktop this \
                  way twice, on the fourth cycle's enumeration.",
     },
     Relegated {
@@ -627,6 +631,23 @@ pub const RELEGATED: &[Relegated] = &[
                  an incidental cost, which is why the price straddles the 10,000 ms line run \
                  to run rather than sitting on one side of it: 9,355 ms committed, 10,568 ms \
                  in nightly run 31680778730, 11,073 ms in run 31704997228.",
+    },
+    // 2026-08-19: PR #132's run measured it over the line while PR #125's run,
+    // minutes apart on the same main, measured 4,774 ms — the price is the
+    // partition's, not the code's, and Fast's promise has to hold under every
+    // legal partition.
+    Relegated {
+        test: "c_capture_ignores_daemon_lines",
+        ci_ms: 12_612,
+        why: Why::Cost,
+        guards: "A C program's capture is stripped of other processes' lines before the \
+                 comparison, on the boot config's own list of who may speak, with the \
+                 filter turned off as the control. Its own work is two `echo`s and string \
+                 comparisons — no clock in it — so the price is Sched::Parallel \
+                 co-scheduling: 5,241 ms committed, 12,612 ms in run 32301181725 and \
+                 4,774 ms in run 32301828122 the same evening, straddling the 10,000 ms \
+                 line run to run. The next KVM measurements decide whether it returns to \
+                 Fast.",
     },
 ];
 
