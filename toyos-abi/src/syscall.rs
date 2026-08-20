@@ -92,8 +92,8 @@ pub const SYS_CLOCK_EPOCH: u64 = 75;
 /// operation with the argument the capability model requires — the way
 /// [`SYS_HANDLE_DUP`] is `SYS_DUP` with a rights word. What is retired is
 /// addressing a pipe by a number anyone could guess, not making a duplex
-/// object out of two simplex ends: `std`'s `TcpStream` is one fd, and netd's
-/// data path is two pipes.
+/// object out of two simplex ends: `std`'s `TcpStream` is one endpoint, and
+/// netd's data path is two pipes.
 pub const SYS_CONNECTION_JOIN: u64 = 76;
 pub const SYS_PIPE_MAP: u64 = 77;
 pub const SYS_NIC_RX_POLL: u64 = 78;
@@ -116,8 +116,19 @@ pub const SYS_ACCEPT: u64 = 86;
 /// Arg0: module_id (1-based DTV index). Returns the block's virtual address,
 /// or a `SyscallError` word — see [`tls_alloc_block`].
 pub const SYS_TLS_ALLOC_BLOCK: u64 = 88;
-pub const SYS_IO_URING_SETUP: u64 = 89;
-pub const SYS_IO_URING_ENTER: u64 = 90;
+/// Create an [`inbox`](crate::inbox) and map its rings. See [`inbox_setup`].
+///
+/// **A rename is not a retirement, which is why this is still 89.** These two
+/// were `SYS_IO_URING_SETUP` and `SYS_IO_URING_ENTER` until 2026-08-20. The
+/// rule above — a deleted syscall's number is retired and never reused — is
+/// about a *deleted* call: 89 and 90 are the same two operations with the same
+/// arguments and the same struct layouts, and only the Rust identifier moved.
+/// No number was taken and none was retired, so `RETIRED_ABI_NAMES` in
+/// `src/sourcegate.rs` gains no row for either.
+pub const SYS_INBOX_SETUP: u64 = 89;
+/// Hand queued submissions to the kernel and/or wait for completions. See
+/// [`inbox_submit`]; on the number, see [`SYS_INBOX_SETUP`].
+pub const SYS_INBOX_SUBMIT: u64 = 90;
 pub const SYS_QUERY_MODULES: u64 = 91;
 /// Debug syscall. Arg0 selects the action:
 ///   0 = kernel panic (triggers panic!() in syscall context)
@@ -458,7 +469,7 @@ fn check_unit(val: u64) -> Result<(), SyscallError> {
     check(val).map(|_| ())
 }
 
-/// File type for file descriptors.
+/// File type for file handles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(u64)]
 pub enum FileType {
@@ -565,7 +576,7 @@ impl core::ops::BitOr for MmapFlags {
 
 /// Result of [`pipe`]: the read and write ends.
 #[derive(Debug, Clone, Copy)]
-pub struct PipeFds {
+pub struct PipeEnds {
     pub read: RawHandle,
     pub write: RawHandle,
 }
@@ -639,14 +650,14 @@ fn encode_timeout(timeout: Option<u64>) -> u64 {
     timeout.unwrap_or(u64::MAX)
 }
 
-/// Write bytes to a file descriptor. Returns number of bytes written.
-pub fn write(fd: RawHandle, buf: &[u8]) -> Result<usize, SyscallError> {
-    check(syscall(SYS_WRITE, fd.0 as u64, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
+/// Write bytes to a handle. Returns number of bytes written.
+pub fn write(handle: RawHandle, buf: &[u8]) -> Result<usize, SyscallError> {
+    check(syscall(SYS_WRITE, handle.0 as u64, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
-/// Read bytes from a file descriptor. Returns number of bytes read.
-pub fn read(fd: RawHandle, buf: &mut [u8]) -> Result<usize, SyscallError> {
-    check(syscall(SYS_READ, fd.0 as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
+/// Read bytes from a handle. Returns number of bytes read.
+pub fn read(handle: RawHandle, buf: &mut [u8]) -> Result<usize, SyscallError> {
+    check(syscall(SYS_READ, handle.0 as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
 /// Exit the current thread only. Does not return.
@@ -761,7 +772,7 @@ pub const OBJECT_KINDS: &[&str] = &[
     "Connection",
     "Device",
     "Acceptor",
-    "IoUring",
+    "Inbox",
     "SharedMem",
     "Connector",
     "Namespace",
@@ -781,9 +792,9 @@ pub const OBJECT_KINDS: &[&str] = &[
 /// A packed pair can never be mistaken for an error word: no handle is ever
 /// `0xFFFF_FFFF`, because a slot at `MAX_GENERATION` is retired rather than
 /// reissued, and `SyscallError` occupies only the top 256 values.
-pub fn pipe() -> Result<PipeFds, SyscallError> {
+pub fn pipe() -> Result<PipeEnds, SyscallError> {
     let raw = check(syscall(SYS_PIPE, 0, 0, 0, 0))?;
-    Ok(PipeFds {
+    Ok(PipeEnds {
         read: RawHandle((raw >> 32) as u32),
         write: RawHandle((raw & 0xFFFF_FFFF) as u32),
     })
@@ -874,9 +885,9 @@ pub fn log_read(
     .map(|n| n as usize)
 }
 
-/// Mark file descriptor as the controlling TTY for this process.
-pub fn mark_tty(fd: RawHandle) {
-    syscall(SYS_MARK_TTY, fd.0 as u64, 0, 0, 0);
+/// Mark this handle as the controlling TTY for this process.
+pub fn mark_tty(handle: RawHandle) {
+    syscall(SYS_MARK_TTY, handle.0 as u64, 0, 0, 0);
 }
 
 /// Spawn a new thread with the given entry point, stack pointer, argument, and stack base.
@@ -904,31 +915,31 @@ pub fn open(path: &[u8], flags: OpenFlags) -> Result<RawHandle, SyscallError> {
     check(syscall(SYS_OPEN, path.as_ptr() as u64, path.len() as u64, flags.0, 0)).map(|v| RawHandle(v as u32))
 }
 
-/// Close a file descriptor.
-pub fn close(fd: RawHandle) {
-    syscall(SYS_CLOSE, fd.0 as u64, 0, 0, 0);
+/// Close a handle.
+pub fn close(handle: RawHandle) {
+    syscall(SYS_CLOSE, handle.0 as u64, 0, 0, 0);
 }
 
-/// Seek within a file descriptor. Returns new offset.
-pub fn seek(fd: RawHandle, pos: SeekFrom) -> Result<u64, SyscallError> {
+/// Seek within a file handle. Returns new offset.
+pub fn seek(handle: RawHandle, pos: SeekFrom) -> Result<u64, SyscallError> {
     let (offset, whence) = match pos {
         SeekFrom::Start(n) => (n as i64, 0u64),
         SeekFrom::Current(n) => (n, 1u64),
         SeekFrom::End(n) => (n, 2u64),
     };
-    check(syscall(SYS_SEEK, fd.0 as u64, offset as u64, whence, 0))
+    check(syscall(SYS_SEEK, handle.0 as u64, offset as u64, whence, 0))
 }
 
-/// Get file metadata for a file descriptor.
-pub fn fstat(fd: RawHandle) -> Result<Stat, SyscallError> {
+/// Get file metadata for a file handle.
+pub fn fstat(handle: RawHandle) -> Result<Stat, SyscallError> {
     let mut stat = Stat { file_type: FileType::Unknown, size: 0, mtime: 0 };
-    check_unit(syscall(SYS_FSTAT, fd.0 as u64, &mut stat as *mut Stat as u64, 0, 0))?;
+    check_unit(syscall(SYS_FSTAT, handle.0 as u64, &mut stat as *mut Stat as u64, 0, 0))?;
     Ok(stat)
 }
 
-/// Flush file descriptor to disk.
-pub fn fsync(fd: RawHandle) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_FSYNC, fd.0 as u64, 0, 0, 0))
+/// Flush a file handle to disk.
+pub fn fsync(handle: RawHandle) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_FSYNC, handle.0 as u64, 0, 0, 0))
 }
 
 /// Read directory entries. Returns the number of bytes the listing *needs*.
@@ -1182,36 +1193,36 @@ impl RegWidth {
     }
 }
 
-/// Read one register of the device `fd` claims.
+/// Read one register of the device `handle` claims.
 ///
 /// `offset` is a byte offset inside that device's register window. The kernel
 /// checks it against the device's read allow-list and refuses anything else by
 /// name; there is no way to name an address here and no way to reach a
 /// register the list does not carry.
 pub fn device_reg_read(
-    fd: RawHandle,
+    handle: RawHandle,
     offset: u32,
     width: RegWidth,
 ) -> Result<u32, SyscallError> {
-    check(syscall(SYS_DEVICE_REG_READ, fd.0 as u64, offset as u64, width.bytes(), 0))
+    check(syscall(SYS_DEVICE_REG_READ, handle.0 as u64, offset as u64, width.bytes(), 0))
         .map(|v| v as u32)
 }
 
-/// Write one register of the device `fd` claims.
+/// Write one register of the device `handle` claims.
 ///
 /// The allow-list is positive and per-device: an entry is on it because its
 /// value is not an address and indexes nothing the kernel allocated. A missing
 /// entry costs a driver that cannot bring its stream up and says so, which is
 /// the failure mode a refusal list does not have.
 pub fn device_reg_write(
-    fd: RawHandle,
+    handle: RawHandle,
     offset: u32,
     width: RegWidth,
     value: u32,
 ) -> Result<(), SyscallError> {
     check(syscall(
         SYS_DEVICE_REG_WRITE,
-        fd.0 as u64,
+        handle.0 as u64,
         offset as u64,
         width.bytes(),
         value as u64,
@@ -1548,9 +1559,9 @@ pub unsafe fn futex_wake(addr: *const u32, count: u32) -> u64 {
     syscall(SYS_FUTEX_WAKE, addr as u64, count as u64, 0, 0)
 }
 
-/// Truncate file descriptor to `size` bytes.
-pub fn ftruncate(fd: RawHandle, size: u64) -> Result<(), SyscallError> {
-    check_unit(syscall(SYS_FTRUNCATE, fd.0 as u64, size, 0, 0))
+/// Truncate a file handle to `size` bytes.
+pub fn ftruncate(handle: RawHandle, size: u64) -> Result<(), SyscallError> {
+    check_unit(syscall(SYS_FTRUNCATE, handle.0 as u64, size, 0, 0))
 }
 
 /// Get the current thread's stack base address and size.
@@ -1611,13 +1622,13 @@ pub unsafe fn munmap(addr: *mut u8, size: usize) -> Result<(), SyscallError> {
 }
 
 /// Non-blocking read. Returns bytes read, or `Err(WouldBlock)` if no data available.
-pub fn read_nonblock(fd: RawHandle, buf: &mut [u8]) -> Result<usize, SyscallError> {
-    check(syscall(SYS_READ_NONBLOCK, fd.0 as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
+pub fn read_nonblock(handle: RawHandle, buf: &mut [u8]) -> Result<usize, SyscallError> {
+    check(syscall(SYS_READ_NONBLOCK, handle.0 as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
 /// Non-blocking write. Returns bytes written, or `Err(WouldBlock)` if no space available.
-pub fn write_nonblock(fd: RawHandle, buf: &[u8]) -> Result<usize, SyscallError> {
-    check(syscall(SYS_WRITE_NONBLOCK, fd.0 as u64, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
+pub fn write_nonblock(handle: RawHandle, buf: &[u8]) -> Result<usize, SyscallError> {
+    check(syscall(SYS_WRITE_NONBLOCK, handle.0 as u64, buf.as_ptr() as u64, buf.len() as u64, 0)).map(|n| n as usize)
 }
 
 /// Map a pipe's shared-memory ring buffer into this process's address space.
@@ -1625,8 +1636,8 @@ pub fn write_nonblock(fd: RawHandle, buf: &[u8]) -> Result<usize, SyscallError> 
 ///
 /// The mapping is writable, and the header is a publication: writing it tells
 /// the kernel nothing. Reads and writes still go through `SYS_READ`/`SYS_WRITE`.
-pub fn pipe_map(fd: RawHandle) -> Result<*mut u8, SyscallError> {
-    check(syscall(SYS_PIPE_MAP, fd.0 as u64, 0, 0, 0)).map(|v| v as *mut u8)
+pub fn pipe_map(handle: RawHandle) -> Result<*mut u8, SyscallError> {
+    check(syscall(SYS_PIPE_MAP, handle.0 as u64, 0, 0, 0)).map(|v| v as *mut u8)
 }
 
 /// Poll for a received frame, presenting the NIC claim. Returns
@@ -1666,32 +1677,32 @@ pub fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
     check(syscall(SYS_TLS_ALLOC_BLOCK, module_id, 0, 0, 0))
 }
 
-/// A ring and where its SQ/CQ/SQE page is mapped.
+/// An inbox and where its page of rings is mapped.
 ///
-/// **The ring owns its page and the kernel maps it at setup.** It used to hand
+/// **The inbox owns its page and the kernel maps it at setup.** It used to hand
 /// back a shared-memory token the caller mapped itself, which is the only place
-/// io_uring ever needed shared memory to be a separate thing with a separate
-/// lifetime.
+/// this mechanism ever needed shared memory to be a separate thing with a
+/// separate lifetime.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct IoUringSetup {
+pub struct InboxSetup {
     pub handle: RawHandle,
     pub _pad: u32,
     pub vaddr: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<IoUringSetup>() == 16);
+const _: () = assert!(core::mem::size_of::<InboxSetup>() == 16);
 
-/// Create an io_uring instance with the given queue depth (a power of two, at
-/// most 256), and map its rings.
+/// Create an [`inbox`](crate::inbox) with the given queue depth (a power of
+/// two, at most 256), and map its rings.
 ///
 /// # Safety
 /// Caller must manage the returned pointer; it stops being mapped when the
-/// last handle to the ring closes.
-pub unsafe fn io_uring_setup(depth: u32) -> Result<(RawHandle, *mut u8), SyscallError> {
-    let mut out = IoUringSetup { handle: HANDLE_INVALID, _pad: 0, vaddr: 0 };
+/// last handle to the inbox closes.
+pub unsafe fn inbox_setup(depth: u32) -> Result<(RawHandle, *mut u8), SyscallError> {
+    let mut out = InboxSetup { handle: HANDLE_INVALID, _pad: 0, vaddr: 0 };
     check_unit(syscall(
-        SYS_IO_URING_SETUP,
+        SYS_INBOX_SETUP,
         depth as u64,
         &raw mut out as u64,
         0,
@@ -1700,13 +1711,15 @@ pub unsafe fn io_uring_setup(depth: u32) -> Result<(RawHandle, *mut u8), Syscall
     Ok((out.handle, core::ptr::with_exposed_provenance_mut(out.vaddr as usize)))
 }
 
-/// Submit SQEs and/or wait for completions on an io_uring instance.
-/// `to_submit`: number of SQEs to consume from the SQ ring.
-/// `min_complete`: block until at least this many CQEs are available (0 = don't block).
+/// Hand queued submissions to the kernel and/or wait for completions on an
+/// inbox.
+/// `to_submit`: number of submissions to consume from the submission ring.
+/// `min_complete`: block until at least this many completions are available
+/// (0 = don't block).
 /// `timeout_nanos`: 0 = non-blocking, u64::MAX = block forever, else timeout in nanos.
-/// Returns the number of CQEs available.
-pub fn io_uring_enter(fd: RawHandle, to_submit: u32, min_complete: u32, timeout_nanos: u64) -> Result<u32, SyscallError> {
-    check(syscall(SYS_IO_URING_ENTER, fd.0 as u64, to_submit as u64, min_complete as u64, timeout_nanos))
+/// Returns the number of completions available.
+pub fn inbox_submit(handle: RawHandle, to_submit: u32, min_complete: u32, timeout_nanos: u64) -> Result<u32, SyscallError> {
+    check(syscall(SYS_INBOX_SUBMIT, handle.0 as u64, to_submit as u64, min_complete as u64, timeout_nanos))
         .map(|n| n as u32)
 }
 
