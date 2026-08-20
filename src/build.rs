@@ -116,8 +116,8 @@ struct ProgramConfig {
     /// Device classes init mints a claim for and endows.
     devices: Vec<String>,
     /// Rights on the `SysCap` duplicate init endows this program, by the names
-    /// `toyos_manifest::syscap_rights` takes. Two programs in the whole tree
-    /// declare one.
+    /// `toyos_manifest::syscap_rights` takes. A handful of rows in the whole
+    /// tree declare one.
     syscap: Vec<String>,
 }
 
