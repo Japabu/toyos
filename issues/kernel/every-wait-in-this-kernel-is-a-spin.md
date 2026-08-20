@@ -169,6 +169,13 @@ contain.
   frame *above* the trait, in `UsbBlockDevice`, which works for a value and
   cannot work for the park token.
 
+  **Owner ruling 1B, 2026-08-20: the leaves receive, and a leaf never mints.**
+  `Parkable::of_current` at a leaf is forbidden, and `scheduler::Parkable`'s
+  header claim becomes enforced truth rather than discipline: the frame that
+  owns the operation establishes parkability once, the depth reads the token and
+  the deadline off the running task, and a depth that asks without an
+  establishment above it is a loud refusal. This closes the third wall.
+
 `drain_zero_handles`'s derived constraint — none of its three drain sites can
 park, so no `on_zero_handles` hook may take a sleep lock — is **untouched by
 #148**, because #148 converts no lock. Its ground was checked rather than
