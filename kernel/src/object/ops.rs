@@ -88,7 +88,7 @@ pub fn install(table: &mut HandleTable, object: KObjectRef) -> Result<RawHandle,
 /// Takes the VFS lock itself and gives it up before the object exists, so a
 /// refused install drops the `OpenFileState` — and re-takes the lock in its
 /// `Drop` — without the *VFS* lock held. **Not with nothing held**, which this
-/// used to claim: its one caller runs it inside `with_fd_owner_data`, so the
+/// used to claim: its one caller runs it inside `with_process_data`, so the
 /// process's own lock is still there. What the sequencing buys is that the VFS
 /// lock is not taken twice, and that is all it buys.
 pub fn open(table: &mut HandleTable, path: &str, flags: OpenFlags) -> u64 {
@@ -196,17 +196,17 @@ pub fn close(
         }
     }
     // **The sources this handle really ends, and the type is what decides.**
-    // `remove_fd` cancels by source across every ring in the machine, so a
+    // `cancel_by_source` cancels by source across every ring in the machine, so a
     // source the object does not own takes other processes' polls with it —
     // which is what a `Device(Keyboard)` claim used to do to every terminal
     // read there was, because `Console` names [`Source::Keyboard`] too. It
-    // cannot happen from here any more: `remove_fd` takes only
+    // cannot happen from here any more: `cancel_by_source` takes only
     // `EndedSource`, and `Source::ended_by_its_last_handle` is the one place
     // that can make one.
     let sources = [read_source(&object), write_source(&object)]
         .map(|s| s.and_then(Source::ended_by_its_last_handle));
     if sources.iter().any(|s| s.is_some()) {
-        crate::io_uring::remove_fd(&sources);
+        crate::io_uring::cancel_by_source(&sources);
     }
     Ok(())
 }

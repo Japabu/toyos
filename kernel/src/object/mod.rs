@@ -70,7 +70,7 @@ impl<T: Clone> Held<T> {
 /// A kernel object's identity.
 ///
 /// For diagnostics and for kernel-internal keys — an io_uring watch names the
-/// object it watches by this, because an fd number means nothing in another
+/// object it watches by this, because a handle means nothing in another
 /// process's table. **Never an authority**: no syscall turns a koid into
 /// access to anything.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
