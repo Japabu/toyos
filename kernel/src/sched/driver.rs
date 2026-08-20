@@ -20,6 +20,14 @@
 //! release, no outgoing task to park. That is what park-before-switch buys, and
 //! it is sound only because a wake for the just-parked task is a *message to
 //! this same CPU*, which cannot be consumed before the switch completes.
+//!
+//! **What is *not* done by the time the pass ends is the save.** `switch`'s
+//! last instruction writes the outgoing context's `rsp`, and everything above
+//! it — the `with_cpu` return, `charge_cpu_time`, the publish, CR3, `TSS.rsp0`,
+//! the FS base — runs with that context still holding the stack pointer from
+//! the *previous* time it was switched away, or, for a task that never has
+//! been, `alloc_kernel_stack`'s entry frame. Any CPU that restores it inside
+//! that window lands on a stack this one is standing on.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;

@@ -58,18 +58,45 @@ was **268 of 268 green**, and the kernel source between that run and this one
 differs by a module doc comment and nothing else — no statement compiled
 differently. No `handle fault:` line appears anywhere in the run.
 
-## The family
+## The family it was filed beside, which has since been diagnosed — and this one
+is not yet in it
 
-The same session's first run died differently and is
-`issues/kernel/a-ring-0-fetch-at-zero-inside-sys-read.md`; the zero-address
-sightings before it are
-`issues/kernel/the-shared-boot-jumped-to-null-spawning-sched-stress.md`,
-`issues/kernel/ring0-jump-to-zero-under-port-polls.md` and
-`issues/kernel/a-ring-0-fetch-at-0x1b-during-a-loaded-boot.md`. Two kernel deaths
-in the first three of that session's five runs, both under host contention, both
-`ALONE … GREEN`, and neither of them a verdict any test wrote; the fourth run
-died a third way, and
-`issues/kernel/a-ring-0-fetch-at-0x1b-with-the-stack-pointer-on-a-page-boundary.md`
-carries that one together with the session's table. **Whether they are one defect
-is not decided here** — this one has a corrupted container and a name for it, which is
-the first of the family to carry that much.
+Four sightings of a Ring 0 instruction fetch at a tiny address (`0x1b`, `0x0`)
+were filed alongside this one, all under loaded boots, all `ALONE: GREEN`. They
+were one defect and it is fixed: a CPU could hand the task **whose context it
+was still standing on** to a thief, because a scheduler pass ends before the
+context switch it decided on has run. `SchedPass::answer_steal_requests` in
+`toyos-sched/src/cpu.rs` carries the derivation and
+`a_cpu_does_not_hand_over_the_context_it_is_still_standing_on` is the gate. The
+symptom was `context_switch` popping the residue of a Ring 3 interrupt frame:
+`rbx` ← the saved `CS` (`0x23`), `rbp` ← the saved `RFLAGS`, `popfq` ← the saved
+user `RSP`, and `ret` ← the saved `SS`, which is `0x1b`.
+
+**This sighting is not that, on the evidence it carries.** Every one of the four
+identified itself the same way — `rsi` holding `rsp - 0x40`, which is
+`context_switch`'s own `new_rsp` argument still in the register the ABI put it
+in — and this report has no register dump at all, because it is a Rust panic and
+not a fault. What it has instead is a corrupted container, which none of the
+four had.
+
+Two readings, and nothing here decides between them:
+
+- **Downstream of the same defect.** Two CPUs standing on one kernel stack is
+  unbounded memory corruption: the CPU that resumed a stale frame runs old
+  kernel code with stale locals while the other CPU writes its own save frame
+  into the same stack. A heap object with a length field that stops matching its
+  nodes is inside what that can produce, and this session is exactly the
+  condition the defect needed.
+- **A second defect.** `parked` is per-CPU and reachable only from its own CPU
+  (`CpuSched` is `!Sync`), so nothing about the stack-sharing story reaches
+  *this* map by construction — it would have to arrive as a stray write, which
+  is a claim with no evidence behind it.
+
+**What settles it is recurrence.** The fix removes the only condition either
+reading rests on, so a `sched_stress` red of this shape after it is a second
+defect and the first sighting stops being ambiguous. Until then this stays open.
+
+`issues/kernel/ring0-jump-to-zero-under-port-polls.md` is the family's remaining
+open sighting, for a different reason its own file gives.
+
+Do not close this on green runs.
