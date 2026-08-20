@@ -22,6 +22,8 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
+      # A probe is one guest on the benchmark host, never a competing lane.
+      max-parallel: 1
       matrix:
         rep: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     container:

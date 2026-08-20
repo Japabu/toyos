@@ -28,5 +28,6 @@ jobs:
           test -w /dev/kvm
           uname -a
           cat /etc/os-release
-          nproc
+          test "$(nproc)" = 8
+          grep -Eq '^Cpus_allowed_list:[[:space:]]*0-7$' /proc/self/status
           df -h /

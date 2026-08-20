@@ -38,6 +38,9 @@ jobs:
     timeout-minutes: 180
     strategy:
       fail-fast: false
+      # The T14 is one benchmark host: never overlap its matrix lanes, even if
+      # another runner is later given the `toyos` label.
+      max-parallel: 1
       matrix:
         shard: [1, 2]
     # `--device=/dev/kvm` and root inside the container, exactly as the shards:
