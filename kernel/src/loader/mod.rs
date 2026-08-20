@@ -10,6 +10,15 @@
 //! `SyscallError::{InvalidArgument, ResourceExhausted}` with a log line naming
 //! the path and the field, never a panic and never a silent truncation.
 
+// Every unsafe block under `loader::` carries a `SAFETY:` comment —
+// measured and documented in full by
+// `issues/build/clippy-has-never-run-here.md`'s per-area plan.
+// `host-tests.yml`'s kernel clippy step already runs with `-D warnings`, so
+// `warn` here is what actually gates: a new undocumented block anywhere in
+// this module tree fails CI, while the rest of the kernel (not yet swept)
+// stays silent.
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 mod start;
 mod symbols;
 mod tls;
