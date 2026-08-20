@@ -113,9 +113,93 @@ pub struct LoadedLib {
     pub init_array_size: u64,
     /// Bytes between the image's lowest and highest virtual address.
     pub span: u64,
+    /// The image-relative half-open range every writable `PT_LOAD` of this
+    /// module falls in, and `(span, span)` for a module with none.
+    ///
+    /// **What a page of a mapped library gets its protection from.** Exact,
+    /// unlike the 2 MiB-rounded `rw_offset`/`rw_size` beside it: those size the
+    /// private copy, where rounding outwards costs a page of memory — rounding
+    /// a *protection* outwards costs a writable page of somebody's `.text`.
+    pub rw_lo: u64,
+    pub rw_hi: u64,
 }
 
 impl LoadedLib {
+    /// What the 4 KiB page `offset` bytes into this image may be used for.
+    ///
+    /// Three zones, from the module's own program headers: code below the
+    /// writable window, data inside it, constants above it. A read-only
+    /// non-executable segment placed *below* `.text` by some other linker would
+    /// come out executable here — over-permissive, never writable, and the
+    /// exact segment map is not carried past `load_shared_lib`.
+    fn page_prot(&self, offset: u64) -> crate::mm::paging::Prot {
+        use crate::mm::paging::Prot;
+        if offset < self.rw_lo {
+            Prot::ReadExec
+        } else if offset < self.rw_hi {
+            Prot::ReadWrite
+        } else {
+            Prot::Read
+        }
+    }
+
+    /// Give this module a virtual address in `pt` and map its pages there.
+    ///
+    /// **One pass, one window at a time, and no window is mapped twice.** The
+    /// shape this replaces mapped the whole image writable and then re-mapped
+    /// the private window over the top of it, which meant every library's
+    /// `.text` was writable in every process that loaded it — and, once the
+    /// image was cached, writable in *every* process at the same physical
+    /// pages.
+    ///
+    /// A `Shared` module's private copy starts at a 2 MiB boundary rounded down
+    /// from `rw_lo`, so the window it starts in holds the tail of `.text` as
+    /// well. That window is the split one: its code pages come out `ReadExec`
+    /// over the private copy, which holds a byte-identical copy of them.
+    pub fn map_into(&self, pt: &crate::process::PageTables) -> Option<UserAddr> {
+        use crate::mm::paging::WindowProt;
+
+        let (image_phys, image_size) = match &self.memory {
+            LibMemory::Owned(alloc) => (
+                crate::DirectMap::phys_of(alloc.ptr()),
+                alloc.size() as u64,
+            ),
+            LibMemory::Shared { cached_image, .. } => {
+                (cached_image.phys(), cached_image.size() as u64)
+            }
+        };
+
+        let base = pt
+            .lock()
+            .alloc_region(image_size, crate::vma::RegionKind::Mapped)?;
+
+        let mut offset = 0;
+        while offset < image_size {
+            // Which physical frame backs this window: the cache's shared image,
+            // except where this process has a private writable copy.
+            let phys = match &self.memory {
+                LibMemory::Owned(_) => image_phys + offset,
+                LibMemory::Shared { rw_alloc, rw_offset, .. } => {
+                    let lo = *rw_offset as u64;
+                    if (lo..lo + rw_alloc.size() as u64).contains(&offset) {
+                        crate::DirectMap::phys_of(rw_alloc.ptr()) + (offset - lo)
+                    } else {
+                        image_phys + offset
+                    }
+                }
+            };
+            let mut prot = WindowProt::uniform(crate::mm::paging::Prot::Read);
+            let mut page = 0;
+            while page < PAGE_2M {
+                prot.set(page, self.page_prot(offset + page));
+                page += 4096;
+            }
+            pt.lock().map_window(UserAddr::new(base.raw() + offset), phys, &prot);
+            offset += PAGE_2M;
+        }
+        Some(base)
+    }
+
     /// This module's symbol table, or an empty one when it declares none.
     ///
     /// The slices are kernel pages this `LoadedLib` either owns or shares with
@@ -431,6 +515,8 @@ pub fn load_shared_lib(
             init_array_vaddr: init_array.map_or(0, |t| t.vaddr),
             init_array_size: init_array.map_or(0, |t| t.size),
             span: layout.span(),
+            rw_lo,
+            rw_hi,
         },
         rw_offset,
         rw_size,

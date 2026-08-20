@@ -99,6 +99,8 @@ struct Snapshot {
     init_array_vaddr: u64,
     init_array_size: u64,
     span: u64,
+    rw_lo: u64,
+    rw_hi: u64,
 }
 
 impl Snapshot {
@@ -118,6 +120,8 @@ impl Snapshot {
             init_array_vaddr: lib.init_array_vaddr,
             init_array_size: lib.init_array_size,
             span: lib.span,
+            rw_lo: lib.rw_lo,
+            rw_hi: lib.rw_hi,
         }
     }
 
@@ -146,6 +150,8 @@ impl Snapshot {
             init_array_vaddr: self.init_array_vaddr,
             init_array_size: self.init_array_size,
             span: self.span,
+            rw_lo: self.rw_lo,
+            rw_hi: self.rw_hi,
         }
     }
 }

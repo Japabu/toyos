@@ -24,10 +24,10 @@ use alloc::vec::Vec;
 
 use crate::elf;
 use crate::object::{ops, HandleTable, KObjectRef};
-use crate::mm::paging::CachePolicy;
+use crate::mm::paging::{CachePolicy, Prot};
 use crate::mm::PAGE_2M;
 use crate::process::{
-    vma_map, ElfInfo, Endowments, OwnedAlloc, PageAlloc, PageFaultTrace, PageTables, Pid,
+    ElfInfo, Endowments, OwnedAlloc, PageAlloc, PageFaultTrace, PageTables, Pid,
     ProcessAccounting, ProcessData, ProcessEntry, ThreadData, ThreadEntry, UserStack,
     PROCESS_TABLE,
 };
@@ -161,6 +161,7 @@ fn insert_elf_regions(
         if seg_end == seg_start {
             continue;
         }
+        let prot = segment_prot(seg);
 
         let file_block_start = seg.file_offset / 4096;
         let file_blocks_needed = (seg.filesz + (seg.file_offset % 4096)).div_ceil(4096);
@@ -171,11 +172,11 @@ fn insert_elf_regions(
                 UserAddr::new(seg_start),
                 Region {
                     size: file_backed_end.min(seg_end) - seg_start,
-                    writable: seg.writable(),
                     kind: RegionKind::FileBacked {
                         backing: Arc::clone(backing),
                         file_offset: file_block_start * 4096,
                         file_size: seg.filesz + (seg.file_offset % 4096),
+                        prot,
                     },
                 },
             );
@@ -187,13 +188,32 @@ fn insert_elf_regions(
                 UserAddr::new(anon_start),
                 Region {
                     size: seg_end - anon_start,
-                    writable: seg.writable(),
-                    kind: RegionKind::Anonymous,
+                    kind: RegionKind::Anonymous { prot },
                 },
             );
         }
     }
     Ok(())
+}
+
+/// What one `PT_LOAD` segment's pages may be used for.
+///
+/// **A file that declares itself both writable and executable is refused the
+/// write, not the execution.** `PF_W | PF_X` is a segment no linker in this
+/// tree emits and no correct program needs, and there is no fourth [`Prot`] to
+/// honour it with; taking `X` away instead would turn a hostile ELF into a
+/// process that runs its own data, while taking `W` away leaves it faulting on
+/// the first store. `PF_R` alone — a `.rodata` segment — is the plain
+/// [`Prot::Read`] case, and a segment claiming nothing at all gets it too.
+fn segment_prot(seg: &toyos_elf::Segment) -> crate::mm::paging::Prot {
+    use crate::mm::paging::Prot;
+    if seg.flags.executable() {
+        Prot::ReadExec
+    } else if seg.flags.writable() {
+        Prot::ReadWrite
+    } else {
+        Prot::Read
+    }
 }
 
 /// Everything the executable's `PT_DYNAMIC` names, resolved to file offsets and
@@ -531,11 +551,15 @@ pub fn spawn(
     let user_stack = UserStack::new(stack_vaddr, stack_phys, USER_STACK_SIZE as u64);
     {
         let mut pt = child_pt.lock();
-        pt.map_range(stack_vaddr, stack_pages.phys(), USER_STACK_SIZE as u64, true, CachePolicy::DeferToMtrr);
+        // The stack is data, and `Prot::ReadWrite` is what makes it stop being
+        // a place to jump to: eight megabytes of writable, executable memory at
+        // a fixed address is the shape every stack-smashing payload is written
+        // against.
+        pt.map_range(stack_vaddr, stack_pages.phys(), USER_STACK_SIZE as u64,
+            Prot::ReadWrite, CachePolicy::DeferToMtrr);
         pt.insert_region(stack_vaddr, crate::vma::Region {
             size: USER_STACK_SIZE as u64,
-            writable: true,
-            kind: crate::vma::RegionKind::Anonymous,
+            kind: crate::vma::RegionKind::Anonymous { prot: Prot::ReadWrite },
         });
     }
 
@@ -779,36 +803,20 @@ fn load_needed_libs(exe: &ExeTables, path: &str) -> Result<NeededLibs, SyscallEr
 /// Give every library a virtual address in the child and map its pages there.
 ///
 /// A cached library's read-only pages are the cache's own, mapped into this
-/// process; only its writable window is private.
+/// process; only its writable window is private. Which pages of it may be
+/// written and which may be executed is [`LoadedLib::map_into`]'s, out of the
+/// module's own program headers.
+///
+/// [`LoadedLib::map_into`]: crate::elf::LoadedLib::map_into
 fn map_libs(
     child_pt: &PageTables,
     loaded: &mut NeededLibs,
     path: &str,
 ) -> Result<(), SyscallError> {
     for lib in &mut loaded.libs {
-        let vaddr = match &lib.memory {
-            elf::LibMemory::Owned(alloc) => {
-                let phys = DirectMap::phys_of(alloc.ptr());
-                let Some((vaddr, _)) = vma_map(child_pt, phys, alloc.size() as u64) else {
-                    log!("spawn: {}: out of virtual address space for a library", path);
-                    return Err(SyscallError::ResourceExhausted);
-                };
-                vaddr
-            }
-            elf::LibMemory::Shared { rw_alloc, cached_image, rw_offset, .. } => {
-                let cached_phys = cached_image.phys();
-                let Some((lib_vaddr, _)) = vma_map(child_pt, cached_phys, cached_image.size() as u64)
-                else {
-                    log!("spawn: {}: out of virtual address space for a library", path);
-                    return Err(SyscallError::ResourceExhausted);
-                };
-                let rw_phys = DirectMap::phys_of(rw_alloc.ptr());
-                for i in 0..rw_alloc.size() / PAGE_2M as usize {
-                    let user_virt = lib_vaddr.raw() + *rw_offset as u64 + i as u64 * PAGE_2M;
-                    child_pt.lock().remap(UserAddr::new(user_virt), rw_phys + i as u64 * PAGE_2M, true);
-                }
-                lib_vaddr
-            }
+        let Some(vaddr) = lib.map_into(child_pt) else {
+            log!("spawn: {}: out of virtual address space for a library", path);
+            return Err(SyscallError::ResourceExhausted);
         };
         lib.user_base = vaddr;
     }
