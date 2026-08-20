@@ -1055,19 +1055,21 @@ fn sys_device_reg(handle: RawHandle, offset: u64, width: u64, value: Option<u64>
                 Err(e) => e.to_u64(),
             }
         }
-        Some(value) if value <= u32::MAX as u64 => {
-            let written = match target {
-                RegTarget::Hda => crate::drivers::hda::reg_write(offset, width, value as u32),
-                RegTarget::VirtioSound => {
-                    crate::drivers::virtio_sound::reg_write(offset, width, value as u32)
+        Some(value) => match u32::try_from(value) {
+            Ok(value) => {
+                let written = match target {
+                    RegTarget::Hda => crate::drivers::hda::reg_write(offset, width, value),
+                    RegTarget::VirtioSound => {
+                        crate::drivers::virtio_sound::reg_write(offset, width, value)
+                    }
+                };
+                match written {
+                    Ok(()) => 0,
+                    Err(e) => e.to_u64(),
                 }
-            };
-            match written {
-                Ok(()) => 0,
-                Err(e) => e.to_u64(),
             }
-        }
-        Some(_) => SyscallError::InvalidArgument.to_u64(),
+            Err(_) => SyscallError::InvalidArgument.to_u64(),
+        },
     }
 }
 
@@ -1918,7 +1920,7 @@ fn connect_through(connector: &port::Connector) -> u64 {
     if !watchers.is_empty() {
         crate::io_uring::complete_pending_for_event(
             &watchers,
-            crate::io_uring::Source::Port(port.clone()),
+            crate::io_uring::Source::Port(port),
         );
     }
     h.0 as u64

@@ -446,7 +446,9 @@ impl Parser {
                 Expr::Builtin("__builtin_offsetof".into(), vec![Expr::Ident(type_name), field])
             }
             TokenKind::Builtin(name) => {
-                let name = name.clone();
+                // `self.peek().clone()` (the match scrutinee above) already
+                // made `name` an owned `String` — cloning it again just to
+                // shadow-and-drop the original was a wasted allocation.
                 self.advance();
                 if self.peek() == &TokenKind::LParen {
                     self.advance();

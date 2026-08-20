@@ -133,6 +133,39 @@ impl ExceptionContext<'_> {
 // whatever it happens to call — and it covers uses this rule has not been
 // applied to yet, which chasing call sites would not.
 
+/// What a vector is called in a report.
+///
+/// Read by `crash_report_exception`, which has the frame in front of it, and by
+/// `fatal_exception`, which hands it to `panic::record_fault` before the report
+/// runs — so a `DOUBLE PANIC` names the fault it landed on top of in the same
+/// words the report would have.
+fn vector_name(vector: Vector) -> &'static str {
+    match vector {
+        Vector::DivideError => "divide error",
+        Vector::Debug => "debug",
+        Vector::Breakpoint => "breakpoint",
+        Vector::Overflow => "overflow",
+        Vector::BoundRange => "bound range exceeded",
+        Vector::InvalidOpcode => "invalid opcode",
+        Vector::DeviceNotAvailable => "device not available",
+        Vector::DoubleFault => "double fault",
+        Vector::InvalidTss => "invalid TSS",
+        Vector::SegmentNotPresent => "segment not present",
+        Vector::StackSegment => "stack fault",
+        Vector::GeneralProtection => "general protection fault",
+        Vector::PageFault => "page fault",
+        Vector::X87FloatingPoint => "x87 floating-point exception",
+        Vector::AlignmentCheck => "alignment check",
+        Vector::MachineCheck => "machine check",
+        Vector::SimdFloatingPoint => "SIMD floating-point exception",
+        Vector::Virtualization => "virtualization exception",
+        Vector::ControlProtection => "control protection",
+        // Vectors with a `direct` gate never reach this report: their entries
+        // do not go through `trap_dispatch`.
+        _ => "exception",
+    }
+}
+
 /// Source of a crash — either a hardware exception or a Rust panic.
 pub(crate) enum CrashInfo<'a> {
     Exception(&'a ExceptionContext<'a>),
@@ -172,30 +205,7 @@ fn crash_report_exception(ctx: &ExceptionContext) {
         ("", "")
     };
 
-    let name = match ctx.vector() {
-        Vector::DivideError => "divide error",
-        Vector::Debug => "debug",
-        Vector::Breakpoint => "breakpoint",
-        Vector::Overflow => "overflow",
-        Vector::BoundRange => "bound range exceeded",
-        Vector::InvalidOpcode => "invalid opcode",
-        Vector::DeviceNotAvailable => "device not available",
-        Vector::DoubleFault => "double fault",
-        Vector::InvalidTss => "invalid TSS",
-        Vector::SegmentNotPresent => "segment not present",
-        Vector::StackSegment => "stack fault",
-        Vector::GeneralProtection => "general protection fault",
-        Vector::PageFault => "page fault",
-        Vector::X87FloatingPoint => "x87 floating-point exception",
-        Vector::AlignmentCheck => "alignment check",
-        Vector::MachineCheck => "machine check",
-        Vector::SimdFloatingPoint => "SIMD floating-point exception",
-        Vector::Virtualization => "virtualization exception",
-        Vector::ControlProtection => "control protection",
-        // Vectors with a `direct` gate never reach this report: their entries
-        // do not go through `trap_dispatch`.
-        _ => "exception",
-    };
+    let name = vector_name(ctx.vector());
 
     if theirs {
         match ctx.vector() {
@@ -287,6 +297,12 @@ fn crash_report_exception(ctx: &ExceptionContext) {
 }
 
 fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
+    // Before the first word of the report, which is the state
+    // `panic::record_panic` exists to survive: what the machine says now comes
+    // from the copy the handler took, or it is `DOUBLE PANIC` and nothing else.
+    if crate::actuator::panic_in_report() {
+        panic!("panic-in-report: the crash report panicked before it said anything");
+    }
     alert!("PANIC: {}", info);
 
     log!("  Backtrace:");
@@ -328,6 +344,7 @@ pub(crate) fn recover_or_halt(blame: Blame) -> ! {
         // True user-mode fault — no kernel locks held, safe to use normal exit.
         Blame::Process => {
             percpu::set_fault_state(CpuFaultState::Normal);
+            crate::panic::forget();
             syscall::kill_process(-1);
         }
         // Kernel fault on the thread's behalf — may hold locks, use try_lock path.
@@ -352,6 +369,12 @@ pub(crate) fn try_recover_from_panic() -> ! {
         scheduler::poison_tid(scheduler::TaskId(pid, tid));
     }
     percpu::set_fault_state(CpuFaultState::Normal);
+    // The crash this CPU was in is over, so its captured evidence dies with it
+    // — the same reason `panic_console::discard_capture` is called beside this
+    // on the panic path. Left standing, the next `DOUBLE PANIC` on this CPU
+    // would name a panic the machine survived an hour ago as the crash it had
+    // just landed on top of.
+    crate::panic::forget();
     scheduler::schedule_no_return();
 }
 
@@ -583,6 +606,21 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
     let prev = percpu::swap_fault_state(CpuFaultState::Fatal);
     let recursive = prev == CpuFaultState::Fatal || prev == CpuFaultState::Panic;
 
+    // Before this fault has said one word about itself, because a panic taken
+    // anywhere below — inside `emit`, inside a symbol walk, inside the page
+    // walk — reaches the panic handler with this CPU already `Fatal` and gets
+    // the `DOUBLE PANIC` arm, which can then only report what was captured
+    // here. `panic.rs` owns the argument; the ordering is the whole of it.
+    crate::panic::record_fault(
+        vector_name(ctx.vector()),
+        ctx.frame.rip,
+        ctx.cr2,
+        ctx.frame.error_code,
+    );
+    if crate::actuator::panic_in_report() {
+        panic!("panic-in-report: the crash report panicked before it said anything");
+    }
+
     let tid_raw = percpu::current_tid().map_or(u32::MAX, |t| t.raw());
     if recursive {
         alert!("FAULT rip={:#018x} cr2={:#018x} err={:#018x} cr3={:#018x} rsp={:#018x} tid={} RECURSIVE",
@@ -599,6 +637,7 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
     if recursive {
         if blame != Blame::Kernel {
             percpu::set_fault_state(CpuFaultState::Normal);
+            crate::panic::forget();
             syscall::kill_process(-1);
         }
         apic::halt_all_cpus();

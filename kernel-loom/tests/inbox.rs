@@ -79,7 +79,7 @@ fn a_record_reaches_its_taker_intact() {
         let poster = inbox.clone();
         let p = loom::thread::spawn(move || poster.post(record(7)));
 
-        let taker = inbox.clone();
+        let taker = inbox;
         let t = loom::thread::spawn(move || taker.has_record().then(|| taker.take()).flatten());
 
         let taken = t.join().unwrap();

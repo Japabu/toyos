@@ -69,6 +69,161 @@ Two boundaries the sweep must respect:
   site genuinely cannot lose the word — an ABI string, a wire format — it is
   named in the wave's report rather than silently kept.
 
+## The sweep, counted (2026-08-20)
+
+Nobody had counted. Measured at `0a7470f`, excluding `rust/`, `target/`,
+lockfiles and `tests/testcases/` (third-party C):
+
+| | `rg -wi fd` | wider pattern | `io_?uring` |
+|---|---|---|---|
+| `toyos-abi/src` | 36 / 4f | 42 / 5f | 36 / 5f |
+| `toyos/src` | 115 / 10f | 130 / 11f | 25 / 3f |
+| `kernel` + `kernel-loom` | 36 / 11f | 133 / 19f | 225 / 27f |
+| `userland/libc` (exempt) | 112 / 11f | 208 / 11f | 2 / 1f |
+| `userland` non-libc | 130 / 11f | 203 / 14f | 54 / 11f |
+| `tests/` | 107 / 24f | 156 / 38f | 63 / 14f |
+| `src/` build system | 9 / 4f | 18 / 5f | 9 / 2f |
+| other pure crates | 7 / 2f | 13 / 6f | 7 / 5f |
+| `issues/` + `NOTICE` | 41 / 20f | 71 / 32f | 34 / 15f |
+| **outside `userland/libc`** | **481 / 86f** | 766 / 130f | **453 / 82f** |
+
+**The closing check is weaker than the ruling, and the sweep has to know it.**
+`\bfd\b` matches neither `fd_map`, `ring_fd`, `poll_add_fd`, `PipeFds` nor
+`FDs`, because `_` and a trailing letter are word characters. The wider pattern
+above is
+
+```
+(?i)(^|[^a-zA-Z0-9])fds?([^a-zA-Z0-9]|$)|(?i)(^|[^a-zA-Z0-9_])fds?_|_fds?($|[^a-zA-Z0-9_])|[a-z]Fds?([^a-zA-Z]|$)
+```
+
+and it finds 285 lines the closing check does not. Whichever the wave settles
+on, the last commit states *that* one.
+
+Sites that keep the word, each because it is not this jargon:
+
+- **OVMF firmware files** — `ovmf/*.fd` is a filename extension: `NOTICE` (6),
+  `src/qemu.rs` (2), `tests/common/qemu.rs` (2).
+- **`src/buildlock.rs`** — `flock(fd: i32)` on the *host*, through
+  `std::os::unix::io::AsRawFd`. A genuine POSIX descriptor, 5 sites.
+- **`src/toolchain.rs:2378`** — a rustc diagnostic path,
+  `library/std/src/os/fd/owned.rs`, quoted verbatim.
+- **`toyos-cc/src/codegen/resolve.rs`** — `fd` is a *field declarator*, 4 sites.
+  A different word that greps the same; rename it to `decl` and the check gets
+  quieter for free.
+
+Stale citations to delete rather than rename: `tests/common/volumes.rs` twice
+names `fd::write`, and `kernel/src/mm/alloc.rs`, `toyos-sched/src/cpu.rs`,
+`userland/netd/src/main.rs:1272` and
+`issues/isolation/compositor-and-netd-unbounded-accept.md` each cite `MAX_FDS`
+— a constant of the deleted `kernel/src/fd.rs`, one of them still giving its
+file and its value. The name the kernel refuses by is `MAX_HANDLES`
+(`toyos-abi/src/handle.rs`).
+
+## The ABI half is a four-repository landing, and that is the blocker
+
+**`toyos-abi` and `toyos` are consumed by the fork estate, which is not in this
+repository** — the blind spot
+`issues/build/an-abi-item-only-a-fork-calls-looks-caller-less.md` records for
+*deletions* bites a *rename* identically, and this is the live case:
+
+- **`rust/library/std/src/sys/net/connection/toyos.rs`** — `Japabu/rust`, the
+  submodule. `use toyos::poller::{Poller, IORING_POLL_IN, IORING_POLL_OUT};`,
+  `poller.poll_add_fd(…)` twice, `Pipe::into_fd()` three times, `Pipe::fd()`
+  twice. `rust/library/std/Cargo.toml:106` takes `toyos-abi` and `toyos` **by
+  path into this tree**, so every sysroot build compiles it against the
+  working tree's SDK.
+- **`Japabu/mio@toyos`**, pinned at `e8068c2` by `userland/Cargo.lock:1801` —
+  `src/sys/toyos/selector.rs` does `use toyos_abi::io_uring::*` and names
+  `IoUringSqe`, `IoUringCqe`, `IoUringParams`, `IoUringRingHeader`,
+  `IORING_OP_POLL_ADD`, `IORING_POLL_IN`, `IORING_POLL_OUT`, `SQ_RING_OFF`,
+  `CQ_RING_OFF`, `SQES_OFF`, `syscall::io_uring_setup` and
+  `syscall::io_uring_enter` — 21 uses in one file — plus `Pipe::into_fd()`
+  five times. `userland/sshd` pulls it in through tokio.
+- **`Japabu/socket2@toyos`**, pinned at `b55ee41` by
+  `userland/Cargo.lock:3304` — `src/sys/toyos.rs` uses
+  `toyos::poller::IORING_POLL_IN`/`OUT`, `Poller::poll_add_fd`, `Pipe::fd()`
+  four times and `Pipe::into_fd()`.
+
+So the ABI/SDK half is not one pull request. It is **the three fork repositories
+first, then the monorepo** carrying the submodule bump and the two lockfile
+pins — and a linked worktree cannot do the first of them at all, because
+`git worktree add` leaves `rust/` an empty stub (`src/CLAUDE.md`). Whether that
+sequence is worth its cost is the owner's call, not an agent's.
+
+**He made it on 2026-08-20: go.** The inventory above stands and is what the
+two sections at the end of this file build on, with one correction it earns by
+being re-measured against the whole fork estate rather than the three
+repositories already known to be in it. Six `userland/Cargo.lock` entries
+depend on `toyos`/`toyos-abi` from outside this repository — cpal,
+getrandom ×3, libloading, mio, socket2 — and only mio and socket2 name
+anything the rename touches: getrandom calls `syscall::random`, libloading
+calls `dl_open`/`dl_sym`/`dl_close`, and cpal calls `audio::AudioStream` and
+`futex_wait`/`futex_wake`. The estate therefore costs two fork branches and
+not five, and both are pushed: `Japabu/mio@toyos-inbox` at `c84d7e3` and
+`Japabu/socket2@toyos-inbox` at `19eb798`.
+
+What is *not* blocked, and is the whole majority of the count: everything in
+`kernel/`, `userland/` outside libc, `tests/` and `src/` — 282 of the 481
+`rg -wi fd` hits outside libc — names nothing a fork can see. Parameter names
+inside `toyos-abi`'s wrappers are invisible too (Rust has no named arguments),
+as is `PipeFds`, which no fork spells.
+
+## `inbox` already names two other things in this kernel
+
+`inbox` is not a free word. `completion::Inbox`
+(`kernel/src/completion/inbox.rs`, landed with #91) is a *task's* bounded record
+ring, with `kernel-loom/tests/inbox.rs` and two cargo features
+(`inbox-release-off`, `inbox-signal-as-post`) named after it; and
+`ConnectionEnd`/`PortShared` call their receiving `HandleQueue` an `inbox`
+beside an `outbox` (`kernel/src/object/service.rs`).
+
+The first is convergence rather than collision — this track's own chunk list
+says "**the ring as an inbox**", so the object userland sets up and the record
+ring a waiter owns are meant to become one thing. The rename should therefore
+put the ABI's `Inbox` where that convergence lands and not invent a third
+`Inbox` beside it: `crate::object::inbox` for the object, `completion::inbox`
+for the waiter's ring, each header naming the other. The connection's
+`inbox`/`outbox` are the common noun and stay.
+
+Left open for the same reason the fork blocker leaves it open: whether `SQ`,
+`CQ` and `SQE` go with `io_uring`. They are Linux's acronyms for a submission
+and a completion queue, which is what the structure honestly is; the ruling
+names the string `iouring` and not these.
+
+**Ruled 2026-08-20: rename.** They go, and what replaces them is the thing the
+paragraph above already says they honestly are, spelled out — submission ring,
+completion ring, submission entry. The words are in the table below, and this
+section's recommendation is what that table adopts: the ABI's inbox goes to
+`crate::object::inbox` and the waiter's ring stays `completion::inbox`, which
+is also why the SDK's `Poller` keeps its name rather than becoming a third
+`Inbox` in userland.
+
+## The order the blocker forces
+
+"An ABI change lands on its own pull request first" is the rule, and here the
+ABI change cannot be attempted at all until the owner decides on the fork
+sequence. So the wave inverts: the monorepo-local half — `kernel/`, `userland/`
+outside libc, `tests/`, `src/` — touches no ABI, is not the ABI PR riding along
+with unrelated work, and lands whenever. What it may not do is rename anything
+that would read as half-done beside an unrenamed ABI: `abuse_io_uring` and
+`io_uring_cancel_wakes` keep their registered names until the ABI moves.
+
+Registered names this wave changes, priced once because each costs the
+`UNMEASURED` round-trip (`tests/CLAUDE.md`): `fd_lifetime` and `abuse_fd_table`
+now — `fd_lifetime` also carries `/bin/test_rs_fd_lifetime`, a service named
+`fd-lifetime-service`, `/tmp/fd-lifetime.txt`, `/home/fd-lifetime-killed.txt`,
+a row in `tests/test-durations` and **three** `src/redlist.rs` entries —
+and `abuse_io_uring` and `io_uring_cancel_wakes` with the ABI half. Four names,
+two of them deferred.
+
+**The deferred two move once more, by one PR.** "With the ABI half" is right
+about the order and wrong about the vehicle: an `UNMEASURED` round-trip inside
+the finale would spend a CI cycle of the one landing that holds the machine's
+sysroot still. So they ride the tree-local PR that follows it — the same PR
+that renames the kernel's internal `io_uring` vocabulary — where a red is about
+a name and not about a sysroot. Order unchanged; cost moved off the critical
+window.
+
 ## PR-A: the naming table
 
 Every name below is derived from a word the tree already uses, not invented.
@@ -203,9 +358,9 @@ pin bump.
    an ABI whose consumers are pinned to the old names compiles nowhere:
    - `toyos-abi` and `toyos` renamed per the table;
    - every forced call site in `kernel/`, `userland/`, `tests/` and `src/` —
-     as of `72e1635`, 83 `IORING_POLL_*`, 34 `poll_add_fd`, 7 `into_fd()` and
-     132 `.fd()` occurrences outside `userland/libc`, of which the 62 in
-     `toyos/src` are the SDK's own;
+     measured on this branch's merge with `edf8d69`, 83 `IORING_POLL_*`, 34
+     `poll_add_fd`, 7 `into_fd()` and 132 `.fd()` occurrences outside
+     `userland/libc`, of which the 62 in `toyos/src` are the SDK's own;
    - `src/sourcegate.rs`'s citation of `toyos-abi/src/io_uring.rs`;
    - the `rust` submodule gitlink, bumped onto a `Japabu/rust` commit carrying
      the std edits;

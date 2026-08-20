@@ -56,6 +56,10 @@ const _: () = {
 
 impl HdaInfo {
     pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `self` is a valid `&Self` (non-null, aligned, readable for
+        // `size_of::<Self>()` bytes), and the const assert above proves the
+        // `repr(C)` layout has no padding, so every byte the slice exposes is
+        // an initialized field, not a gap.
         unsafe {
             core::slice::from_raw_parts(
                 self as *const Self as *const u8,
