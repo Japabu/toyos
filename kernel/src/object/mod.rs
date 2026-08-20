@@ -14,6 +14,13 @@
 //! lifecycle event rides `handle_count`, which process teardown drains on the
 //! killer's CPU. The stranded `Arc` leaks memory: bounded, visible in the
 //! [`census`], and unable to delay a semantic event.
+//!
+//! **The count is drained on the killer's CPU; the event is not published
+//! there.** What a peer sees is the `on_zero_handles` hook, and that runs from
+//! [`ZERO_QUEUE`] on whichever CPU drains next — so a kill can return with the
+//! victim's read end still held and the peer's next write accepted. Measured,
+//! and the reason nothing may read "the count reached zero" as "the peer has
+//! been told": `issues/kernel/deferred-release-outlives-its-syscall.md`.
 
 // Every unsafe block under `object::` carries a `SAFETY:` comment —
 // measured and documented in full by
@@ -361,10 +368,14 @@ pub(crate) fn enqueue_zero_handles(object: KObjectRef) {
 /// syscall then reaches its own drain site, is told there is nothing to do, and
 /// **returns to userland with its objects still unreleased**. Measured from
 /// userland as a 2 MiB staircase in `SYS_SYSINFO` across consecutive calls
-/// after a kill, which is one ring page at a time on the other CPU. Nothing is
-/// lost — a killed process's pages do all come back, sub-millisecond — but
-/// nothing may be written that assumes a release has happened because the call
-/// that caused it has returned. `issues/kernel/deferred-release-outlives-its-syscall.md`
+/// after a kill, which is one ring page at a time on the other CPU — and, since
+/// 2026-08-20, as a syscall answering the wrong word: `kill_while_blocked` sees
+/// a write to a killed peer's pipe or connection return `Ok(n)` where the ABI
+/// says `NotFound`, because the peer's `on_zero_handles` had not run yet.
+/// Memory is not lost — a killed process's pages do all come back,
+/// sub-millisecond — but a semantic event can be, so nothing may be written
+/// that assumes a release has happened because the call that caused it has
+/// returned. `issues/kernel/deferred-release-outlives-its-syscall.md`
 /// carries the measurement and the two shapes a fix could take; the release
 /// protocol itself belongs to the track in
 /// `issues/kernel/every-wait-in-this-kernel-is-a-spin.md`, whose sleep lock is
