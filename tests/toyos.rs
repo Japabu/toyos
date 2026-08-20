@@ -11810,7 +11810,9 @@ fn suspend_invalidates_a_verdict() -> Result<(), String> {
     let awake = Duration::ZERO;
     // Under the threshold on purpose: two clock reads jitter against each other
     // by microseconds, and a run must not be thrown away for that.
-    let jitter = common::clock::SUSPENDED_AT_LEAST - Duration::from_millis(1);
+    let jitter = common::clock::SUSPENDED_AT_LEAST
+        .checked_sub(Duration::from_millis(1))
+        .expect("SUSPENDED_AT_LEAST must be at least 1ms for this case to mean anything");
     let cases: [(&str, Option<&str>, Duration, Verdict); 6] = [
         ("a pass on a host that stayed up", None, awake, Verdict::Pass(None)),
         ("a fail on a host that stayed up", Some("the guest said no"), awake, Verdict::Fail(None)),
