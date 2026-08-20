@@ -40,7 +40,7 @@ impl SharedMemory {
     /// negotiated.
     pub fn adopt(handle: RawHandle, size: usize) -> Result<Self, SyscallError> {
         let handle = OwnedHandle(handle);
-        let ptr = unsafe { syscall::shm_map(handle.fd()) }?;
+        let ptr = unsafe { syscall::shm_map(handle.raw()) }?;
         assert!(!ptr.is_null(), "shm_map answered null");
         Ok(Self { handle, ptr, size })
     }
@@ -50,7 +50,7 @@ impl SharedMemory {
     /// The send *moves* what it is given, so a sender that wants to keep the
     /// region duplicates first — which is the same rule spawn endowment has.
     pub fn share(&self) -> Result<RawHandle, SyscallError> {
-        syscall::dup(self.handle.fd())
+        syscall::dup(self.handle.raw())
     }
 
     pub fn as_ptr(&self) -> *mut u8 {
@@ -76,6 +76,6 @@ impl SharedMemory {
 
 impl AsHandle for SharedMemory {
     fn as_handle(&self) -> RawHandle {
-        self.handle.fd()
+        self.handle.raw()
     }
 }

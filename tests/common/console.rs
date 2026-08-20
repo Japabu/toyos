@@ -645,7 +645,7 @@ pub fn c_capture_ignores_daemon_lines(
 /// cancel.
 ///
 /// **`Source::Keyboard` is named by two kinds of object and only one of them
-/// can end it.** `io_uring::remove_fd` cancels by source across every ring in
+/// can end it.** `io_uring::cancel_by_source` cancels by source across every ring in
 /// the machine, and `object::ops::close` used to decide whether to call it by
 /// asking the object: `Device(_)` answered yes, on the argument that a claim
 /// admits exactly one handle so every ring watching it is the one holder's. The

@@ -249,7 +249,7 @@ fn selftest() {
     // capability registers occupy the first few, so no list starts at zero.
     fn windowed(cells: &[u32; 16]) -> impl Fn(u64) -> Option<u32> + '_ {
         move |offset: u64| -> Option<u32> {
-            if offset % 4 != 0 || offset.checked_add(4)? > WINDOW {
+            if !offset.is_multiple_of(4) || offset.checked_add(4)? > WINDOW {
                 return None;
             }
             Some(cells[(offset / 4) as usize])

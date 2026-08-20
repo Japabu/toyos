@@ -79,12 +79,37 @@ jobs:
       # Inside `host`, which is required today, a clippy finding blocks a merge
       # today.
       #
-      # Three invocations because there are three resolutions, not because there
-      # are three opinions. The lint set is default clippy everywhere: no
-      # `pedantic`, no `nursery`, no `restriction`. Those are adopted one lint at
-      # a time with each one's finding count measured first
-      # (`issues/build/clippy-has-never-run-here.md` records why, and that
-      # `pedantic` + `nursery` alone was 1,684 findings on the kernel).
+      # Three trees, five invocations — the kernel runs twice and `toyos-abi`
+      # once more, both explained below; neither is a second opinion. The lint
+      # set is default clippy everywhere, plus a short, individually-adopted list from
+      # `pedantic`/`nursery` — never the groups themselves, and never
+      # `restriction` as a group.
+      # `issues/build/clippy-has-never-run-here.md` carries the full ledger:
+      # every `pedantic`/`nursery` lint measured, each adoption or rejection
+      # with its count and reason (`pedantic` + `nursery` together were 1,684
+      # findings on the kernel alone — almost all of it stayed rejected).
+      # Adopted so far, each earning its place on a *measured* finding, not a
+      # guess: `checked_conversions`, `default_trait_access`, `manual_midpoint`,
+      # `redundant_clone`, `unchecked_time_subtraction`, `unnecessary_semicolon`.
+      #
+      # **The kernel's default feature set is not what any guest boots.** Every
+      # guest the harness boots is built with `boot-actuators`, and several
+      # configs add `test-actuators`, so a clippy pass over the default set
+      # alone never sees the code behind either `cfg` — six findings, in six
+      # files, went unlinted this way until
+      # `issues/build/kernel-clippy-runs-without-the-actuator-features.md`
+      # measured it. The fix is a second kernel invocation naming both
+      # features, in the same step rather than a new job, for the reason
+      # above. `boot-actuators,test-actuators` is the whole of what default
+      # clippy was missing: `kernel/Cargo.toml` declares twelve more features
+      # and no kernel build may ever enable any of them — `loom` and the eight
+      # other `kernel-loom` model controls, `debug-wait`, `sched-check` and
+      # `fpu-save-nothing` — so `cargo test --lib`, `kernel-loom`'s own suites
+      # and `--debug` already close that set, and this gate has no business in
+      # it. Measured against a warm kernel target (`cargo clean -p kernel`,
+      # then both invocations back to back, 2026-08-20): the added invocation
+      # costs about **1.6 s** more — the same tree, checked twice, not a
+      # second target directory.
       #
       # `rustup run stable` on all three, and no ToyOS toolchain: the kernel's
       # `x86_64-unknown-none` and the bootloader's `x86_64-unknown-uefi` are
@@ -94,7 +119,12 @@ jobs:
       #
       # **Userland is not here, and cannot be yet**: `x86_64-unknown-toyos` is a
       # custom target, so linting `userland/` needs the fork's clippy and the
-      # bootstrapped sysroot this job deliberately does not wait for.
+      # bootstrapped sysroot this job deliberately does not wait for. The fork's
+      # `toyos` toolchain has no `cargo-clippy` component at all today — a
+      # custom `rustup toolchain link` target can't `rustup component add` one,
+      # it would need building from `rust/` by hand — so userland's
+      # `undocumented_unsafe_blocks` count is still unmeasured, not measured
+      # and deferred (`issues/build/clippy-has-never-run-here.md`).
       #
       # `--all-targets` on the workspace and *not* on the other two: it is what
       # reaches `tests/`, `examples/` and every crate's test targets, and on the
@@ -112,6 +142,17 @@ jobs:
       # directory: `cd kernel` is what applies that file's `-Dwarnings`, and the
       # `-- -D warnings` here is deliberately the same wall said twice.
       #
+      # `undocumented_unsafe_blocks` (a `restriction` lint, cherry-picked, never
+      # the group) is adopted per area as each area's justifications land — the
+      # plan `issues/build/clippy-has-never-run-here.md` records. The bootloader
+      # (10 blocks) is documented and gated below, inline. `toyos-abi` (19
+      # blocks) is documented too, but gated as its own `-p` invocation rather
+      # than folded into the workspace one: the workspace command lints every
+      # other host-workspace crate as well, and none of *those* unsafe blocks
+      # has been reviewed, so enabling the lint there would silently gate crates
+      # nobody has looked at. The kernel (373 blocks) is measured, not gated —
+      # not tractable in one pass, and recorded as follow-up in the same issue.
+      #
       # Measured on the dev host with three fresh `CARGO_TARGET_DIR`s and a warm
       # cargo registry: **19.2 s** for the workspace (139 crates checked),
       # **2.2 s** for the kernel (19), **3.7 s** for the bootloader (20) — 25 s
@@ -123,14 +164,22 @@ jobs:
           set -e -o pipefail
           rustup component add clippy
           rustup target add x86_64-unknown-none x86_64-unknown-uefi
+          ADOPTED="-W clippy::checked_conversions -W clippy::default_trait_access -W clippy::manual_midpoint -W clippy::redundant_clone -W clippy::unchecked_time_subtraction -W clippy::unnecessary_semicolon"
           echo "=== clippy: host workspace" | tee -a /tmp/host.log
-          cargo clippy --workspace --all-targets --keep-going -- -D warnings 2>&1 \
+          cargo clippy --workspace --all-targets --keep-going -- $ADOPTED -D warnings 2>&1 \
             | tee -a /tmp/host.log
           echo "=== clippy: kernel (x86_64-unknown-none)" | tee -a /tmp/host.log
-          (cd kernel && cargo clippy --target x86_64-unknown-none -- -D warnings) 2>&1 \
+          (cd kernel && cargo clippy --target x86_64-unknown-none -- $ADOPTED -D warnings) 2>&1 \
+            | tee -a /tmp/host.log
+          echo "=== clippy: kernel (x86_64-unknown-none, boot-actuators+test-actuators)" | tee -a /tmp/host.log
+          (cd kernel && cargo clippy --target x86_64-unknown-none \
+            --features boot-actuators,test-actuators -- $ADOPTED -D warnings) 2>&1 \
             | tee -a /tmp/host.log
           echo "=== clippy: bootloader (x86_64-unknown-uefi)" | tee -a /tmp/host.log
-          (cd bootloader && cargo clippy --target x86_64-unknown-uefi -- -D warnings) 2>&1 \
+          (cd bootloader && cargo clippy --target x86_64-unknown-uefi -- $ADOPTED -W clippy::undocumented_unsafe_blocks -D warnings) 2>&1 \
+            | tee -a /tmp/host.log
+          echo "=== clippy: toyos-abi unsafe blocks" | tee -a /tmp/host.log
+          cargo clippy -p toyos-abi --all-targets --keep-going -- -W clippy::undocumented_unsafe_blocks -D warnings 2>&1 \
             | tee -a /tmp/host.log
 
       # The build system's own gates: the two lock scopes, the landing

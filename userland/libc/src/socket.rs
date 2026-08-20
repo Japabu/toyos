@@ -219,8 +219,8 @@ pub unsafe extern "C" fn connect(fd: i32, addr: *const Sockaddr, addrlen: Sockle
             entry.remote_addr = ip;
             entry.remote_port = port;
             entry.connected = true;
-            entry.rx_fd = conn.rx.into_fd().0 as i32;
-            entry.tx_fd = conn.tx.into_fd().0 as i32;
+            entry.rx_fd = conn.rx.into_raw().0 as i32;
+            entry.tx_fd = conn.tx.into_raw().0 as i32;
             0
         }
         SocketKind::Udp => {
@@ -256,7 +256,7 @@ pub unsafe extern "C" fn bind(fd: i32, addr: *const Sockaddr, addrlen: SocklenT)
             entry.netd_id = bound.socket_id.0;
             entry.local_port = bound.bound_port;
             entry.bound = true;
-            entry.notify_fd = bound.notify.into_fd().0 as i32;
+            entry.notify_fd = bound.notify.into_raw().0 as i32;
             0
         }
         SocketKind::Udp => {
@@ -267,8 +267,8 @@ pub unsafe extern "C" fn bind(fd: i32, addr: *const Sockaddr, addrlen: SocklenT)
             entry.netd_id = bound.socket_id.0;
             entry.local_port = bound.bound_port;
             entry.bound = true;
-            entry.tx_fd = bound.tx.into_fd().0 as i32;
-            entry.rx_fd = bound.rx.into_fd().0 as i32;
+            entry.tx_fd = bound.tx.into_raw().0 as i32;
+            entry.rx_fd = bound.rx.into_raw().0 as i32;
             0
         }
     }
@@ -318,8 +318,8 @@ pub unsafe extern "C" fn accept(
         local_port: accepted.local_port,
         remote_addr: accepted.remote_addr,
         remote_port: accepted.remote_port,
-        rx_fd: accepted.rx.into_fd().0 as i32,
-        tx_fd: accepted.tx.into_fd().0 as i32,
+        rx_fd: accepted.rx.into_raw().0 as i32,
+        tx_fd: accepted.tx.into_raw().0 as i32,
         notify_fd: 0,
     };
     let new_fd = alloc_socket(new_entry);

@@ -33,11 +33,9 @@ pub(crate) fn read_info<T: Copy>(dev: &Device) -> Result<T, SyscallError> {
 pub struct Keyboard(pub(crate) Device);
 
 impl Keyboard {
-    pub fn fd(&self) -> RawHandle { self.0.fd() }
-
     /// Non-blocking read of pending key events; empty surfaces as `Err(WouldBlock)`.
     ///
-    /// Event loops must only ever read this fd non-blocking. The kernel wakes
+    /// Event loops must only ever read this handle non-blocking. The kernel wakes
     /// keyboard watchers only when a report queued an event, so readiness and
     /// "there is data" agree today — but a blocking read that loses the race
     /// with another reader parks the caller until the next real key, and an
@@ -48,14 +46,12 @@ impl Keyboard {
 }
 
 impl AsHandle for Keyboard {
-    fn as_handle(&self) -> RawHandle { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.as_handle() }
 }
 
 pub struct Mouse(pub(crate) Device);
 
 impl Mouse {
-    pub fn fd(&self) -> RawHandle { self.0.fd() }
-
     /// Non-blocking read of pending mouse events; empty surfaces as `Err(WouldBlock)`.
     ///
     /// Same rationale as [`Keyboard::read_nonblock`]: an event loop that can
@@ -66,7 +62,7 @@ impl Mouse {
 }
 
 impl AsHandle for Mouse {
-    fn as_handle(&self) -> RawHandle { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.as_handle() }
 }
 
 pub struct FramebufferDev(pub(crate) Device);
@@ -78,37 +74,35 @@ impl FramebufferDev {
 }
 
 impl AsHandle for FramebufferDev {
-    fn as_handle(&self) -> RawHandle { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.as_handle() }
 }
 
 pub struct Nic(pub(crate) Device);
 
 impl Nic {
-    pub fn fd(&self) -> RawHandle { self.0.fd() }
-
     pub fn info(&self) -> Result<toyos_abi::net::NicInfo, SyscallError> {
         read_info(&self.0)
     }
 
     /// The next received frame as `(buf_index << 16) | frame_len`, or 0.
     pub fn rx_poll(&self) -> Result<u64, SyscallError> {
-        syscall::nic_rx_poll(self.0.fd())
+        syscall::nic_rx_poll(self.0.as_handle())
     }
 
     /// Give buffer `buf_index` back to the RX ring. A dropped refill costs an
     /// RX slot permanently: 256 of them and the NIC stops receiving.
     pub fn rx_done(&self, buf_index: u64) -> Result<(), SyscallError> {
-        syscall::nic_rx_done(self.0.fd(), buf_index)
+        syscall::nic_rx_done(self.0.as_handle(), buf_index)
     }
 
     /// Submit the TX DMA buffer. `total_len` includes the net header.
     pub fn tx(&self, total_len: u64) -> Result<(), SyscallError> {
-        syscall::nic_tx(self.0.fd(), total_len)
+        syscall::nic_tx(self.0.as_handle(), total_len)
     }
 }
 
 impl AsHandle for Nic {
-    fn as_handle(&self) -> RawHandle { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.as_handle() }
 }
 
 /// A virtio-sound device the kernel brought up and drives no policy on.
@@ -148,12 +142,12 @@ impl VirtioSoundDev {
     /// Ring one queue's doorbell. `offset` is one of the three the info struct
     /// reports and nothing else is on the kernel's allow-list.
     pub fn notify(&self, offset: u32, queue: u16) -> Result<(), SyscallError> {
-        syscall::device_reg_write(self.0.fd(), offset, syscall::RegWidth::U16, queue as u32)
+        syscall::device_reg_write(self.0.as_handle(), offset, syscall::RegWidth::U16, queue as u32)
     }
 }
 
 impl AsHandle for VirtioSoundDev {
-    fn as_handle(&self) -> RawHandle { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.as_handle() }
 }
 
 /// An Intel HDA controller the kernel brought up and drives no policy on.
@@ -200,7 +194,7 @@ impl HdaDev {
         offset: u32,
         width: toyos_abi::syscall::RegWidth,
     ) -> Result<u32, SyscallError> {
-        syscall::device_reg_read(self.0.fd(), offset, width)
+        syscall::device_reg_read(self.0.as_handle(), offset, width)
     }
 
     pub fn reg_write(
@@ -209,10 +203,10 @@ impl HdaDev {
         width: toyos_abi::syscall::RegWidth,
         value: u32,
     ) -> Result<(), SyscallError> {
-        syscall::device_reg_write(self.0.fd(), offset, width, value)
+        syscall::device_reg_write(self.0.as_handle(), offset, width, value)
     }
 }
 
 impl AsHandle for HdaDev {
-    fn as_handle(&self) -> RawHandle { self.0.fd() }
+    fn as_handle(&self) -> RawHandle { self.0.as_handle() }
 }

@@ -4,8 +4,8 @@ use core::sync::atomic::AtomicU32;
 
 /// One batch of DMA buffer completions, recorded at interrupt time.
 ///
-/// Reads on a sound device's fd (after the initial info read) return an array
-/// of these: the kernel writes as many pending records as fit in the caller's
+/// Reads on a sound device's handle (after the initial info read) return an
+/// array of these: the kernel writes as many pending records as fit in the caller's
 /// buffer and returns the byte count. `mask` bit N set means period N finished
 /// playing, and `timestamp_nanos` is `nanos_since_boot` captured in the
 /// interrupt handler — the clock source for soundd's DLL, and the reason the

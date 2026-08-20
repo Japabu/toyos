@@ -146,8 +146,8 @@ fn data_path() -> [RawHandle; DATA_HANDLES] {
     let (from_client_read, from_client_write) =
         toyos::pipe_pair().expect("the pipe netd reads from");
     let mut handles = [toyos_abi::HANDLE_INVALID; DATA_HANDLES];
-    handles[DATA_TO_CLIENT] = to_client_write.into_fd();
-    handles[DATA_FROM_CLIENT] = from_client_read.into_fd();
+    handles[DATA_TO_CLIENT] = to_client_write.into_raw();
+    handles[DATA_FROM_CLIENT] = from_client_read.into_raw();
     drop(to_client_read);
     drop(from_client_write);
     handles

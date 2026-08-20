@@ -6,7 +6,7 @@
 //! the compositor read and wrote its clients with blocking calls. The one
 //! written up in `issues/isolation/` is the second case here: a client
 //! that connects and sends four bytes, met by `ipc::recv_header` on a freshly
-//! accepted fd.
+//! accepted connection.
 //!
 //! Each case sets its stall up and leaves it standing, then asks the
 //! compositor a question **with a deadline**. That is the shape the assertion
@@ -20,6 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use toyos::endow;
+use toyos::AsHandle;
 use toyos::{ipc, Connection};
 use toyos_abi::syscall::{self, SyscallError};
 use window::Window;
@@ -59,8 +60,8 @@ const REQUESTS: usize = 140_000;
 const REFUSAL_POLLS: u32 = 1_500;
 
 fn main() {
-    // Held to the end of the run: a dropped `Connection` closes the fd, and a
-    // closed fd is a peer that hung up rather than one that went quiet.
+    // Held to the end of the run: a dropped `Connection` closes the handle, and
+    // a closed handle is a peer that hung up rather than one that went quiet.
     let mut held: Vec<Connection> = Vec::new();
 
     held.push(connect("connected and silent"));
@@ -86,8 +87,8 @@ fn main() {
     // stall is on an established connection rather than a fresh one, which is
     // the sibling of the accept-path defect and had the same cure.
     let stuck = Window::create(64, 64).expect("a window to stall mid-message with");
-    write_raw_fd(stuck.fd(), &header(window::MSG_CLIPBOARD_SET, 116), "window mid-message");
-    write_raw_fd(stuck.fd(), &[b'x'; 8], "window mid-message");
+    write_handle(stuck.handle(), &header(window::MSG_CLIPBOARD_SET, 116), "window mid-message");
+    write_handle(stuck.handle(), &[b'x'; 8], "window mid-message");
     probe("window stopped mid-message");
 
     // A window that asks faster than it reads. The compositor's answer has to
@@ -98,7 +99,7 @@ fn main() {
     for _ in 0..REQUESTS {
         requests.extend_from_slice(&header(window::MSG_GET_RESOLUTION, 0));
     }
-    write_raw_fd(deaf.fd(), &requests, "window that will not read");
+    write_handle(deaf.handle(), &requests, "window that will not read");
     await_refusal(&deaf);
     probe("window that will not read");
 
@@ -107,7 +108,7 @@ fn main() {
     // ends only when nothing is ready never reaches the screen. The assertion
     // is the host's: frames, between these two markers.
     let noisy = Window::create(64, 64).expect("a window to stream from");
-    let fd = noisy.fd();
+    let handle = noisy.handle();
     println!("compositor stall: stream start");
     let streamer = thread::spawn(move || {
         let frame = header(UNKNOWN_MSG, 0);
@@ -121,7 +122,7 @@ fn main() {
             // Never a torn frame: both ends move this ring in multiples of
             // eight bytes and its capacity is one too, so a write of a header
             // either fits whole or finds no room at all.
-            while matches!(syscall::write_nonblock(fd, &frame), Ok(8)) {}
+            while matches!(syscall::write_nonblock(handle, &frame), Ok(8)) {}
             if Instant::now() >= until {
                 break;
             }
@@ -148,15 +149,15 @@ fn connect(what: &str) -> Connection {
 }
 
 fn write_raw(conn: &Connection, bytes: &[u8], what: &str) {
-    write_raw_fd(conn.fd(), bytes, what);
+    write_handle(conn.as_handle(), bytes, what);
 }
 
 /// Every write here fits in the pipe it goes into, so a blocking `write` can
 /// only be the compositor's problem, never this binary's.
-fn write_raw_fd(fd: toyos_abi::RawHandle, bytes: &[u8], what: &str) {
+fn write_handle(handle: toyos_abi::RawHandle, bytes: &[u8], what: &str) {
     let mut offset = 0;
     while offset < bytes.len() {
-        match syscall::write(fd, &bytes[offset..]) {
+        match syscall::write(handle, &bytes[offset..]) {
             Ok(n) => offset += n,
             Err(e) => fail(&format!("[{what}] write failed after {offset} bytes: {e:?}")),
         }
@@ -170,11 +171,11 @@ fn write_raw_fd(fd: toyos_abi::RawHandle, bytes: &[u8], what: &str) {
 /// so the answer cannot be read from the ring. An empty `write_nonblock`
 /// writes nothing and still asks the one question that matters — is anything
 /// still holding the read end — so the refusal is observed rather than slept
-/// through. A compositor parked in `write` instead has its fd open and
+/// through. A compositor parked in `write` instead has its handle open and
 /// answers `Ok` here forever.
 fn await_refusal(deaf: &Window) {
     for _ in 0..REFUSAL_POLLS {
-        if let Err(SyscallError::NotFound) = syscall::write_nonblock(deaf.fd(), &[]) {
+        if let Err(SyscallError::NotFound) = syscall::write_nonblock(deaf.handle(), &[]) {
             return;
         }
         syscall::nanosleep(PROBE_POLL_NS);
@@ -189,7 +190,7 @@ fn await_refusal(deaf: &Window) {
 /// Ask the compositor something it always answers, and give it a deadline.
 fn probe(what: &str) {
     let conn = connect(what);
-    if let Err(e) = ipc::signal(conn.fd(), window::MSG_GET_RESOLUTION) {
+    if let Err(e) = ipc::signal(conn.as_handle(), window::MSG_GET_RESOLUTION) {
         fail(&format!("[{what}] could not ask the compositor for its resolution: {e:?}"));
     }
     let mut buf = [0u8; 16];

@@ -1,6 +1,6 @@
 //! A `SYS_PIPE_MAP` window must not outlive the descriptors that justified it.
 //!
-//! Three syscalls: `SYS_PIPE`, `SYS_PIPE_MAP` on either fd, then close both.
+//! Three syscalls: `SYS_PIPE`, `SYS_PIPE_MAP` on either end, then close both.
 //! The last `PipeReader`/`PipeWriter` drop takes the refcount to zero,
 //! `free_pipe` drops the `PhysPage`, and the PMM has the 2 MiB page back —
 //! while the caller's mapping of it is still live and still writable. Whatever

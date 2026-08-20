@@ -20,6 +20,14 @@
 //! release, no outgoing task to park. That is what park-before-switch buys, and
 //! it is sound only because a wake for the just-parked task is a *message to
 //! this same CPU*, which cannot be consumed before the switch completes.
+//!
+//! **What is *not* done by the time the pass ends is the save.** `switch`'s
+//! last instruction writes the outgoing context's `rsp`, and everything above
+//! it — the `with_cpu` return, `charge_cpu_time`, the publish, CR3, `TSS.rsp0`,
+//! the FS base — runs with that context still holding the stack pointer from
+//! the *previous* time it was switched away, or, for a task that never has
+//! been, `alloc_kernel_stack`'s entry frame. Any CPU that restores it inside
+//! that window lands on a stack this one is standing on.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -781,6 +789,17 @@ pub fn current_shared() -> Option<Arc<KShared>> {
 /// lives. `None` on a CPU with no task: boot, and the idle loop.
 pub fn current_handle() -> Option<Arc<crate::sched::payload::TaskHandle>> {
     try_with_cpu(|cpu| cpu.running().map(|t| t.ext().handle.clone())).flatten()
+}
+
+/// The same face, borrowed rather than cloned, for a reader that does not
+/// outlive the peek. `None` on a CPU with no task, exactly as above.
+///
+/// It exists because [`current_handle`]'s `Arc::clone` is two uncontended
+/// read-modify-writes, and `scheduler::Operation::established` asks this
+/// question on every park token minted in the machine — the hot-path atomic
+/// `tests/CLAUDE.md` names as the one TCG prices unlike hardware.
+pub fn with_current_handle<R>(f: impl FnOnce(&crate::sched::payload::TaskHandle) -> R) -> Option<R> {
+    try_with_cpu(|cpu| cpu.running().map(|t| f(t.ext().handle.as_ref())))?
 }
 
 /// Whether the running task has been killed — one relaxed load, no clone.

@@ -137,6 +137,31 @@ fn check(index: usize, disk: &mut usb_storage::UsbBlockDevice) {
     let past_end = disk.read_blocks(blocks, 1, &mut buf).is_err();
     log!("usb-gate: read past the last block refused={past_end}");
 
+    // A read whose *caller's* budget was already spent when it arrived — the
+    // other half of the error channel, and the half no device state can
+    // produce. `crate::block::OPERATION` is what bounds a device that answers
+    // every transfer and takes too long over the work; no property of a host
+    // device and no injection in this driver can stage a disk slow enough to
+    // reach two seconds, so an operation that is already over is established
+    // instead. What that proves is the plumbing and the verdict together: the
+    // deadline reaches `XhciController::scsi` from above the driver, no command
+    // is issued, and the disk is untouched — every assertion after this one
+    // runs against a device this read must not have disturbed, which is why it
+    // sits here and not at the end.
+    //
+    // Straight to the driver rather than through `BlockDevice`, so the line the
+    // trait writes about a failed read is not in the capture for a read that was
+    // never issued. Going through it would also work — `UsbBlockDevice` would
+    // establish its own two seconds inside this one and an inner establishment
+    // may only narrow — but this file is standing in for the caller of the
+    // trait, and establishing exactly what that caller establishes is the
+    // layering working rather than being dodged.
+    let spent = {
+        let _op = crate::scheduler::Operation::begin(crate::time::Deadline::passed());
+        !crate::drivers::xhci::storage_read(index, at(blocks, HOST_BLOCKS[0]), 1, &mut buf)
+    };
+    log!("usb-gate: read with a spent budget refused={spent}");
+
     // A read the controller cut short while the device's own CSW claims it
     // moved everything. Armed here rather than by a boot-wide count so the
     // transfer it lands on is a known one, and issued against a block the host

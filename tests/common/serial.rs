@@ -107,7 +107,11 @@ const DEATHS: &[(&str, Died, Died)] = &[
     // kernel/src/iommu/vtd/fault.rs — every stream on this machine is
     // kernel-owned, so a DMA fault is a kernel bug and the handler halts.
     ("iommu: DMA FAULT", Died::Kernel, Died::Kernel),
-    // kernel/src/main.rs — a panic taken while already panicking.
+    // kernel/src/main.rs — a panic that landed on a CPU already inside a fault
+    // or a report. The rest of the line is `panic::last_words`: which of the
+    // four states it found, what that first crash was, and where the second
+    // one is. It goes out the UART port first and then as a record, so a
+    // capture can carry it twice.
     ("DOUBLE PANIC", Died::Kernel, Died::Kernel),
     // kernel/src/main.rs — the reentry guard, written straight out the UART
     // port with no lock and therefore with no prefix. It reaches the 16550 log
@@ -483,10 +487,15 @@ pub fn self_check() -> Result<(), String> {
             Some(Died::Kernel),
         ),
         ("[kernel 0.001 cpu0] EARLY PANIC: nothing is up yet", Some(Died::Kernel)),
-        ("[kernel 2.000 cpu1] DOUBLE PANIC", Some(Died::Kernel)),
+        (
+            "[kernel 2.000 cpu1] DOUBLE PANIC: the cpu was already in Fatal; first: invalid \
+             opcode rip=0x0000000000401234 cr2=0x0000000000000000 err=0x0000000000000000; \
+             second: panic at src/mm/paging.rs:41:5: the page is not there",
+            Some(Died::Kernel),
+        ),
         // No prefix, and still the kernel's: the reentry line goes out the UART
         // port directly, and no program in this tree says these words.
-        ("\n!!! PANIC REENTRY: CPU halted !!!", Some(Died::Kernel)),
+        ("\n!!! PANIC REENTRY: CPU halted !!! (apic 3)", Some(Died::Kernel)),
         ("KERNEL PANIC: spliced onto somebody's unterminated write", Some(Died::Kernel)),
         // The kernel, about a process. Its line, somebody else's death.
         ("[kernel 0.412 cpu0] SEGFAULT tid=7: read unmapped address at 0x0", Some(Died::Faulted)),

@@ -22,6 +22,7 @@ use std::os::toyos::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use toyos::port::Acceptor;
+use toyos::AsHandle;
 use toyos::{ipc, namespace, port};
 use toyos_abi::syscall::SVC_LABEL;
 use window::{CreateError, Window};
@@ -78,18 +79,18 @@ fn server() {
 /// readable once the writer is gone.
 fn serve_one(acceptor: &Acceptor, reply: Option<u32>) {
     let accepted = acceptor.accept().expect("accept a client");
-    let fd = accepted.fd();
-    let header = ipc::recv_header(fd).expect("request header");
+    let handle = accepted.as_handle();
+    let header = ipc::recv_header(handle).expect("request header");
     assert_eq!(header.msg_type, window::MSG_CREATE_WINDOW, "client sent the wrong request");
     let _req: window::CreateWindowRequest =
-        ipc::recv_payload(fd, &header).expect("request payload");
+        ipc::recv_payload(handle, &header).expect("request payload");
     match reply {
         Some(reason) => {
-            ipc::send(fd, window::MSG_WINDOW_REFUSED, &window::WindowRefused { reason })
+            ipc::send(handle, window::MSG_WINDOW_REFUSED, &window::WindowRefused { reason })
                 .expect("send the refusal");
         }
         None => {
-            ipc::signal(fd, window::MSG_FRAME).expect("send a reply that answers nothing");
+            ipc::signal(handle, window::MSG_FRAME).expect("send a reply that answers nothing");
         }
     }
 }

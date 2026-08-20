@@ -28,7 +28,7 @@ filled it. That syscall then reaches its own drain site, is told the queue is
 empty, and returns to userland with its objects still unreleased.
 
 **Measured 2026-08-19 on `wt/toyos-fdleak` at `8e9f851`**, `tests/testcases`,
-two CPUs, TCG, one binary in the guest. `fd_lifetime`'s holder makes eight
+two CPUs, TCG, one binary in the guest. `handle_lifetime`'s holder makes eight
 io_uring rings (16 MiB) and is killed; the killer reads `SYS_SYSINFO` eight
 times back to back straight after `wait` returns. The deficit against the
 pre-spawn reading, in megabytes, over those eight reads:
@@ -86,7 +86,7 @@ owner's to do with a measurement rather than with this argument.
 ## Why it matters beyond a test
 
 The visible consequence today is only that two harness binaries had to learn to
-settle (`fd_lifetime`, `shm_release_reclaims`; `issues/build/free-memory-verdicts-share-a-boot.md`
+settle (`handle_lifetime`, `shm_release_reclaims`; `issues/build/free-memory-verdicts-share-a-boot.md`
 carries that story). The consequence that is not a test is a process which kills
 a child to make room and immediately allocates: the pages it just freed are not
 free yet, and `SYS_SHM_CREATE`/`io_uring_setup` can answer `ResourceExhausted`

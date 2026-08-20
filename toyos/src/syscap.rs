@@ -22,7 +22,7 @@ impl SysCap {
     /// and endows nothing for — not a failure. `AlreadyExists` is another
     /// process holding the class, which is a different fact and stays loud.
     pub fn claim<T: FromHandle>(&self, class: DeviceType) -> Result<T, SyscallError> {
-        let raw = syscall::device_claim(self.0.fd(), class)?;
+        let raw = syscall::device_claim(self.0.raw(), class)?;
         // SAFETY: the kernel installed this handle in this process's table for
         // this call and no other, so nothing else answers for it.
         Ok(unsafe { T::from_handle(raw) })
@@ -34,13 +34,13 @@ impl SysCap {
     /// the whole tree is the test estate: its binaries mint their own claims,
     /// and one boot runs several that each need the keyboard.
     pub fn duplicate(&self) -> Result<Self, SyscallError> {
-        syscall::dup(self.0.fd()).map(|h| Self(OwnedHandle(h)))
+        syscall::dup(self.0.raw()).map(|h| Self(OwnedHandle(h)))
     }
 
     /// Enter the real-time band. A device claim was never enough to confer
     /// this; a right is.
     pub fn enter_rt(&self) -> Result<(), SyscallError> {
-        syscall::rt_enter(self.0.fd())
+        syscall::rt_enter(self.0.raw())
     }
 
     /// A second handle to this capability carrying **less**.
@@ -49,7 +49,7 @@ impl SysCap {
     /// shrink, so the dup can never mint a claim or open a process however the
     /// holder asks.
     pub fn narrowed(&self, rights: Rights) -> Result<Self, SyscallError> {
-        syscall::dup_narrowed(self.0.fd(), rights).map(|h| Self(OwnedHandle(h)))
+        syscall::dup_narrowed(self.0.raw(), rights).map(|h| Self(OwnedHandle(h)))
     }
 
     /// A `Process` handle for a pid.
@@ -58,7 +58,7 @@ impl SysCap {
     /// carrying [`Rights::MANAGE`] reaches it — which in the whole system is
     /// `/bin/init`'s.
     pub fn open_process(&self, pid: toyos_abi::Pid) -> Result<crate::process::Process, SyscallError> {
-        let raw = syscall::process_open(self.0.fd(), pid)?;
+        let raw = syscall::process_open(self.0.raw(), pid)?;
         // SAFETY: the kernel installed this handle in this process's table for
         // this call and no other.
         Ok(unsafe { crate::process::Process::from_raw(raw) })
@@ -72,6 +72,6 @@ impl SysCap {
 
 impl AsHandle for SysCap {
     fn as_handle(&self) -> RawHandle {
-        self.0.fd()
+        self.0.raw()
     }
 }

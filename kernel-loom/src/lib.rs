@@ -243,7 +243,7 @@ pub mod scheduler {
     pub struct Parkable(());
 
     impl Parkable {
-        pub fn of_current() -> Self {
+        pub fn at_entry() -> Self {
             Self(())
         }
     }

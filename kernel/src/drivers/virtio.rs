@@ -655,8 +655,12 @@ pub fn used_selftest() {
     // device bumps. `at` is what the queue's own `last_used_idx` will be.
     let publish = Virtqueue::write_used_as_a_device_would;
 
+    /// One table row: name, head descriptor id, completion length, and what
+    /// `poll_used` must answer for it (`None` means "must refuse").
+    type Case = (&'static str, u32, u32, Option<(u16, u32)>);
+
     /// One element, and what `poll_used` must answer for it.
-    const TABLE: [(&str, u32, u32, Option<(u16, u32)>); 9] = [
+    const TABLE: [Case; 9] = [
         ("a chain the device filled", 3, CHAIN, Some((3, CHAIN))),
         ("a chain the device part-filled", 3, 1, Some((3, 1))),
         // A readable-only chain: the device wrote nothing into it and says so.

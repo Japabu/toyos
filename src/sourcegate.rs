@@ -31,7 +31,7 @@
 //! purpose.
 //!
 //! The third runs the same walk over [`RETIRED_ABI_NAMES`]: every syscall,
-//! `SYS_DEBUG` action and io_uring op code this project has deleted. Its
+//! `SYS_DEBUG` action and inbox op code this project has deleted. Its
 //! *number* is what is retired, and a number is not a thing a scan can look
 //! for — the name that used to carry it is.
 
@@ -196,15 +196,23 @@ const RETIRED_REGISTRY: &[&str] = &[
 ];
 
 /// Every other ABI name this project has retired: a deleted syscall, debug
-/// action or io_uring op code, whose *number* is retired with it and never
+/// action or inbox op code, whose *number* is retired with it and never
 /// reused (`CLAUDE.md`, "Syscall ABI").
 ///
 /// The number is what the rule protects and a number cannot be scanned for —
 /// so the name is, and a name back in code is how a number gets reissued by
 /// accident. Retired numbers themselves are recorded where they can be read
 /// beside the live ones: the comments in `toyos-abi/src/syscall.rs` and
-/// `toyos-abi/src/io_uring.rs`, which this scan is blind to by construction
+/// `toyos-abi/src/inbox.rs`, which this scan is blind to by construction
 /// because it strips comments.
+///
+/// **A rename is not a retirement, and this table gained no row for one.**
+/// `SYS_IO_URING_SETUP`/`SYS_IO_URING_ENTER` became `SYS_INBOX_SETUP`/
+/// `SYS_INBOX_SUBMIT` on 2026-08-20 keeping numbers 89 and 90, the same
+/// arguments and the same struct layouts, so nothing was deleted and no number
+/// is protectable by forbidding the old spelling.
+/// `issues/build/retired-inbox-op-names-are-a-spelling-behind.md` records what
+/// the rename left this table owing.
 const RETIRED_ABI_NAMES: &[&str] = &[
     // Syscall 107. Nothing called it; a region's mappings go with its last
     // handle, so the handle is the whole of letting go.
@@ -214,8 +222,11 @@ const RETIRED_ABI_NAMES: &[&str] = &[
     // test can see; every leak assertion in the estate is `CENSUS_KIND`.
     "CENSUS_TOTAL",
     "CENSUS_BREAKDOWN",
-    // io_uring op code 2. No submitter anywhere: this kernel's polls are
-    // one-shot and mio re-arms rather than cancels.
+    // Inbox op code 2. No submitter anywhere: this kernel's watches are
+    // one-shot and mio re-arms rather than cancels. Spelled as it was when it
+    // was deleted; op code 4 is missing from this table entirely, and both
+    // gaps are
+    // `issues/build/retired-inbox-op-names-are-a-spelling-behind.md`.
     "IORING_OP_POLL_REMOVE",
 ];
 
@@ -310,9 +321,10 @@ const LOG_PRODUCERS: &[&str] = &["log!(", "alert!(", "boot_phase!(", "log::emit(
 /// Counted in occurrences of `!!!` and not in lines, because each of these
 /// writes one at each end of its message.
 const SENTINEL_ALLOWED: &[(&str, usize)] = &[
-    // `\n!!! PANIC REENTRY: CPU halted !!!\n`, written with the IDT possibly
-    // gone.
-    ("kernel/src/main.rs", 2),
+    // The two ends of `panic::last_words`' first line — `\n!!! <the dead end
+    // this is> !!!` — written with the IDT possibly gone. Two whichever dead
+    // end called it, because there is one writer of them.
+    ("kernel/src/panic.rs", 2),
     // `\n!!! DB TRAP !!!\n`, from the #DB handler before it clears DR7.
     ("kernel/src/arch/idt/exceptions.rs", 2),
 ];

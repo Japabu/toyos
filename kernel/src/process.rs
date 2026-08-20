@@ -528,7 +528,7 @@ impl ElfInfo {
 
 /// Process-level data shared across all threads via `Arc<Lock<ProcessData>>`.
 /// Contains handles, memory mappings, ELF state, accounting — everything that belongs to the process.
-/// Accessed via `with_fd_owner_data`. All threads of a process share the same Arc.
+/// Accessed via `with_process_data`. All threads of a process share the same Arc.
 pub struct ProcessData {
     /// Every kernel object this process can name. Stdio is slots 0, 1 and 2 at
     /// generation 0, which is what makes those handles literally `0`, `1`, `2`.
@@ -956,7 +956,7 @@ pub fn set_current_thread_name(name: &[u8]) {
 
 /// Get the process-level ProcessData Arc (brief table lock).
 /// All threads of a process share the same Arc — no table walk needed.
-pub fn fd_owner_data() -> Arc<Lock<ProcessData>> {
+pub fn process_data() -> Arc<Lock<ProcessData>> {
     let guard = PROCESS_TABLE.lock();
     let table = guard.as_ref().unwrap();
     match table.get(current_process()) {
@@ -978,8 +978,8 @@ pub fn with_current_data<R>(f: impl FnOnce(&mut ThreadData) -> R) -> R {
 
 /// Access the process-level ProcessData mutably.
 /// Table lock is NOT held during the closure — only the per-process lock.
-pub fn with_fd_owner_data<R>(f: impl FnOnce(&mut ProcessData) -> R) -> R {
-    let arc = fd_owner_data();
+pub fn with_process_data<R>(f: impl FnOnce(&mut ProcessData) -> R) -> R {
+    let arc = process_data();
     let mut guard = arc.lock();
     f(&mut guard)
 }
@@ -1277,7 +1277,7 @@ fn release_process(code: i32) {
             drop(guard);
             unsafe { crate::mm::paging::kernel_cr3().activate(); }
             return;
-        };
+        }
         let other_tids: Vec<Tid> = proc.threads.iter()
             .map(|(t, _)| t)
             .filter(|&t| t != tid)
@@ -1373,7 +1373,7 @@ fn release_thread(process_pid: Pid, tid: Tid, code: i32) -> Tid {
         tdata.tls_pages.take()
     };
     let released = {
-        let owner_arc = fd_owner_data();
+        let owner_arc = process_data();
         let mut owner_data = owner_arc.lock();
         release_thread_mappings(&mut owner_data, tls, &addr_space, tid)
     };

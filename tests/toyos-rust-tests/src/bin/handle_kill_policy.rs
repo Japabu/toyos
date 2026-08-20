@@ -49,7 +49,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use toyos::census::Census;
-use toyos::poller::{Poller, IORING_POLL_IN, IORING_POLL_OUT};
+use toyos::poller::{Poller, READABLE, WRITABLE};
 use toyos::AsHandle;
 use toyos_abi::handle::Rights;
 use toyos_abi::syscall::{self, MmapFlags, MmapProt, SpawnArgs, SyscallError};
@@ -81,7 +81,7 @@ const UNHELD_SLOT: u32 = 3000;
 const CHURN_ROUNDS: usize = 16;
 
 /// The most 10 ms census samples `settled_census` takes before answering with
-/// what it last saw. `fd_lifetime`'s bound, for the same deferred queues.
+/// what it last saw. `handle_lifetime`'s bound, for the same deferred queues.
 const SETTLE_SAMPLES: usize = 100;
 
 /// The three kinds that end the caller. Each is a role this binary runs as, and
@@ -95,7 +95,7 @@ const FATAL: &[(&str, &str)] = &[
     // roles rather than a loop over the first two because what has to be
     // asserted is the same in both places and the *call* is what differs: a
     // syscall refuses where it stands, a `POLL_ADD` is refused inside
-    // `io_uring_enter` on the submitting thread.
+    // `inbox_submit` on the submitting thread.
     ("poll-bad-handle", "a POLL_ADD on a slot this process never held"),
     ("poll-stale", "a POLL_ADD on a slot this process closed"),
     // The third site the same audit found. It answered `NotFound` for every
@@ -161,7 +161,7 @@ fn test() {
 /// narrowed here to stage it.
 fn a_poll_without_wait_is_a_word() {
     let region = toyos::shm::SharedMemory::create(4096).expect("a region to poll");
-    let answered = answered_within(POLL_ANSWER, region.as_handle(), IORING_POLL_IN);
+    let answered = answered_within(POLL_ANSWER, region.as_handle(), READABLE);
     assert!(
         answered.is_some(),
         "a POLL_ADD on a handle carrying no WAIT was neither answered nor refused in \
@@ -175,12 +175,12 @@ fn a_poll_without_wait_is_a_word() {
 /// **Not a refusal, and that is why it is its own arm.** The handle resolves,
 /// it carries `WAIT`, and the caller is entitled to ask — a pipe's read end
 /// simply has no writability, so there is no source to register on and nothing
-/// that could ever complete the poll. `POSIX poll(fd, POLLOUT)` on a read end is
+/// that could ever complete the poll. POSIX's `poll` for `POLLOUT` on a read end is
 /// exactly this call, so it is a mistake real programs make, and the answer the
 /// kernel gave was silence.
 fn a_poll_with_no_source_is_answered() {
     let (read, _write) = toyos::pipe_pair().expect("a pipe with a read end");
-    let answered = answered_within(POLL_ANSWER, read.as_handle(), IORING_POLL_OUT);
+    let answered = answered_within(POLL_ANSWER, read.as_handle(), WRITABLE);
     assert!(
         answered.is_some(),
         "a POLL_ADD for writability on a pipe's read end went unanswered for \
@@ -196,7 +196,7 @@ fn a_poll_with_no_source_is_answered() {
 /// arrives at all. Which word it is belongs to the kernel's own matrix.
 fn answered_within(bound: Duration, handle: RawHandle, flags: u32) -> Option<Duration> {
     let poller = Poller::new(1);
-    poller.poll_add_fd(handle, flags, 0);
+    poller.watch_raw(handle, flags, 0);
     let started = Instant::now();
     let mut seen = 0usize;
     poller.wait(1, bound.as_nanos() as u64, |_| seen += 1);
@@ -269,7 +269,7 @@ fn a_full_table_is_a_word() {
 /// still loses to the lag it describes: on a loaded CI shard the last corpse's
 /// own `Process` object outlived the parent's `wait` into the second census —
 /// `[("Process", 6, 7)]`, twice on one shard, green alone both times (PR #141
-/// run 32307331537, the same deferral `fd_lifetime` measured decaying across
+/// run 32307331537, the same deferral `handle_lifetime` measured decaying across
 /// eight back-to-back reads). The kernel half is
 /// `issues/kernel/deferred-release-outlives-its-syscall.md`; here it is a lag
 /// and not a leak exactly when settling converges, which is what
@@ -301,7 +301,7 @@ fn churn(rounds: usize) -> Census {
 }
 
 /// The census once the deferred queues have finished giving back what the
-/// kills released. `fd_lifetime`'s `settled_free_bytes`, for object counts:
+/// kills released. `handle_lifetime`'s `settled_free_bytes`, for object counts:
 /// sample until two readings ten milliseconds apart agree, which is the
 /// machine saying it has finished. **A liveness bound and not a margin** — a
 /// kernel that leaks holds a stable, elevated census, is quiescent on the
@@ -415,12 +415,12 @@ fn fatal_role(role: &str) -> ! {
             panic!("a pipe accepted a connection: {taken:?}");
         }
         // The submission form of `bad-handle`. The kill lands inside
-        // `io_uring_enter`, on this thread, while it is processing the SQE —
+        // `inbox_submit`, on this thread, while it is processing the SQE —
         // so a tree that answers instead of ending comes back from `wait` and
         // reaches the panic below with the wrong exit code.
         "poll-bad-handle" => {
             let poller = Poller::new(1);
-            poller.poll_add_fd(RawHandle(UNHELD_SLOT), IORING_POLL_IN, 0);
+            poller.watch_raw(RawHandle(UNHELD_SLOT), READABLE, 0);
             let mut seen = 0usize;
             poller.wait(1, POLL_ANSWER.as_nanos() as u64, |_| seen += 1);
             panic!("a POLL_ADD on a slot this process never held left it running ({seen} CQEs)");
@@ -433,7 +433,7 @@ fn fatal_role(role: &str) -> ! {
             let closed = read.as_handle();
             drop(read);
             let poller = Poller::new(1);
-            poller.poll_add_fd(closed, IORING_POLL_IN, 0);
+            poller.watch_raw(closed, READABLE, 0);
             let mut seen = 0usize;
             poller.wait(1, POLL_ANSWER.as_nanos() as u64, |_| seen += 1);
             panic!("a POLL_ADD on a handle this process closed left it running ({seen} CQEs)");

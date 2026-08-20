@@ -251,11 +251,11 @@ pub fn poll() {
 
     // A CPU that is missing gets a line naming it, because the summary says
     // only how many. Bounded by the CPU count, and silent on a healthy machine.
-    for cpu in 0..cpus {
+    for (cpu, &stamp) in stamps.iter().enumerate().take(cpus) {
         if mask & (1 << cpu) != 0 {
             continue;
         }
-        match stamps[cpu] {
+        match stamp {
             0 => log!("heartbeat: cpu{cpu} has never reached a scheduler pass"),
             stamp => {
                 let (s, ms) = split(now.saturating_sub(stamp));

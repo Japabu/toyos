@@ -3,6 +3,13 @@
 //! The scheduler itself is `toyos-sched`, driven by `kernel/src/sched/`. This
 //! file is *only* a surface: no decision, no state transition and no
 //! ordering-sensitive step happens here.
+//!
+//! **One exception, and it is stated rather than implied: who may park.**
+//! [`Parkable`] and [`Operation`] live here because they are one decision — the
+//! token has no public constructor, so the only ways to hold one are the two
+//! doors below, and putting either of them in another module would make that
+//! constructor `pub(crate)` and the guarantee a naming convention. Neither
+//! touches the machine; both only decide whether a caller is allowed to.
 
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +25,7 @@ use crate::hw::HW;
 use crate::pipe::PipeId;
 use crate::process::{self, Pid, Tid};
 use crate::sched::driver::{self, cpus, preempt_off, Dispose, NewTask};
-use crate::sched::payload::{KShare, KShared, KWaitQueue, KernelLock, ThreadSched};
+use crate::sched::payload::{KShare, KShared, KWaitQueue, KernelLock, TaskHandle, ThreadSched};
 use crate::sched::reap_gate::ReapGate;
 use crate::sched::waitqs;
 use crate::sync::Lock;
@@ -100,11 +107,11 @@ fn blocking_baseline() -> u32 {
 
 /// The right to give the CPU back.
 ///
-/// Made once per trap entry and once per kernel-thread body;
-/// [`Parkable::of_current`] asserts the context's baseline preempt depth, so a
-/// caller holding a spinlock cannot make one. Not
-/// `Copy`, not `Clone`, and never stored in a struct: it is threaded down the
-/// call chain by reference, and that is the whole mechanism.
+/// Made once per trap entry and once per kernel-thread body, by
+/// [`Parkable::at_entry`], which asserts the context's baseline preempt depth —
+/// so a caller holding a spinlock cannot make one. Not `Copy`, not `Clone`, and
+/// never stored in a struct: it is threaded down the call chain by reference,
+/// and that is the whole mechanism.
 ///
 /// **What the token delivers is a compile-time property about the *context*,
 /// and nothing about which locks are held.** A function with no `Parkable` in
@@ -113,6 +120,24 @@ fn blocking_baseline() -> u32 {
 /// `sched::dump`, `panic_console`, every ISR and every `Drop` impl are
 /// structurally unable to block: none of them can make one.
 ///
+/// **That claim used to be discipline, and owner ruling 1B (2026-08-20) made it
+/// enforced.** The gap was `Parkable::of_current`: a leaf reached through a
+/// trait that cannot carry a token — `BlockDevice::read_blocks` under
+/// `toyos-fat32`'s `BlockAccess` — could simply mint its own, and the assertion
+/// would *pass*, because a leaf under nothing but sleep locks genuinely meets
+/// the baseline. Two things close it. The forbidden call no longer exists:
+/// `of_current` is gone and this type has no public constructor at all, so a
+/// leaf that writes the old line does not compile. And the two doors that
+/// replace it each refuse the other's context — [`Parkable::at_entry`] refuses
+/// inside an [`Operation`], [`Operation::parkable`] refuses outside one — so
+/// the frame that owns an operation establishes parkability once and every
+/// depth below it *receives*.
+///
+/// **The refusal is a named runtime panic and not a type**, for the reason the
+/// track already settled about a spinlock held across a park: the type system
+/// cannot see which frame is a leaf, and the honest alternative to a loud
+/// refusal is a rule nobody enforces.
+///
 /// **It is not a borrow rule.** §6.2 records the first draft's proposal — a
 /// `&mut Parkable` for `wait` so that a live sleep guard would make a park a
 /// compile error — and why it is wrong: three of this design's own sections
@@ -120,23 +145,226 @@ fn blocking_baseline() -> u32 {
 /// of giving the CPU back during a device round trip. What still catches a
 /// *spinlock* held across a park is the runtime assertion here and at the park
 /// (RT1, §6.3), because `Lock::lock` takes no token and must not.
-///
-/// The first consumers are C3's `completion::wait` and C5's `SleepLock::lock`.
-/// C1 builds the token and puts it where the assertion already was, so the
-/// failure names the entry rather than the park.
 pub struct Parkable(());
 
 impl Parkable {
-    /// Assert that this context may park, and mint the proof.
+    /// Assert that this context may park, and mint the proof. **A trap entry or
+    /// a kernel thread's body, and nothing below one.**
     ///
     /// There is no `Parkable::boot()` and no spin fallback: a primitive that
     /// silently degrades to a spin depending on invisible context is the
     /// sentinel class the root `CLAUDE.md` forbids. Boot has no token because
     /// boot has no current task, and code that runs there takes `try_lock`.
+    ///
+    /// The [`Operation`] refusal is what makes "entry" a checked word rather
+    /// than a naming convention: a context inside an established operation is
+    /// by definition below one, and a leaf minting there is exactly what ruling
+    /// 1B forbids.
     #[track_caller]
-    pub fn of_current() -> Parkable {
+    pub fn at_entry() -> Parkable {
+        assert!(
+            !Operation::established(),
+            "scheduler: a frame inside an established operation minted its own park \
+             permission — a leaf receives one from the operation, it does not make one",
+        );
+        Parkable::mint()
+    }
+
+    /// The baseline assertion and the proof, with no question asked about which
+    /// context is asking. Private, so the two doors above are the whole of the
+    /// public surface.
+    #[track_caller]
+    fn mint() -> Parkable {
         assert_baseline(blocking_baseline());
         Parkable(())
+    }
+}
+
+/// One operation the running context is inside, for as long as this value
+/// lives.
+///
+/// **The word ruling 1B asked for.** A block-device operation crosses two
+/// frames that cannot carry an argument — `toyos-fat32`'s `BlockAccess::read_at`
+/// is a pure host-tested crate's, and [`crate::block::BlockDevice`]'s
+/// implementors are reached from a `&mut self` that knows nothing of the caller
+/// — so the depth that finally waits for the device can be handed neither the
+/// caller's deadline nor a park token. It recovers both here instead, off the
+/// context that established them, and a depth that asks without an
+/// establishment above it is told so by name.
+///
+/// **Established where one call is one operation**, which today is
+/// [`crate::drivers::usb_storage::UsbBlockDevice`]'s three trait methods: below
+/// them the driver batches, retries and recovers, and none of those loops knows
+/// what it is part of. [`crate::block::OPERATION`] carries why that layer owns
+/// the number.
+///
+/// **Two homes, because a context is a task or it is not.** A task's word is on
+/// its [`TaskHandle`], which is the cross-CPU face that already travels with it
+/// — so an operation survives the migration a converted `XHCI` will make
+/// possible. A context with no task is boot and an idle CPU's pass, neither of
+/// which migrates and neither of which has a handle, so those get one slot per
+/// CPU. `sleeplock`'s `NOT_A_TASK` is the same distinction under the same
+/// reasoning, and there is no third case: [`crate::sched::driver::current_handle`]
+/// answers one or the other.
+///
+/// **Establishments nest, and an inner one may only narrow.** Refusing to nest
+/// was the first draft and it is wrong for the conversion this word exists for:
+/// `fat32_adapter::VOLUMES` is acquired *above* `BlockDevice`, so the frame that
+/// must establish park permission on the filesystem path sits above the frame
+/// that owns the block-device deadline, and the two are nested by construction.
+/// What the nesting may not do is *widen*: an inner establishment takes the
+/// earlier of its own deadline and its parent's, so a caller cannot buy itself
+/// more device time by starting a second operation inside the first — which is
+/// exactly the failure `block::OPERATION` exists to stop, arriving one layer
+/// lower. The guard restores what it displaced rather than clearing the slot,
+/// so the outer operation survives the inner one ending.
+#[must_use = "an operation lasts exactly as long as this guard"]
+pub struct Operation {
+    /// The handle whose slot this establishment wrote, or `None` for the
+    /// per-CPU slot named by `cpu`. Held rather than re-derived so the drop
+    /// restores the slot it set even if the task has moved.
+    task: Option<Arc<TaskHandle>>,
+    cpu: usize,
+    /// What the slot held before this establishment: `None` where there was no
+    /// operation, which is what the drop puts back.
+    outer: Option<u64>,
+}
+
+/// One context's establishment.
+///
+/// Two words rather than one sentinel, because [`Deadline`] is total over its
+/// whole range by construction and has no value left to mean "none" — which is
+/// the property its own doc exists to defend. They are never read as a pair by
+/// anyone but the context that wrote them, so no ordering is owed between them.
+pub struct OperationSlot {
+    live: core::sync::atomic::AtomicBool,
+    until: AtomicU64,
+}
+
+impl OperationSlot {
+    pub const fn new() -> Self {
+        Self {
+            live: core::sync::atomic::AtomicBool::new(false),
+            until: AtomicU64::new(0),
+        }
+    }
+}
+
+impl Default for OperationSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Where a context with no task establishes. One per CPU: boot runs on the BSP
+/// and an idle CPU's pass runs on its own, and neither can be moved off it.
+static NO_TASK_OPERATION: [OperationSlot; MAX_CPUS] =
+    [const { OperationSlot::new() }; MAX_CPUS];
+
+impl Operation {
+    /// Declare the running context inside one operation, bounded by `until` or
+    /// by whatever already bounds it, whichever comes first.
+    ///
+    /// No `#[track_caller]`, because nothing here panics: nesting is legal and
+    /// narrowing is what an inner establishment does. The two recoveries carry
+    /// it, because they are where a caller learns it got the context wrong.
+    pub fn begin(until: Deadline) -> Operation {
+        let task = driver::current_handle();
+        let cpu = percpu::cpu_id() as usize;
+        let outer = {
+            let slot = operation_slot(&task, cpu);
+            let outer = slot
+                .live
+                .load(Ordering::Relaxed)
+                .then(|| slot.until.load(Ordering::Relaxed));
+            slot.until.store(
+                outer.map_or(until.nanos(), |outer| outer.min(until.nanos())),
+                Ordering::Relaxed,
+            );
+            slot.live.store(true, Ordering::Relaxed);
+            outer
+        };
+        Operation { task, cpu, outer }
+    }
+
+    /// The deadline the operation this depth is part of has left to spend.
+    ///
+    /// **A loud refusal without an establishment above it**, which is ruling
+    /// 1B's third clause: the alternative is answering [`Deadline::never`] to a
+    /// caller that believed it had a budget, and an unbounded wait that looks
+    /// like a bounded one is the shape `block::OPERATION` exists to delete.
+    #[track_caller]
+    pub fn deadline() -> Deadline {
+        let (live, until) = Self::read();
+        assert!(
+            live,
+            "scheduler: a depth asked for its operation's deadline with no operation \
+             established above it",
+        );
+        Deadline::at(crate::time::Instant::from_nanos_since_boot(until))
+    }
+
+    /// The park token of the operation this depth is part of.
+    ///
+    /// The other half of the one decision ruling 1B took, and the half with no
+    /// caller until the four locks convert: the only depth that wants it is
+    /// `xhci::wait/mod.rs`'s `wait_transfer`, which still spins because the
+    /// three ticket locks above it — `vfs::VFS`, `fat32_adapter::VOLUMES` and
+    /// `xhci::XHCI` — make [`Parkable::mint`]'s baseline assertion fail by
+    /// construction until they convert together. It is written beside the
+    /// deadline rather than after it because the ruling is one decision covering
+    /// both values, and splitting it would land the enforcement without the
+    /// thing enforced.
+    #[allow(dead_code)]
+    #[track_caller]
+    pub fn parkable() -> Parkable {
+        assert!(
+            Self::established(),
+            "scheduler: a depth asked to park with no operation established above it",
+        );
+        Parkable::mint()
+    }
+
+    /// Whether the running context is inside one.
+    pub fn established() -> bool {
+        Self::read().0
+    }
+
+    /// **A borrow and not a clone.** This runs on every mint in the machine,
+    /// and `Arc::clone` is the uncontended read-modify-write TCG prices at
+    /// hundreds of microseconds on a hot path.
+    fn read() -> (bool, u64) {
+        fn of(slot: &OperationSlot) -> (bool, u64) {
+            (
+                slot.live.load(Ordering::Relaxed),
+                slot.until.load(Ordering::Relaxed),
+            )
+        }
+        driver::with_current_handle(|task| of(task.operation()))
+            .unwrap_or_else(|| of(&NO_TASK_OPERATION[percpu::cpu_id() as usize]))
+    }
+
+    fn slot(&self) -> &OperationSlot {
+        operation_slot(&self.task, self.cpu)
+    }
+}
+
+/// The slot a context establishes in: its task's, or its CPU's where it has no
+/// task.
+fn operation_slot(task: &Option<Arc<TaskHandle>>, cpu: usize) -> &OperationSlot {
+    match task {
+        Some(task) => task.operation(),
+        None => &NO_TASK_OPERATION[cpu],
+    }
+}
+
+impl Drop for Operation {
+    fn drop(&mut self) {
+        let slot = self.slot();
+        match self.outer {
+            Some(until) => slot.until.store(until, Ordering::Relaxed),
+            None => slot.live.store(false, Ordering::Relaxed),
+        }
     }
 }
 
@@ -250,14 +478,20 @@ pub fn enqueue_new(
 /// whatever locks it needs, and the deferred request is served by the block or
 /// by the cancel. See [`Ticket`].
 ///
-/// The baseline assertion is [`Parkable::of_current`]'s, which is RT1: the
-/// token is minted where the decision to park is made, so a trip names that
-/// site. The proof is dropped again here because nothing below takes one yet —
-/// C3's `completion::wait` and C5's `SleepLock::lock` are what thread it.
+/// The baseline assertion is RT1: the token is minted where the decision to
+/// park is made, so a trip names that site. The proof is dropped again here
+/// because nothing below takes one yet — `completion::wait` and
+/// `SleepLock::lock` are what thread it.
+///
+/// **[`Parkable::mint`] and deliberately not [`Parkable::at_entry`].** This is
+/// the park, which is the one place every context ends up — the entry that
+/// minted the caller's token *and* the depth that received one from its
+/// [`Operation`]. Asking the entry question here would refuse exactly the shape
+/// ruling 1B exists to create.
 #[must_use = "a wait ticket must be blocked on or cancelled"]
 #[track_caller]
 pub fn prepare_wait(queue: &KWaitQueue, cancel: Cancel, class: WaitClass) -> Ticket<'_> {
-    let _parkable = Parkable::of_current();
+    let _parkable = Parkable::mint();
     Ticket::register(queue, cancel, class)
 }
 
@@ -479,7 +713,7 @@ pub fn futex_wait(
     expected: u32,
     deadline: Deadline,
 ) -> bool {
-    let parkable = Parkable::of_current();
+    let parkable = Parkable::at_entry();
     // The value check is the predicate, and it runs *after* the arm — which is
     // the same ordering the registration gave it, and the reason the
     // wake-generation protocol this used to need is not coming back (§23's
@@ -703,7 +937,7 @@ pub fn retire_task(sched: &ThreadSched) {
          the real-time band may stretch elevenfold; past this the wake was lost",
     );
     let give_up = Deadline::at(crate::clock::now() + GIVE_UP.duration());
-    let parkable = Parkable::of_current();
+    let parkable = Parkable::at_entry();
     // Armed on the victim, which is what `publish_released` posts to. The wait
     // is uncancellable (§7.4): a killed retirer cannot propagate a cancel with
     // the retire half done, and what bounds it is the tripwire above.

@@ -393,14 +393,14 @@ impl Codegen {
         let mut fields = Vec::new();
         for f in st.fields.as_ref().unwrap() {
             let ty = self.resolve_type(&f.specifiers);
-            for fd in &f.declarators {
-                let field_ty = if let Some(d) = &fd.declarator {
+            for decl in &f.declarators {
+                let field_ty = if let Some(d) = &decl.declarator {
                     self.apply_declarator(&ty, d)
                 } else {
                     ty.clone()
                 };
-                let name = fd.declarator.as_ref().map(|d| self.get_declarator_name(d)).filter(|n| !n.is_empty());
-                let bit_width = fd.bit_width.as_ref().map(|bw| {
+                let name = decl.declarator.as_ref().map(|d| self.get_declarator_name(d)).filter(|n| !n.is_empty());
+                let bit_width = decl.bit_width.as_ref().map(|bw| {
                     self.eval_const(bw)
                         .expect("bitfield width must be a constant expression") as u32
                 });

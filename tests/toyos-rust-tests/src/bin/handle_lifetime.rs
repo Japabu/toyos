@@ -1,9 +1,9 @@
 //! What a handle holds is released when the *last* handle goes, and no sooner —
 //! on `close` and on being killed alike.
 //!
-//! `Descriptor::clone` used to copy a `ListenerId` and a `RingId` as bare
+//! Duplicating a handle used to copy a `ListenerId` and a `RingId` as bare
 //! numbers while `close` unregistered the service and destroyed the ring
-//! unconditionally, so `dup` and then closing either fd took the object out
+//! unconditionally, so `dup` and then closing either handle took the object out
 //! from under the survivor. A file was already refcounted; it is here because
 //! the kinds are one property, and a test covering three of them says nothing
 //! about the fourth.
@@ -16,7 +16,7 @@
 //!
 //! The kill half is why this is a guest test and not a host one. This kernel
 //! does not unwind, so a `Drop` reached only by an orderly `close` would be
-//! decoration: `kill` runs on another CPU and drains the victim's descriptor
+//! decoration: `kill` runs on another CPU and drains the victim's handle
 //! table itself, and that is the path each case below re-checks.
 //!
 //! Roles: no argument is the test; `holder <kind>` takes one object, reports
@@ -27,16 +27,16 @@ use std::os::toyos::process::CommandExt;
 use std::process::{Child, ChildStdout, Command, Stdio};
 
 use toyos::{namespace, port, AsHandle};
-use toyos_abi::io_uring::IoUringParams;
+use toyos_abi::inbox::RingLayout;
 use toyos_abi::syscall::{self, OpenFlags, SeekFrom, SyscallError, SERVE_PREFIX};
 
-const SELF_PATH: &str = "/bin/test_rs_fd_lifetime";
+const SELF_PATH: &str = "/bin/test_rs_handle_lifetime";
 /// The name this test's own namespaces map to the port under test. Private to
 /// this process and its children, which is the whole of what a namespace is.
-const SERVICE: &str = "fd-lifetime-service";
-const PATH: &[u8] = b"/tmp/fd-lifetime.txt";
-const KILLED_PATH: &[u8] = b"/home/fd-lifetime-killed.txt";
-const PAYLOAD: &[u8] = b"a file outlives the fd that was closed first";
+const SERVICE: &str = "handle-lifetime-service";
+const PATH: &[u8] = b"/tmp/handle-lifetime.txt";
+const KILLED_PATH: &[u8] = b"/home/handle-lifetime-killed.txt";
+const PAYLOAD: &[u8] = b"a file outlives the handle that was closed first";
 const KILLED_PAYLOAD: &[u8] = b"written by a process that was killed before it could close";
 /// `process::HANDLE_FAULT_EXIT_CODE`.
 const HANDLE_FAULT: i32 = 139;
@@ -71,16 +71,16 @@ fn test() {
 fn file_survives_one_close() {
     let a = syscall::open(PATH, OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE)
         .expect("create the file");
-    let b = syscall::dup(a).expect("dup a file fd");
+    let b = syscall::dup(a).expect("dup a file handle");
     syscall::write(b, PAYLOAD).expect("write through the dup");
     syscall::close(a);
 
     // Reading through the survivor is what says the first close did not take
     // the file's cache entry with it.
-    syscall::seek(b, SeekFrom::Start(0)).expect("seek on the surviving fd");
+    syscall::seek(b, SeekFrom::Start(0)).expect("seek on the surviving handle");
     let mut buf = [0u8; 128];
-    let n = syscall::read(b, &mut buf).expect("read through the surviving fd");
-    assert_eq!(&buf[..n], PAYLOAD, "the surviving fd no longer names the file");
+    let n = syscall::read(b, &mut buf).expect("read through the surviving handle");
+    assert_eq!(&buf[..n], PAYLOAD, "the surviving handle no longer names the file");
     syscall::close(b);
 }
 
@@ -111,7 +111,7 @@ fn acceptor_survives_one_close() {
 }
 
 fn ring_survives_one_close() {
-    let (a, base) = unsafe { syscall::io_uring_setup(8) }.expect("io_uring_setup");
+    let (a, base) = unsafe { syscall::inbox_setup(8) }.expect("inbox_setup");
     let b = syscall::dup(a).expect("dup a ring handle");
     syscall::close(a);
 
@@ -120,10 +120,10 @@ fn ring_survives_one_close() {
     // there is no separate region and no token naming one — so reading the
     // params back through the pointer setup handed over is what says the close
     // did not unmap it.
-    syscall::io_uring_enter(b, 0, 0, 0)
+    syscall::inbox_submit(b, 0, 0, 0)
         .expect("closing one of two ring handles destroyed the instance");
-    let params = unsafe { core::ptr::read_volatile(base as *const IoUringParams) };
-    assert_eq!(params.sq_ring_size, 8, "the ring's page no longer describes the ring");
+    let params = unsafe { core::ptr::read_volatile(base as *const RingLayout) };
+    assert_eq!(params.submission_ring_size, 8, "the ring's page no longer describes the ring");
 
     syscall::close(b);
 
@@ -251,17 +251,17 @@ fn settled_free_bytes() -> u64 {
 }
 
 /// A killed process's dirty file must still reach the filesystem: that flush
-/// used to be a hand-written arm of `close_all`, and is now the descriptor's
+/// used to be a hand-written arm of `close_all`, and is now the handle's
 /// own drop on the same teardown path.
 fn kill_flushes_file() {
     let (mut child, _) = spawn_holder("file");
     kill_and_reap(&mut child);
 
-    let fd = syscall::open(KILLED_PATH, OpenFlags::READ)
+    let handle = syscall::open(KILLED_PATH, OpenFlags::READ)
         .expect("the killed holder's file does not exist");
     let mut buf = [0u8; 128];
-    let n = syscall::read(fd, &mut buf).expect("read the killed holder's file");
-    syscall::close(fd);
+    let n = syscall::read(handle, &mut buf).expect("read the killed holder's file");
+    syscall::close(handle);
     assert_eq!(
         &buf[..n],
         KILLED_PAYLOAD,
@@ -302,13 +302,13 @@ fn kill_and_reap(child: &mut Child) {
 
 /// Both handles to one ring, both closed, and then the number presented again.
 fn closed_ring() -> ! {
-    let (a, _base) = unsafe { syscall::io_uring_setup(8) }.expect("closed-ring: io_uring_setup");
+    let (a, _base) = unsafe { syscall::inbox_setup(8) }.expect("closed-ring: inbox_setup");
     let b = syscall::dup(a).expect("closed-ring: dup");
     syscall::close(a);
     syscall::close(b);
     println!("closed");
     std::io::stdout().flush().expect("closed-ring: flush");
-    let answered = syscall::io_uring_enter(b, 0, 0, 0);
+    let answered = syscall::inbox_submit(b, 0, 0, 0);
     panic!("a ring handle closed twice over answered {answered:?}");
 }
 
@@ -324,19 +324,19 @@ fn holder(kind: &str) {
         }
         "ring" => {
             let rings: Vec<_> = (0..HOLDER_RINGS)
-                .map(|_| unsafe { syscall::io_uring_setup(8) }.expect("holder: io_uring_setup"))
+                .map(|_| unsafe { syscall::inbox_setup(8) }.expect("holder: inbox_setup"))
                 .collect();
             // Held for the process's life: the point is what the kill does.
             core::mem::forget(rings);
             println!("held");
         }
         "file" => {
-            let fd = syscall::open(
+            let handle = syscall::open(
                 KILLED_PATH,
                 OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
             )
             .expect("holder: open");
-            syscall::write(fd, KILLED_PAYLOAD).expect("holder: write");
+            syscall::write(handle, KILLED_PAYLOAD).expect("holder: write");
             println!("held");
         }
         other => panic!("holder: unknown kind {other:?}"),

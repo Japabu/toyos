@@ -510,6 +510,17 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // measured 11.8 s on CI KVM, over the fast line, so the whole verdict is
     // nightly until the split the relegation row names.
     ("klogd_hosted", Sched::Parallel, Tier::Nightly),
+    // The two dead ends of the panic path, each staged on purpose and read for
+    // what the machine manages to say on its way out. **Two names because one
+    // over two boots measured 12 s twelve-wide on the dev host**, against
+    // `screen_late_panic`'s 5 s there for one boot of the same shape and its
+    // 3,782 ms in CI — a single name would have arrived at the fast tier's line
+    // with nothing to spare. Each boot dies inside the boot phases at the marker
+    // the harness waits for, so neither pays for a userland. Parallel and Fast:
+    // every verdict is a substring of a report the guest wrote, and there is no
+    // clock in any of it.
+    ("reentry_names_the_first_panic", Sched::Parallel, Tier::Fast),
+    ("double_panic_names_the_fault", Sched::Parallel, Tier::Fast),
     // §9.1's conservation law across `SYS_LOG_READ`, one registered name per
     // width, and §9.2's nesting gate at one CPU. **Three names because one over
     // three boots measured 17,112 ms in CI** — over the fast tier's line, and
@@ -3808,7 +3819,7 @@ fn run_screen_test(
             // that the panel is not mid-repaint before the watch starts.
             const SETTLED: Duration = Duration::from_secs(1);
             let settle_by = Instant::now() + qemu::budget(Duration::from_secs(20));
-            let mut held = last.clone();
+            let mut held = last;
             let mut stable_since = Instant::now();
             loop {
                 let Some(now) = footer(&mut qemu) else {
@@ -4281,7 +4292,7 @@ const METAL_SIM_DESKTOP: &str = "metal-sim desktop";
 const I8042_TRACE: &str = "i8042 trace";
 
 /// The line `tests/toyos-rust-tests/src/bin/i8042_keyboard.rs` prints once it
-/// holds the keyboard fd, and the line every injection into that binary is
+/// holds the keyboard claim, and the line every injection into that binary is
 /// timed off. Eight callers wait for it, and one — `i8042_undecoded_bytes` —
 /// also reads its capture *from* it: it is the boundary between what the
 /// machine did on its own and what this test staged.
@@ -4848,7 +4859,7 @@ fn metal_sim_window_drag(rust_bins: &[(String, Vec<u8>)]) -> Result<(), String> 
     // The client ends on the host's second press, so the interval the drag is
     // in is still open when it exits. Waiting for the line that closes it keeps
     // a slower guest a longer run rather than a different verdict.
-    let mut text = result.serial.clone();
+    let mut text = result.serial;
     text.push_str(
         &qemu.drain_until(Duration::from_secs(10), |l| l.contains("compositor: frames=")),
     );
@@ -5228,7 +5239,7 @@ fn swiss_german_layout(qemu: &mut QemuInstance) -> Result<(), String> {
 /// whole timeout for a test that finished. Escape presses after the wizard has
 /// gone are discarded by the next reader, and each one is an i8042 interrupt
 /// that keeps the ring draining. `i8042_no_spurious_wake` records the same
-/// property from the other side: a guest polling its fd keeps it moving.
+/// property from the other side: a guest polling its handle keeps it moving.
 fn keep_the_ring_moving(input: &mut qemu::QmpInput) {
     for _ in 0..4 {
         thread::sleep(Duration::from_millis(150));
@@ -6404,7 +6415,7 @@ fn soundd_clients_since(log: &str, from: usize, verb: &str) -> usize {
 /// It drives the same in-guest reader as [`i8042_keyboard`], and not only for
 /// the userland half of the assertion: on a fully idle machine the kernel's
 /// log ring flushes one line behind, so the last trace line would never reach
-/// the console (filed in `issues/`). A guest polling its fd keeps the ring
+/// the console (filed in `issues/`). A guest polling its handle keeps the ring
 /// moving.
 ///
 /// **The zero-event drain is arranged, not hoped for.** What a drain carries is
@@ -6666,7 +6677,7 @@ fn i8042_mouse(boot: &mut Boot) -> Result<(), String> {
                 return;
             }
             // The driver reports its counters from a scheduler pass, and the
-            // client polling its fd is what keeps passes running: the line has
+            // client polling its handle is what keeps passes running: the line has
             // to arrive before the client is told to stop.
             if !counted {
                 return;
@@ -8737,6 +8748,140 @@ fn run_machine_test(
             eprintln!("  [usbd] a kernel thread's panic killed the thread and the machine booted");
             Ok(())
         }
+        "reentry_names_the_first_panic" => {
+            // **The one class of crash that is by definition two bugs deep, and
+            // the one class that used to leave no evidence.** A machine two
+            // crashes deep said `DOUBLE PANIC` and nothing else — not what the
+            // first crash was, not where, and not what the second one was
+            // (`issues/panic-path/a-double-panic-at-boots-edge-says-nothing-but-its-name.md`).
+            // What closed it is a bounded byte copy taken *before* either
+            // report runs, into a static reserved at link time
+            // (`kernel/src/panic.rs`), so what the second crash reads is the
+            // first crash's own words rather than whatever the log path
+            // survived.
+            //
+            // **Two names because the two dead ends are reached by different
+            // accidents**, and `double_panic_names_the_fault` is the other. The
+            // reentry guard fires when the panic *report* panics, on a CPU whose
+            // panic depth is already one; `DOUBLE PANIC` fires when a panic
+            // lands on a CPU that a *fault* had, whose depth is zero.
+            //
+            // **This one: the panic path panics.** `test-late-panic` is a real
+            // panic with a literal message at a fixed site, and
+            // `panic-in-report` kills the report of it before it says a word —
+            // so everything on the wire about the first panic came out of the
+            // capture. The reentry guard writes straight to the 16550 with no
+            // lock, deliberately, because the record path is exactly what has
+            // just failed: the marker and the verdict are both in the UART file
+            // rather than on the console.
+            const REENTRY: &str = "PANIC REENTRY";
+            let qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    kernel_params: &["test-late-panic", "panic-in-report"],
+                    ready_marker: REENTRY,
+                    ..Default::default()
+                },
+            );
+            let mut reentry = serial::Serial::boot(&qemu);
+            reentry.push(&qemu.uart_log());
+            // Nothing of the first panic reached the record ring: the report
+            // that writes `PANIC:` is the one that died. So this is not a
+            // weaker way of reading the same line — without the capture there
+            // is no other copy of the site anywhere in the capture.
+            reentry.must_not_say("PANIC:")?;
+            let header = reentry.must_say(REENTRY)?;
+            eprintln!("  [reentry] {}", header.trim());
+            let first = reentry.must_say("first (apic")?;
+            // `src/main.rs` and not `kernel/src/main.rs`: `build.rs` runs cargo
+            // in `kernel/`, so the kernel's own `file!()` is crate-relative.
+            for want in ["panic at ", "src/main.rs:", "test-late-panic: on-screen console check"] {
+                if !first.contains(want) {
+                    return Err(format!(
+                        "the reentry report does not carry {want:?} — the first panic's own \
+                         words are what the capture exists to keep: {first:?}"
+                    ));
+                }
+            }
+            eprintln!("  [reentry] {}", first.trim());
+            let second = reentry.must_say("second: panic at")?;
+            if !second.contains("panic-in-report: the crash report panicked") {
+                return Err(format!(
+                    "the reentry report does not name the second panic: {second:?}"
+                ));
+            }
+            eprintln!("  [reentry] {}", second.trim());
+            Ok(())
+        }
+        "double_panic_names_the_fault" => {
+            // **A panic on top of a fault, which is what the sighting was and
+            // what no test in this tree had ever executed**: a Ring 0 exception
+            // is not something a guest program or a QEMU property can produce,
+            // so `fatal_exception`'s kernel arm — and the `DOUBLE PANIC` branch
+            // only reachable through it — had never run under a test at all.
+            // `reentry_names_the_first_panic` is the other dead end and carries
+            // the shared argument.
+            //
+            // `test-kernel-fault` takes the `#UD` with nothing current, so
+            // `fatal_exception` runs its kernel arm; `panic-in-report` panics it
+            // before the `FAULT rip=…` line, which is the shape the sighting had
+            // — a fault whose report died before saying anything at all. This
+            // dead end says it as a record too, because a machine with no serial
+            // port has no other channel, so the verdict is on the console.
+            let qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    kernel_params: &["test-kernel-fault", "panic-in-report"],
+                    ready_marker: "DOUBLE PANIC",
+                    ..Default::default()
+                },
+            );
+            let mut double = serial::Serial::boot(&qemu);
+            double.push(&qemu.uart_log());
+            // The fault said nothing about itself, which is the state under
+            // test: `FAULT rip=…` is `fatal_exception`'s own first line and it
+            // never ran.
+            double.must_not_say("FAULT rip=")?;
+            let line = double.must_say("DOUBLE PANIC")?;
+            for want in [
+                // Which of the four states the arriving panic found. A panic on
+                // top of a fault and a panic on top of a panic are different
+                // machines and the old line named neither.
+                "already in Fatal",
+                // The fault, by the same name the report it never reached would
+                // have given it, and where it was.
+                "invalid opcode",
+                "rip=0x",
+                // And the panic that ended it.
+                "second: panic at ",
+                "panic-in-report: the crash report panicked",
+            ] {
+                if !line.contains(want) {
+                    return Err(format!(
+                        "the DOUBLE PANIC line does not carry {want:?}, so the machine still \
+                         dies without saying what it was already doing: {line:?}"
+                    ));
+                }
+            }
+            eprintln!("  [double] {}", line.trim());
+            // And the same report on the channel that cannot be held by
+            // whatever broke — the raw port write goes out before the record
+            // does, so a wedge in the log path costs the second copy and never
+            // the first.
+            let raw = serial::Serial::named("16550 file", qemu.uart_log());
+            let raw_line = raw.must_say("first (apic")?;
+            if !raw_line.contains("invalid opcode") {
+                return Err(format!(
+                    "the lock-free copy of the report does not name the fault: {raw_line:?}"
+                ));
+            }
+            eprintln!("  [double] {}", raw_line.trim());
+            Ok(())
+        }
         "pre_idle_wedge_speaks" => {
             // **The worst diagnostic hole in the tree, closed and gated.**
             // Before this branch a boot that wedged before `enter_idle_loop`
@@ -9252,7 +9397,7 @@ fn run_machine_test(
                 return Err(format!("the PS/2 keyboard never came up:\n{}", qemu.boot_log()));
             }
             // One key, a silence several periods long, then one more key. The
-            // guest program holds the keyboard fd for 5 s and the period is
+            // guest program holds the keyboard claim for 5 s and the period is
             // 500 ms, so the quiet stretch is nine periods with nothing to say.
             let result = qemu.run_test_hooked(
                 "test_rs_i8042_keyboard",
@@ -9798,7 +9943,7 @@ fn run_machine_test(
             // (`issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md`).
             // The marker is the boundary the test knows, because the marker is
             // what the injection was timed off.
-            let capture = serial::Serial::named("i8042 capture", result.serial.clone());
+            let capture = serial::Serial::named("i8042 capture", result.serial);
             let mute = capture.must_say_after(I8042_READY, "nothing decoded").map_err(|why| {
                 format!("bytes arrived and decoded to nothing and the driver never said so: {why}")
             })?;
@@ -9987,7 +10132,7 @@ fn run_machine_test(
             // The owner froze his desktop twice by plugging a mouse in and
             // pulling it out again, and the second freeze landed on the fourth
             // cycle's enumeration. The compositor holds the merged pointer's
-            // fd across all of it, so every cycle is a source binding and
+            // handle across all of it, so every cycle is a source binding and
             // releasing underneath a claim it never made and cannot see.
             //
             // The liveness signal is `compositor: frames=`, for the reason it
@@ -11245,7 +11390,7 @@ fn build_test_registry(
             // Its verdict is that a parked waiter woke, so the failing run is
             // the slow one: it spends its own patience before reporting, and
             // the report is worth more than the harness's timeout message.
-            "io_uring_cancel_wakes" => Duration::from_secs(30),
+            "inbox_cancel_wakes" => Duration::from_secs(30),
             _ => Duration::from_secs(5),
         };
         tests.push(TestDef {
@@ -11810,7 +11955,9 @@ fn suspend_invalidates_a_verdict() -> Result<(), String> {
     let awake = Duration::ZERO;
     // Under the threshold on purpose: two clock reads jitter against each other
     // by microseconds, and a run must not be thrown away for that.
-    let jitter = common::clock::SUSPENDED_AT_LEAST - Duration::from_millis(1);
+    let jitter = common::clock::SUSPENDED_AT_LEAST
+        .checked_sub(Duration::from_millis(1))
+        .expect("SUSPENDED_AT_LEAST must be at least 1ms for this case to mean anything");
     let cases: [(&str, Option<&str>, Duration, Verdict); 6] = [
         ("a pass on a host that stayed up", None, awake, Verdict::Pass(None)),
         ("a fail on a host that stayed up", Some("the guest said no"), awake, Verdict::Fail(None)),
