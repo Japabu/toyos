@@ -43,6 +43,13 @@ link_toolchain() {
     mkdir -p "$(dirname "$linked_stage2")"
     if [ -L "$linked_stage2" ]; then
       rm -f "$linked_stage2"
+    elif [ -d "$linked_stage2" ]; then
+      # A pre-cache job can leave the extracted artifact here. The complete
+      # cached source above is the same content-addressed toolchain, so discard
+      # only this duplicate before replacing it with the stable link.
+      echo "replacing duplicate workspace toolchain with the local-cache link"
+      find "$linked_stage2" -mindepth 1 -delete
+      rmdir "$linked_stage2"
     elif [ -e "$linked_stage2" ]; then
       echo "::error::$linked_stage2 exists and is not the local-cache link"
       exit 1
