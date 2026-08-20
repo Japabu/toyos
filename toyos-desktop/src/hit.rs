@@ -126,7 +126,7 @@ mod tests {
             for p in [
                 at(rect.x0, rect.y0),
                 at(rect.x1 - 1, rect.y1 - 1),
-                at((rect.x0 + rect.x1) / 2, (rect.y0 + rect.y1) / 2),
+                at(i32::midpoint(rect.x0, rect.x1), i32::midpoint(rect.y0, rect.y1)),
             ] {
                 assert_eq!(hit_test(&DESK, &s, p, false), want, "{p:?} in {rect:?}");
             }
