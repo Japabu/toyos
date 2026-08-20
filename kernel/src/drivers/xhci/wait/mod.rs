@@ -99,6 +99,7 @@ use crate::log;
 use super::{deadline, enqueue_control, log_unrecoverable, Completion, Trb, TrbRing};
 use super::{XhciController, EVENT_TRANSFER, EVENT_CMD_COMPLETE, USB_TIMEOUT_NS};
 use super::{CC_SUCCESS, CC_SHORT_PACKET};
+use toyos_xhci::job::Await;
 use toyos_xhci::recovery::{Act, NeedsConfigure, Recovery};
 
 /// How one control transfer ended.
@@ -344,20 +345,29 @@ impl XhciController {
         }
     }
 
-    /// The completion of the transfer just queued on (`slot`, `dci`), as a
-    /// completion code and the number of bytes the controller did *not* move.
+    /// The completion of the transfer `on` names, as a completion code and the
+    /// number of bytes the controller did *not* move.
     ///
     /// The event ring is one queue for the whole controller, so anything that
     /// arrives here and is not ours belongs to a bound device delivering a
     /// report — handing it to `dispatch_event` rather than dropping it is what
-    /// keeps that device's interrupt ring fed. Matching on the endpoint as
-    /// well as the slot matters for mass storage, where one slot carries three
-    /// endpoints and a stalled one still completes.
-    fn wait_transfer(&mut self, slot: u8, dci: u8) -> Option<(u32, u32)> {
+    /// keeps that device's interrupt ring fed.
+    ///
+    /// **The TRB and not the endpoint**, which is [`Await::Transfer`]'s own
+    /// argument arriving at the site that motivated it: one slot carries three
+    /// endpoints, a stalled one still completes, and a transfer this driver
+    /// stopped waiting for is still the device's to answer. Matching on
+    /// (slot, dci) alone hands that late answer — and its residue, which is how
+    /// many of the caller's bytes are real — to whatever asked next on the same
+    /// endpoint.
+    fn wait_transfer(&mut self, on: Await) -> Option<(u32, u32)> {
         #[cfg(feature = "boot-actuators")]
         if crate::actuator::io_depth_probe() {
             depth_probe::report();
         }
+        let Await::Transfer { slot, .. } = on else {
+            unreachable!("wait_transfer was given a command to wait for");
+        };
         let deadline = deadline();
         let port = self.port_of_slot(slot);
         loop {
@@ -380,9 +390,12 @@ impl XhciController {
                 continue;
             };
             let trb_type = (event.control >> 10) & 0x3F;
-            let ev_slot = ((event.control >> 24) & 0xFF) as u8;
-            let ev_dci = ((event.control >> 16) & 0x1F) as u8;
-            if trb_type == EVENT_TRANSFER && ev_slot == slot && ev_dci == dci {
+            let answers = Await::Transfer {
+                slot: ((event.control >> 24) & 0xFF) as u8,
+                dci: ((event.control >> 16) & 0x1F) as u8,
+                trb: event.param & !0xF,
+            };
+            if trb_type == EVENT_TRANSFER && answers == on {
                 return Some(((event.status >> 24) & 0xFF, event.status & 0x00FF_FFFF));
             }
             self.dispatch_event(event);
@@ -406,14 +419,14 @@ impl XhciController {
         data_buf: Option<u64>,
         data_len: u16,
     ) -> Control {
-        let has_data = enqueue_control(
+        let trbs = enqueue_control(
             ring, bm_request_type, b_request, w_value, w_index, data_buf, data_len,
         );
         self.ring_doorbell(slot, 1);
 
         let mut delivered = 0u16;
-        if has_data {
-            match self.wait_transfer(slot, 1) {
+        if let Some(data) = trbs.data {
+            match self.wait_transfer(Await::Transfer { slot, dci: 1, trb: data }) {
                 Some((CC_SUCCESS | CC_SHORT_PACKET, residue)) => {
                     // A residue past the length asked for is a controller
                     // contradicting itself; believing it would report more bytes
@@ -427,7 +440,7 @@ impl XhciController {
                 None => return Control::Silent { stage: "data" },
             }
         }
-        match self.wait_transfer(slot, 1) {
+        match self.wait_transfer(Await::Transfer { slot, dci: 1, trb: trbs.status }) {
             Some((CC_SUCCESS, _)) => Control::Done { delivered },
             Some((code, _)) => Control::Failed { stage: "status", code },
             None => Control::Silent { stage: "status" },

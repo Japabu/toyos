@@ -9,15 +9,30 @@ use crate::port::Nanos;
 
 /// What the controller has to produce for an outstanding operation to be over.
 ///
-/// The command arm carries the **physical address of the Command TRB**, which
-/// is what a Command Completion Event names in its first two dwords (xHCI 1.2
-/// §6.4.2.2). Matching on anything coarser — "the next Command Completion
-/// Event" — hands a command that ran out its deadline and answered afterwards
-/// to whatever asked next.
+/// **Both arms carry the physical address of the TRB whose completion this
+/// is**, which is what the event names in its first two dwords: a Command
+/// Completion Event names its Command TRB (xHCI 1.2 §6.4.2.2) and a Transfer
+/// Event names the Transfer TRB that generated it (§6.4.2.1, with ED clear —
+/// no TRB this driver enqueues sets Event Data). Matching on anything coarser
+/// — "the next Command Completion Event", or "the next completion on this
+/// endpoint" — hands an operation that ran out its deadline and answered
+/// afterwards to whatever asked next.
+///
+/// **The transfer arm did the coarser thing until 2026-08-20**, with
+/// [`Stages::DataThenStatus`] standing in for the ambiguity a control
+/// transfer's two completions on one endpoint create. The two are now one
+/// answer: a stage is named by its own TRB, so the second stage is not
+/// something the *count* has to keep track of, and an abandoned transfer's late
+/// completion matches nothing rather than matching the next asker.
+///
+/// `slot` and `dci` stay beside the address because they cost nothing and are a
+/// second, independent statement of the same fact: an event whose endpoint
+/// disagrees with the TRB the driver put on that endpoint's ring is a
+/// controller contradicting itself, and one this driver must not act on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Await {
     Command { trb: u64 },
-    Transfer { slot: u8, dci: u8 },
+    Transfer { slot: u8, dci: u8, trb: u64 },
 }
 
 /// xHCI 1.2 Table 6-90's Success, and its Short Packet — a transfer that ended
@@ -27,29 +42,27 @@ pub enum Await {
 pub const CC_SUCCESS: u32 = 1;
 pub const CC_SHORT_PACKET: u32 = 13;
 
-/// How many completions the controller owes one operation.
+/// What the controller still owes one operation after the completion it was
+/// submitted on.
 ///
-/// **A control transfer with a data stage produces two.** The data stage
-/// carries IOC so the driver can learn how many bytes actually arrived, and the
-/// status stage carries its own — so an operation that ended on the first would
-/// leave the second to be matched by whatever asked next on the same endpoint.
-/// That is the transfer-side form of the defect [`Await::Command`]'s TRB
-/// address closed on the command ring, and it is reachable rather than
-/// theoretical: a driver that drains the whole event ring before it acts on
-/// anything sees both in one pass.
+/// **A control transfer with a data stage produces two completions.** The data
+/// stage carries IOC so the driver can learn how many bytes actually arrived,
+/// and the status stage carries its own — so an operation that ended on the
+/// first would leave the second to be matched by whatever asked next on the
+/// same endpoint.
+///
+/// **A second [`Await`] and not a count**, which is the difference the TRB
+/// address makes: the two stages are two TRBs at two addresses, so what is owed
+/// after the data stage is a *named* event rather than "one more of something
+/// on this endpoint". A count could only be spent by whatever arrived next.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Stages {
+    /// Nothing further: the operation is over on the completion of the TRB it
+    /// was submitted with.
     One,
-    DataThenStatus,
-}
-
-impl Stages {
-    fn count(self) -> u8 {
-        match self {
-            Self::One => 1,
-            Self::DataThenStatus => 2,
-        }
-    }
+    /// A control transfer's status stage, on its own TRB, after the data stage
+    /// the operation was submitted with.
+    DataThenStatus(Await),
 }
 
 /// How an operation ended.
@@ -97,9 +110,12 @@ impl Outcome {
 
 struct Job<W> {
     what: W,
+    /// What the **next** completion this operation owes must name. A two-stage
+    /// control transfer moves it on to its status stage when the data stage
+    /// arrives, so the slot never owes an unnamed event.
     on: Await,
-    /// Completions still owed before this operation is over.
-    owed: u8,
+    /// The stage after [`Self::on`], and `None` once nothing further is owed.
+    then: Option<Await>,
     /// Wall clock, and deliberately not a spin count: the pass that submitted
     /// this gave itself back, so what notices the deadline is a later pass and
     /// not this one.
@@ -152,8 +168,11 @@ impl<W> Outstanding<W> {
     /// left a completion nothing will ever match.
     pub fn submit(&mut self, what: W, on: Await, stages: Stages, deadline: Nanos) {
         assert!(self.job.is_none(), "a second operation was submitted over an outstanding one");
-        self.job =
-            Some(Job { what, on, owed: stages.count(), deadline, answer: None, param: None });
+        let then = match stages {
+            Stages::One => None,
+            Stages::DataThenStatus(status) => Some(status),
+        };
+        self.job = Some(Job { what, on, then, deadline, answer: None, param: None });
     }
 
     /// Offer an arriving completion to the outstanding operation, and say
@@ -176,16 +195,21 @@ impl<W> Outstanding<W> {
             return false;
         }
         let param = *job.param.get_or_insert(param);
-        job.owed -= 1;
         // A stage that did not succeed is the end of the operation whatever is
         // still owed: an errored data stage halts the endpoint, so the status
         // TRB behind it never runs and waiting for it spends the whole deadline
-        // learning that.
-        if job.owed == 0 || !matches!(code, CC_SUCCESS | CC_SHORT_PACKET) {
-            job.answer = Some(match by {
-                Await::Command { .. } => Outcome::Command { code, slot: param as u8 },
-                Await::Transfer { .. } => Outcome::Transfer { code, residue: param },
-            });
+        // learning that. The `take` is what makes that true of the *slot* and
+        // not only of this call — a failed data stage leaves nothing owed, so
+        // the status TRB's own event, should the controller produce one anyway,
+        // matches nothing.
+        match job.then.take() {
+            Some(status) if matches!(code, CC_SUCCESS | CC_SHORT_PACKET) => job.on = status,
+            _ => {
+                job.answer = Some(match by {
+                    Await::Command { .. } => Outcome::Command { code, slot: param as u8 },
+                    Await::Transfer { .. } => Outcome::Transfer { code, residue: param },
+                })
+            }
         }
         true
     }
@@ -221,12 +245,18 @@ impl<W> Outstanding<W> {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const CMD: Await = Await::Command { trb: 0x1000 };
-    const EP0: Await = Await::Transfer { slot: 3, dci: 1 };
+    /// A control transfer's two stages on one endpoint: two TRBs, sixteen bytes
+    /// apart, because that is how [`crate::job`]'s caller enqueues them.
+    const EP0_DATA: Await = Await::Transfer { slot: 3, dci: 1, trb: 0x2000 };
+    const EP0_STATUS: Await = Await::Transfer { slot: 3, dci: 1, trb: 0x2010 };
+    /// A bulk transfer, which is one TRB and one completion.
+    const BULK: Await = Await::Transfer { slot: 3, dci: 4, trb: 0x3000 };
 
     fn answered(code: u32) -> Outcome {
         Outcome::Command { code, slot: 0 }
@@ -242,7 +272,7 @@ mod tests {
     /// in the driver is.
     fn two_stage() -> Outstanding<&'static str> {
         let mut o = Outstanding::EMPTY;
-        o.submit("descriptor", EP0, Stages::DataThenStatus, 100);
+        o.submit("descriptor", EP0_DATA, Stages::DataThenStatus(EP0_STATUS), 100);
         o
     }
 
@@ -259,18 +289,41 @@ mod tests {
     fn a_completion_for_another_trb_is_not_this_one() {
         let mut o = slot();
         assert!(!o.answered(Await::Command { trb: 0x2000 }, 1, 0));
-        assert!(!o.answered(Await::Transfer { slot: 1, dci: 1 }, 1, 0));
+        assert!(!o.answered(BULK, 1, 0));
         assert!(o.finished(99).is_none());
         assert!(o.answered(CMD, 1, 0));
     }
 
     #[test]
-    fn a_transfer_matches_on_both_halves_of_its_endpoint() {
+    fn a_transfer_matches_on_its_trb_and_on_both_halves_of_its_endpoint() {
         let mut o = Outstanding::EMPTY;
-        o.submit((), Await::Transfer { slot: 3, dci: 1 }, Stages::One, 100);
-        assert!(!o.answered(Await::Transfer { slot: 3, dci: 2 }, 1, 0));
-        assert!(!o.answered(Await::Transfer { slot: 4, dci: 1 }, 1, 0));
-        assert!(o.answered(Await::Transfer { slot: 3, dci: 1 }, 1, 0));
+        o.submit((), BULK, Stages::One, 100);
+        assert!(!o.answered(Await::Transfer { slot: 3, dci: 5, trb: 0x3000 }, 1, 0));
+        assert!(!o.answered(Await::Transfer { slot: 4, dci: 4, trb: 0x3000 }, 1, 0));
+        assert!(!o.answered(Await::Transfer { slot: 3, dci: 4, trb: 0x3010 }, 1, 0));
+        assert!(o.answered(BULK, 1, 0));
+    }
+
+    /// **The defect the TRB address closes.** A transfer the driver stopped
+    /// waiting for is still the device's to answer, and the answer arrives on
+    /// the same endpoint as whatever asked next. Matching on the endpoint hands
+    /// the first transfer's completion — and its residue — to the second.
+    #[test]
+    fn a_late_completion_from_an_abandoned_transfer_answers_nobody() {
+        let mut o = Outstanding::EMPTY;
+        o.submit("abandoned", BULK, Stages::One, 100);
+        assert_eq!(o.cancel(), Some("abandoned"));
+        let next = Await::Transfer { slot: 3, dci: 4, trb: 0x3010 };
+        o.submit("the next command", next, Stages::One, 200);
+        // The abandoned transfer's completion, on the same slot and the same
+        // endpoint, carrying a residue that is not this transfer's.
+        assert!(!o.answered(BULK, CC_SUCCESS, 4096));
+        assert!(o.finished(150).is_none());
+        assert!(o.answered(next, CC_SUCCESS, 0));
+        assert_eq!(
+            o.finished(150),
+            Some(("the next command", Outcome::Transfer { code: CC_SUCCESS, residue: 0 }))
+        );
     }
 
     #[test]
@@ -315,20 +368,32 @@ mod tests {
         o.submit("recovery", Await::Command { trb: 0x2000 }, Stages::One, 200);
     }
 
-    /// The defect the stage count exists for: both completions land in one
+    /// The defect the second stage exists for: both completions land in one
     /// drain, and an operation that ended on the data stage would leave the
     /// status stage to answer whatever asked next on the same endpoint.
     #[test]
     fn a_data_stage_does_not_end_a_transfer_that_still_owes_its_status() {
         let mut o = two_stage();
-        assert!(o.answered(EP0, CC_SUCCESS, 4));
+        assert!(o.answered(EP0_DATA, CC_SUCCESS, 4));
         assert!(o.finished(0).is_none());
         assert!(o.busy());
-        assert!(o.answered(EP0, CC_SUCCESS, 0));
+        assert!(o.answered(EP0_STATUS, CC_SUCCESS, 0));
         assert_eq!(
             o.finished(0),
             Some(("descriptor", Outcome::Transfer { code: CC_SUCCESS, residue: 4 }))
         );
+    }
+
+    /// The stages are named and therefore ordered: a status stage cannot answer
+    /// the data stage the operation is still waiting for, and a data stage
+    /// cannot be counted twice.
+    #[test]
+    fn a_stage_is_answered_by_its_own_trb_and_in_its_own_order() {
+        let mut o = two_stage();
+        assert!(!o.answered(EP0_STATUS, CC_SUCCESS, 0));
+        assert!(o.answered(EP0_DATA, CC_SUCCESS, 4));
+        assert!(!o.answered(EP0_DATA, CC_SUCCESS, 4));
+        assert!(o.answered(EP0_STATUS, CC_SUCCESS, 0));
     }
 
     /// Only the data stage carries a buffer, so its residue is the one that
@@ -336,8 +401,8 @@ mod tests {
     #[test]
     fn the_residue_is_the_first_stages_and_the_code_is_the_last() {
         let mut o = two_stage();
-        assert!(o.answered(EP0, CC_SHORT_PACKET, 10));
-        assert!(o.answered(EP0, CC_SUCCESS, 999));
+        assert!(o.answered(EP0_DATA, CC_SHORT_PACKET, 10));
+        assert!(o.answered(EP0_STATUS, CC_SUCCESS, 999));
         assert_eq!(
             o.finished(0),
             Some(("descriptor", Outcome::Transfer { code: CC_SUCCESS, residue: 10 }))
@@ -345,11 +410,13 @@ mod tests {
     }
 
     /// A failing data stage halts the endpoint, so the status TRB behind it
-    /// never runs. Waiting for it spends the whole deadline learning that.
+    /// never runs. Waiting for it spends the whole deadline learning that —
+    /// and a status event the controller produces anyway belongs to nobody.
     #[test]
     fn a_failing_stage_ends_the_transfer_whatever_is_still_owed() {
         let mut o = two_stage();
-        assert!(o.answered(EP0, 6, 8));
+        assert!(o.answered(EP0_DATA, 6, 8));
+        assert!(!o.answered(EP0_STATUS, CC_SUCCESS, 0));
         assert_eq!(
             o.finished(0),
             Some(("descriptor", Outcome::Transfer { code: 6, residue: 8 }))
@@ -361,8 +428,8 @@ mod tests {
     #[test]
     fn a_failing_status_stage_is_the_answer() {
         let mut o = two_stage();
-        assert!(o.answered(EP0, CC_SUCCESS, 0));
-        assert!(o.answered(EP0, 4, 0));
+        assert!(o.answered(EP0_DATA, CC_SUCCESS, 0));
+        assert!(o.answered(EP0_STATUS, 4, 0));
         assert_eq!(
             o.finished(0),
             Some(("descriptor", Outcome::Transfer { code: 4, residue: 0 }))
@@ -372,7 +439,7 @@ mod tests {
     #[test]
     fn a_transfer_that_answers_one_stage_and_stops_is_silent() {
         let mut o = two_stage();
-        assert!(o.answered(EP0, CC_SUCCESS, 0));
+        assert!(o.answered(EP0_DATA, CC_SUCCESS, 0));
         assert_eq!(o.finished(100), Some(("descriptor", Outcome::Silent)));
     }
 }
