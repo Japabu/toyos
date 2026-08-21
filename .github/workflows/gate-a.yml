@@ -98,12 +98,36 @@ jobs:
       # where `workflow_dispatch`'s `required: true, default: '30'` always
       # populates it, so the fallback is reached only on the trigger that has
       # no other way to say 30.
+      #
+      # **`set -o pipefail`, and no `${PIPESTATUS[0]}`.** The runner logs the
+      # shell it picked for this container on every step — `shell: sh -e {0}` —
+      # and `PIPESTATUS` is a bash array that shell does not have. It answered
+      # `Bad substitution` and exited 2 *after* the gate had printed its verdict
+      # and cargo had already carried the right status out, so the exit code was
+      # 2 whatever the audio said: across every run this workflow has ever had,
+      # thirteen shard-runs printed PASS and five printed FAILED, and all
+      # eighteen reported the same red. The verdict this workflow exists to
+      # deliver may not travel through a construct the shell running it cannot
+      # expand.
+      #
+      # `pipefail` is in effect in this image, not merely accepted: `ci.yml`'s
+      # `suite` step runs it under the same `sh -e {0}` and the same
+      # `| tee`, and on 2026-08-21 it delivered a harness exit 1 to the step as
+      # exit 1 — which cannot happen unless pipefail is doing its job, because
+      # `tee`'s own 0 would otherwise be the pipeline's status. `-e` then exits
+      # on the harness's code: 0 on PASS, 1 on FAILED, 2 on a suspended host.
+      #
+      # It also fails *early* if a future image ever drops it — line 1, before
+      # the twenty-minute gate — where the construct it replaces failed on the
+      # last line wearing the costume of a verdict. Do not "make it portable"
+      # with a status file: under `-e` the left side of the pipe dies before it
+      # can record `$?`, and the step goes green on a red.
       - name: gate
         run: |
+          set -o pipefail
           cargo test --test toyos-build -- \
             --audio-gate ${{ inputs.iterations || '30' }} \
             --shard ${{ matrix.shard }}/2 --host-slots 0 2>&1 | tee /tmp/gate-a.log
-          exit "${PIPESTATUS[0]}"
 
       - name: gate sample
         if: always()

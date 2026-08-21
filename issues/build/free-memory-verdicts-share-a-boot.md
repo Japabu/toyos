@@ -108,8 +108,16 @@ claims, and one CI run broke both.
 **"`Instrument::Ci` cannot see any of this — one guest per machine, `--jobs 1`."**
 It saw it. `guest (1)` on PR #126, run `32237424649` — a pull request whose
 entire diff is two new markdown files. `main` is red at the same commit
-(`8e9f851`): the `ci` and `gate A, thorough` workflows both failed on
-2026-08-19, at 03:40Z and 03:56Z.
+(`8e9f851`): the `ci` workflow failed on 2026-08-19 at 03:40Z.
+
+> **Struck 2026-08-21.** This paragraph also named `gate A, thorough` failing at
+> 03:56Z that day. It did fail, and it was not a verdict: its step ended in
+> `exit "${PIPESTATUS[0]}"` under `sh -e {0}`, which has no such array, so every
+> run of that workflow reported `failure` whatever the audio said. Both of its
+> shards printed `[gate A] PASS` on 2026-08-19 (run `32213928799`). The `ci` half
+> is a verdict and the argument rests on it unchanged — but two failing workflows
+> was never two independent sightings. See
+> `issues/audio/thorough-tier-reds-on-unmodified-main.md`.
 
 **"green alone both times", "every one ALONE GREEN".** Not this time. The
 harness re-ran it by itself and printed:
