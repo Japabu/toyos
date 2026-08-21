@@ -61,6 +61,36 @@ A non-empty diff means the machine is running a revision that is not this one:
 either the operator step has not been run since the file changed, or somebody
 edited the machine. Neither is a state to leave.
 
+## What a trusted job can do to this machine
+
+The hook admits the job; after that the machine is the job's. GitHub's runner
+mounts `/var/run/docker.sock` into every container job — its own doing, plainly
+visible in the `docker create` line in `~/actions-runner/_diag/Worker_*.log`,
+and no workflow setting turns it off — so an admitted job can start a
+privileged container and own the host. **The container's user decides who owns
+the files a job writes, not whether a job could take the laptop.** The boundary
+is `accept-trusted.sh` and the set of people who can trigger a trusted event,
+and there is no second one.
+
+That is why the jobs run unprivileged even though it buys no isolation. The
+image carries `USER ci` at the runner's own uid (`Dockerfile`), so a job owns
+the work area and the cache entries it writes. The alternative was the shape
+this replaced: root jobs leaving trees the runner account could not clean, and
+a root `ubuntu:24.04` container started by the hook on *every* admission to
+chown them back — a per-job privileged container in the one file that must be
+readable at a glance, paying for nothing the socket had not already given away.
+
+Measured on the machine, in the image the workflows name
+(`docker run --device=/dev/kvm`, no `--user`, no `--privileged`):
+
+```
+uid=1000(ci) gid=1000(ci) groups=1000(ci),994(kvm)
+KVM_GET_API_VERSION=12
+KVM_CREATE_VM fd=4
+```
+
+`build-image.sh` re-asserts the first two lines of that on every rebuild.
+
 ## Rebuild the image
 
 From a trusted checkout on the T14:
@@ -69,10 +99,17 @@ From a trusted checkout on the T14:
 sh .github/runner/build-image.sh
 ```
 
-The script starts the loopback registry if necessary, verifies QEMU and Rust,
-pushes the tag, and prints the image reference. Copy the printed digest into
-the T14 image references in `ci.yml`, `gate-a.yml`, and `probe-green.yml`.
+The script reads the host's `kvm` gid, starts the loopback registry if
+necessary, verifies QEMU, Rust and the unprivileged shape, pushes the tag, and
+prints the image reference. Copy the printed digest into the four T14 image
+references — two in `ci.yml`, one each in `gate-a.yml` and `probe-green.yml`.
 Never replace those digest references with a moving tag.
+
+A machine whose `/dev/kvm` carries a different gid needs its own build: the gid
+is baked into the image because that is the only place Docker will apply a
+supplementary group from. Getting it wrong does not fail loudly by itself, so
+`.github/instrument.sh` opens `/dev/kvm` when the node is present and reds if
+it cannot — the alternative is a suite that quietly emulates.
 
 ## Inspect storage
 

@@ -133,7 +133,7 @@ jobs:
     # with no chmod: the node ships `crw-rw---- root:kvm` and root opens it.
     # `kvm_usable` opens the device and every boot follows.
     container:
-      image: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'debian:sid' || '127.0.0.1:5000/toyos-ci@sha256:ed1b6b269e6bfe9aedd4334aaea05ee51d1c66e300c6b8fbb5a75ef5c24a241b' }}
+      image: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'debian:sid' || '127.0.0.1:5000/toyos-ci@sha256:0b31109e74af8c9a6083dc8a484ad9f0bb8d87e9e128cf58e48ccc97b16121de' }}
       options: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '--device=/dev/kvm' || '--device=/dev/kvm --volume=/home/t14/actions-runner-cache:/toyos-cache' }}
     steps:
       # Before the checkout: `actions/checkout` wants git and this image has
@@ -345,7 +345,7 @@ jobs:
     runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || 'toyos' }}
     timeout-minutes: 60
     container:
-      image: 127.0.0.1:5000/toyos-ci@sha256:ed1b6b269e6bfe9aedd4334aaea05ee51d1c66e300c6b8fbb5a75ef5c24a241b
+      image: 127.0.0.1:5000/toyos-ci@sha256:0b31109e74af8c9a6083dc8a484ad9f0bb8d87e9e128cf58e48ccc97b16121de
       options: --volume=/home/t14/actions-runner-cache:/toyos-cache
     steps:
       - name: the toolchain built

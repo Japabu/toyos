@@ -1,4 +1,15 @@
 #!/usr/bin/env bash
+# The T14 runner's job-start hook: the whole trust boundary of this appliance.
+# Actions runs it, as the runner account, before any of a job's own steps, and
+# a non-zero exit refuses the job. Everything downstream — the container, the
+# persistent build cache, the accelerator — assumes what this file admitted.
+#
+# It cannot be narrower than it is. The runner mounts /var/run/docker.sock into
+# every container job, so an admitted job is root-capable on this host no
+# matter what user its container runs as; the container user decides who owns
+# the files, not who could take the machine. `.github/runner/README.md` states
+# that plainly, and `install-hook.sh` beside this file is how an edit here
+# reaches /usr/local/libexec/toyos-runner.
 set -euo pipefail
 
 refuse() {
@@ -38,19 +49,15 @@ case "${GITHUB_EVENT_NAME:-}" in
     ;;
 esac
 
-# Container jobs create build directories as root, and cache extraction can
-# narrow inherited ACL masks back to read-only. Normalize directories after
-# admission but before checkout. Deleting a tree needs write access to every
-# parent directory; individual files need not be rewritten or traversed by
-# chown. The fixed, root-owned hook supplies the command and mounts only this
-# repository runner's work area, with networking disabled.
+# Nothing is repaired here, and that is the change worth naming. Container jobs
+# used to run as root and leave root-owned trees in the work area that the
+# runner account could neither clean nor overwrite, so this hook ran a second,
+# root, `ubuntu:24.04` container on every admission to chown them back. The
+# trusted image now carries `USER ci` at this uid
+# (`.github/runner/Dockerfile`), so a job owns what it writes and there is
+# nothing left to repair.
+#
+# The uid stays asserted: the image's user is fixed at 1000, and a runner
+# account that is not that uid would write a work area its own jobs cannot
+# touch — one line here instead of that failure spread across a suite.
 [[ "$(id -u)" == 1000 ]] || refuse "runner uid is no longer the configured 1000"
-runner_work=/home/t14/actions-runner/_work
-if [[ -d "$runner_work" ]]; then
-  /usr/bin/docker run --rm --network none \
-    --volume "$runner_work:/work" \
-    ubuntu:24.04 \
-    find /work/ToyOS /work/_temp -type d \
-      -exec chown 1000:1000 '{}' + \
-      -exec chmod u+rwx '{}' +
-fi

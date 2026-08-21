@@ -27,7 +27,7 @@ jobs:
       matrix:
         rep: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     container:
-      image: 127.0.0.1:5000/toyos-ci@sha256:ed1b6b269e6bfe9aedd4334aaea05ee51d1c66e300c6b8fbb5a75ef5c24a241b
+      image: 127.0.0.1:5000/toyos-ci@sha256:0b31109e74af8c9a6083dc8a484ad9f0bb8d87e9e128cf58e48ccc97b16121de
       options: --device=/dev/kvm --volume=/home/t14/actions-runner-cache:/toyos-cache
     steps:
       - name: deps
