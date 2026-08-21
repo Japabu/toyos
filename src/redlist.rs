@@ -2303,6 +2303,27 @@ pub const KNOWN_RED: &[Red] = &[
         source: "issues/build/the-duration-profile-is-enforced-where-it-was-not-measured.md",
         measured: "2026-08-21",
     },
+    // One observation, so `Seen` and not a rate: the harness re-ran it alone and
+    // it passed, and its own verdict line declined to call that a
+    // classification. The row is here because a `<symbol unread: …>` stopped
+    // being routine weather when `reap_poisoned` stopped taking the process
+    // table on every idle trip, so the next reader of this name gets the
+    // mechanism instead of `NOT ON THE LIST`.
+    Red {
+        test: "panic_recovery",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`the crash report could not read a symbol it was asked for, so a bare address \
+               in it is a lost race and not a verdict: 0x100000072ce <symbol unread: the \
+               process table was held>` — one frame of one report, at an address cpu1's own \
+               report had resolved by name (`_start+0xe`) three milliseconds earlier, while \
+               cpu1 was itself in the panic path",
+        evidence: "the T14 1/1 `guest` lane of run 32527751613 (job 96913340222, PR #204, \
+                   2026-08-21 21:25Z), whose re-run alone was green",
+        source: "issues/panic-path/a-crash-report-conceded-a-frame-to-a-concurrent-one.md",
+        measured: "2026-08-21",
+    },
 ];
 
 // ---------------------------------------------------------------------------
