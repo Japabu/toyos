@@ -408,6 +408,9 @@ pub struct SounddWindow {
     /// `worst_irq_late_us + worst_pickup_us == max_wake_lat_us`, up to the
     /// truncation each half takes on its way to microseconds.
     pub worst: WorstWake,
+    /// Wakes in this window a whole device period or more past their grid
+    /// point — how many stalls the maximum is the maximum *of*.
+    pub late_wakes: u32,
 }
 
 /// soundd's decomposition of its worst wake, carried through the harness so a
@@ -437,6 +440,9 @@ pub struct SounddCounters {
     pub underruns: u32,
     pub submitted: u32,
     pub wakes: u32,
+    /// Summed over the run's windows: how many wakes were a whole period or
+    /// more late, which is what separates one stall from a thousand.
+    pub late_wakes: u32,
     pub max_batch: u32,
 }
 
@@ -462,7 +468,7 @@ fn strip_kernel_logging(serial: &str) -> String {
 
 const STATS_MARKER: &str = "soundd: wakes=";
 /// soundd's stats fields, in the order it prints them.
-const STATS_KEYS: [&str; 12] = [
+const STATS_KEYS: [&str; 13] = [
     "wakes",
     "completions",
     "submitted",
@@ -478,6 +484,7 @@ const STATS_KEYS: [&str; 12] = [
     "worst_pickup_us",
     "worst_empty",
     "worst_batch",
+    "late_wakes",
 ];
 
 /// Read `key=<digits>` at or after `from`, tolerating a foreign line spliced
@@ -534,6 +541,7 @@ pub fn parse_soundd_counters(serial: &str) -> Result<SounddCounters, String> {
                 empty: vals[10] as u32,
                 batch: vals[11] as u32,
             },
+            late_wakes: vals[12] as u32,
         };
         out.windows += 1;
         // The decomposition travels with the maximum it decomposes: `>=` so
@@ -548,6 +556,7 @@ pub fn parse_soundd_counters(serial: &str) -> Result<SounddCounters, String> {
         out.underruns += w.underruns;
         out.submitted += w.submitted;
         out.wakes += w.wakes;
+        out.late_wakes += w.late_wakes;
     }
     Ok(out)
 }

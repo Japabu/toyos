@@ -51,6 +51,16 @@ pub struct MixStats {
     /// Wakes since the last completion that found none. Working state, not a
     /// field of the report; published as [`WorstWake::empty`].
     empty_run: u32,
+    /// How many wakes in this window were a whole device period or more past
+    /// the grid point they armed on.
+    ///
+    /// **The maximum alone cannot say whether a window held one stall or a
+    /// thousand**, and those are different defects: one is an event that
+    /// happened to the machine, a thousand is a pipeline that never keeps its
+    /// grid. A period is the threshold because it is the step the grid is made
+    /// of — a wake later than one has cost the pipeline a whole period of its
+    /// margin, and one shorter has cost it none.
+    pub late_wakes: u32,
     pub max_batch: u32,
     /// Free buffers left unfilled because a streaming client was still
     /// producing the period that belongs in them (§5.10) — an activity signal,
@@ -96,10 +106,23 @@ impl MixStats {
     ///
     /// `>=` rather than `>`: a window whose worst wake is zero still gets a
     /// decomposition, and the last wake to reach the maximum owns it.
-    pub fn wake(&mut self, lateness_ns: u64, irq_late_ns: u64, pickup_ns: u64, batch: u32) {
+    ///
+    /// `period_ns` is the grid's own step, and the only thing it decides is
+    /// what counts toward [`late_wakes`](Self::late_wakes).
+    pub fn wake(
+        &mut self,
+        lateness_ns: u64,
+        irq_late_ns: u64,
+        pickup_ns: u64,
+        batch: u32,
+        period_ns: u64,
+    ) {
         if lateness_ns >= self.max_wake_lat_ns {
             self.max_wake_lat_ns = lateness_ns;
             self.worst = WorstWake { irq_late_ns, pickup_ns, empty: self.empty_run, batch };
+        }
+        if lateness_ns >= period_ns {
+            self.late_wakes += 1;
         }
         self.empty_run = 0;
     }
@@ -112,8 +135,8 @@ impl MixStats {
     /// The null sink's grid is soundd's own monotonic one: there is no device
     /// and no interrupt, so the grid point *is* the instant soundd should have
     /// run and every nanosecond past it is soundd's own.
-    pub fn wake_on_software_grid(&mut self, lateness_ns: u64) {
-        self.wake(lateness_ns, 0, lateness_ns, 1);
+    pub fn wake_on_software_grid(&mut self, lateness_ns: u64, period_ns: u64) {
+        self.wake(lateness_ns, 0, lateness_ns, 1, period_ns);
     }
 
     /// Account one period, whichever sink played it.
@@ -134,6 +157,11 @@ impl MixStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The shipped device period in nanoseconds — 256 frames at 44100 Hz, and
+    /// the step [`MixStats::late_wakes`] counts against. The wakes below are
+    /// microseconds apart precisely so none of them reaches it by accident.
+    const PERIOD: u64 = 2_902_494;
 
     /// **A period nobody was streaming through is not an underrun.** Silence
     /// before the first client has spawned its callback thread, and silence
@@ -193,8 +221,8 @@ mod tests {
     #[test]
     fn the_halves_come_from_one_wake() {
         let mut stats = MixStats::default();
-        stats.wake(9_000, 8_000, 1_000, 3);
-        stats.wake(5_000, 100, 4_900, 1);
+        stats.wake(9_000, 8_000, 1_000, 3, PERIOD);
+        stats.wake(5_000, 100, 4_900, 1, PERIOD);
         assert_eq!(stats.max_wake_lat_ns, 9_000);
         assert_eq!(stats.worst.irq_late_ns, 8_000);
         assert_eq!(stats.worst.pickup_ns, 1_000);
@@ -206,7 +234,7 @@ mod tests {
     #[test]
     fn the_halves_sum_to_the_whole() {
         let mut stats = MixStats::default();
-        stats.wake(20_000, 19_500, 500, 8);
+        stats.wake(20_000, 19_500, 500, 8, PERIOD);
         assert_eq!(stats.worst.irq_late_ns + stats.worst.pickup_ns, stats.max_wake_lat_ns);
     }
 
@@ -219,11 +247,32 @@ mod tests {
         for _ in 0..6 {
             stats.empty_wake();
         }
-        stats.wake(20_000, 19_000, 1_000, 8);
+        stats.wake(20_000, 19_000, 1_000, 8, PERIOD);
         assert_eq!(stats.worst.empty, 6);
         stats.empty_wake();
-        stats.wake(30_000, 29_000, 1_000, 8);
+        stats.wake(30_000, 29_000, 1_000, 8, PERIOD);
         assert_eq!(stats.worst.empty, 1);
+    }
+
+    /// **One stall and a thousand are different defects**, and the maximum is
+    /// the same number for both. A window of punctual wakes with one overshoot
+    /// past a period counts one; a window where every wake is past one counts
+    /// them all.
+    #[test]
+    fn a_late_wake_is_one_past_a_whole_period() {
+        let mut once = MixStats::default();
+        for _ in 0..500 {
+            once.wake(PERIOD - 1, 0, PERIOD - 1, 1, PERIOD);
+        }
+        once.wake(20 * PERIOD, 19 * PERIOD, PERIOD, 8, PERIOD);
+        assert_eq!(once.late_wakes, 1);
+
+        let mut always = MixStats::default();
+        for _ in 0..500 {
+            always.wake(PERIOD, 0, PERIOD, 1, PERIOD);
+        }
+        assert_eq!(always.late_wakes, 500);
+        assert_eq!(always.max_wake_lat_ns, once.max_wake_lat_ns / 20);
     }
 
     /// The null sink has no interrupt to be late, so all of its lateness is
@@ -231,7 +280,7 @@ mod tests {
     #[test]
     fn a_software_grid_blames_only_itself() {
         let mut stats = MixStats::default();
-        stats.wake_on_software_grid(7_000);
+        stats.wake_on_software_grid(7_000, PERIOD);
         assert_eq!(stats.worst.irq_late_ns, 0);
         assert_eq!(stats.worst.pickup_ns, 7_000);
         assert_eq!(stats.max_wake_lat_ns, 7_000);

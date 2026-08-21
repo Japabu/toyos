@@ -36,11 +36,11 @@ const STATS_INTERVAL_NANOS: u64 = 2_000_000_000;
 /// effect and stays here. `#106`'s status tool reads one shape, so the null
 /// sink prints the same line.
 fn report(stats: &MixStats, clients: usize) {
-    say!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={} deferred={} starve_max={} worst_irq_late_us={} worst_pickup_us={} worst_empty={} worst_batch={}",
+    say!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={} deferred={} starve_max={} worst_irq_late_us={} worst_pickup_us={} worst_empty={} worst_batch={} late_wakes={}",
         stats.wakes, stats.completions, stats.submitted, stats.underruns, stats.drains,
         stats.max_wake_lat_ns / 1_000, stats.max_batch, clients, stats.deferred,
         stats.starve_max, stats.worst.irq_late_ns / 1_000, stats.worst.pickup_ns / 1_000,
-        stats.worst.empty, stats.worst.batch);
+        stats.worst.empty, stats.worst.batch, stats.late_wakes);
 }
 
 /// Signal every client before the wait so priority inheritance can fill their
@@ -369,6 +369,7 @@ pub(crate) fn mix_thread(
                     irq_at.saturating_sub(t_est),
                     seen_at.saturating_sub(irq_at),
                     wake_completions,
+                    period_nanos,
                 );
             }
             if !streams.is_empty() {
@@ -700,7 +701,7 @@ pub(crate) fn null_sink_thread(
                 break;
             }
             let lateness = now.saturating_sub(next_period_ns);
-            stats.wake_on_software_grid(lateness);
+            stats.wake_on_software_grid(lateness, period_nanos);
 
             mix_f32.fill(0.0);
             let mut any_data = false;
