@@ -443,8 +443,11 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("boot_partition_identity", Sched::Parallel, Tier::Fast),
     ("double_fault_stack", Sched::Parallel, Tier::Fast),
     // Its own boot, its own feature, and it drives the guest only through
-    // stdin — nothing it touches is shared with another test.
-    ("idle_stack_guard", Sched::Parallel, Tier::Nightly),
+    // stdin — nothing it touches is shared with another test. Returned to
+    // Fast on 2026-08-21: the 2026-08-17 drain fix took it from 52,822 ms to
+    // a measured 5,049 ms on KVM (nightly run 32444411794), exactly the
+    // crossing its relegation record said the next nightly would decide.
+    ("idle_stack_guard", Sched::Parallel, Tier::Fast),
     // Its own boot and its own feature, and it deafens one CPU for 400 ms —
     // but the deafening is a *window*, and the verdict is whether the NMI is
     // answered inside `NMI_BUDGET_NS`, which is one millisecond. That is a
@@ -452,8 +455,11 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // probe missed the window and reported the NMI as never delivered, which
     // reads exactly like the defect it hunts, and it was green alone in the
     // same run and three times after it. Serial by the default rule — a
-    // verdict that is a duration does not go in the parallel phase.
-    ("dump_nmi_probe", Sched::Serial, Tier::Nightly),
+    // verdict that is a duration does not go in the parallel phase. Returned
+    // to Fast on 2026-08-21: the 2026-08-17 drain fix took it from 24,625 ms
+    // to a measured 6,284 ms on KVM (nightly run 32444411794), the return its
+    // relegation record called the likeliest in the table.
+    ("dump_nmi_probe", Sched::Serial, Tier::Fast),
     ("diskless_boot", Sched::Parallel, Tier::Fast),
     // Every verdict is a line of text or a device property, and no clock is in
     // any of them.
@@ -566,7 +572,9 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("keyboard_claim_close_spares_stdin", Sched::Parallel, Tier::Fast),
     // One boot that stops dead in phase 3, read for what it managed to say.
     ("pre_idle_wedge_speaks", Sched::Parallel, Tier::Fast),
-    ("i8042_health", Sched::Parallel, Tier::Nightly),
+    // Returned to Fast 2026-08-21: 47,121 ms relegated, 9,509 ms measured on
+    // nightly run 32444411794 after the i8042 pacing fix.
+    ("i8042_health", Sched::Parallel, Tier::Fast),
     // And one from here to `i8042_mouse` (`I8042_TRACE`), which is why all
     // three carry the answer the last of them needs.
     //
@@ -632,8 +640,10 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // ceiling, which the guest spends and the host never measures.
     ("blocked_dump", Sched::Parallel, Tier::Fast),
     // Two boots of one machine compared on the guest's own `Boot: complete`
-    // with a 300 ms allowance, which is the whole assertion.
-    ("i8042_absent", Sched::Serial, Tier::Nightly),
+    // with a 300 ms allowance, which is the whole assertion. Returned to Fast
+    // 2026-08-21: 10,410 ms relegated, 9,221 ms measured on nightly run
+    // 32444411794; its standing redlist row is the rate its reds are read at.
+    ("i8042_absent", Sched::Serial, Tier::Fast),
     // The fault quarantines (masks) the controller's GSI within milliseconds
     // of readiness — confirmed from the serial log, before a host round trip
     // could land anything — so no sentinel can ever reach the guest and the
