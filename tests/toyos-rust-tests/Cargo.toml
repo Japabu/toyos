@@ -8,8 +8,8 @@ license = "MIT OR Apache-2.0"
 toyos-abi = { path = "../../toyos-abi" }
 toyos = { path = "../../toyos" }
 window = { path = "../../userland/window" }
-libloading = { git = "https://github.com/Japabu/rust_libloading", branch = "toyos" }
-cpal = { git = "https://github.com/Japabu/cpal", branch = "toyos" }
+libloading = { git = "https://github.com/ToyOSOrg/rust_libloading", branch = "toyos" }
+cpal = { git = "https://github.com/ToyOSOrg/cpal", branch = "toyos" }
 
 # Separate workspace from userland/, so it needs its own redirects: the forks
 # above depend on ToyOS crates by version, and only a patch maps those to the

@@ -42,19 +42,19 @@ toyos = { path = "../toyos" }
 window = { path = "window" }
 
 # Ecosystem forks — see forks.toml for upstream base, tier, and PR status.
-getrandom = { git = "https://github.com/Japabu/getrandom", branch = "toyos-0.2", package = "getrandom" }
-getrandom_03 = { git = "https://github.com/Japabu/getrandom", branch = "toyos-0.3", package = "getrandom" }
-getrandom_04 = { git = "https://github.com/Japabu/getrandom", branch = "toyos-0.4", package = "getrandom" }
-mio = { git = "https://github.com/Japabu/mio", branch = "toyos" }
-tokio = { git = "https://github.com/Japabu/tokio", branch = "toyos" }
-russh = { git = "https://github.com/Japabu/russh", branch = "toyos" }
-russh-cryptovec = { git = "https://github.com/Japabu/russh", branch = "toyos" }
-socket2 = { git = "https://github.com/Japabu/socket2", branch = "toyos" }
-raw-window-handle = { git = "https://github.com/Japabu/raw-window-handle", branch = "toyos" }
-cpal = { git = "https://github.com/Japabu/cpal", branch = "toyos" }
-softbuffer = { git = "https://github.com/Japabu/softbuffer", branch = "toyos" }
-winit = { git = "https://github.com/Japabu/winit", branch = "toyos" }
-libloading = { git = "https://github.com/Japabu/rust_libloading", branch = "toyos" }
+getrandom = { git = "https://github.com/ToyOSOrg/getrandom", branch = "toyos-0.2", package = "getrandom" }
+getrandom_03 = { git = "https://github.com/ToyOSOrg/getrandom", branch = "toyos-0.3", package = "getrandom" }
+getrandom_04 = { git = "https://github.com/ToyOSOrg/getrandom", branch = "toyos-0.4", package = "getrandom" }
+mio = { git = "https://github.com/ToyOSOrg/mio", branch = "toyos" }
+tokio = { git = "https://github.com/ToyOSOrg/tokio", branch = "toyos" }
+russh = { git = "https://github.com/ToyOSOrg/russh", branch = "toyos" }
+russh-cryptovec = { git = "https://github.com/ToyOSOrg/russh", branch = "toyos" }
+socket2 = { git = "https://github.com/ToyOSOrg/socket2", branch = "toyos" }
+raw-window-handle = { git = "https://github.com/ToyOSOrg/raw-window-handle", branch = "toyos" }
+cpal = { git = "https://github.com/ToyOSOrg/cpal", branch = "toyos" }
+softbuffer = { git = "https://github.com/ToyOSOrg/softbuffer", branch = "toyos" }
+winit = { git = "https://github.com/ToyOSOrg/winit", branch = "toyos" }
+libloading = { git = "https://github.com/ToyOSOrg/rust_libloading", branch = "toyos" }
 
 
 # The one profile every guest binary is built with.
