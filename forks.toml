@@ -48,7 +48,7 @@
 # `not_pr_content` records. `toyos` is the branch every [patch] entry consumes.
 
 [meta]
-owner = "Japabu"
+owner = "ToyOSOrg"
 branch = "toyos"
 # Local dev: clone a fork next to the monorepo and add a path override in
 # .cargo/config.toml for the duration; the committed [patch] entries always

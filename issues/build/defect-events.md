@@ -117,3 +117,18 @@ ledger was written.
   bit W^X depends on. Whoever placed this row in the brief holds the citation
   this entry is missing; append it here rather than re-deriving it once
   found.
+
+## 2026-08-21
+
+- **`i8042_absent` returned to Fast on one calm sample** — origin: introduced
+  (PR #186, the orchestrator reading nightly run 32444411794's 9,221 ms as a
+  Cost row crossing back). discoverer: automated gate (the `durations` gate on
+  the first two merge-queue compositions after it merged, runs 32475363422
+  and 32476143292, both measuring 10,738 ms). escape boundary: `main`, for
+  about ninety minutes — merged 2026-08-21T10:29:58Z, every queue entry
+  bounced until the reclassification landed. The test's verdict is a 300 ms
+  wall-clock comparison and its price straddles the line (10,410 / 9,221 /
+  10,738); it was `TimerAnchored` all along. Same-day lesson: a relegation
+  table's cost rule invites back whatever one quiet nightly prices under the
+  line, and `tests/CLAUDE.md`'s "a widened bound is a finding" has a mirror —
+  a narrowed one is too.
