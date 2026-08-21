@@ -594,8 +594,26 @@ jobs:
   #
   # GitHub-hosted: it downloads artifacts and runs one host-side command, so
   # the T14 would lend it nothing and lose its only lane while it ran.
+  #
+  # **The profile has one instrument, so only that instrument renders the
+  # verdict.** `tests/test-durations` is what twelve hosted shards measured;
+  # since `route.yml` every trusted event's lane is one partition on the T14,
+  # which does not price the same tests alike, and the name that crosses the
+  # line rotates run to run — four consecutive T14 lanes reded four different
+  # names, one of them on a pull request that changed a Markdown file and a
+  # `const` array row. So on a T14 lane this job still merges, still reports and
+  # still uploads the measured artifact, and prints the price verdict as a
+  # warning instead of failing on it; a merge-queue ref and a fork's pull
+  # request are hosted, the profile is true there, and the queue is required
+  # before `main` moves. `src/durations.rs`'s module header carries the
+  # measurements. Nothing about correctness moves: the T14 lane's suite run
+  # gates every test's verdict exactly as before, and every refusal
+  # `--merge-durations` raises that is *not* the price verdict — a duplicate
+  # execution label, a short shard set, an erased Fast label, a committed
+  # `UNMEASURED` marker past its one bought run — still reds here on either
+  # machine.
   durations:
-    needs: [guest]
+    needs: [route, guest]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -627,6 +645,13 @@ jobs:
       # finding. A *green* `guest` with no measurement is refused, since that
       # combination would be a false green in the ten-second gate.
       - name: merge durations
+        env:
+          # Where this run's guest lane ran, read from the one place that
+          # decided it — the same output `guest` keyed its `runs-on`, its matrix
+          # and its shard count on. Not `runner.name`: this job is
+          # GitHub-hosted on every event, so its own runner answers about the
+          # wrong machine entirely.
+          GUEST_LANE_TRUSTED: ${{ needs.route.outputs.trusted }}
         run: |
           set -o pipefail
           if ! ls /tmp/durations/*/test-durations.shard-* >/dev/null 2>&1; then
@@ -654,7 +679,12 @@ jobs:
             fi
             exit 0
           fi
-          cargo run -- --merge-durations /tmp/durations 2>&1 | tee /tmp/merged.log
+          # The report is the half that is true on both machines — the
+          # critical-path line, the unpriced and unrun names, the merged
+          # artifact — so it is written whether or not the merge refused, which
+          # is why the status is caught here instead of ending the step.
+          status=0
+          cargo run -- --merge-durations /tmp/durations 2>&1 | tee /tmp/merged.log || status=$?
           {
             echo "### the duration profile"
             echo ""
@@ -667,6 +697,38 @@ jobs:
               echo "  then \`cargo run -- --merge-durations <dir>\`."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" = 0 ]; then
+            exit 0
+          fi
+
+          # The price verdict and nothing else. `VERDICT` is
+          # `src/durations.rs`'s `TIER_DISAGREEMENT`, which `src/ci.rs` holds
+          # against this file so the wording cannot move here in silence;
+          # `PROVISIONAL` is the committed-`UNMEASURED` refusal that shares that
+          # first line and is a fact about the tree rather than about machine
+          # speed. A refusal this does not recognise fails the job, which is the
+          # safe direction for anything the two strings stop matching.
+          VERDICT='the merged CI profile and tier declaration disagree'
+          PROVISIONAL='may not land'
+          if [ "$GUEST_LANE_TRUSTED" = yes ] \
+             && grep -q "$VERDICT" /tmp/merged.log \
+             && ! grep -q "$PROVISIONAL" /tmp/merged.log; then
+            echo "::warning::the fast-tier duration verdict was not rendered: this run's guest"
+            echo "::warning::lane was the T14, which the profile was not measured on. The merge"
+            echo "::warning::queue's hosted run renders the verdict, and it is required to merge."
+            {
+              echo ""
+              echo "**The fast-tier verdict was not rendered on this run**: measured on the T14,"
+              echo "which \`tests/test-durations\` was not recorded on; the merge queue's hosted"
+              echo "run renders it. What the gate would have said:"
+              echo ""
+              echo '```'
+              sed -n "/$VERDICT/,\$p" /tmp/merged.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          exit "$status"
 
       - uses: actions/upload-artifact@v4
         if: always()
