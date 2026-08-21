@@ -186,10 +186,15 @@ mod tripwire {
     /// way, so the slack past the payload's end is byte-for-byte what an
     /// unbanded build has.
     ///
-    /// Deaths returning in one arm and not the other names the side, and the
-    /// side names the direction of the write. Deaths in neither is the
-    /// displacement reading, which [`super::sweep`] then has to confirm rather
-    /// than merely fail to refute.
+    /// **What the arms measured, 2026-08-21, and the durable half of it.**
+    /// Twelve-wide boot storms of ~7,000 boots each, `sched-tripwire` on in
+    /// every one, against a same-session unbanded baseline of 6 deaths in 7,251
+    /// boots: default bands 0/7,211, `notail` 0/7,011, `nohead` 2/7,102 — and
+    /// the default bands *with* [`super::sweep`] added 9/7,040. The absorb
+    /// reading predicted that taking the tail slack away would bring the deaths
+    /// back, and it did the opposite. **So the band width is not what governs
+    /// this class's rate; the layout it happens to produce is.** Do not read a
+    /// quiet arm here as a fix, and do not read a loud one as a regression.
     #[cfg(all(feature = "heap-band-notail", feature = "heap-band-nohead"))]
     compile_error!("heap-band-notail and heap-band-nohead are two arms of one sweep; build one");
 
@@ -216,6 +221,9 @@ mod tripwire {
     /// is fill; without one the record is the first 32 bytes above the payload.
     pub const TAIL_FILL_OFF: usize = if HEAD_MIN == 0 { RECORD } else { 0 };
     pub const TAIL_FILL: usize = TAIL - TAIL_FILL_OFF;
+    /// Every band walk here steps eight bytes and stops on `!=`, which is only
+    /// the same loop as `<` while the step divides the band.
+    const _: () = assert!(TAIL_FILL.is_multiple_of(8), "the tail band's fill is walked in words");
 
     /// Head bytes for a request of this alignment. A head band is as wide as
     /// the alignment because that is what keeps the payload aligned, and it is
@@ -287,16 +295,22 @@ mod tripwire {
         // The rest of the head band, which [`check`] deliberately skips. Only
         // here: it is `align - 32` bytes wide, 4064 of them on a kernel stack,
         // and a live site pays that on every visit.
-        if HEAD_MIN > 0 {
-            for i in 0..head - RECORD {
-                let byte = ptr.sub(head).add(i).read();
-                assert!(
-                    byte == FILL,
-                    "HEAP TRIPWIRE (dealloc): {ptr:?} was written {} bytes BELOW its {}-byte \
-                     allocation — head band byte +{i} of {} is {byte:#04x}, want {FILL:#04x}",
-                    head - i, layout.size(), head - RECORD,
-                );
-            }
+        // A `while` and not a `for` over a range, in this loop and every other
+        // band walk here: a shape whose band is zero wide makes that range
+        // empty at compile time, and an empty range is a clippy denial rather
+        // than a loop that runs no times.
+        let fill_bytes = head.saturating_sub(RECORD);
+        let mut i = 0;
+        while i < fill_bytes {
+            let byte = ptr.sub(head).add(i).read();
+            assert!(
+                byte == FILL,
+                "HEAP TRIPWIRE (dealloc): {ptr:?} was written {} bytes BELOW its {}-byte \
+                 allocation — head band byte +{i} of {fill_bytes} is {byte:#04x}, want \
+                 {FILL:#04x}",
+                head - i, layout.size(),
+            );
+            i += 1;
         }
         let record = record_ptr(ptr, layout.size());
         record.cast::<u64>().write_unaligned(0);
@@ -344,14 +358,20 @@ mod tripwire {
     /// `ptr`/`size` describe an allocation this module armed.
     pub unsafe fn check_tail_fill(ptr: *mut u8, size: usize, site: &str) {
         let fill = ptr.add(size).add(TAIL_FILL_OFF);
-        for i in 0..TAIL_FILL / 8 {
-            let word = fill.cast::<u64>().add(i).read_unaligned();
+        // `!=` and not `<`, which the `heap-band-notail` shape makes a
+        // comparison against a type's minimum and clippy denies. The step
+        // divides the band, asserted beside the constant, so the two are the
+        // same loop.
+        let mut off = 0;
+        while off != TAIL_FILL {
+            let word = fill.add(off).cast::<u64>().read_unaligned();
             assert!(
                 word == FILL_WORD,
                 "HEAP TRIPWIRE ({site}): {ptr:?} was written past its {size}-byte allocation — \
                  tail band word +{} is {word:#018x}",
-                TAIL_FILL_OFF + i * 8,
+                TAIL_FILL_OFF + off,
             );
+            off += 8;
         }
     }
 }
@@ -420,6 +440,19 @@ pub unsafe fn check_live(ptr: *mut u8, layout: Layout, site: &str) {
 /// that a panic under that lock abandons the heap with the lock held, and the
 /// report would never reach the wire. So the walk answers with a value and the
 /// panic happens outside it.
+///
+/// **This reader is not free of the machine it reads, and that is measured.**
+/// Two twelve-wide boot storms, same tree, same bands, differing only in
+/// whether this was compiled in: without it, 0 kernel deaths in 7,211 boots;
+/// with it, 9 in 7,040, which is the unbanded baseline's own rate. The chance
+/// that all nine of those events land on the swept side under one common rate
+/// is 1.8e-3. It compiles no decision, so it is not causing corruption — what
+/// it does is take `dlmalloc`'s lock on the pass path every 25 ms and hold it
+/// for a walk of every heap page, and that is enough to move the rate from
+/// "does not happen" to "happens". `sched::driver`'s `sched-tripwire` shadow
+/// has the same shape and the same unexplained 7.2x. **A kernel carrying this
+/// is not the kernel a rate was measured on**; hold the instrument set fixed
+/// across any two arms that are being compared.
 #[cfg(feature = "heap-sweep")]
 pub fn sweep(site: &str) {
     SWEPT.0.fetch_add(1, Ordering::Relaxed);
@@ -655,21 +688,25 @@ unsafe fn inspect(found: Found) -> Option<Bad> {
     // overrun lands in, and neither is read anywhere else for an allocation
     // that is never freed.
     let tail = payload.add(size).add(tripwire::TAIL_FILL_OFF);
-    for i in 0..tripwire::TAIL_FILL / 8 {
-        let word = tail.cast::<u64>().add(i).read_unaligned();
+    // `!=` for `check_tail_fill`'s reason.
+    let mut off = 0;
+    while off != tripwire::TAIL_FILL {
+        let word = tail.add(off).cast::<u64>().read_unaligned();
         if word != tripwire::FILL_WORD {
-            return bad("the tail band", tripwire::TAIL_FILL_OFF + i * 8, word);
+            return bad("the tail band", tripwire::TAIL_FILL_OFF + off, word);
         }
+        off += 8;
     }
-    if tripwire::HEAD_MIN > 0 {
-        let head = tripwire::head(align);
-        let bottom = payload.sub(head);
-        for i in 0..(head - tripwire::RECORD) / 8 {
-            let word = bottom.cast::<u64>().add(i).read_unaligned();
-            if word != tripwire::FILL_WORD {
-                return bad("the head band", i * 8, word);
-            }
+    let head = tripwire::head(align);
+    let bottom = payload.sub(head);
+    let fill_bytes = head.saturating_sub(tripwire::RECORD);
+    let mut off = 0;
+    while off < fill_bytes {
+        let word = bottom.add(off).cast::<u64>().read_unaligned();
+        if word != tripwire::FILL_WORD {
+            return bad("the head band", off, word);
         }
+        off += 8;
     }
     None
 }

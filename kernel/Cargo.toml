@@ -171,6 +171,13 @@ heap-tripwire = []
 # boot, so its band is never read at all. A write the bands absorb and a write
 # they displace look identical. This reads them, every 25 ms of guest time, and
 # turns "no band fired" into either a named victim or a real negative.
+#
+# **And it is itself an amplifier, measured.** Same tree, same bands, differing
+# only in this feature: 0 deaths in 7,211 boots without it, 9 in 7,040 with it.
+# It compiles no decision — what it does is hold `dlmalloc`'s lock on the pass
+# path for a walk of every heap page, which is the same shape as
+# `sched-tripwire`'s unexplained 7.2x. Two arms being compared must carry the
+# same instruments.
 heap-sweep = ["heap-tripwire"]
 # The two band shapes that separate absorb from displace, one side at a time.
 # `kernel/src/mm/alloc.rs`'s `tripwire` module carries the table.
@@ -181,9 +188,14 @@ heap-sweep = ["heap-tripwire"]
 # returning under it name a forward overrun. `nohead` puts the payload at the
 # bottom of its own chunk and moves the record above it, asking `dlmalloc` for
 # the same outer size as the default shape, so deaths returning under it name a
-# write below an allocation. Deaths under neither is the displacement reading,
-# and `heap-sweep` is what has to confirm that rather than merely fail to refute
-# it. The two are one experiment in two arms and refuse to build together.
+# write below an allocation. The two are one experiment in two arms and refuse
+# to build together.
+#
+# **Measured 2026-08-21, and it answered `displace`.** Against a same-session
+# unbanded baseline of 6 deaths in 7,251 boots: `notail` 0/7,011, `nohead`
+# 2/7,102, the default shape 0/7,211. Taking the tail slack away was supposed
+# to bring the deaths back and took them to zero instead, so the band width is
+# not what governs the rate — the layout it happens to produce is.
 heap-band-notail = ["heap-tripwire"]
 heap-band-nohead = ["heap-tripwire"]
 # Take the FP body out of `arch::entry`'s bracket and the declared state out of

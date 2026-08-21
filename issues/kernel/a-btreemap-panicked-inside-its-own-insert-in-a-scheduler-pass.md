@@ -377,3 +377,163 @@ own captures — so **a log emitted from inside a pass can re-enter the pass**.
 `sched-tripwire`'s own `log!` gets away with it only because a `panic!` follows
 and it never has to return. The number now lives in an atomic that nothing logs
 from where it is written.
+
+---
+
+## 2026-08-21, the separating sweep: it is displacement, and a reader that writes nothing is worth more than the bands
+
+Five arms, one host, one session, one recipe — twelve-wide `bootable.img`,
+`-smp cores=2`, `-m 2G`, q35, TCG, `snapshot=on`, each guest killed on
+`compositor: ready` or a death marker, thirty minutes each. `sched-tripwire` is
+on in every arm, so every number below is against **this session's own
+baseline** and not against the older one: `main` has moved a long way since
+`e4c2c8ff` (`arch/syscall.rs`, `object/handle.rs`, `hw.rs`, `sched/driver.rs`,
+the whole of `soundd`), and a stale baseline would have carried every
+conclusion.
+
+| arm | head band | tail band | `heap-sweep` | boots | deaths | hangs |
+|---|---|---|---|---|---|---|
+| **B2** | — | — | no | 7,251 | **6** | 19 |
+| **H′** | `max(align,32)` | 32 | no | 7,211 | **0** | 19 |
+| **W** | `max(align,32)` | 32 | **yes** | 7,040 | **9** | 30 |
+| **F** | `max(align,32)` | **0** | yes | 7,011 | **0** | 28 |
+| **R** | **0** | 64 | yes | 7,102 | **2** | 28 |
+
+B2 is the positive control and it reproduces the class: 6 in 7,251, one per
+1,208. Against that rate, H′ expects 5.97 and has none (p = 2.6 × 10⁻³), F
+expects 5.80 and has none (p = 3.0 × 10⁻³), R expects 5.88 and has two
+(p = 0.068), and W expects 5.83 and has nine (p = 0.14 the other way — the same
+rate).
+
+The hangs are not deaths and not the class: they are guests the thirty-second
+wall-clock ceiling caught, and one of the captures carries
+`[kernel 2.404 cpu0] spawn: /bin/netd`, a guest running eight times slow. Their
+count is flat across every arm, so they confound nothing.
+
+### The verdict: **displace**, and absorb is refuted as the explanation
+
+The absorb reading made one falsifiable prediction, written into this file
+before the sweep ran: *shrink the bands and the deaths return; widen them and
+they stay gone*. Arm **F** shrank the tail band to nothing — the slack past a
+payload is byte-for-byte what an unbanded build has, because `dlmalloc` rounds
+to a 16-byte granule either way — and the deaths **did not return**. They went
+to zero. And the **widest** configuration in the table, arm W, has the **most**
+deaths of any arm.
+
+There is no monotone relation between how much slack a band puts past an
+allocation and how often the class kills. Every arm that moved every allocation
+drew a different rate: +32 bytes per allocation (F) draws zero, +64 (H′) draws
+zero, +64 with the payload at the other end of its chunk (R) draws two, and +64
+with a reader added (W) draws nine. That is a layout lottery, which is what
+displacement *is*.
+
+### A band did fire, once, and it names a victim
+
+One capture in 7,040 — arm W, slot 11's 154th boot, at 530 ms:
+
+```
+HEAP TRIPWIRE (dealloc): 0xffff800002cb0000 was written past its 131072-byte
+allocation — tail band word +0 is 0xffff800002cd0010
+  kernel::mm::alloc::tripwire::disarm
+  <kernel::mm::alloc::KernelAllocator as ...GlobalAlloc>::dealloc
+  core::ptr::drop_glue::<kernel::sched::payload::KernelPayload>
+  <kernel::hw::KernelHw as toyos_sched::hw::Hw>::release
+  <toyos_sched::cpu::SchedPass<...>>::begin
+```
+
+131,072 bytes is `KERNEL_STACK_SIZE`, so the victim is a **task kernel stack**
+being freed as its task is reaped, and the dirty word sits at
+`payload + 131072` — which is exactly `stack_top`, the first word *above* the
+highest usable stack word. The value written there is `stack_top + 16`, which is
+`Chunk::to_mem` of a chunk header at `stack_top`.
+
+So a bounded, adjacent overrun does exist and the bands do catch one. It is not
+what governs the rate — one fire against fifteen deaths across the three banded
+arms — but it is the first time in this file's history that anything has named
+a *victim* rather than a downstream symptom.
+
+**The periodic sweep never fired**, in roughly 127,000 walks across arms W, F
+and R (~7,000 boots each, six to seven sweeps a boot, 344 to 498 live bands per
+walk). The one dirty band was found at `dealloc` and not by a walk, which bounds
+the write to the last 25 ms before that free.
+
+### The instrument is the amplifier, and that is now measured twice
+
+**W and H′ differ in exactly one thing: `heap-sweep`.** Same bands, same
+placement, same addresses, same everything else. H′ has zero deaths in 7,211 and
+W has nine in 7,040. Conditional on the nine events, the chance that all of them
+land in W under one common rate is (7040/14251)⁹ = **1.8 × 10⁻³**.
+
+`heap-sweep` compiles no decision. It reads bands, it maintains a table of the
+2 MiB pages `KernelPageSource` has handed out, and — this is the part that is
+not free — it takes `dlmalloc`'s lock on the pass path every 25 ms of guest time
+and holds it for a walk of every heap page. So a pure *reader* moved this class
+from "does not happen" to "happens at the baseline rate".
+
+That is the same shape as the 7.2× `sched-tripwire` amplification this file
+already records as measured and unexplained, and it is now the second
+independent instance: **instrumentation that spends time on the scheduler's pass
+path multiplies this class.** The mechanism is still not known, but the shape
+of it is now three facts rather than one — a byte-shadow copy on the pass path
+amplifies, a heap walk under the allocator's lock on the pass path amplifies,
+and neither writes anything the machine reads. Read every future arm of this
+class knowing that the instrument's *cost* is a bigger lever on the rate than
+the thing the instrument measures.
+
+None of W's nine deaths is a new failure mode: they are the class's own
+signatures — `dlmalloc::malloc` faulting on `0x43800008` (the same address the
+2026-08-20 arm B recorded), a Ring 0 fetch at `0x18`, a GP fault inside
+`sort_unstable_by_key` under `RelocationIndex::finalize`, `hashbrown` "went past
+end of probe sequence". So the sweep amplifies the existing class rather than
+introducing one.
+
+### Two claims in the entry above this one are wrong, and here is the evidence
+
+* **`dlmalloc`'s own `validate_size` does fire.** The 2026-08-21 entry argued
+  "the class is neither a mismatched free nor a double free" from the fact that
+  it never had. Arm B2 has it:
+  `dlmalloc-0.2.13/src/dlmalloc.rs:1207: assertion failed: psize <= size + max_overhead`,
+  from `__rust_dealloc` under `<kernel::vfs::Vfs>::open_backing_depth`, at
+  484 ms. A second capture has `dlmalloc.rs:873` overflowing its subtraction in
+  the treebin search. What `validate_size` actually proves when it fires is that
+  the chunk header and the `(ptr, size)` pair disagree — which a corrupted
+  header produces as readily as a mismatched free — so the conclusion may
+  survive, but the evidence it rested on does not.
+* **"No band ever fired" is no longer true**, per the capture above.
+
+### A lead nobody has followed: one victim is written the same wrong value twice
+
+Two of arm W's nine deaths are byte-identical in the one place that matters:
+
+```
+KernelSlice OOB: offset=0xffff80007cae3310 size=0xd total=0x200000
+  <kernel::drivers::xhci::XhciController>::bot+0x939
+  <kernel::drivers::xhci::XhciController>::scsi+0xe5
+```
+
+`size=0xd` is `CSW_LEN` and `total=0x200000` is the xHCI DMA region, so the
+offset is `dev.block + MSC_CSW` and **`MscDevice::block` is holding a kernel
+text address**. `MscDevice` lives inside `XhciController`'s fixed
+`msc: [MscBlock; MSC_BLOCKS]`, so this is a victim and not a cause — but the
+value is *the same in two independent boots*, which means the writer stores a
+deterministic kernel pointer at a deterministic place. Every other corrupted
+word this class has produced looked random. Whatever writes a stable
+`0xffff80007cae3310` is the narrowest thread anyone has been handed.
+
+Note also that `bot` reached line 763's `dma.subslice(dev.block + MSC_CBW, 31)`
+successfully and died on line 829's `dma.subslice(dev.block + MSC_CSW, 13)`, so
+`dev.block` changed **inside one `bot` call** — across the command phase, the
+data phase and the status phase, which is where that call waits.
+
+### What is owed now
+
+* **The rate is not a measurement of the heap.** Any arm that changes the pass
+  path's cost changes it more than the bands do. An arm that means to measure a
+  *fix* has to hold the instrument set fixed and vary only the fix.
+* **`heap-sweep` is the instrument that names victims**, and it earns a build
+  because the one band that fired named one. It found nothing in 127,000 walks,
+  so the write it is looking for either lands in a payload (where no band can
+  see it) or lands within 25 ms of a free.
+* **The `0xffff80007cae3310` written over `MscDevice::block`** is the one
+  deterministic artefact on record. Resolving that address to a symbol, and
+  finding what holds a pointer to it, is the next thing to do.
