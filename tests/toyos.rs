@@ -640,10 +640,11 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // ceiling, which the guest spends and the host never measures.
     ("blocked_dump", Sched::Parallel, Tier::Fast),
     // Two boots of one machine compared on the guest's own `Boot: complete`
-    // with a 300 ms allowance, which is the whole assertion. Returned to Fast
-    // 2026-08-21: 10,410 ms relegated, 9,221 ms measured on nightly run
-    // 32444411794; its standing redlist row is the rate its reds are read at.
-    ("i8042_absent", Sched::Serial, Tier::Fast),
+    // with a 300 ms allowance, which is the whole assertion — a real-time
+    // verdict, so Nightly as TimerAnchored. Returned to Fast for half a day
+    // on 2026-08-21 (PR #186, on one 9,221 ms nightly sample) and bounced the
+    // merge queue at 10,738 ms twice; `src/tiers.rs` carries the straddle.
+    ("i8042_absent", Sched::Serial, Tier::Nightly),
     // The fault quarantines (masks) the controller's GSI within milliseconds
     // of readiness — confirmed from the serial log, before a host round trip
     // could land anything — so no sentinel can ever reach the guest and the

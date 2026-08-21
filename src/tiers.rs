@@ -628,6 +628,23 @@ pub const RELEGATED: &[Relegated] = &[
                  line run to run. The next KVM measurements decide whether it returns to \
                  Fast.",
     },
+    // 2026-08-21, the same day it was returned: PR #186 read nightly run
+    // 32444411794's 9,221 ms as a Cost row crossing back and put it in Fast;
+    // the first two merge-queue compositions after that measured it at
+    // 10,738 ms twice (runs 32475363422, 32476143292) and the durations gate
+    // bounced every queue entry. Its history is a straddle — 10,410 / 9,221 /
+    // 10,738 — and its verdict is two boots compared within 300 ms, a real-time
+    // quantity by construction. It was never a Cost row; the return was the
+    // orchestrator's misreading, and `issues/build/defect-events.md` says so.
+    Relegated {
+        test: "i8042_absent",
+        ci_ms: 10_738,
+        why: Why::TimerAnchored,
+        guards: "A normal boot is paired with i8042=off: the latter clears the FADT bit, \
+                 exposes the floating 0xff bus refusal, and must complete within the 300 ms \
+                 comparison bound — a wall-clock verdict whose price straddles the 10,000 ms \
+                 line run to run, so no single calm sample may return it.",
+    },
 ];
 
 /// The names [`RELEGATED`] holds, which is what `tests/toyos.rs` checks its own
