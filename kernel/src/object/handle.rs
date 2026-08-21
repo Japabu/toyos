@@ -5,6 +5,15 @@
 //! no borrow into the table can outlive the guard, which is what stops a
 //! syscall holding a reference into a table another thread of the same process
 //! is editing.
+//!
+//! **A slot's generations are finite and what happens at the end of them is a
+//! security decision, not an overflow.** A handle carries twelve bits of slot
+//! and twenty of generation, so a slot has 1,048,575 lifecycles; a table that
+//! wrapped would hand the holder of an ancient handle a live object again,
+//! which is a use-after-free of authority however improbable. It does not wrap:
+//! by owner ruling of 2026-08-20 a slot at its last generation **retires**, and
+//! [`Slot`] is the shape that decision takes — a retired slot has no generation
+//! to be issued at, so no insertion path can offer one by forgetting to look.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -52,7 +61,9 @@ pub struct TableFull;
 pub enum HandleError {
     /// Out of range, or an empty slot.
     BadHandle,
-    /// The slot is live but at a later generation: this handle was closed.
+    /// The slot has moved past this handle: it was closed, or its generations
+    /// ran out and it retired. Either way the number names nothing, and it will
+    /// never name anything again.
     Stale,
     WrongType { held: &'static str, wanted: &'static str },
     /// The handle is fine and does not carry what the call needs.
@@ -204,12 +215,41 @@ impl Drop for HandleEntry {
     }
 }
 
-struct Slot {
-    /// The generation this slot is *at*. A handle naming an earlier one is
-    /// `Stale`, which is a different fact from `BadHandle` and is worth telling
-    /// a crash report apart by.
-    generation: u32,
-    entry: Option<HandleEntry>,
+/// One slot of a process's table, and there are exactly two things it can be.
+///
+/// **A retired slot carries no generation, which is what makes retirement a
+/// state rather than a check every insertion path has to remember.** A slot is
+/// issued by handing out `RawHandle::new(slot, generation)`, and `Serving` is
+/// the only place a generation exists — so a site that forgets to ask whether a
+/// slot is still allocatable has no number to hand out and does not compile.
+///
+/// The shape this replaced parked an exhausted slot at `MAX_GENERATION` and
+/// left the free list as the only thing keeping it out of circulation. That
+/// held for [`install`](HandleTable::install), which allocates from that list,
+/// and not for [`install_at`](HandleTable::install_at), which names its own
+/// slot: `dup2` onto an exhausted slot reissued it at `MAX_GENERATION` — for
+/// slot 4095 that encoding *is* `HANDLE_INVALID` — and the close after it
+/// stepped the counter to `MAX_GENERATION + 1`, whose overflowing bit
+/// `RawHandle::new` discards without panicking in any profile, putting the slot
+/// back on the free list at generation 0. Every handle the process had ever
+/// been issued for that slot named a live object again.
+enum Slot {
+    /// Issuable, at this generation. A handle naming an earlier one is `Stale`,
+    /// which is a different fact from `BadHandle` and is worth telling a crash
+    /// report apart by. `entry` says whether anything is in it: an empty
+    /// `Serving` slot is on `HandleTable::free` and a full one is not.
+    Serving { generation: u32, entry: Option<HandleEntry> },
+    /// Spent. Never issued again and never written again — the table is one
+    /// slot smaller for the rest of this process's life.
+    ///
+    /// **Owner ruling of 2026-08-20**, taken over widening the field,
+    /// randomising the token, and accepting the wrap under a stated threat
+    /// model: a handle that becomes valid again is a use-after-free of
+    /// *authority*, and one leaked slot in 4096 buys it away for good. It is
+    /// also this tree's standing instinct about a name that is spent — a
+    /// deleted syscall's number is retired and never reused
+    /// (`toyos_abi::syscall`).
+    Retired,
 }
 
 /// Handles one process may hold.
@@ -237,22 +277,32 @@ impl HandleTable {
     /// Spawn's endowment vector asks before it takes anything out of the
     /// parent's table, because a move that fails halfway has already emptied a
     /// slot the caller is about to be told nothing happened to.
+    ///
+    /// A retired slot is counted in neither term — it is in `slots` and never
+    /// in `free` — so the room it used to be is gone from this answer, which is
+    /// what "the table is one slot smaller" means at the only place anything
+    /// asks how big it is.
     pub fn has_room(&self, n: usize) -> bool {
         self.free.len() + (MAX_HANDLES - self.slots.len()) >= n
     }
 
     pub fn install(&mut self, entry: HandleEntry) -> Result<RawHandle, TableFull> {
         if let Some(slot) = self.free.pop() {
-            let s = &mut self.slots[slot as usize];
-            debug_assert!(s.entry.is_none(), "a live slot was on the free list");
-            s.entry = Some(entry);
-            return Ok(RawHandle::new(slot, s.generation));
+            // A retired slot is never pushed onto the free list and an occupied
+            // one is taken off it, so a vacancy is the one shape this holds.
+            let Slot::Serving { generation, entry: vacancy } = &mut self.slots[slot as usize]
+            else {
+                unreachable!("the free list offered a retired slot");
+            };
+            debug_assert!(vacancy.is_none(), "a live slot was on the free list");
+            *vacancy = Some(entry);
+            return Ok(RawHandle::new(slot, *generation));
         }
         if self.slots.len() >= MAX_HANDLES {
             return Err(TableFull);
         }
         let slot = self.slots.len() as u16;
-        self.slots.push(Slot { generation: 0, entry: Some(entry) });
+        self.slots.push(Slot::Serving { generation: 0, entry: Some(entry) });
         Ok(RawHandle::new(slot, 0))
     }
 
@@ -277,6 +327,12 @@ impl HandleTable {
     /// its holder does not itself redirect the slot. Anything using a handle
     /// value as a *name* — `toyos::surface::ClientId` — is relying on that
     /// narrower statement.
+    ///
+    /// **A retired slot is refused here, and this is the path that needed
+    /// saying so.** Naming the slot is the whole of what this call does, so the
+    /// free list — which is what keeps a spent slot away from `install` — stands
+    /// in front of nothing here. The word is the cap's own: a slot the table no
+    /// longer has is the same answer as a slot past the end.
     #[must_use = "the displaced entry must be dropped by the caller"]
     pub fn install_at(
         &mut self,
@@ -292,25 +348,29 @@ impl HandleTable {
         }
         while self.slots.len() <= slot_index {
             self.free.push(self.slots.len() as u16);
-            self.slots.push(Slot { generation: 0, entry: None });
+            self.slots.push(Slot::Serving { generation: 0, entry: None });
         }
         self.free.retain(|&s| s != slot);
-        let s = &mut self.slots[slot_index];
-        let displaced = s.entry.take();
-        s.entry = Some(entry);
-        Ok((RawHandle::new(slot, s.generation), displaced))
+        let Slot::Serving { generation, entry: at } = &mut self.slots[slot_index] else {
+            return Err(TableFull);
+        };
+        let displaced = at.replace(entry);
+        Ok((RawHandle::new(slot, *generation), displaced))
     }
 
-    fn slot_of(&self, h: RawHandle) -> Result<&Slot, HandleError> {
-        let slot = self.slots.get(h.slot() as usize).ok_or(HandleError::BadHandle)?;
-        if slot.generation != h.generation() {
-            return Err(HandleError::Stale);
-        }
-        Ok(slot)
-    }
-
+    /// The entry a handle names, or why it names none.
+    ///
+    /// A retired slot answers `Stale` rather than `BadHandle`: the slot is in
+    /// range and the handle is one from before it was given up, which is the
+    /// same fact about the same slot that a moved generation states.
     fn entry_of(&self, h: RawHandle) -> Result<&HandleEntry, HandleError> {
-        self.slot_of(h)?.entry.as_ref().ok_or(HandleError::BadHandle)
+        match self.slots.get(h.slot() as usize).ok_or(HandleError::BadHandle)? {
+            Slot::Retired => Err(HandleError::Stale),
+            Slot::Serving { generation, .. } if *generation != h.generation() => {
+                Err(HandleError::Stale)
+            }
+            Slot::Serving { entry, .. } => entry.as_ref().ok_or(HandleError::BadHandle),
+        }
     }
 
     /// The typed accessor.
@@ -393,37 +453,55 @@ impl HandleTable {
     /// still holds names nothing. See [`transfer`](Self::transfer).
     #[must_use = "the entry must be given back or its slot retired"]
     fn take_for_transfer(&mut self, h: RawHandle) -> Result<HandleEntry, HandleError> {
-        let slot = self.slots.get_mut(h.slot() as usize).ok_or(HandleError::BadHandle)?;
-        if slot.generation != h.generation() {
-            return Err(HandleError::Stale);
+        match self.slots.get_mut(h.slot() as usize).ok_or(HandleError::BadHandle)? {
+            Slot::Retired => Err(HandleError::Stale),
+            Slot::Serving { generation, .. } if *generation != h.generation() => {
+                Err(HandleError::Stale)
+            }
+            Slot::Serving { entry, .. } => entry.take().ok_or(HandleError::BadHandle),
         }
-        slot.entry.take().ok_or(HandleError::BadHandle)
     }
 
-    /// The handle is gone for good.
+    /// The handle is gone for good, and the slot either moves on or stops.
     ///
-    /// **A slot at the last generation is retired, never wrapped.** One leaked
-    /// slot of 4096 against a handle that silently names a different object is
-    /// not a trade; it is also what keeps `HANDLE_INVALID` unreachable, since
-    /// that encoding is slot 4095 at this generation.
+    /// **A slot at its last generation retires, never wraps** — the owner's
+    /// ruling of 2026-08-20, and the reason [`Slot::Retired`] exists rather than
+    /// a counter parked at its maximum. One leaked slot of 4096 against a handle
+    /// that silently names a different object is not a trade; it is also what
+    /// keeps `HANDLE_INVALID` unreachable, since that encoding is slot 4095 at
+    /// `MAX_GENERATION` and no slot is ever issued at that generation now.
     fn retire(&mut self, h: RawHandle) {
-        let slot = &mut self.slots[h.slot() as usize];
-        if slot.generation == RawHandle::MAX_GENERATION - 1 {
-            slot.generation = RawHandle::MAX_GENERATION;
+        let index = h.slot() as usize;
+        let spent = match &mut self.slots[index] {
+            Slot::Serving { generation, entry } => {
+                debug_assert!(entry.is_none(), "a slot still holding an entry was retired");
+                if *generation == RawHandle::MAX_GENERATION - 1 {
+                    true
+                } else {
+                    *generation += 1;
+                    false
+                }
+            }
+            Slot::Retired => unreachable!("a retired slot answered a handle"),
+        };
+        if spent {
+            self.slots[index] = Slot::Retired;
         } else {
-            slot.generation += 1;
             self.free.push(h.slot());
         }
     }
 
     /// Put an entry back at the number it was taken from.
     fn give_back(&mut self, h: RawHandle, entry: HandleEntry) {
-        let slot = &mut self.slots[h.slot() as usize];
+        let Slot::Serving { generation, entry: vacancy } = &mut self.slots[h.slot() as usize]
+        else {
+            unreachable!("a slot taken for transfer was retired under the same lock");
+        };
         debug_assert!(
-            slot.entry.is_none() && slot.generation == h.generation(),
+            vacancy.is_none() && *generation == h.generation(),
             "a slot taken for transfer was written under the same lock",
         );
-        slot.entry = Some(entry);
+        *vacancy = Some(entry);
     }
 
     /// Move `handles` out of this table into `sink`, and put every one of them
@@ -476,8 +554,11 @@ impl HandleTable {
     pub fn drain(&mut self) -> Vec<HandleEntry> {
         let mut out = Vec::new();
         for slot in &mut self.slots {
-            if let Some(entry) = slot.entry.take() {
-                out.push(entry);
+            match slot {
+                Slot::Serving { entry, .. } => out.extend(entry.take()),
+                // Nothing to give back: a slot retires on the close that has
+                // already taken its entry out.
+                Slot::Retired => {}
             }
         }
         self.free.clear();
@@ -485,8 +566,38 @@ impl HandleTable {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (RawHandle, &HandleEntry)> {
-        self.slots.iter().enumerate().filter_map(|(i, slot)| {
-            slot.entry.as_ref().map(|e| (RawHandle::new(i as u16, slot.generation), e))
+        self.slots.iter().enumerate().filter_map(|(i, slot)| match slot {
+            Slot::Serving { generation, entry } => {
+                entry.as_ref().map(|e| (RawHandle::new(i as u16, *generation), e))
+            }
+            Slot::Retired => None,
         })
+    }
+
+    /// Test actuator: put a free slot at the last generation it can be issued
+    /// at, and answer the handle its next install will carry.
+    ///
+    /// **The near-exhaustion instrument, and there is no other way to reach
+    /// this state.** A slot's counter is twenty bits, so running one out for
+    /// real is 1,048,575 close/reopen round trips against a table that answers
+    /// each in a syscall — the property under test would be gated by a test
+    /// nobody could afford to run, which is how it went ungated to begin with.
+    /// Nothing is faked: the generation is the shipped field, the install that
+    /// follows is the shipped path, and [`retire`](Self::retire) makes the
+    /// shipped decision about what it finds.
+    ///
+    /// A slot that still holds an entry is refused, so this can never invalidate
+    /// a handle its process is holding — the caller stages a slot it has just
+    /// closed, and what comes back is the number the next `install` of it
+    /// answers.
+    #[cfg(feature = "test-actuators")]
+    pub fn stage_last_generation(&mut self, slot: u16) -> Option<RawHandle> {
+        match self.slots.get_mut(slot as usize)? {
+            Slot::Serving { generation, entry: None } => {
+                *generation = RawHandle::MAX_GENERATION - 1;
+                Some(RawHandle::new(slot, *generation))
+            }
+            Slot::Serving { entry: Some(_), .. } | Slot::Retired => None,
+        }
     }
 }

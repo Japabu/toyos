@@ -87,6 +87,7 @@ toyos-fat32-check/ FAT32 checker from Microsoft's fatgen103 — the outside judg
 toyos-elf/         ELF64 decoding (no_std, no alloc, forbid(unsafe_code))
 toyos-gpt/         GPT parser (no_std, no alloc, forbid(unsafe_code))
 toyos-hda/         HDA codec decoding and output-path selection, pure
+toyos-mixer/       The mixer's decisions — samples, gain, dither, quantize — pure, corpus-certified
 toyos-pci/         MSI and MSI-X capability decoding, pure
 toyos-desktop/     Every decision the compositor makes, pure
 toyos-ld/          Custom linker
