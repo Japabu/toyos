@@ -109,11 +109,11 @@ impl HostSlots {
 /// Which tier the shared boot's 153 binaries are in.
 ///
 /// [`Tier::Fast`] because every member in the effective CI profile is at or
-/// under `toyos_build::tiers::FAST_CEILING_MS`. [`check_no_collisions`] refuses
-/// a Fast shared member with no current measurement or one over the line, so a
-/// newly discovered binary starts conservative instead of inheriting this
-/// answer silently. Declared beside [`SHARED_BLOCK`] rather than assumed, for
-/// the same reason that is declared.
+/// under `toyos_build::tiers::FAST_COMMIT_MS`. [`check_no_collisions`] refuses
+/// a Fast shared member with no current measurement or one priced without
+/// margin, so a newly discovered binary starts conservative instead of
+/// inheriting this answer silently. Declared beside [`SHARED_BLOCK`] rather
+/// than assumed, for the same reason that is declared.
 const SHARED_TIER: Tier = Tier::Fast;
 
 /// The one boot that carries every Rust and C test.
@@ -526,7 +526,9 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // every verdict is a substring of a report the guest wrote, and there is no
     // clock in any of it.
     ("reentry_names_the_first_panic", Sched::Parallel, Tier::Fast),
-    ("double_panic_names_the_fault", Sched::Parallel, Tier::Fast),
+    // Nightly 2026-08-21 by the margin rule: 9,120 ms committed, inside
+    // `FAST_COMMIT_MS`..`FAST_CEILING_MS`. Its twin above is 5,073 ms and stays.
+    ("double_panic_names_the_fault", Sched::Parallel, Tier::Nightly),
     // §9.1's conservation law across `SYS_LOG_READ`, one registered name per
     // width, and §9.2's nesting gate at one CPU. **Three names because one over
     // three boots measured 17,112 ms in CI** — over the fast tier's line, and
@@ -548,7 +550,9 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // host changes when the writers run and not whether a line is whole. It boots
     // its own machine because what it reads is the console capture, which a
     // shared boot fills with everything else.
-    ("console_line_atomicity", Sched::Parallel, Tier::Fast),
+    // Nightly 2026-08-21 by the margin rule: 8,925 ms committed, inside
+    // `FAST_COMMIT_MS`..`FAST_CEILING_MS`.
+    ("console_line_atomicity", Sched::Parallel, Tier::Nightly),
     // What the C family is allowed to conclude from the line above being whole:
     // a guest writes a daemon-shaped line into a real capture window on purpose
     // and the real comparison ignores it, with the filter turned off as the
@@ -572,9 +576,11 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("keyboard_claim_close_spares_stdin", Sched::Parallel, Tier::Fast),
     // One boot that stops dead in phase 3, read for what it managed to say.
     ("pre_idle_wedge_speaks", Sched::Parallel, Tier::Fast),
-    // Returned to Fast 2026-08-21: 47,121 ms relegated, 9,509 ms measured on
-    // nightly run 32444411794 after the i8042 pacing fix.
-    ("i8042_health", Sched::Parallel, Tier::Fast),
+    // Returned to Fast 2026-08-21 on nightly run 32444411794's 9,509 ms, then
+    // back to Nightly the same day: run 32506320411 measured 10,281 ms and the
+    // 9,509 ms it returned on is inside `FAST_COMMIT_MS`..`FAST_CEILING_MS`.
+    // The i8042 pacing fix did cut it from 47,121 ms; it did not buy margin.
+    ("i8042_health", Sched::Parallel, Tier::Nightly),
     // And one from here to `i8042_mouse` (`I8042_TRACE`), which is why all
     // three carry the answer the last of them needs.
     //
@@ -13463,6 +13469,11 @@ fn check_shard_partition(all_tests: &[TestDef]) {
 /// Missing evidence is refused rather than quietly joining Fast. The one-off
 /// measurement-branch bootstrap for a new name is recorded in the cost audit;
 /// its provisional price is never the evidence a final change lands with.
+///
+/// **The line here is `FAST_COMMIT_MS`, not `FAST_CEILING_MS`** — the price a
+/// test may be *committed* at, which is where the fast tier's margin rule bites
+/// on a registration. `validate_ci_profile` says the same of a merged
+/// measurement; two gates on one policy may not disagree about where it is.
 fn assert_fast_profile_label(
     label: &str,
     tier: Tier,
@@ -13482,10 +13493,12 @@ fn assert_fast_profile_label(
         return;
     }
     assert!(
-        measured.as_millis() <= tiers::FAST_CEILING_MS as u128,
+        measured.as_millis() <= tiers::FAST_COMMIT_MS as u128,
         "{label} is registered Fast but the committed CI profile measures it at {} ms, \
-         over the {} ms line",
+         over the {} ms price a Fast test may be committed at (the {} ms line less its \
+         margin) — relegate it or make it faster",
         measured.as_millis(),
+        tiers::FAST_COMMIT_MS,
         tiers::FAST_CEILING_MS,
     );
 }
