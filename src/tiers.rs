@@ -813,10 +813,11 @@ pub fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
             ));
         } else if ms > FAST_COMMIT_MS {
             errors.push(format!(
-                "{label} is priced at {ms} ms, inside the {FAST_COMMIT_MS}..{FAST_CEILING_MS} ms \
-                 band, and {name} remains Fast — priced without margin: relegate it or make it \
-                 faster. A price this close to the line is decided by which partition ran it, \
-                 so it reds whichever pull request measures it next"
+                "{label} is priced at {ms} ms — over the {FAST_COMMIT_MS} ms a Fast test may be \
+                 committed at and under the {FAST_CEILING_MS} ms line — and {name} remains \
+                 Fast: priced without margin, so relegate it or make it faster. A price this \
+                 close to the line is decided by which partition ran it, and reds whichever \
+                 pull request measures it next"
             ));
         }
     }
