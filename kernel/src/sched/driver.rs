@@ -164,6 +164,46 @@ fn report_pass_costs(now: Nanos) {
     crate::log!("{}", cpus().get(cpu).pass_costs().report(cpu));
 }
 
+/// How often the heap sweep walks every live band, in guest nanoseconds.
+///
+/// **Guest time and not passes**, because a pass is not a unit of anything: a
+/// loaded CPU takes thousands in the spawn burst this class dies in and an idle
+/// one takes a handful. 25 ms puts roughly a dozen sweeps inside a boot that
+/// reaches `compositor: ready` at ~600 ms, with at least one after the burst —
+/// which is where a band that was written has to be found, since the writer is
+/// long gone by then and the allocation it wrote past is never freed.
+#[cfg(feature = "heap-sweep")]
+const SWEEP_EVERY_NS: u64 = 25_000_000;
+
+#[cfg(feature = "heap-sweep")]
+static NEXT_SWEEP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Take the sweep if this CPU is the one that claims the slot.
+///
+/// **Outside `with_cpu`, deliberately and not incidentally.** The sweep takes
+/// `dlmalloc`'s lock; taking any lock inside the driver's exclusive region is
+/// what wedged four of twelve guests when the first heap tripwire logged from
+/// in there, because the log's readiness path re-enters `driver::pass`. Here
+/// there is no pass in progress and no `&mut CpuSched` alive, so a lock — and
+/// the panic a dirty band raises — is an ordinary one.
+///
+/// The claim is a compare-exchange rather than a store, so twelve CPUs coming
+/// through the same nanosecond run one sweep between them and not twelve.
+#[cfg(feature = "heap-sweep")]
+fn maybe_sweep(now: Nanos) {
+    let due = NEXT_SWEEP.load(Ordering::Relaxed);
+    if now.0 < due {
+        return;
+    }
+    if NEXT_SWEEP
+        .compare_exchange(due, now.0 + SWEEP_EVERY_NS, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    crate::mm::sweep_heap_bands("pass");
+}
+
 pub fn cpus() -> &'static CpuHandles<KMsg> {
     let ptr = CPUS.load(Ordering::Acquire);
     assert!(!ptr.is_null(), "scheduler used before sched::init");
@@ -599,6 +639,8 @@ pub fn pass(dispose: Dispose) {
     // irq drain above it.
     crate::object::drain_zero_handles();
     let now = HW.now();
+    #[cfg(feature = "heap-sweep")]
+    maybe_sweep(now);
     let action = with_cpu(|cpu| {
         let pass = SchedPass::begin(cpu, env(&PreemptOff(())), now);
         if let Some(current) = pass.cpu().running() {

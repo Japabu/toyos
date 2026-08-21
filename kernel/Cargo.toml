@@ -159,6 +159,33 @@ sched-tripwire = ["toyos-sched/tripwire"]
 # it is not in `TEST_SUITE_KERNEL_BUILDS`, so a full run pays nothing for it and
 # a boot storm asks for it by name.
 heap-tripwire = []
+# Read every live band in the heap, at a point of the kernel's choosing rather
+# than at the free that may never come. `kernel/src/mm/alloc.rs`'s `sweep`
+# carries the walk and why it needs no registry of live allocations.
+#
+# **It exists because `heap-tripwire` answered too well.** Under it the class
+# stopped happening — 7,205 boots against a rate that expected twelve deaths —
+# and *no band fired*. That silence separates nothing: a band is read at
+# `dealloc` and, for the running task's kernel stack, at every pass, and an
+# allocation live from early boot to `compositor: ready` is never freed inside a
+# boot, so its band is never read at all. A write the bands absorb and a write
+# they displace look identical. This reads them, every 25 ms of guest time, and
+# turns "no band fired" into either a named victim or a real negative.
+heap-sweep = ["heap-tripwire"]
+# The two band shapes that separate absorb from displace, one side at a time.
+# `kernel/src/mm/alloc.rs`'s `tripwire` module carries the table.
+#
+# The padding *is* the displacement, so no band can be made zero-width and keep
+# its placement — which is why the separation is per side. `notail` leaves the
+# slack past every payload byte-for-byte what an unbanded build has, so deaths
+# returning under it name a forward overrun. `nohead` puts the payload at the
+# bottom of its own chunk and moves the record above it, asking `dlmalloc` for
+# the same outer size as the default shape, so deaths returning under it name a
+# write below an allocation. Deaths under neither is the displacement reading,
+# and `heap-sweep` is what has to confirm that rather than merely fail to refute
+# it. The two are one experiment in two arms and refuse to build together.
+heap-band-notail = ["heap-tripwire"]
+heap-band-nohead = ["heap-tripwire"]
 # Take the FP body out of `arch::entry`'s bracket and the declared state out of
 # the loader's trampolines, leaving a kernel that preserves the *rest* of the
 # user machine state and nothing else — which is the kernel this tree had before

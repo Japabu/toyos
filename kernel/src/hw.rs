@@ -251,6 +251,16 @@ pub fn report_contexts(rsp: u64, subject: Option<u64>) {
     if let Some((used, of)) = crate::sched::driver::stack_high_water() {
         crate::log!("  Task kernel stacks: deepest {used} of {of} bytes");
     }
+    // What the heap sweep had covered by the time this crash happened. A death
+    // with sweeps behind it and no band fired says the write that killed it was
+    // not a bounded overrun of a live allocation; a death with none behind it
+    // says only that the sweep never ran.
+    if let Some((sweeps, records, overflowed)) = crate::mm::sweep_stats() {
+        crate::log!(
+            "  Heap sweeps: {sweeps} run, {records} live bands on the last walk{}",
+            if overflowed { ", and the page table filled — the walk is incomplete" } else { "" },
+        );
+    }
 }
 
 /// The frame `context_switch` is about to pop, when its return slot is not a
