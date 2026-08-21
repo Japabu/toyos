@@ -164,6 +164,46 @@ fn report_pass_costs(now: Nanos) {
     crate::log!("{}", cpus().get(cpu).pass_costs().report(cpu));
 }
 
+/// How often the heap sweep walks every live band, in guest nanoseconds.
+///
+/// **Guest time and not passes**, because a pass is not a unit of anything: a
+/// loaded CPU takes thousands in the spawn burst this class dies in and an idle
+/// one takes a handful. 25 ms puts roughly a dozen sweeps inside a boot that
+/// reaches `compositor: ready` at ~600 ms, with at least one after the burst —
+/// which is where a band that was written has to be found, since the writer is
+/// long gone by then and the allocation it wrote past is never freed.
+#[cfg(feature = "heap-sweep")]
+const SWEEP_EVERY_NS: u64 = 25_000_000;
+
+#[cfg(feature = "heap-sweep")]
+static NEXT_SWEEP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Take the sweep if this CPU is the one that claims the slot.
+///
+/// **Outside `with_cpu`, deliberately and not incidentally.** The sweep takes
+/// `dlmalloc`'s lock; taking any lock inside the driver's exclusive region is
+/// what wedged four of twelve guests when the first heap tripwire logged from
+/// in there, because the log's readiness path re-enters `driver::pass`. Here
+/// there is no pass in progress and no `&mut CpuSched` alive, so a lock — and
+/// the panic a dirty band raises — is an ordinary one.
+///
+/// The claim is a compare-exchange rather than a store, so twelve CPUs coming
+/// through the same nanosecond run one sweep between them and not twelve.
+#[cfg(feature = "heap-sweep")]
+fn maybe_sweep(now: Nanos) {
+    let due = NEXT_SWEEP.load(Ordering::Relaxed);
+    if now.0 < due {
+        return;
+    }
+    if NEXT_SWEEP
+        .compare_exchange(due, now.0 + SWEEP_EVERY_NS, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    crate::mm::sweep_heap_bands("pass");
+}
+
 pub fn cpus() -> &'static CpuHandles<KMsg> {
     let ptr = CPUS.load(Ordering::Acquire);
     assert!(!ptr.is_null(), "scheduler used before sched::init");
@@ -599,6 +639,8 @@ pub fn pass(dispose: Dispose) {
     // irq drain above it.
     crate::object::drain_zero_handles();
     let now = HW.now();
+    #[cfg(feature = "heap-sweep")]
+    maybe_sweep(now);
     let action = with_cpu(|cpu| {
         let pass = SchedPass::begin(cpu, env(&PreemptOff(())), now);
         if let Some(current) = pass.cpu().running() {
@@ -1100,7 +1142,88 @@ pub extern "sysv64" fn trampoline_entry() {
 
 const STACK_CANARY: u64 = 0xDEAD_BEEF_CAFE_BABE;
 
+/// What every untouched word of a task's kernel stack holds under
+/// `heap-tripwire`.
+///
+/// The same byte `arch::percpu` fills the idle and IST1 stacks with, for the
+/// same reason: a zero is a value a stack legitimately writes, so a zeroed
+/// stack cannot tell untouched from written and has no depth to report.
+#[cfg(feature = "heap-tripwire")]
+const STACK_FILL: u8 = 0xA5;
+#[cfg(feature = "heap-tripwire")]
+const STACK_FILL_WORD: u64 = u64::from_ne_bytes([STACK_FILL; 8]);
+
+/// The layout `alloc_kernel_stack` asks for, named once so the tripwire reads
+/// back the bands that request was given.
+#[cfg(feature = "heap-tripwire")]
+fn stack_layout() -> core::alloc::Layout {
+    core::alloc::Layout::from_size_align(KERNEL_STACK_SIZE, 4096)
+        .expect("the kernel stack layout")
+}
+
+/// Rungs of the depth ladder, in bytes above the bottom of the stack.
+///
+/// Descending, so the depths they report *ascend*: a word at `bottom + rung`
+/// that is no longer [`STACK_FILL_WORD`] says the stack reached within `rung`
+/// of its own bottom, which is `KERNEL_STACK_SIZE - rung` bytes used. Touched
+/// is monotone up the stack, so the first rung still holding fill ends the
+/// walk and the one before it is the high water.
+///
+/// **Read rather than walked.** The exact depth is a `partition_point` over
+/// 16,384 words, and this runs on every pass — which `kernel/CLAUDE.md` says is
+/// an audio change. Nine volatile reads bound the high water to a band, which
+/// is what the question needs: a stack that never leaves the top 16 KiB is not
+/// what is writing the heap, and one that reaches the bottom 4 KiB is.
+#[cfg(feature = "heap-tripwire")]
+const DEPTH_RUNGS: [usize; 9] = [
+    124 * 1024, 120 * 1024, 112 * 1024, 96 * 1024, 64 * 1024,
+    32 * 1024, 16 * 1024, 8 * 1024, 4 * 1024,
+];
+
+/// The deepest any task kernel stack has been, in bytes used.
+///
+/// **An atomic that is never logged from where it is written.** The first draft
+/// of this logged the high water the moment it rose, from inside
+/// `check_stack_canary` — which runs inside `with_cpu`'s exclusive region — and
+/// **four of the first twelve-wide storm arm's guests wedged**, every one of
+/// them in the spawn burst with the previously-logged rung as its last line,
+/// and every one recorded as a hang rather than a panic. `sched-tripwire`'s
+/// three arms had no hang between them. `crate::log!` is not a leaf: the log's
+/// own readiness path reaches `driver::pass` — `post_readiness+0x98` above
+/// `pass+0x94` is in one of the captures this class is built from — so a log
+/// emitted from inside a pass can re-enter the pass. `sched-tripwire`'s own
+/// `log!` gets away with it only because a `panic!` follows it and it never has
+/// to return. The number is read by [`stack_high_water`] from the crash report
+/// instead, which is the channel a storm reads anyway.
+#[cfg(feature = "heap-tripwire")]
+static DEEPEST: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The deepest any task kernel stack has been and the stack it is measured
+/// against, or `None` from a kernel that carries no ladder.
+///
+/// For `hw::report_contexts`, which runs on every kernel crash. A `Some(0)` is
+/// a reading and not an absence: it says no task stack ever reached the
+/// shallowest rung, which is 4 KiB used.
+#[cfg(feature = "heap-tripwire")]
+pub fn stack_high_water() -> Option<(usize, usize)> {
+    Some((DEEPEST.load(Ordering::Relaxed), KERNEL_STACK_SIZE))
+}
+
+/// See the `heap-tripwire` arm above. A kernel without the ladder has no
+/// reading to report, which is not the same as a reading of zero.
+#[cfg(not(feature = "heap-tripwire"))]
+pub fn stack_high_water() -> Option<(usize, usize)> {
+    None
+}
+
 pub fn write_stack_canary(stack: &OwnedAlloc) {
+    // Painted before the canary word, so the canary survives the fill rather
+    // than the other way round.
+    //
+    // SAFETY: `stack` is a fresh `OwnedAlloc::new(KERNEL_STACK_SIZE, 4096)`
+    // that nothing else has seen yet, so this writes exactly its own bytes.
+    #[cfg(feature = "heap-tripwire")]
+    unsafe { core::ptr::write_bytes(stack.ptr(), STACK_FILL, KERNEL_STACK_SIZE) };
     unsafe { *(stack.ptr() as *mut u64) = STACK_CANARY };
 }
 
@@ -1112,6 +1235,40 @@ fn check_stack_canary(payload: &KernelPayload) {
             payload.id.1, canary, STACK_CANARY
         );
     }
+    #[cfg(feature = "heap-tripwire")]
+    stack_depth(payload);
+}
+
+/// The heap bands around this task's kernel stack, and how deep it has been.
+///
+/// **Both ends, which is what makes a red say when.** The canary above is one
+/// word at the bottom of the usable stack and it is read at every pass already;
+/// what it cannot see is a frame that stepped *over* it — a `memcpy` at a
+/// computed offset, a red zone — and what nothing here could see before is a
+/// stack that ran off its bottom into the neighbouring chunk. Under
+/// `heap-tripwire` there is no neighbouring chunk to reach: 4096 bytes of head
+/// band stand between, and the four words of it that sit immediately below the
+/// lowest usable stack word — the first thing an overflow writes — are read
+/// here, with the tail band's four for company.
+#[cfg(feature = "heap-tripwire")]
+fn stack_depth(payload: &KernelPayload) {
+    let bottom = payload.kernel_stack.ptr();
+    // SAFETY: the running task's own stack, allocated by `alloc_kernel_stack`
+    // with exactly `stack_layout()`. It is running on this CPU, so nothing is
+    // freeing it.
+    unsafe { crate::mm::check_heap_bands(bottom, stack_layout(), "kernel stack") };
+    let mut used = 0;
+    for rung in DEPTH_RUNGS {
+        // SAFETY: `rung < KERNEL_STACK_SIZE`, so this reads a word of that
+        // same stack.
+        let word = unsafe { core::ptr::read_volatile(bottom.add(rung).cast::<u64>()) };
+        if word == STACK_FILL_WORD {
+            break;
+        }
+        used = KERNEL_STACK_SIZE - rung;
+    }
+    // Recorded and not logged. See [`DEEPEST`].
+    DEEPEST.fetch_max(used, Ordering::Relaxed);
 }
 
 /// Callee-saved register save/restore. Unchanged from the old scheduler — the

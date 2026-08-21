@@ -125,6 +125,79 @@ sched-check = ["toyos-sched/check"]
 # Not a boot parameter, and the one that could not be, for `sched-check`'s
 # reason: it forwards to a dependency's cargo feature.
 sched-tripwire = ["toyos-sched/tripwire"]
+# The tripwire one layer below `sched-tripwire`: a band of known bytes on each
+# side of **every** heap allocation, read back when it is freed and, for the
+# running task's kernel stack, at every scheduler pass. `kernel/src/mm/alloc.rs`
+# carries the shape and what each side catches.
+#
+# **What it exists to separate.** `sched-tripwire` measured its subject and
+# cleared it — the `CpuSched` byte shadow fired zero times in 7,136 boots, so
+# the scheduler's own record is never written from outside and the deaths are in
+# the heap its containers hang off. This asks the heap the same question: did
+# anything write outside an allocation it owns. The head band is deliberately as
+# wide as the request's alignment, so the kernel stacks — the one heap
+# allocation this kernel runs a stack on — get 4096 bytes of it. `arch::percpu`
+# gives every *idle* stack an unmapped guard page for exactly this reason, and
+# says in its own words what the absence costs: an overflow that does not fault
+# "used to land in the heap and be found later, somewhere else, as a corrupted
+# allocation". Task kernel stacks never got one, because they come out of the
+# heap.
+#
+# Not `dlmalloc/debug`, and that is a measurement rather than a preference:
+# Doug Lea's own checker walks all 64 bins and every chunk of every segment at
+# the head of every `malloc` and `free` — O(heap) per allocation on a heap that
+# reaches several MiB, which is the right oracle at a price a TCG boot storm
+# cannot pay.
+#
+# Not a boot parameter, and the one that could not be: the bands change what
+# `GlobalAlloc::alloc` returns, so an allocation minted under one arm and freed
+# under the other is a miscomputed base address. A runtime switch would have to
+# be a branch at every allocation in the machine.
+#
+# Off by default and never on in a measured build: every allocation grows by
+# `align + 32` bytes and the pass path gains eight reads. No suite builds it —
+# it is not in `TEST_SUITE_KERNEL_BUILDS`, so a full run pays nothing for it and
+# a boot storm asks for it by name.
+heap-tripwire = []
+# Read every live band in the heap, at a point of the kernel's choosing rather
+# than at the free that may never come. `kernel/src/mm/alloc.rs`'s `sweep`
+# carries the walk and why it needs no registry of live allocations.
+#
+# **It exists because `heap-tripwire` answered too well.** Under it the class
+# stopped happening — 7,205 boots against a rate that expected twelve deaths —
+# and *no band fired*. That silence separates nothing: a band is read at
+# `dealloc` and, for the running task's kernel stack, at every pass, and an
+# allocation live from early boot to `compositor: ready` is never freed inside a
+# boot, so its band is never read at all. A write the bands absorb and a write
+# they displace look identical. This reads them, every 25 ms of guest time, and
+# turns "no band fired" into either a named victim or a real negative.
+#
+# **And it is itself an amplifier, measured.** Same tree, same bands, differing
+# only in this feature: 0 deaths in 7,211 boots without it, 9 in 7,040 with it.
+# It compiles no decision — what it does is hold `dlmalloc`'s lock on the pass
+# path for a walk of every heap page, which is the same shape as
+# `sched-tripwire`'s unexplained 7.2x. Two arms being compared must carry the
+# same instruments.
+heap-sweep = ["heap-tripwire"]
+# The two band shapes that separate absorb from displace, one side at a time.
+# `kernel/src/mm/alloc.rs`'s `tripwire` module carries the table.
+#
+# The padding *is* the displacement, so no band can be made zero-width and keep
+# its placement — which is why the separation is per side. `notail` leaves the
+# slack past every payload byte-for-byte what an unbanded build has, so deaths
+# returning under it name a forward overrun. `nohead` puts the payload at the
+# bottom of its own chunk and moves the record above it, asking `dlmalloc` for
+# the same outer size as the default shape, so deaths returning under it name a
+# write below an allocation. The two are one experiment in two arms and refuse
+# to build together.
+#
+# **Measured 2026-08-21, and it answered `displace`.** Against a same-session
+# unbanded baseline of 6 deaths in 7,251 boots: `notail` 0/7,011, `nohead`
+# 2/7,102, the default shape 0/7,211. Taking the tail slack away was supposed
+# to bring the deaths back and took them to zero instead, so the band width is
+# not what governs the rate — the layout it happens to produce is.
+heap-band-notail = ["heap-tripwire"]
+heap-band-nohead = ["heap-tripwire"]
 # Take the FP body out of `arch::entry`'s bracket and the declared state out of
 # the loader's trampolines, leaving a kernel that preserves the *rest* of the
 # user machine state and nothing else — which is the kernel this tree had before

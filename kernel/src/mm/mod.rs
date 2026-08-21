@@ -13,6 +13,19 @@ mod mmio;
 mod region;
 mod unmapped;
 
+/// Only the ladder in `sched::driver` reads a live allocation's bands, and it
+/// is behind the same feature — so exporting this unconditionally would be a
+/// name nothing in a shipping kernel can call.
+#[cfg(feature = "heap-tripwire")]
+pub use alloc::check_live as check_heap_bands;
+/// The sweep, behind its own feature for the same reason: it reads every live
+/// band in the heap, which is the only thing that tells a band that *absorbed*
+/// a stray write from one that merely *displaced* it.
+#[cfg(feature = "heap-sweep")]
+pub use alloc::sweep as sweep_heap_bands;
+/// Unconditional, because `hw::report_contexts` runs on every kernel crash and
+/// a kernel that carries no sweep answers `None` rather than failing to build.
+pub use alloc::sweep_stats;
 pub use mmio::Mmio;
 pub use region::KernelSlice;
 pub use unmapped::Unmapped;
