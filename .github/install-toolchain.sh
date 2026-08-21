@@ -63,10 +63,10 @@ link_toolchain() {
 }
 
 if [ -n "$cache" ]; then
-  case "$tag" in
-    toolchain-linux-x86_64-[0-9a-f][0-9a-f]*) ;;
-    *) echo "::error::refusing malformed toolchain cache tag: $tag"; exit 1 ;;
-  esac
+  # The same check the build-cache scripts make, and the same script making it:
+  # `$cache/toolchains/$tag` is a directory this creates and empties, so the
+  # tag is a path component and the check on it is exact.
+  TAG="$tag" sh "$(dirname "$0")/runner/cache-key.sh" check
   cache_entry="$cache/toolchains/$tag"
   stage2="$cache_entry/x86_64-unknown-linux-gnu/stage2"
   if [ -f "$cache_entry/.complete" ] && [ -x "$stage2/bin/rustc" ]; then

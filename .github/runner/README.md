@@ -98,6 +98,39 @@ KVM_CREATE_VM fd=4
 
 `build-image.sh` re-asserts the first two lines of that on every rebuild.
 
+### The residual risk, stated
+
+**The persistent cache is trusted state.** A job can write anything into
+`/home/t14/actions-runner-cache`, and the next job with the same content key
+links those bytes in as its Cargo target directory — so a malicious trusted run
+could leave a compiled artifact that a later, honest run builds against and
+ships. Nothing here detects that: a content key is about reuse, not integrity,
+and a persistent runner has no ephemeral state to fall back on. It is accepted
+because the set of accounts that can start a trusted run is the set that can
+push to this repository at all — two today, read back with
+`gh api repos/ToyOSOrg/ToyOS/collaborators --jq '.[] | [.login, .role_name]'`:
+`Japabu` (admin) and `stu214634` (write). The exit from this is an ephemeral
+runner or a signed cache, and neither exists yet.
+
+The keys are at least exact. `cache-key.sh` is the one derivation both
+`link-build-cache.sh` and `save-build-cache.sh` use, and it checks the whole
+tag rather than its first two characters.
+
+**The fork pull-request policy should be raised, and only the owner can do
+it.** It is `first_time_contributors` today:
+
+```sh
+gh api repos/ToyOSOrg/ToyOS/actions/permissions/fork-pr-contributor-approval
+```
+
+so a fork pull request from anyone who has landed one commit runs workflows
+with no approval. Those runs are GitHub-hosted — `route.yml` sends them there
+and the hook refuses them regardless — so this is not a hole in the T14 today.
+It is what stands between a stranger and a second attempt at finding one, and
+`all_outside_collaborators` costs one click per genuine outside contribution.
+**Recommended, and an owner settings action: no file in this repository can
+make it.**
+
 ## Rebuild the image
 
 From a trusted checkout on the T14:

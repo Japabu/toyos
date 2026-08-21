@@ -6,22 +6,8 @@
 # trusted T14 job.
 set -eu
 
-: "${TAG:?the toolchain tag is required}"
 cache=/toyos-cache
-
-case "$TAG" in
-  toolchain-linux-x86_64-[0-9a-f][0-9a-f]*) ;;
-  *) echo "::error::refusing malformed toolchain cache tag: $TAG"; exit 1 ;;
-esac
-
-lock_hash=$(
-  git ls-files '*Cargo.lock' \
-    | LC_ALL=C sort \
-    | while IFS= read -r lock; do sha256sum "$lock"; done \
-    | sha256sum \
-    | cut -c1-16
-)
-key="guest-$TAG-$lock_hash"
+key=$(sh "$(dirname "$0")/cache-key.sh")
 root="$cache/build/$key"
 mkdir -p "$cache/cargo" "$root"
 touch "$root/.last-used"
