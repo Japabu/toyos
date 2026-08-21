@@ -293,38 +293,13 @@ pub const RELEGATED: &[Relegated] = &[
                  threshold lies between the measured 89% whole-window repaint and 0.46% \
                  clock update.",
     },
-    Relegated {
-        test: "idle_stack_guard",
-        ci_ms: 52_822,
-        why: Why::Cost,
-        guards: "The guard page under every per-CPU idle stack. Its absence is invisible \
-                 to every log line and every screendump — an overflow rewrote whatever the \
-                 allocator had put underneath — so the only way to ask is to touch it, and \
-                 SYS_DEBUG action 9 is the one read. **`ci_ms` is now stale on the high \
-                 side and deliberately left:** 2026-08-17 took a flat 20 s `drain_serial` \
-                 off it — the fatal path halts every CPU without QEMU exiting, so the drain \
-                 waited out its whole ceiling for a machine that would never speak again — \
-                 and the same test measures 28.5 s to 3.0 s on the dev host. Whether \
-                 that is enough to cross back is a KVM question this branch cannot answer, \
-                 so the number above is the last CI measurement and the next nightly run \
-                 replaces it.",
-    },
-    Relegated {
-        test: "dump_nmi_probe",
-        ci_ms: 24_625,
-        why: Why::Cost,
-        guards: "Ctrl+Alt+D's NMI probe: a CPU that ignores a kick is named and then asked \
-                 where it is with the one interrupt it cannot mask, with the rip it brings \
-                 back resolved against the kernel's own symbols. On the T14 the dump named \
-                 three CPUs without saying which of three causes each was. **`ci_ms` is \
-                 stale on the high side for the same reason `idle_stack_guard`'s is:** \
-                 2026-08-17 replaced its flat 20 s `drain_serial` with the two lines the \
-                 report actually owes — an NMI interrupts a CPU rather than killing it, so \
-                 the guest neither exits nor halts and the drain was paid in full on every \
-                 green run — and it measures 22.4 s to 6.0 s on the dev host. That may put \
-                 it under the line on KVM; the next nightly measurement decides, and it is \
-                 the one row here most likely to return to Fast.",
-    },
+    // 2026-08-21: `idle_stack_guard` (52,822 ms) and `dump_nmi_probe` (24,625
+    // ms) left this table — returned to Fast. Both rows had said the 2026-08-17
+    // drain fix might carry them under the line and that the next nightly KVM
+    // measurement would decide; nightly run 32444411794 measured 5,049 ms and
+    // 6,284 ms, and the durations gate refused their Nightly declarations
+    // against those labels ("belongs Fast"), which is this table's own return
+    // rule firing. `git log` on this file carries their rows.
     Relegated {
         test: "metal_sim_pointer_churn",
         ci_ms: 260_607,
@@ -475,15 +450,10 @@ pub const RELEGATED: &[Relegated] = &[
                  dropout or silent-period harm is confirmed by the second run and fails. \
                  Wake and cadence distributions remain the separate --audio-gate verdict.",
     },
-    Relegated {
-        test: "i8042_health",
-        ci_ms: 47_121,
-        why: Why::Cost,
-        guards: "Two boots distinguish untouched silence from one injected key: the quiet \
-                 report has zero interrupts and no alive/mute verdict; the active report \
-                 has nonzero interrupts, bytes and keys, and its health wake does not keep \
-                 a CPU spinning.",
-    },
+    // 2026-08-21: `i8042_health` (47,121 ms) left this table — returned to
+    // Fast on nightly run 32444411794's 9,509 ms, an honest Cost row measured
+    // under the line. The i8042 pacing fix of 2026-08-19 (PR #143) is the
+    // likely cause of the drop; its row is in `git log` on this file.
     Relegated {
         test: "kernel_log_file",
         ci_ms: 43_056,
@@ -521,18 +491,22 @@ pub const RELEGATED: &[Relegated] = &[
                  an unstamped disk byte-identical, and binds exactly the boot stick on \
                  metal-sim.",
     },
-    Relegated {
-        test: "i8042_absent",
-        ci_ms: 10_410,
-        why: Why::Cost,
-        guards: "A normal boot is paired with i8042=off: the latter clears the FADT bit, \
-                 exposes the floating 0xff bus refusal, and must complete within the 300 ms \
-                 comparison bound.",
-    },
+    // 2026-08-21: `i8042_absent` (10,410 ms, barely over) left this table —
+    // returned to Fast on nightly run 32444411794's 9,221 ms. It carries a
+    // standing redlist row, so its fast-tier reds are read against that rate
+    // and never re-run away.
     Relegated {
         test: "audio_tone",
-        ci_ms: 21_934,
-        why: Why::Cost,
+        ci_ms: 16_921,
+        // Reclassified 2026-08-21 from `Cost`: nightly run 32444411794 measured
+        // both labels under the line (8,450 + 8,471 ms) and the return rule
+        // fired — wrongly, because this row's reason was never its price. It
+        // plays a tone in real time and judges dropouts against wake-lateness
+        // ceilings: a verdict anchored to real time, `TimerAnchored` by the
+        // variant's own definition, and tests/CLAUDE.md already states both
+        // audio configs are `Tier::Nightly` as law. The `Cost` label was the
+        // 2026-08-12 sweep grading it by the number it happened to show.
+        why: Why::TimerAnchored,
         guards: "The real-time audio pipeline glitch check per config: the tone captured on \
                  one and eight CPUs is checked for dropouts against per-run wake-lateness and \
                  underrun ceilings, with a harm verdict confirmed by a second boot before it \
@@ -635,11 +609,16 @@ pub const RELEGATED: &[Relegated] = &[
     // 2026-08-19: PR #132's run measured it over the line while PR #125's run,
     // minutes apart on the same main, measured 4,774 ms — the price is the
     // partition's, not the code's, and Fast's promise has to hold under every
-    // legal partition.
+    // legal partition. 2026-08-21: nightly run 32444411794 measured 4,578 ms
+    // and the `Cost` return rule fired; reclassified instead, because a quiet
+    // nightly's number is exactly the reading this row says cannot decide it —
+    // what it measures is co-scheduling stretch, a rate, `TimerAnchored` in the
+    // variant's own terms. Returning it on one calm sample would re-import the
+    // straddle the row records.
     Relegated {
         test: "c_capture_ignores_daemon_lines",
         ci_ms: 12_612,
-        why: Why::Cost,
+        why: Why::TimerAnchored,
         guards: "A C program's capture is stripped of other processes' lines before the \
                  comparison, on the boot config's own list of who may speak, with the \
                  filter turned off as the control. Its own work is two `echo`s and string \
