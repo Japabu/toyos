@@ -12,6 +12,20 @@
 //! which tests are long, the dev host overwrites every name it measures with its
 //! own, and the file exists for the checkout that has measured nothing.
 //!
+//! **One profile, one instrument, and the profile's instrument is the hosted
+//! shards.** `tests/test-durations` holds what twelve GitHub-hosted shards
+//! measured; since `985f3834` every trusted event's guest lane is instead one
+//! 1/1 partition on the T14, which does not price the same tests alike —
+//! `main`'s tip `13953023` measured `xhci_full_speed_device` at 6,845 ms hosted
+//! and 12,156 ms on the T14 the same day, and twenty interleaved reps an arm
+//! cannot tell that tip from the tree the profile was recorded on (p = 0.42).
+//! So the tier verdict is rendered only where the profile was taken:
+//! `.github/workflows/ci.yml`'s `durations` job matches
+//! [`TIER_DISAGREEMENT`] on a T14 lane, prints it as a warning and exits 0,
+//! and the merge queue — always hosted, and required before `main` moves — is
+//! what fails on it. Every other refusal raised here is about the tree or the
+//! partition, not about machine speed, and reds on either instrument.
+//!
 //! Why a command and not a `cat`: the shards are a *partition*, and that is the
 //! property the merged file's usefulness rests on. A repeated name means two
 //! shards claimed one test or one shard ran the same label twice — the first is
@@ -33,6 +47,16 @@ use std::path::Path;
 
 /// The file name a sharded run leaves its own measurement in.
 const SHARD_PREFIX: &str = "test-durations.shard-";
+
+/// The first line of the refusal this raises when the measured profile and
+/// `src/tiers.rs` disagree about a tier — the price verdict, and the only
+/// refusal here that a slower machine can manufacture on an innocent tree.
+///
+/// A `const` because `.github/workflows/ci.yml` matches on it to tell that one
+/// verdict from every other way this command can refuse, and `src/ci.rs` holds
+/// the two spellings together so the wording cannot move out from under the
+/// workflow in silence.
+pub const TIER_DISAGREEMENT: &str = "the merged CI profile and tier declaration disagree";
 
 /// `--merge-durations <dir>`: every shard file under `dir`, into
 /// `tests/test-durations`.
@@ -79,7 +103,7 @@ pub fn dispatch(root: &Path, args: &[String]) {
     fs::write(&out, body).unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));
     if let Err(refusal) = validate_written_profile(&profile, &before) {
         panic!(
-            "the merged CI profile and tier declaration disagree:\n{refusal}\n\
+            "{TIER_DISAGREEMENT}:\n{refusal}\n\
              The measured profile was written to {} for inspection",
             out.display()
         );
