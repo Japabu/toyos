@@ -1,12 +1,16 @@
 name: ci
 
-# The guest suite: twelve KVM shards on Linux x86_64, which own the booted
-# kernel on native silicon and run exactly the Fast tier as a partition — every
-# Fast test runs exactly once per run. `ci/**` is where throwaway probe branches
-# live; they trigger their own workflows and not this one.
+# The guest suite: twelve KVM shards on GitHub-hosted Linux x86_64, or one
+# complete 1/1 lane on the persistent T14. Both shapes own one booted kernel at
+# a time and run exactly the Fast tier as a partition — every Fast test runs
+# exactly once per run. The T14 shape pulls its prepared image from a loopback
+# registry and builds directly in content-keyed local storage; it downloads no
+# apt, Rust, custom-toolchain or build-cache payload on a warm run. `ci/**` is
+# where throwaway probe branches live; they trigger their own workflows and not
+# this one.
 #
 # `main` moves only through a merged pull request, so a branch push and the pull
-# request on it are two runs of the same twelve shards. `main`'s own run is what
+# request on it are two runs of the same guest partition. `main`'s own run is what
 # `landing.yml`'s `gate-stage` reads, and its `actions/cache` entries are the
 # only ones every branch can restore.
 #
@@ -34,12 +38,23 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  # Where the guest lanes run, answered once — `route.yml` has the whole rule
+  # and every use below reads it from here.
+  route:
+    uses: ./.github/workflows/route.yml
+
   # Nothing here may run against a tree whose toolchain does not build.
   # `toolchain.yml` is a separate workflow because it must never be cancelled
   # (an hour-long bootstrap thrown away by the next push starts from nothing),
   # and `needs:` does not reach across workflows — so this job waits for the
   # release instead of depending on it directly, once, so a broken toolchain
   # strands one runner rather than every shard.
+  #
+  # GitHub-hosted, and it must stay that way: this job does nothing but poll an
+  # API for up to two hours, and the release it waits for is built by
+  # `toolchain.yml`'s own job on the T14. The T14 has one worker, so a version
+  # of this job that ran there would hold the lane against the build it is
+  # waiting for and time out every time a tree needs a new toolchain.
   toolchain-ready:
     runs-on: ubuntu-latest
     timeout-minutes: 150
@@ -102,34 +117,61 @@ jobs:
           exit 1
 
   guest:
-    needs: [toolchain-ready]
-    runs-on: ubuntu-24.04
+    needs: [route, toolchain-ready]
+    runs-on: ${{ needs.route.outputs.runner }}
     # A wedge guard, not a budget: the harness answers a dead shared boot with
     # a new one, so a shard that cannot finish inside this ceiling measures
-    # nothing.
-    timeout-minutes: 60
+    # nothing. One lane runs twelve shards' worth of work, so its ceiling is
+    # not one shard's.
+    timeout-minutes: ${{ needs.route.outputs.trusted == 'yes' && 120 || 60 }}
     strategy:
       fail-fast: false
+      # Hosted work keeps the twelve-way matrix it has always used. The T14 is
+      # already one physical benchmark host, so one 1/1 lane runs the complete
+      # selection after paying setup costs once.
+      max-parallel: ${{ needs.route.outputs.trusted == 'yes' && 1 || 12 }}
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-    # `debian:sid` ships the QEMU `.github/qemu-version` declares, the dev
-    # host's version too; `ubuntu-24.04` ships 8.2.2 and the two were measured
+        shard: ${{ fromJSON(needs.route.outputs.trusted == 'yes' && '[1]' || '[1,2,3,4,5,6,7,8,9,10,11,12]') }}
+    # Both images ship the QEMU `.github/qemu-version` declares, the dev host's
+    # version too; `ubuntu-24.04` ships 8.2.2 and the two were measured
     # disagreeing about test outcomes on the same tree. The firmware, boot
     # image and host CPU are unchanged from a bare runner — only the QEMU
     # binary and libraries under it differ.
     #
-    # `--device=/dev/kvm` and root inside the container reach the accelerator
-    # with no chmod: the node ships `crw-rw---- root:kvm` and root opens it.
-    # `kvm_usable` opens the device and every boot follows.
+    # `--device=/dev/kvm` is how either container reaches the accelerator with
+    # no chmod: the hosted node ships `crw-rw---- root:kvm` and root opens it,
+    # and the T14 image's own user is in that group
+    # (`.github/runner/Dockerfile`). `kvm_usable` opens the device and every
+    # boot follows, so `.github/instrument.sh` reds on a node it cannot open
+    # rather than letting the suite emulate.
     container:
-      image: debian:sid
-      options: --device=/dev/kvm
+      image: ${{ needs.route.outputs.image }}
+      options: --device=/dev/kvm ${{ needs.route.outputs.cache_mount }}
     steps:
+      # Which environment this is, asked of the environment. The trusted image
+      # sets `TOYOS_LOCAL_CACHE` and the trusted container options mount it, so
+      # one writable directory answers "my dependencies are already here and my
+      # build outputs belong in the cache" for every step below. The runner's
+      # *name* answered none of that: a second machine given the `toyos` label,
+      # or this one renamed, would silently take the wrong branch everywhere.
+      - id: local
+        name: the persistent cache
+        run: |
+          cache=${TOYOS_LOCAL_CACHE:-}
+          if [ -n "$cache" ] && [ -d "$cache" ] && [ -w "$cache" ]; then
+            echo "cache=yes" >> "$GITHUB_OUTPUT"
+            echo "persistent cache at $cache: this job installs nothing"
+          else
+            echo "cache=no" >> "$GITHUB_OUTPUT"
+            echo "no persistent cache: this job installs its own dependencies"
+          fi
+
       # Before the checkout: `actions/checkout` wants git and this image has
       # none. Three attempts, since `sid` is a rolling release and its mirror
       # is not a fixed artifact — `guest-suite` is required, so a mirror blip
       # must not be able to block a merge.
       - name: deps
+        if: steps.local.outputs.cache != 'yes'
         run: |
           got=no
           for attempt in 1 2 3; do
@@ -156,7 +198,7 @@ jobs:
       # must be read against.
       - name: the instrument
         env:
-          MATRIX_LABEL: shard ${{ matrix.shard }}/12
+          MATRIX_LABEL: shard ${{ matrix.shard }}/${{ needs.route.outputs.trusted == 'yes' && 1 || 12 }}
         run: .github/instrument.sh
 
       - id: key
@@ -168,6 +210,7 @@ jobs:
             >> "$GITHUB_OUTPUT"
 
       - name: rust
+        if: steps.local.outputs.cache != 'yes'
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain stable
@@ -178,6 +221,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.key.outputs.tag }}
         run: .github/install-toolchain.sh
+
+      - name: local build cache
+        if: steps.local.outputs.cache == 'yes'
+        env:
+          TAG: ${{ steps.key.outputs.tag }}
+        run: sh .github/runner/link-build-cache.sh
 
       # The key is the toolchain tag first, the lockfiles second: cargo cannot
       # see the sysroot (`toyos-abi`, `toyos`, `userland/libc`), so its
@@ -191,11 +240,10 @@ jobs:
       # compiles against a cold one's 177, and all 167 of the difference are
       # third-party.
       #
-      # `cache-writer` is the single writer, one per run; the twelve shards only
-      # read. `actions/cache/save` never overwrites an existing key, so a second
-      # writer could not benefit a sibling and a nightly writer could
-      # permanently win the key with a tree several merges behind. A cache
-      # written on `main` is the one every branch can restore.
+      # On GitHub-hosted work `cache-writer` is the single writer and the twelve
+      # shards only read. The T14 uses the exact content-keyed directory linked
+      # above and updates it in place, so it neither downloads nor uploads a
+      # GitHub cache.
       #
       # `toyos-ld/target` and `toyos-cc/target` used to be on this list and are
       # not directories any more: both crates are members of the host workspace
@@ -203,6 +251,7 @@ jobs:
       # host halves and guest halves alike — into `target`, which is already
       # here. Naming a path that does not exist caches nothing and says nothing.
       - uses: actions/cache/restore@v4
+        if: steps.local.outputs.cache != 'yes'
         with:
           path: |
             ~/.cargo/registry/index
@@ -231,13 +280,24 @@ jobs:
       # pull request.
       - name: suite
         env:
+          SHARD_COUNT: ${{ needs.route.outputs.trusted == 'yes' && 1 || 12 }}
           SUITE_TIER_ARGS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '--nightly' || '' }}
         run: |
           set -o pipefail
           cargo test --test toyos-build -- \
-            --shard ${{ matrix.shard }}/12 --jobs 1 --host-slots 0 \
+            --shard ${{ matrix.shard }}/$SHARD_COUNT --jobs 1 --host-slots 0 \
             $SUITE_TIER_ARGS 2>&1 \
             | tee /tmp/suite.log
+
+      # A stale external-dependency stamp makes `cargo clean` replace a target
+      # symlink with a real checkout directory. Preserve that rebuilt directory
+      # before checkout cleanup so the next T14 job is warm. Links that survived
+      # already wrote into the persistent cache and this step leaves them alone.
+      - name: save local build cache
+        if: always() && steps.local.outputs.cache == 'yes'
+        env:
+          TAG: ${{ steps.key.outputs.tag }}
+        run: sh .github/runner/save-build-cache.sh
 
       # `cargo test` runs several binaries and each prints a `test result:`
       # line; the line grepped here is the suite's own, the one that
@@ -267,8 +327,8 @@ jobs:
       # never the profile it partitioned on, so this writes
       # `test-durations.shard-<i>-of-<n>`, which `load_durations` never reads.
       # `--merge-durations` is the one step per run that writes
-      # `tests/test-durations`, and the deliberate act that turns the twelve
-      # into it.
+      # `tests/test-durations`, and the deliberate act that turns the one or
+      # twelve partition files into it.
       - name: shard durations
         if: always()
         uses: actions/upload-artifact@v4
@@ -304,27 +364,46 @@ jobs:
   #
   # Nightly and dispatch only: across its history as a required check this job
   # never named a tree defect, so the class moved to a whole TCG shard in the
-  # nightly tier instead. It no longer writes the cache the twelve shards
-  # read — that write must happen on every run, so it is `cache-writer`, below.
+  # nightly tier instead. It no longer writes the cache the hosted shards read.
   #
   # `if: always()` and a guard step, kept from when this was required: a
   # nightly run that silently skipped instead of naming why the toolchain
   # never arrived would be the quiet loss `nightly-red` exists to catch.
+  #
+  # Both triggers are trusted, so `route` sends this to the T14 today. It is
+  # written through the same outputs and the same cache probe as `guest`
+  # anyway: the one place these two jobs are allowed to differ is the
+  # accelerator, and a second shape written here is how that stops being true.
   tcg:
-    needs: [toolchain-ready]
+    needs: [route, toolchain-ready]
     if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-24.04
+    runs-on: ${{ needs.route.outputs.runner }}
     timeout-minutes: 60
     container:
-      image: debian:sid
+      image: ${{ needs.route.outputs.image }}
+      options: ${{ needs.route.outputs.cache_mount }}
     steps:
       - name: the toolchain built
         run: |
           test "${{ needs.toolchain-ready.result }}" = success \
             || { echo "::error::toolchain-ready: ${{ needs.toolchain-ready.result }}"; exit 1; }
 
+      # `guest`'s own probe step carries why this is not the runner's name.
+      - id: local
+        name: the persistent cache
+        run: |
+          cache=${TOYOS_LOCAL_CACHE:-}
+          if [ -n "$cache" ] && [ -d "$cache" ] && [ -w "$cache" ]; then
+            echo "cache=yes" >> "$GITHUB_OUTPUT"
+            echo "persistent cache at $cache: this job installs nothing"
+          else
+            echo "cache=no" >> "$GITHUB_OUTPUT"
+            echo "no persistent cache: this job installs its own dependencies"
+          fi
+
       # Three attempts, for the reason the shards' own `deps` step carries.
       - name: deps
+        if: steps.local.outputs.cache != 'yes'
         run: |
           got=no
           for attempt in 1 2 3; do
@@ -361,6 +440,7 @@ jobs:
             >> "$GITHUB_OUTPUT"
 
       - name: rust
+        if: steps.local.outputs.cache != 'yes'
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain stable
@@ -372,9 +452,16 @@ jobs:
           TAG: ${{ steps.key.outputs.tag }}
         run: .github/install-toolchain.sh
 
-      # Restore only: `cache-writer` below is the single writer (`guest`'s own
-      # restore step has the full argument).
+      - name: local build cache
+        if: steps.local.outputs.cache == 'yes'
+        env:
+          TAG: ${{ steps.key.outputs.tag }}
+        run: sh .github/runner/link-build-cache.sh
+
+      # A hosted canary restores only. The T14 has already linked the same local
+      # content-keyed build directory the KVM lane uses.
       - uses: actions/cache/restore@v4
+        if: steps.local.outputs.cache != 'yes'
         with:
           path: |
             ~/.cargo/registry/index
@@ -392,17 +479,19 @@ jobs:
       - name: one test, emulated
         run: cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats
 
-  # The cache's single writer — exactly one job per run writes the shared build
-  # cache, and it must run on every pull-request run, so it runs on every
-  # non-nightly one. `if:` is that rule written as code rather than only as
-  # prose beside `guest`'s restore step. Same build and the same one fast test
-  # as a shard, under KVM rather than TCG — what gets cached does not depend on
-  # which accelerator produced it, and KVM is the accelerator every reader of
-  # this cache uses. `guest-suite` needs this job and reds if it did not
-  # succeed: a build that cannot produce what it caches is a real defect.
+  # The GitHub cache's single writer, and a job about GitHub-hosted work only:
+  # the `actions/cache` entry it writes is what the twelve hosted shards
+  # restore, and a T14 run updates its own content-keyed directory in place
+  # with nothing to upload. Exactly one job per run writes that cache, and it
+  # must run on every hosted pull-request run, so it runs on every hosted
+  # non-nightly one. Same build and the same one fast test as a hosted shard,
+  # under KVM rather than TCG — what gets cached does not depend on which
+  # accelerator produced it. `guest-suite` accepts `skipped` here because that
+  # means either the established nightly rule or a trusted run, which has no
+  # GitHub cache to write.
   cache-writer:
-    needs: [toolchain-ready]
-    if: github.event_name != 'schedule'
+    needs: [route, toolchain-ready]
+    if: github.event_name != 'schedule' && needs.route.outputs.trusted != 'yes'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
@@ -494,14 +583,17 @@ jobs:
   # 10,000 ms measured on this instrument, with no tolerance band. Every test
   # selected for Fast CI must measure at or under it, and this job is what
   # enforces the tier declaration against the profile rather than letting it go
-  # stale. It also refuses any duplicate execution label: the twelve shards are
-  # a partition, so a duplicate is a cross-shard partition defect as much as a
-  # same-shard one.
+  # stale. It also refuses any duplicate execution label: whether the run is
+  # one T14 shard or twelve hosted shards, it is one partition and a duplicate
+  # is a partition defect.
   #
-  # `guest`'s `SUITE_TIER_ARGS` widens the twelve shards to include `RELEGATED`
-  # on a nightly run, so their `test-durations.shard-*` files carry fresh
+  # `guest`'s `SUITE_TIER_ARGS` widens its one-or-twelve shards to include
+  # `RELEGATED` on a nightly run, so their `test-durations.shard-*` files carry fresh
   # Nightly measurements the same way an ordinary run's carry Fast ones — this
   # job does not need to know which trigger produced them.
+  #
+  # GitHub-hosted: it downloads artifacts and runs one host-side command, so
+  # the T14 would lend it nothing and lose its only lane while it ran.
   durations:
     needs: [guest]
     if: always()
@@ -594,7 +686,7 @@ jobs:
       - name: aggregate
         run: |
           echo "toolchain: ${{ needs.toolchain-ready.result }}"
-          echo "twelve shards: ${{ needs.guest.result }}"
+          echo "guest partition: ${{ needs.guest.result }}"
           echo "fast-tier durations: ${{ needs.durations.result }}"
           echo "cache writer: ${{ needs.cache-writer.result }}"
           if [ "${{ needs.toolchain-ready.result }}" != success ]; then
@@ -610,16 +702,16 @@ jobs:
           if [ "${{ needs.durations.result }}" != success ]; then
             echo "::error::the merged duration profile reported \
               ${{ needs.durations.result }}. Fast CI may contain a test over ten seconds, \
-              or the twelve shards did not leave a complete measurement."
+              or the guest partition did not leave a complete measurement."
             exit 1
           fi
-          # `cache-writer` is `if: github.event_name != 'schedule'`, so a
-          # nightly run reports it `skipped` by design; anything else means the
-          # write itself failed.
+          # `cache-writer` runs only for hosted, non-nightly work. A nightly or
+          # T14 run reports it `skipped` by design; anything else means the
+          # hosted write itself failed.
           if [ "${{ needs.cache-writer.result }}" != success ] \
              && [ "${{ needs.cache-writer.result }}" != skipped ]; then
             echo "::error::cache-writer reported ${{ needs.cache-writer.result }}. Its build is"
-            echo "::error::the same one the twelve shards run, so this is a real defect, not"
+            echo "::error::the same one the hosted shards run, so this is a real defect, not"
             echo "::error::cache hygiene — see the job's own log."
             exit 1
           fi

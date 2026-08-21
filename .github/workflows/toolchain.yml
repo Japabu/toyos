@@ -30,8 +30,18 @@ permissions:
   contents: write
 
 jobs:
+  # Where the bootstrap runs, answered once — `route.yml` has the whole rule.
+  route:
+    uses: ./.github/workflows/route.yml
+
+  # The one long build worth the T14's single lane: nearly every branch changes
+  # none of the four trees and this job exits in seconds, and the runs that do
+  # build are hours of compilation that the laptop does faster than a hosted
+  # two-core VM. `ci.yml`'s `toolchain-ready` waits for what this publishes and
+  # is GitHub-hosted for exactly that reason.
   build:
-    runs-on: ubuntu-24.04
+    needs: [route]
+    runs-on: ${{ needs.route.outputs.runner }}
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
@@ -53,20 +63,42 @@ jobs:
             echo "build=yes" >> "$GITHUB_OUTPUT"
           fi
 
+      # This job runs on the bare machine and not in a container, so what it
+      # needs is the machine's own provisioning. `runner.environment` is what
+      # answers that — the runner reports `github-hosted` or `self-hosted`, and
+      # each of the three steps below is about exactly one of those two: an
+      # image whose disk must be reclaimed and whose packages must be
+      # installed, or a machine that was provisioned once and is only checked.
+      # A runner's *name* answers none of that and breaks on a rename.
       - name: reclaim runner disk
-        if: steps.have.outputs.build == 'yes'
+        if: steps.have.outputs.build == 'yes' && runner.environment == 'github-hosted'
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
                       /usr/local/share/boost /usr/local/.ghcup
           df -h /
 
-      - name: deps
-        if: steps.have.outputs.build == 'yes'
+      - name: GitHub-hosted deps
+        if: steps.have.outputs.build == 'yes' && runner.environment == 'github-hosted'
         run: |
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
             cmake ninja-build build-essential pkg-config libssl-dev zstd \
             qemu-system-x86 ovmf
+
+      # No sudo on the persistent machine by design: this asserts the same list
+      # the step above installs, so a reprovisioned host that lost one of them
+      # reds here by name instead of failing an hour into the bootstrap.
+      - name: self-hosted deps
+        if: steps.have.outputs.build == 'yes' && runner.environment == 'self-hosted'
+        run: |
+          command -v cmake
+          command -v ninja
+          command -v cc
+          command -v pkg-config
+          command -v zstd
+          command -v qemu-system-x86_64
+          pkg-config --exists openssl
+          test -d /usr/share/OVMF
 
       # Full history, deliberately: bootstrap finds the upstream commit whose
       # prebuilt LLVM to download by walking back to the newest bors commit,

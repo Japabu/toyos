@@ -15,18 +15,42 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Where the reps run, answered once — `route.yml` has the whole rule.
+  route:
+    uses: ./.github/workflows/route.yml
+
   green:
-    runs-on: ubuntu-24.04
+    needs: [route]
+    runs-on: ${{ needs.route.outputs.runner }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
+      # On the benchmark host a probe is one guest and never a competing lane —
+      # a red rate is about a quiet machine. Hosted reps get a runner each and
+      # keep the width they have always had.
+      max-parallel: ${{ needs.route.outputs.trusted == 'yes' && 1 || 10 }}
       matrix:
         rep: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     container:
-      image: debian:sid
-      options: --device=/dev/kvm
+      image: ${{ needs.route.outputs.image }}
+      options: --device=/dev/kvm ${{ needs.route.outputs.cache_mount }}
     steps:
+      # `ci.yml`'s `guest` carries why this asks the environment and not the
+      # runner's name.
+      - id: local
+        name: the persistent cache
+        run: |
+          cache=${TOYOS_LOCAL_CACHE:-}
+          if [ -n "$cache" ] && [ -d "$cache" ] && [ -w "$cache" ]; then
+            echo "cache=yes" >> "$GITHUB_OUTPUT"
+            echo "persistent cache at $cache: this job installs nothing"
+          else
+            echo "cache=no" >> "$GITHUB_OUTPUT"
+            echo "no persistent cache: this job installs its own dependencies"
+          fi
+
       - name: deps
+        if: steps.local.outputs.cache != 'yes'
         run: |
           for attempt in 1 2 3; do
             apt-get update -qq \
@@ -44,33 +68,31 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: rust
+        if: steps.local.outputs.cache != 'yes'
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
+      - id: key
+        name: the toolchain this tree needs
+        run: |
+          git config --global --add safe.directory "$PWD"
+          echo "tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)" \
+            >> "$GITHUB_OUTPUT"
+
       - name: install the toolchain
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          git config --global --add safe.directory "$PWD"
-          tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
-                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)
-          echo "toolchain: $tag"
-          api=https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag
-          for _ in $(seq 120); do
-            asset=$(curl -sSL -H "Authorization: Bearer $GH_TOKEN" "$api" \
-              | jq -r '.assets[]? | select(.name=="toyos-toolchain.tar.zst") | .url')
-            [ -n "$asset" ] && break
-            echo "waiting for the toolchain workflow to publish $tag ..."
-            sleep 60
-          done
-          test -n "$asset"
-          curl -sSL -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/octet-stream" "$asset" -o /tmp/t.tar.zst
-          mkdir -p rust/build
-          zstd -dc /tmp/t.tar.zst | tar -C rust/build -x
-          rustup toolchain link toyos "$PWD/rust/build/x86_64-unknown-linux-gnu/stage2"
+          TAG: ${{ steps.key.outputs.tag }}
+        run: .github/install-toolchain.sh
+
+      - name: local build cache
+        if: steps.local.outputs.cache == 'yes'
+        env:
+          TAG: ${{ steps.key.outputs.tag }}
+        run: sh .github/runner/link-build-cache.sh
 
       # `exit 0`: a red is the datum, not the job's verdict.
       - name: named tests
