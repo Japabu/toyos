@@ -47,9 +47,7 @@ printing `joining scheduler` one millisecond later and cpu4/5/6 never having
 switched. `driver.rs:212` states the invariant this contradicts in as many
 words: *"`init` fills `SCHEDS` before any AP is released"*. Either that ordering
 does not hold on the KVM bring-up path, or the slot was filled and something
-wrote it back to `None` — which is the class
-`issues/kernel/a-btreemap-panicked-inside-its-own-insert-in-a-scheduler-pass.md`
-tracks, and whose current suspect is the kernel heap rather than the scheduler.
+wrote it back to `None`.
 
 **And the instrument is new.** Every previous measurement of this class is the
 dev host under cross-arch TCG; `tests/CLAUDE.md` warns that TCG is one vendor's
@@ -73,9 +71,27 @@ shows when the vCPUs are not all running at once. What the load buys is a
 running one on a deliberately oversubscribed KVM host is a cheaper instrument
 than 6,576 TCG boots per sighting.
 
+## 2026-08-21: the stray-write class this was read as a sighting of is resolved
+
+The dev host's `BTreeMap`-inside-its-own-`insert` class — a per-CPU scheduler
+record reading as a value no operation on it produces — was resolved that day:
+no Ring 0 entry cleared the direction flag, `compiler_builtins::mem::memmove`
+sets it across three `rep` string operations with interrupts enabled, and every
+`memcpy`/`memset` reached from an entry taken inside that window wrote the `n`
+bytes *below* its destination. `arch::entry::ring3_naked_asm`'s `cld` and
+`arch::syscall::init`'s `DF` in `IA32_FMASK` close it: 17 deaths in 7,059
+twelve-wide boots without them, 0 in 7,418 with them.
+
+`SCHEDS` is `static` and a `None` written back into it is exactly what a
+backwards `memset`/`memcpy` landing in `.bss` produces, so **this sighting is
+consistent with that mechanism and needs no bring-up ordering bug at all** — the
+fix is architecture-neutral and applies to the KVM path unchanged. What is owed
+is a re-measurement, not a new hypothesis.
+
 ## Whoever takes it
 
-Read `driver.rs:429`'s fill against the AP release path first — it is a
-one-reader question and it either holds or it does not, which is worth settling
-before spending storms on the heap hypothesis. If it holds, this joins the heap
-class and the KVM host is the new instrument for it.
+Re-run the oversubscribed-KVM recipe this file records on a kernel carrying the
+`cld` — the T14, a CI image by digest, `--device=/dev/kvm`, a contended host. A
+sighting that survives it is a real bring-up ordering question and
+`driver.rs`'s fill against the AP release path is the one-reader thing to read
+first; a clean run of the same width closes this.

@@ -642,9 +642,11 @@ pub unsafe fn set_kernel_stack(rsp: u64) {
 /// together and used apart.** Every Ring 3 → Ring 0 entry in the machine takes
 /// its stack from one of these two, so a value here that is not the running
 /// task's stack top is a stack pointer aimed at memory some other execution
-/// owns — and the entry that uses it writes a return address there, which is
-/// the shape `issues/kernel/a-btreemap-panicked-inside-its-own-insert-in-a-\
-/// scheduler-pass.md` keeps finding in kernel data.
+/// owns — and the entry that uses it writes a return address there, which is the
+/// shape a stray-write class chased across 2026-08-19..21 kept finding in kernel
+/// data. It never was that: across 25,123 storm boots these two words always
+/// agreed with the running task's own stack top, and the text-in-data came from
+/// a `memcpy` running backwards (`arch::entry`'s `cld`).
 ///
 /// # Safety
 /// Must be called from the CPU whose GS base points to the relevant PerCpu.

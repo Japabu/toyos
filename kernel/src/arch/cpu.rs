@@ -52,6 +52,60 @@ pub fn read_rsp() -> u64 {
     rsp
 }
 
+/// The direction flag, asked at a place in Ring 0 where it must be clear.
+///
+/// **The instrument for the one kernel-wide stray writer this tree has had.**
+/// No gate clears `DF` — an interrupt or trap gate clears `TF`, `NT`, `RF`, `VM`
+/// and `IF`, and `SYSCALL` clears what `IA32_FMASK` names — while
+/// `compiler_builtins::mem::memmove` sets it across three `rep` string operations
+/// for every overlapping copy the kernel makes. Every `memcpy`, `memset` and
+/// forward `memmove` executed while it is set writes the `n` bytes *below* its
+/// destination instead of at it, which is a writer of real, pointer-shaped data
+/// at addresses nothing meant to touch.
+///
+/// Its own build, because it is a `pushfq` and a test on the pass path, the
+/// syscall path and the trap path, and a kernel carrying it is not the kernel a
+/// rate was measured on. It reads and decides nothing.
+#[cfg(feature = "df-witness")]
+pub fn direction_flag_set() -> bool {
+    let rflags: u64;
+    unsafe {
+        asm!("pushfq", "pop {}", out(reg) rflags, options(nomem));
+    }
+    rflags & 0x400 != 0
+}
+
+/// The panic [`direction_flag_set`] exists to raise, at the site that asked.
+///
+/// **It clears the flag before it says anything, and that is not tidiness.** The
+/// first draft did not, and the control (`df-witness-mutate`, one `std` at the
+/// head of a pass) never printed a word: both CPUs died at
+/// `rip=0x0d8d480000e02c3d` with `rbp=0x8d48000e1f3215ff` — values whose bytes
+/// are `48 8d 0d` and `ff 15`, x86 instruction encodings, which is kernel *text*
+/// copied into a stack by the report's own formatting running backwards. A
+/// reporter that runs with the flag set destroys its report, and the wreckage is
+/// the same shape as the class it is reporting on.
+#[cfg(feature = "df-witness")]
+#[cold]
+#[inline(never)]
+pub fn df_witness(site: &str) {
+    if !direction_flag_set() {
+        return;
+    }
+    // SAFETY: the observation is already made; everything below this line is
+    // `core::fmt` and the log, which the ABI says may not run with it set.
+    unsafe { asm!("cld", options(nomem, nostack)) };
+    crate::hw::report_contexts(read_rsp(), None);
+    panic!(
+        "DF WITNESS: cpu{} reached {site} with the direction flag set. \
+         `compiler_builtins::mem::memmove`'s overlapping-copy path holds it across \
+         `rep movsb`/`rep movsq`/`rep movsb` with interrupts enabled, and it is the one \
+         `std` a linear disassembly of this kernel's `.text` puts on an executable path; \
+         every `rep movs`/`rep stos` reached from here writes backwards.",
+        crate::arch::percpu::cpu_id(),
+    );
+}
+
 /// CPUID with both index registers, `rbx` saved by hand because Rust reserves
 /// it as a general operand.
 pub fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
