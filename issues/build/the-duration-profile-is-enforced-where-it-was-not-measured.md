@@ -107,25 +107,85 @@ is the stuck slot, so it yielded. Nothing here rests on it. The alone arm is
 the controlled tree-versus-tree comparison, and the lane multiplier is a
 property of the partition rather than of a tree.
 
-## What this leaves undecided
+## The ruling: one profile, one instrument
 
-The remedy is a choice nobody has made, and it is not this issue's to make:
+**The orchestrator chose the second of the three options below, 2026-08-21: the
+profile has one instrument, so only that instrument renders the tier verdict.**
+`.github/workflows/ci.yml`'s `durations` job now reads
+`needs.route.outputs.trusted` — the same output `guest` keys its `runs-on`,
+matrix and shard count on, and never `runner.name`, since `durations` is
+GitHub-hosted on every event and its own runner says nothing about where the
+measurement was taken. On a T14 lane (`trusted == 'yes'`) it still merges, still
+prints the critical-path line and the unpriced/unrun names into the step
+summary, and still uploads `test-durations-merged`; the price verdict is printed
+as a `::warning::` naming the reason and the job exits 0. On a merge-queue ref
+or a fork's pull request — hosted, the shape the profile was taken in — nothing
+changes and the verdict fails exactly as before. The queue is required before
+`main` moves, so the verdict is still rendered on every landing.
+
+The three options as they stood, for the record:
 
 * re-measure the profile on the instrument that now enforces it, and accept
   that a 1/1 lane whose totals swing 429 s → 549 s will red on a rotating cast
   of names anyway;
-* keep the profile hosted — the merge queue still measures that shape — and
-  stop letting the T14 lane write a verdict against it;
+* **keep the profile hosted — the merge queue still measures that shape — and
+  stop letting the T14 lane write a verdict against it;** ← taken
 * or price the ceiling per instrument.
 
-Two module headers assert the old world and are now false at the site:
+`src/durations.rs`'s module header now carries the rule and the measurements
+behind it, and `src/ci.rs`'s
+`the_softened_duration_verdict_is_the_one_the_merge_actually_raises` holds the
+workflow's match string against `durations::TIER_DISAGREEMENT`, because the
+telling-apart is a shell string against a Rust string and rewording the panic
+would otherwise leave both files reading perfectly while the workflow stopped
+recognising the one verdict it may soften.
 
-* `src/durations.rs` says the profile's numbers come from "KVM on four Azure
-  cores". They did; the run that judges them no longer does.
-* `src/redlist.rs` describes `Instrument::Ci` as "KVM on four native x86-64
-  cores" and says "metal is not an instrument here, because the suite does not
-  run on the T14". The suite runs on the T14 for every trusted event.
+**Only the price verdict moved.** The T14 lane's suite run gates every test's
+verdict exactly as before, `tests/test-durations` and `src/tiers.rs`'s rules are
+untouched, and there is no second profile. Every other refusal
+`--merge-durations` can raise — a duplicate execution label, a short shard set,
+an erased Fast label, a committed `UNMEASURED` marker past its one bought run —
+is a fact about the tree or the partition rather than about machine speed, and
+still reds on either instrument. Six arms of the step were driven against a
+stubbed merge before landing: a T14 tier refusal exits 0 with the warning; the
+same refusal hosted, a `may not land` marker refusal on the T14, a duplicate
+label on the T14, and a tier refusal with the routing output empty (a failed or
+skipped `route`) all still exit 101.
 
-Until then `cargo run -- --known-red xhci_full_speed_device` answers with the
-row this issue is the source of, so an author who meets the red does not
-re-derive the above.
+## What remains
+
+* **`src/redlist.rs`'s `xhci_full_speed_device` row is now about a warning.**
+  Its evidence — four consecutive T14 lanes reding four different names — is
+  unchanged and it is still what a reader of the warning should check; the
+  refusal it describes simply no longer fails the job on a T14 lane. That row's
+  `source` is this file.
+* **`src/redlist.rs`'s `Instrument::Ci` doc is fixed and the profile's own
+  instrument is not.** The enum now says two machines wear that name and do not
+  price alike. `tests/test-durations` still holds one number per test with no
+  record of which machine took it.
+* **Nothing hosted measures the nightly tier any more, and this change does not
+  create that — it exposes it.** `route.yml` sends `schedule` and
+  `workflow_dispatch` to the T14, and those are the only two events that pass
+  `--nightly`; a merge-queue ref and a fork's pull request are hosted and never
+  do. So every fresh Nightly measurement from now on is a T14 number entering a
+  hosted profile — the table above measures that gap at 1.35–1.37× for
+  `xhci_full_speed_device` alone and uncontended — and after this
+  change the nightly's own `durations` job no longer renders a verdict on it
+  either — the `Why::Cost` return rule and the over-the-line rule stop firing
+  there. What the hosted merge queue still checks is Nightly *placement* against
+  whatever numbers are committed, since `merged_profile` preserves rows a fast
+  run did not measure. **The gap is that no instrument matching the profile
+  produces a fresh Nightly number at all.** This is prospective, not yet
+  observed: `985f3834` landed in `a4e0ab75` at 2026-08-21 10:41Z and the nightly
+  that recorded the current profile ran at 03:43Z that morning, before it — the
+  first T14 nightly is 2026-08-22 03:00Z.
+* **The `UNMEASURED` round trip now takes its one bought measurement on the
+  T14.** A new Fast name's marker still reds on a T14 lane by design, and the
+  measured value the author is told to commit comes from that lane's artifact —
+  a T14 number entering a hosted profile. A branch in this repository cannot get
+  a hosted twelve-shard measurement at all except by entering the merge queue,
+  so the number is adjudicated there rather than on the pull request.
+
+`cargo run -- --known-red xhci_full_speed_device` answers with the row this
+issue is the source of, so an author who meets the refusal does not re-derive
+the above.
