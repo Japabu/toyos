@@ -23,6 +23,14 @@ own tip, on a different set of names every run.
 | 32498159547 (push, 15:32Z) | `07f89c8b` | T14, i5-1135G7, 8 cores | `--shard 1/1` | **11,076** | 9 |
 | 32506479551 (push, 17:07Z) | `13953023` | T14, same | `--shard 1/1` | **12,156** | 5 |
 | 32513441183 (PR #199, 18:27Z) | `c670ea27` | T14, same | `--shard 1/1` | **10,166** | 1 |
+| 32524769419 (PR #201, 20:40Z) | `84bf0861` | T14, same | `--shard 1/1` | **9,052** | 1 — `i8042_health` at 15,122 |
+
+**The last row is the whole argument.** PR #201 is this file and one
+`src/redlist.rs` data row — a Markdown document and a `const` array entry,
+nothing a kernel compiles. On it `xhci_full_speed_device` came in under the
+ceiling, and the gate reded anyway: `i8042_health` at 15,122 ms against a
+committed 9,509. Four consecutive lanes, four different casts over the line, on
+trees whose differences cannot reach a boot.
 
 The cast over the line rotates run to run — `dump_nmi_probe`,
 `esp_filesystem`, `i8042_health`, `log_conservation_smp4`,
@@ -90,7 +98,14 @@ identical: each put 2 of 20 reps over the 10,000 ms ceiling.
 **The tree that recorded 6,900 ms costs 9,431 ms on the T14.** Both arms are
 1.35–1.37× the committed price, alone and uncontended — so roughly a third of
 the gap is the machine, and the rest is the lane: inside the 1/1 partition the
-same test measured 10,166–12,156 ms.
+same test measured 10,166–12,156 ms in the three CI runs above.
+
+The old tree was **not** measured inside a 1/1 lane. That arm was started and
+abandoned: one lane rep is ~8 minutes, the T14 has one worker, and CI wanted
+the machine — a measuring container that holds the lane against a `guest` job
+is the stuck slot, so it yielded. Nothing here rests on it. The alone arm is
+the controlled tree-versus-tree comparison, and the lane multiplier is a
+property of the partition rather than of a tree.
 
 ## What this leaves undecided
 

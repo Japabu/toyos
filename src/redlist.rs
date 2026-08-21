@@ -2288,16 +2288,18 @@ pub const KNOWN_RED: &[Red] = &[
     Red {
         test: "xhci_full_speed_device",
         instrument: Instrument::Ci,
-        finding: Finding::fires(3, 3),
+        finding: Finding::fires(3, 4),
         standing: Standing::Stands,
         what: "the durations gate and not the test, which passes: `xhci_full_speed_device \
                measured 10166 ms in CI, over the 10000 ms line, but xhci_full_speed_device \
-               remains Fast` — 10,166 ms on the pull request, and 11,076 and 12,156 ms on \
-               `main`'s own tip, against a committed 6,900 ms that twelve hosted shards \
-               measured and still measure",
-        evidence: "the three consecutive T14 1/1 `guest` lanes of 2026-08-21: runs 32498159547 \
+               remains Fast` — 11,076, 12,156, 10,166 and 9,052 ms across four T14 lanes, \
+               against a committed 6,900 ms that twelve hosted shards measured and still \
+               measure. **The fourth is the point**: it crossed nothing, and the same run \
+               reded on `i8042_health` at 15,122 ms instead",
+        evidence: "the four consecutive T14 1/1 `guest` lanes of 2026-08-21 — runs 32498159547 \
                    (`main` 07f89c8b, 9 names over the ceiling), 32506479551 (`main` 13953023, \
-                   5) and 32513441183 (PR #199, 1)",
+                   5), 32513441183 (PR #199, 1) and 32524769419 (PR #201, 1, a different name) \
+                   — whose lane totals were 548.8 s, 483.6 s, 429.2 s and 444.1 s of tests",
         source: "issues/build/the-duration-profile-is-enforced-where-it-was-not-measured.md",
         measured: "2026-08-21",
     },
