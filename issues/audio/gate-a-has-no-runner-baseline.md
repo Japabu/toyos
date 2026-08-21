@@ -80,6 +80,15 @@ host*, and two things block writing one:
    `issues/audio/t14-wake-lateness-is-bimodal-per-boot.md`, which is what has to
    be understood before any T14 number is worth recording.
 
+   **And the mixing weight does not move only with the tree.** Four hours after
+   the A/B, 296 config-runs on the same host — `main` and `53101d08`
+   interleaved, each carrying only the wake instrument — produced the fast mode
+   296 times of 296, and both 15-iteration blocks reported `[gate A] PASS`
+   against *this very sample*, `audio_tone.smp1` included: fresh medians 4075
+   and 4143 against the recorded 8972. A T14 sample recorded on one evening
+   therefore would not describe the same host on another, which is a stronger
+   objection than the schema and the one that has to be answered first.
+
 The 2026-08-10 measurement this file opened with — run `31386117376`, tree
 `99e47d9`, two GitHub-hosted runners of different vendors — remains the reason a
 hosted sample would be a sample over two unnamed CPUs. Its `wakes` observation

@@ -61,3 +61,28 @@ misclassification, and those are not the same row.
 Gate A is unaffected and green throughout: `audio_tone` and `audio_tone_load` at
 smp=1 and smp=8 all pass on `cf72c3dc` with 440.0 Hz, phase-breaks 0, gaps none,
 0 underruns and 0 drains.
+
+## 2026-08-21: it also fails by *position in the session*, which is what makes a two-arm reading of it worthless below n≈10
+
+Confirmed again on the dev host against `fe41dbae` (`main`), 42 invocations in
+one afternoon across three interleaved A/Bs, `cargo test --test toyos-build --
+--nightly audio_idle_suspend`. The magnitudes are one population on both arms —
+every reported delta in 1,231,172-2,561,459 ns, the band this file already
+records.
+
+The **rate** moves with where in a session an invocation falls, not with the
+arm. Two A/Bs that held the within-round order fixed gave one arm the early
+slots and produced 6 reds of 9 against 2 of 9; a third — twelve rounds with the
+order alternating, so neither arm keeps the early slots — produced **4 of 12
+against 3 of 12**, no difference at all. In all three the reds cluster in the
+first four invocations of the session whichever arm holds them, which is the
+same quiet-host dependence as the `ALONE:` line above rather than a property of
+any diff.
+
+Two consequences. A rate difference in this test at n<10 per arm is not evidence
+about a diff, and an A/B of it must alternate the within-round order or it
+measures session position instead. And a third failure mode belongs on the
+record: one `main` invocation of the 42 failed differently — `expected soundd's
+mix and control threads in sysinfo, found 1` — so this test also races soundd's
+control thread into `sysinfo`, and a red carrying that sentence is not this
+issue at all.
