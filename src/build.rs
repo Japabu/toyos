@@ -1640,6 +1640,31 @@ mod tests {
                 "boot-actuators",
                 "debug-wait",
                 "fpu-save-nothing",
+                // The two band shapes that separate the two readings
+                // `heap-tripwire`'s own result left standing — the bands absorb
+                // a bounded overrun, or they displace every allocation and the
+                // victim moved. No band can be zero-width and keep its
+                // placement, because the padding *is* the displacement, so the
+                // separation is per side: `notail` leaves the slack past a
+                // payload byte-for-byte what an unbanded build has, `nohead`
+                // puts the payload at the bottom of its own chunk. They are one
+                // experiment in two arms and refuse to build together.
+                "heap-band-nohead",
+                "heap-band-notail",
+                // The sweep that reads every live band rather than only the
+                // ones a `dealloc` reaches. Its own build for `heap-tripwire`'s
+                // reason twice over: the walk takes `dlmalloc`'s lock on the
+                // pass path, which nothing shipping may do.
+                "heap-sweep",
+                // `sched-tripwire`'s twin one layer down: a band of known bytes
+                // on each side of every heap allocation, read back at `dealloc`
+                // and — for the running task's kernel stack — at every pass. It
+                // earns a build of its own because the bands change what
+                // `GlobalAlloc::alloc` returns, which no boot parameter can
+                // reach: an allocation minted under one arm and freed under the
+                // other is a miscomputed base address. No suite builds it, so a
+                // full run pays nothing and a boot storm asks for it by name.
+                "heap-tripwire",
                 // `wake-fence-off`'s twin, for the completion core: turned on
                 // only by `kernel-loom`, to make the inbox's record
                 // publication relaxed and prove `inbox` reds without the
