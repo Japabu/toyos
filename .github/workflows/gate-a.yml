@@ -30,32 +30,50 @@ on:
 concurrency:
   group: gate-a-${{ github.ref }}
 
-# Trusted Linux events select the persistent `toyos` runner. Fork PRs and
-# merge-queue refs stay on GitHub-hosted machines.
 jobs:
+  # Where this gate runs, answered once — `route.yml` has the whole rule.
+  route:
+    uses: ./.github/workflows/route.yml
+
   gate:
-    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || 'toyos' }}
+    needs: [route]
+    runs-on: ${{ needs.route.outputs.runner }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
-      # The T14 is one benchmark host: never overlap its matrix lanes, even if
-      # another runner is later given the `toyos` label.
+      # One benchmark lane at a time on the T14, whatever else carries the
+      # `toyos` label later.
       max-parallel: 1
       matrix:
         shard: [1]
-    # `--device=/dev/kvm` and root inside the container, exactly as the shards:
-    # the node ships `crw-rw---- root:kvm` and root opens it, with no chmod.
+    # `--device=/dev/kvm`, exactly as the shards: the hosted node ships
+    # `crw-rw---- root:kvm` and root opens it with no chmod, and the T14
+    # image's own user is in that group (`.github/runner/Dockerfile`).
     container:
-      image: 127.0.0.1:5000/toyos-ci@sha256:0b31109e74af8c9a6083dc8a484ad9f0bb8d87e9e128cf58e48ccc97b16121de
-      options: --device=/dev/kvm --volume=/home/t14/actions-runner-cache:/toyos-cache
+      image: ${{ needs.route.outputs.image }}
+      options: --device=/dev/kvm ${{ needs.route.outputs.cache_mount }}
     steps:
+      # `ci.yml`'s `guest` carries why this asks the environment and not the
+      # runner's name.
+      - id: local
+        name: the persistent cache
+        run: |
+          cache=${TOYOS_LOCAL_CACHE:-}
+          if [ -n "$cache" ] && [ -d "$cache" ] && [ -w "$cache" ]; then
+            echo "cache=yes" >> "$GITHUB_OUTPUT"
+            echo "persistent cache at $cache: this job installs nothing"
+          else
+            echo "cache=no" >> "$GITHUB_OUTPUT"
+            echo "no persistent cache: this job installs its own dependencies"
+          fi
+
       # Before the checkout: `actions/checkout` wants git and this image has
       # none. Three attempts, for the reason `ci.yml`'s own `deps` carries:
       # `sid` is a rolling release and its mirror is not a fixed artifact. No
       # `ovmf` package: the firmware is `ovmf/` in this repository on every
       # host.
       - name: deps
-        if: runner.name != 't14'
+        if: steps.local.outputs.cache != 'yes'
         run: |
           got=no
           for attempt in 1 2 3; do
@@ -85,7 +103,7 @@ jobs:
         run: .github/instrument.sh
 
       - name: rust
-        if: runner.name != 't14'
+        if: steps.local.outputs.cache != 'yes'
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain stable
@@ -111,6 +129,7 @@ jobs:
         run: .github/install-toolchain.sh
 
       - name: local build cache
+        if: steps.local.outputs.cache == 'yes'
         env:
           TAG: ${{ steps.key.outputs.tag }}
         run: sh .github/runner/link-build-cache.sh
@@ -142,7 +161,7 @@ jobs:
   nightly-red-gate-a:
     needs: [gate]
     if: ${{ !cancelled() && github.event_name == 'schedule' && needs.gate.result != 'success' }}
-    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'toyos' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       issues: write

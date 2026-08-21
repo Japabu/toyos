@@ -1,10 +1,17 @@
 # T14 CI appliance
 
 Trusted Linux jobs use the image in this directory through a registry bound to
-`127.0.0.1` on the T14. The workflow names the registry digest, so a rebuild
-cannot silently move the QEMU/Rust instrument. Fork pull requests and merge
-queues still select `debian:sid` on GitHub-hosted runners, and
-`portability.yml` deliberately keeps its from-scratch bootstrap.
+`127.0.0.1` on the T14. `.github/workflows/route.yml` names the registry
+digest — once, for the whole repository — so a rebuild cannot silently move the
+QEMU/Rust instrument. Fork pull requests and merge queues select `debian:sid`
+on GitHub-hosted runners.
+
+Only the jobs that need the accelerator, the persistent build cache or hours of
+this machine's CPU are routed here: the guest lanes, the audio gate, the green
+probe and the toolchain bootstrap. Every coordinating job stays GitHub-hosted,
+where it is free and parallel — this runner has one worker, and a job waiting
+there for something another job on the same machine has to produce cannot
+finish.
 
 The image contains the apt dependencies and stable Rust. The host directory
 `/home/t14/actions-runner-cache` is mounted only into trusted T14 containers:
@@ -101,9 +108,10 @@ sh .github/runner/build-image.sh
 
 The script reads the host's `kvm` gid, starts the loopback registry if
 necessary, verifies QEMU, Rust and the unprivileged shape, pushes the tag, and
-prints the image reference. Copy the printed digest into the four T14 image
-references — two in `ci.yml`, one each in `gate-a.yml` and `probe-green.yml`.
-Never replace those digest references with a moving tag.
+prints the image reference. Copy the printed digest into
+`.github/workflows/route.yml`, which is the repository's one reference to it —
+every workflow that names an image reads it from there. Never replace that
+digest with a moving tag.
 
 A machine whose `/dev/kvm` carries a different gid needs its own build: the gid
 is baked into the image because that is the only place Docker will apply a

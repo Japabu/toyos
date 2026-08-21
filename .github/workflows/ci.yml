@@ -6,9 +6,8 @@ name: ci
 # exactly once per run. The T14 shape pulls its prepared image from a loopback
 # registry and builds directly in content-keyed local storage; it downloads no
 # apt, Rust, custom-toolchain or build-cache payload on a warm run. `ci/**` is
-# where
-# throwaway probe branches live; they trigger their own workflows and not this
-# one.
+# where throwaway probe branches live; they trigger their own workflows and not
+# this one.
 #
 # `main` moves only through a merged pull request, so a branch push and the pull
 # request on it are two runs of the same guest partition. `main`'s own run is what
@@ -38,17 +37,26 @@ concurrency:
   group: ci-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
-# Trusted Linux events select the persistent `toyos` runner. Fork PRs and
-# merge-queue refs stay on GitHub-hosted machines.
 jobs:
+  # Where the guest lanes run, answered once — `route.yml` has the whole rule
+  # and every use below reads it from here.
+  route:
+    uses: ./.github/workflows/route.yml
+
   # Nothing here may run against a tree whose toolchain does not build.
   # `toolchain.yml` is a separate workflow because it must never be cancelled
   # (an hour-long bootstrap thrown away by the next push starts from nothing),
   # and `needs:` does not reach across workflows — so this job waits for the
   # release instead of depending on it directly, once, so a broken toolchain
   # strands one runner rather than every shard.
+  #
+  # GitHub-hosted, and it must stay that way: this job does nothing but poll an
+  # API for up to two hours, and the release it waits for is built by
+  # `toolchain.yml`'s own job on the T14. The T14 has one worker, so a version
+  # of this job that ran there would hold the lane against the build it is
+  # waiting for and time out every time a tree needs a new toolchain.
   toolchain-ready:
-    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'toyos' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
@@ -109,39 +117,61 @@ jobs:
           exit 1
 
   guest:
-    needs: [toolchain-ready]
-    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || 'toyos' }}
+    needs: [route, toolchain-ready]
+    runs-on: ${{ needs.route.outputs.runner }}
     # A wedge guard, not a budget: the harness answers a dead shared boot with
     # a new one, so a shard that cannot finish inside this ceiling measures
-    # nothing.
-    timeout-minutes: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 60 || 120 }}
+    # nothing. One lane runs twelve shards' worth of work, so its ceiling is
+    # not one shard's.
+    timeout-minutes: ${{ needs.route.outputs.trusted == 'yes' && 120 || 60 }}
     strategy:
       fail-fast: false
       # Hosted work keeps the twelve-way matrix it has always used. The T14 is
       # already one physical benchmark host, so one 1/1 lane runs the complete
       # selection after paying setup costs once.
-      max-parallel: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 12 || 1 }}
+      max-parallel: ${{ needs.route.outputs.trusted == 'yes' && 1 || 12 }}
       matrix:
-        shard: ${{ fromJSON((github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '[1,2,3,4,5,6,7,8,9,10,11,12]' || '[1]') }}
-    # `debian:sid` ships the QEMU `.github/qemu-version` declares, the dev
-    # host's version too; `ubuntu-24.04` ships 8.2.2 and the two were measured
+        shard: ${{ fromJSON(needs.route.outputs.trusted == 'yes' && '[1]' || '[1,2,3,4,5,6,7,8,9,10,11,12]') }}
+    # Both images ship the QEMU `.github/qemu-version` declares, the dev host's
+    # version too; `ubuntu-24.04` ships 8.2.2 and the two were measured
     # disagreeing about test outcomes on the same tree. The firmware, boot
     # image and host CPU are unchanged from a bare runner — only the QEMU
     # binary and libraries under it differ.
     #
-    # `--device=/dev/kvm` and root inside the container reach the accelerator
-    # with no chmod: the node ships `crw-rw---- root:kvm` and root opens it.
-    # `kvm_usable` opens the device and every boot follows.
+    # `--device=/dev/kvm` is how either container reaches the accelerator with
+    # no chmod: the hosted node ships `crw-rw---- root:kvm` and root opens it,
+    # and the T14 image's own user is in that group
+    # (`.github/runner/Dockerfile`). `kvm_usable` opens the device and every
+    # boot follows, so `.github/instrument.sh` reds on a node it cannot open
+    # rather than letting the suite emulate.
     container:
-      image: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'debian:sid' || '127.0.0.1:5000/toyos-ci@sha256:0b31109e74af8c9a6083dc8a484ad9f0bb8d87e9e128cf58e48ccc97b16121de' }}
-      options: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && '--device=/dev/kvm' || '--device=/dev/kvm --volume=/home/t14/actions-runner-cache:/toyos-cache' }}
+      image: ${{ needs.route.outputs.image }}
+      options: --device=/dev/kvm ${{ needs.route.outputs.cache_mount }}
     steps:
+      # Which environment this is, asked of the environment. The trusted image
+      # sets `TOYOS_LOCAL_CACHE` and the trusted container options mount it, so
+      # one writable directory answers "my dependencies are already here and my
+      # build outputs belong in the cache" for every step below. The runner's
+      # *name* answered none of that: a second machine given the `toyos` label,
+      # or this one renamed, would silently take the wrong branch everywhere.
+      - id: local
+        name: the persistent cache
+        run: |
+          cache=${TOYOS_LOCAL_CACHE:-}
+          if [ -n "$cache" ] && [ -d "$cache" ] && [ -w "$cache" ]; then
+            echo "cache=yes" >> "$GITHUB_OUTPUT"
+            echo "persistent cache at $cache: this job installs nothing"
+          else
+            echo "cache=no" >> "$GITHUB_OUTPUT"
+            echo "no persistent cache: this job installs its own dependencies"
+          fi
+
       # Before the checkout: `actions/checkout` wants git and this image has
       # none. Three attempts, since `sid` is a rolling release and its mirror
       # is not a fixed artifact — `guest-suite` is required, so a mirror blip
       # must not be able to block a merge.
       - name: deps
-        if: runner.name != 't14'
+        if: steps.local.outputs.cache != 'yes'
         run: |
           got=no
           for attempt in 1 2 3; do
@@ -168,7 +198,7 @@ jobs:
       # must be read against.
       - name: the instrument
         env:
-          MATRIX_LABEL: shard ${{ matrix.shard }}/${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 12 || 1 }}
+          MATRIX_LABEL: shard ${{ matrix.shard }}/${{ needs.route.outputs.trusted == 'yes' && 1 || 12 }}
         run: .github/instrument.sh
 
       - id: key
@@ -180,7 +210,7 @@ jobs:
             >> "$GITHUB_OUTPUT"
 
       - name: rust
-        if: runner.name != 't14'
+        if: steps.local.outputs.cache != 'yes'
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain stable
@@ -193,7 +223,7 @@ jobs:
         run: .github/install-toolchain.sh
 
       - name: local build cache
-        if: runner.name == 't14'
+        if: steps.local.outputs.cache == 'yes'
         env:
           TAG: ${{ steps.key.outputs.tag }}
         run: sh .github/runner/link-build-cache.sh
@@ -221,7 +251,7 @@ jobs:
       # host halves and guest halves alike — into `target`, which is already
       # here. Naming a path that does not exist caches nothing and says nothing.
       - uses: actions/cache/restore@v4
-        if: runner.name != 't14'
+        if: steps.local.outputs.cache != 'yes'
         with:
           path: |
             ~/.cargo/registry/index
@@ -250,7 +280,7 @@ jobs:
       # pull request.
       - name: suite
         env:
-          SHARD_COUNT: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 12 || 1 }}
+          SHARD_COUNT: ${{ needs.route.outputs.trusted == 'yes' && 1 || 12 }}
           SUITE_TIER_ARGS: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '--nightly' || '' }}
         run: |
           set -o pipefail
@@ -264,7 +294,7 @@ jobs:
       # before checkout cleanup so the next T14 job is warm. Links that survived
       # already wrote into the persistent cache and this step leaves them alone.
       - name: save local build cache
-        if: runner.name == 't14' && always()
+        if: always() && steps.local.outputs.cache == 'yes'
         env:
           TAG: ${{ steps.key.outputs.tag }}
         run: sh .github/runner/save-build-cache.sh
@@ -339,23 +369,41 @@ jobs:
   # `if: always()` and a guard step, kept from when this was required: a
   # nightly run that silently skipped instead of naming why the toolchain
   # never arrived would be the quiet loss `nightly-red` exists to catch.
+  #
+  # Both triggers are trusted, so `route` sends this to the T14 today. It is
+  # written through the same outputs and the same cache probe as `guest`
+  # anyway: the one place these two jobs are allowed to differ is the
+  # accelerator, and a second shape written here is how that stops being true.
   tcg:
-    needs: [toolchain-ready]
+    needs: [route, toolchain-ready]
     if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || 'toyos' }}
+    runs-on: ${{ needs.route.outputs.runner }}
     timeout-minutes: 60
     container:
-      image: 127.0.0.1:5000/toyos-ci@sha256:0b31109e74af8c9a6083dc8a484ad9f0bb8d87e9e128cf58e48ccc97b16121de
-      options: --volume=/home/t14/actions-runner-cache:/toyos-cache
+      image: ${{ needs.route.outputs.image }}
+      options: ${{ needs.route.outputs.cache_mount }}
     steps:
       - name: the toolchain built
         run: |
           test "${{ needs.toolchain-ready.result }}" = success \
             || { echo "::error::toolchain-ready: ${{ needs.toolchain-ready.result }}"; exit 1; }
 
+      # `guest`'s own probe step carries why this is not the runner's name.
+      - id: local
+        name: the persistent cache
+        run: |
+          cache=${TOYOS_LOCAL_CACHE:-}
+          if [ -n "$cache" ] && [ -d "$cache" ] && [ -w "$cache" ]; then
+            echo "cache=yes" >> "$GITHUB_OUTPUT"
+            echo "persistent cache at $cache: this job installs nothing"
+          else
+            echo "cache=no" >> "$GITHUB_OUTPUT"
+            echo "no persistent cache: this job installs its own dependencies"
+          fi
+
       # Three attempts, for the reason the shards' own `deps` step carries.
       - name: deps
-        if: runner.name != 't14'
+        if: steps.local.outputs.cache != 'yes'
         run: |
           got=no
           for attempt in 1 2 3; do
@@ -392,7 +440,7 @@ jobs:
             >> "$GITHUB_OUTPUT"
 
       - name: rust
-        if: runner.name != 't14'
+        if: steps.local.outputs.cache != 'yes'
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain stable
@@ -405,7 +453,7 @@ jobs:
         run: .github/install-toolchain.sh
 
       - name: local build cache
-        if: runner.name == 't14'
+        if: steps.local.outputs.cache == 'yes'
         env:
           TAG: ${{ steps.key.outputs.tag }}
         run: sh .github/runner/link-build-cache.sh
@@ -413,7 +461,7 @@ jobs:
       # A hosted canary restores only. The T14 has already linked the same local
       # content-keyed build directory the KVM lane uses.
       - uses: actions/cache/restore@v4
-        if: runner.name != 't14'
+        if: steps.local.outputs.cache != 'yes'
         with:
           path: |
             ~/.cargo/registry/index
@@ -431,17 +479,20 @@ jobs:
       - name: one test, emulated
         run: cargo test --test toyos-build -- --jobs 1 --host-slots 0 process_stats
 
-  # GitHub-hosted work retains its single cache writer exactly as before. The
-  # T14's one full guest lane updates its local content-keyed directory itself,
-  # so starting this second container there would only repeat setup. Same build
-  # and the same one fast test as a hosted
-  # shard, under KVM rather than TCG — what gets cached does not depend on which
+  # The GitHub cache's single writer, and a job about GitHub-hosted work only:
+  # the `actions/cache` entry it writes is what the twelve hosted shards
+  # restore, and a T14 run updates its own content-keyed directory in place
+  # with nothing to upload. Exactly one job per run writes that cache, and it
+  # must run on every hosted pull-request run, so it runs on every hosted
+  # non-nightly one. Same build and the same one fast test as a hosted shard,
+  # under KVM rather than TCG — what gets cached does not depend on which
   # accelerator produced it. `guest-suite` accepts `skipped` here because that
-  # means either the established nightly rule or the T14 single-lane path.
+  # means either the established nightly rule or a trusted run, which has no
+  # GitHub cache to write.
   cache-writer:
-    needs: [toolchain-ready]
-    if: github.event_name != 'schedule' && (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository))
-    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || 'toyos' }}
+    needs: [route, toolchain-ready]
+    if: github.event_name != 'schedule' && needs.route.outputs.trusted != 'yes'
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     container:
       image: debian:sid
@@ -479,13 +530,6 @@ jobs:
           echo "tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
                 HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)" \
             >> "$GITHUB_OUTPUT"
-
-      - name: fresh Rustup state on the persistent runner
-        if: runner.name == 't14'
-        run: |
-          for dir in "$HOME/.cargo" "$HOME/.rustup"; do
-            [ ! -d "$dir" ] || find "$dir" -mindepth 1 -delete
-          done
 
       - name: rust
         run: |
@@ -547,16 +591,18 @@ jobs:
   # `RELEGATED` on a nightly run, so their `test-durations.shard-*` files carry fresh
   # Nightly measurements the same way an ordinary run's carry Fast ones — this
   # job does not need to know which trigger produced them.
+  #
+  # GitHub-hosted: it downloads artifacts and runs one host-side command, so
+  # the T14 would lend it nothing and lose its only lane while it ran.
   durations:
     needs: [guest]
     if: always()
-    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'toyos' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/cache@v4
-        if: runner.name != 't14'
         with:
           path: |
             ~/.cargo/registry/index
@@ -583,9 +629,6 @@ jobs:
       - name: merge durations
         run: |
           set -o pipefail
-          if [ "${{ runner.name }}" = t14 ]; then
-            export CARGO_TARGET_DIR=/home/t14/actions-runner-cache/host-target
-          fi
           if ! ls /tmp/durations/*/test-durations.shard-* >/dev/null 2>&1; then
             echo "no shard left a measurement: ${{ needs.guest.result }}"
             echo "- no shard measured anything (\`guest\`: ${{ needs.guest.result }})" \
@@ -635,7 +678,7 @@ jobs:
   guest-suite:
     needs: [toolchain-ready, guest, durations, cache-writer]
     if: always()
-    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'toyos' }}
+    runs-on: ubuntu-latest
     steps:
       # `toolchain-ready` is named here as well as in the shards' `needs:`,
       # since a skipped `guest` says nothing about why it was skipped and this
@@ -681,7 +724,7 @@ jobs:
   nightly-red:
     needs: [tcg, guest-suite]
     if: ${{ !cancelled() && github.event_name == 'schedule' && (needs.tcg.result != 'success' || needs.guest-suite.result != 'success') }}
-    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'toyos' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       issues: write
@@ -713,7 +756,7 @@ jobs:
   # `durations` above installs neither.
   merge-health:
     if: github.event_name == 'schedule'
-    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'toyos' }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read

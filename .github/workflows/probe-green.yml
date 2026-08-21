@@ -14,24 +14,43 @@ on:
     branches: ['ci/probe-green']
   workflow_dispatch:
 
-# Trusted Linux events select the persistent `toyos` runner. Fork PRs and
-# merge-queue refs stay on GitHub-hosted machines.
 jobs:
+  # Where the reps run, answered once — `route.yml` has the whole rule.
+  route:
+    uses: ./.github/workflows/route.yml
+
   green:
-    runs-on: ${{ (github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-24.04' || 'toyos' }}
+    needs: [route]
+    runs-on: ${{ needs.route.outputs.runner }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      # A probe is one guest on the benchmark host, never a competing lane.
-      max-parallel: 1
+      # On the benchmark host a probe is one guest and never a competing lane —
+      # a red rate is about a quiet machine. Hosted reps get a runner each and
+      # keep the width they have always had.
+      max-parallel: ${{ needs.route.outputs.trusted == 'yes' && 1 || 10 }}
       matrix:
         rep: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     container:
-      image: 127.0.0.1:5000/toyos-ci@sha256:0b31109e74af8c9a6083dc8a484ad9f0bb8d87e9e128cf58e48ccc97b16121de
-      options: --device=/dev/kvm --volume=/home/t14/actions-runner-cache:/toyos-cache
+      image: ${{ needs.route.outputs.image }}
+      options: --device=/dev/kvm ${{ needs.route.outputs.cache_mount }}
     steps:
+      # `ci.yml`'s `guest` carries why this asks the environment and not the
+      # runner's name.
+      - id: local
+        name: the persistent cache
+        run: |
+          cache=${TOYOS_LOCAL_CACHE:-}
+          if [ -n "$cache" ] && [ -d "$cache" ] && [ -w "$cache" ]; then
+            echo "cache=yes" >> "$GITHUB_OUTPUT"
+            echo "persistent cache at $cache: this job installs nothing"
+          else
+            echo "cache=no" >> "$GITHUB_OUTPUT"
+            echo "no persistent cache: this job installs its own dependencies"
+          fi
+
       - name: deps
-        if: runner.name != 't14'
+        if: steps.local.outputs.cache != 'yes'
         run: |
           for attempt in 1 2 3; do
             apt-get update -qq \
@@ -49,7 +68,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: rust
-        if: runner.name != 't14'
+        if: steps.local.outputs.cache != 'yes'
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain stable
@@ -70,6 +89,7 @@ jobs:
         run: .github/install-toolchain.sh
 
       - name: local build cache
+        if: steps.local.outputs.cache == 'yes'
         env:
           TAG: ${{ steps.key.outputs.tag }}
         run: sh .github/runner/link-build-cache.sh

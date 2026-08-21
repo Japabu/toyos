@@ -1,13 +1,28 @@
 name: self-hosted-runner-smoke
 
 # Deliberately manual-only: this persistent runner belongs to a public
-# repository, so no pull request or fork-controlled tree may select it.
+# repository, so no pull request or fork-controlled tree may select it. The
+# runner's own hook refuses a dispatch of anything but `main`'s copy of a
+# workflow (`.github/runner/accept-trusted.sh`), so this file has to be on
+# `main` to run at all.
+#
+# `runs-on` names the labels directly rather than going through `route.yml`:
+# every other workflow asks "where should this run", and this one asks "does
+# that machine work". What it does take from `route.yml` is the image, so the
+# repository keeps exactly one reference to the digest.
 on:
   workflow_dispatch:
 
 permissions: {}
 
 jobs:
+  route:
+    uses: ./.github/workflows/route.yml
+
+  # The runner and the container boundary, with no source tree and no project
+  # image involved: a stock `ubuntu:24.04` that only has to prove the job
+  # landed on the machine this repository provisioned, with the accelerator
+  # reachable.
   container:
     runs-on: [self-hosted, Linux, X64, toyos]
     # A wedge guard, not a measured duration: every step is a fixed host or
@@ -19,7 +34,8 @@ jobs:
     steps:
       - name: runner and container boundary
         run: |
-          test "$RUNNER_NAME" = t14
+          echo "runner: $RUNNER_NAME"
+          test "$RUNNER_ENVIRONMENT" = self-hosted
           test "$RUNNER_OS" = Linux
           test "$RUNNER_ARCH" = X64
           test -f /.dockerenv
@@ -31,3 +47,34 @@ jobs:
           test "$(nproc)" = 8
           grep -Eq '^Cpus_allowed_list:[[:space:]]*0-7$' /proc/self/status
           df -h /
+
+  # The appliance itself: the image the trusted jobs run, the mount they key
+  # on, and the accelerator opened by the unprivileged user that runs them.
+  # Every conditional in `ci.yml`, `gate-a.yml` and `probe-green.yml` turns on
+  # the two facts asserted here, so this is where they are proved on demand
+  # rather than inferred from a suite that happened to pass.
+  appliance:
+    needs: [route]
+    runs-on: [self-hosted, Linux, X64, toyos]
+    timeout-minutes: 5
+    container:
+      image: ${{ needs.route.outputs.image }}
+      options: --device=/dev/kvm ${{ needs.route.outputs.cache_mount }}
+    steps:
+      - name: the keys every trusted job turns on
+        run: |
+          set -x
+          id
+          test "$(id -u)" = 1000
+          test -n "$TOYOS_LOCAL_CACHE"
+          test -d "$TOYOS_LOCAL_CACHE"
+          test -w "$TOYOS_LOCAL_CACHE"
+          test -w "$TOYOS_LOCAL_CACHE/build"
+          test -w "$TOYOS_LOCAL_CACHE/cargo"
+          # Presence is not permission: this is the open `kvm_usable` performs
+          # and `.github/instrument.sh` reds on.
+          exec 3<>/dev/kvm
+          exec 3>&-
+          qemu-system-x86_64 --version | head -1
+          cargo -V
+          du -sh "$TOYOS_LOCAL_CACHE"/*
