@@ -183,4 +183,4 @@ path = "tests/toyos.rs"
 harness = false
 
 [patch.crates-io]
-target-lexicon = { git = "https://github.com/Japabu/target-lexicon", branch = "toyos" }
+target-lexicon = { git = "https://github.com/ToyOSOrg/target-lexicon", branch = "toyos" }

@@ -12,7 +12,7 @@ cranelift-frontend = "0.128.3"
 target-lexicon = "0.13"
 
 [patch.crates-io]
-target-lexicon = { git = "https://github.com/Japabu/target-lexicon", branch = "toyos" }
+target-lexicon = { git = "https://github.com/ToyOSOrg/target-lexicon", branch = "toyos" }
 
 [lints.rust]
 warnings = "deny"

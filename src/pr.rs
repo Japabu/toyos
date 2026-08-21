@@ -11,21 +11,21 @@
 //! What did *not* move is the property the gate rests on. `--land` merged main
 //! into the branch and gated the **merged result**, which is what catches a
 //! semantic conflict between two branches that each pass alone. GitHub's native
-//! merge queue is the feature that restores that, and it is **not available on
-//! this repository** — measured, not read off a page: `POST
-//! /repos/Japabu/toyos/rulesets` with a `merge_queue` rule answers `Validation
-//! Failed: Invalid rule 'merge_queue'`, and `repository.mergeQueue` is `null`
-//! over GraphQL, while the `MERGE_QUEUE` rule type is in the schema. Same cause
-//! as the larger runners being unavailable: `Japabu/toyos` is owned by a
-//! User account.
+//! merge queue is the feature that provides that, and since 2026-08-20 it is
+//! **on**: the repository moved to the `ToyOSOrg` organization (the rule type
+//! is org-only — measured on the personal account as `Validation Failed:
+//! Invalid rule 'merge_queue'`, which is the history the strict-substitute era
+//! below came from), and `main`'s ruleset carries a required `merge_queue`
+//! rule. The queue builds each merge's exact composition and runs the required
+//! checks on it before `main` moves; `gh pr merge --auto --merge` enqueues.
 //!
-//! The substitute is a **strict** required status check — "require branches to
-//! be up to date before merging" — which refuses the merge button until the
-//! branch contains `origin/main`. That makes the checks that ran on the branch
-//! head checks on the merged result, exactly as step 2 did, and it serialises
-//! landings for the same reason the lock did: the first merge moves main and
-//! every other branch is out of date until it merges again. `--pr` is the
-//! command that produces that state.
+//! Before the organization existed, the substitute was a **strict** required
+//! status check — branches up to date before merging — which bought the same
+//! property by serialising landings: the first merge moved main and every
+//! other branch was stale until it merged again. That tax, its measured
+//! breach, and the eased-law interlude between the two regimes are the
+//! tracker's record (`the-eased-merge-law-carries-a-threshold`); `--pr`
+//! remains the local half either way.
 //!
 //! Nothing here rewrites history and nothing pushes `main`.
 

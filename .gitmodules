@@ -1,3 +1,3 @@
 [submodule "rust"]
 	path = rust
-	url = https://github.com/Japabu/rust.git
+	url = https://github.com/ToyOSOrg/rust.git

@@ -96,7 +96,7 @@ dependencies = [
 [[package]]
 name = "cpal"
 version = "0.18.0"
-source = "git+https://github.com/Japabu/cpal?branch=toyos#40fe997922c9ab30a8647e54cf23c4b07197732c"
+source = "git+https://github.com/ToyOSOrg/cpal?branch=toyos#40fe997922c9ab30a8647e54cf23c4b07197732c"
 dependencies = [
  "alsa",
  "coreaudio-rs",
@@ -254,7 +254,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "libloading"
 version = "0.8.9"
-source = "git+https://github.com/Japabu/rust_libloading?branch=toyos#fa0abe774f6f891a5d8918ac554bc43004232cf2"
+source = "git+https://github.com/ToyOSOrg/rust_libloading?branch=toyos#fa0abe774f6f891a5d8918ac554bc43004232cf2"
 dependencies = [
  "cfg-if",
  "toyos-abi",
