@@ -69,16 +69,82 @@ two blocks differ by z=2.51 against arm A's z=0.35. Arm B is *unstable* on this
 config; arm A is not. That is a change in the mixing weight, not a level shift,
 and bisecting a mixing weight at n=15 per point would measure noise.
 
-## Whoever takes it
-
-The mechanism is what is missing, and the instrument now exists to find it: the
-T14 reproduces both modes on demand in ten minutes per 15 iterations, and
-`audio_tone.smp8` on arm B is 30 of 30 in the fast mode — a config that is
-*always* fast is the control a mechanism has to explain. Start from what differs
-between a fast boot and a slow one in soundd's own counters: `wakes` moves only
-1354-1371 across both modes on `audio_tone.smp1`, so the pipeline is being
-retired the same number of times either way, and the difference is *when* rather
-than *how often*.
-
-The arrays behind every number here are in this branch's commit message; the
+The arrays behind every number above are in `0942f02c`'s commit message; the
 gate's own logs expire with the workflow artifacts.
+
+## 2026-08-21, four hours later: the number is the *device's* lateness, and the slow mode did not come back
+
+`max_wake_lat_us` now arrives in two halves (`toyos_mixer::WorstWake`), split at
+the completion interrupt's own ISR timestamp: `irq` is the device failing to
+complete when the grid said it would, `pickup` is soundd failing to run once it
+had. They sum to the old number exactly. `late_wakes` counts how many wakes in
+the run were a whole period or more late, so the maximum can be read as one
+stall or as a thousand.
+
+**176 config-runs on the T14 the same evening, 17:26-18:17 UTC, CI image at the
+`route.yml` digest, `--device=/dev/kvm --shard 1/1 --host-slots 0`, no other
+container up for any boot** (each block aborts and retries if one appears), on
+two trees: `fe41dbae` (`main`) and `53101d08` — *the A/B's own arm B*, the tree
+that produced the arrays above — each carrying only the instrument:
+
+| config | n | wake_lat | irq mean | pickup mean / max | late wakes |
+|---|---|---|---|---|---|
+| `audio_tone.smp1` | 44 | 3835-4262 | 3967 | 76 / **106** | 12.9% |
+| `audio_tone.smp8` | 44 | 3980-6176 | 4034 | 142 / **206** | 14.2% |
+| `audio_tone_load.smp1` | 44 | 2509-2972 | 2743 | 10 / **14** | **0.0%** |
+| `audio_tone_load.smp8` | 44 | 3692-4149 | 3822 | 56 / **132** | 11.0% |
+
+Two things fall out of that table and a third out of its absence.
+
+**The statistic is not about the scheduler.** `pickup` never once exceeded
+206 µs — 0.009 pipeline depths — on one CPU or on eight, and `irq` is 94-99.6%
+of every worst wake. So *which CPU soundd lands on cannot be the mechanism*:
+every interrupt lands on the boot CPU (`kernel/src/drivers/pci.rs`'s `MSG_ADDR`)
+and a soundd sharing that CPU or not moves a term that is two orders of
+magnitude too small to matter. The instrument is not blind to the other half —
+the dev host under load 30 reported `pickup 8681us` on `audio_tone_load.smp8`
+the same afternoon — the T14 simply never spends it.
+
+**The fast mode is a beat, not an event.** 12-14% of wakes are a whole period
+late on the three idle configs, and the worst is ~1.4 periods with `2 empty
+wakes` and `batch 2` on essentially every boot. That is soundd's 2.902 ms grid
+against QEMU's `timer-period=5000` audio timer: soundd arms, wakes punctually
+twice at a device that has produced nothing, and the batch lands ~4 ms after the
+grid point. `audio_tone_load.smp1` — the config that is *always* fast — has
+**zero** late wakes and `pickup 10 µs`, because a guest with work to do never
+lets the beat open.
+
+**And the slow mode did not appear once in 44 boots per config.** Not on `main`
+and not on the tree that produced it at 11 of 15 and 9 of 15 four hours earlier.
+Under that afternoon's mixing weight, 0 of 44 has probability ~1e-21. So the
+mode is **not a per-boot draw from a per-tree distribution**: the distribution
+itself moved between two sessions of the same day, on the same host, with
+nothing about the tree between them — which also means the A/B's one same-host
+row (`audio_tone_load.smp1`, z=4.12) is a difference between afternoons and not
+between trees. Today the two trees are indistinguishable on it: 2509-2972 on
+both.
+
+The host was on AC throughout, `intel_pstate`/`powersave`/`balance_performance`,
+`intel_idle` whose deepest state (`C3_ACPI`) costs 1048 µs to leave — a third of
+one period, and a fortieth of the 20 ms mode. Nothing on the host was measured
+*during* the earlier session, so what moved is not established; the one
+difference recorded is that the slow session ran at 1-min load 0.2-1.74 and the
+fast one at 1.5-4.4, which is the opposite direction from "a busy host is worse".
+
+## Whoever takes it next
+
+Do not spend the day on soundd. The next sighting of the slow mode is now one
+line, and that line already answers three questions: whether it is the device or
+soundd (`irq` vs `pickup`), whether it is one stall or a thousand
+(`late_wakes`), and whether the guest was executing at all while it happened
+(`empty` — a punctual soundd waking repeatedly at a silent device, versus a
+single overlong sleep). Gate A's per-boot line also carries the two numbers this
+boot drew for its clocks, which are the only per-boot draws that scale every
+armed timer for the boot's whole life; on this host they are stable to 0.2%
+(`tsc 999MHz lapic 10007013..10025378 ticks/10ms` over four boots).
+
+What is missing is a *host-side* record taken during a slow session, because the
+guest-side evidence above points there and cannot go further on its own. The
+cheapest one is per-boot `/proc/<qemu>/task/*/schedstat` and the host's
+`cpuidle` residencies sampled across a block — and it perturbs the measurement,
+so it is worth taking only once a session is producing the mode.
