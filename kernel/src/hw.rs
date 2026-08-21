@@ -309,7 +309,11 @@ fn switch_frame_is_wrong(ctx: &KernelCtx, token: &RunToken<KernelPayload>) -> ! 
             crate::log!("  [{addr:#x}] {name:>6} = {word:#018x}");
         }
     }
-    panic!("context_switch: the restored frame's return address is not kernel text");
+    panic!(
+        "context_switch: the frame about to be restored is not one — its rsp is not a kernel \
+         address, or its return slot is not kernel text, or (under `stack-witness`) it is not \
+         inside the stack this context's own `kernel_stack_top` names"
+    );
 }
 
 /// See [`switch_frame_is_wrong`]. Kept tiny so the hot path is a load, a
@@ -319,6 +323,51 @@ fn check_switch_frame(ctx: &KernelCtx, token: &RunToken<KernelPayload>) {
     let rsp = ctx.rsp;
     if !crate::mm::is_kernel_addr(rsp) || !rsp.is_multiple_of(8) {
         switch_frame_is_wrong(ctx, token);
+    }
+    // **Is it this task's own stack, and not merely *a* kernel address.**
+    //
+    // A guest parked on its shutdown action — the one capture of this class
+    // taken with both vCPUs still readable — had cpu1 at `RIP=1b7b9f15ffd23100`
+    // with `SS=0`, `DF` set and `RSP=0xffff800000c00680`, which is inside the
+    // *per-CPU* region and no stack at all. That is `context_switch`'s tail
+    // exactly: `popfq` took garbage flags and `ret` took a garbage return
+    // address, sixty-four bytes above an `rsp` of `0xffff800000c00640`. The two
+    // tests above passed it, because that address is a kernel address and the
+    // word at `+56` was one too — which is the gap this file's own entry in
+    // `issues/kernel/a-btreemap-panicked-inside-its-own-insert-in-a-scheduler-\
+    // pass.md` records as "a green guard was never evidence".
+    //
+    // An incoming context's `rsp` belongs to the stack its own
+    // `kernel_stack_top` names or it belongs to nothing: `alloc_kernel_stack`
+    // builds the entry frame at `top - 64` and every later save comes from a
+    // `context_switch` running on that same stack. Two compares, and the
+    // difference is a report that names the task against a triple fault that
+    // says nothing on either channel.
+    //
+    // **And the idle context is not exempt, which is the whole point.** Its
+    // `kernel_stack_top` is zero by construction — per-CPU, and not knowable at
+    // the boot-time init that builds the record — but the stack it names is
+    // knowable *here*, on the CPU the record belongs to, which is exactly where
+    // the arm below this one already reads it to load the TSS. The parked
+    // capture's `rsp` was `0xffff800000c00640`, in the per-CPU region, and cpu0's
+    // idle stack in that same boot ran to `0xffff800000e21000` — so the frame
+    // was in neither a task stack nor an idle one, and a version of this test
+    // that skipped `id: None` would have skipped it. A first storm of 7,349
+    // boots with the task-only form fired zero times against 19 silent deaths,
+    // which is what asking the question of the wrong contexts looks like.
+    //
+    // `ctx.rsp` on an idle context is always a real one when it is restored: a
+    // CPU only ever switches *to* idle after switching away from it, which is
+    // what wrote the value; the idle loop itself is entered by jump.
+    #[cfg(feature = "stack-witness")]
+    {
+        let top = match ctx.id {
+            Some(_) => ctx.kernel_stack_top,
+            None => percpu::idle_stack_top(),
+        };
+        if rsp > top || rsp <= top - crate::process::KERNEL_STACK_SIZE as u64 {
+            switch_frame_is_wrong(ctx, token);
+        }
     }
     // SAFETY: `rsp` is a kernel address eight bytes below the top of the
     // incoming task's own kernel stack at the shallowest, so the return slot is

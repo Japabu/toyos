@@ -23,6 +23,11 @@ pub use alloc::check_live as check_heap_bands;
 /// a stray write from one that merely *displaced* it.
 #[cfg(feature = "heap-sweep")]
 pub use alloc::sweep as sweep_heap_bands;
+/// The sweep's lock hold without the sweep, behind its own feature: the arm
+/// that asks whether what amplifies this class is the allocator's lock or the
+/// delay either instrument spends on the pass path.
+#[cfg(feature = "heap-lockspin")]
+pub use alloc::hold_lock as hold_heap_lock;
 /// Unconditional, because `hw::report_contexts` runs on every kernel crash and
 /// a kernel that carries no sweep answers `None` rather than failing to build.
 pub use alloc::sweep_stats;

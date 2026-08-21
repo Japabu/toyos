@@ -1651,6 +1651,13 @@ mod tests {
                 // experiment in two arms and refuse to build together.
                 "heap-band-nohead",
                 "heap-band-notail",
+                // The sweep's lock hold without the sweep. `heap-sweep` and
+                // `sched-tripwire` both multiply this class and both spend time
+                // on the pass path; only the sweep also holds `dlmalloc`'s lock
+                // while it does. This arm and `pass-spin` below spend one
+                // `HOLD_NS` with and without that lock, which is the one
+                // variable nobody has varied.
+                "heap-lockspin",
                 // The sweep that reads every live band rather than only the
                 // ones a `dealloc` reaches. Its own build for `heap-tripwire`'s
                 // reason twice over: the walk takes `dlmalloc`'s lock on the
@@ -1678,6 +1685,9 @@ mod tests {
                 "lock-acquire-off",
                 "log-commit-release-off",
                 "loom",
+                // `heap-lockspin`'s other arm: the same visit to the pass path,
+                // for the same span, without the allocator's lock.
+                "pass-spin",
                 "reap-raise-relaxed",
                 "sched-check",
                 // The stray-write tripwire on the per-CPU `CpuSched` record: a
@@ -1698,6 +1708,13 @@ mod tests {
                 // `Relaxed` and `kernel-loom/tests/sleep_lock.rs` reds. Costs
                 // no kernel build, for the same reason as the six above it.
                 "sleeplock-acquire-off",
+                // The two comparisons that ask who else is standing on a task's
+                // kernel stack: the words a Ring 3 entry takes its stack from,
+                // against the running task's own top, at every pass; and the one
+                // driver field this class has been caught changing inside a
+                // single call. Its own build because both halves are readers on
+                // hot paths, so it has to be in both arms of any comparison.
+                "stack-witness",
                 "test-actuators",
                 // Costs no kernel build at all, for `loom`'s reason: declared
                 // so `cfg` checking knows the name, and turned on only by

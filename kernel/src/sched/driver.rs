@@ -204,6 +204,68 @@ fn maybe_sweep(now: Nanos) {
     crate::mm::sweep_heap_bands("pass");
 }
 
+/// How long a [`maybe_hold`] visit spends on the pass path, and how often.
+///
+/// **The number is a floor on the sweep's own hold and not a match for it.**
+/// `heap-sweep` walks every 2 MiB page the heap owns under `dlmalloc`'s lock on
+/// the same 25 ms cadence; the storms that measured it lost about 2% of their
+/// boots to it, which over a ~3 s boot and a handful of sweeps is milliseconds
+/// per walk. 1 ms every 25 ms is 4% of the pass path spent the way the sweep
+/// spends it, chosen so an arm that amplifies says so without a duty cycle that
+/// stops being a boot storm. An arm that does *not* amplify at 1 ms has bounded
+/// the effect rather than refuted it, and the next arm is a longer hold.
+#[cfg(feature = "pass-spin")]
+const HOLD_NS: u64 = 1_000_000;
+#[cfg(feature = "pass-spin")]
+const HOLD_EVERY_NS: u64 = 25_000_000;
+#[cfg(feature = "pass-spin")]
+static NEXT_HOLD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Spend [`HOLD_NS`] on the pass path, and — under `heap-lockspin` — spend it
+/// holding `dlmalloc`'s lock.
+///
+/// **The control the amplifier has never had.** Two instruments now multiply
+/// this class and neither writes anything: `sched-tripwire`'s byte shadow (7.2x)
+/// and `heap-sweep`'s walk (absent to baseline). They share a shape — time spent
+/// on the path every pass takes — and `heap-sweep` adds a second thing, the
+/// allocator's lock. Nothing has separated the two, and the separation is one
+/// cargo feature: `pass-spin` spends the time and takes no lock, `heap-lockspin`
+/// spends the same time under the same lock the sweep takes. Two arms at one
+/// `HOLD_NS` say whether the window this class needs is the *lock* or merely the
+/// *delay*, and the answer decides where a fix can be looked for at all.
+///
+/// It reads nothing and writes nothing but its own claim, so — like the sweep —
+/// it compiles no decision and cannot itself be corrupting anything.
+///
+/// Outside `with_cpu` for [`maybe_sweep`]'s reason: this takes a lock, and the
+/// driver's exclusive region is where a lock wedged four of twelve guests.
+#[cfg(feature = "pass-spin")]
+fn maybe_hold(now: Nanos) {
+    let due = NEXT_HOLD.load(Ordering::Relaxed);
+    if now.0 < due {
+        return;
+    }
+    if NEXT_HOLD
+        .compare_exchange(due, now.0 + HOLD_EVERY_NS, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    #[cfg(feature = "heap-lockspin")]
+    crate::mm::hold_heap_lock(HOLD_NS);
+    #[cfg(not(feature = "heap-lockspin"))]
+    spin_for(HOLD_NS);
+}
+
+/// Burn `ns` of guest time and nothing else.
+#[cfg(feature = "pass-spin")]
+pub(crate) fn spin_for(ns: u64) {
+    let until = crate::clock::nanos_since_boot() + ns;
+    while crate::clock::nanos_since_boot() < until {
+        core::hint::spin_loop();
+    }
+}
+
 pub fn cpus() -> &'static CpuHandles<KMsg> {
     let ptr = CPUS.load(Ordering::Acquire);
     assert!(!ptr.is_null(), "scheduler used before sched::init");
@@ -641,6 +703,8 @@ pub fn pass(dispose: Dispose) {
     let now = HW.now();
     #[cfg(feature = "heap-sweep")]
     maybe_sweep(now);
+    #[cfg(feature = "pass-spin")]
+    maybe_hold(now);
     let action = with_cpu(|cpu| {
         let pass = SchedPass::begin(cpu, env(&PreemptOff(())), now);
         if let Some(current) = pass.cpu().running() {
@@ -1235,8 +1299,62 @@ fn check_stack_canary(payload: &KernelPayload) {
             payload.id.1, canary, STACK_CANARY
         );
     }
+    #[cfg(feature = "stack-witness")]
+    check_stack_ownership(payload);
     #[cfg(feature = "heap-tripwire")]
     stack_depth(payload);
+}
+
+/// Does every Ring 3 → Ring 0 entry this CPU can take land on the stack of the
+/// task this CPU is actually running, and is this CPU standing on it?
+///
+/// **The question a corrupted word cannot answer and this can.** The class in
+/// `issues/kernel/a-btreemap-panicked-inside-its-own-insert-in-a-scheduler-\
+/// pass.md` keeps producing *kernel text* words inside kernel data — a
+/// deterministic `0xffff8000_7cae_3310` over `MscDevice::block`, a stack's own
+/// `stack_top + 16` one word above its top — and a mid-function text address in
+/// a data field is a **return address**, which means something executed with
+/// that address as its stack pointer. There are exactly two words in this
+/// machine that aim an execution at a stack it did not grow: `kernel_rsp`, which
+/// `syscall` loads, and `tss.rsp0`, which every interrupt from Ring 3 loads.
+/// `Hw::switch` writes both from the incoming context's `kernel_stack_top`, so
+/// either a switch left them naming the wrong task or that field is itself a
+/// victim — and both cases are one comparison away, *here*, before the entry
+/// that would use them happens, instead of a boot later at whatever the write
+/// landed on.
+///
+/// The third comparison is the converse: this CPU is executing a pass, so its
+/// own `rsp` must be inside the stack of the task the pass says is running. It
+/// costs a register read and catches the case where the entry stacks are right
+/// and the *execution* is on the wrong one.
+///
+/// Two loads, a register read and three compares per pass. It is a reader and
+/// decides nothing, which is why a kernel carrying it schedules exactly as one
+/// without it — and why the arm it belongs to is still not the arm a rate was
+/// measured on (`heap-sweep`'s note).
+#[cfg(feature = "stack-witness")]
+fn check_stack_ownership(payload: &KernelPayload) {
+    let bottom = payload.kernel_stack.ptr() as u64;
+    let top = bottom + KERNEL_STACK_SIZE as u64;
+    // SAFETY: a pass runs on the CPU whose GS base is its own `PerCpu`.
+    let (kernel_rsp, rsp0) = unsafe { percpu::entry_stacks() };
+    let rsp = crate::arch::cpu::read_rsp();
+    if kernel_rsp == top && rsp0 == top && rsp <= top && rsp > bottom {
+        return;
+    }
+    panic!(
+        "STACK WITNESS: cpu{} is passing on tid={} whose stack is \
+         [{bottom:#018x}, {top:#018x}) — kernel_rsp={kernel_rsp:#018x} \
+         (off by {}), tss.rsp0={rsp0:#018x} (off by {}), rsp={rsp:#018x} \
+         ({} bytes below the top). A Ring 3 entry takes its stack from one of \
+         those two words, so one that is not this task's top aims the next \
+         entry's return addresses into memory another execution owns.",
+        percpu::cpu_id(),
+        payload.id.1,
+        kernel_rsp.wrapping_sub(top) as i64,
+        rsp0.wrapping_sub(top) as i64,
+        top.wrapping_sub(rsp) as i64,
+    );
 }
 
 /// The heap bands around this task's kernel stack, and how deep it has been.

@@ -198,6 +198,44 @@ heap-sweep = ["heap-tripwire"]
 # not what governs the rate — the layout it happens to produce is.
 heap-band-notail = ["heap-tripwire"]
 heap-band-nohead = ["heap-tripwire"]
+# **Who else is standing on this stack.** The class's first non-random
+# fingerprints are both *kernel text* words inside kernel data — a
+# `0xffff8000_7cae_3310` written over `MscDevice::block` identically in two
+# independent boots, and a task kernel stack holding `stack_top + 16` one word
+# above its own top — and a mid-function text address in a data field is a
+# return address, which means something executed with that address as its stack
+# pointer.
+#
+# So this asks the two questions a corrupted word cannot answer for itself.
+# `sched::driver`'s `check_stack_ownership` compares, at every pass, the two
+# words that aim a Ring 3 entry at a stack — `percpu.kernel_rsp` and
+# `tss.rsp0` — against the running task's own stack top, and this CPU's `rsp`
+# against that stack's bounds; `drivers::xhci::wait::msc`'s `BlockWitness`
+# snapshots the one field that has been seen changing inside a single call and
+# names the frame, the depth and the value when it does.
+#
+# Its own build and not a boot parameter, for `heap-tripwire`'s reason turned
+# around: the driver half is a comparison on the block path and the scheduler
+# half is three comparisons on the pass path, so a kernel carrying it is not
+# the kernel a rate was measured on and it has to be in *both* arms of any
+# comparison. It compiles no decision — every line is a reader and a panic.
+stack-witness = []
+# The amplifier's own control, in two arms that differ by one lock.
+#
+# Two instruments now multiply this class and neither writes anything a machine
+# reads: `sched-tripwire`'s byte shadow (7.2x) and `heap-sweep`'s walk (absent
+# to baseline). What they share is time spent on the path every scheduler pass
+# takes; what only the sweep adds is `dlmalloc`'s lock held across that time.
+# Nothing has ever separated the two. `pass-spin` spends `sched::driver`'s
+# `HOLD_NS` on the pass path and takes no lock; `heap-lockspin` spends the same
+# time holding the same lock the sweep holds. One `HOLD_NS`, two arms, and the
+# answer says whether the window this class needs is the lock or the delay.
+#
+# Neither can be a boot parameter, for the reason none of the instruments above
+# can: an arm is a whole kernel, and a branch at the site would put the arm's
+# own cost into the arm it is being compared against.
+pass-spin = []
+heap-lockspin = ["pass-spin"]
 # Take the FP body out of `arch::entry`'s bracket and the declared state out of
 # the loader's trampolines, leaving a kernel that preserves the *rest* of the
 # user machine state and nothing else — which is the kernel this tree had before

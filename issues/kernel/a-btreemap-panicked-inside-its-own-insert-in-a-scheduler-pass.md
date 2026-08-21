@@ -537,3 +537,239 @@ data phase and the status phase, which is where that call waits.
 * **The `0xffff80007cae3310` written over `MscDevice::block`** is the one
   deterministic artefact on record. Resolving that address to a symbol, and
   finding what holds a pointer to it, is the next thing to do.
+
+---
+
+## 2026-08-21, the silent half: three quarters of this class never says a word, and every rate above is a count of the quarter that does
+
+Four arms, one host, one session, one recipe, thirty minutes each, twelve-wide,
+`compositor: ready` as the completion marker — and one change to the harness
+that turns out to matter more than any arm: **a guest whose QEMU is gone is
+counted.** Every earlier storm of this class counted a boot as a death when its
+serial log carried a panic marker. This one also counts the boots where QEMU
+simply is not there any more, and those are three quarters of the total.
+
+### What a "silent" death actually is, read off the vCPUs
+
+They are not host noise and they are not the harness. Re-run with
+`-action reboot=shutdown -action shutdown=pause`, which parks QEMU on a guest
+reset instead of letting `-no-reboot` end it, 441 boots produced one — and it is
+readable:
+
+```
+{"return": {"status": "shutdown", "running": false}}
+CPU#1  RIP=1b7b9f15ffd23100  RFL=00000446 [D--Z-P-]  CPL=0  HLT=0
+       RSP=ffff800000c00680  SS =0000 0000000000000000 00000000 00000000
+       CS =0008 ... CS64 [-R-]      CR2=ffff800000e21ee8
+       GS =0000 ffff800000c00510    TR =0028 ffff800000c00530
+```
+
+`RIP` is not canonical, `SS` is the null selector, and `DF` is **set** — which
+Ring 0 code never runs with. That is `context_switch`'s last two instructions
+and nothing else: `popfq` took a garbage word for `RFLAGS` and `ret` took a
+garbage word for the return address. Sixty-four bytes below the `rsp` that
+leaves is `0xffff800000c00640`, and cpu1's `PerCpu` is at `0xffff800000c00510`
+(its `GS` base, with its TSS at `+0x20` and its GDT at `+0x90`) — **so the frame
+this switch restored was inside the per-CPU region, which is not a stack at
+all.** The machine then triple-faulted, which is why nothing reached either
+channel: the 16550 goes quiet at the virtio-console handover and the virtio
+console needs a live guest to drive its queue.
+
+The one other death in that probe was `rc=139` — QEMU itself taking a SIGSEGV.
+Host crashes are real and they are rare: macOS wrote **one** `qemu-system-x86_64`
+crash report between 17:39 and 19:26, across roughly 29,000 boots, and it is that
+one.
+
+### The four arms
+
+| arm | kernel | boots | deaths | of those, spoke | hangs |
+|---|---|---|---|---|---|
+| **A** | `sched-tripwire` | 7,413 | **22** | 6 | 0 |
+| **B** | `sched-tripwire` + `heap-lockspin` | 7,004 | **12** | 1 | 0 |
+| **C** | `sched-tripwire` + `heap-sweep` + `stack-witness` | 7,044 | **21** | 0 | 17 |
+| **D** | `sched-tripwire` + `stack-witness` | 7,349 | **23** | 4 | 0 |
+| **E** | D + the switch test extended to the idle context (15 min) | 3,671 | **10** | 3 | 0 |
+
+Every p below is the conditional binomial on the two counts — under one common
+rate, `k1 | (k1+k2) ~ Binomial(k1+k2, n1/(n1+n2))`, two-sided.
+
+### The band arms did not stop this class. They stopped it *speaking*.
+
+**C against A is the same rate**: 21 in 7,044 against 22 in 7,413, ratio 1.00,
+p = 0.79. And **not one of C's 21 deaths said anything**, against 6 of A's 22:
+0 versus 6, p = 0.015.
+
+That is the correction this session owes the two entries above it. The headline
+of 2026-08-21 — *"7,205 boots, no deaths"* under `heap-tripwire`, p ≈ 5.5×10⁻⁶ —
+and the sweep table's `H′ 0/7,211` and `F 0/7,011` are all counts of deaths that
+**printed a panic marker**. A storm that kills on a marker cannot see a guest
+that vanishes, and this arm says that is where the bands send them: the machine
+dies exactly as often and dies without a word. The bands' displacement is real
+and it is not a suppression — read "the bands took the deaths to zero" as
+"the bands took the *reports* to zero", and treat every number in the two
+sections above as a lower bound on its arm.
+
+### Lead 3, the amplifier: the allocator's lock is not the window
+
+`heap-lockspin` is `heap-sweep`'s cost without the sweep — it takes
+`dlmalloc`'s lock on the pass path and holds it for `HOLD_NS` of guest time,
+reading nothing and walking nothing. At 1 ms every 25 ms, a 4% duty cycle on
+the one lock the whole kernel allocates through:
+
+**12 in 7,004 against the baseline's 22 in 7,413 — ratio 0.58, p = 0.093.** It
+did not amplify. If anything it went the other way.
+
+So the hypothesis as it was posed — *the class is multiplied by time spent in
+the pass with the allocator lock held, and the racer is whoever writes heap
+memory without the lock* — is **not supported**. What is left of the amplifier
+is what `sched-tripwire` already showed: time on the pass path, without any
+lock. The next arm is `pass-spin` — the same visit, the same `HOLD_NS`, no lock —
+which separates "the delay" from "the delay under this particular lock", and
+after it a longer `HOLD_NS`, because 1 ms bounds the effect rather than refuting
+it.
+
+### Lead 1: the deterministic address is a return address inside `BTreeMap::insert_recursing`
+
+`0xffff8000_7cae_3310` is `dev.block + MSC_CSW`, and `MSC_CSW` is `0x2040`, so
+the word written into `MscDevice::block` was `0xffff8000_7cae_12d0`. The kernel
+is loaded by UEFI at a fixed `0x7ca00000` on this shape — `Kernel memory located
+at: 0x7ca00000` in every boot log of every arm — and its first segment is
+`vaddr 0, memsz 1409024, flags 5`, so kernel offset **`0xe12d0` is inside the
+executable segment**, with 0x77000 of text above it. It is kernel text.
+
+Resolved against the `nm` of a kernel built from this tree with arm W's own
+feature set (`sched-tripwire heap-sweep`), `0xe12d0` is:
+
+```
+<btree::node::Handle<NodeRef<Mut, (Tid, u64), kernel::process::MappedPages, Leaf>, Edge>
+  >::insert_recursing::<Global, <VacantEntry<(Tid,u64), MappedPages>>::insert_entry::{closure#0}>
+  + 0x930          (symbol at 0xe09a0, next symbol at 0xe14c0)
+```
+
+`+0x930` of a 0xb20-byte function is **mid-function**, which no function pointer
+and no vtable slot ever is: it is a **return address**. And the identification
+survives a rebuild — the contiguous run of `alloc::collections::btree`
+monomorphizations around it spans `0xd7980 .. 0xf4920`, **118,688 bytes**, with
+39,760 of them below the target, and arm W's tree differs from this one by a
+loop rewrite in `mm/alloc.rs` alone.
+
+So the word is the return site of a call inside an insert into
+`BTreeMap<(Tid, u64), MappedPages>` — the map a spawn and a demand fault write.
+`XhciController::with_storage` copies the whole `Disk` out of `self.msc[at]` onto
+its own frame and writes it back after, so the `&mut MscDevice` every phase of
+`bot` holds points **into the running task's kernel stack**. Something executed
+`insert_recursing` with that slot as its stack pointer.
+
+That is the same sentence the parked capture above writes in the other
+direction: a CPU running with an `rsp` that is not its stack. The two
+fingerprints agree, and neither is about the heap's *contents*.
+
+### What landed, and what it is for
+
+* **`stack-witness`** (`kernel/Cargo.toml`), three readers and a panic each:
+  * `sched::driver::check_stack_ownership`, at every pass — the two words a
+    Ring 3 entry takes its stack from (`percpu.kernel_rsp` and `tss.rsp0`)
+    against the running task's own `kernel_stack_top`, and this CPU's `rsp`
+    against that stack's bounds.
+  * `hw::check_switch_frame`'s third test — the incoming context's `rsp` must be
+    **inside the stack its own `kernel_stack_top` names**, not merely a kernel
+    address. This is the test the parked capture asks for: `0xffff800000c00640`
+    is a kernel address and the word at `+56` was one too, which is why #149's
+    guard let it through and the machine triple-faulted instead of reporting.
+  * `drivers::xhci::wait::msc`'s `BlockWitness` — `dev.block` snapshotted at the
+    top of a `bot` round trip and compared before the status phase reads it,
+    reporting the field's address, its depth below this CPU's Ring 3 entry
+    stack, and both values.
+* **`pass-spin` / `heap-lockspin`** — the amplifier's control, above.
+* The heap tripwire's tail-band report now prints the **whole band**, four
+  words, not the one that failed. The single fire this instrument has ever had
+  held `stack_top + 16` at `stack_top`, which is what an interrupt frame's saved
+  `RSP` looks like if the entry happened sixteen bytes above the stack — and
+  from one word that reading could not be checked. Word +8 would be a stack
+  segment selector if it is one.
+
+**No witness fired in any arm.** 7,044 boots of C, 7,349 of D — `stack-witness`
+on a kernel with no bands, at arm A's rate and arm A's speaking character — and
+3,671 of E, which is D with the switch test extended to the idle context after
+D's task-only form fired zero times against 19 silent deaths. So across 18,064
+boots:
+
+* `percpu.kernel_rsp` and `tss.rsp0` **never** disagreed with the running task's
+  own stack top, and no pass ever ran on an `rsp` outside that stack. The
+  "a Ring 3 entry landed on a stack another task is live on" mechanism is not
+  what is happening — or not while a pass is looking.
+* `MscDevice::block` never changed inside a `bot` round trip. The two identical
+  `KernelSlice OOB` deaths did not recur in this session at all.
+* No context was ever switched onto a frame outside its own stack — including
+  the idle contexts, in E. The parked capture's wrecked frame is therefore
+  either rarer than 1 in 3,671 boots, or it is not reached through
+  `Hw::switch` at all, which would mean an `rsp` wrecked *after* the switch
+  passed and before the `popfq`.
+
+That last branch is the one worth taking next: `check_switch_frame` runs on
+`ctx.rsp` and `context_switch` then reads the frame through `rsp` a few
+instructions later, and nothing tests the seven words in between.
+
+### A fourth deterministic fingerprint, and this one names a scheduler function
+
+Two of arm E's ten deaths are byte-identical:
+
+```
+FAULT rip=0xffff80007cad48ae cr2=0x0000000000000078 err=0x0 cr3=0xded001
+```
+
+`0x7cad48ae - 0x7ca00000` is `0xd48ae`, and against that build's own `nm` it is
+`<toyos_sched::task::TaskShared<Msg<KernelPayload>>>::transition + 78` — a read
+through a **null** `self` at field offset `0x78`, at the same instruction, in
+two independent boots. A third death in the same arm faulted at
+`dlmalloc::malloc + 125`.
+
+That is the same shape as the `MscDevice::block` fingerprint one level up: not a
+random word, but the same code reaching the same wrong place. A `TaskShared`
+pointer read as zero is a `Msg` or a `RunToken` whose target has been cleared,
+and `transition` is on the pass path.
+
+### Two cautions for the next reader
+
+* **`report_contexts` calls a stale pointer an idle context.** Three captures in
+  this session show `cpu1 is on ctx 0x… (its idle context) stack_top=0x0 …` with
+  garbage in `saved_rsp` — `0x480011f801050000`, `0x4800123c41050000` — and one
+  with a nonzero `stack_top` under the report's own "ZERO BY CONSTRUCTION"
+  warning. They are not the idle context. Idle contexts are boxed together and
+  sit within `0x90` of one another (`cpu-7-has-no-cpusched-returned-on-kvm.md`
+  shows `0x…1900310` and `0x…19003a0`); these sit 45 MB away, in the region
+  where *task* contexts live, and they read as idle only because `id: None` is a
+  niche a released record's bytes can satisfy. `RUNNING_CTX[cpu]` is not cleared
+  when a task is reaped, so what the report walked was a freed record. Nothing
+  is wrong with reading it — the direct map stays mapped — but the rendering
+  invites exactly the misreading the report's own comment warns about, one field
+  over.
+* **`0x4800123c41050000` recurs across two independent boots in two arms**, once
+  in `rbx` and once at a released context's `rsp` offset. That is a recycled
+  allocation holding the same bytes, not necessarily a second deterministic
+  writer.
+
+### What is owed now
+
+* **Re-measure the two entries above this one.** Every "no deaths" in this file
+  was counted with a marker-only storm. The bands' arms in particular have to be
+  re-run counting silent guests before "displacement suppresses the class" can
+  stand at all.
+* **`pass-spin` at `HOLD_NS`, then at ten times it.** The amplifier is time on
+  the pass path, and the lock arm has cleared the lock.
+* **The seven words between the check and the `ret`.** `check_switch_frame`
+  tests `ctx.rsp` and `context_switch` reads the frame through it a few
+  instructions later; 18,064 boots say the value the check sees is always sound,
+  and one parked capture says the value the `popfq` used was not. Testing the
+  *frame* rather than the pointer — the seven saved registers and the return
+  slot, against the stack they must lie in — is the next narrowing, and it is
+  the only one this session leaves that has not been measured to zero.
+* **`check_switch_frame`'s third test is worth the shipping kernel even so.** It
+  is two compares on the switch path. It is behind `stack-witness` only because
+  a scheduler change owes the two checks the root `CLAUDE.md` requires, and this
+  session has a negative control for neither.
+* **Any mechanism proposed for this class must also explain
+  `cpu-7-has-no-cpusched-returned-on-kvm.md`** — the first sighting on real
+  silicon, under KVM, from `idle_loop` during AP bring-up on a loaded machine.
+  Nothing found here is TCG-specific: a `popfq`/`ret` off a frame that is not a
+  stack, and a return address in a data field, are architecture-neutral shapes.
