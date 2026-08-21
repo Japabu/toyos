@@ -16,16 +16,24 @@
 //! The second arm is the whole of what stops the first passing because the
 //! service was never there.
 //!
-//! **Capabilities.** Three things are reachable no other way — minting a device
-//! claim, entering the real-time band, and turning a pid into a process handle
+//! **Capabilities.** Four things are reachable no other way — minting a device
+//! claim, entering the real-time band, turning a pid into a process handle, and
+//! powering the machine off
 //! — and each is one bit on a handle to a `SysCap` the kernel mints exactly once,
 //! for `/bin/init`. A handle that carries the wrong *bit* is refused with a word,
 //! because probing what an attenuated capability can still do is what
 //! attenuation is for; a handle that is **no handle at all** ends the caller.
 //!
+//! **The shutdown arms are the ones with a machine behind them.** `SYS_SHUTDOWN`
+//! used to take no argument, so both of them made the call and the guest went
+//! away: a kernel that stops demanding `Rights::POWER` does not fail these
+//! assertions, it powers off the boot they run on, which is the loudest red
+//! this suite can produce and exactly the defect being denied.
+//!
 //! **A wrong-typed handle is refused with a word here, and that is a property of
 //! the check rather than an exception to the policy.** The table resolves rights
-//! before type, and `DEVICE` and `RT` are bits only a `SysCap` ever carries — so
+//! before type, and `DEVICE`, `RT` and `POWER` are bits only a `SysCap` ever
+//! carries — so
 //! nothing of another type can reach the type check at all, and presenting one is
 //! indistinguishable from presenting an attenuated capability. Asserted, because
 //! it is the answer a caller gets and a test that expected the kill would be
@@ -54,6 +62,10 @@ const HANDLE_FAULT: i32 = 139;
 const NOT_A_HANDLE: &[(&str, &str)] = &[
     ("claim-absent", "SYS_DEVICE_CLAIM took a handle nobody holds"),
     ("rt-absent", "SYS_RT_ENTER took a handle nobody holds"),
+    // The third, and the only one whose failure mode is not a wrong exit code:
+    // a kernel that took this handle would cut the power to the guest the
+    // parent is waiting on.
+    ("shutdown-absent", "SYS_SHUTDOWN took a handle nobody holds"),
 ];
 
 fn main() {
@@ -135,6 +147,21 @@ fn a_right_the_capability_lacks_is_a_word() {
         "a capability without DEVICE minted a claim",
     );
 
+    // **Narrowed and not the estate's own cap, because this estate does carry
+    // `POWER`.** `run shutdown` is how a dozen host-side gates end their guest,
+    // so `tests/testcases` names `power` on the test-runner row and every
+    // binary it spawns holds a duplicate — including this one. The subject is a
+    // capability that resolves and lacks the bit, which is what `toothless` is.
+    //
+    // There is no arm for the unnarrowed cap here, and there cannot be: the
+    // call that proves the estate *does* hold `POWER` does not come back, and
+    // `run shutdown` at the end of a dozen host-side gates is that proof.
+    assert_eq!(
+        toothless.shutdown(),
+        SyscallError::PermissionDenied,
+        "a capability without POWER shut the machine down",
+    );
+
     // A handle that is not a capability at all. It never reaches the type
     // check: `DEVICE` and `RT` are bits nothing else carries, so this is the
     // same refusal the narrowed capability got.
@@ -147,6 +174,11 @@ fn a_right_the_capability_lacks_is_a_word() {
         syscall::rt_enter(RawHandle(1)),
         Err(SyscallError::PermissionDenied),
         "a pipe was taken as a capability by SYS_RT_ENTER",
+    );
+    assert_eq!(
+        syscall::shutdown(RawHandle(1)),
+        SyscallError::PermissionDenied,
+        "a pipe was taken as a capability by SYS_SHUTDOWN",
     );
 
     // And the unnarrowed one does carry `DEVICE`, so the refusals above were
@@ -165,6 +197,7 @@ fn a_right_the_capability_lacks_is_a_word() {
         syscall::close(claim);
     }
     println!("  capability: refused for the bit it lacks and for having none, allowed for the bit it has");
+    println!("  power: a capability without POWER, and a pipe, were both refused the machine");
 }
 
 /// Run `role` and require that the kernel ended it at its call.
@@ -201,10 +234,16 @@ fn not_a_handle(role: &str) -> ! {
     assert!(NOT_A_HANDLE.iter().any(|(name, _)| *name == role), "unknown role {role:?}");
     println!("reached {role}");
     std::io::stdout().flush().expect("flush the marker");
-    let answered = if role.starts_with("claim") {
-        format!("{:?}", syscall::device_claim(HANDLE_INVALID, DeviceType::Keyboard))
-    } else {
-        format!("{:?}", syscall::rt_enter(HANDLE_INVALID))
+    let answered = match role {
+        "claim-absent" => {
+            format!("{:?}", syscall::device_claim(HANDLE_INVALID, DeviceType::Keyboard))
+        }
+        "rt-absent" => format!("{:?}", syscall::rt_enter(HANDLE_INVALID)),
+        // If this comes back at all the kernel refused it, which is already the
+        // wrong answer for a handle nobody holds. If it does not come back, the
+        // machine this child is running on has been powered off and the parent
+        // never reads a word of this.
+        _ => format!("{:?}", syscall::shutdown(HANDLE_INVALID)),
     };
     panic!("{role} was answered {answered} instead of ending the caller");
 }
