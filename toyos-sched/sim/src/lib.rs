@@ -27,6 +27,7 @@ pub mod choice;
 pub mod explore;
 pub mod hw_impl;
 pub mod invariants;
+pub mod latency;
 pub mod msg;
 pub mod payload;
 pub mod scenarios;

@@ -8,6 +8,7 @@
 use toyos_sched::queue::FairOrder;
 use toyos_sched::task::WaitClass;
 
+use crate::vm::RUN_CHUNK_NS;
 use crate::workload::{
     AgeShape, BlockShape, ChargeShape, IrqSpec, MigrateShape, Op, ParkShape, ProcSpec, Protocol,
     QueueSpec, Scenario, Script, ShareShape, WindowShape,
@@ -1022,6 +1023,13 @@ pub fn overlong_pass() -> Scenario {
 /// would be asserting the opposite of what they are for. `old_commit_fused` is
 /// absent for the mirror-image reason — it passes, but only because the
 /// harness cannot see the bug it contains.
+///
+/// The three measured-policy workloads are here at their **cheapest** widths and
+/// nowhere else. `sim/tests/policy.rs` measures them across a curve of widths and
+/// asserts a bound at each; what this list adds is the other half — the widths it
+/// can afford get every invariant walk on 500 seeds and a fuzz sweep on top, so a
+/// policy workload cannot state a latency about a machine that was breaking I1
+/// while it was measured.
 pub fn all() -> Vec<Scenario> {
     vec![
         crash_md_exit_race(),
@@ -1042,15 +1050,39 @@ pub fn all() -> Vec<Scenario> {
         fairness_storm(2),
         sibling_storm(),
         lend_then_block(),
+        share_gain(4, WORK),
+        interactive_mix(1, 4),
+        wakeup_storm(2, 16),
     ]
 }
 
 /// Look a scenario up by name, for the CLI and the corpus replays.
+///
+/// The measured policy suite's three workloads are parameterized and reachable
+/// here by name, for the same reason `fairness_storm:<cpus>` is: what
+/// `sim/tests/policy.rs` can afford is a few widths, and the question each of
+/// them answers is asked of a *curve*. `measure share_gain:256 20` is how the
+/// numbers in that file's tables were taken.
 pub fn by_name(name: &str) -> Option<Scenario> {
     // `fairness_storm:<cpus>` for any width, which is what spec §11 Stage 9
     // gates on ("1–128 vcpus"). `all()` carries only the two cheap widths.
     if let Some(cpus) = name.strip_prefix("fairness_storm:") {
         return cpus.parse().ok().filter(|&n| n >= 1).map(fairness_storm);
+    }
+    // `share_gain:<threads>` at the suite's own per-thread work.
+    if let Some(threads) = name.strip_prefix("share_gain:") {
+        return threads
+            .parse()
+            .ok()
+            .filter(|&n| n >= 1)
+            .map(|threads| share_gain(threads, WORK));
+    }
+    // `interactive_mix:<cpus>:<hogs>` and `wakeup_storm:<cpus>:<waiters>`.
+    if let Some(rest) = name.strip_prefix("interactive_mix:") {
+        return two_numbers(rest).map(|(cpus, hogs)| interactive_mix(cpus, hogs));
+    }
+    if let Some(rest) = name.strip_prefix("wakeup_storm:") {
+        return two_numbers(rest).map(|(cpus, waiters)| wakeup_storm(cpus, waiters));
     }
     match name {
         "old_steal_port" => Some(old_steal_port()),
@@ -1068,6 +1100,15 @@ pub fn by_name(name: &str) -> Option<Scenario> {
         "old_preemptible_window" => Some(old_preemptible_window()),
         _ => all().into_iter().find(|s| s.name == name),
     }
+}
+
+/// `<a>:<b>`, both positive. `None` for anything else, so a mistyped CLI name
+/// is an unknown scenario rather than a scenario at a width nobody asked for.
+fn two_numbers(text: &str) -> Option<(usize, usize)> {
+    let (first, second) = text.split_once(':')?;
+    let first: usize = first.parse().ok()?;
+    let second: usize = second.parse().ok()?;
+    (first >= 1 && second >= 1).then_some((first, second))
 }
 
 /// Invariant I9's workload, and the control half of its gate: one lend, then a
@@ -1135,6 +1176,188 @@ pub fn lend_then_block() -> Scenario {
         ],
     )
 }
+
+/// **The share-gain attack, as a workload**: one process with a single runnable
+/// thread against one with `threads` of them, both pure CPU, on one CPU.
+///
+/// The policy says "threads execute, processes own fair share", so `solo`'s work
+/// must take about twice as long as it would alone whatever `threads` is —
+/// `swarm` cannot buy CPU by forking. `sim/tests/policy.rs` measures how long it
+/// actually takes and what that is worth as a share.
+///
+/// Shape, and why each part of it:
+///
+/// * **One CPU.** A process cannot run on more CPUs than it has runnable
+///   threads, so a single-threaded `solo` on a wider machine is limited by its
+///   own thread count and not by the scheduler — which is the same reason
+///   invariant I5's window excludes a member under its even share of the
+///   machine. One CPU is where an even split is achievable and therefore where
+///   the claim has content.
+/// * **Every thread carries the same `work`.** `swarm` then holds `threads`
+///   times `solo`'s total, so it is still runnable long after `solo` has
+///   finished under any policy, and `solo`'s completion is a measurement of the
+///   *rate* it was served at rather than of the moment its rival ran out.
+/// * **Nothing blocks.** The whole run is one contention window, which is what
+///   makes the completion instant a share.
+///
+/// The run costs `(threads + 1) × work` of virtual time, so the price of a wide
+/// swarm is linear and the constant is `work`.
+pub fn share_gain(threads: usize, work: u64) -> Scenario {
+    let hog = |ns| Script::new(vec![Op::Run(ns)]);
+    let mut scenario = scenario(
+        "share_gain",
+        1,
+        // No wait queues: a queue nobody blocks on would only be scaffolding.
+        Vec::new(),
+        vec![
+            process("solo", vec![0], vec![hog(work)]),
+            process("swarm", vec![0; threads], vec![hog(work)]),
+        ],
+    );
+    scenario.max_tasks = threads + 2;
+    // Every thread's work is chopped into `RUN_CHUNK_NS` execution steps, and
+    // each quantum boundary costs a pass on top — about 73 steps per thread at
+    // `work = 60 ms`, against the 66 those two terms predict. Measured over the
+    // whole sweep `sim/tests/policy.rs` runs: 148 steps at one swarm thread, 367
+    // at four, 1,243 at sixteen, 4,747 at 64. The safety net reserves four times
+    // the linear term, which is a wide margin on a quantity that is linear by
+    // construction — nothing here blocks, so there are no idle passes to pay for.
+    scenario.max_steps = 20_000 + 4 * (threads + 1) * (work / RUN_CHUNK_NS) as usize;
+    scenario
+}
+
+/// The interactive workload: one thread that sleeps, wakes on a device
+/// interrupt, runs briefly and sleeps again, against `hogs` threads of pure CPU
+/// that never yield.
+///
+/// This is the shape every desktop scheduler is judged on, and the claim under
+/// test is `mailbox::Urgency::Normal`'s own sentence — a busy target drains an
+/// ordinary wake "at its next safe point (≤ one quantum)". The sleeper is under
+/// its fair share by construction (it uses a quarter of a millisecond per
+/// three), so its stored lag is positive and its re-derived vruntime puts it at
+/// the head of the fair band the moment the running hog gives the CPU up.
+///
+/// **The waker is a device and not a thread**, as in [`lost_wake_audio`]: a
+/// waker thread would be a third competitor for the CPU whose latency is being
+/// measured. The interrupt carries no boost, so what is measured is the *fair*
+/// band's wake latency and not a borrowed real-time window — invariant I4
+/// already owns that one.
+pub fn interactive_mix(cpus: usize, hogs: usize) -> Scenario {
+    let mut scenario = scenario(
+        "interactive_mix",
+        cpus,
+        vec![queue(WaitClass::Io)],
+        vec![
+            process(
+                "sleeper",
+                vec![0],
+                vec![Script::looping(
+                    vec![
+                        // The deadline is far past the interrupt period, so the
+                        // wake under measurement is always the device's and
+                        // never a timeout the sleeper armed for itself.
+                        Op::Block {
+                            queue: 0,
+                            deadline: Some(50 * MS),
+                        },
+                        Op::Run(MS / 4),
+                    ],
+                    INTERACTIVE_ROUNDS,
+                )],
+            ),
+            // Long enough that the hogs outlast every round the sleeper runs:
+            // the sleeper's rounds take about `INTERACTIVE_ROUNDS` interrupt
+            // periods of wall clock, and one hog thread of this length outlasts
+            // that even holding half the machine.
+            process(
+                "hog",
+                vec![0; hogs],
+                vec![Script::new(vec![Op::Run(20 * MS)])],
+            ),
+        ],
+    );
+    scenario.irqs.push(IrqSpec {
+        period_ns: 3 * MS,
+        queue: 0,
+        boost_ns: None,
+    });
+    scenario.max_tasks = hogs + 2;
+    // Measured over the sweep `sim/tests/policy.rs` runs: 220 steps at one hog,
+    // 278 at four, 572 at sixteen, 2,092 at 64.
+    scenario.max_steps = 20_000 + 400 * hogs;
+    scenario
+}
+
+/// How many times the sleeper of [`interactive_mix`] wakes in one run. It is the
+/// sample count per seed, and `sim/tests/policy.rs` divides by it: the spawn
+/// burst delays exactly one of these wakes, so the steady-state claim is about
+/// the other `INTERACTIVE_ROUNDS - 1`.
+pub const INTERACTIVE_ROUNDS: usize = 20;
+
+/// A wakeup storm: `waiters` threads parked on one queue, all made runnable at
+/// once, over and over.
+///
+/// What it measures is the *drain* — how long the last of them waits for a CPU —
+/// and whether that time falls when the machine gets wider. A storm that drains
+/// no faster on four CPUs than on one is a storm being serialized somewhere, and
+/// the wake path has two places it could be: `wake_all` claims every waiter in
+/// one loop on the waker's CPU, and each claim posts a `Msg::Wake` to the
+/// waiter's *home* CPU, which is where spawn placement put it.
+///
+/// Each waiter runs for a quarter of a millisecond and blocks again, so the
+/// drain is dominated by how many waiters share a run queue rather than by what
+/// any of them does with the CPU.
+pub fn wakeup_storm(cpus: usize, waiters: usize) -> Scenario {
+    let mut scenario = scenario(
+        "wakeup_storm",
+        cpus,
+        vec![queue(WaitClass::Futex)],
+        vec![
+            process(
+                "waiters",
+                vec![0; waiters],
+                vec![Script::looping(
+                    vec![
+                        Op::Block {
+                            queue: 0,
+                            deadline: Some(50 * MS),
+                        },
+                        Op::Run(MS / 4),
+                    ],
+                    STORM_ROUNDS,
+                )],
+            ),
+            process(
+                "waker",
+                vec![0],
+                vec![Script::looping(
+                    vec![
+                        Op::Run(2 * MS),
+                        Op::Wake {
+                            queue: 0,
+                            all: true,
+                            boost: None,
+                        },
+                        // Without the yield the waker runs its whole script
+                        // inside one quantum and the storms overlap, which
+                        // measures the workload rather than the drain.
+                        Op::Yield,
+                    ],
+                    STORM_ROUNDS,
+                )],
+            ),
+        ],
+    );
+    scenario.max_tasks = waiters + 2;
+    // Measured over the sweep `sim/tests/policy.rs` runs: 334 steps at 16
+    // waiters on one CPU, 427 at 16 on four, 1,270 at 64 on one, 1,671 at 64 on
+    // eight — the width costs idle passes and steal probes on top of the storm.
+    scenario.max_steps = 20_000 + 200 * waiters * STORM_ROUNDS;
+    scenario
+}
+
+/// How many storms one [`wakeup_storm`] run raises.
+pub const STORM_ROUNDS: usize = 4;
 
 /// Negative gate for invariant I9: [`lend_then_block`] under commit `9c2fc4d`'s
 /// park, which cleared the borrowed window only `if now >= until`.

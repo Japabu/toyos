@@ -67,14 +67,19 @@ and it is a real finding about the scheduler. The row is scoped to
 silenced by it.
 
 **That has now happened, so read the two sentences above as spent.** Invariant P
-fired on a KVM shard at 200569 ns — run 31946183485, job 95162423932,
-`guest (8)`, 2026-08-16 — and
+fired on KVM shards twice on 2026-08-16 — 277260 ns on cpu1 in
+`driver::idle_loop` (run 31936533470, a push to `main`) and 200569 ns on cpu0 in
+`timer_handler` (run 31946183485) — at a measured 2 of 91 sampled `ci` runs.
 `issues/kernel/the-check-build-guest-stopped-answering-on-kvm-twice.md`
-carries it. Nothing in *this* file's reasoning about the dev host is disturbed:
-1.68 ms in `driver::idle_loop` before userland and 200569 ns in `timer_handler`
-during `sched_stress` are three orders of magnitude and two call sites apart. What
-is disturbed is the sentence "a scheduler pass that fits 200 µs natively"; on the
-one native measurement there is, it did not.
+carries it.
+
+**Magnitude does not disturb this file; two other things do.** 1.68 ms is five
+times the largest KVM firing, and nothing on KVM has come near it, so the TCG
+explanation of *that* gap stands. But the **call site** no longer separates the
+accelerators — `driver::idle_loop` is where the 277260 ns firing landed too, so
+it is not a TCG signature and must not be read as one. And the sentence "a
+scheduler pass that fits 200 µs natively" is false on both native measurements
+there are.
 
 ## The panic is gone, and so is this file's headline
 

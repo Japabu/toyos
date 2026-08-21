@@ -5,8 +5,8 @@
 # `debian:sid` is a rolling release and the remedy is to record the new
 # version, not to carry on; the host CPU vendor, since `kvm_amd` and
 # `kvm_intel` are both in play
-# and not selectable; and whether `/dev/kvm` is there, the only difference
-# between a `guest` shard and the `tcg` canary.
+# and not selectable; and whether `/dev/kvm` is there *and opens*, the only
+# difference between a `guest` shard and the `tcg` canary.
 #
 # Run from the repository root, after the checkout, by every job that boots a
 # guest.
@@ -21,8 +21,10 @@ have=$(echo "$first" | sed -n '1s/^QEMU emulator version \([^ ]*\).*/\1/p')
 echo "$first"
 if [ -f /dev/kvm ] || [ -c /dev/kvm ]; then
   accel=$(ls -l /dev/kvm)
+  node=yes
 else
   accel="no /dev/kvm node: this is the emulated arm"
+  node=no
 fi
 echo "$accel"
 cpu=""
@@ -38,6 +40,22 @@ if [ "$have" != "$want" ]; then
   echo "::error::debian:sid is a rolling release and this is what it moving looks like —"
   echo "::error::nothing here is about the tree. The remedy is one line: put the new version"
   echo "::error::in .github/qemu-version, in a commit that says the instrument changed."
+  exit 1
+fi
+
+# Presence is not permission. `src/lib.rs`'s `kvm_usable` opens the node with
+# O_RDWR and every boot follows its answer, so a job that *has* `/dev/kvm` and
+# cannot open it emulates the whole suite and reports numbers taken on another
+# instrument — the same class of silent drift the version check above refuses,
+# and nothing else here would see it. The `tcg` canary has no node at all and
+# is untouched. On the self-hosted runner this is the one thing that can go
+# wrong invisibly: the container's user must be in the accelerator's group, and
+# that gid is a fact about one machine (`.github/runner/README.md`).
+if [ "$node" = yes ] && ! (exec 3<>/dev/kvm) 2>/dev/null; then
+  echo "::error::/dev/kvm is here and this job cannot open it, so every boot would fall"
+  echo "::error::back to emulation while the log above says the accelerator is present."
+  echo "::error::Nothing about the tree: the job's user is outside the group that owns"
+  echo "::error::the node — .github/runner/README.md has the gid and where it comes from."
   exit 1
 fi
 

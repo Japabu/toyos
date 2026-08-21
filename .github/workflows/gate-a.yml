@@ -1,10 +1,12 @@
 name: gate A, thorough
 
-# `tests/audio-baseline.toml`'s thorough tier, one audio test per job. N boots
-# per config taken strictly one at a time, and each job's guest has a runner to
-# itself — the quiet host the recorded sample was attested on.
+# `tests/audio-baseline.toml`'s thorough tier: N boots per config taken strictly
+# one at a time, as two shards on GitHub-hosted runners or one full partition on
+# the T14. Either way a guest has its runner to itself — the quiet host the
+# recorded sample was attested on — and either way the shards are a partition of
+# the same configs, so the number of them changes the wall clock and no verdict.
 #
-# Same `debian:sid`/QEMU 11.1.0 container the twelve shards run, since a QEMU
+# Same QEMU 11.1.0 container the twelve shards run, since a QEMU
 # version this job does not share with the rest of CI and the dev host would
 # make the one arm that exists to be compared a third instrument. What still
 # differs from the dev host, deliberately, is the accelerator (KVM against
@@ -31,25 +33,53 @@ concurrency:
   group: gate-a-${{ github.ref }}
 
 jobs:
+  # Where this gate runs, answered once — `route.yml` has the whole rule.
+  route:
+    uses: ./.github/workflows/route.yml
+
   gate:
-    runs-on: ubuntu-24.04
+    needs: [route]
+    runs-on: ${{ needs.route.outputs.runner }}
     timeout-minutes: 180
     strategy:
       fail-fast: false
+      # Two shards on GitHub-hosted runners, as this gate has always run: each
+      # gets a machine to itself, so splitting the configs halves the wall
+      # clock and changes no verdict. The T14 is one machine, so a second lane
+      # there would put two guests on the cores this gate exists to have to
+      # itself — one partition, `max-parallel: 1`, whatever else carries the
+      # `toyos` label later.
+      max-parallel: ${{ needs.route.outputs.trusted == 'yes' && 1 || 2 }}
       matrix:
-        shard: [1, 2]
-    # `--device=/dev/kvm` and root inside the container, exactly as the shards:
-    # the node ships `crw-rw---- root:kvm` and root opens it, with no chmod.
+        shard: ${{ fromJSON(needs.route.outputs.trusted == 'yes' && '[1]' || '[1,2]') }}
+    # `--device=/dev/kvm`, exactly as the shards: the hosted node ships
+    # `crw-rw---- root:kvm` and root opens it with no chmod, and the T14
+    # image's own user is in that group (`.github/runner/Dockerfile`).
     container:
-      image: debian:sid
-      options: --device=/dev/kvm
+      image: ${{ needs.route.outputs.image }}
+      options: --device=/dev/kvm ${{ needs.route.outputs.cache_mount }}
     steps:
+      # `ci.yml`'s `guest` carries why this asks the environment and not the
+      # runner's name.
+      - id: local
+        name: the persistent cache
+        run: |
+          cache=${TOYOS_LOCAL_CACHE:-}
+          if [ -n "$cache" ] && [ -d "$cache" ] && [ -w "$cache" ]; then
+            echo "cache=yes" >> "$GITHUB_OUTPUT"
+            echo "persistent cache at $cache: this job installs nothing"
+          else
+            echo "cache=no" >> "$GITHUB_OUTPUT"
+            echo "no persistent cache: this job installs its own dependencies"
+          fi
+
       # Before the checkout: `actions/checkout` wants git and this image has
       # none. Three attempts, for the reason `ci.yml`'s own `deps` carries:
       # `sid` is a rolling release and its mirror is not a fixed artifact. No
       # `ovmf` package: the firmware is `ovmf/` in this repository on every
       # host.
       - name: deps
+        if: steps.local.outputs.cache != 'yes'
         run: |
           got=no
           for attempt in 1 2 3; do
@@ -79,10 +109,19 @@ jobs:
         run: .github/instrument.sh
 
       - name: rust
+        if: steps.local.outputs.cache != 'yes'
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
             | sh -s -- -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - id: key
+        name: the toolchain this tree needs
+        run: |
+          git config --global --add safe.directory "$PWD"
+          echo "tag=toolchain-linux-x86_64-$(git rev-parse HEAD:rust HEAD:toyos-abi/src \
+                HEAD:toyos/src HEAD:userland/libc/src | sha256sum | cut -c1-16)" \
+            >> "$GITHUB_OUTPUT"
 
       # This workflow builds no toolchain and never waits for one: a dispatch
       # runs after the branch's pull request already went through
@@ -92,18 +131,56 @@ jobs:
       - name: install the toolchain
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.key.outputs.tag }}
         run: .github/install-toolchain.sh
+
+      - name: local build cache
+        if: steps.local.outputs.cache == 'yes'
+        env:
+          TAG: ${{ steps.key.outputs.tag }}
+        run: sh .github/runner/link-build-cache.sh
 
       # `inputs.iterations || '30'`: a `schedule` event carries no `inputs`,
       # where `workflow_dispatch`'s `required: true, default: '30'` always
       # populates it, so the fallback is reached only on the trigger that has
       # no other way to say 30.
+      #
+      # **`set -o pipefail`, and no `${PIPESTATUS[0]}`.** The runner logs the
+      # shell it picked for this container on every step — `shell: sh -e {0}` —
+      # and `PIPESTATUS` is a bash array that shell does not have. It answered
+      # `Bad substitution` and exited 2 *after* the gate had printed its verdict
+      # and cargo had already carried the right status out, so the exit code was
+      # 2 whatever the audio said: across every run this workflow has ever had,
+      # thirteen shard-runs printed PASS and five printed FAILED, and all
+      # eighteen reported the same red. The verdict this workflow exists to
+      # deliver may not travel through a construct the shell running it cannot
+      # expand.
+      #
+      # `pipefail` is in effect on the hosted image, not merely accepted:
+      # `ci.yml`'s `suite` step runs it under the same `sh -e {0}` and the same
+      # `| tee`, and on 2026-08-21 it delivered a harness exit 1 to the step as
+      # exit 1 — which cannot happen unless pipefail is doing its job, because
+      # `tee`'s own 0 would otherwise be the pipeline's status. `-e` then exits
+      # on the harness's code: 0 on PASS, 1 on FAILED, 2 on a suspended host.
+      # `route.yml` now picks the image, so the shell here is whichever that
+      # image ships — which is the argument, not a caveat: a step that must
+      # carry a verdict is written in what every shell has, and `pipefail` is
+      # also what bash gives if the T14 image answers with one.
+      #
+      # It also fails *early* if an image ever lacks it — line 1, before the
+      # twenty-minute gate — where the construct it replaces failed on the last
+      # line wearing the costume of a verdict. Do not "make it portable" with a
+      # status file: under `-e` the left side of the pipe dies before it can
+      # record `$?`, and the step goes green on a red.
       - name: gate
+        env:
+          SHARD_COUNT: ${{ needs.route.outputs.trusted == 'yes' && 1 || 2 }}
         run: |
+          set -o pipefail
           cargo test --test toyos-build -- \
             --audio-gate ${{ inputs.iterations || '30' }} \
-            --shard ${{ matrix.shard }}/2 --host-slots 0 2>&1 | tee /tmp/gate-a.log
-          exit "${PIPESTATUS[0]}"
+            --shard ${{ matrix.shard }}/$SHARD_COUNT --host-slots 0 2>&1 \
+            | tee /tmp/gate-a.log
 
       - name: gate sample
         if: always()

@@ -888,9 +888,11 @@ pub const KNOWN_RED: &[Red] = &[
     // ---------------------------------------------------------------------
     // Invariant P on KVM. The dev-host row below predicted this case and said
     // what it would mean: "if invariant P ever fires on a KVM shard, this file
-    // does not cover it". It has. The two rows are the same assert on two
-    // accelerators and they are not one measurement — the magnitudes differ by
-    // three orders and so do the call sites.
+    // does not cover it". It has, twice. The two rows are the same assert on
+    // two accelerators and they are not one measurement — magnitude separates
+    // them, not call site: `driver::idle_loop` fired under both accelerators,
+    // three orders of magnitude apart, so only the size of the overshoot says
+    // which one ran.
     // ---------------------------------------------------------------------
     Red {
         test: "sched_check_build",
@@ -909,7 +911,15 @@ pub const KNOWN_RED: &[Red] = &[
              that sample is sixteen CI runs and 7 612 passes with **zero over 200 000 ns**, \
              largest single pass 173 906 ns, 90th percentile 32 768 ns. The gate on this \
              instrument is therefore *tighter* than the number this row's assert stood over, \
-             and a red under it is a fresh measurement rather than this one returning",
+             and a red under it is a fresh measurement rather than this one returning. A wider \
+             survey taken the day before this retirement, never landed as its own commit, found \
+             a second firing and a third sighting: run 31936533470, a push to `main`, `277260 \
+             ns` on cpu1 in `driver::idle_loop` rather than `timer_handler`, 2026-08-16 08:28 \
+             UTC — so the two KVM firings shared a call site with the TCG row below and only \
+             magnitude told them apart. Of the 100 most recent `ci` runs through 2026-08-17 \
+             13:29 UTC, 91 actually ran this shard and two fired, a rate of 2 of 91 that this \
+             retirement supersedes rather than inherits: the assert those two firings are of \
+             does not exist to fire a third time",
         ),
         what: "`invariant P: a scheduler pass took 200569 ns, budget 200000 ns` — the assert \
                firing on native x86-64 under KVM, in `timer_handler` -> `driver::pass` -> \
@@ -958,8 +968,9 @@ pub const KNOWN_RED: &[Red] = &[
                    then ALONE re-run); green on KVM the same day — twelve of twelve guest shards, \
                    run 31875856466, where it measured 5,879 ms. **What this row may no longer be \
                    read as saying is that the budget fits natively**: the same assert has since \
-                   fired on a KVM shard at 200569 ns, which is the `Instrument::Ci` row above. \
-                   The TCG explanation of *this* magnitude stands; the implied claim about the \
+                   fired on KVM shards twice, at 277260 ns and 200569 ns, which is the \
+                   `Instrument::Ci` row above. The TCG explanation of *this* magnitude stands — \
+                   nothing on KVM has come within five times it — but the implied claim about the \
                    other accelerator does not",
         source: "issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
         measured: "2026-08-15",
@@ -1247,8 +1258,14 @@ pub const KNOWN_RED: &[Red] = &[
                progress at all when the reading was taken. `ALONE handle_lifetime: red again, the \
                same failure both times`, which on a shared-block name is a fresh boot carrying \
                that binary and nothing else",
+        // The `gate A, thorough` half of this citation was struck 2026-08-21.
+        // That workflow ended its step in `exit "${PIPESTATUS[0]}"` under a shell
+        // with no `PIPESTATUS`, so it reported `failure` on every run it ever had
+        // whatever the audio said — and on 2026-08-19 both of its shards printed
+        // `[gate A] PASS`. It was never evidence of anything about `main`. The
+        // `ci` half is a verdict, and it is what this row rests on.
         evidence: "CI run 32237424649 (PR #126, job `guest (1)`); `main` red at `8e9f851` on \
-                   `ci` and on `gate A, thorough` the same day",
+                   `ci` the same day",
         source: "issues/build/free-memory-verdicts-share-a-boot.md",
         measured: "2026-08-19",
     },

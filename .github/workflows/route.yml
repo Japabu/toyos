@@ -1,0 +1,97 @@
+name: route
+
+# Where a Linux job runs, decided once for the whole repository.
+#
+# A job may use the persistent T14 exactly when the event that produced it came
+# from inside this repository. A fork's pull request and a merge-queue ref are
+# code nobody has reviewed, and the runner's own admission hook
+# (`.github/runner/accept-trusted.sh`) refuses both — so a workflow that sent
+# them there would not be less safe, it would queue until it timed out. Every
+# caller reads the answer from the outputs below and none of them repeats the
+# condition.
+#
+# A reusable workflow because it is the only form that reaches the places the
+# answer is needed: `runs-on` and `container` see the `needs` context and not
+# `env`, so no workflow-level variable can serve them, and Actions has no YAML
+# anchors. The alternative was the expression written out at every use, which
+# is how files drift apart one edit at a time.
+#
+# What this deliberately does not decide is *which* jobs are worth sending.
+# The T14 is one runner with one worker: a job that wants neither the
+# accelerator nor the persistent build cache gains nothing there and costs the
+# machine's only lane, and a job that waits on another T14 job while holding it
+# cannot finish at all. So only the guest lanes, the audio gate, the probe and
+# the toolchain bootstrap name these outputs; every coordinating job in this
+# repository stays GitHub-hosted, where it is free and parallel.
+
+on:
+  workflow_call:
+    outputs:
+      trusted:
+        description: >-
+          `yes` when this event may use the persistent runner, `no` otherwise.
+          The shape of a matrix or a timeout keys on this.
+        value: ${{ jobs.pick.outputs.trusted }}
+      runner:
+        description: The `runs-on` label for a job that wants the T14.
+        value: ${{ jobs.pick.outputs.runner }}
+      image:
+        description: >-
+          The container image such a job runs — the repository's one reference
+          to the T14 image digest.
+        value: ${{ jobs.pick.outputs.image }}
+      cache_mount:
+        description: >-
+          The `--volume` fragment mounting the persistent cache, empty on a
+          hosted runner. Compose it with whatever else the container needs.
+        value: ${{ jobs.pick.outputs.cache_mount }}
+
+permissions: {}
+
+jobs:
+  pick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      trusted: ${{ steps.pick.outputs.trusted }}
+      runner: ${{ steps.pick.outputs.runner }}
+      image: ${{ steps.pick.outputs.image }}
+      cache_mount: ${{ steps.pick.outputs.cache_mount }}
+    steps:
+      - id: pick
+        env:
+          # The one place this condition is written in the repository.
+          # `head.repo.full_name` and not `head.repo.fork`: what makes a pull
+          # request trusted is that its head is *this* repository, which is a
+          # different question from whether that repository is itself a fork of
+          # something.
+          HOSTED: >-
+            ${{ github.event_name == 'merge_group'
+                || (github.event_name == 'pull_request'
+                    && github.event.pull_request.head.repo.full_name != github.repository) }}
+        run: |
+          if [ "$HOSTED" = true ]; then
+            trusted=no
+            runner=ubuntu-24.04
+            # `debian:sid` ships the QEMU `.github/qemu-version` declares;
+            # `ubuntu-24.04` ships 8.2.2 and the two were measured disagreeing
+            # about test outcomes on the same tree.
+            image=debian:sid
+            cache_mount=
+          else
+            trusted=yes
+            runner=toyos
+            # A digest and never a moving tag: a rebuild must not be able to
+            # change the QEMU or Rust a recorded number was taken on.
+            # `.github/runner/build-image.sh` prints this line.
+            image=127.0.0.1:5000/toyos-ci@sha256:0b31109e74af8c9a6083dc8a484ad9f0bb8d87e9e128cf58e48ccc97b16121de
+            cache_mount=--volume=/home/t14/actions-runner-cache:/toyos-cache
+          fi
+          {
+            echo "trusted=$trusted"
+            echo "runner=$runner"
+            echo "image=$image"
+            echo "cache_mount=$cache_mount"
+          } >> "$GITHUB_OUTPUT"
+          echo "$GITHUB_EVENT_NAME on ${GITHUB_REF:-?}: trusted=$trusted, runner=$runner"
+          echo "image=$image"

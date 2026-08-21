@@ -29,7 +29,11 @@ usage: toyos-sched-sim <command> [args]
   list                         scenario names
 
 `fairness_storm:<cpus>` names the fairness workload at any width, which is what
-spec §11 Stage 9 gates on; `list` shows only the two widths the sweeps carry.";
+spec §11 Stage 9 gates on; `list` shows only the two widths the sweeps carry.
+The measured policy suite's workloads are parameterized the same way, and are
+what `sim/tests/policy.rs` states its bounds over:
+`share_gain:<threads>`, `interactive_mix:<cpus>:<hogs>`,
+`wakeup_storm:<cpus>:<waiters>`.";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
