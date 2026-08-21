@@ -67,3 +67,8 @@ Not done here: whether `SYS_SYSINFO` should be rights-bearing at all is one of
 the four rulings
 `issues/kernel/the-capability-end-state-is-twelve-answers.md` puts before the
 owner.
+
+**Ruled 2026-08-20**: gate it — one more SysCap bit, endowed by system.toml
+to whatever carries ps, exactly as logread is endowed today. Implementation
+queued behind the in-flight ABI landings: one ABI-bearing task holds the
+machine at a time.

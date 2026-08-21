@@ -38,7 +38,14 @@ own arm — `Rights::NONE` where the handle alone is the authority
 unstated is a right each call site invents" (`toyos-abi/src/handle.rs:53`). The
 qualification is question 5's ambient set.
 
-## 2. Is every authority ultimately derived from a handle/capability? — OPEN
+## 2. Is every authority ultimately derived from a handle/capability? — RULED 2026-08-20
+
+**The owner ruled: the filesystem is deliberately outside the capability
+model, and the exception is declared** — the root `CLAUDE.md`'s Capabilities
+paragraph now states it. Kernel objects answer to handles alone; paths are
+ambient by ruling, with `/boot`'s mount guard as the one restriction the
+ambient space carries. Ticket-based file access, if ever wanted, is a future
+era opened deliberately, never a retrofit.
 
 **Two sites disagree.** The root `CLAUDE.md`'s Capabilities paragraph says "a
 process holds exactly what its parent moved into it, and there is nothing it can
@@ -76,7 +83,13 @@ Four pid-addressed syscalls were deleted and their numbers retired rather than
 reused — 26 `SYS_WAITPID`, 33 `SYS_FIND_PID`, 37 `SYS_GRANT_SHARED`, 65
 `SYS_KILL` (`kernel/src/arch/syscall.rs:63`).
 
-## 4. Can a process enumerate objects it lacks authority over? — OPEN
+## 4. Can a process enumerate objects it lacks authority over? — RULED 2026-08-20
+
+**The owner ruled: `SYS_SYSINFO` demands a right** — one more `SysCap` bit,
+endowed by `system.toml` to whatever carries `ps`, exactly as `logread` is
+endowed today. Implementation queued behind the in-flight ABI landings (one
+ABI-bearing task holds the machine at a time);
+`issues/isolation/sysinfo-enumerates-every-process.md` carries it.
 
 The object graph is clean. No syscall lists another process's handles; a
 `Namespace` answers `lookup` and has no listing operation at all
@@ -100,7 +113,14 @@ VFS rather than a separate hole. Filed:
 `system.toml` to whichever program is meant to carry `ps`, exactly as `logread`
 is endowed to `logd` today.
 
-## 5. What ambient authority intentionally remains, if any? — OPEN
+## 5. What ambient authority intentionally remains, if any? — RULED 2026-08-20, by composition
+
+Questions 2 and 4's rulings plus the `SYS_SHUTDOWN` fix (PR #169/#172) settle
+this one: the list below, minus `SYS_SHUTDOWN` (now `Rights::POWER`) and minus
+`SYS_SYSINFO` (ruled rights-bearing, implementation queued), **is the
+committed intentional set** — a process's own execution, address space and
+record, machine facts, creation-that-confers-nothing, and the filesystem/
+`SYS_DLOPEN`/`SYS_SPAWN` path space under question 2's declared exception.
 
 Nothing states the set, so nothing is *intentional* yet. Classifying every arm
 of `syscall_dispatch` by what it demands, a process with an **empty handle
@@ -192,7 +212,13 @@ connection may not be sent over itself (`kernel/src/arch/syscall.rs:2086`,
 handles `install_buffer` writes are the kernel handing a claim's holder its own
 buffers, not a transfer (`kernel/src/object/device.rs:49`).
 
-## 9. Are threads intended to become independently controllable first-class kernel objects? — OPEN
+## 9. Are threads intended to become independently controllable first-class kernel objects? — RULED 2026-08-20
+
+**The owner ruled: declined until a caller exists.** No API may answer this by
+accident — an interface change that would make a thread independently
+holdable, waitable-by-others, or delegable is stopped and this ruling
+reopened deliberately, the day a debugger, profiler, or supervisor genuinely
+needs it.
 
 **Nothing in the tree has decided it.** There is no `Thread` row in `kobject!`
 (`kernel/src/object/mod.rs:278`), so a thread is not something a handle can
