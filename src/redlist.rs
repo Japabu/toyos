@@ -71,12 +71,24 @@ use std::path::Path;
 /// device timing, real latency — and is blind to anything needing repetition or
 /// isolation, being one manual machine. A defect found by a non-owning
 /// instrument transfers to its owner. Only three of the four can appear below:
-/// **metal is not an instrument here**, because the suite does not run on the
-/// T14.
+/// **metal is not an instrument here**, because nothing below is ToyOS on bare
+/// hardware. The T14 does run the suite — since `985f3834` it runs every
+/// trusted event's — but it runs it in QEMU under KVM, which is [`Ci`].
+///
+/// [`Ci`]: Instrument::Ci
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
 pub enum Instrument {
-    /// A `guest` shard: KVM on four native x86-64 cores, `-cpu host`, **one
-    /// guest per machine**, `--jobs 1`, nothing else on the box.
+    /// A `guest` lane: KVM on native x86-64 cores, `-cpu host`, **one guest per
+    /// machine**, `--jobs 1`, nothing else on the box.
+    ///
+    /// **Two machines wear this name and they do not price alike.**
+    /// `.github/workflows/route.yml` sends a fork's pull request and a
+    /// merge-queue ref to twelve GitHub-hosted shards of four EPYC cores each,
+    /// and every other event to one 1/1 lane on the T14's i5-1135G7. A row has
+    /// to say which in its [`Red::evidence`], because the difference is not
+    /// noise: one tip measured `xhci_full_speed_device` at 6,845 ms in the
+    /// first and 12,156 ms in the second on one day
+    /// (`issues/build/the-duration-profile-is-enforced-where-it-was-not-measured.md`).
     Ci,
     /// The dev host with the test run by itself. Cross-arch TCG on arm64.
     DevHostAlone,
@@ -2258,6 +2270,59 @@ pub const KNOWN_RED: &[Red] = &[
                    dev-host-alone rate",
         source: "issues/kernel/a-killed-peer-still-takes-a-write.md",
         measured: "2026-08-20",
+    },
+    // ---------------------------------------------------------------------
+    // The T14 guest lane, 2026-08-21. `985f3834` moved every trusted event's
+    // `guest` job from twelve hosted shards to one 1/1 lane on the T14, and
+    // `tests/test-durations` still holds what twelve hosted shards measured. The
+    // durations gate compares the two and reds — on `main`'s own tip as readily
+    // as on a pull request, and on a different set of names each run.
+    //
+    // **Not a red about the tree, and the row is here so nobody re-derives
+    // that.** `main`'s tip measured 6,845 ms in the profile's own hosted
+    // twelve-way shape hours earlier (merge-queue run 32505371471, green, no
+    // name over the ceiling), and twenty interleaved reps an arm on the T14
+    // cannot tell that tip from the tree the profile was recorded on:
+    // p = 0.42, and each arm put 2 of 20 reps over the line.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "xhci_full_speed_device",
+        instrument: Instrument::Ci,
+        finding: Finding::fires(3, 4),
+        standing: Standing::Stands,
+        what: "the durations gate and not the test, which passes: `xhci_full_speed_device \
+               measured 10166 ms in CI, over the 10000 ms line, but xhci_full_speed_device \
+               remains Fast` — 11,076, 12,156, 10,166 and 9,052 ms across four T14 lanes, \
+               against a committed 6,900 ms that twelve hosted shards measured and still \
+               measure. **The fourth is the point**: it crossed nothing, and the same run \
+               reded on `i8042_health` at 15,122 ms instead",
+        evidence: "the four consecutive T14 1/1 `guest` lanes of 2026-08-21 — runs 32498159547 \
+                   (`main` 07f89c8b, 9 names over the ceiling), 32506479551 (`main` 13953023, \
+                   5), 32513441183 (PR #199, 1) and 32524769419 (PR #201, 1, a different name) \
+                   — whose lane totals were 548.8 s, 483.6 s, 429.2 s and 444.1 s of tests",
+        source: "issues/build/the-duration-profile-is-enforced-where-it-was-not-measured.md",
+        measured: "2026-08-21",
+    },
+    // One observation, so `Seen` and not a rate: the harness re-ran it alone and
+    // it passed, and its own verdict line declined to call that a
+    // classification. The row is here because a `<symbol unread: …>` stopped
+    // being routine weather when `reap_poisoned` stopped taking the process
+    // table on every idle trip, so the next reader of this name gets the
+    // mechanism instead of `NOT ON THE LIST`.
+    Red {
+        test: "panic_recovery",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`the crash report could not read a symbol it was asked for, so a bare address \
+               in it is a lost race and not a verdict: 0x100000072ce <symbol unread: the \
+               process table was held>` — one frame of one report, at an address cpu1's own \
+               report had resolved by name (`_start+0xe`) three milliseconds earlier, while \
+               cpu1 was itself in the panic path",
+        evidence: "the T14 1/1 `guest` lane of run 32527751613 (job 96913340222, PR #204, \
+                   2026-08-21 21:25Z), whose re-run alone was green",
+        source: "issues/panic-path/a-crash-report-conceded-a-frame-to-a-concurrent-one.md",
+        measured: "2026-08-21",
     },
 ];
 
