@@ -81,18 +81,31 @@ had. They sum to the old number exactly. `late_wakes` counts how many wakes in
 the run were a whole period or more late, so the maximum can be read as one
 stall or as a thousand.
 
-**176 config-runs on the T14 the same evening, 17:26-18:17 UTC, CI image at the
+**296 config-runs on the T14 the same evening, 17:26-19:00 UTC, CI image at the
 `route.yml` digest, `--device=/dev/kvm --shard 1/1 --host-slots 0`, no other
-container up for any boot** (each block aborts and retries if one appears), on
-two trees: `fe41dbae` (`main`) and `53101d08` — *the A/B's own arm B*, the tree
-that produced the arrays above — each carrying only the instrument:
+container up for any boot** — each block samples `docker ps` every five seconds
+and discards and retries itself whole if a CI job appears, which happened three
+times and cost three blocks. Two trees, each carrying only the instrument:
+`fe41dbae` (`main`, 51 runs per config) and `53101d08` (23 per config) — *the
+A/B's own arm B*, the tree that produced the arrays above.
 
-| config | n | wake_lat | irq mean | pickup mean / max | late wakes |
-|---|---|---|---|---|---|
-| `audio_tone.smp1` | 44 | 3835-4262 | 3967 | 76 / **106** | 12.9% |
-| `audio_tone.smp8` | 44 | 3980-6176 | 4034 | 142 / **206** | 14.2% |
-| `audio_tone_load.smp1` | 44 | 2509-2972 | 2743 | 10 / **14** | **0.0%** |
-| `audio_tone_load.smp8` | 44 | 3692-4149 | 3822 | 56 / **132** | 11.0% |
+| config | tree | n | wake_lat | irq mean | pickup mean / max | late wakes |
+|---|---|---|---|---|---|---|
+| `audio_tone.smp1` | main | 51 | 3875-4299 | 4005 | 76 / **113** | 12.9% |
+| | `53101d08` | 23 | 3835-4197 | 3969 | 75 / **121** | 12.8% |
+| `audio_tone.smp8` | main | 51 | 3977-6176 | 4025 | 139 / **206** | 14.2% |
+| | `53101d08` | 23 | 3982-4341 | 3985 | 144 / **188** | 14.2% |
+| `audio_tone_load.smp1` | main | 51 | 2509-2986 | 2732 | 10 / **14** | **0.0%** |
+| | `53101d08` | 23 | 2542-2981 | 2737 | 10 / **12** | **0.0%** |
+| `audio_tone_load.smp8` | main | 51 | 3692-4086 | 3812 | 64 / **142** | 11.1% |
+| | `53101d08` | 23 | 3728-4331 | 3881 | 59 / **159** | 11.3% |
+
+Dropouts 0/296, underruns 0/296, drains 0/296, ceiling breaches 0/296. The two
+15-iteration blocks that ran the thorough tier both reported **`[gate A] PASS`
+— no statistic regressed at alpha=1e-3 per test**, on both trees, against the
+same recorded sample the morning's first readable T14 run failed at
+`audio_tone.smp1 median 8972 -> 17186 (z=4.36)`. Its fresh medians this evening
+were 4075 (`53101d08`) and 4143 (`main`).
 
 Two things fall out of that table and a third out of its absence.
 
@@ -114,22 +127,23 @@ grid point. `audio_tone_load.smp1` — the config that is *always* fast — has
 **zero** late wakes and `pickup 10 µs`, because a guest with work to do never
 lets the beat open.
 
-**And the slow mode did not appear once in 44 boots per config.** Not on `main`
+**And the slow mode did not appear once in 74 boots per config.** Not on `main`
 and not on the tree that produced it at 11 of 15 and 9 of 15 four hours earlier.
-Under that afternoon's mixing weight, 0 of 44 has probability ~1e-21. So the
+Under that afternoon's mixing weight, 0 of 74 has probability ~1e-35. So the
 mode is **not a per-boot draw from a per-tree distribution**: the distribution
 itself moved between two sessions of the same day, on the same host, with
 nothing about the tree between them — which also means the A/B's one same-host
 row (`audio_tone_load.smp1`, z=4.12) is a difference between afternoons and not
-between trees. Today the two trees are indistinguishable on it: 2509-2972 on
-both.
+between trees. This evening the two trees are indistinguishable on it: 2509-2986
+against 2542-2981.
 
 The host was on AC throughout, `intel_pstate`/`powersave`/`balance_performance`,
 `intel_idle` whose deepest state (`C3_ACPI`) costs 1048 µs to leave — a third of
 one period, and a fortieth of the 20 ms mode. Nothing on the host was measured
 *during* the earlier session, so what moved is not established; the one
 difference recorded is that the slow session ran at 1-min load 0.2-1.74 and the
-fast one at 1.5-4.4, which is the opposite direction from "a busy host is worse".
+fast one at 1.1-4.4 — overlapping, and with the fast blocks' own quietest
+stretches at 1.1-1.6, so load does not separate them either.
 
 ## Whoever takes it next
 
@@ -140,8 +154,10 @@ soundd (`irq` vs `pickup`), whether it is one stall or a thousand
 (`empty` — a punctual soundd waking repeatedly at a silent device, versus a
 single overlong sleep). Gate A's per-boot line also carries the two numbers this
 boot drew for its clocks, which are the only per-boot draws that scale every
-armed timer for the boot's whole life; on this host they are stable to 0.2%
-(`tsc 999MHz lapic 10007013..10025378 ticks/10ms` over four boots).
+armed timer for the boot's whole life; on the T14 they are stable to 0.02%
+(`tsc 2418-2419MHz`, `lapic 10000742-10002460 ticks/10ms` over 120 boots) and on
+the dev host to 0.2%, so a slow-mode boot whose pair sits outside that is a
+finding on sight and one whose pair sits inside it removes the whole class.
 
 What is missing is a *host-side* record taken during a slow session, because the
 guest-side evidence above points there and cannot go further on its own. The
