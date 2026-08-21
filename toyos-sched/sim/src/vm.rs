@@ -17,6 +17,7 @@ use std::sync::Arc as StdArc;
 use toyos_sched::cpu::{Action, CpuHandle, CpuSched, Env, SchedPass};
 use toyos_sched::fair::{FairShare, Frontier, ShareState};
 use toyos_sched::hw::{CpuId, Hw, Kicker, Machine, Nanos};
+use toyos_sched::invariants::Container;
 use toyos_sched::mailbox::{mailbox, Kick, Urgency};
 use toyos_sched::msg::Msg;
 use toyos_sched::retire;
@@ -31,6 +32,7 @@ use toyos_sched::waitq::{
 
 use crate::choice::ChoiceStream;
 use crate::hw_impl::SimHw;
+use crate::latency::{ReadyCause, RunWait};
 use crate::msg::{SimHandles, SimMsg, SimQueue};
 use crate::payload::{
     MockAddressSpace, SimCtx, SimPayload, SimPreempt, SimShareLock, SimWaitList, StdLock,
@@ -431,6 +433,42 @@ pub struct Vm<'q> {
     pub thread_spread: u64,
     pub thread_bound: u64,
     pub thread_over_bound: u64,
+    /// Every task currently owed a dispatch and not getting one, with the
+    /// instant it became owed one and why — the measured policy suite's
+    /// instrument (`crate::latency`, `sim/tests/policy.rs`).
+    ///
+    /// "Owed a dispatch" is two states and not one: a task in a run queue, and a
+    /// *parked* task a wake has already claimed (`TaskState::WakeQueued`), whose
+    /// `Msg::Wake` is posted and whose home CPU has not drained it yet. Stamping
+    /// only the first would measure the queue and call it the wake latency, and
+    /// the interval `mailbox::Urgency::Normal` promises a bound on starts at the
+    /// claim.
+    ///
+    /// A task in transit between CPUs keeps its stamp: it is still runnable and
+    /// still waiting, and its migration is exactly the part of the wait a
+    /// per-CPU instrument would lose. A task in the *dying* list drops it — a
+    /// corpse's wait for the CPU is invariant I14's quantity, measured on I14's
+    /// clock against I14's bound.
+    pub awaiting: BTreeMap<TaskKey, (Nanos, ReadyCause)>,
+    /// Where each task sat at the end of the previous step, which is what says
+    /// whether an arrival in a run queue is a wake, a preemption or a spawn.
+    pub prev_container: BTreeMap<TaskKey, Container>,
+    /// Per process: how long its threads waited between being owed the CPU and
+    /// getting it, split by cause.
+    pub run_wait: Vec<RunWait>,
+    /// Per process: the wall-clock instant its last live thread was released,
+    /// i.e. when the process finished all the work its scripts carry.
+    ///
+    /// The measured policy suite's other primitive. A share is a claim about
+    /// *rate*, and the sharpest statement of a rate a work-conserving scheduler
+    /// admits is how long a fixed amount of work took against a rival that never
+    /// runs out: `sim/tests/policy.rs`'s share-gain cases read the floor off this
+    /// and the workload's own constants, with no bookkeeping in between.
+    pub finish_ns: Vec<Option<u64>>,
+    /// How many tasks the balance path has moved between CPUs. Reported rather
+    /// than judged: a wakeup storm that drains in parallel across a machine is
+    /// only evidence about the balance path if the balance path ran.
+    pub migrations: u64,
 }
 
 /// One contention window: a maximal interval over which the same set of
@@ -546,6 +584,11 @@ impl<'q> Vm<'q> {
             thread_spread: 0,
             thread_bound: 0,
             thread_over_bound: 0,
+            awaiting: BTreeMap::new(),
+            prev_container: BTreeMap::new(),
+            run_wait: vec![RunWait::default(); process_count],
+            finish_ns: vec![None; process_count],
+            migrations: 0,
             next_irq,
             next_key: 1,
             next_spawn_cpu: 0,
@@ -1576,8 +1619,14 @@ impl<'q> Vm<'q> {
             if !self.live.remove(&key) {
                 self.violate(format!("I10: {key:?} was finalized twice"));
             }
-            for process in &mut self.procs {
-                process.live.remove(&key);
+            for (index, process) in self.procs.iter_mut().enumerate() {
+                // The release that empties a process's live set is the instant
+                // its work is done — recorded here rather than derived from the
+                // trace, because a process that never had a thread must stay
+                // `None` and "no threads left" cannot tell the two apart.
+                if process.live.remove(&key) && process.live.is_empty() {
+                    self.finish_ns[index] = Some(self.clock.0);
+                }
             }
             self.programs.remove(&key);
             // A task retired while parked never runs again, so nobody else
