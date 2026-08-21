@@ -1,11 +1,10 @@
 //! soundd as the driver of an Intel HDA controller.
 //!
-//! `specs/plans/hda-driver-plan.md` §4.1: the kernel brought the controller up, owns
-//! the buffer descriptor list and the interrupt, and answers five register
-//! writes and two reads. Everything that is a *decision* is here and in
-//! `toyos-hda` — which codecs answered, which pin, which converter, the
-//! amplifiers, EAPD, the format — and every one of those decisions is a pure
-//! function this file calls.
+//! The kernel brought the controller up, owns the buffer descriptor list and
+//! the interrupt, and answers five register writes and two reads. Everything
+//! that is a *decision* is here and in `toyos-hda` — which codecs answered,
+//! which pin, which converter, the amplifiers, EAPD, the format — and every one
+//! of those decisions is a pure function this file calls.
 //!
 //! What this file itself owns is the I/O: one verb over the immediate-command
 //! registers, and the stream's run bit.

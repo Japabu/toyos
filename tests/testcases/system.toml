@@ -3,10 +3,10 @@
 start = ["logd", "soundd", "test-runner"]
 
 # **Every image that carries a `TOYOS-LOG` partition runs this**, and every
-# image does. The kernel stopped writing files at L6 of
-# `specs/log-architecture-spec.md`, so a boot config without `logd` is a boot
-# whose `/log` is empty — `every_boot_config_runs_logd` is what refuses one.
-# It claims no device and serves no port yet (§5.1, §5.2): its whole authority
+# image does. The kernel keeps the record ring and writes no file at all, so a
+# boot config without `logd` is a boot whose `/log` is empty —
+# `every_boot_config_runs_logd` is what refuses one.
+# It claims no device and serves no port: its whole authority
 # is `logread`, which is `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
 [programs.logd]
 syscap = ["logread"]
@@ -16,16 +16,20 @@ serves = ["soundd"]
 devices = ["hda-audio", "virtio-sound"]
 syscap = ["rt"]
 
-# The test estate's authority (`specs/capability-endowment-spec.md` §4).
+# The test estate's authority.
 # `device` because five of the guest binaries claim the keyboard or the mouse
 # and no manifest row can name them — they are not `[programs]` keys — and `dup`
 # because a claim moves and one boot runs several of them.
 # `logread` because the log gate reads the kernel's own records and cannot be
 # a spawned binary: a `SysCap` dup is not part of the namespace test-runner
-# hands down (`specs/log-architecture-spec.md` §3.2, §9.5).
+# hands down.
+# `power` because `run shutdown` is how a dozen host-side gates end their guest
+# and read what reached the volume, and test-runner spawns `/bin/shutdown`
+# directly — it holds no `launcher` connector, so the applet's authority is the
+# dup it is endowed here rather than the `toybox` row.
 [programs.test-runner]
 receives = ["soundd"]
-syscap = ["device", "dup", "logread"]
+syscap = ["device", "dup", "logread", "power"]
 
 [programs.toybox]
 receives = ["soundd"]

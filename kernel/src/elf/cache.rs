@@ -99,6 +99,8 @@ struct Snapshot {
     init_array_vaddr: u64,
     init_array_size: u64,
     span: u64,
+    rw_lo: u64,
+    rw_hi: u64,
 }
 
 impl Snapshot {
@@ -118,6 +120,8 @@ impl Snapshot {
             init_array_vaddr: lib.init_array_vaddr,
             init_array_size: lib.init_array_size,
             span: lib.span,
+            rw_lo: lib.rw_lo,
+            rw_hi: lib.rw_hi,
         }
     }
 
@@ -146,6 +150,8 @@ impl Snapshot {
             init_array_vaddr: self.init_array_vaddr,
             init_array_size: self.init_array_size,
             span: self.span,
+            rw_lo: self.rw_lo,
+            rw_hi: self.rw_hi,
         }
     }
 }
@@ -198,6 +204,16 @@ pub fn cache_loaded_lib(path: &str, lib: LoadedLib, rw_offset: usize, rw_size: u
         return owned(alloc);
     };
     let alloc_ptr = alloc.ptr();
+    // SAFETY: `alloc` is exactly `load_shared_lib`'s `load_size`-byte
+    // allocation, and `rw_offset`/`rw_size` are the same values that
+    // function derived from the writable window — this function's own doc
+    // names the invariant ("the window ... cannot drift apart"):
+    // `rw_offset + rw_size` is `rw_end_aligned <= load_size`, since `rw_hi
+    // <= layout.span()` and both round up through the same
+    // `align_2m_checked`. So `alloc_ptr.add(rw_offset)` stays inside
+    // `alloc`'s tail, valid for `rw_size` bytes. `rw_alloc` is a fresh,
+    // distinct `PageAlloc::new(rw_size, ...)` just above, so the ranges
+    // cannot overlap.
     unsafe {
         core::ptr::copy_nonoverlapping(alloc_ptr.add(rw_offset), rw_alloc.ptr(), rw_size);
     }
@@ -235,7 +251,16 @@ fn clone_from_cache(cached: &CachedLib) -> Option<LoadedLib> {
     let t0 = crate::clock::nanos_since_boot();
 
     let rw_alloc = PageAlloc::new(cached.rw_size, crate::mm::pmm::Category::Elf)?;
+    // SAFETY: `cached.alloc`/`cached.rw_offset`/`cached.rw_size` are exactly
+    // the values `cache_loaded_lib` validated when it built this `CachedLib`
+    // (see the `SAFETY` there) — the sum stays inside `cached.alloc`'s
+    // allocation. `CachedLib` is immortal once cached (this struct's own
+    // doc, and `SO_CACHE` never removes an entry), so `cached.alloc` is
+    // still live here.
     let src = unsafe { cached.alloc.ptr().add(cached.rw_offset) };
+    // SAFETY: `src` is valid for `cached.rw_size` bytes per the `SAFETY`
+    // above; `rw_alloc` is a fresh, distinct `PageAlloc::new(cached.rw_size,
+    // ...)` on the line above, so the two ranges cannot overlap.
     unsafe {
         core::ptr::copy_nonoverlapping(src, rw_alloc.ptr(), cached.rw_size);
     }

@@ -21,8 +21,6 @@
 //! the guard exists, and removing the guard would change nothing. A kernel
 //! thread's body runs with `IF` set, which is where the guard is the only thing
 //! holding the interrupt off.
-//!
-//! `specs/log-architecture-spec.md` §9.2.
 
 /// Which producer the burst's records declare themselves as.
 ///
@@ -78,10 +76,7 @@ mod armed {
         ARMED.store(false, Ordering::Relaxed);
         crate::log!("lognest done emitted={SHARD_RECORDS}");
 
-        loop {
-            let ticket = crate::scheduler::prepare_wait(crate::scheduler::park_lot());
-            crate::scheduler::block_on(ticket, 0);
-        }
+        crate::completion::park_forever();
     }
 
     /// Consume the one-shot and send this CPU its own IPI. `true` when it was

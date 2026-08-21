@@ -9,7 +9,7 @@
 //!    decoration.
 //! 2. **Every scenario passes**, over a seed sweep and a fuzz-byte sweep.
 //!
-//! # The nine negative gates, and the two controls
+//! # The ten negative gates, and the two controls
 //!
 //! Each is a `scenarios::` constructor that *is* a broken scheduler, and each
 //! has a `#[test]` below asserting both that it is caught and which invariant
@@ -22,11 +22,12 @@
 //! | `old_commit_before_pass` | the pre-`8508b37` blocking shape | I1, on every seed |
 //! | `old_preemptible_window` | preemption left on in the registration window | an abort inside `check_cpu` |
 //! | `old_migrate_kept_the_corpse` | the balance path handing on a killed task | I14 |
+//! | `old_rt_starved_the_corpse` | the RT band outranking the dying list without a bound | I14, on every seed |
 //! | `old_park_kept_the_lend` | commit `9c2fc4d`'s park keeping a lapsed lend | I9 |
 //! | `fair_share_per_thread` | one fair share per thread, not per process | I5, and nothing else |
 //! | `fair_double_charge` | a share charged twice for what it runs | I5, in the opposite direction |
 //! | `fair_identity_within_share` | the lowest-keyed sibling served, not the earliest-inserted | I13, and nothing else |
-//! | `overlong_pass` | a pass costing five times its budget | an abort inside `check_pass_duration` |
+//! | `overlong_pass` | a pass costing five times its budget | `cpu::PassCosts`, which records it rather than aborting |
 //!
 //! The controls are `old_commit_fused` and `fair_identity_tiebreak`, and both
 //! must come back **clean**. They are what make two of those gates measurements
@@ -38,10 +39,11 @@
 //!
 //! # The liveness gates, which are a different claim
 //!
-//! Three checks below are not negative gates. They guard the third failure
-//! shape in `specs/README.md`'s method — a gate that goes *quiet* rather than
-//! red — by asserting that an invariant had a comparison open for a recorded
-//! fraction of the run: `the_fairness_storm_is_measured_and_holds` for I5,
+//! Three checks below are not negative gates. They guard against a gate that
+//! goes *quiet* rather than red — a change that narrows the gate's own coverage
+//! instead of violating it — by asserting that an invariant had a comparison
+//! open for a recorded fraction of the run:
+//! `the_fairness_storm_is_measured_and_holds` for I5,
 //! `invariant_i13_is_measured_and_holds` for I13, and
 //! `a_retire_completes_inside_its_derived_bound` for I14, which requires some
 //! retire to have outlived the instant it was posted in. A change that closes
@@ -51,7 +53,7 @@
 //!
 //! The budgets here are what a `cargo test` can afford. The full criterion —
 //! 10⁴ seeds and 10⁷ fuzz steps per scenario class — runs from the CLI, where
-//! `gate` carries all nine gates and both controls:
+//! `gate` carries all ten gates and both controls:
 //!
 //! ```text
 //! cargo run --release -p toyos-sched-sim -- gate 10000
@@ -268,6 +270,53 @@ fn old_migrate_keeping_the_corpse_is_caught() {
     );
 }
 
+/// **The other direction of the same law, and the one the first fix created.**
+/// The gate above is a corpse handed away and left waiting; this is a corpse
+/// never dispatched at all, because the pick asked only `rq.has_rt()` and one
+/// permanently-RT thread that never parks answered yes for ever.
+///
+/// That shape shipped on this branch between the two fixes, and its failure is
+/// not a slow retire: `scheduler::retire_task` blocks behind a wall-clock
+/// tripwire and **panics the kernel**, from a workload that only needs
+/// `Rights::RT` — which `soundd` holds and `SYS_RT_ENTER` never gives back.
+///
+/// It must be caught by **I14**, on every seed: nothing in this scenario is a
+/// race. The corpse is queued, the RT thread runs, and the only question is
+/// whether the pick ever takes the dying list. `rt_saturated_retire` is the
+/// positive half and is in `all()`.
+#[test]
+fn rt_starving_the_corpse_is_caught() {
+    let scenario = scenarios::old_rt_starved_the_corpse();
+    let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
+    let mut caught = 0;
+    for seed in 0..SEEDS {
+        let mut choices = if seed % 2 == 0 {
+            ChoiceStream::from_seed(seed)
+        } else {
+            ChoiceStream::pct(seed, scenario.cpus, 3)
+        };
+        let outcome = run(scenario.clone(), &mut choices);
+        if outcome.passed() {
+            continue;
+        }
+        caught += 1;
+        for violation in &outcome.violations {
+            let id = violation.split(':').next().unwrap_or("?").to_string();
+            *kinds.entry(id).or_default() += 1;
+        }
+    }
+    assert_eq!(
+        caught, SEEDS as usize,
+        "a corpse held off for ever by the RT band went undetected in \
+         {}/{SEEDS} schedules — and the tree that does it panics the kernel",
+        SEEDS as usize - caught,
+    );
+    assert!(
+        kinds.contains_key("I14"),
+        "expected a retire-promptness violation; got {kinds:?}",
+    );
+}
+
 /// The positive half of the same pair: with the kill bit read, no schedule of
 /// that workload puts a corpse in transit, and every retire completes well
 /// inside the derived bound.
@@ -301,6 +350,63 @@ fn a_retire_completes_inside_its_derived_bound() {
          in, so I14's latency half never measured anything",
     );
     println!("I14: worst retire {worst} ns against a {bound} ns bound");
+}
+
+/// **A fidelity gate, not a scheduler gate**: the model's own unwind deferral
+/// lasts one chunk plus what the model can prove it owes elsewhere, which is
+/// what its doc promises and what the code did not do.
+///
+/// [`toyos_sched_sim::vm::Vm::unwind_at`] closes `Vm::enabled`'s gate on every
+/// *other* CPU's `Exec` while one CPU owes an unwind step. Stamped only on the
+/// false→true transition, and read with a `find` that named one owed CPU and
+/// denied the step to every other, that gate stayed shut for a CPU's whole
+/// teardown window — several consecutive corpses — and every other CPU was
+/// frozen for all of it: 17,000,000 ns measured, 17 x `RUN_CHUNK_NS`, against a
+/// doc saying "the same grace" as the one-chunk `resched_at`.
+///
+/// That is not a scheduler defect; it is the explorer being denied exactly the
+/// interleavings the surrounding chunk is about, over exactly the window I14 is
+/// measured across. So the promise is asserted as a number, term by term, for a
+/// stamp taken at T on a scenario of `cpus` CPUs:
+///
+/// 1. **one chunk** — the grace itself. The gate does not close until the clock
+///    reaches `T + RUN_CHUNK_NS`, and until it does every CPU may step freely.
+/// 2. **one chunk** — the step that carries the clock past that threshold, which
+///    is somebody's execution step and may be a whole chunk long. (An
+///    `Op::KernelSection` advances by its own length instead; the largest in the
+///    suite is `MS / 2`, half a chunk, so a chunk is the wider price.)
+/// 3. **`cpus - 1` chunks** — the other CPUs whose own stamp is no later than
+///    this one. Debts are discharged oldest first, ties by CPU number, and a CPU
+///    that takes its step restamps to *now* — so each peer can go ahead of this
+///    one at most once. A workload-shaped term in a derived bound, exactly as
+///    invariant I14's `(1 + peers)` is.
+/// 4. **one chunk** — the step that discharges it.
+#[test]
+fn the_unwind_gate_lasts_one_chunk_and_not_one_unwind() {
+    let scenario = scenarios::retire_under_balance();
+    let bound = (2 + scenario.cpus as u64) * toyos_sched_sim::vm::RUN_CHUNK_NS;
+    let mut worst = 0;
+    for seed in 0..SEEDS {
+        let mut choices = if seed % 2 == 0 {
+            ChoiceStream::from_seed(seed)
+        } else {
+            ChoiceStream::pct(seed, scenario.cpus, 3)
+        };
+        let outcome = run(scenario.clone(), &mut choices);
+        assert!(outcome.passed(), "{}", outcome.report());
+        worst = worst.max(outcome.unwind_gate_ns);
+    }
+    assert!(
+        worst > 0,
+        "in {SEEDS} schedules no CPU ever held an unwind across a step, so this \
+         measured nothing at all",
+    );
+    assert!(
+        worst <= bound,
+        "the unwind gate stood for {worst} ns against a derived {bound} ns — the \
+         explorer was frozen over the very window I14 is measured across",
+    );
+    println!("unwind gate: worst {worst} ns against a {bound} ns bound");
 }
 
 /// A `Retire` that lands inside the registration window, and the fact that the
@@ -726,38 +832,80 @@ fn double_charging_a_share_is_caught() {
     assert!(shipped.passed(), "{}", shipped.report());
 }
 
-/// The seventh self-validation gate: the core's `feature = "check"` pass-duration
-/// assert, which spec §10.2 makes the on-target counterpart to everything else in
-/// this file.
+/// The seventh self-validation gate: the core's `feature = "check"` pass-cost
+/// recorder, which spec §10.2 makes the on-target counterpart to everything else
+/// in this file.
 ///
-/// It is the one check here that says something about *cost* rather than about
-/// state, so it is the one the simulator cannot exercise for free: the VM's clock
-/// does not move inside a step, and an assert whose measured quantity is always
-/// zero is an assert that cannot fail. `SimHw` therefore charges every pass a
-/// modelled cost, and this gate turns that cost up past the budget.
+/// It is the one instrument here that says something about *cost* rather than
+/// about state, so it is the one the simulator cannot exercise for free: the
+/// VM's clock does not move inside a step, and a histogram whose measured
+/// quantity is always zero is a histogram that cannot say anything. `SimHw`
+/// therefore charges every pass a modelled cost, and this gate turns that cost
+/// up past the budget.
 ///
-/// Without it, "kernel check builds assert a max pass duration" would be a claim
-/// backed by an expression that computes `0 <= 200_000` a few thousand times a
-/// second.
+/// **This gate used to demand an abort and now demands a number**, because the
+/// budget stopped being asserted in the kernel: elapsed time across a pass is
+/// wall clock, a guest's wall clock runs while a hypervisor has the vCPU, and a
+/// panic may not stand over a quantity the host inflates. What the recorder must
+/// still do is see the cost — without that, "a check build measures what a pass
+/// costs" would be a claim backed by an expression that computes zero a few
+/// thousand times a second, and the harness gate downstream would be reading a
+/// distribution of nothing.
 #[test]
-fn a_pass_that_overruns_its_budget_is_caught() {
-    let caught = sweep::abort_gate(&scenarios::overlong_pass(), FAIR_SEEDS);
-    let Some((seed, message)) = caught else {
-        panic!(
-            "a pass modelled at five times `cpu::MAX_PASS_NS` went undetected in \
-             {FAIR_SEEDS} schedules — either the assert is not compiled in, or the \
-             clock it reads never moves",
-        );
-    };
+fn a_pass_that_overruns_its_budget_is_recorded() {
+    let scenario = scenarios::overlong_pass();
+    let cost = scenario.pass_cost_ns;
+    let outcome = run(scenario, &mut ChoiceStream::from_seed(0));
+    assert!(outcome.passed(), "{}", outcome.report());
+
+    let measured: u64 = outcome.pass_costs.iter().map(|c| c.count).sum();
+    let over: u64 = outcome.pass_costs.iter().map(|c| c.over).sum();
     assert!(
-        message.contains("invariant P: a scheduler pass took"),
-        "expected the pass-duration assert to be what fires (seed {seed}); got: {message}",
+        measured > 0,
+        "a run that took {} steps recorded no pass at all — either the recorder is not \
+         compiled in, or `finish` stopped feeding it",
+        outcome.steps,
     );
+    assert_eq!(
+        over, measured,
+        "every one of {measured} passes was modelled at {cost} ns, five times \
+         `cpu::MAX_PASS_NS`, and {over} of them were recorded over budget — so the clock \
+         the recorder reads does not move, or it reads it in the wrong place",
+    );
+    for report in &outcome.pass_costs {
+        assert_eq!(
+            report.max_ns, cost,
+            "cpu{} recorded a maximum of {} ns for passes modelled at {cost} ns",
+            report.cpu.0, report.max_ns,
+        );
+        // The measurement the harness gates, on the one distribution whose
+        // answer is known: every sample at the modelled cost, so every quantile
+        // is the bucket that cost falls in.
+        assert!(
+            report.count == 0 || report.quantile_upper_ns(1, 2) > toyos_sched::cpu::MAX_PASS_NS,
+            "cpu{}'s median came back at {} ns with every pass modelled at {cost}",
+            report.cpu.0,
+            report.quantile_upper_ns(1, 2),
+        );
+    }
 
     // The control: the identical workload at the default modelled cost of zero
-    // must be clean, so the gate is measuring the budget and not the workload.
-    let free = sweep::seed_sweep(&scenarios::lost_wake_pipe(), FAIR_SEEDS, 1);
+    // must record nothing over budget, so the gate is measuring the cost and not
+    // the workload.
+    let free = run(scenarios::lost_wake_pipe(), &mut ChoiceStream::from_seed(0));
     assert!(free.passed(), "{}", free.report());
+    assert!(
+        free.pass_costs.iter().map(|c| c.count).sum::<u64>() > 0,
+        "the control recorded no pass either, so the assertion above it is about nothing",
+    );
+    assert_eq!(
+        free.pass_costs.iter().map(|c| c.over).sum::<u64>(),
+        0,
+        "a workload whose passes are modelled at zero recorded passes over budget",
+    );
+
+    let sweep = sweep::seed_sweep(&scenarios::lost_wake_pipe(), FAIR_SEEDS, 1);
+    assert!(sweep.passed(), "{}", sweep.report());
 }
 
 /// The ninth self-validation gate, and the newest: invariant I9's teeth.

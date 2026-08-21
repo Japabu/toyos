@@ -9,6 +9,14 @@
 //! nothing here panics on a malformed one. Refusals are `&'static str` because
 //! every caller logs them beside the path.
 
+// Every unsafe block under `elf::` carries a `SAFETY:` comment — measured
+// and documented in full by `issues/build/clippy-has-never-run-here.md`'s
+// per-area plan. `host-tests.yml`'s kernel clippy step already runs with
+// `-D warnings`, so `warn` here is what actually gates: a new undocumented
+// block anywhere in this module tree fails CI, while the rest of the kernel
+// (not yet swept) stays silent.
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 mod cache;
 mod index;
 mod reloc;
@@ -113,9 +121,93 @@ pub struct LoadedLib {
     pub init_array_size: u64,
     /// Bytes between the image's lowest and highest virtual address.
     pub span: u64,
+    /// The image-relative half-open range every writable `PT_LOAD` of this
+    /// module falls in, and `(span, span)` for a module with none.
+    ///
+    /// **What a page of a mapped library gets its protection from.** Exact,
+    /// unlike the 2 MiB-rounded `rw_offset`/`rw_size` beside it: those size the
+    /// private copy, where rounding outwards costs a page of memory — rounding
+    /// a *protection* outwards costs a writable page of somebody's `.text`.
+    pub rw_lo: u64,
+    pub rw_hi: u64,
 }
 
 impl LoadedLib {
+    /// What the 4 KiB page `offset` bytes into this image may be used for.
+    ///
+    /// Three zones, from the module's own program headers: code below the
+    /// writable window, data inside it, constants above it. A read-only
+    /// non-executable segment placed *below* `.text` by some other linker would
+    /// come out executable here — over-permissive, never writable, and the
+    /// exact segment map is not carried past `load_shared_lib`.
+    fn page_prot(&self, offset: u64) -> crate::mm::paging::Prot {
+        use crate::mm::paging::Prot;
+        if offset < self.rw_lo {
+            Prot::ReadExec
+        } else if offset < self.rw_hi {
+            Prot::ReadWrite
+        } else {
+            Prot::Read
+        }
+    }
+
+    /// Give this module a virtual address in `pt` and map its pages there.
+    ///
+    /// **One pass, one window at a time, and no window is mapped twice.** The
+    /// shape this replaces mapped the whole image writable and then re-mapped
+    /// the private window over the top of it, which meant every library's
+    /// `.text` was writable in every process that loaded it — and, once the
+    /// image was cached, writable in *every* process at the same physical
+    /// pages.
+    ///
+    /// A `Shared` module's private copy starts at a 2 MiB boundary rounded down
+    /// from `rw_lo`, so the window it starts in holds the tail of `.text` as
+    /// well. That window is the split one: its code pages come out `ReadExec`
+    /// over the private copy, which holds a byte-identical copy of them.
+    pub fn map_into(&self, pt: &crate::process::PageTables) -> Option<UserAddr> {
+        use crate::mm::paging::WindowProt;
+
+        let (image_phys, image_size) = match &self.memory {
+            LibMemory::Owned(alloc) => (
+                crate::DirectMap::phys_of(alloc.ptr()),
+                alloc.size() as u64,
+            ),
+            LibMemory::Shared { cached_image, .. } => {
+                (cached_image.phys(), cached_image.size() as u64)
+            }
+        };
+
+        let base = pt
+            .lock()
+            .alloc_region(image_size, crate::vma::RegionKind::Mapped)?;
+
+        let mut offset = 0;
+        while offset < image_size {
+            // Which physical frame backs this window: the cache's shared image,
+            // except where this process has a private writable copy.
+            let phys = match &self.memory {
+                LibMemory::Owned(_) => image_phys + offset,
+                LibMemory::Shared { rw_alloc, rw_offset, .. } => {
+                    let lo = *rw_offset as u64;
+                    if (lo..lo + rw_alloc.size() as u64).contains(&offset) {
+                        crate::DirectMap::phys_of(rw_alloc.ptr()) + (offset - lo)
+                    } else {
+                        image_phys + offset
+                    }
+                }
+            };
+            let mut prot = WindowProt::uniform(crate::mm::paging::Prot::Read);
+            let mut page = 0;
+            while page < PAGE_2M {
+                prot.set(page, self.page_prot(offset + page));
+                page += 4096;
+            }
+            pt.lock().map_window(UserAddr::new(base.raw() + offset), phys, &prot);
+            offset += PAGE_2M;
+        }
+        Some(base)
+    }
+
     /// This module's symbol table, or an empty one when it declares none.
     ///
     /// The slices are kernel pages this `LoadedLib` either owns or shares with
@@ -131,9 +223,19 @@ impl LoadedLib {
         // matches nothing. Losing the *count* would instead make every
         // relocation naming one look out of range.
         let strs: &[u8] = match &self.dynstr {
+            // SAFETY: `dynstr` is `Some` only when `load_shared_lib` built it
+            // through `ModuleImage::slice`, which bounds-checked the file's
+            // declared vaddr/size against `vaddr_min..vaddr_max` before ever
+            // returning a `KernelSlice` — see `KernelSlice::as_slice`'s
+            // `# Safety`. `image` (and everything subsliced from it) lives as
+            // long as this `LoadedLib` does, which outlives this borrow.
             Some(strs) => unsafe { strs.as_slice() },
             None => &[],
         };
+        // SAFETY: same bounds argument as `dynstr` above, for `syms`
+        // (`self.dynsym`) — `load_shared_lib` additionally clamps its size to
+        // the declared symbol count (see its own comment there), so `syms`
+        // covers exactly the entries `SymTab` is allowed to index.
         unsafe { SymTab::new(syms.as_slice(), strs) }
     }
 
@@ -142,6 +244,9 @@ impl LoadedLib {
     }
 
     fn gnu_hash(&self) -> Option<GnuHash<'_>> {
+        // SAFETY: same bounds argument as `symbols` above — `self.gnu_hash`
+        // is `Some` only through `ModuleImage::slice_to_end`, which is
+        // `slice` (bounds-checked) under the hood.
         GnuHash::parse(unsafe { self.gnu_hash.as_ref()?.as_slice() })
     }
 
@@ -242,6 +347,21 @@ pub(crate) fn read_backing_into(
         let off_in_block = (file_off % 4096) as usize;
         let chunk = (4096 - off_in_block).min(remaining);
         backing.read_page(file_off - off_in_block as u64, &mut page_buf)?;
+        // SAFETY: `dst` must be valid for `len` bytes starting at `buf_off ==
+        // 0` and every later `buf_off` stays under `len` by this loop's own
+        // arithmetic (`remaining` only shrinks by `chunk`, never past 0) —
+        // but *that* `dst` is valid for `len` bytes at all is not checked by
+        // this function; it is established at each call site (every current
+        // one is, by hand: `elf::mod::load_shared_lib` passes a
+        // `KernelSlice::subslice`'s own `(base, size)`, `loader::spawn`'s TLS
+        // read sizes its buffer from `memsz` and reads `filesz`, which
+        // `toyos_elf::Layout::parse` already refused to accept above `memsz`,
+        // and `loader::symbols::read_backtrace_table` partitions one
+        // allocation of `syms.size + strs.size` into exactly two writes of
+        // `syms.size` and `strs.size`). Nothing in `read_backing_into`'s
+        // signature makes a future caller re-derive any of that — filed as
+        // issues/kernel/raw-pointer-writers-not-marked-unsafe-in-loader.md
+        // rather than changed here.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 page_buf[off_in_block..off_in_block + chunk].as_ptr(),
@@ -290,8 +410,17 @@ pub fn load_shared_lib(
     let alloc =
         PageAlloc::new(load_size, crate::mm::pmm::Category::Elf).ok_or("dlopen: allocation failed")?;
     let t1 = crate::clock::nanos_since_boot();
+    // SAFETY: `alloc` is the fresh `PageAlloc::new(load_size, ...)` above —
+    // `alloc.ptr()` is valid for exactly `load_size` bytes for as long as
+    // `alloc` lives, matching `from_raw`'s `# Safety` exactly. `alloc` is
+    // moved into `LoadedLib::memory` below (`LibMemory::Owned`), so the
+    // memory outlives `image`'s use for the whole `LoadedLib`.
     let image = unsafe { KernelSlice::from_raw(alloc.ptr(), load_size) };
 
+    // SAFETY: `image` was just built from the fresh, exclusively-owned
+    // `alloc` above — nothing else has a reference to it yet, so `zero`'s
+    // exclusivity requirement (see `KernelSlice::write`'s `# Safety`, which
+    // `zero` shares) holds trivially.
     unsafe {
         image.zero();
     }
@@ -313,6 +442,11 @@ pub fn load_shared_lib(
     let dyn_info = match layout.dynamic {
         Some((_, vaddr, size)) => {
             let region = module.slice(vaddr, size)?;
+            // SAFETY: `region` came from `ModuleImage::slice`, which
+            // bounds-checked `vaddr`/`size` against `vaddr_min..vaddr_max`
+            // before returning — see `KernelSlice::as_slice`'s `# Safety`.
+            // `image` is exclusively owned here, before `LoadedLib` (and any
+            // reader of it) exists.
             Dynamic::parse(unsafe { region.as_slice() })
         }
         None => Dynamic::default(),
@@ -330,6 +464,10 @@ pub fn load_shared_lib(
     let declared = dynsym_count_from_sections(backing, &layout)
         .filter(|&n| n > 0)
         .or_else(|| {
+            // SAFETY: same bounds argument as `dyn_info` above — `gnu_hash`
+            // came from `module.slice_to_end`, which is `slice` under the
+            // hood, still within `load_shared_lib`'s exclusive-construction
+            // phase.
             let table = GnuHash::parse(unsafe { gnu_hash.as_ref()?.as_slice() })?;
             table.sym_count()
         })
@@ -382,6 +520,13 @@ pub fn load_shared_lib(
     for entry in table_entries(&rela).chain(table_entries(&jmprel)) {
         if entry.kind == toyos_elf::RelocKind::Relative {
             let value = (base_phys as i64 + entry.addend) as u64;
+            // SAFETY: `write::<u64>` requires 8 valid, unaliased bytes at
+            // this offset. `module.slice(entry.offset, 8)?` re-derives that
+            // from `ModuleImage::slice`'s own bounds check, independent of
+            // the `rela::validate` pass above — an `entry.offset` outside the
+            // image is an `Err` here via `?`, not a write. `image` is still
+            // exclusively owned within `load_shared_lib`, before any reader
+            // (`LoadedLib::symbols`, `dlsym`, …) can see it.
             unsafe { module.slice(entry.offset, 8)?.write::<u64>(0, value) };
             reloc_count += 1;
         }
@@ -431,6 +576,8 @@ pub fn load_shared_lib(
             init_array_vaddr: init_array.map_or(0, |t| t.vaddr),
             init_array_size: init_array.map_or(0, |t| t.size),
             span: layout.span(),
+            rw_lo,
+            rw_hi,
         },
         rw_offset,
         rw_size,
@@ -458,6 +605,13 @@ fn dynsym_count_from_sections(
 /// A free function rather than a closure because the iterator borrows the
 /// kernel pages the table lives in, not the caller's frame.
 fn table_entries(table: &Option<KernelSlice>) -> impl Iterator<Item = toyos_elf::Rela> + '_ {
+    // SAFETY: every `KernelSlice` this is ever called with (`LoadedLib.rela`/
+    // `.jmprel`, or the local bindings of the same names in
+    // `load_shared_lib`) came from `ModuleImage::slice`'s bounds check.
+    // Relocation tables are read-only data: nothing in this module writes
+    // back into the `rela`/`jmprel` range once built — the `RELATIVE` pass
+    // above writes into `image`'s data through `module.slice(entry.offset,
+    // 8)`, a different range — so a shared `&[u8]` here never races a writer.
     table
         .iter()
         .flat_map(|slice| RelaTable::new(unsafe { slice.as_slice() }).iter())

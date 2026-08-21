@@ -30,16 +30,124 @@ pub fn live_instances() -> u32 {
     LIVE.load(Ordering::SeqCst)
 }
 
+/// The NVMe backing files live guests are holding open.
+///
+/// A lane reuses one image across its boots on purpose ([`super::lane`]), so
+/// "one image, one guest" is an invariant this harness already believed and
+/// nothing checked. QEMU checks it — it takes an exclusive `write` lock and the
+/// second process exits 1 — but it checks it *after* the first one is unusable,
+/// on stderr, in a sentence about locks that says nothing about which two boots
+/// overlapped. This is the same claim, made before anything spawns and in the
+/// harness's own words.
+static NVME_HELD: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// One live guest's hold on the NVMe image it was given.
+///
+/// Taken before the QEMU process is spawned and released when the
+/// [`QemuInstance`] is dropped — including when `wait_for_ready` panics on its
+/// way out, which builds no instance to drop and so must not leave a hold
+/// behind either.
+pub struct NvmeClaim {
+    path: PathBuf,
+    /// A profile declaring no NVMe controller is handed no image: the path is
+    /// `no-nvme`, it never reaches QEMU's argv, and every lane's is the same
+    /// name. There is nothing to hold and nothing to conflict with.
+    held: bool,
+}
+
+impl NvmeClaim {
+    /// Hold `path` for a guest that is about to be launched with it.
+    ///
+    /// The refusal is returned rather than raised because it is what
+    /// `nvme_image_is_held_by_one_guest` stages: [`QemuInstance::boot_with_options`]
+    /// panics on it, since a lane whose image is already open cannot boot and
+    /// there is nothing else to do about that.
+    pub fn take(path: &Path) -> Result<Self, String> {
+        // Decided under the lock and raised after it: a panic with the guard
+        // held poisons the mutex, and one refusal would then become a refusal
+        // on every later boot in the process — the shape this whole entry is
+        // about.
+        let refusal = {
+            let mut held = NVME_HELD.lock().unwrap_or_else(|e| e.into_inner());
+            match nvme_conflict(&held, path) {
+                Some(why) => Some(why),
+                None => {
+                    held.insert(path.to_path_buf());
+                    None
+                }
+            }
+        };
+        match refusal {
+            Some(why) => Err(why),
+            None => Ok(Self { path: path.to_path_buf(), held: true }),
+        }
+    }
+
+    /// The image a profile with no controller names and never uses.
+    pub fn unattached(path: &Path) -> Self {
+        Self { path: path.to_path_buf(), held: false }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for NvmeClaim {
+    fn drop(&mut self) {
+        if self.held {
+            NVME_HELD.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.path);
+        }
+    }
+}
+
+/// Why a boot may not open `want`, given what live guests are already holding.
+///
+/// Pure, and every input a parameter, so both directions can be staged without
+/// a guest.
+pub fn nvme_conflict(held: &std::collections::BTreeSet<PathBuf>, want: &Path) -> Option<String> {
+    held.contains(want).then(|| {
+        format!(
+            "a live guest is still holding {}. QEMU takes an exclusive write lock on the image \
+             it is given, so the second process exits 1 before it says anything and the boot \
+             that waited on it panics — which is how one lost guest reported 129 tests red on \
+             2026-08-17. A guest that replaces another must be built from that one's \
+             `QemuInstance::shutdown`, which takes it by value; `qemu = boot()` evaluates its \
+             right-hand side first and launches the replacement while the old guest is up.",
+            want.display()
+        )
+    })
+}
+
+/// Proof that no guest is holding a lane's images.
+///
+/// There are two ways to have one and there is no third: a lane that has not
+/// booted anything yet ([`LaneFree::no_guest_yet`]), and a guest that has been
+/// ended ([`QemuInstance::shutdown`], which takes `self`). A boot that takes
+/// this by value therefore *cannot be written* before the guest it replaces is
+/// gone — which is the mistake `qemu = boot()` makes, because Rust evaluates
+/// the right-hand side first.
+#[must_use]
+pub struct LaneFree(());
+
+impl LaneFree {
+    /// Before a lane's first boot, where there is no guest to end.
+    pub fn no_guest_yet() -> Self {
+        Self(())
+    }
+}
+
 /// Guests this run has started, how many of them were not the shipping kernel,
 /// and every distinct kernel build it asked cargo for.
 ///
 /// A registration is not a boot — several tests boot two machines and one boots
 /// four — so the count that decides whether a scheduling or build change worked
-/// cannot be read off the test lists. It was static analysis until now, and
-/// `specs/assessments/test-cost-audit.md` §6 records that as a lower bound.
+/// cannot be read off the test lists. It was static analysis until now, which
+/// only ever gave a lower bound.
 ///
 /// **The third is the one this run is judged on.** A kernel build is ~6.9 s of
-/// wall clock and ~29.6 s of CPU after any edit to `kernel/` (§5.9.2), and
+/// wall clock and ~29.6 s of CPU after any edit to `kernel/`, and
 /// until 2026-08-10 a full run made 45 of them. The set is what a run reports
 /// and what [`declared_kernel_builds`] refuses an addition to.
 static BOOTS: AtomicU32 = AtomicU32::new(0);
@@ -63,7 +171,7 @@ pub fn boot_census() -> (u32, u32, Vec<String>) {
 /// actuator compiled in, armed by boot parameter. `fpu-save-nothing` is the one
 /// actuator that could not become a parameter — it takes the `fxsave64` out of
 /// `arch::entry`'s `naked_asm!` bracket, which is the path its own gate is
-/// about — and `specs/assessments/test-cost-audit.md` §5.9.7 is where that is argued.
+/// about.
 ///
 /// [`toyos_build::build::SCHED_CHECK_KERNEL`] is the fourth, and it is the one
 /// this list's own warning was written about: an entry here is a decision to pay
@@ -72,8 +180,9 @@ pub fn boot_census() -> (u32, u32, Vec<String>) {
 /// the alternative had already been paid for and delivered nothing —
 /// `kernel/Cargo.toml` has forwarded `sched-check = ["toyos-sched/check"]` since
 /// the check build was written, and nothing in `src/` or `tests/` ever asked for
-/// it, so `cpu::MAX_PASS_NS`, invariant P and `invariants::check_cpu` were
-/// compiled by no CI run at all. `sched_check_build` is the test that asks.
+/// it, so `cpu::MAX_PASS_NS`, the pass-cost recorder and `invariants::check_cpu`
+/// were compiled by no CI run at all. `sched_check_build` is the test that asks,
+/// and `common::passcost` is what judges the half of it that is a measurement.
 ///
 /// A fifth entry is that decision again, and it gets this paragraph's argument
 /// made afresh. Interactive debug mode is separate: it builds
@@ -145,9 +254,8 @@ fn record_boot(took: Duration) {
 /// corrected for how fast the machine *is*, and that is the other half of the
 /// same mistake: a number reasoned about on an M4 Pro is not a liveness ceiling
 /// on a four-core Azure vCPU, it is a verdict about which of the two is running
-/// the test. `specs/assessments/ci-plan-assessment-2026-08.md` §7.1 counted
-/// 307 bare timeouts in one CI run and
-/// every one of them was that.
+/// the test. 307 bare timeouts were counted in one CI run and every one of
+/// them was that.
 ///
 /// **Only ever upward.** On a faster host the number in the source stands,
 /// because it is the number its author reasoned about, and a ceiling that shrank
@@ -179,7 +287,7 @@ pub fn host_speed() -> (Option<u32>, u32, u32, u32) {
 /// is the part of "how fast is the host today" the harness knows. It does not
 /// know the rest, and a retry loop bounded by elapsed time has that ceiling for
 /// a *verdict* the moment the rest moves: a guest that is merely late reports
-/// exactly what a wedged one reports. `specs/issues/design-debt/` is the bill —
+/// exactly what a wedged one reports. `issues/design-debt/` is the bill —
 /// `desktop_audio_client` 385 s wide against 13 s alone, a landing gate that is
 /// a coin toss, and six reds in four suites every one of which was
 /// `ALONE: GREEN`.
@@ -289,6 +397,313 @@ pub fn guest_liveness() -> Liveness {
     Liveness::new(GUEST_QUIET, GUEST_WEDGED)
 }
 
+/// A kernel line without its `[kernel <t> cpu<N>] ` stamp.
+///
+/// The stamp is the instance and the rest is the finding, and which of the two
+/// a verdict quotes decides an adjudication. `alone_line` compares the wide
+/// run's sentence against the lone re-run's, and two runs of one deterministic
+/// panic differ in the stamp alone — quoted whole, a staged double fault read
+/// `red again on a DIFFERENT failure`, which is the harness reporting two
+/// defects where there is one. The stamp is still in the capture underneath.
+fn without_stamp(line: &str) -> &str {
+    if !is_kernel_line(line) {
+        return line;
+    }
+    line.split_once("] ").map_or(line, |(_, rest)| rest)
+}
+
+/// The sentence a wait gives when what stopped the guest is on the console.
+///
+/// **One wording for all three waits**, so a summary line, a redlist row and an
+/// issue file quote the same words wherever the wait was — and so that nothing
+/// in it is a measurement of the host. The silence that proved the panic was
+/// fatal is deliberately not in the sentence: it differs by a poll interval
+/// between two runs of one panic, and `alone_line` compares those two sentences
+/// to decide whether a re-run reproduced the defect or found a second one.
+fn kernel_died_here(line: &str) -> String {
+    format!(
+        "kernel panic: {} — the guest went quiet because every CPU is halted, not because it \
+         was still working. The panic is the finding and the guard never got to be one.",
+        without_stamp(line.trim())
+    )
+}
+
+/// The heading a verdict puts the guest's own account under.
+///
+/// One spelling, so an issue file, a redlist row and a CI log all quote the
+/// same words when they quote a report.
+pub const DIED_SAYING: &str = "--- what the kernel said as it died ---";
+
+/// Why a wait ended badly, carrying the guest's own account of it.
+///
+/// **A newtype, because what this closes is an omission and an omission cannot
+/// be gated by review.** Fifty-two sites in this suite format
+/// [`TestResult::error`] and thirty-six of them printed no capture beside it
+/// (counted on the tree, 2026-08-18), and on
+/// 2026-08-18 that is what a `DOUBLE FAULT on CPU 1` cost — the wait named the
+/// death in one sentence, the kernel's report sat in `TestResult::serial`, and
+/// the arm printed `stdout`
+/// (`issues/kernel/a-double-fault-on-cpu-1-under-a-wide-suite.md`). Fixing
+/// the arms would have fixed the arms. What is fixed here is that the sentence
+/// cannot be built without the capture: [`Self::new`] is the only constructor
+/// there is and the capture is one of its two arguments, so a wait that reports
+/// a kernel death and no report is not expressible.
+///
+/// It carries nothing when the capture carries no kernel death, and that half
+/// matters as much: an ordinary ceiling on a live guest, or a guest binary
+/// reporting its own error, must not start pasting a boot's serial log into
+/// somebody's terminal. [`ceiling_self_check`] asserts both directions.
+#[derive(Clone, Debug)]
+pub struct WaitVerdict(String);
+
+impl WaitVerdict {
+    /// The sentence a wait reached, and the capture it reached it on.
+    ///
+    /// `capture` is the window in the order the guest wrote it — for a test,
+    /// [`TestResult::before`] and then [`TestResult::serial`], which is where
+    /// the two halves of one window live — because the first kernel death in it
+    /// is the one this verdict is about. An empty slice is a claim that there
+    /// was no capture at all, and it is a visible one rather than an omission.
+    pub fn new(sentence: String, capture: &[&str]) -> Self {
+        let Some(report) = capture.iter().find_map(|c| super::serial::death_report(c)) else {
+            return Self(sentence);
+        };
+        Self(format!("{sentence}\n{DIED_SAYING}\n{report}"))
+    }
+
+    /// The sentence, without the account under it.
+    ///
+    /// What `headline` in `tests/toyos.rs` reads off a red's reason and what
+    /// `alone_line` compares two runs of one defect on — so the first line is
+    /// still one line, and the report below it can differ between two boots of
+    /// the same panic without reading as a second defect.
+    pub fn sentence(&self) -> &str {
+        self.0.lines().next().unwrap_or_default()
+    }
+}
+
+impl std::fmt::Display for WaitVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// What a test's ceiling caught — the panic, the stall, or the slow test.
+///
+/// Pure, and every input a parameter, so [`ceiling_self_check`] can stage all
+/// three rather than wait for a guest to produce one.
+///
+/// `dying` is the line on which the kernel said it was dying, if it ever did,
+/// and `quiet` is how long the guest has said nothing. **The first arm is the
+/// whole point.** A Rust `panic!` in the kernel prints `PANIC:` and then
+/// `halt_all_cpus` stops every CPU, so the guest goes silent and the ceiling —
+/// which is a liveness guard and never a verdict — expired on a machine that
+/// had been dead since the first second. `sched_check_build` in run
+/// `31946183485` was reported `STALLED: 382s of guard expired` with the panic
+/// and its full backtrace four lines above that sentence, on a guest that died
+/// at 1.450 s of its own uptime.
+///
+/// A kernel panic does not end the wait *by itself*, and that is deliberate:
+/// the same handler recovers a panic taken in syscall context, killing the
+/// caller and leaving the machine running, which is exactly what
+/// `panic_recovery`, `heap_ceiling` and `screen_recoverable_untouched` assert.
+/// Silence is what separates the two, and it is the separation the harness
+/// already trusts everywhere else ([`GUEST_QUIET`]): a recovering guest keeps
+/// talking — it has a periodic speaker on every config and the test's own
+/// `===TEST_END` arrives in milliseconds — and a halted one cannot.
+pub fn ceiling_verdict(
+    dying: Option<&str>,
+    elapsed: Duration,
+    ceiling: Duration,
+    quiet: Duration,
+    lines: usize,
+) -> Option<String> {
+    if let Some(line) = dying {
+        if quiet >= GUEST_QUIET {
+            return Some(kernel_died_here(line));
+        }
+    }
+    if elapsed <= ceiling {
+        return None;
+    }
+    let secs = ceiling.as_secs();
+    Some(if quiet >= GUEST_QUIET {
+        format!(
+            "{STALLED} {secs}s of guard expired, and the guest had said nothing for the last \
+             {quiet:.0?} of it — the ceiling caught a machine that had stopped, which is not an \
+             answer to what this test asked"
+        )
+    } else {
+        format!(
+            "timed out after {secs}s, with the guest still talking {quiet:.0?} ago ({lines} \
+             console line(s) while it ran) — it was working and did not finish"
+        )
+    })
+}
+
+/// The three verdicts a ceiling reaches and what each carries, staged with no
+/// guest at all.
+///
+/// The gate for [`ceiling_verdict`], and it runs in both directions on each:
+/// the panic must be named *and* not read as a stall, the stall must still read
+/// as one, and a program's own panic must not end anybody's run. That last one
+/// is the case the obvious patch breaks — a bare panic spelling in the read
+/// loop matches a guest binary's panic, and a guest binary is allowed to die.
+///
+/// The fourth section is [`WaitVerdict`]: naming a death is not the same as
+/// keeping the report, and a suite that had the first without the second lost a
+/// double fault's whole account on 2026-08-18.
+pub fn ceiling_self_check() -> Result<(), String> {
+    const CEILING: Duration = Duration::from_secs(380);
+    const KERNEL: &str =
+        "[kernel 1.450 cpu3] PANIC: panicked at kernel/src/sched/reserve.rs:812:9:";
+    let quiet = GUEST_QUIET + Duration::from_secs(1);
+    let talking = Duration::from_millis(200);
+
+    // 1. The kernel panicked and the machine went quiet. Named, and named
+    //    *before* the ceiling: the guest died at 1.45 s and the guard is 380 s.
+    let early = Duration::from_secs(17);
+    let Some(panic) = ceiling_verdict(Some(KERNEL), early, CEILING, quiet, 40) else {
+        return Err(String::from(
+            "a kernel panic followed by silence did not end the wait, so it costs the whole guard",
+        ));
+    };
+    if !panic.contains("kernel panic") || !panic.contains("reserve.rs:812:9") {
+        return Err(format!("the verdict does not name the panic: {panic}"));
+    }
+    if panic.contains(STALLED) {
+        return Err(format!("a kernel panic is still reported as a stall: {panic}"));
+    }
+    if early >= CEILING {
+        return Err(String::from("staged the panic after the ceiling, so it proves nothing"));
+    }
+    // The same panic on a later boot, differing only in its stamp, is the same
+    // sentence — or the lone re-run of a reproducible panic reads as a second,
+    // different defect. `alone_line` is what compares the two.
+    let again = "[kernel 1.503 cpu7] PANIC: panicked at kernel/src/sched/reserve.rs:812:9:";
+    if ceiling_verdict(Some(again), early, CEILING, quiet, 40).as_deref() != Some(panic.as_str()) {
+        return Err(format!(
+            "one panic on two boots gives two sentences, so a re-run reads as a second defect:\n\
+             {panic}\n{:?}",
+            ceiling_verdict(Some(again), early, CEILING, quiet, 40)
+        ));
+    }
+
+    // 2. A **userland** panic is not the machine's death. `died` is what the
+    //    read loop asks, so the case is staged where the loop reads it: the
+    //    same words from a program classify as nobody's business, and a wait
+    //    with no kernel death in it runs on.
+    const USER: &str = "thread 'main' (1) panicked at sshd/src/main.rs:359:23:";
+    if super::serial::died(USER) == Some(super::serial::Died::Kernel) {
+        return Err(format!("a program's own panic reads as the kernel's: {USER:?}"));
+    }
+    if ceiling_verdict(None, early, CEILING, quiet, 40).is_some() {
+        return Err(String::from(
+            "a run with no kernel death in it ended before its ceiling — a program that panicked \
+             would take the whole test down with it",
+        ));
+    }
+
+    // 2b. The same two cases for the wait that holds a whole capture rather
+    //     than a line at a time — `await_guest`, whose `it went quiet` is the
+    //     wording #156's signature is stated in.
+    let halted = format!("[kernel 0.400 cpu0] compositor: frames=120\n{KERNEL}\n");
+    let Some(found) = super::serial::kernel_death(&halted) else {
+        return Err(String::from("a capture ending in a kernel panic reads as a guest that merely \
+                                 stopped, which is the verdict that threw the cause away"));
+    };
+    if kernel_died_here(found) != panic {
+        return Err(String::from("the two waits word one panic differently"));
+    }
+    let program_died = format!("[kernel 0.400 cpu0] compositor: frames=120\n{USER}\n");
+    if super::serial::kernel_death(&program_died).is_some() {
+        return Err(format!(
+            "a capture whose only panic is a program's reads as a halted machine:\n{program_died}"
+        ));
+    }
+
+    // 3. A guest that merely stopped, with no panic of either kind, still
+    //    reports as a stall — the classification the whole redlist is written
+    //    against.
+    let Some(stall) = ceiling_verdict(None, CEILING + Duration::from_secs(1), CEILING, quiet, 40)
+    else {
+        return Err(String::from("an expired guard on a silent guest returned no verdict at all"));
+    };
+    if !stall.starts_with(STALLED) {
+        return Err(format!("a genuine stall stopped reporting as one: {stall}"));
+    }
+    // And the other end of the same guard: a guest still talking at the ceiling
+    // was working, and that is a different red.
+    let Some(slow) = ceiling_verdict(None, CEILING + Duration::from_secs(1), CEILING, talking, 900)
+    else {
+        return Err(String::from("an expired guard on a talking guest returned no verdict"));
+    };
+    if slow.contains(STALLED) || !slow.contains("did not finish") {
+        return Err(format!("a slow test reads as a stall: {slow}"));
+    }
+    // Nothing has expired and nothing died: no verdict.
+    if ceiling_verdict(None, early, CEILING, talking, 40).is_some() {
+        return Err(String::from("a healthy run was given a verdict"));
+    }
+
+    // 4. **What the verdict carries, which is the half that was missing.** Every
+    //    arm above names a death in one sentence; until 2026-08-18 that sentence
+    //    was the whole of what a failure arm had, and a `DOUBLE FAULT on CPU 1`
+    //    went into the record with its report — written, on IST1, 6688 bytes of
+    //    it — never printed. Both directions, because the second is what keeps a
+    //    stall or a slow test from pasting a boot's console at somebody.
+    const DF: &str = "[kernel 6.204 cpu1] DOUBLE FAULT on CPU 1 (pid=Some(Pid(2)) tid=Some(Tid(0)))";
+    let window_before = "[kernel 6.201 cpu0] spawn: /bin/test_rs_console_line_atomicity pid=41\n";
+    let window_serial = format!(
+        "AAAAAAAA\n{DF}\n\
+         [kernel 6.204 cpu1]   cr2=0xffff800002672ff8 (address that caused the fault chain)\n\
+         [kernel 6.204 cpu1]   rip=0xffffffff80121a40  rsp=0xffff800002673000  rbp=0x0\n"
+    );
+    let died_verdict = ceiling_verdict(Some(DF), early, CEILING, quiet, 40)
+        .ok_or("a staged double fault reached no verdict at all")?;
+    let carried = WaitVerdict::new(died_verdict.clone(), &[window_before, &window_serial]);
+    for want in [DIED_SAYING, "cr2=0xffff800002672ff8", "rip=0xffffffff80121a40"] {
+        if !carried.to_string().contains(want) {
+            return Err(format!(
+                "the verdict names the death and drops {want:?}, which is the defect \
+                 `issues/kernel/a-double-fault-on-cpu-1-under-a-wide-suite.md` is \
+                 about:\n{carried}"
+            ));
+        }
+    }
+    // The sentence is still one line and still the sentence — `headline` in
+    // `tests/toyos.rs` reads it off a red's reason and `alone_line` compares two
+    // runs of one defect on it, so a report under it must not become part of it.
+    if carried.sentence() != died_verdict {
+        return Err(format!(
+            "the report changed the sentence a summary quotes:\n{}\n{died_verdict}",
+            carried.sentence()
+        ));
+    }
+    // The other direction. A guest still talking at its ceiling has nothing to
+    // account for, and a verdict that grew a serial log would be a second defect
+    // dressed as a fix.
+    let quiet_capture = WaitVerdict::new(slow.clone(), &["[kernel 0.377 cpu0] NVMe: found\n"]);
+    if quiet_capture.to_string() != slow {
+        return Err(format!(
+            "a verdict on a capture nothing died in grew a report:\n{quiet_capture}"
+        ));
+    }
+    // And the capture being handed over at all is the argument, not a habit: an
+    // empty slice is what a wait with nothing to show says, and it says it.
+    if WaitVerdict::new(died_verdict.clone(), &[]).to_string() != died_verdict {
+        return Err(String::from("a verdict built on no capture invented a report"));
+    }
+
+    eprintln!(
+        "  [ceiling] the panic, the stall, the slow test and the healthy run, each named apart \
+         from the other three; the panic's verdict carries the kernel's own {} lines and the \
+         other three carry nothing",
+        carried.to_string().lines().count() - 1,
+    );
+    Ok(())
+}
+
 /// Collect console output until `done` reads true of the whole capture, or the
 /// guest stops making progress.
 ///
@@ -313,6 +728,10 @@ pub fn await_guest(
     doing: &str,
     done: impl Fn(&str) -> bool,
 ) -> Result<(), String> {
+    // Where this wait's own evidence starts. The capture is the caller's and
+    // outlives every wait on it, so a panic the machine recovered from ten
+    // probes ago must not be handed to this one as its cause.
+    let from = log.len();
     let mut live = guest_liveness();
     while !done(log) && live.working(log) {
         let more = qemu.drain_serial(Duration::from_millis(200));
@@ -320,6 +739,24 @@ pub fn await_guest(
     }
     if done(log) {
         return Ok(());
+    }
+    // **The third wait, asking the one question the other two ask.** A guest
+    // that halted every CPU went quiet for a reason it wrote down first, and
+    // `it went quiet` is that reason thrown away — which is the shape #156's
+    // whole signature is stated in (`a total freeze of the guest`, judged by a
+    // periodic line that stopped arriving), so what this says decides how the
+    // next occurrence is read.
+    let since = &log[from..];
+    if let Some(line) = super::serial::kernel_death(since) {
+        // Through [`WaitVerdict`] for the reason that type exists: this caller
+        // owns the capture and usually prints it, and `usually` is what the
+        // arms that do not have in common with the one that lost a double
+        // fault's report.
+        return Err(WaitVerdict::new(
+            format!("{} It was waiting for {doing}", kernel_died_here(line)),
+            &[since],
+        )
+        .to_string());
     }
     Err(format!("{STALLED} waiting for {doing} — {}", live.why()))
 }
@@ -403,8 +840,7 @@ pub enum Profile {
     Diskless,
     /// metal-sim with a namespace formatted in 8 KiB logical blocks.
     ///
-    /// Sector size is a shape dimension in exactly the sense
-    /// `specs/device-test-strategy.md` means, and it was one the harness could
+    /// Sector size is a shape dimension, and it was one the harness could
     /// not express: every profile got QEMU's implicit 512-byte namespace, so
     /// nothing asked the driver what it does with a device it cannot address.
     /// The answer was `4096 / sector_size == 0` and then a divide by zero, at
@@ -542,8 +978,8 @@ pub enum Profile {
     /// Two controllers, and every input device arrives *after* the boot.
     ///
     /// The T14's shape for the one thing no profile stages: its Thunderbolt
-    /// xHCI at 00:0d.0 has five ports and has never had a device on them
-    /// (`specs/reference/metal-hardware-inventory.md`), so the controller a user plugs
+    /// xHCI at 00:0d.0 has five ports and has never had a device on them, so
+    /// the controller a user plugs
     /// into is the one that enumerated nothing at boot. Here the second
     /// controller is that one and the boot stick is on the first.
     ///
@@ -561,8 +997,8 @@ pub enum Profile {
     ///
     /// Presence of the unit is the shape dimension, and it is the one QEMU
     /// gives for free that no real machine gives at all: on hardware, "no
-    /// DMAR" and "VT-d disabled in firmware setup" are the same observation
-    /// (`specs/iommu-spec.md` §2.2). This is the machine where the kernel has
+    /// DMAR" and "VT-d disabled in firmware setup" are the same observation.
+    /// This is the machine where the kernel has
     /// to say which of the two it cannot tell apart.
     NoIommu,
     /// metal-sim whose unit advertises a 39-bit address width instead of 48.
@@ -570,12 +1006,12 @@ pub enum Profile {
     /// `CAP.SAGAW` is a register the guest decodes into a page-table depth,
     /// and a suite with one value of it cannot tell a decode from a constant.
     /// Both widths are real: 39-bit units ship, and the IOVA base every domain
-    /// gets is derived from this number (`specs/iommu-spec.md` §5.3).
+    /// gets is derived from this number.
     IommuNarrow,
     /// metal-sim whose unit cannot remap interrupts.
     ///
     /// Two registers move together — the DMAR's own `INTR_REMAP` flag and the
-    /// unit's `ECAP.IR` — and `specs/iommu-spec.md` §2.2 gives them separate
+    /// unit's `ECAP.IR` — and the kernel gives them separate
     /// refusals, because a platform that declares it cannot remap and a unit
     /// that cannot are different facts a user can act on differently.
     IommuNoIntremap,
@@ -587,8 +1023,8 @@ pub enum Profile {
     /// differs from the machine gate A's four recorded configs run on is the
     /// sound card, so a difference in the capture is a difference in the audio
     /// path. It is not the T14's literal shape and does not try to be — this is
-    /// the audio arm, not a PCI-topology one. `specs/plans/hda-driver-plan.md`
-    /// H0's diagnostic staged that comparison and is deleted now that the
+    /// the audio arm, not a PCI-topology one. H0's diagnostic staged that
+    /// comparison and is deleted now that the
     /// driver above answers every question it was asked for.
     Hda,
     /// [`Profile::Hda`] with a second controller that also has a codec.
@@ -610,8 +1046,8 @@ pub enum Profile {
 /// registers from one that prints what it expected to find.
 ///
 /// `caching-mode` is deliberately not a field. It is on everywhere: it is the
-/// stricter configuration, it is the only one QEMU can stage, and
-/// `specs/iommu-spec.md` §5.5 refuses to branch on it — so a profile that
+/// stricter configuration, it is the only one QEMU can stage, and the kernel
+/// refuses to branch on it — so a profile that
 /// turned it off would be staging a machine no code here distinguishes.
 #[derive(Clone, Copy, PartialEq)]
 pub struct Iommu {
@@ -622,8 +1058,7 @@ pub struct Iommu {
 }
 
 /// What every profile but the three that vary it declares: the widest address
-/// width QEMU offers and interrupt remapping on, which is
-/// `specs/iommu-spec.md` §8's configuration.
+/// width QEMU offers and interrupt remapping on.
 pub const IOMMU_DEFAULT: Iommu = Iommu { aw_bits: 48, intremap: true };
 
 /// The controller every profile but [`Profile::MetalUsb`] gets. `nec-usb-xhci`
@@ -779,7 +1214,7 @@ struct Shape {
     ///
     /// Presence of a class-0403 *function* is the shape dimension, and it is
     /// separate from whether anything answers on the link behind it — which is
-    /// `specs/plans/hda-driver-plan.md` H0's question (b), and what the codec
+    /// H0's question (b), and what the codec
     /// arguments in this list decide per controller.
     hda: &'static [&'static str],
     /// The unit that decodes this machine's DMA, or its absence. Stated per
@@ -1385,7 +1820,13 @@ pub struct TestResult {
     /// capture. It is separate from `serial` because `serial` means "while this
     /// test ran" and audio gates count lines in it.
     pub before: String,
-    pub error: Option<String>,
+    /// Why the run did not finish, when it did not.
+    ///
+    /// A [`WaitVerdict`] and not a `String`, so that the sentence and the
+    /// kernel's own account of its death cannot come apart — see that type.
+    /// Every arm that formats this gets the report for free, and there are
+    /// fifty-two of them that were never going to be edited one at a time.
+    pub error: Option<WaitVerdict>,
     /// Whether the guest ever announced *this* test.
     ///
     /// The in-guest runner reads one command, prints `===TEST_START <name>` and
@@ -1411,7 +1852,7 @@ pub struct QemuInstance {
     _reader_thread: thread::JoinHandle<String>,
     audio_wav: PathBuf,
     uart_log: PathBuf,
-    nvme_image: PathBuf,
+    nvme: NvmeClaim,
     usb_images: Vec<PathBuf>,
     qmp_socket: Option<PathBuf>,
     screendump: PathBuf,
@@ -1627,6 +2068,10 @@ impl QemuInstance {
         // not hand each other a filesystem formatted for the wrong one. Reused
         // across the boots of one lane and shared with no other — which is what
         // `super::lane` is for, and why this is not a per-boot name.
+        //
+        // One live guest per image, claimed here rather than discovered from
+        // QEMU's stderr after the second process has already exited — see
+        // [`NvmeClaim`].
         let nvme_bytes = options.profile.shape().nvme_bytes;
         let nvme_image = match &options.nvme_image {
             Some(path) => path.clone(),
@@ -1640,6 +2085,11 @@ impl QemuInstance {
                 }
                 path
             }
+        };
+        let nvme = if nvme_bytes == 0 {
+            NvmeClaim::unattached(&nvme_image)
+        } else {
+            NvmeClaim::take(&nvme_image).unwrap_or_else(|why| panic!("[qemu] {why}"))
         };
 
         // Named by size and block size for the same reason the namespace is:
@@ -1682,7 +2132,7 @@ impl QemuInstance {
 
         let qemu = qemu_command(
             &boot_image,
-            &nvme_image,
+            nvme.path(),
             &usb_images,
             &audio_wav,
             &uart_log,
@@ -1696,7 +2146,7 @@ impl QemuInstance {
                 seq,
                 audio_wav,
                 uart_log,
-                nvme_image,
+                nvme,
                 usb_images,
                 qmp_socket,
                 screendump,
@@ -1806,7 +2256,24 @@ impl QemuInstance {
     /// only place a storage assertion can stand outside the guest's own
     /// account of itself.
     pub fn nvme_image(&self) -> &Path {
-        &self.nvme_image
+        self.nvme.path()
+    }
+
+    /// End this guest and hand back the proof its lane is free.
+    ///
+    /// **This is the only way to boot a replacement**, because [`LaneFree`] is
+    /// the only thing a replacement can be built from and this is the only
+    /// thing that makes one out of a guest. Taking `self` is the whole of it:
+    /// `qemu = boot()` launched the new QEMU while the old instance still held
+    /// the lane's `test-nvme-*.img` open for write, the new one exited 1 on
+    /// QEMU's own lock, and `wait_for_ready`'s panic escaped the shared block —
+    /// 129 of one run's 131 reds carried that one sentence on 2026-08-17.
+    /// Deterministic, not a race in the sense of a window: the old guest is
+    /// always still alive at that point, so every shared-boot reboot since the
+    /// mechanism landed on 2026-08-08 died this way.
+    pub fn shutdown(self) -> LaneFree {
+        drop(self);
+        LaneFree(())
     }
 
     /// The data disks' backing files, which is what the *devices* received.
@@ -1917,7 +2384,7 @@ impl QemuInstance {
     /// `run_test`, with `action` run once the guest prints `ready_line`.
     ///
     /// The hook is inside the read loop because that is the only place the
-    /// two facts meet: the guest is holding the keyboard fd, and the host has
+    /// two facts meet: the guest is holding the keyboard claim, and the host has
     /// not injected yet. A sleep would be a guess in both directions.
     pub fn run_test_hooked(
         &mut self,
@@ -1979,26 +2446,28 @@ impl QemuInstance {
         // and one still talking at the ceiling has not.
         let mut last_line = Instant::now();
         let mut lines = 0usize;
+        // **The line on which the kernel said it was dying, if it ever did.**
+        // The first one only: a crash report's later lines carry the spelling
+        // too, and the header is the one worth quoting. What it buys is in
+        // [`ceiling_verdict`] — until it existed, a Rust `panic!` in the kernel
+        // matched nothing here, the machine halted, and the whole guard expired
+        // onto a verdict that said the guest had stopped answering.
+        let mut dying: Option<String> = None;
 
         loop {
-            if start.elapsed() > timeout {
-                let quiet = last_line.elapsed();
-                let secs = timeout.as_secs();
-                let error = if quiet >= GUEST_QUIET {
-                    format!(
-                        "{STALLED} {secs}s of guard expired, and the guest had said nothing for \
-                         the last {:.0?} of it — the ceiling caught a machine that had stopped, \
-                         which is not an answer to what this test asked",
-                        quiet
-                    )
-                } else {
-                    format!(
-                        "timed out after {secs}s, with the guest still talking {:.0?} ago \
-                         ({lines} console line(s) while it ran) — it was working and did not \
-                         finish",
-                        quiet
-                    )
-                };
+            if let Some(error) = ceiling_verdict(
+                dying.as_deref(),
+                start.elapsed(),
+                timeout,
+                last_line.elapsed(),
+                lines,
+            ) {
+                // The window in the order the guest wrote it: `before` holds
+                // every line up to `===TEST_START===` and `serial` everything
+                // after, so a kernel that died before this test announced
+                // itself has its report found in the first and one that died
+                // during it in the second.
+                let error = WaitVerdict::new(error, &[&before, &serial]);
                 return TestResult {
                     name: name.to_string(),
                     exit_code: None,
@@ -2015,6 +2484,11 @@ impl QemuInstance {
                     last_line = Instant::now();
                     lines += 1;
                     fire(&line, self.qmp_socket.as_ref());
+                    if dying.is_none()
+                        && super::serial::died(&line) == Some(super::serial::Died::Kernel)
+                    {
+                        dying = Some(line.clone());
+                    }
                     if line.contains(&format!("===TEST_START {want}===")) {
                         in_test = true;
                     } else if let Some(at) = line.find(END_MARKER) {
@@ -2022,7 +2496,7 @@ impl QemuInstance {
                         let rest = rest.split_once("===").map_or(rest, |(head, _)| head);
                         let parts: Vec<&str> = rest.splitn(2, ' ').collect();
                         // **A marker naming another test is the previous one's**,
-                        // and taking it was `specs/issues/build/`'s cascade:
+                        // and taking it was `issues/build/`'s cascade:
                         // one timed-out test left the guest still producing its
                         // output, every later member of the block read a window
                         // that opened on it, and 110 of 238 went red on an
@@ -2066,6 +2540,11 @@ impl QemuInstance {
                         } else {
                             (None, None)
                         };
+                        // The guest's runner said this one, so the capture is
+                        // handed over for the same reason: a runner reporting
+                        // an error on a machine whose kernel had already died
+                        // is reporting the smaller of the two facts.
+                        let error = error.map(|e| WaitVerdict::new(e, &[&before, &serial]));
                         return TestResult {
                             name: name.to_string(),
                             exit_code,
@@ -2073,16 +2552,6 @@ impl QemuInstance {
                             serial,
                             before,
                             error,
-                            started: in_test,
-                        };
-                    } else if line.contains("KERNEL PANIC") {
-                        return TestResult {
-                            name: name.to_string(),
-                            exit_code: None,
-                            stdout,
-                            serial,
-                            before,
-                            error: Some(format!("kernel panic: {line}")),
                             started: in_test,
                         };
                     } else if !in_test {
@@ -2098,13 +2567,18 @@ impl QemuInstance {
                 }
                 Err(RecvTimeoutError::Timeout) => continue,
                 Err(RecvTimeoutError::Disconnected) => {
+                    // QEMU going away is a sentence about the host process, and
+                    // a guest whose kernel panicked on the way out wrote down
+                    // the reason first.
+                    let error =
+                        WaitVerdict::new(String::from("QEMU disconnected"), &[&before, &serial]);
                     return TestResult {
                         name: name.to_string(),
                         exit_code: None,
                         stdout,
                         serial,
                         before,
-                        error: Some("QEMU disconnected".to_string()),
+                        error: Some(error),
                         started: in_test,
                     };
                 }
@@ -2118,13 +2592,17 @@ impl Drop for QemuInstance {
         let _ = writeln!(self.stdin, "quit");
         let _ = self.stdin.flush();
         let _ = self.child.kill();
+        // **Reaped, not merely signalled.** The `NvmeClaim` field is released
+        // after this body returns, and what makes that release true rather than
+        // hopeful is that the process whose descriptors hold QEMU's write lock
+        // on the image is gone by the time it happens.
         let _ = self.child.wait();
         let _ = fs::remove_file(&self.audio_wav);
         // **The 16550's log outlives the guest, because it is the one channel
         // that exists before the console does.** Firmware, the bootloader and
         // the kernel up to the backend switch write here and nowhere else, so a
         // boot that dies before virtio-console comes up leaves this file and an
-        // empty capture — which is exactly the shape `specs/issues/diagnostics/`
+        // empty capture — which is exactly the shape `issues/diagnostics/`
         // records as looking like a kernel that never started. 1.4 KB on a
         // healthy `tests/testcases` boot, measured, against the hundreds of
         // megabytes of per-boot image beside it.
@@ -2532,8 +3010,7 @@ fn qemu_command(
     // Ahead of every other `-device`: QEMU gives a PCI function the bypassing
     // address space unless the unit exists when the function is created, so a
     // unit emitted after the devices it is meant to decode is a unit that
-    // decodes nothing — the vacuity trap `specs/plans/userspace-drivers-spec.md` §7.2
-    // is built around, in its harness-side form.
+    // decodes nothing — the vacuity trap, in its harness-side form.
     if let Some(unit) = shape.iommu {
         qemu.arg("-device").arg(format!(
             "intel-iommu,intremap={},caching-mode=on,aw-bits={}",
@@ -2719,7 +3196,7 @@ struct Files {
     seq: u32,
     audio_wav: PathBuf,
     uart_log: PathBuf,
-    nvme_image: PathBuf,
+    nvme: NvmeClaim,
     usb_images: Vec<PathBuf>,
     qmp_socket: Option<PathBuf>,
     screendump: PathBuf,
@@ -2731,7 +3208,7 @@ fn spawn_and_wait_ready(mut qemu: Command, options: &BootOptions, files: Files) 
         seq,
         audio_wav,
         uart_log,
-        nvme_image,
+        nvme,
         usb_images,
         qmp_socket,
         screendump,
@@ -2794,7 +3271,7 @@ fn spawn_and_wait_ready(mut qemu: Command, options: &BootOptions, files: Files) 
         _reader_thread: reader_thread,
         audio_wav,
         uart_log,
-        nvme_image,
+        nvme,
         usb_images,
         qmp_socket,
         screendump,
@@ -2814,8 +3291,8 @@ fn wait_for_ready(
     let ready = options.ready_marker;
     let panic_aborts = ready == DEFAULT_READY;
     // Ten seconds per guest this phase may have up, and never fewer than two
-    // guests' worth — the tree runs 15-25 suites a day across several agents
-    // (`specs/assessments/test-cost-audit.md` §4), so one guest on a quiet host stopped being
+    // guests' worth — the tree runs 15-25 suites a day across several agents,
+    // so one guest on a quiet host stopped being
     // the regime some time before this did. Measured on 2026-08-03 with other
     // agents building: two boots exceeded the flat ten seconds, one of them in a
     // phase running a single guest.
@@ -2855,12 +3332,28 @@ fn wait_for_ready(
                 }
                 break;
             }
+            // **A death nothing left on this machine can come back from.** The
+            // kernel's own, or a process the kernel killed — before the ready
+            // marker the second is as fatal as the first, because whatever died
+            // was `init` or one of its children and nothing else is going to
+            // reach the marker.
+            //
+            // A process that ended *itself* is not on that list, and the
+            // difference is not academic: `sshd` panics across boots that then
+            // come up perfectly
+            // (`issues/build/sshd-panics-when-netd-exits-before-it-binds.md`).
+            // The words are the same words — `panicked at` — and who wrote the
+            // line is the whole of what tells them apart. `super::serial::died`
+            // is where that is decided, for this wait and for [`await_guest`]
+            // and [`QemuInstance::run_test_paced`] alike, so the three cannot
+            // drift into disagreeing about a spelling.
             Ok(ref line)
                 if panic_aborts
                     && !no_timeout
-                    && (line.contains("SEGFAULT")
-                        || line.contains("KERNEL PANIC")
-                        || line.contains("PANIC:")) =>
+                    && matches!(
+                        super::serial::died(line),
+                        Some(super::serial::Died::Kernel | super::serial::Died::Faulted)
+                    ) =>
             {
                 let mut crash_msg = line.clone();
                 let drain_deadline = Instant::now() + Duration::from_secs(2);

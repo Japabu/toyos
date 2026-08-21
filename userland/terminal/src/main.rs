@@ -13,7 +13,7 @@ use std::os::toyos::process::CommandExt;
 use std::process::Command;
 
 use terminal::Console;
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::port;
 use toyos::surface::{self, Delivery, Host, Notice};
 use toyos::RawHandle;
@@ -71,16 +71,16 @@ fn main() {
     // with no trace — which is what the desktop tests used to compensate for by
     // retyping against a clock, making every one of their verdicts a statement
     // about how long a desktop takes to come up on the host of the day
-    // (`specs/issues/design-debt/`).
+    // (`issues/design-debt/`).
     eprintln!("terminal: ready");
 
     loop {
-        poller.poll_add_fd(RawHandle(shell_stdout.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDOUT);
-        poller.poll_add_fd(RawHandle(shell_stderr.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDERR);
-        poller.poll_add_fd(window.fd(), IORING_POLL_IN, TOKEN_WINDOW);
-        poller.poll_add_fd(host.acceptor_fd(), IORING_POLL_IN, TOKEN_LISTEN);
-        for fd in host.client_fds() {
-            poller.poll_add_fd(fd, IORING_POLL_IN, TOKEN_CLIENT);
+        poller.watch_raw(RawHandle(shell_stdout.as_raw_fd() as u32), READABLE, TOKEN_STDOUT);
+        poller.watch_raw(RawHandle(shell_stderr.as_raw_fd() as u32), READABLE, TOKEN_STDERR);
+        poller.watch_raw(window.handle(), READABLE, TOKEN_WINDOW);
+        poller.watch_raw(host.acceptor_handle(), READABLE, TOKEN_LISTEN);
+        for client in host.client_handles() {
+            poller.watch_raw(client, READABLE, TOKEN_CLIENT);
         }
 
         let mut ready = [false; 5];

@@ -1,4 +1,4 @@
-//! What `CR0` and `CR4` hold on every CPU in this machine.
+//! What `CR0`, `CR4` and `IA32_EFER` hold on every CPU in this machine.
 //!
 //! One declaration, applied by the BSP and by every AP, and checked on each of
 //! them afterwards. Before this file there was no declaration at all: the BSP
@@ -7,15 +7,32 @@
 //! 1..N booted with **caching disabled**, `WP` clear and `NE` clear for the
 //! whole history of the tree.
 //!
-//! Both registers are written whole, so every bit of both is decided here.
-//! `CR0`'s value is a constant; three of `CR4`'s bits are the silicon's to
-//! offer, so its value is *required plus whatever of the optional set this CPU
-//! has* — a function every CPU evaluates and has to agree on.
+//! All three are written whole, so every bit of each is decided here. `CR0`'s
+//! value is a constant; four of `CR4`'s bits are the silicon's to offer, so its
+//! value is *required plus whatever of the optional set this CPU has* — a
+//! function every CPU evaluates and has to agree on. `EFER` is a constant, and
+//! it is the register [`Prot`](crate::mm::paging::Prot) rests on: with `NXE`
+//! clear, bit 63 of a paging entry is a *reserved* bit rather than a permission,
+//! so a CPU that reached Ring 3 without it would either fault on every mapping
+//! this kernel writes or — before this file owned the bit — run every one of
+//! them as executable, and no test downstream could tell which.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::cpu;
 use crate::log;
+
+/// `IA32_EFER`, SDM Vol. 3A §2.2.1. Address from Vol. 4 Table 2-2.
+mod efer {
+    pub const MSR: u32 = 0xC000_0080;
+    pub const SCE: u64 = 1 << 0;
+    pub const LME: u64 = 1 << 8;
+    /// Set by the CPU when paging turns long mode on, and read-only: a write
+    /// cannot change it, so the check below reads it out of the comparison
+    /// rather than declaring a value for it.
+    pub const LMA: u64 = 1 << 10;
+    pub const NXE: u64 = 1 << 11;
+}
 
 /// `CR0`, SDM Vol. 3A §2.5.
 mod cr0 {
@@ -37,6 +54,7 @@ mod cr4 {
     pub const OSFXSR: u64 = 1 << 9;
     pub const OSXMMEXCPT: u64 = 1 << 10;
     pub const LA57: u64 = 1 << 12;
+    pub const UMIP: u64 = 1 << 11;
     pub const FSGSBASE: u64 = 1 << 16;
     pub const PCIDE: u64 = 1 << 17;
     pub const SMEP: u64 = 1 << 20;
@@ -50,9 +68,10 @@ mod cr4 {
 /// - `EM` (2) clear and `MP` (1) set — the pair that says an x87 instruction
 ///   executes on the FPU rather than raising `#NM` (SDM Vol. 3A §2.5), and that
 ///   `WAIT` respects `TS`.
-/// - `TS` (3) clear — lazy FP switching is ruled out
-///   (`specs/user-machine-state.md` §6.3), so nothing ever sets it and `#NM`
-///   keeps its meaning of "a userland bug".
+/// - `TS` (3) clear — lazy FP switching is ruled out, because deferring the
+///   restore behind `#NM` leaks the previous task's register file across the
+///   deferral boundary. Nothing ever sets it and `#NM` keeps its meaning of
+///   "a userland bug".
 /// - `AM` (18) clear — with it set, `RFLAGS.AC` would make an unaligned Ring 3
 ///   access `#AC`. Nothing in this kernel is ready to be the thing that decides
 ///   a process wanted that.
@@ -83,7 +102,36 @@ const CR4_REQUIRED: u64 = cr4::DE
 
 /// The `CR4` bits this kernel takes when the CPU offers them and does without
 /// when it does not.
-const CR4_OPTIONAL: u64 = cr4::SMEP | cr4::SMAP | cr4::PCIDE;
+///
+/// `UMIP` (bit 11) joined `SMEP`/`SMAP`/`PCIDE` here rather than
+/// [`CR4_REQUIRED`] for the same reason they did: it is silicon's to offer,
+/// not every CPU this kernel targets does, and `declaration` already checks
+/// it against CPUID before setting it. With it set, `SGDT`, `SIDT`, `SLDT`,
+/// `SMSW` and `STR` executed in Ring 3 raise `#GP` instead of handing a
+/// process the GDT, IDT and TSS addresses (SDM Vol. 3A §2.5) — the addresses
+/// a KASLR bypass is built out of, and nothing in this kernel's userland
+/// executes any of the five. Free hardening, taken.
+const CR4_OPTIONAL: u64 = cr4::SMEP | cr4::SMAP | cr4::PCIDE | cr4::UMIP;
+
+/// `IA32_EFER` on every CPU running this kernel.
+///
+/// Three bits, and none of them optional:
+///
+/// - `LME` (8) — long mode, which this CPU is already in. Named rather than
+///   preserved, because the register is written whole and dropping it here is
+///   a `#GP` with paging on (SDM Vol. 3A §4.1.2).
+/// - `NXE` (11) — bit 63 of a paging entry means *not executable* instead of
+///   *reserved*. Every data mapping this kernel writes carries it
+///   (`mm::paging::Prot`), and it was set nowhere until W^X existed.
+/// - `SCE` (0) — `SYSCALL`/`SYSRET`. It used to be a read-modify-write in
+///   `arch::syscall::init`, which is the shape this file exists to delete: two
+///   places decided what one register held, and the second one could not see
+///   the first.
+///
+/// `LMA` (10) is the CPU's and appears nowhere: it is read-only, so a write
+/// with it clear leaves it set and a comparison against it would fail on every
+/// CPU.
+pub const EFER: u64 = efer::SCE | efer::LME | efer::NXE;
 
 /// The declaration as the BSP computed it, for every AP to reproduce and match.
 ///
@@ -121,16 +169,24 @@ pub fn init_cr0(cpu_id: u32) {
     bench::report(cpu_id, before);
 }
 
-/// Put this CPU's `CR4` into the declaration, then check that this CPU holds
-/// both registers the declaration names.
+/// Put this CPU's `CR4` and `EFER` into the declaration, then check that this
+/// CPU holds all three registers the declaration names.
 ///
-/// Later than [`init_cr0`] because `SMEP` and `SMAP` are statements about the
-/// address space: they are set once the CPU is on the kernel's own page tables,
-/// not on the bootloader's.
+/// Later than [`init_cr0`] because `SMEP`, `SMAP` and `NXE` are statements
+/// about the address space: they are set once the CPU is on the kernel's own
+/// page tables, not on the bootloader's. `NXE` in particular reinterprets bit
+/// 63 of every live paging entry, and the tables this kernel writes are the
+/// ones it is a statement about.
+///
+/// Before `arch::syscall::init` on both paths — `percpu::init_bsp` runs it from
+/// `main`, `percpu::init_ap` from `ap_entry`, and each is ahead of that call —
+/// which is what lets `SCE` live in the declaration instead of in a
+/// read-modify-write there.
 pub fn init(cpu_id: u32) {
     let declared = declaration(cpu_id);
     if !skipped(cpu_id) {
         unsafe { cpu::write_cr4(declared) };
+        cpu::wrmsr(efer::MSR, EFER);
         if declared & cr4::SMAP != 0 {
             // SMAP binds only while `RFLAGS.AC` is clear, and `AC` here is
             // whatever was inherited — `INIT` clears it on an AP, firmware
@@ -165,6 +221,26 @@ fn declaration(cpu_id: u32) -> u64 {
     );
     let declared = CR4_REQUIRED | (have & CR4_OPTIONAL);
 
+    // `EFER`'s three bits are checked here for the same reason `CR4`'s are:
+    // setting a bit this CPU does not define is `#GP`, and on the BSP that is a
+    // triple fault before `idt::init` with nothing to read. `SYSCALL` and `NX`
+    // are both `CPUID.80000001H:EDX` (SDM Vol. 2A Table 3-8), and the extended
+    // leaf itself has to be there before its bits mean anything: below
+    // `0x8000_0001` a read of it answers with the highest basic leaf's
+    // registers.
+    let (max_ext, _, _, _) = cpu::cpuid(0x8000_0000, 0);
+    let ext_edx = if max_ext >= 0x8000_0001 { cpu::cpuid(0x8000_0001, 0).3 } else { 0 };
+    assert!(
+        ext_edx & (1 << 11) != 0,
+        "control_regs: cpu{cpu_id} has no SYSCALL/SYSRET, which is this kernel's only \
+         way into and out of Ring 3",
+    );
+    assert!(
+        ext_edx & (1 << 20) != 0,
+        "control_regs: cpu{cpu_id} has no NX bit, so no mapping this kernel writes could \
+         be made non-executable and W^X would silently not exist",
+    );
+
     // Changing `LA57` with paging on is `#GP`, so a wholesale write cannot be
     // the thing that discovers firmware chose 5-level paging under a kernel
     // whose page tables are 4-level.
@@ -198,6 +274,7 @@ fn supported() -> u64 {
     ];
     const CPUID_7_EBX: [(u32, u64); 3] =
         [(0, cr4::FSGSBASE), (7, cr4::SMEP), (20, cr4::SMAP)];
+    const CPUID_7_ECX: [(u32, u64); 1] = [(2, cr4::UMIP)];
 
     let (max_leaf, _, _, _) = cpu::cpuid(0, 0);
     let (_, _, ecx1, edx1) = cpu::cpuid(1, 0);
@@ -206,7 +283,7 @@ fn supported() -> u64 {
     // somebody else's data — and a `CR4` bit the CPU does not define is the
     // triple fault the CPUID gating exists to replace with a named refusal.
     // Zero instead gives `declaration`'s assertion, which names the CPU.
-    let (_, ebx7, _, _) = if max_leaf >= 7 { cpu::cpuid(7, 0) } else { (0, 0, 0, 0) };
+    let (_, ebx7, ecx7, _) = if max_leaf >= 7 { cpu::cpuid(7, 0) } else { (0, 0, 0, 0) };
 
     let mut have = 0;
     for (bit, flag) in CPUID_1_EDX {
@@ -216,6 +293,11 @@ fn supported() -> u64 {
     }
     for (bit, flag) in CPUID_7_EBX {
         if ebx7 & (1 << bit) != 0 {
+            have |= flag;
+        }
+    }
+    for (bit, flag) in CPUID_7_ECX {
+        if ecx7 & (1 << bit) != 0 {
             have |= flag;
         }
     }
@@ -237,15 +319,25 @@ fn supported() -> u64 {
 fn self_check(cpu_id: u32, declared_cr4: u64) {
     let live_cr0 = cpu::read_cr0();
     let live_cr4 = cpu::read_cr4();
+    let live_efer = cpu::rdmsr(efer::MSR);
     log!(
-        "control_regs: cpu{} cr0={:#010x} cr4={:#010x}{}{}{}",
+        "control_regs: cpu{} cr0={:#010x} cr4={:#010x} efer={:#06x}{}{}{}{}{}",
         cpu_id,
         live_cr0,
         live_cr4,
+        live_efer,
         opt(live_cr4, cr4::SMEP, " smep"),
         opt(live_cr4, cr4::SMAP, " smap"),
         opt(live_cr4, cr4::PCIDE, " pcid"),
+        opt(live_cr4, cr4::UMIP, " umip"),
+        opt(live_efer, efer::NXE, " nx"),
     );
+    // **In the order this file declares them**, which is also the order the
+    // line above prints and the order `init_cr0` then `init` applies them. A
+    // CPU that diverges usually diverges in all three at once — `skipped` is
+    // exactly that CPU — and which assertion fires first is then the whole of
+    // what a reader sees, so it may not depend on the order somebody happened
+    // to add a register in.
     assert!(
         live_cr0 == CR0,
         "control_regs: cpu{cpu_id} holds cr0={live_cr0:#010x}, the declaration is {CR0:#010x}",
@@ -254,6 +346,13 @@ fn self_check(cpu_id: u32, declared_cr4: u64) {
         live_cr4 == declared_cr4,
         "control_regs: cpu{cpu_id} holds cr4={live_cr4:#010x}, the declaration is \
          {declared_cr4:#010x}",
+    );
+    // `LMA` out of the comparison and not out of the log: it is the CPU's
+    // answer about itself, and a CPU that has cleared it has left long mode.
+    assert!(
+        live_efer & !efer::LMA == EFER && live_efer & efer::LMA != 0,
+        "control_regs: cpu{cpu_id} holds efer={live_efer:#06x}, the declaration is \
+         {EFER:#06x} plus the CPU's own LMA",
     );
 }
 
@@ -267,7 +366,7 @@ fn opt(value: u64, bit: u64, name: &'static str) -> &'static str {
 /// **The dev host cannot answer this and no test asserts on it.** QEMU's TCG
 /// models no cache, so `CR0.CD` there is a bit with no timing consequence, and
 /// a KVM guest does not hold the bit at all — an AP that never cleared `CD`
-/// reads it clear (`specs/issues/kernel/ap-control-registers-inherit-init.md`).
+/// reads it clear (`issues/kernel/ap-control-registers-inherit-init.md`).
 /// The number is bare metal's, not a VM on
 /// it, and the owner takes it with
 /// `--diag-boot --kernel-param control-regs-bench`, off the panel.

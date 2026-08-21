@@ -26,9 +26,33 @@
 //! - [`msc::bind`] — **the one door**, and the only blocking thing a scheduler
 //!   pass can still reach. A disk plugged in after boot has to be brought up by
 //!   somebody, its bring-up is Bulk-Only Transport, and that is a machine of
-//!   its own that `specs/plans/xhci-port-machine-plan.md` X2c gives one to. Until
-//!   then the claim above holds of everything except a disk arriving after
-//!   boot.
+//!   its own that has not been written yet
+//!   (`issues/hardware/the-bot-scsi-machine-is-still-hand-written-in-the-kernel.md`).
+//!   Until then the claim above holds of everything except a disk arriving
+//!   after boot.
+//!
+//! # Two bounds, and only one of them is this driver's
+//!
+//! [`USB_TIMEOUT_NS`] bounds *one* command or transfer, and it is reached only
+//! by a device that has stopped answering. What a caller actually spends is the
+//! composition above it — `ceil(count / MSC_MAX_BLOCKS)` commands, each of them
+//! issued up to [`msc`]'s `MAX_TRANSPORT_ATTEMPTS` times with a Reset Recovery
+//! between the attempts — and nothing in this driver has an opinion about how
+//! long that may be. [`crate::block::OPERATION`] is that opinion, and it
+//! belongs to the layer that knows one call is one operation.
+//!
+//! **It arrives ambiently and is threaded from there.** Owner ruling 1B: the
+//! deadline is established on the running context above `BlockDevice` and
+//! recovered by [`msc`]'s three operation entry points — `msc_read`,
+//! `msc_write`, `msc_flush` — because the two frames in between cannot carry
+//! it. From those three down it is an ordinary argument, ending at
+//! `XhciController::scsi`, which is the one site that reads it; that is what
+//! leaves `scsi` usable by `msc::bind`'s bring-up, which is not a block-device
+//! operation, has no establishment above it, and passes [`Deadline::never`] by
+//! name. `block::OPERATION`'s doc carries why the refusal is taken between
+//! commands and never inside one.
+//!
+//! [`Deadline::never`]: crate::time::Deadline::never
 
 pub mod boot;
 pub mod msc;
@@ -39,8 +63,9 @@ pub mod msc;
 /// A measurement and not an actuator: nothing here changes what the driver
 /// does. It exists because the depth cannot be read off the call graph — the
 /// backtrace it prints beside it is what says which locks those are, and one of
-/// them is named nowhere in the chain of function names. Every stage of
-/// `specs/completion-architecture-spec.md` is judged on this number falling.
+/// them is named nowhere in the chain of function names. The work in
+/// `issues/kernel/every-wait-in-this-kernel-is-a-spin.md` is judged on this
+/// number falling.
 ///
 /// Deepest-so-far rather than every wait, because a line per transfer on a
 /// machine whose log lives on the transfer's own device is the self-sustaining
@@ -74,6 +99,7 @@ use crate::log;
 use super::{deadline, enqueue_control, log_unrecoverable, Completion, Trb, TrbRing};
 use super::{XhciController, EVENT_TRANSFER, EVENT_CMD_COMPLETE, USB_TIMEOUT_NS};
 use super::{CC_SUCCESS, CC_SHORT_PACKET};
+use toyos_xhci::job::Await;
 use toyos_xhci::recovery::{Act, NeedsConfigure, Recovery};
 
 /// How one control transfer ended.
@@ -319,20 +345,27 @@ impl XhciController {
         }
     }
 
-    /// The completion of the transfer just queued on (`slot`, `dci`), as a
+    /// The completion of the transfer queued at `trb` on (`slot`, `dci`), as a
     /// completion code and the number of bytes the controller did *not* move.
     ///
     /// The event ring is one queue for the whole controller, so anything that
     /// arrives here and is not ours belongs to a bound device delivering a
     /// report — handing it to `dispatch_event` rather than dropping it is what
-    /// keeps that device's interrupt ring fed. Matching on the endpoint as
-    /// well as the slot matters for mass storage, where one slot carries three
-    /// endpoints and a stalled one still completes.
-    fn wait_transfer(&mut self, slot: u8, dci: u8) -> Option<(u32, u32)> {
+    /// keeps that device's interrupt ring fed.
+    ///
+    /// **The TRB and not the endpoint**, which is [`Await::Transfer`]'s own
+    /// argument arriving at the site that motivated it: one slot carries three
+    /// endpoints, a stalled one still completes, and a transfer this driver
+    /// stopped waiting for is still the device's to answer. Matching on
+    /// (slot, dci) alone hands that late answer — and its residue, which is how
+    /// many of the caller's bytes are real — to whatever asked next on the same
+    /// endpoint.
+    fn wait_transfer(&mut self, slot: u8, dci: u8, trb: u64) -> Option<(u32, u32)> {
         #[cfg(feature = "boot-actuators")]
         if crate::actuator::io_depth_probe() {
             depth_probe::report();
         }
+        let on = Await::Transfer { slot, dci, trb };
         let deadline = deadline();
         let port = self.port_of_slot(slot);
         loop {
@@ -355,9 +388,12 @@ impl XhciController {
                 continue;
             };
             let trb_type = (event.control >> 10) & 0x3F;
-            let ev_slot = ((event.control >> 24) & 0xFF) as u8;
-            let ev_dci = ((event.control >> 16) & 0x1F) as u8;
-            if trb_type == EVENT_TRANSFER && ev_slot == slot && ev_dci == dci {
+            let answers = Await::Transfer {
+                slot: ((event.control >> 24) & 0xFF) as u8,
+                dci: ((event.control >> 16) & 0x1F) as u8,
+                trb: event.param & !0xF,
+            };
+            if trb_type == EVENT_TRANSFER && answers == on {
                 return Some(((event.status >> 24) & 0xFF, event.status & 0x00FF_FFFF));
             }
             self.dispatch_event(event);
@@ -366,6 +402,10 @@ impl XhciController {
 
     /// One control transfer on `ring`, which must be the EP0 ring named by
     /// `slot`'s device context.
+    // Nine arguments because a USB setup packet has five fields and those are
+    // what a caller varies; a struct for them would name the wire format a
+    // second time (xHCI 1.2 §6.4.1.2.1).
+    #[allow(clippy::too_many_arguments)]
     fn control_transfer(
         &mut self,
         slot: u8,
@@ -377,14 +417,14 @@ impl XhciController {
         data_buf: Option<u64>,
         data_len: u16,
     ) -> Control {
-        let has_data = enqueue_control(
+        let trbs = enqueue_control(
             ring, bm_request_type, b_request, w_value, w_index, data_buf, data_len,
         );
         self.ring_doorbell(slot, 1);
 
         let mut delivered = 0u16;
-        if has_data {
-            match self.wait_transfer(slot, 1) {
+        if let Some(data) = trbs.data {
+            match self.wait_transfer(slot, 1, data) {
                 Some((CC_SUCCESS | CC_SHORT_PACKET, residue)) => {
                     // A residue past the length asked for is a controller
                     // contradicting itself; believing it would report more bytes
@@ -398,7 +438,7 @@ impl XhciController {
                 None => return Control::Silent { stage: "data" },
             }
         }
-        match self.wait_transfer(slot, 1) {
+        match self.wait_transfer(slot, 1, trbs.status) {
             Some((CC_SUCCESS, _)) => Control::Done { delivered },
             Some((code, _)) => Control::Failed { stage: "status", code },
             None => Control::Silent { stage: "status" },

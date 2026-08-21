@@ -1,13 +1,13 @@
 //! `/bin/logd` — the machine's log, written to a file by a process that can be
 //! killed without taking the kernel with it.
 //!
-//! `specs/log-architecture-spec.md` §5 and §6 are the design. What this program
-//! replaces is `kernel/src/log_file.rs`: a kernel module that appended the log
-//! ring to a FAT volume **from the idle loop**, which is why an idle CPU on this
-//! machine could be found four spinlocks deep inside a USB transfer with a
-//! userland `println!` behind it. The kernel keeps the record ring and the
-//! console; every policy about files — where they go, what they are called, how
-//! many there are, what happens when the stick stops answering — is here.
+//! What this program replaces is the kernel's own file sink,
+//! `kernel/src/log_file.rs`: a kernel module that appended the log ring to a
+//! FAT volume **from the idle loop**, which is why an idle CPU on this machine
+//! could be found four spinlocks deep inside a USB transfer with a userland
+//! `println!` behind it. The kernel keeps the record ring and the console;
+//! every policy about files — where they go, what they are called, how many
+//! there are, what happens when the stick stops answering — is here.
 //!
 //! # Its whole authority
 //!
@@ -15,50 +15,51 @@
 //! manifest row asks for by the name `logread`. With it, it may read every
 //! record every CPU wrote and park on the readiness source when there is
 //! nothing new. It claims no device, opens no compositor connection and can
-//! name no process. Writing files is ambient, which is the endowment spec's
-//! declared residual D6 and not this program's to close.
+//! name no process. Writing files is ambient — a known residual of the
+//! capability endowment, and not this program's to close.
 //!
-//! # What it does not do at L6, and why the port is not here
+//! # What it does not do, and why the port is not here
 //!
-//! §5.2 gives it a `log` port with two frame kinds, and **neither has a caller
-//! on this tree**:
+//! Its design carries a `log` port with two frame kinds, and **neither has a
+//! caller on this tree**:
 //!
 //! - `Register` carries the read ends of a child's stdout and stderr pipes.
-//!   Those pipes are L7's — until then every program's stdio is a console
-//!   object minted at spawn (§4.4), and nothing sends this frame.
+//!   Those pipes do not exist yet — until they do, every program's stdio is a
+//!   console object minted at spawn, and nothing sends this frame.
 //! - `Sync` was the shutdown path asking for durability. It is **struck**: the
 //!   asker is `SYS_SHUTDOWN`, which runs in the *kernel*, and a kernel that
 //!   opens an IPC connection to a userland server to ask it a question is the
 //!   inversion this architecture exists to avoid. `LogCursor::durable` already
 //!   travels the other way on a call this program makes every loop, so the
-//!   kernel reads a word instead — §6.3 and §6.4 are one mechanism now, not two.
+//!   kernel reads a word instead — shutdown and panic are one mechanism now,
+//!   not two.
 //!
-//! So `serves = ["log"]` is not on its manifest row yet. §5.1a's own rule is
-//! the argument, applied to this program instead of to `/bin/console`: *a right
-//! with no caller is a capability handed out for a plan*. The acceptor arrives
-//! in L7 with the first `Register`.
+//! So `serves = ["log"]` is not on its manifest row yet, by the same rule that
+//! keeps `logread` off `/bin/console`'s: *a right with no caller is a
+//! capability handed out for a plan*. The acceptor arrives with the first
+//! `Register`.
 //!
 //! # Durability, which is a contract and not a hope
 //!
 //! Every batch is written, `fsync`ed and only then published: `LogTail::
 //! publish_durable` carries the `at_ns` of the newest record now **on the
 //! device**, the kernel clamps it and keeps the maximum in `LOG_DURABLE_NS`,
-//! and a panicking kernel waits on that word for its own report to land
-//! (§6.4). Publishing before the sync would make the word a lie in exactly the
-//! case it exists for, so the order here is load-bearing: write, sync, publish,
-//! never two of the three.
+//! and a panicking kernel waits on that word for its own report to land.
+//! Publishing before the sync would make the word a lie in exactly the case it
+//! exists for, so the order here is load-bearing: write, sync, publish, never
+//! two of the three.
 //!
-//! `SYS_FSYNC` reaches the device's own cache flush since L6 (§12.4) — before
-//! that it stopped at the page cache, and this program calling the result
-//! durable would have been a spec lying about its own guarantee.
+//! `SYS_FSYNC` reaches the device's own cache flush — before it did, it stopped
+//! at the page cache, and this program calling the result durable would have
+//! been a claim of durability that was not one.
 //!
 //! # The console is the kernel's and stays the kernel's
 //!
 //! This program does **not** write kernel records to the console. `klogd` does,
 //! at the commit, and a second copy from here would double every line on the
 //! wire. What it writes to its own console is what only it knows: where the log
-//! is going, and when it has stopped going there. §4.1's split, taken
-//! literally.
+//! is going, and when it has stopped going there — the kernel keeping the
+//! console and giving up the filesystem, taken literally.
 
 mod store;
 mod wall;
@@ -67,7 +68,7 @@ use std::time::{Duration, Instant};
 
 use toyos::endow::{Endowments, SYSCAP_LABEL};
 use toyos::log::{LogTail, Record};
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::syscap::SysCap;
 use toyos_wallclock::Civil;
 
@@ -86,12 +87,23 @@ const BATCH: usize = 64;
 /// volume dead (§5.4).
 ///
 /// **A policy number, and it says so**: nothing about the device supplies one.
-/// The transport already bounds a single transfer — `USB_TIMEOUT_NS` is 2 s in
-/// `kernel/src/drivers/xhci`, which is what turns a stick that stopped
-/// answering into an `Err` here rather than an unbounded park. Five seconds:
-/// long enough that a slow stick under a boot's worth of other I/O is not
-/// called dead, short enough that a person watching the console learns about it
-/// while they are still watching.
+/// Five seconds: long enough that a slow stick under a boot's worth of other
+/// I/O is not called dead, short enough that a person watching the console
+/// learns about it while they are still watching.
+///
+/// **It is measured around a syscall, so it is reachable only if the syscall
+/// returns** — every bound below it is what decides whether this policy runs at
+/// all. There are two of them and they answer different failures. The transport
+/// bounds one device round trip (`USB_TIMEOUT_NS`, 2 s in
+/// `kernel/src/drivers/xhci`), which is what turns a stick that *stopped
+/// answering* into an `Err` here rather than an unbounded wait; that bound is
+/// never reached by a device that answers, so on its own it says nothing about
+/// how long a call may take. `kernel/src/block.rs`'s `OPERATION` is the other,
+/// 2 s over one whole block-device operation — the batching, the retries and
+/// the recoveries a single `read_blocks` composes — and it is what bounds a
+/// device that answers every transfer and takes too long over the work. Two
+/// plus one command's overshoot is what leaves this constant a second to notice
+/// with.
 ///
 /// **What it bounds is slowness and not errors, and that split is measured
 /// rather than chosen.** §5.4 called it "a policy over repeated errors and a
@@ -182,9 +194,9 @@ fn main() {
     // the readiness is an edge, so the window is closed by reading once more
     // after arming rather than by asking the kernel a question about a cursor
     // it does not hold. `min_complete` 0 with no timeout submits the entry and
-    // returns — one `wait` per `poll_add`, which is what the ring's own
+    // returns — one `wait` per `watch`, which is what the ring's own
     // capacity accounting requires.
-    poller.poll_add(&cap, IORING_POLL_IN, LOG_TOKEN);
+    poller.watch(&cap, READABLE, LOG_TOKEN);
     poller.wait(0, 0, |_| {});
 
     let mut lost = 0u64;
@@ -214,7 +226,7 @@ fn main() {
             // **Nothing new, so park on the readiness source rather than spin.**
             // `SYS_LOG_READ` never blocks by design; this is the other half of
             // that design.
-            poller.poll_add(&cap, IORING_POLL_IN, LOG_TOKEN);
+            poller.watch(&cap, READABLE, LOG_TOKEN);
             poller.wait(1, IDLE_NANOS, |_| {});
             continue;
         }

@@ -5,7 +5,8 @@ use toyos_abi::log::MAX_RECORD_MESSAGE;
 use toyos_elf::section::{SectionTable, SHT_SYMTAB};
 use toyos_elf::sym::SymTab;
 
-use crate::log::elide::{self, Elided};
+use toyos_elide::{widest, Elided, MARKER_MAX};
+
 use crate::process::PageAlloc;
 
 /// A backtrace frame's own text: `    ` + `{addr:#x}` + `  ` + `+` +
@@ -32,21 +33,20 @@ const SYMBOL_BUDGET: usize = MAX_RECORD_MESSAGE - FRAME_OVERHEAD;
 /// name in it names nothing either way: the head is the crate and the module
 /// path, the tail is the function, and `screen_late_panic` asserts on the tail
 /// for that reason.
-const SYMBOL_KEPT: usize = SYMBOL_BUDGET - elide::MARKER_MAX;
+const SYMBOL_KEPT: usize = SYMBOL_BUDGET - MARKER_MAX;
 const SYMBOL_HEAD: usize = SYMBOL_KEPT / 2;
 const SYMBOL_TAIL: usize = SYMBOL_KEPT - SYMBOL_HEAD;
 
 /// The whole of the claim, in one place a compiler checks: a frame line fits a
 /// record whatever the symbol was.
-const _: () =
-    assert!(elide::widest(SYMBOL_HEAD, SYMBOL_TAIL) + FRAME_TEXT <= MAX_RECORD_MESSAGE);
+const _: () = assert!(widest(SYMBOL_HEAD, SYMBOL_TAIL) + FRAME_TEXT <= MAX_RECORD_MESSAGE);
 
 /// And the three numbers the prose around here states, pinned so it cannot
 /// drift from them again — which it did the first time `FRAME_OVERHEAD` moved.
 const _: () = assert!(SYMBOL_BUDGET == 944 && SYMBOL_HEAD == 451 && SYMBOL_TAIL == 452);
 
 /// A demangled symbol, rendered head-and-tail when it is wider than a record
-/// can carry. `kernel/src/log/elide.rs` is the mechanism and the argument.
+/// can carry. `toyos-elide` is the mechanism and the argument.
 ///
 /// **Nothing in the guest suite reaches this at the shipped bound, and saying
 /// so is the point of this comment.** `screen_late_panic`'s
@@ -54,8 +54,8 @@ const _: () = assert!(SYMBOL_BUDGET == 944 && SYMBOL_HEAD == 451 && SYMBOL_TAIL 
 /// that gate proves the panel keeps a symbol's tail and proves nothing about
 /// the elision — the tree's own widest symbol is under a third of what
 /// triggers it.
-/// `kernel-elide` is where the seams are checked, on the host, against
-/// characters that straddle both of them.
+/// `toyos-elide`'s own tests are where the seams are checked, on the host,
+/// against characters that straddle both of them.
 fn symbol_text<D>(name: D) -> Elided<D, SYMBOL_HEAD, SYMBOL_TAIL> {
     Elided(name)
 }
@@ -140,6 +140,10 @@ impl SymbolTable {
     /// Laid out by one caller, [`crate::loader::symbols::read_backtrace_table`],
     /// which is also what read them — so the two halves cannot be given
     /// separately and cannot disagree about where the second one starts.
+    // Eight arguments, and the paragraph above is why: four are the two address
+    // ranges a backtrace is checked against, and every one arrives from the one
+    // caller that already holds it.
+    #[allow(clippy::too_many_arguments)]
     pub fn from_pages(
         pages: PageAlloc,
         symtab_len: usize,

@@ -1,8 +1,9 @@
 //! The verbs that turn a chosen path into a path that makes sound.
 //!
-//! `specs/plans/hda-driver-plan.md` §2.3 step 6, as one pure function: power, the
-//! connection selects, pin control, EAPD, the amplifiers, the format and the
-//! stream tag. The driver sends what comes back and decides nothing on the way.
+//! The whole configuration step as one pure function, in the order it has to be
+//! sent: power, the connection selects, pin control, EAPD, the amplifiers, the
+//! format and the stream tag. The driver sends what comes back and decides
+//! nothing on the way.
 //!
 //! Boundary contract: every payload layout below is the Intel High Definition
 //! Audio specification's. They are here rather than in the driver because a

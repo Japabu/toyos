@@ -2,8 +2,8 @@
 //! that named it.
 //!
 //! **The defect this is aimed at was cancellation by source.**
-//! `object::ops::close` handed `io_uring::remove_fd` whatever sources the
-//! closing object named, and `remove_fd` walks the source's watcher list across
+//! `object::ops::close` handed `io_uring::cancel_by_source` whatever sources the
+//! closing object named, and `cancel_by_source` walks the source's watcher list across
 //! every ring in the machine — which is right for a pipe, whose other end really
 //! has gone, and wrong for the log, which outlives every handle that can name
 //! it. Every `SysCap` maps to `Source::Log`, so any process closing any
@@ -14,7 +14,7 @@
 //! The two processes in the real failure need not know about each other at all,
 //! which is why this runs with one: a duplicate of this program's own capability
 //! is a second handle to the same object, and closing it is exactly the event
-//! `remove_fd` acted on. What it proves is that the *handle* is not what the
+//! `cancel_by_source` acted on. What it proves is that the *handle* is not what the
 //! source's lifetime is tied to.
 //!
 //! It runs inside `test-runner` for `log-gate`'s reason — a `SysCap` dup is not
@@ -24,7 +24,7 @@
 use std::process::Command;
 
 use toyos::log::{LogTail, Record};
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::syscap::SysCap;
 
 /// The poll's token. One handle is watched, so one number.
@@ -80,9 +80,9 @@ fn probe(cap: &SysCap) -> Result<(), String> {
         drain(cap, &mut tail, &mut buf)?;
 
         let poller = Poller::new(2);
-        poller.poll_add(cap, IORING_POLL_IN, TOKEN);
+        poller.watch(cap, READABLE, TOKEN);
         // **Submitted before the close, and this is the whole of what the gate
-        // has to get right.** `poll_add` only queues a submission entry;
+        // has to get right.** `watch` only queues a submission entry;
         // `wait` is what enters the kernel. A round that closed the sibling
         // handle first would stage nothing at all — the ring is not a watcher
         // of the log yet, so there is nothing for a cancellation to reach, and

@@ -41,7 +41,7 @@ pub fn lock() -> VfsGuard {
 /// stopped: `open_file` and `read_link` returned `Option`, `file_mtime` a bare
 /// `u64` and `delete` a `bool`, and every one of those read a device that would
 /// not answer as *no such file*. That is not a degradation a caller can act on
-/// — `fd::open` created an empty file over one that exists, because `CREATE`
+/// — `ops::open` created an empty file over one that exists, because `CREATE`
 /// acted on the same `None` a refused transfer produced.
 ///
 /// [`SyscallError`] and not a filesystem error type of its own, because there
@@ -70,7 +70,7 @@ pub trait FileSystem: Send {
     /// `bcachefs::Mounted::list` has no count primitive and `btree::collect_all`
     /// under it builds the whole entry set first. Their check is on the result,
     /// so it makes the refusal uniform without making the allocation bounded —
-    /// see `specs/issues/isolation/untrusted-input-panics.md`.
+    /// see `issues/isolation/untrusted-input-panics.md`.
     fn list(&mut self, limit: usize) -> Result<Vec<(String, u64)>, SyscallError>;
 
     /// When `name` was last written, in whatever epoch the mount keeps.
@@ -120,7 +120,8 @@ pub trait FileSystem: Send {
     /// sync produce the pending bytes that ask for the next one.
     fn sync(&mut self) -> Result<(), SyscallError>;
 
-    /// Open a file backing for demand-paged ELF loading (separate from fd I/O).
+    /// Open a file backing for demand-paged ELF loading (separate from handle
+    /// I/O).
     ///
     /// No default body. One answering "nothing here" would be the sentinel this
     /// trait exists to have removed, wearing a mount's own signature: a
@@ -286,7 +287,7 @@ impl Vfs {
     /// gate.
     pub fn user_may_modify(&self, path: &str) -> bool {
         let (mount, _) = self.resolve_path("/", path);
-        self.mounts.get(&mount).map_or(true, |m| m.access == UserAccess::ReadWrite)
+        self.mounts.get(&mount).is_none_or(|m| m.access == UserAccess::ReadWrite)
     }
 
     fn resolve_fs(&mut self, mount: &str, file: &str) -> Option<(&mut dyn FileSystem, String)> {
@@ -467,11 +468,11 @@ impl Vfs {
         Ok(result)
     }
 
-    /// Open a file for fd-based I/O.
+    /// Open a file for handle-based I/O.
     ///
     /// The backing the filesystem hands back is registered with the file
-    /// cache rather than returned: it belongs to the file, not to the fd that
-    /// happened to open it, and eviction is only sound for pages the cache
+    /// cache rather than returned: it belongs to the file, not to the handle
+    /// that happened to open it, and eviction is only sound for pages the cache
     /// itself knows how to fetch again.
     pub fn open_file(&mut self, path: &str) -> Result<FileId, SyscallError> {
         let (file_id, backing) = self.open_file_depth(path, 0)?;
@@ -512,9 +513,9 @@ impl Vfs {
     ///
     /// No early return on an empty dirty set. A `ftruncate` changes the file's
     /// size without dirtying a page, so returning here left the new size in the
-    /// file cache and never told the filesystem — correct until the last fd
+    /// file cache and never told the filesystem — correct until the last handle
     /// closed and the cached size went with it. Callers reach this only when
-    /// the fd is marked modified, so there is always something to record.
+    /// the handle is marked modified, so there is always something to record.
     pub fn flush_file(&mut self, path: &str, file_id: FileId, mtime: u64) -> Result<(), SyscallError> {
         let dirty = crate::file_cache::clone_dirty(file_id);
 
@@ -684,9 +685,9 @@ impl Vfs {
 
     /// Is there a filesystem mounted under this name?
     ///
-    /// The one thing the kernel still knows about `/log` after L6 of
-    /// `specs/log-architecture-spec.md`: it mounts the volume and hands it to
-    /// userland, and `/bin/logd` is what knows whether a file was opened on it.
+    /// The one thing the kernel still knows about `/log`: it mounts the volume
+    /// and hands it to userland, and `/bin/logd` is what knows whether a file
+    /// was opened on it.
     /// `report_log_destination` is the caller and the panel is why it exists —
     /// logd's own line reaches a console and never the screen.
     pub fn has_mount(&self, name: &str) -> bool {
@@ -700,7 +701,7 @@ impl Vfs {
     /// write cache, and [`Vfs::sync_mount`] is what does — `Fat32::sync` writes
     /// FSInfo and then calls `dev.flush()`, which is SCSI SYNCHRONIZE CACHE on a
     /// stick. Until L6 the only caller of that second step was `log_file.rs`,
-    /// from the idle loop, and `fd::fsync` stopped one level short of it.
+    /// from the idle loop, and `ops::fsync` stopped one level short of it.
     /// `/bin/logd` now publishes `LOG_DURABLE_NS` off the result of an ordinary
     /// `fsync`, and a panicking kernel waits on that word — so a syscall that
     /// stopped at the page cache would make the word a claim about nothing
@@ -742,7 +743,7 @@ impl Vfs {
     }
 
     /// Open a file backing for demand-paged ELF loading.
-    /// This is separate from fd-based I/O and doesn't use the file cache.
+    /// This is separate from handle-based I/O and doesn't use the file cache.
     pub fn open_backing(&mut self, path: &str) -> Result<alloc::sync::Arc<dyn crate::file_backing::FileBacking>, SyscallError> {
         self.open_backing_depth(path, 0)
     }

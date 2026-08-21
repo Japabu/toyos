@@ -1,7 +1,7 @@
 //! The kernel's console sink, the two drain modes, and `klogd`.
 //!
 //! One thread where every idle CPU used to drain, and that is a reduction this
-//! design accepts and names (`specs/log-architecture-spec.md` §4.3). Three
+//! design accepts and names. Three
 //! things bound it: boot does not need a thread at all, the panic and shutdown
 //! paths drain inline and never depend on `klogd` being schedulable, and
 //! **`klogd`'s own death is not survivable quietly** — its row in
@@ -25,14 +25,15 @@ use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use alloc::sync::Arc;
 
 use toyos_abi::log::LogRecord;
-use toyos_sched::task::{WakeCause, WakeReason};
+use toyos_sched::task::{WaitClass, WakeCause, WakeReason};
 use toyos_sched::waitq::wake_direct;
 
 use crate::drivers::serial::{self, BackendGuard};
 use crate::hw::HW;
 use crate::sched::driver::{cpus, irq_off};
 use crate::sched::kthread::{self, OnPanic};
-use crate::sched::payload::KShared;
+use crate::completion;
+use crate::sched::payload::{KShared, TaskHandle};
 use crate::scheduler;
 
 use super::read::{drain_ordered, Published, RecordSink};
@@ -58,6 +59,16 @@ const NAME: &str = "klogd";
 /// There is no second flag to disagree with this one about which mode the
 /// machine is in.
 static KLOGD: AtomicPtr<Arc<KShared>> = AtomicPtr::new(core::ptr::null_mut());
+
+/// `klogd`'s inbox, published by `klogd` itself before its first park.
+///
+/// Separate from [`KLOGD`] because the two are read by the same producer at the
+/// same instant and are written by different threads at different ones: the
+/// spawner publishes the rendezvous word, and the thread publishes its own
+/// handle once it is running. A null here is a producer that has nothing to
+/// record — which is exactly the window between the spawn and `klogd`'s first
+/// loop, where `Drain::Thread` is already set and the claim alone is the wake.
+static KLOGD_INBOX: AtomicPtr<Arc<TaskHandle>> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Who puts a committed record on the wire.
 ///
@@ -123,6 +134,30 @@ pub fn post_wake() {
     // SAFETY: written once from a leaked `Box`, never cleared, so the pointer
     // is live for the rest of the machine's life.
     let shared = unsafe { &*ptr };
+    // **The record first, then the claim** — invariant W, in the one shape
+    // that may take no lock. `emit` runs inside `sync.rs`, inside IRQ handlers,
+    // inside the scheduler and inside every syscall's locked region, so the
+    // ordinary `completion::post` — which walks a watch list under the
+    // subject's leaf lock — is not available here.
+    //
+    // **`signal` and not `post`, because there is no one-poster argument to be
+    // had on this path.** The struck version reasoned from the swap in
+    // `shard::signal_after_commit`: "it admits exactly one poster per park, so
+    // this inbox has one producer and needs no mutual exclusion of its own".
+    // Per *park* is not per *post*. `klogd`'s loop re-arms the waiter flag and
+    // goes round without parking whenever `arm_waiter` finds work, so a second
+    // producer can win a fresh epoch's swap while the first is still inside
+    // `Inbox::post` — two CPUs writing one `UnsafeCell<Record>`, which is
+    // undefined behaviour and not a lost record. `Inbox::signal` is one atomic
+    // store and has no such precondition; what it gives up is the record's
+    // content, which this subject is edge-classed and never had to say.
+    let inbox = KLOGD_INBOX.load(Ordering::Acquire);
+    if !inbox.is_null() {
+        // SAFETY: as above — leaked once by `klogd` itself before its first
+        // park, never cleared.
+        let handle = unsafe { &*inbox };
+        handle.inbox().signal();
+    }
     irq_off(|guard| {
         wake_direct(shared, WakeCause::new(WakeReason::Woken), cpus(), &HW, guard);
     });
@@ -197,7 +232,7 @@ pub fn drain_locked(guard: &mut BackendGuard) {
 /// `klogd` never wakes, so it never reaches `user::post_readiness`, so **the one
 /// machine shape this whole design exists for posts no log readiness at all**
 /// and `/bin/logd` parks for ever with `/log` unwritten
-/// (`specs/issues/diagnostics/a-console-less-machine-posts-no-log-readiness.md`).
+/// (`issues/diagnostics/a-console-less-machine-posts-no-log-readiness.md`).
 ///
 /// Advancing costs nothing that machine had: the records stay in their shards
 /// for the panel, which reads them through `snapshot_committed` and not through
@@ -342,7 +377,7 @@ impl<F: FnMut(&[u8])> core::fmt::Write for Line<F> {
             // `LogRecord::tagged(&str)` beside `Display` would be tidier and is
             // a *sysroot* change: §11 lands the ABI alone and it has already
             // landed, so this branch composes instead of reopening it.
-            // `specs/issues/diagnostics/a-console-tag-is-composed-by-replacing-a-bracket.md`.
+            // `issues/diagnostics/a-console-tag-is-composed-by-replacing-a-bracket.md`.
             //
             // If that leading bracket ever goes, the fragment passes through
             // whole: a visible `[kernel [0.1 …` beats a line silently missing
@@ -361,8 +396,10 @@ impl<F: FnMut(&[u8])> core::fmt::Write for Line<F> {
 ///
 /// **Public because `/log`'s sink renders the same line**, and a second
 /// implementation of it there would be a second thing to keep agreeing with the
-/// panel. It goes when `logd` does the rendering (L6), which is also when the
-/// wall-clock prefix stops being this one.
+/// panel. An earlier note here predicted it would go when `logd` took over the
+/// rendering; it did not, because `logd` renders the same record through the
+/// same `Display` and writes a *wall-clock* prefix in front of it. One
+/// implementation of everything that varies, two prefixes over it.
 pub fn write_line(record: &LogRecord, emit: impl FnMut(&[u8])) {
     use core::fmt::Write;
     let mut line = Line::new(emit);
@@ -423,6 +460,15 @@ extern "C" fn body(_arg: u64) -> ! {
         panic!("klogd-panic: the console drainer died");
     }
 
+    let parkable = scheduler::Parkable::at_entry();
+    let handle = crate::sched::driver::current_handle().expect("klogd runs as a task");
+    // The producer signals here, without a lock and without a watch list —
+    // `post_wake` says why it may not write a record instead.
+    KLOGD_INBOX.store(
+        alloc::boxed::Box::leak(alloc::boxed::Box::new(handle.clone())) as *const Arc<TaskHandle>
+            as *mut _,
+        Ordering::Release,
+    );
     loop {
         // One bounded chunk per backend acquisition, exactly as
         // `drain_chunk_to_serial` was, so an interrupts-off window is never
@@ -437,23 +483,34 @@ extern "C" fn body(_arg: u64) -> ! {
 
         // **The one context in the machine that has just observed committed
         // records and may take a lock**, which is why the readiness post is
-        // here and not in `emit` (`specs/log-architecture-spec.md` §3.2). One
-        // post per batch rather than one per record, and none at all while
-        // nothing is watching.
+        // here and not in `emit`: each per-source watcher list is a
+        // `Lock<Vec<_>>` the post clones under the lock, and taking a lock is
+        // the one thing `emit` may not do. One post per batch rather than one
+        // per record, and none at all while nothing is watching.
         //
         // It is outside `drain_inline` deliberately: that function's other two
         // callers are a producer mid-`emit` and a panicking machine, and
-        // neither may touch `IO_URINGS`.
+        // neither may touch `INBOXES`.
         super::user::post_readiness();
 
-        // **Register, then arm, then park — in that order, and the order is the
-        // lost wake's other half.** `prepare_wait` moves the word to
-        // `Committing`, so a producer that wins the swap from here on takes
-        // `Claim::PrePark` and this thread's own commit refuses to park. Arming
-        // first would leave a window where the producer claims a still-`Running`
-        // `klogd`, takes `Claim::Lost`, drops the wake, and `klogd` parks on a
-        // committed record.
-        let ticket = scheduler::prepare_wait(scheduler::park_lot());
+        // **The registration no longer has to come first, and the record is
+        // why.** It used to: `prepare_wait` moved the word to `Committing`
+        // before the arm, so a producer that won the swap took
+        // `Claim::PrePark` and this thread's own commit refused to park —
+        // arming first left a window where the producer claimed a
+        // still-`Running` `klogd`, took `Claim::Lost` and *dropped* the wake.
+        // A completion post cannot drop one: it stores the record before it
+        // claims, so a claim that finds nobody leaves a record `wait`'s own
+        // recheck finds. That is the log branch's §2.6a fallback converted,
+        // and it is what makes the order below a choice rather than a proof
+        // obligation.
+        let Some(armed) = completion::arm(
+            completion::Subject::of(handle.watch()),
+            completion::Token::new(0),
+            WaitClass::Other,
+        ) else {
+            continue;
+        };
         // **A machine with no console arms exactly like one that has a
         // console, and it did not until 2026-08-15.** It parked unarmed then,
         // on the reasoning that an armed waiter with a standing position would
@@ -463,14 +520,16 @@ extern "C" fn body(_arg: u64) -> ! {
         // it never reached `post_readiness`, so on the one machine shape this
         // design exists for a userland reader was never told records had moved.
         if shard::arm_waiter(shard::log_waiter(), || DRAINED.any_pending()) {
-            ticket.cancel();
             continue;
         }
         // No deadline. A spurious wake is legal and costs one re-drain; a
         // missing one is what W3's two fences exist to make impossible, and a
         // timeout here would hide exactly that.
         PARKS.fetch_add(1, Ordering::Relaxed);
-        scheduler::block_on(ticket, 0);
+        // `klogd` is never killed — its row in the panic predicate is
+        // deliberately not recoverable — so the cancel arm is unreachable and
+        // says so rather than being handled.
+        let _ = completion::wait(&parkable, &armed, crate::time::Deadline::never());
     }
 }
 

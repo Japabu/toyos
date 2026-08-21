@@ -5,6 +5,9 @@
 //! its decisions, so a failure is a *value* — a list of integers — that can be
 //! replayed, shrunk and committed as a regression.
 
+use toyos_sched::cpu::PassCostReport;
+use toyos_sched::hw::CpuId;
+
 use crate::choice::ChoiceStream;
 use crate::invariants;
 use crate::vm::{build_queues, Step, Vm};
@@ -50,6 +53,12 @@ pub struct Outcome {
     /// clock is a backstop or a coin flip.
     pub retire_latency: u64,
     pub retire_bound: u64,
+    /// The longest one CPU's unwind gate held every other CPU still — see
+    /// [`crate::vm::Vm::unwind_gate_ns`]. Reported rather than only asserted,
+    /// because it is a statement about the *model's* fidelity and not about the
+    /// scheduler: a gate wider than one chunk means the explorer was not free
+    /// to interleave over the teardown window I14 is measured across.
+    pub unwind_gate_ns: u64,
     /// Invariant I5's measurement: the widest service spread seen over one
     /// contention window, and the bound in force when it was seen. A number
     /// rather than a verdict, because spec §11 Stage 9 compares a per-CPU
@@ -73,6 +82,16 @@ pub struct Outcome {
     /// a separate question from its verdict and one a change to the pick or the
     /// balance can silently shrink; see [`crate::vm::Vm::thread_covered_ns`].
     pub thread_covered_ns: u64,
+    /// What each CPU's passes cost, as the core's `feature = "check"` recorder
+    /// measured them — the on-target instrument, driven here by the scenario's
+    /// modelled `pass_cost_ns`.
+    ///
+    /// Reported rather than judged, and for the same reason the kernel does not
+    /// judge it either: a pass's elapsed time composes the scheduler's own work
+    /// with whatever the world underneath it did. What the simulator can say is
+    /// that the recorder counts what it is given, which is
+    /// [`crate::scenarios::overlong_pass`]'s whole job.
+    pub pass_costs: Vec<PassCostReport>,
 }
 
 impl Outcome {
@@ -204,6 +223,7 @@ fn outcome_of(scenario: &'static str, vm: &Vm<'_>, choices: &ChoiceStream) -> Ou
         killed_at_park: vm.killed_at_park,
         retire_latency: vm.retire_latency,
         retire_bound: vm.retire_bound,
+        unwind_gate_ns: vm.unwind_gate_ns,
         fair_spread: vm.fair_spread,
         fair_bound: vm.fair_bound,
         fair_over_bound: vm.fair_over_bound,
@@ -212,6 +232,12 @@ fn outcome_of(scenario: &'static str, vm: &Vm<'_>, choices: &ChoiceStream) -> Ou
         thread_bound: vm.thread_bound,
         thread_over_bound: vm.thread_over_bound,
         thread_covered_ns: vm.thread_covered_ns,
+        pass_costs: (0..vm.handles.len())
+            .map(|cpu| {
+                let cpu = CpuId(cpu as u32);
+                vm.handles.get(cpu).pass_costs().report(cpu)
+            })
+            .collect(),
     }
 }
 

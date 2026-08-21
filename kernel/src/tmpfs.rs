@@ -125,7 +125,7 @@ impl FileSystem for TmpFs {
     }
 
     fn update_metadata(&mut self, file_id: FileId, _size: u64, mtime: u64) -> Result<(), SyscallError> {
-        for (_, (fid, mt)) in self.files.iter_mut() {
+        for (fid, mt) in self.files.values_mut() {
             if *fid == file_id {
                 *mt = mtime;
                 return Ok(());

@@ -3,9 +3,8 @@
 //!
 //! Landing used to be `--land`: an integration lock on this host, `git merge
 //! --no-ff main`, the whole suite as a gate, `git -C <primary> merge --ff-only`.
-//! The gate ran on the dev host, which is arm64 cross-arch TCG, and
-//! `specs/assessments/ci-plan-assessment-2026-08.md` §7 is the class of
-//! defect that machine cannot execute at
+//! The gate ran on the dev host, which is arm64 cross-arch TCG, and there is a
+//! class of defect that machine cannot execute at
 //! all — 64 boots of 64 lost on an AMD host while every run here stayed green.
 //! So the gate moved to twelve KVM shards on x86_64 and the merge moved with it.
 //!
@@ -17,8 +16,7 @@
 //! /repos/Japabu/toyos/rulesets` with a `merge_queue` rule answers `Validation
 //! Failed: Invalid rule 'merge_queue'`, and `repository.mergeQueue` is `null`
 //! over GraphQL, while the `MERGE_QUEUE` rule type is in the schema. Same cause
-//! as `specs/assessments/ci-plan-assessment-2026-08.md` §9.4's larger
-//! runners: `Japabu/toyos` is owned by a
+//! as the larger runners being unavailable: `Japabu/toyos` is owned by a
 //! User account.
 //!
 //! The substitute is a **strict** required status check — "require branches to
@@ -83,7 +81,7 @@ pub fn dispatch_retired_land() {
         "[land] `--land` is retired. `main` moves through pull requests and CI now, and this \
          command moved main on this host from a gate that ran on it.\n\
          [land] The dev host is arm64 cross-arch TCG and cannot execute the class of defect \
-         specs/assessments/ci-plan-assessment-2026-08.md §7 records, so the gate is twelve KVM \
+         that lost 64 boots of 64 on an AMD KVM host, so the gate is twelve KVM \
          shards on x86_64 instead.\n\
          [land]\n\
          [land]   cargo run -- --pr      merge origin/main into this branch, push it, and print \
@@ -157,8 +155,7 @@ fn prepare(root: &Path) -> Result<String, String> {
 /// **The first push is where the draft belongs, and a branch's first `--pr` is
 /// the only moment anyone is reading this.**
 ///
-/// Nothing runs CI on a branch push — deliberately,
-/// `specs/assessments/ci-plan-assessment-2026-08.md` §5, since
+/// Nothing runs CI on a branch push — deliberately, since
 /// a push and the pull request on it were two runs of the same twelve shards. So
 /// a branch without a pull request is a branch nothing has ever gated, and that
 /// is not a corner case: eleven agents took `wt/toyos-endow` to completion with
@@ -365,6 +362,13 @@ fn merge_base_into_branch(root: &Path, branch: &str) -> Result<String, String> {
 /// Merges are skipped: a branch's own update merges touch nothing of their own,
 /// and counting them as unrelated work would refuse a branch whose only commit
 /// is the ABI change.
+///
+/// **This reads history, not the tree — so the split is decided at the first
+/// commit, not fixed later.** A branch that will touch `toyos-abi/src`,
+/// `toyos/src` or `userland/libc/src` puts that change in its first commit or
+/// on its own branch from the start; a later revert leaves the commit in
+/// history and the only remedy is rebuilding the branch. Cost one full rebuild
+/// on 2026-08-19 (`issues/build/abi-split-reads-commits-not-the-tree.md`).
 pub fn abi_lands_alone(root: &Path, base: &str) -> Result<(), String> {
     let commits = branch_commits(root, base)?;
     if commits.iter().any(|c| c.declares_inseparable) {

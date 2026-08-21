@@ -1,0 +1,359 @@
+name: portability
+
+# The dependency doctrine's own premise, run rather than argued: root
+# CLAUDE.md's "only Rust and QEMU" is a claim about what a fresh machine of
+# any OS needs. Nothing checked that on any OS but this project's own dev
+# hosts until this file — issues/build/the-portability-premise-has-no-
+# instrument.md is the defect this answers, and it stays open after this PR:
+# the third step that issue originally sketched (`cargo test` where
+# virtualization allows, a TCG run where it does not) is still future work,
+# deliberately not here — wiring it in would put this file on
+# `src/ci.rs`'s `GATES` list, which the linux and macos jobs below correctly
+# stay off, since neither ever calls `qemu::launch`.
+#
+# Three jobs. Linux proves as much of the premise as the tree currently
+# allows: `cargo run -- --build-only` from nothing but `rustup` and the
+# declared QEMU, inside the same minimal `debian:sid` container `ci.yml`'s
+# guest shards already run in — not a stock GitHub-hosted image, which is
+# itself heavily provisioned enough to quietly cover a gap in the declared
+# package list. macOS asks the same question on `macos-latest`, which
+# `host-tests.yml` already proves reachable on this plan; QEMU there comes
+# from Homebrew, pinned to `.github/qemu-version` where Homebrew can honor a
+# pin at all (the macos job's own comment has what that turned up). Windows
+# cannot get past `cargo build -p toyos-build` yet
+# (issues/build/the-build-system-does-not-compile-on-windows.md) — that job's
+# whole purpose is to turn the known hole into a standing, nightly
+# measurement instead of a claim sitting in a file nobody reruns.
+#
+# Nightly and dispatch only, never the PR gate: the from-scratch jobs here
+# cost roughly an hour of runner time each with no cache, and a portability
+# regression does not need to block tonight's merge — it needs to be seen.
+# `landing.yml`'s `gate-stage` does not name any job here.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Clear of ci.yml (03:00), host-tests.yml (03:05) and gate-a.yml (03:10).
+    - cron: '15 3 * * *'
+
+# `cancel-in-progress: false`, `toolchain.yml`'s own reason: an hour of
+# from-scratch bootstrap thrown away by a second trigger starts from nothing.
+concurrency:
+  group: portability-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # What this proves today: inside the same minimal `debian:sid` container
+  # `ci.yml`'s guest shards run in — not a GitHub-hosted image — installing
+  # nothing but a C compiler (`cc`, the declared standing exception — `rustc`
+  # links every host binary through it), Python (`rust/x`'s own bootstrap
+  # dependency for a clean clone — `src/main.rs`'s `ALSO_USED` names it; the
+  # previous `ubuntu-latest` version of this job never had to declare it
+  # because that image ships one already, which is exactly the kind of gap
+  # this move exists to close), git (for `actions/checkout` and for
+  # `rust/x`'s own history walk), curl and its CA bundle (to fetch `rustup`
+  # itself), the declared QEMU and Rust, `cargo run -- --build-only` builds
+  # the toolchain, kernel, bootloader, userland and initrd — the whole of
+  # "cargo run builds everything" (root CLAUDE.md) — without ever launching a
+  # window.
+  #
+  # issues/build/the-portability-premise-has-no-instrument.md named the move
+  # this replaces as the open gap in the previous version of this job: a
+  # green run on `ubuntu-latest` could not distinguish "the three packages
+  # this job installed were enough" from "the image's own contents quietly
+  # covered the rest". `debian:sid` is the same image `ci.yml`'s guest shards
+  # already run in for the identical reason. This job's timing below is not
+  # comparable to the `ubuntu-latest` version's own measurement — a
+  # from-scratch container pull and `apt-get install` is a different cost
+  # than a pre-provisioned VM image — and nobody has re-measured this job
+  # since the move; its first number is whatever the first real run reports.
+  #
+  # Still deliberately not `toolchain.yml`'s own dep list: cmake, ninja-build,
+  # pkg-config, libssl-dev and ovmf are not installed here either. `ovmf/` is
+  # committed to this repository and read directly by `src/qemu.rs`'s
+  # `launch` — `--build-only` never calls it, so the ovmf package is moot
+  # here regardless. Whether the bootstrap genuinely needs cmake, ninja or
+  # libssl-dev (rustc's LLVM step can download a prebuilt LLVM instead of
+  # building one, when the submodule is unchanged from upstream) has still
+  # never been tested against a machine that lacks them — the question this
+  # job has always carried. If it does, this job reds on exactly that, which
+  # is the gap the premise has today and the reason this file exists.
+  #
+  # No `actions/cache`: caching a "fresh machine" build is a contradiction —
+  # what is measured below is what a from-scratch run costs, every time.
+  linux:
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:sid
+    # A wedge guard, not a fresh measurement: this ceiling is carried over
+    # from the `ubuntu-latest` version's own from-scratch runs (see that
+    # job's history), which is not the same cost as a container pull plus
+    # `apt-get install` on top of a from-scratch bootstrap. Nobody has
+    # measured this version yet.
+    timeout-minutes: 350
+    steps:
+      # Before the checkout: `actions/checkout` wants git and this image has
+      # none — `ci.yml`'s guest shards' own `deps` step carries the same
+      # fact. Three attempts, since `sid` is a rolling release and its mirror
+      # is not a fixed artifact — a portability regression is not a question
+      # a mirror blip should get to answer.
+      - name: deps
+        run: |
+          got=no
+          for attempt in 1 2 3; do
+            if apt-get update -qq \
+               && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                    git curl ca-certificates build-essential qemu-system-x86 \
+                    python3 > /dev/null; then
+              got=yes
+              break
+            fi
+            echo "apt attempt $attempt failed"
+            [ "$attempt" = 3 ] || sleep 20
+          done
+          # Named, so a mirror blip reads as one and not as a broken image.
+          if [ "$got" != yes ]; then
+            echo "::error::apt failed three times against sid's mirror. Nothing here is about"
+            echo "::error::the tree — re-run the job."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: rustup
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Informational, not a gate: unlike `ci.yml`/`gate-a.yml` this job never
+      # calls `qemu::launch` (`--build-only` skips it, `src/main.rs`), so
+      # there is no guest boot here for `.github/qemu-version` and
+      # `.github/instrument.sh` to make comparable across — `src/ci.rs`'s
+      # `every_gate_that_boots_a_guest_names_its_instrument` scans a fixed
+      # `GATES` list (`ci.yml`, `gate-a.yml`) for exactly that reason, and
+      # this file is deliberately not on it. What apt gave `qemu-system-x86`
+      # is still worth a line: `src/main.rs::check_prerequisites` only
+      # *notes* a version other than declared, and never refuses one, because
+      # nothing here boots a guest to disagree about.
+      - name: what this ran with
+        run: |
+          qemu-system-x86_64 --version | head -1
+          rustc -vV
+          echo "declared QEMU (.github/qemu-version): $(grep -v '^#' .github/qemu-version | tr -d '[:space:]')"
+          df -h /
+
+      - name: cargo run -- --build-only
+        id: build
+        run: |
+          set -o pipefail
+          t0=$(date +%s)
+          cargo run -- --build-only 2>&1 | tee /tmp/build.log
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### linux"
+            echo ""
+            echo "- \`cargo run -- --build-only\` in \`debian:sid\` with only \
+              \`git\`, \`curl\`, \`ca-certificates\`, \`build-essential\`, \
+              \`qemu-system-x86\`, \`python3\` and \`rustup\` installed: \
+              ${{ job.status }} in ${{ steps.build.outputs.seconds || 'an unmeasured number of' }}s"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The natural third row: `host-tests.yml` already proves `macos-latest` is
+  # reachable on this plan, and the only gap was that nobody had pointed a
+  # `--build-only` at a fresh one — issues/build/the-portability-premise-has-
+  # no-instrument.md names it. What this job can and cannot prove differs
+  # from Linux's in one respect: Homebrew keeps exactly one version of the
+  # `qemu` formula — whichever homebrew-core currently calls stable — and no
+  # versioned `qemu@<x.y.z>` formula exists for it the way one does for
+  # `python` or `openssl`, so there is no general mechanism to *pin* an old
+  # release the way `.github/qemu-version` names one. Measured empirically on
+  # a macOS Homebrew install while writing this job (2026-08-20): `brew
+  # install qemu@11.1.0` answers "No available formula with the name
+  # \"qemu@11.1.0\"." with exit status 1 — confirming the pin does not exist
+  # as a mechanism, not merely that this one version lacks it. The step below
+  # tries the pinned name first anyway, in case that ever changes, and falls
+  # back to the unpinned formula otherwise; the same measurement found
+  # homebrew-core's unpinned `qemu` *is* 11.1.0 today, so this job currently
+  # proves the declared version by coincidence of timing, not by anything the
+  # workflow enforces. The "what this ran with" step prints the declared and
+  # installed versions side by side on every run rather than assuming they
+  # still agree — a future disagreement is a finding for the issue, not a
+  # reason to fail this job: `src/main.rs`'s `check_prerequisites` only
+  # *notes* a QEMU version other than declared everywhere outside
+  # `ci.yml`/`gate-a.yml`'s guest boots, and this job boots no guest either.
+  #
+  # No macOS-specific FAT tooling here despite the standing "four macOS FAT
+  # tools" exception (root CLAUDE.md): `--build-only` runs no test, and
+  # `src/image.rs`'s `format_fat32` builds both volumes this build writes
+  # with the pure-Rust `fatfs` crate, never `newfs_msdos`/`hdiutil` — those
+  # two are exercised only by `toyos-fat32`/`toyos-fat32-check`'s host test
+  # fixtures, which live in `host-tests.yml`, not here. So this job's honesty
+  # does not lean on the standing exception at all; if that ever stops being
+  # true, this comment is the one to correct.
+  #
+  # Nothing installed but Homebrew's QEMU and `rustup`: `macos-latest` ships
+  # Xcode's command-line tools already, which is where `git` and `cc` (the
+  # same declared exception Linux carries) come from — the same reason
+  # `host-tests.yml`'s macOS job installs nothing but checks `rustc -vV`.
+  # `rustup` is installed fresh here rather than trusting the image's own
+  # preinstalled Rust, for the same reason Linux does: the premise under test
+  # is "install Rust and QEMU on a fresh machine", not "this image already
+  # has a working one".
+  #
+  # No `actions/cache`, same reason as Linux. This job has never run, so
+  # `timeout-minutes` borrows Linux's own ceiling rather than inventing a
+  # tighter one — a macOS free-tier runner has fewer cores than Linux's, so
+  # the real number may run longer, and the first nightly run is what answers
+  # that, not this comment.
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: the declared QEMU, pinned via brew where brew can honor it
+        run: |
+          want=$(grep -v '^#' .github/qemu-version | tr -d '[:space:]')
+          echo "declared QEMU (.github/qemu-version): $want"
+          if brew install "qemu@$want"; then
+            echo "brew pinned qemu@$want directly — the exact declared version."
+          else
+            echo "brew has no qemu@$want formula: homebrew-core keeps exactly one \
+              qemu version (whichever is current stable) and no versioned pin — \
+              installing the unpinned formula instead. What version that resolves \
+              to is printed in the next step, not assumed to match."
+            brew install qemu
+          fi
+
+      - name: rustup
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Same informational reasoning as Linux's own step: this job never
+      # calls `qemu::launch` either, so there is no guest boot for
+      # `.github/qemu-version` to be checked against — only printed beside
+      # what actually got installed.
+      - name: what this ran with
+        run: |
+          qemu-system-x86_64 --version | head -1
+          rustc -vV
+          echo "declared QEMU (.github/qemu-version): $(grep -v '^#' .github/qemu-version | tr -d '[:space:]')"
+          df -h /
+
+      - name: cargo run -- --build-only
+        id: build
+        run: |
+          set -o pipefail
+          t0=$(date +%s)
+          cargo run -- --build-only 2>&1 | tee /tmp/build.log
+          echo "seconds=$(( $(date +%s) - t0 ))" >> "$GITHUB_OUTPUT"
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### macos"
+            echo ""
+            echo "- \`cargo run -- --build-only\` on \`macos-latest\` with only \
+              Homebrew's \`qemu\` and \`rustup\` installed: \
+              ${{ job.status }} in ${{ steps.build.outputs.seconds || 'an unmeasured number of' }}s"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The declared Windows frontier. `src/toolchain.rs`'s `link_host_target`
+  # calls `std::os::unix::fs::symlink` with no `#[cfg(unix)]` guard
+  # (issues/build/the-build-system-does-not-compile-on-windows.md), so the
+  # build system is a compile error on this OS before it can report anything
+  # better — nothing past that line has ever been reached, and there is no
+  # reason to believe `cargo run -- --build-only` would even parse its own
+  # arguments first. `cargo build -p toyos-build` is the only question this
+  # job can honestly ask today: does the crate compile at all.
+  #
+  # Fixing the symlink is that issue's scope, not this workflow's — this job
+  # exists so the hole is a red every night rather than a sentence in a file
+  # nobody reruns, and its first green is the fix's own proof. No QEMU
+  # install: irrelevant to a question that current code never reaches, and
+  # `windows-latest` ships a working Rust and MSVC linker already (same
+  # reason `host-tests.yml`'s macOS job installs nothing but checks
+  # `rustc -vV`).
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: rust
+        run: rustc -vV
+
+      - name: cargo build -p toyos-build
+        id: build
+        run: cargo build -p toyos-build
+
+      - name: what this red means
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### windows"
+            echo ""
+            if [ "${{ steps.build.outcome }}" = success ]; then
+              echo "- \`cargo build -p toyos-build\` succeeded. That is new: \
+                issues/build/the-build-system-does-not-compile-on-windows.md \
+                says this compiles nowhere on Windows because of an unguarded \
+                \`std::os::unix::fs::symlink\` in \
+                \`src/toolchain.rs::link_host_target\`. If this job is green, \
+                that issue is closeable and the next step is pointing \
+                \`cargo run -- --build-only\` at this OS, the same as Linux \
+                above."
+            elif [ "${{ steps.build.outcome }}" = failure ]; then
+              echo "- \`cargo build -p toyos-build\` failed, as expected: \
+                issues/build/the-build-system-does-not-compile-on-windows.md \
+                names the cause. This red is the declared Windows frontier, \
+                not a surprise, and fixing it belongs to that issue, not this \
+                workflow."
+            else
+              echo "- \`cargo build -p toyos-build\` never ran (outcome: \
+                \`${{ steps.build.outcome }}\`) — an earlier step failed first, \
+                which is not the Windows frontier this job means to measure."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Same standing issue `ci.yml`, `gate-a.yml` and `host-tests.yml` file or
+  # update, and the same reason: only on `schedule`, since a dispatched run
+  # is somebody watching it directly. `windows` is deliberately not named
+  # here — its red is the declared, tracked frontier this file exists to
+  # measure, and filing "nightly is red" against a gap that already has its
+  # own open issue every night would be exactly the noise the redlist
+  # doctrine calls "absorbed" rather than "declared". A `linux` or `macos`
+  # red is new information neither job's own comment already explains away,
+  # so both report here; `windows`'s is not new information until the day it
+  # turns green.
+  nightly-red-portability:
+    needs: [linux, macos]
+    if: ${{ !cancelled() && github.event_name == 'schedule' && (needs.linux.result != 'success' || needs.macos.result != 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: file or update "nightly is red"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LINUX_RESULT: ${{ needs.linux.result }}
+          MACOS_RESULT: ${{ needs.macos.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          failed=""
+          [ "$LINUX_RESULT" = success ] || failed="$failed portability-linux($LINUX_RESULT)"
+          [ "$MACOS_RESULT" = success ] || failed="$failed portability-macos($MACOS_RESULT)"
+          export TITLE="nightly is red"
+          export BODY="Run: $RUN_URL"$'\n'"Failed jobs:$failed"
+          .github/nightly-red.sh

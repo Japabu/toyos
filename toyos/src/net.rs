@@ -395,7 +395,7 @@ impl DataPath {
 
     fn split(self) -> (Pipe, Pipe, [RawHandle; DATA_HANDLES]) {
         let [to_client, from_client] = self.to_netd;
-        (self.rx, self.tx, [to_client.into_fd(), from_client.into_fd()])
+        (self.rx, self.tx, [to_client.into_raw(), from_client.into_raw()])
     }
 }
 
@@ -427,7 +427,7 @@ pub fn tcp_bind(addr: [u8; 4], port: u16) -> Result<TcpBound, NetError> {
 
     let resp: TcpBindResponse = netd
         .request_with_handles(
-            &[netd_notify.into_fd()],
+            &[netd_notify.into_raw()],
             MsgType::TcpBindPiped,
             &TcpBindPipedRequest { addr, port, _pad: 0 },
         )?

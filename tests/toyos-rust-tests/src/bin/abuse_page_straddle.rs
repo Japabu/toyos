@@ -44,8 +44,8 @@ fn raw(num: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     ret
 }
 
-fn fstat_raw(fd: RawHandle, out: u64) -> u64 {
-    raw(SYS_FSTAT, fd.0 as u64, out, 0)
+fn fstat_raw(handle: RawHandle, out: u64) -> u64 {
+    raw(SYS_FSTAT, handle.0 as u64, out, 0)
 }
 
 fn err(ret: u64) -> Option<SyscallError> {
@@ -66,7 +66,7 @@ fn main() {
     let boundary = base + PAGE_2M;
     assert_eq!(base % PAGE_2M, 0, "mmap did not return a 2 MiB-aligned region");
 
-    let fd = syscall::open(b"/bin/test_rs_abuse_page_straddle", OpenFlags::READ).expect("open self");
+    let handle = syscall::open(b"/bin/test_rs_abuse_page_straddle", OpenFlags::READ).expect("open self");
 
     // 1. A `Stat` eight bytes below the boundary: eight bytes of it are in this
     //    page and sixteen are not.
@@ -81,7 +81,7 @@ fn main() {
     };
 
     poison(straddling, STAT_LEN);
-    let ret = fstat_raw(fd, straddling);
+    let ret = fstat_raw(handle, straddling);
     // The memory before the verdict: an error return the kernel produced after
     // making the write is the failure this gate exists to catch, and asserting
     // the verdict first would stop the run before anyone looked.
@@ -97,11 +97,11 @@ fn main() {
     //    refusal above is about the boundary and nothing else.
     let fitting = boundary - STAT_LEN as u64;
     poison(fitting, STAT_LEN);
-    let ret = fstat_raw(fd, fitting);
+    let ret = fstat_raw(handle, fitting);
     assert!(err(ret).is_none(), "fstat refused a Stat that ends at the boundary: {ret:#x}");
     let size = unsafe { (fitting as *const u64).add(1).read_volatile() };
     assert!(size > 0, "fstat wrote a Stat with no size in it");
-    syscall::close(fd);
+    syscall::close(handle);
 
     // 3. `SpawnArgs` straddling. Every byte of it is this process's own and
     //    says the same thing on both sides of the boundary, so a kernel that

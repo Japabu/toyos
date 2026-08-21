@@ -4,7 +4,6 @@ pub mod cpu;
 pub mod debug;
 pub mod entry;
 pub mod fpu;
-pub mod gdt;
 pub mod idt;
 pub mod mtrr;
 pub mod pat;
@@ -96,7 +95,7 @@ impl Drop for LogCommitGuard {
 /// read-modify-write is not one instruction under TCG — QEMU leaves the
 /// translation block to run it exclusively — and one `fetch_add` per log line
 /// cost 350 ms of boot
-/// (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`). An unlocked
+/// (`issues/hardware/one-rmw-per-log-line-cost-350ms.md`). An unlocked
 /// `xadd` still retires whole, so an interrupt on this CPU cannot split it.
 ///
 /// [`LogCommitGuard`] is the bracket. It lives at the call site because the

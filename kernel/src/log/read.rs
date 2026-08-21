@@ -16,8 +16,6 @@
 //!
 //! **Two names rather than one with a flag**, because each is correct for its
 //! caller and neither is a mode of the other.
-//!
-//! `specs/log-architecture-spec.md` §3.1.
 
 use toyos_abi::log::{LogRecord, MAX_LOG_SHARDS};
 
@@ -138,10 +136,13 @@ impl Cursor {
         Self { next: cursor.next, lost: cursor.lost }
     }
 
-    /// Where the walk got to, back into the caller's own cursor.
+    /// Where the walk got to, back into the caller's own cursor. The inverse of
+    /// [`Self::from_reader`], named for the direction it copies rather than
+    /// `into_`: it consumes nothing, and `into_` is Rust's word for one that
+    /// does.
     ///
     /// [`LogCursor`]: toyos_abi::log::LogCursor
-    pub fn into_reader(&self, cursor: &mut toyos_abi::log::LogCursor) {
+    pub fn write_into(&self, cursor: &mut toyos_abi::log::LogCursor) {
         cursor.next = self.next;
         cursor.lost = self.lost;
     }
@@ -285,6 +286,11 @@ pub fn drain_ordered(cursor: &mut Cursor, out: &mut impl RecordSink) -> usize {
         let Some((i, _)) = best else { return emitted };
         let Some(shard) = shards[i] else { return emitted };
 
+        // A `match` and not an `if let`: the `None` arm is empty and the whole
+        // argument for why it may be empty is written inside it. An `if let`
+        // has no arm to hold that, and it is the part of this loop nobody may
+        // re-derive from the code.
+        #[allow(clippy::single_match)]
         match shard.read(cursor.next[i]) {
             Some(record) => {
                 if !out.put(&record) {

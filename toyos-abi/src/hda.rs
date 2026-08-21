@@ -1,11 +1,11 @@
 //! What the kernel's HDA stub hands its driver.
 //!
-//! `specs/plans/hda-driver-plan.md` §4.1 is the design. The line through the device
-//! is **who touches a register**: the kernel programs every register whose
-//! value is an address or indexes a structure it allocated, and the driver
-//! reaches the rest through [`syscall::device_reg_read`] and
-//! [`syscall::device_reg_write`], each checked against an allow-list and
-//! refused by name. Nothing here names a physical address.
+//! The line through the device is **who touches a register**: the kernel
+//! programs every register whose value is an address or indexes a structure it
+//! allocated, and the driver reaches the rest through
+//! [`syscall::device_reg_read`] and [`syscall::device_reg_write`], each checked
+//! against an allow-list and refused by name. Nothing here names a physical
+//! address.
 //!
 //! [`RegWidth`](crate::syscall::RegWidth) is those calls' and not this device's,
 //! since virtio-sound's stub reaches its notification registers the same way.
@@ -56,6 +56,10 @@ const _: () = {
 
 impl HdaInfo {
     pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `self` is a valid `&Self` (non-null, aligned, readable for
+        // `size_of::<Self>()` bytes), and the const assert above proves the
+        // `repr(C)` layout has no padding, so every byte the slice exposes is
+        // an initialized field, not a gap.
         unsafe {
             core::slice::from_raw_parts(
                 self as *const Self as *const u8,

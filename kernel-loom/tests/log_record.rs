@@ -10,7 +10,34 @@
 //! `SHARD_RECORDS` is 4 here, which is what makes the recycle cases reachable
 //! in a model at all — `shard.rs` says why.
 //!
-//! `specs/log-architecture-spec.md` §2.5, obligations W1, W2 and W4.
+//! Three of the ring's memory-ordering obligations are modelled here. **W1**,
+//! publication: the body stores precede the `Release` store of `seq`, so a
+//! reader whose `Acquire` load sees the sequence number sees the whole body.
+//! **W2**, recycle detection: the readable window is exactly the last
+//! `SHARD_RECORDS` sequence numbers, and a slot a writer has re-entered answers
+//! for neither generation. **W4**, the reservation: `head` is written by one CPU
+//! through inline asm and read by every other as an `AtomicU64`. Loom cannot
+//! model inline asm, so `percpu_fetch_add` is shimmed to a real `fetch_add` —
+//! strictly stronger, because the only behaviour the real instruction has that
+//! `fetch_add` does not is non-atomicity against another CPU's write, and the
+//! commit bracket is what makes "no other CPU writes `head`" true.
+//!
+//! The negative case is a cargo feature rather than a comment:
+//!
+//! ```text
+//! cargo test --manifest-path kernel-loom/Cargo.toml --features log-commit-release-off \
+//!   --test log_record
+//! ```
+//!
+//! drops the `Release` from `commit`'s publishing store — W1's own weakening —
+//! and this file must red, at [`a_committed_record_is_whole_or_absent`] (*torn:
+//! at_ns is another record's*) and at
+//! [`a_key_and_the_record_it_names_come_from_one_generation`] (*a key from the
+//! generation the slot used to hold*). Verified 2026-08-17, both ways round.
+//! The other two weakenings this file catches — the `WRITING` mark with its
+//! release fence, and either reader's acquire fence — are recorded on
+//! [`a_reader_racing_a_recycle_gets_nothing_rather_than_a_mixture`] and are
+//! mutations rather than features.
 
 #![cfg(feature = "loom")]
 

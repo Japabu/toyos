@@ -23,6 +23,7 @@
 use std::process::exit;
 
 use toyos::endow;
+use toyos::AsHandle;
 use toyos::Connection;
 use toyos_abi::syscall;
 use window::Window;
@@ -52,7 +53,7 @@ fn main() {
         let mut frame = [0u8; 8];
         frame[..4].copy_from_slice(&msg_type.to_ne_bytes());
         frame[4..].copy_from_slice(&len.to_ne_bytes());
-        let written = syscall::write(conn.fd(), &frame)
+        let written = syscall::write(conn.as_handle(), &frame)
             .unwrap_or_else(|e| panic!("[{name}] could not write the frame: {e:?}"));
         assert_eq!(written, frame.len(), "[{name}] partial frame write");
 
@@ -83,7 +84,7 @@ fn closed_by_peer(conn: &Connection) -> bool {
             // means the connection is alive — which is not what was asked.
             Ok(_) => return false,
             Err(syscall::SyscallError::WouldBlock) => syscall::nanosleep(EOF_POLL_NS),
-            // The fd itself is gone, which is the same hang-up seen from the
+            // The connection itself is gone, which is the same hang-up seen from the
             // other end of the same race.
             Err(_) => return true,
         }

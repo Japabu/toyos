@@ -57,7 +57,7 @@ fn main() {
     let mut refused_after = None;
     for i in 0..ATTEMPTS {
         match syscall::namespace_open(ns.as_handle(), NAME) {
-            Ok(fd) => held.push(fd),
+            Ok(handle) => held.push(handle),
             Err(SyscallError::ResourceExhausted) => {
                 refused_after = Some(i);
                 break;
@@ -112,12 +112,12 @@ fn main() {
     println!("  the first write on a connection allocated {} KiB", ring / 1024);
 
     syscall::close(accepted);
-    let fd = syscall::namespace_open(ns.as_handle(), NAME)
+    let handle = syscall::namespace_open(ns.as_handle(), NAME)
         .expect("an open must succeed once the server drains one");
-    held.push(fd);
+    held.push(handle);
 
-    for fd in held {
-        syscall::close(fd);
+    for handle in held {
+        syscall::close(handle);
     }
 
     println!("connect refused after {depth} unaccepted, and resumed once one was drained");

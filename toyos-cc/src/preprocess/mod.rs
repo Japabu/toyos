@@ -123,7 +123,7 @@ impl Preprocessor {
         };
 
         // Seed macros: primary arch and OS. Everything else is derived in compat.h.
-        let is_toyos = target.map_or(false, |t| t.contains("toyos"));
+        let is_toyos = target.is_some_and(|t| t.contains("toyos"));
         let is_macos = target.map_or(cfg!(target_os = "macos"), |t| t.contains("apple") || t.contains("darwin"));
         let is_aarch64 = target.map_or(cfg!(target_arch = "aarch64"), |t| t.starts_with("aarch64"));
 
@@ -218,12 +218,12 @@ impl Preprocessor {
             // If we're accumulating a multi-line expression (unbalanced parens), handle it
             if !pending_line.is_empty() {
                 let trimmed_check = line.trim();
-                if trimmed_check.starts_with('#') {
+                if let Some(after_hash) = trimmed_check.strip_prefix('#') {
                     // Directive inside multi-line expression.
                     // #include produces output that must appear after pending_line,
                     // so flush pending_line first. Other directives (conditionals,
                     // #define, etc.) don't produce output and can fall through.
-                    let dt = trimmed_check[1..].trim_start();
+                    let dt = after_hash.trim_start();
                     let dir_end = dt.find(|c: char| !c.is_ascii_alphabetic() && c != '_').unwrap_or(dt.len());
                     let dir_name = &dt[..dir_end];
 
@@ -251,8 +251,8 @@ impl Preprocessor {
             }
 
             let trimmed = line.trim();
-            if trimmed.starts_with('#') {
-                let directive_text = &trimmed[1..].trim_start();
+            if let Some(after_hash) = trimmed.strip_prefix('#') {
+                let directive_text = &after_hash.trim_start();
                 // Split directive name from rest: directive names are alphabetic,
                 // so `#include<stdio.h>` correctly splits into ("include", "<stdio.h>")
                 let (directive, rest) = match directive_text.find(|c: char| !c.is_ascii_alphabetic() && c != '_') {
@@ -406,7 +406,7 @@ impl Preprocessor {
                     }
                     "" => { /* empty # line */ }
                     _ if filename.ends_with(".S") || filename.ends_with(".s")
-                        || directive.chars().next().map_or(false, |c| c.is_ascii_digit()) =>
+                        || directive.chars().next().is_some_and(|c| c.is_ascii_digit()) =>
                     {
                         // Unknown directives in assembly files are silently ignored.
                         // Numeric directive names (# N or # N "file") are GCC line markers
@@ -548,19 +548,19 @@ impl Preprocessor {
 
     fn handle_include(&mut self, arg: &str, current_file: &str) {
         let arg = arg.trim();
-        let (path_str, is_system) = if arg.starts_with('"') {
-            let end = arg[1..].find('"').unwrap_or(arg.len() - 1);
-            (&arg[1..1 + end], false)
-        } else if arg.starts_with('<') {
-            let end = arg[1..].find('>').unwrap_or(arg.len() - 1);
-            (&arg[1..1 + end], true)
+        let (path_str, is_system) = if let Some(after) = arg.strip_prefix('"') {
+            let end = after.find('"').unwrap_or(after.len());
+            (&after[..end], false)
+        } else if let Some(after) = arg.strip_prefix('<') {
+            let end = after.find('>').unwrap_or(after.len());
+            (&after[..end], true)
         } else {
             // Macro-expanded include - try to evaluate
             let expanded = self.expand_line(arg);
             let trimmed = expanded.trim();
-            if trimmed.starts_with('"') {
-                let end = trimmed[1..].find('"').unwrap_or(trimmed.len() - 1);
-                let path = trimmed[1..1 + end].to_string();
+            if let Some(after) = trimmed.strip_prefix('"') {
+                let end = after.find('"').unwrap_or(after.len());
+                let path = after[..end].to_string();
                 if let Some((content, resolved, idx)) = self.find_and_read(&path, current_file, false) {
                     self.process_source(&content, &resolved, idx);
                 }
@@ -587,12 +587,12 @@ impl Preprocessor {
         let current_idx = self.file_stack.last().and_then(|(_, _, idx)| *idx).unwrap_or(0);
         let start_idx = current_idx + 1;
 
-        let (path_str, is_system) = if arg.starts_with('"') {
-            let end = arg[1..].find('"').unwrap_or(arg.len() - 1);
-            (&arg[1..1 + end], false)
-        } else if arg.starts_with('<') {
-            let end = arg[1..].find('>').unwrap_or(arg.len() - 1);
-            (&arg[1..1 + end], true)
+        let (path_str, is_system) = if let Some(after) = arg.strip_prefix('"') {
+            let end = after.find('"').unwrap_or(after.len());
+            (&after[..end], false)
+        } else if let Some(after) = arg.strip_prefix('<') {
+            let end = after.find('>').unwrap_or(after.len());
+            (&after[..end], true)
         } else {
             panic!("warning: cannot parse #include_next {}", arg);
         };
@@ -795,9 +795,9 @@ impl Preprocessor {
                 }
                 let arg = std::str::from_utf8(&bytes[start..j]).unwrap_or("").trim();
                 // Extract path from "file" or <file>
-                let path = if arg.starts_with('"') && arg.ends_with('"') {
-                    &arg[1..arg.len()-1]
-                } else if arg.starts_with('<') && arg.ends_with('>') {
+                let path = if (arg.starts_with('"') && arg.ends_with('"'))
+                    || (arg.starts_with('<') && arg.ends_with('>'))
+                {
                     &arg[1..arg.len()-1]
                 } else {
                     // Might be a macro — expand it first

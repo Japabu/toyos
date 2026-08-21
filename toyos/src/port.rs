@@ -38,7 +38,7 @@ impl Acceptor {
     /// reads it out of the protocol's first frame, where it is already the
     /// client's own claim about itself and already distrusted.
     pub fn accept(&self) -> Result<Connection, SyscallError> {
-        syscall::accept(self.0.fd()).map(|fd| Connection(OwnedHandle(fd)))
+        syscall::accept(self.0.raw()).map(|h| Connection(OwnedHandle(h)))
     }
 
     /// Give up ownership, for a handle about to be endowed or transferred.
@@ -58,7 +58,7 @@ impl Connector {
     /// A second connector to the same port, for a holder handing one on while
     /// keeping its own.
     pub fn duplicate(&self) -> Result<Self, SyscallError> {
-        syscall::dup(self.0.fd()).map(|h| Self(OwnedHandle(h)))
+        syscall::dup(self.0.raw()).map(|h| Self(OwnedHandle(h)))
     }
 
     pub fn into_raw(self) -> RawHandle {
@@ -75,12 +75,12 @@ impl Connector {
 
 impl AsHandle for Acceptor {
     fn as_handle(&self) -> RawHandle {
-        self.0.fd()
+        self.0.raw()
     }
 }
 
 impl AsHandle for Connector {
     fn as_handle(&self) -> RawHandle {
-        self.0.fd()
+        self.0.raw()
     }
 }

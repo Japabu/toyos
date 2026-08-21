@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 
 use toyos_abi::syscall::SyscallError;
 
-use crate::mm::paging::CachePolicy;
+use crate::mm::paging::{CachePolicy, Prot};
 use crate::mm::{align_2m, pmm, Unmapped, PAGE_2M};
 use crate::process::{PageTables, Pid};
 use crate::sync::Lock;
@@ -46,10 +46,19 @@ impl Pages {
     }
 }
 
-// SAFETY: a `PhysPage` is a physical address and a category byte. Nothing in it
-// is bound to the CPU that allocated it, and the pages are handed between CPUs
-// by every path that frees a process.
+// SAFETY: open question, not resolved by this comment. The intent is real —
+// a `PhysPage` is a physical address and a category byte, nothing in it is
+// bound to the CPU that allocated it, and the pages are handed between CPUs
+// by every path that frees a process — but `PhysPage` is itself `{phys: u64,
+// category: u8}` with no manual `Send`/`Sync` impl, so `Vec<PhysPage>` (and
+// therefore `Pages`) already derives both automatically: `cargo check` with
+// these two impls deleted still compiles clean (verified 2026-08-20). Filed
+// as issues/kernel/redundant-send-sync-impls-mm-object.md together with the
+// same finding on `paging::AddressSpace`, rather than removed here — if a
+// future `PhysPage` field broke the auto-derive (a raw pointer, say), these
+// hand-written impls would silently paper over it with no new review.
 unsafe impl Send for Pages {}
+// SAFETY: see the `Send` impl above — same open question, same evidence.
 unsafe impl Sync for Pages {}
 
 /// A physical range and the memory type every mapping of it must carry.
@@ -129,7 +138,7 @@ impl SharedMemObject {
     }
 
     /// The kernel's own view of the pages, for a subsystem that reads them
-    /// through the direct map — an io_uring ring's headers are the one case.
+    /// through the direct map — an inbox's ring headers are the one case.
     pub fn phys(&self) -> DirectMap {
         self.region.phys
     }
@@ -145,7 +154,7 @@ impl SharedMemObject {
         }
         let (addr, _) = pt
             .lock()
-            .alloc_and_map(self.region.phys.phys(), self.region.size, true, self.region.cache)
+            .alloc_and_map(self.region.phys.phys(), self.region.size, Prot::ReadWrite, self.region.cache)
             .ok_or(SyscallError::ResourceExhausted)?;
         // A region whose memory type is not RAM's gets a line naming the
         // process, because that process is the one paying the difference and

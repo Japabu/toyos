@@ -17,12 +17,9 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use toyos_sched::task::WaitClass;
 
-use crate::io_uring::RingId;
+use crate::inbox::InboxId;
 use crate::pipe::{PipeReader, PipeWriter};
-use crate::sched::payload::KWaitQueue;
-use crate::sched::waitqs::{new_queue, wake_all};
 use crate::sync::Lock;
 
 use super::service::HandleQueue;
@@ -69,9 +66,12 @@ struct PortQueue {
 /// cycle exists.
 pub struct PortShared {
     queue: Lock<PortQueue>,
-    /// Threads blocked in `accept`.
-    acceptors: Arc<KWaitQueue>,
-    io_uring_watchers: Lock<Vec<RingId>>,
+    /// Threads blocked in `accept`, as a completion subject. On the port rather than on
+    /// either end, for the reason the inbox watch is: a poll a server
+    /// registered on its `Acceptor` is completed by a client connecting
+    /// through a `Connector`.
+    watch: crate::completion::Watch,
+    inbox_watchers: Lock<Vec<InboxId>>,
 }
 
 pub struct Acceptor {
@@ -94,8 +94,8 @@ pub enum PushError {
 pub fn create() -> (Arc<Acceptor>, Arc<Connector>) {
     let shared = Arc::new(PortShared {
         queue: Lock::new(PortQueue { closed: false, pending: VecDeque::new() }),
-        acceptors: new_queue(WaitClass::Ipc),
-        io_uring_watchers: Lock::new(Vec::new()),
+        watch: crate::completion::Watch::new(),
+        inbox_watchers: Lock::new(Vec::new()),
     });
     (
         Arc::new(Acceptor { core: Acceptor::new_core(), shared: shared.clone() }),
@@ -103,7 +103,7 @@ pub fn create() -> (Arc<Acceptor>, Arc<Connector>) {
     )
 }
 
-/// **The io_uring watch names the port, not either end**, because a client
+/// **The inbox watch names the port, not either end**, because a client
 /// connecting through a `Connector` has to complete a poll a server registered
 /// on the `Acceptor` — and the two share exactly this.
 impl PortShared {
@@ -115,25 +115,23 @@ impl PortShared {
         self.queue.lock().closed
     }
 
-    /// The waiter set, cloned out so a blocking site can hold it across its own
-    /// park — the ticket borrows the queue, not the port.
-    pub fn waiters(&self) -> Arc<KWaitQueue> {
-        self.acceptors.clone()
+    pub fn watch(&self) -> &crate::completion::Watch {
+        &self.watch
     }
 
-    pub fn watchers(&self) -> Vec<RingId> {
-        self.io_uring_watchers.lock().clone()
+    pub fn watchers(&self) -> Vec<InboxId> {
+        self.inbox_watchers.lock().clone()
     }
 
-    pub fn add_watcher(&self, ring: RingId) {
-        let mut watchers = self.io_uring_watchers.lock();
+    pub fn add_watcher(&self, ring: InboxId) {
+        let mut watchers = self.inbox_watchers.lock();
         if !watchers.contains(&ring) {
             watchers.push(ring);
         }
     }
 
-    pub fn remove_watcher(&self, ring: RingId) {
-        self.io_uring_watchers.lock().retain(|&id| id != ring);
+    pub fn remove_watcher(&self, ring: InboxId) {
+        self.inbox_watchers.lock().retain(|&id| id != ring);
     }
 }
 
@@ -153,8 +151,8 @@ impl Acceptor {
         self.shared.has_pending()
     }
 
-    pub fn waiters(&self) -> Arc<KWaitQueue> {
-        self.shared.waiters()
+    pub fn watch(&self) -> &crate::completion::Watch {
+        self.shared.watch()
     }
 
     pub fn port(&self) -> Arc<PortShared> {
@@ -211,6 +209,9 @@ impl ZeroHandles for Acceptor {
             connection.inbox.close_now();
         }
         drop(queued);
-        wake_all(&self.shared.acceptors);
+        crate::completion::post(
+            crate::completion::Subject::of(self.shared.watch()),
+            crate::completion::Outcome::Gone(crate::completion::Reason::Closed),
+        );
     }
 }

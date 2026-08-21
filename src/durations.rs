@@ -15,11 +15,17 @@
 //! Why a command and not a `cat`: the shards are a *partition*, and that is the
 //! property the merged file's usefulness rests on. A repeated name means two
 //! shards claimed one test or one shard ran the same label twice — the first is
-//! exactly the failure
-//! `specs/assessments/ci-plan-assessment-2026-08.md` §4 records, three shards
-//! of `nvme_` where one test ran
-//! twice and one ran nowhere, and all three reported green. A concatenation
-//! cannot see it; this refuses it by name.
+//! exactly the failure this has already produced: three shards of `nvme_` where
+//! one test ran twice and one ran nowhere, and all three reported green. A
+//! concatenation cannot see it; this refuses it by name.
+//!
+//! **A `durations` red is never ignorable on a PR**: the required `guest-suite`
+//! check aggregates it, so a red here fails a required check transitively even
+//! though `durations` itself is not on the required list. The usual cause is a
+//! committed `UNMEASURED` marker past its one bought run — the cure is the
+//! measured value from that run's own `test-durations-merged` artifact, never a
+//! re-run. Learned on 2026-08-19, when three PRs stalled on exactly this while
+//! everyone read the red as stale noise.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -172,14 +178,12 @@ fn merged_profile(
 ///
 /// **The other half of the partition, and it was not being checked.** The
 /// merge already refuses any duplicate execution label, including the
-/// `specs/assessments/ci-plan-assessment-2026-08.md` §4 defect where two
-/// shards claimed one name. From the
-/// other side a shard
-/// that measured *nothing* — cancelled at its timeout, or an artifact upload
-/// that failed — leaves eleven files, and merging them wrote a profile missing
+/// observed defect where two shards claimed one name. From the other side a
+/// shard that measured *nothing* — cancelled at its timeout, or an artifact
+/// upload that failed — leaves eleven files, and merging them wrote a profile missing
 /// a twelfth of the suite. Those names then price at the longest the profile
 /// knows on every later run, which is exactly the eight phantom four-minute
-/// tests §11.2 measured steering a twelve-way split. The command that exists to
+/// tests measured steering a twelve-way split. The command that exists to
 /// keep the profile honest was the thing that could quietly break it.
 ///
 /// The information was always there: a shard writes
@@ -296,6 +300,22 @@ fn report(
             gone.len(),
             gone.join(", ")
         );
+    }
+}
+
+fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect(&path, out);
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(SHARD_PREFIX))
+        {
+            out.push(path);
+        }
     }
 }
 
@@ -430,21 +450,5 @@ mod tests {
         assert_eq!(after.get("audio_tone_load (smp=8)"), Some(&11_121));
         assert_eq!(after.get("audio_tone (smp=1)"), Some(&7_000));
         assert_eq!(after.get("not_audio (smp=8)"), Some(&8_000));
-    }
-}
-
-fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect(&path, out);
-        } else if path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(SHARD_PREFIX))
-        {
-            out.push(path);
-        }
     }
 }

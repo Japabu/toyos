@@ -35,7 +35,7 @@ use toyos_abi::input::RawKeyEvent;
 use toyos_abi::RawHandle;
 
 use crate::ipc::{self, Connection, FrameRx, RxStep, TrySendError};
-use crate::poller::{Poller, IORING_POLL_IN};
+use crate::poller::{Poller, READABLE};
 use crate::port::Acceptor;
 use crate::AsHandle;
 
@@ -159,13 +159,13 @@ impl Host {
     }
 
     /// The acceptor, for the caller's poller.
-    pub fn acceptor_fd(&self) -> RawHandle {
+    pub fn acceptor_handle(&self) -> RawHandle {
         self.acceptor.as_handle()
     }
 
     /// Every connected client, for the caller's poller.
-    pub fn client_fds(&self) -> impl Iterator<Item = RawHandle> + '_ {
-        self.peers.iter().flatten().map(|p| p.conn.fd())
+    pub fn client_handles(&self) -> impl Iterator<Item = RawHandle> + '_ {
+        self.peers.iter().flatten().map(|p| p.conn.as_handle())
     }
 
     /// Widest handle set a host adds to its owner's poller.
@@ -183,7 +183,7 @@ impl Host {
         let Ok(conn) = self.acceptor.accept() else {
             return;
         };
-        let id = ClientId(conn.fd());
+        let id = ClientId(conn.as_handle());
         let Some(slot) = self.peers.iter().position(|p| p.is_none()) else {
             // Dropping the connection is the refusal: the client's next read
             // sees the hang-up.
@@ -389,7 +389,7 @@ impl Keys {
     /// a client holding the keys is reading usages, which no layout moves.
     pub fn next(&mut self, timeout_nanos: u64) -> Option<RawKeyEvent> {
         loop {
-            self.poller.poll_add(&self.conn, IORING_POLL_IN, 0);
+            self.poller.watch(&self.conn, READABLE, 0);
             let mut ready = false;
             self.poller.wait(1, timeout_nanos, |_| ready = true);
             if !ready {
@@ -407,7 +407,7 @@ impl Keys {
 
 impl AsHandle for Keys {
     fn as_handle(&self) -> RawHandle {
-        self.conn.fd()
+        self.conn.as_handle()
     }
 }
 

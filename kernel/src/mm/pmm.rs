@@ -233,6 +233,12 @@ pub fn alloc_page(cat: Category) -> Option<PhysPage> {
             bm.next_hint = if idx + 1 < bm.page_count { idx + 1 } else { 0 };
             let phys = bm.idx_to_phys(idx);
             drop(bm);
+            // SAFETY: `set_used(idx)` just claimed this page under
+            // `BITMAP`'s lock, so no other caller can be handed the same
+            // `idx` concurrently and nothing yet holds a `PhysPage` for it —
+            // this write has no alias. The direct map covers every physical
+            // address the bitmap can name, so `PAGE_2M` bytes from
+            // `DirectMap::from_phys(phys)` stays inside mapped memory.
             unsafe {
                 core::ptr::write_bytes(
                     DirectMap::from_phys(phys).as_mut_ptr::<u8>(), 0, PAGE_2M as usize,
@@ -274,6 +280,11 @@ pub fn alloc_contiguous(count: usize, cat: Category) -> Option<alloc::vec::Vec<P
                 let mut pages = alloc::vec::Vec::with_capacity(count);
                 for i in 0..count {
                     let phys = base_phys + i as u64 * PAGE_2M;
+                    // SAFETY: same argument as `alloc_page` above — every
+                    // index in `run_start..run_start + count` was just
+                    // `set_used` under `BITMAP`'s lock, so this run is
+                    // exclusively ours and unaliased, and the direct map
+                    // covers whatever the bitmap can name.
                     unsafe {
                         core::ptr::write_bytes(
                             DirectMap::from_phys(phys).as_mut_ptr::<u8>(), 0, PAGE_2M as usize,
@@ -302,7 +313,7 @@ fn free_page(phys: u64) {
 
 /// One past the highest physical frame this kernel manages.
 ///
-/// The extent the IOMMU's identity domain covers (`specs/iommu-spec.md` §5.7):
+/// The extent the IOMMU's identity domain covers:
 /// every address a driver can hand a device comes out of here, so `[0, top)`
 /// is exactly what a device could reach on a machine with no unit at all.
 /// Taken from the bitmap rather than from the firmware memory map, whose own

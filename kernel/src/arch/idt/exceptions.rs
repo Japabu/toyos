@@ -2,13 +2,15 @@ use crate::arch::{apic, cpu, debug, syscall, percpu};
 use crate::arch::percpu::CpuFaultState;
 use crate::{alert, log, mm, process, scheduler, symbols};
 
-use super::{Vector, TrapFrame, RPL_MASK, PF_PRESENT, PF_WRITE, PF_INSTRUCTION_FETCH};
+use toyos_userbound::{blame, Blame, Faulted, Ring};
+
+use super::{Vector, TrapFrame, PF_PRESENT, PF_WRITE, PF_INSTRUCTION_FETCH};
 
 /// Walk RBP chain for kernel backtrace with symbol resolution.
 pub(crate) fn kernel_backtrace(start_rbp: u64, max_frames: usize) {
     let mut rbp = start_rbp;
     for _ in 0..max_frames {
-        if rbp == 0 || rbp % 8 != 0 || !mm::is_kernel_addr(rbp) { break; }
+        if rbp == 0 || !rbp.is_multiple_of(8) || !mm::is_kernel_addr(rbp) { break; }
         let saved_rbp = unsafe { *(rbp as *const u64) };
         let return_addr = unsafe { *((rbp + 8) as *const u64) };
         if return_addr == 0 || !mm::is_kernel_addr(return_addr) { break; }
@@ -21,7 +23,7 @@ pub(crate) fn kernel_backtrace(start_rbp: u64, max_frames: usize) {
 fn user_backtrace(pid: crate::process::Pid, start_rbp: u64, pml4: *const u64, max_frames: usize) {
     let mut rbp = start_rbp;
     for _ in 0..max_frames {
-        if rbp == 0 || rbp % 8 != 0 { break; }
+        if rbp == 0 || !rbp.is_multiple_of(8) { break; }
         let Some(saved_rbp) = safe_read_u64(rbp, pml4) else { break };
         let Some(return_addr) = safe_read_u64(rbp + 8, pml4) else { break };
         if return_addr == 0 { break; }
@@ -46,7 +48,7 @@ fn kernel_backtrace_safe(start_rbp: u64, max_frames: usize) {
 
 /// Safe kernel memory read. Only reads kernel direct-map addresses.
 fn safe_read_kernel(addr: u64) -> Option<u64> {
-    if addr % 8 != 0 || !mm::is_kernel_addr(addr) {
+    if !addr.is_multiple_of(8) || !mm::is_kernel_addr(addr) {
         return None;
     }
     Some(unsafe { core::ptr::read_volatile(addr as *const u64) })
@@ -55,7 +57,7 @@ fn safe_read_kernel(addr: u64) -> Option<u64> {
 /// Safely read a u64 from memory. For user addresses, translates through page
 /// tables to avoid triggering demand-paging faults inside exception handlers.
 fn safe_read_u64(addr: u64, user_pml4: *const u64) -> Option<u64> {
-    if addr % 8 != 0 || addr == 0 {
+    if !addr.is_multiple_of(8) || addr == 0 {
         return None;
     }
     if !user_pml4.is_null() {
@@ -90,15 +92,23 @@ impl ExceptionContext<'_> {
         Vector::from_raw(self.frame.vector)
     }
 
-    fn is_user_mode(&self) -> bool {
-        self.frame.cs & RPL_MASK != 0
+    /// The privilege level this frame arrived from.
+    fn ring(&self) -> Ring {
+        Ring::of_cs(self.frame.cs)
     }
 
-    fn is_user_fault(&self) -> bool {
-        self.is_user_mode()
-            || (self.vector() == Vector::PageFault
-                && percpu::current_tid().is_some()
-                && self.cr2 < 0x0000_8000_0000_0000)
+    /// CR2 is meaningful on a #PF and stale on every other vector.
+    fn faulted(&self) -> Faulted {
+        if self.vector() == Vector::PageFault {
+            Faulted::Address(self.cr2)
+        } else {
+            Faulted::Nothing
+        }
+    }
+
+    /// Whose fault it was. See `toyos_userbound::fault`.
+    fn blame(&self) -> Blame {
+        blame(self.ring(), self.frame.rip, self.faulted(), percpu::current_tid().is_some())
     }
 }
 
@@ -123,38 +133,14 @@ impl ExceptionContext<'_> {
 // whatever it happens to call — and it covers uses this rule has not been
 // applied to yet, which chasing call sites would not.
 
-/// Source of a crash — either a hardware exception or a Rust panic.
-pub(crate) enum CrashInfo<'a> {
-    Exception(&'a ExceptionContext<'a>),
-    Panic { message: &'a core::panic::PanicInfo<'a>, rbp: u64 },
-}
-
-/// Print full crash diagnostics. Used by both fatal_exception and the panic handler.
-pub(crate) fn crash_report(info: &CrashInfo) {
-    match info {
-        CrashInfo::Exception(ctx) => crash_report_exception(ctx),
-        CrashInfo::Panic { message, rbp } => crash_report_panic(message, *rbp),
-    }
-}
-
-fn crash_report_exception(ctx: &ExceptionContext) {
-    let is_user = ctx.is_user_fault();
-    let tid = percpu::current_tid().unwrap_or(crate::process::Tid(0));
-    let pid = percpu::current_pid();
-    let pml4 = if is_user { crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64 } else { core::ptr::null() };
-
-    let (pf_action, pf_cause) = if ctx.vector() == Vector::PageFault {
-        let action = if ctx.frame.error_code & PF_INSTRUCTION_FETCH != 0 { "execute" }
-            else if ctx.frame.error_code & PF_WRITE != 0 { "write" }
-            else { "read" };
-        let cause = if ctx.frame.error_code & PF_PRESENT != 0 { "protection violation" }
-            else { "unmapped address" };
-        (action, cause)
-    } else {
-        ("", "")
-    };
-
-    let name = match ctx.vector() {
+/// What a vector is called in a report.
+///
+/// Read by `crash_report_exception`, which has the frame in front of it, and by
+/// `fatal_exception`, which hands it to `panic::record_fault` before the report
+/// runs — so a `DOUBLE PANIC` names the fault it landed on top of in the same
+/// words the report would have.
+fn vector_name(vector: Vector) -> &'static str {
+    match vector {
         Vector::DivideError => "divide error",
         Vector::Debug => "debug",
         Vector::Breakpoint => "breakpoint",
@@ -177,9 +163,51 @@ fn crash_report_exception(ctx: &ExceptionContext) {
         // Vectors with a `direct` gate never reach this report: their entries
         // do not go through `trap_dispatch`.
         _ => "exception",
+    }
+}
+
+/// Source of a crash — either a hardware exception or a Rust panic.
+pub(crate) enum CrashInfo<'a> {
+    Exception(&'a ExceptionContext<'a>),
+    Panic { message: &'a core::panic::PanicInfo<'a>, rbp: u64 },
+}
+
+/// Print full crash diagnostics. Used by both fatal_exception and the panic handler.
+pub(crate) fn crash_report(info: &CrashInfo) {
+    match info {
+        CrashInfo::Exception(ctx) => crash_report_exception(ctx),
+        CrashInfo::Panic { message, rbp } => crash_report_panic(message, *rbp),
+    }
+}
+
+fn crash_report_exception(ctx: &ExceptionContext) {
+    // **The verdict follows the blame and the report follows the ring**, and
+    // they are two questions. A pointer that crossed the syscall boundary is
+    // the process's fault and the process is what dies — but the frame that
+    // faulted is Ring 0, so its `rip` is kernel text and its `rbp` walks a
+    // kernel stack. One `is_user` used to answer both, which is why that case
+    // resolved a kernel address through the process's symbol table and printed
+    // a user backtrace off a kernel frame pointer.
+    let theirs = ctx.blame() != Blame::Kernel;
+    let ring3 = ctx.ring().is_user();
+    let tid = percpu::current_tid().unwrap_or(crate::process::Tid(0));
+    let pid = percpu::current_pid();
+    let pml4 = if ring3 { crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() } else { core::ptr::null() };
+
+    let (pf_action, pf_cause) = if ctx.vector() == Vector::PageFault {
+        let action = if ctx.frame.error_code & PF_INSTRUCTION_FETCH != 0 { "execute" }
+            else if ctx.frame.error_code & PF_WRITE != 0 { "write" }
+            else { "read" };
+        let cause = if ctx.frame.error_code & PF_PRESENT != 0 { "protection violation" }
+            else { "unmapped address" };
+        (action, cause)
+    } else {
+        ("", "")
     };
 
-    if is_user {
+    let name = vector_name(ctx.vector());
+
+    if theirs {
         match ctx.vector() {
             Vector::PageFault => log!("SEGFAULT tid={}: {} {} at {:#x}", tid, pf_action, pf_cause, ctx.cr2),
             Vector::InvalidOpcode => log!("SIGILL tid={}: illegal instruction", tid),
@@ -199,7 +227,7 @@ fn crash_report_exception(ctx: &ExceptionContext) {
     }
 
     log!("  rip:");
-    if is_user {
+    if ring3 {
         if let Some(pid) = pid {
             process::resolve_user_symbol(pid, ctx.frame.rip).log_bare(ctx.frame.rip);
         } else {
@@ -227,8 +255,22 @@ fn crash_report_exception(ctx: &ExceptionContext) {
     log!("    cs={:#06x}  ss={:#06x}  rflags={:#018x}",
         ctx.frame.cs, ctx.frame.ss, ctx.frame.rflags);
 
+    // **Ahead of both backtraces, because a crash report can die before it
+    // finishes.** A 2026-08-20 storm capture of the `BTreeMap` class ended
+    // `FAULT rip=… cr2=0x0 … RECURSIVE` one line into the user backtrace, and
+    // everything the report had left to say went with it. This is the part that
+    // decides between the two readings of that class, so it goes where a later
+    // fault cannot take it.
+    //
+    // Only where the kernel is the one that failed: a Ring 3 fault says nothing
+    // about which CPU is on which kernel stack, and these lines under every user
+    // segfault would bury the report that is about the process.
+    if !theirs {
+        crate::hw::report_contexts(ctx.frame.rsp, None);
+    }
+
     log!("  Backtrace:");
-    if is_user {
+    if ring3 {
         if let Some(pid) = pid {
             user_backtrace(pid, ctx.frame.rbp, pml4, 32);
         }
@@ -237,7 +279,7 @@ fn crash_report_exception(ctx: &ExceptionContext) {
 
         // The `Syscall:` line below is the faulting thread's *last* syscall and
         // says nothing about where the fault is: `syscall_rip` is never cleared
-        // (`specs/issues/panic-path/syscall-rip-never-cleared.md`), so it can name a return address
+        // (`issues/panic-path/syscall-rip-never-cleared.md`), so it can name a return address
         // many syscalls old. Reading it as the fault site cost the AMD `#GP`
         // investigation its first day.
         let user_rip = percpu::syscall_rip();
@@ -247,7 +289,7 @@ fn crash_report_exception(ctx: &ExceptionContext) {
                     percpu::syscall_num(), user_rip, percpu::user_rsp());
                 log!("  User backtrace:");
                 process::resolve_user_symbol(pid, user_rip).log_bare(user_rip);
-                let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64;
+                let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>();
                 user_backtrace(pid, percpu::syscall_rbp(), pml4, 20);
             }
         }
@@ -262,17 +304,33 @@ fn crash_report_exception(ctx: &ExceptionContext) {
         }
     }
 
-    if is_user {
+    if theirs {
         let crash_addr = if ctx.vector() == Vector::PageFault { ctx.cr2 } else { 0 };
         process::dump_crash_diagnostics(crash_addr, ctx.frame.rip);
     }
 }
 
 fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
+    // Before the first word of the report, which is the state
+    // `panic::record_panic` exists to survive: what the machine says now comes
+    // from the copy the handler took, or it is `DOUBLE PANIC` and nothing else.
+    if crate::actuator::panic_in_report() {
+        panic!("panic-in-report: the crash report panicked before it said anything");
+    }
     alert!("PANIC: {}", info);
 
     log!("  Backtrace:");
     kernel_backtrace(rbp, 20);
+
+    // **A panic is where this class of defect actually surfaces**, which is why
+    // it is here and not only on the fault path: the two `BTreeMap` deaths and
+    // the two `cpu N has no CpuSched` deaths on record are all Rust panics with
+    // no register dump at all, and every one of them turns on whether a sibling
+    // was standing on this stack. The address of a local is the stack pointer
+    // the containment test wants — this frame is on the crashing stack, which is
+    // the whole of what it asks.
+    let here = 0u64;
+    crate::hw::report_contexts(core::ptr::addr_of!(here) as u64, None);
 
     // Process/thread context (try_lock only)
     if let Some(pid) = percpu::current_pid() {
@@ -292,28 +350,31 @@ fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
                 percpu::syscall_num(), user_rip, percpu::user_rsp());
             log!("  User backtrace:");
             process::resolve_user_symbol(pid, user_rip).log_bare(user_rip);
-            let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64;
+            let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>();
             user_backtrace(pid, percpu::syscall_rbp(), pml4, 20);
         }
     }
 }
 
 /// Terminate after a fatal fault.
-/// - Ring 3 faults: safe to use normal process::exit (no kernel locks held)
-/// - Ring 0 faults attributed to user (kernel fault during syscall): use try_lock path
-/// - Kernel-only faults: halt all CPUs
-pub(crate) fn recover_or_halt(is_user: bool, is_ring3: bool) -> ! {
-    if is_user {
-        if is_ring3 {
-            // True user-mode fault — no kernel locks held, safe to use normal exit
+///
+/// One argument, and it is [`Blame`]: this used to take `is_user` and
+/// `is_ring3` as separate `bool`s, whose fourth combination — a user fault from
+/// a frame that was not Ring 3 and was not in a syscall either — meant nothing
+/// and was writable all the same. The three arms below are the three states
+/// there are.
+pub(crate) fn recover_or_halt(blame: Blame) -> ! {
+    match blame {
+        // True user-mode fault — no kernel locks held, safe to use normal exit.
+        Blame::Process => {
             percpu::set_fault_state(CpuFaultState::Normal);
+            crate::panic::forget();
             syscall::kill_process(-1);
-        } else {
-            // Kernel fault during syscall — may hold locks, use try_lock path
-            try_recover_from_panic();
         }
+        // Kernel fault on the thread's behalf — may hold locks, use try_lock path.
+        Blame::ProcessThroughKernel => try_recover_from_panic(),
+        Blame::Kernel => apic::halt_all_cpus(),
     }
-    apic::halt_all_cpus();
 }
 
 /// Recover from a panic in syscall context. Hands the faulted thread to the
@@ -332,6 +393,12 @@ pub(crate) fn try_recover_from_panic() -> ! {
         scheduler::poison_tid(scheduler::TaskId(pid, tid));
     }
     percpu::set_fault_state(CpuFaultState::Normal);
+    // The crash this CPU was in is over, so its captured evidence dies with it
+    // — the same reason `panic_console::discard_capture` is called beside this
+    // on the panic path. Left standing, the next `DOUBLE PANIC` on this CPU
+    // would name a panic the machine survived an hour ago as the crash it had
+    // just landed on top of.
+    crate::panic::forget();
     scheduler::schedule_no_return();
 }
 
@@ -357,7 +424,7 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
         core::arch::asm!("mov dr7, {}", in(reg) 0u64);
         core::arch::asm!("mov dr6, {}", in(reg) 0u64);
     }
-    let is_user = frame.cs & RPL_MASK != 0;
+    let is_user = Ring::of_cs(frame.cs).is_user();
     let tid = percpu::current_tid();
     let pid = percpu::current_pid();
 
@@ -385,7 +452,7 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
 
     log!("  Backtrace:");
     if is_user {
-        let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>() as *const u64;
+        let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>();
         if let Some(pid) = pid {
             user_backtrace(pid, frame.rbp, pml4, 20);
         }
@@ -395,7 +462,7 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
 
     let watched_addr: u64;
     unsafe { core::arch::asm!("mov {}, dr0", out(reg) watched_addr); }
-    if mm::is_kernel_addr(watched_addr) && watched_addr % 8 == 0 {
+    if mm::is_kernel_addr(watched_addr) && watched_addr.is_multiple_of(8) {
         let val = unsafe { *(watched_addr as *const u64) };
         log!("  Value at watched addr {:#x} = {:#018x}", watched_addr, val);
     }
@@ -515,7 +582,7 @@ pub(super) fn page_fault_handler(frame: &TrapFrame) {
 
     let fault_addr = cpu::read_cr2();
 
-    if frame.error_code & PF_PRESENT != 0 && frame.cs & RPL_MASK == 0
+    if frame.error_code & PF_PRESENT != 0 && !Ring::of_cs(frame.cs).is_user()
         && mm::is_kernel_addr(fault_addr)
     {
         log!("SMAP cr2={:#018x} rip={:#018x} err={:#018x} rflags={:#018x}",
@@ -527,7 +594,7 @@ pub(super) fn page_fault_handler(frame: &TrapFrame) {
 
     // Only handle not-present faults — protection violations are always fatal
     if frame.error_code & PF_PRESENT == 0 {
-        let is_user = frame.cs & RPL_MASK != 0;
+        let is_user = Ring::of_cs(frame.cs).is_user();
         if is_user || percpu::current_tid().is_some() {
             if process::handle_page_fault(fault_addr, frame.error_code) {
                 percpu::set_fault_state(percpu::CpuFaultState::Normal);
@@ -559,9 +626,24 @@ pub(super) fn exception_handler(frame: &TrapFrame) -> ! {
 
 /// Core fatal exception logic. Prints diagnostics, then kills process or halts all CPUs.
 fn fatal_exception(ctx: &ExceptionContext) -> ! {
-    let is_user = ctx.is_user_fault();
+    let blame = ctx.blame();
     let prev = percpu::swap_fault_state(CpuFaultState::Fatal);
     let recursive = prev == CpuFaultState::Fatal || prev == CpuFaultState::Panic;
+
+    // Before this fault has said one word about itself, because a panic taken
+    // anywhere below — inside `emit`, inside a symbol walk, inside the page
+    // walk — reaches the panic handler with this CPU already `Fatal` and gets
+    // the `DOUBLE PANIC` arm, which can then only report what was captured
+    // here. `panic.rs` owns the argument; the ordering is the whole of it.
+    crate::panic::record_fault(
+        vector_name(ctx.vector()),
+        ctx.frame.rip,
+        ctx.cr2,
+        ctx.frame.error_code,
+    );
+    if crate::actuator::panic_in_report() {
+        panic!("panic-in-report: the crash report panicked before it said anything");
+    }
 
     let tid_raw = percpu::current_tid().map_or(u32::MAX, |t| t.raw());
     if recursive {
@@ -572,14 +654,19 @@ fn fatal_exception(ctx: &ExceptionContext) -> ! {
             ctx.frame.rip, ctx.cr2, ctx.frame.error_code, cpu::read_cr3(), ctx.frame.rsp, tid_raw);
     }
 
+    // A second fault while reporting the first: no second report, and the
+    // normal exit path even for the `ProcessThroughKernel` case — this CPU is
+    // not going to survive `try_recover_from_panic`'s rejoin either way, and
+    // ending the process is the only thing left that can keep the machine.
     if recursive {
-        if is_user {
+        if blame != Blame::Kernel {
             percpu::set_fault_state(CpuFaultState::Normal);
+            crate::panic::forget();
             syscall::kill_process(-1);
         }
         apic::halt_all_cpus();
     }
 
     crash_report(&CrashInfo::Exception(ctx));
-    recover_or_halt(is_user, ctx.is_user_mode());
+    recover_or_halt(blame);
 }

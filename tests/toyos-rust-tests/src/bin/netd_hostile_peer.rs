@@ -1,9 +1,9 @@
 //! The network stack must survive a client that stops talking.
 //!
-//! netd used to `accept` and then call `ipc::recv_header` on the fresh fd, and
+//! netd used to `accept` and then call `ipc::recv_header` on the fresh connection, and
 //! `read_exact` behind it is a *blocking* read — so one client that connected
 //! and wrote four bytes stopped the network stack for everyone until it
-//! disconnected. Its dispatch read every payload off the fd too, so a whole
+//! disconnected. Its dispatch read every payload off the connection too, so a whole
 //! header followed by silence did the same on a connection that had already
 //! said what it wanted. This is the compositor's closed defect, line for line,
 //! in the last daemon that still had it.
@@ -20,6 +20,7 @@ use std::process::exit;
 use std::time::{Duration, Instant};
 
 use toyos::endow;
+use toyos::AsHandle;
 use toyos::ipc::{self, RxStep};
 use toyos::net::{MsgType, RespType};
 use toyos::Connection;
@@ -49,7 +50,7 @@ const SILENT_BURST: usize = 48;
 /// One netd pass per connection, so the table fills instead of the *kernel's*
 /// 32-deep unaccepted queue refusing the connects before netd ever sees them.
 const BURST_PACE: Duration = Duration::from_millis(1);
-/// Long enough for netd to take one pass over a poller full of ready fds. Two
+/// Long enough for netd to take one pass over a poller full of ready handles. Two
 /// orders of magnitude over the pass itself, and far inside netd's own 2 s
 /// handshake deadline, which is what would make the survivors miscount.
 const SETTLE: Duration = Duration::from_millis(100);
@@ -97,7 +98,7 @@ fn main() {
         let conn = endow::service("netd")
             .unwrap_or_else(|e| panic!("[{}] netd is not serving: {e:?}", case.name));
         if !case.bytes.is_empty() {
-            let written = syscall::write(conn.fd(), &case.bytes)
+            let written = syscall::write(conn.as_handle(), &case.bytes)
                 .unwrap_or_else(|e| panic!("[{}] could not write the frame: {e:?}", case.name));
             assert_eq!(written, case.bytes.len(), "[{}] partial frame write", case.name);
         }
@@ -213,7 +214,7 @@ fn ruled_on(conn: &Connection, within: Duration) -> bool {
         match conn.read_nonblock(&mut buf) {
             Ok(_) => return true,
             Err(syscall::SyscallError::WouldBlock) => syscall::nanosleep(POLL.as_nanos() as u64),
-            // The fd itself is gone, which is the same hang-up seen from the
+            // The connection itself is gone, which is the same hang-up seen from the
             // other end of the same race.
             Err(_) => return true,
         }

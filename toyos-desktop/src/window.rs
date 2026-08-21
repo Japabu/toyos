@@ -12,6 +12,24 @@ pub enum WindowMode {
     SnappedRight,
 }
 
+/// A window's identity, stable for as long as it is in a [`Stack`](crate::stack::Stack).
+///
+/// Its position is not: every close, reorder or dead-client sweep can move a
+/// window or remove it, so state that outlives one event-loop pass — a drag,
+/// a resize — must not name a window by where it sat when the state began.
+/// [`Stack::insert`](crate::stack::Stack::insert) is the only place one is
+/// minted, and [`Stack::position`](crate::stack::Stack::position) is how it
+/// is turned back into a position, fresh, every time it is needed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct WindowId(pub(crate) u64);
+
+impl WindowId {
+    /// [`Window::new`]'s placeholder before the window has ever been in a
+    /// stack. `Stack::insert` never hands this out — its counter starts at 1
+    /// — so a caller can tell an unminted window from a real one.
+    pub(crate) const UNASSIGNED: Self = Self(0);
+}
+
 /// A window as the desktop reasons about it: geometry, order and state.
 ///
 /// `C` is whatever the compositor needs to *reach* the client — a connection,
@@ -21,6 +39,8 @@ pub enum WindowMode {
 /// reordering the stack cannot desynchronise geometry from the connection it
 /// belongs to, which a second parallel list would allow.
 pub struct Window<C> {
+    /// Assigned by `Stack::insert`; see [`WindowId`].
+    pub id: WindowId,
     pub client: C,
     /// The client's own pixels, in screen coordinates.
     pub content: Rect,
@@ -49,6 +69,7 @@ impl<C> Window<C> {
         cursor_style: CursorStyle,
     ) -> Self {
         Self {
+            id: WindowId::UNASSIGNED,
             client,
             content,
             buf_w: content.w(),

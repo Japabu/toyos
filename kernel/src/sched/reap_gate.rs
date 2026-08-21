@@ -28,6 +28,25 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "loom")]
 use loom::sync::atomic::{AtomicBool, Ordering};
 
+/// The store that enrols work, and what it carries.
+///
+/// A raise is made *after* the work it is about — the poison slot written, the
+/// process's exit stored — so this release is the whole edge between the raiser
+/// and the claimer: the reaper reads both with the process table held and
+/// nothing else ordering it against the raiser.
+///
+/// **A cargo feature rather than a comment, because a model that has never
+/// failed proves nothing.** `kernel-loom`'s `reap-raise-relaxed` makes it
+/// `Relaxed` and `kernel-loom/tests/reap_gate.rs` must red under it, at
+/// `a_claim_sees_the_enrolled_work` — a claimed gate then hands the reaper an
+/// empty poison slot, which is the class x86's TSO hides from every guest test
+/// in this tree. No kernel build can turn the name on: the kernel declares it
+/// only so `cfg` checking knows it.
+#[cfg(not(feature = "reap-raise-relaxed"))]
+const ENROL: Ordering = Ordering::Release;
+#[cfg(feature = "reap-raise-relaxed")]
+const ENROL: Ordering = Ordering::Relaxed;
+
 /// Whether the idle loop has cleanup waiting for it.
 pub struct ReapGate {
     pending: AtomicBool,
@@ -42,6 +61,9 @@ impl ReapGate {
         Self { pending: AtomicBool::new(false) }
     }
 
+    // No `Default` beside it: the arm above is the one the kernel builds, it
+    // has to stay `const` for the `static`, and `Default::default` cannot be.
+    #[allow(clippy::new_without_default)]
     #[cfg(feature = "loom")]
     pub fn new() -> Self {
         Self { pending: AtomicBool::new(false) }
@@ -53,7 +75,7 @@ impl ReapGate {
     /// the process's exit stored — so that the release here carries it: a
     /// claimer that reads this store reads everything the raiser did before it.
     pub fn raise(&self) {
-        self.pending.store(true, Ordering::Release);
+        self.pending.store(true, ENROL);
     }
 
     /// Claim the pending work, if there is any.

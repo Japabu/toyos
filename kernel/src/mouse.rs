@@ -1,7 +1,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, Ordering};
-use crate::io_uring::RingId;
+use crate::inbox::InboxId;
 use crate::sync::Lock;
 pub use toyos_abi::input::MouseEvent;
 
@@ -16,7 +16,7 @@ static MOUSE_BUF: Lock<VecDeque<MouseEvent>> = Lock::new(VecDeque::new());
 pub const MAX_QUEUED_EVENTS: usize = 512;
 static LAST_X: AtomicU16 = AtomicU16::new(0);
 static LAST_Y: AtomicU16 = AtomicU16::new(0);
-static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
+static INBOX_WATCHERS: Lock<Vec<InboxId>> = Lock::new(Vec::new());
 
 /// Which physical pointer a report came from. Buttons are tracked per source
 /// and published as their OR: with two live pointers a report carrying
@@ -148,22 +148,22 @@ pub fn set_screen(width: u32, height: u32) {
     crate::log!("mouse: rel scale x={} y={} (screen {}x{})", x, y, width, height);
 }
 
-pub fn add_io_uring_watcher(id: RingId) {
-    let mut w = IO_URING_WATCHERS.lock();
+pub fn add_inbox_watcher(id: InboxId) {
+    let mut w = INBOX_WATCHERS.lock();
     if !w.contains(&id) { w.push(id); }
 }
 
-pub fn remove_io_uring_watcher(id: RingId) {
-    IO_URING_WATCHERS.lock().retain(|&x| x != id);
+pub fn remove_inbox_watcher(id: InboxId) {
+    INBOX_WATCHERS.lock().retain(|&x| x != id);
 }
 
 /// Wake every thread blocked on mouse input.
 pub fn wake_waiters() {
-    crate::sched::waitqs::wake_all(&crate::sched::waitqs::MOUSE);
+    crate::sched::waitqs::wake_device(&crate::sched::waitqs::MOUSE_WATCH);
 }
 
-pub fn io_uring_watchers() -> Vec<RingId> {
-    IO_URING_WATCHERS.lock().clone()
+pub fn inbox_watchers() -> Vec<InboxId> {
+    INBOX_WATCHERS.lock().clone()
 }
 
 /// Queue one pointer update. Returns true iff an event was queued.

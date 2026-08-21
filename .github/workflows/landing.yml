@@ -1,14 +1,14 @@
 name: landing
 
 # The two checks about the landing protocol rather than about the code — rules
-# `cargo run -- --land` used to enforce on the dev host, now retired
-# (specs/worktrees.md §5), so CI is the only thing left between a branch and
-# `main`.
+# `cargo run -- --land` used to enforce on the dev host, now retired, so CI is
+# the only thing left between a branch and `main`.
 
 on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
   workflow_dispatch:
 
 concurrency:
@@ -16,12 +16,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # A sysroot change may not be merged with the work that depends on it
-  # (specs/worktrees.md §3.2): `toyos-abi/src`, `toyos/src` and
-  # `userland/libc/src` compile into the one sysroot every worktree builds
-  # against, so the sysroot half must land first. The same function answers
-  # here and at `cargo run -- --pr`, so a branch that skipped the preflight
-  # gets the identical refusal from this check.
+  # A sysroot change may not be merged with the work that depends on it:
+  # `toyos-abi/src`, `toyos/src` and `userland/libc/src` compile into the one
+  # sysroot every worktree builds against, so the sysroot half must land first.
+  # The same function answers here and at `cargo run -- --pr`, so a branch that
+  # skipped the preflight gets the identical refusal from this check.
   abi-split:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -61,7 +60,7 @@ jobs:
 
   # What protects `main` is configured outside the repository, and this job
   # reads it back into VCS: half of it is readable from an endpoint that needs
-  # no token (specs/assessments/ci-plan-assessment-2026-08.md §10.5).
+  # no token.
   #
   # The name is fixed: a required-check context is matched by job name, and
   # renaming it is a ruleset change with a window in which a required check
@@ -90,7 +89,7 @@ jobs:
           curl -sSL --fail -H "Authorization: Bearer $GH_TOKEN" "$api" -o /tmp/rules.json
           jq . /tmp/rules.json
 
-          # Five (specs/testing-strategy.md §4); `tcg` is not one of them —
+          # The five required checks, and `tcg` is not one of them —
           # it moved to the nightly schedule (`ci.yml`) and the loop below is
           # a minimum, not an equality, so a `tcg` still required at GitHub is
           # reported rather than refused.
@@ -119,14 +118,18 @@ jobs:
               *) echo "::error::main has no \`$want\` rule"; bad=1 ;;
             esac
           done
-          # Strict is what makes a check on this head a check on the merged
-          # result — specs/assessments/ci-plan-assessment-2026-08.md §10.2, and
-          # the property `--land`'s `git merge --no-ff main` used to carry.
-          if [ "$strict" != true ]; then
-            echo "::error::required checks are not strict, so a branch could merge without"
-            echo "::error::containing main and its checks would not be about the merged result"
-            bad=1
-          fi
+          # What a merge's checks are about is the owner's law, and it eased on
+          # 2026-08-20: strict up-to-date branches taxed every landing with one
+          # fresh CI cycle for every other open PR, and GitHub's merge queue —
+          # the configuration that keeps the merged-result property without the
+          # tax — exists only for organization-owned repositories, which this
+          # one is not yet. So a branch's checks are its own, `main`'s
+          # push-triggered run is the merged-result check, and a red on
+          # `main`'s tip is adjudicated at once like any other red. The gate
+          # still reads the regime back and reports it; a required merge
+          # queue, when the repository can carry one, restores the stronger
+          # property for free and this gate already recognises it.
+          queued=$(case " $rules " in *" merge_queue "*) echo true;; *) echo false;; esac)
           # CLAUDE.md's "never rewrite history", said at the remote.
           [ "$methods" = merge ] \
             || { echo "::error::main allows merge methods \`$methods\`, not just \`merge\`"; bad=1; }
@@ -136,7 +139,7 @@ jobs:
             echo ""
             echo "- rules: \`$rules\`"
             echo "- required checks: \`$live\`"
-            echo "- strict: \`$strict\`, merge methods: \`$methods\`"
+            echo "- strict: \`$strict\`, merge queue: \`$queued\`, merge methods: \`$methods\`"
           } >> "$GITHUB_STEP_SUMMARY"
           for have in $live; do
             case " $required " in
@@ -147,4 +150,6 @@ jobs:
           done
 
           test "$bad" = 0
-          echo "main is protected the way specs/assessments/ci-plan-assessment-2026-08.md §10.4 and §10.5 say it is."
+          echo "main is protected: the five checks above are required (strict=$strict,"
+          echo "queue=$queued); merge is the only method, and neither deletion nor a"
+          echo "force-push is allowed."

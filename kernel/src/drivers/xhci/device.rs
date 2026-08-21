@@ -296,8 +296,8 @@ fn parse_config(buf: &[u8]) -> Option<(u8, Function)> {
 /// as much as it is a register bit — so the boot path spins on the register
 /// ([`init_device`]) while the runtime path comes back when the event arrives,
 /// and neither is a second implementation of the other. The T14's own root
-/// ports take 55 ms over this (`specs/reference/metal-hardware-inventory.md`), which is
-/// the whole reason the runtime path must not hold a scheduler pass across it.
+/// ports take 55 ms over this, measured, which is the whole reason the runtime
+/// path must not hold a scheduler pass across it.
 pub fn reset_port(ctrl: &mut XhciController, port_idx: u8, kind: Reset) {
     let portsc = ctrl.read_portsc(port_idx);
     ctrl.write_portsc(port_idx, port::reset_write(kind, portsc));
@@ -547,12 +547,11 @@ fn control(
     if data.is_some() {
         unsafe { write_bytes(dma.ptr_at(OFF_DATA_BUF), 0, MAX_CONFIG_DESC); }
     }
-    let has_data = enqueue_control(
+    let trbs = enqueue_control(
         &mut state.ep0_ring, bm_request_type, b_request, w_value, w_index, data, len,
     );
     ctrl.ring_doorbell(state.slot_id, 1);
-    let stages = if has_data { Stages::DataThenStatus } else { Stages::One };
-    (Await::Transfer { slot: state.slot_id, dci: 1 }, stages)
+    trbs.awaits(state.slot_id)
 }
 
 /// What one control request that completed left in the scratch page, and what

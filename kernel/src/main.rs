@@ -11,6 +11,7 @@ static DEBUG_WAIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 pub use mm::{UserAddr, DirectMap, PHYS_OFFSET};
 
 mod shootdown;
+mod sleeplock;
 mod sync;
 mod id_map;
 
@@ -21,6 +22,7 @@ mod drivers;
 mod log;
 mod actuator;
 mod mm;
+mod panic;
 
 mod keyboard;
 mod mouse;
@@ -28,6 +30,8 @@ mod mouse;
 mod input_merge_test;
 #[cfg(feature = "boot-actuators")]
 mod usb_gate;
+#[cfg(feature = "boot-actuators")]
+mod nvme_gate;
 mod block;
 mod gpt;
 mod page_cache;
@@ -50,11 +54,14 @@ mod iommu;
 mod preempt;
 mod irq_ring;
 mod trace;
+mod time;
 mod clock;
 mod rtc;
 
+mod completion;
+mod iod;
 mod object;
-mod io_uring;
+mod inbox;
 mod pipe;
 
 mod device;
@@ -91,81 +98,44 @@ use arch::{apic, cpu, idt, pat, percpu, smp, syscall};
 use drivers::{acpi, gop, i8042, ioapic, nvme, pci, serial, virtio_console, virtio_gpu, virtio_net, virtio_sound, xhci};
 use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
 
-/// Per-CPU panic-reentry depth, indexed by x2APIC id (masked). The panic path
-/// must not trust GS/percpu: a corrupted percpu block makes `swap_fault_state`
-/// itself fault, re-entering the panic handler in an unbounded recursion that
-/// smashes the stack down through the heap. CPUID is the only per-CPU
-/// discriminator that needs no memory access and no enabled unit at all.
-///
-/// A single global flag was rejected: it would stay set after a *recovered*
-/// panic and silently swallow every later, independent panic report, and a
-/// panic on one CPU would mask a concurrent first panic on another. Masking
-/// the APIC id to 64 slots only means colliding CPUs share a guard — a
-/// concurrent panic on both halts the second, which halt_all_cpus would do
-/// moments later anyway.
-static PANIC_DEPTH: [core::sync::atomic::AtomicU32; 64] =
-    [const { core::sync::atomic::AtomicU32::new(0) }; 64];
-
-/// This CPU's APIC id, from CPUID.
-///
-/// It used to be `rdmsr(IA32_X2APIC_APICID)` under a comment claiming APs
-/// enable x2APIC before running any panicking kernel code. They do not:
-/// `apic::init_ap` is three calls after `percpu::init_ap` in `ap_entry`, and
-/// that MSR is `#GP` until it has run. Every panic an AP took in between —
-/// `pat::init`'s assertion, `control_regs`', the FSGSBASE one that has been
-/// there all along — faulted *inside the reentry guard*, before the guard was
-/// armed, and the machine triple-faulted with the whole boot still unflushed in
-/// the log ring: no report, no backtrace, no serial output at all.
-///
-/// Leaf 0x1F and leaf 0xB give the full x2APIC id and leaf 1 the 8-bit initial
-/// one; the slot is masked to 64 either way, so the fallback loses nothing this
-/// array was keeping.
-fn apic_id() -> u32 {
-    let (max_leaf, _, _, _) = cpu::cpuid(0, 0);
-    for leaf in [0x1F, 0x0B] {
-        if max_leaf >= leaf {
-            let (_, ebx, _, edx) = cpu::cpuid(leaf, 0);
-            // Reaching the leaf index is not the existence test: SDM Vol. 2A,
-            // `CPUID` leaf 0BH, requires `EBX[15:0]` non-zero as well, and a CPU
-            // whose maximum leaf covers it without implementing it answers zero
-            // in every register. That is not a distinguisher — every CPU would
-            // take slot 0 and share one guard — and it is reached by skipping
-            // the leaf-1 fallback that is correct for exactly that machine.
-            if ebx & 0xFFFF != 0 {
-                return edx;
-            }
-        }
-    }
-    let (_, ebx, _, _) = cpu::cpuid(1, 0);
-    ebx >> 24
-}
-
-fn panic_depth_slot() -> &'static core::sync::atomic::AtomicU32 {
-    &PANIC_DEPTH[apic_id() as usize & 63]
-}
-
-/// Fixed-string output for the reentry path: direct UART port I/O — no
-/// locks, no log ring, no percpu, nothing that can fault or recurse.
-///
-/// Gated on the probe like every other UART access: on a machine with no
-/// 16550 the LSR reads 0xFF, so the wait falls through immediately and each
-/// byte is written to a port nothing answers.
-fn panic_raw_uart(msg: &[u8]) {
-    if !drivers::serial::uart_present() {
-        return;
-    }
-    for &b in msg {
-        // Bounded LSR wait so a wedged UART cannot hang the halt path.
-        for _ in 0..100_000 {
-            if cpu::inb(0x3FD) & 0x20 != 0 { break; }
-        }
-        cpu::outb(0x3F8, b);
-    }
-}
-
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+
+    // **Before every branch below, including the early one.** Everything this
+    // path does next can die; what this copies is what a *second* panic still
+    // has to report, and `panic.rs` argues why a bounded byte copy into a
+    // pre-reserved static is the only thing that may run at this depth. It
+    // declines when this CPU is already inside a crash, so the first one is
+    // what survives.
+    panic::record_panic(info);
+
+    // Reentry guard — checked before ANY fallible access (percpu fault
+    // state, logging, unwinding). A panic inside the panic path halts this
+    // CPU immediately with one raw report instead of recursing.
+    //
+    // **Ahead of the early-boot branch, which it used to sit below.** Nothing
+    // up to here reads memory this machine has had to set up — CPUID and two
+    // statics — while the early branch below formats a `PanicInfo` through the
+    // whole log path with no guard over it at all: a panic in *there* re-entered
+    // this handler, took the same branch again, and recursed until the stack
+    // met the heap. It costs a first panic nothing, because its depth is zero.
+    let depth = panic::depth_slot();
+    if depth.fetch_add(1, core::sync::atomic::Ordering::SeqCst) > 0 {
+        // No `prev`: the state swap is below this branch and reading percpu is
+        // exactly what this depth may not do. `on_the_record` is false because
+        // the report path is what has just panicked — this says it straight out
+        // the UART port and nowhere else.
+        panic::last_words("PANIC REENTRY: CPU halted", None, info, false);
+        // The one fatal branch that reached no channel at all on a machine
+        // with no UART. render() is safe here by construction: if the reentry
+        // came from a fault inside the renderer, PAINTING is already taken and
+        // this returns without touching a pixel. No capture() — the outer
+        // panic's snapshot is the report worth showing, and re-peeking a ring
+        // panic_flush may already have drained would replace it with nothing.
+        drivers::panic_console::render();
+        cpu::halt();
+    }
 
     // Early boot: percpu not ready, just halt (single CPU at this point)
     if !log::PERCPU_READY.load(core::sync::atomic::Ordering::Relaxed) {
@@ -184,26 +154,15 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         cpu::halt();
     }
 
-    // Reentry guard — checked before ANY fallible access (percpu fault
-    // state, logging, unwinding). A panic inside the panic path halts this
-    // CPU immediately with one raw line instead of recursing.
-    let depth = panic_depth_slot();
-    if depth.fetch_add(1, core::sync::atomic::Ordering::SeqCst) > 0 {
-        panic_raw_uart(b"\n!!! PANIC REENTRY: CPU halted !!!\n");
-        // The one fatal branch that reached no channel at all on a machine
-        // with no UART. render() is safe here by construction: if the reentry
-        // came from a fault inside the renderer, PAINTING is already taken and
-        // this returns without touching a pixel. No capture() — the outer
-        // panic's snapshot is the report worth showing, and re-peeking a ring
-        // panic_flush may already have drained would replace it with nothing.
-        drivers::panic_console::render();
-        cpu::halt();
-    }
-
     let prev = percpu::swap_fault_state(percpu::CpuFaultState::Panic);
     if prev != percpu::CpuFaultState::Normal {
-        // Nested: Panic→Panic, Fatal→Panic, PageFault→Panic. Escalate.
-        alert!("DOUBLE PANIC");
+        // Nested: Panic→Panic, Fatal→Panic, PageFault→Panic. Escalate — and
+        // say what the crash it landed on top of was. This branch is reached
+        // with the reentry depth at zero, so the first event is one no panic
+        // handler is inside: a fatal exception mid-report, or a demand-paging
+        // fault. `DOUBLE PANIC` on its own named neither, which is the whole of
+        // `issues/panic-path/a-double-panic-at-boots-edge-says-nothing-but-its-name.md`.
+        panic::last_words("DOUBLE PANIC", Some(prev), info, true);
         apic::halt_all_cpus();
     }
 
@@ -235,7 +194,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // **A kernel thread answers from its own row and never from the two words
     // below**, because for one of them the words do not merely give the wrong
     // answer — they give a *nondeterministic* one. `syscall_rip` is never
-    // cleared (`specs/issues/panic-path/syscall-rip-never-cleared.md`), so a
+    // cleared (`issues/panic-path/syscall-rip-never-cleared.md`), so a
     // kernel task reads whatever user thread last ran on this CPU left behind:
     // the same panic on the same build would recover or halt depending on which
     // CPU work stealing had put the thread on. `sched::kthread` is where the
@@ -256,6 +215,15 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
 /// Kernel entry point. Called by bootloader with rdi = &KernelArgs.
 /// Switches to the kernel's own stack, then falls through to init.
+///
+/// # Safety
+///
+/// Nothing in this kernel may call it, and the bar is the machine rather than
+/// the argument: it is the bootloader's jump target on a CPU that has just left
+/// firmware — one CPU running, interrupts off, the bootloader's page tables
+/// still live, and `rdi` holding a [`KernelArgs`] the bootloader wrote and keeps
+/// mapped. The body's first act is to move `rsp` to the kernel's own stack, so a
+/// Rust caller would be moved off the stack it is standing on.
 #[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "sysv64" fn _start(_kernel_args: &KernelArgs) -> ! {
@@ -403,8 +371,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // everything above 200 characters in the measured corpus is this line, 18
     // of 12,497 — and unlike a demangled symbol it is a producer the kernel can
     // split. So it is split, grouped by the question each field answers, rather
-    // than truncated with a count of what was lost
-    // (`specs/log-architecture-spec.md` §2.1).
+    // than truncated with a count of what was lost.
     log!(
         "boot: memory map {:#x}+{:#x}, kernel {:#x}+{:#x}, stack {:#x}+{:#x}",
         kernel_args.memory_map_addr, kernel_args.memory_map_size,
@@ -501,8 +468,8 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     let ecam = mm::paging::map_mmio(ecam_base, 256 * 32 * 8 * 4096, CachePolicy::DeferToMtrr);
     let pci_devices = pci::enumerate(&ecam);
     // After ACPI is readable and PCI is enumerable, before any driver `init`:
-    // the unit has to be programmed before the first device is told to do DMA
-    // (`specs/iommu-spec.md` §2.1), and every function the walk above returned
+    // the unit has to be programmed before the first device is told to do DMA,
+    // and every function the walk above returned
     // has to have a context entry before translation comes on. Refuses nothing
     // — a machine with no usable unit boots exactly as it does without one.
     iommu::init(kernel_args.rsdp_addr, &pci_devices);
@@ -529,6 +496,12 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
             let sector_size = nvme_dev.sector_size();
             gpt::probe(&mut nvme_dev, sector_size);
             page_cache::init(Box::new(nvme_dev));
+            // Before anything has mounted the device, so the one block the gate
+            // asks for is one nothing else is reading yet.
+            #[cfg(feature = "boot-actuators")]
+            if actuator::nvme_spent_budget() {
+                nvme_gate::run();
+            }
             bcachefs_adapter::open_home()
         }
         None => {
@@ -573,7 +546,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     process::init();
     scheduler::init();
     pipe::init();
-    io_uring::init();
+    inbox::init();
 
 
     // Mount initrd as read-only root filesystem (bcachefs, no extraction)
@@ -609,7 +582,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // unbootable. The log volume is not — it is a diagnostic partition whose
     // worst loss is the diagnostic, and `toybox` writes to it. That the log
     // file itself is unprotected is the residual; see
-    // `specs/issues/boot-media/log-is-userland-writable.md`.
+    // `issues/boot-media/log-is-userland-writable.md`.
     match fat32_adapter::mount(Role::Boot) {
         Some(fs) => vfs::lock().mount(Role::Boot.mount(), Box::new(fs), UserAccess::KernelOnly),
         None => log!("boot-volume: not mounted; the kernel has no /boot this boot"),
@@ -634,6 +607,14 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 
     // Phase 6: Devices
     let t_devices = clock::nanos_since_boot();
+
+    // Once for the machine, before any device is brought up: it touches no
+    // device and reads no register, so a run per virtio driver would say the
+    // same thing four times.
+    #[cfg(feature = "boot-actuators")]
+    if actuator::virtio_used_selftest() {
+        drivers::virtio::used_selftest();
+    }
 
     virtio_console::init(&pci_devices);
     virtio_net::init(&pci_devices);
@@ -660,7 +641,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
         register_gpu(gpu_driver, gpu_info);
     } else {
         log!("GPU: none found, running headless");
-    };
+    }
 
     boot_phase!("devices ready", t_devices);
 
@@ -697,13 +678,29 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
             late_panic::Nest<late_panic::Nest<()>>>>>>>>>>::on_screen_console_check();
     }
 
+    // A Ring 0 exception, in the same window and for the same reason the panic
+    // above is here: nothing is current, so `blame` is `Kernel` and
+    // `fatal_exception` takes the branch that halts the machine. `ud2` is the
+    // one instruction whose whole architectural meaning is #UD, so what arrives
+    // at the handler is a real fault and not a simulated one.
+    if actuator::test_kernel_fault() {
+        unsafe { core::arch::asm!("ud2", options(nomem, nostack)) };
+    }
+
     // The last thing before the machine hands itself to the scheduler, because
     // that is the first moment anything can run: the APs spin on `SMP_READY`
     // below and the BSP reaches no pass before `enter_idle_loop`. A `klogd`
     // spawned earlier would sit in a run queue through phases 5, 6 and 7 —
     // which is the window a machine with no console wedges in — while the boot
-    // believed it had a drainer. `specs/log-architecture-spec.md` §4.2.
+    // believed it had a drainer.
     log::console::start();
+    // The other two of §10's three, beside the drainer and for the same reason:
+    // a device's work needs a context of its own rather than whichever thread
+    // happened to trap. Here rather than earlier because nothing can run before
+    // `enter_idle_loop` anyway, and after `klogd` because a kernel thread that
+    // logs its own spawn wants a drainer to exist.
+    drivers::xhci::usbd::start();
+    iod::start();
 
     smp::set_ready();
     crate::scheduler::enter_idle_loop();

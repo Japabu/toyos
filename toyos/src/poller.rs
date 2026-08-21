@@ -1,20 +1,25 @@
-//! Event-driven I/O polling via io_uring.
+//! Event-driven I/O polling on an [inbox](toyos_abi::inbox).
 
 use core::sync::atomic::Ordering;
 use toyos_abi::RawHandle;
 use toyos_abi::syscall;
-use toyos_abi::io_uring::{
-    IoUringSqe, IoUringCqe, IoUringRingHeader, IoUringParams,
-    IORING_OP_POLL_ADD, SQ_RING_OFF, CQ_RING_OFF, SQES_OFF,
+use toyos_abi::inbox::{
+    Submission, Completion, RingHeader, RingLayout,
+    OP_WATCH, SUBMISSION_RING_OFF, COMPLETION_RING_OFF, SUBMISSIONS_OFF,
 };
 use crate::AsHandle;
 
-pub use toyos_abi::io_uring::{IORING_POLL_IN, IORING_POLL_OUT};
+pub use toyos_abi::inbox::{READABLE, WRITABLE};
 
-/// An io_uring instance for polling fd readiness.
+/// An inbox, for watching handles for readiness.
 ///
-/// Owns the ring fd and shared memory mapping. Submissions are batched
+/// Owns the inbox handle and shared memory mapping. Submissions are batched
 /// and flushed on [`wait`](Self::wait).
+///
+/// **Deliberately not called `Inbox`.** The ABI object is the kernel's
+/// `object::inbox` and a task's bounded record ring is `completion::inbox`;
+/// a third `Inbox` in userland would undo exactly the separation those two
+/// names keep. `Poller` is what this type does for its caller.
 ///
 /// **A poller has a declared capacity and cannot lose a completion inside it.**
 /// [`new`](Self::new) takes the number of handles the caller will watch at once
@@ -39,11 +44,11 @@ pub use toyos_abi::io_uring::{IORING_POLL_IN, IORING_POLL_OUT};
 /// counter — an assert that should now be unreachable, kept because that is
 /// the shape a fail-fast check is supposed to have.
 pub struct Poller {
-    ring_fd: RawHandle,
+    inbox: RawHandle,
     base: *mut u8,
     capacity: u32,
-    sq_size: u32,
-    cq_size: u32,
+    submission_ring_size: u32,
+    completion_ring_size: u32,
 }
 
 // Safety: the base pointer is process-local shared memory mapped from the
@@ -72,33 +77,33 @@ impl Poller {
             Self::MAX_HANDLES,
         );
         let entries = capacity.next_power_of_two();
-        // The ring owns its page and the kernel maps it: one call, and no
-        // second lifetime for a mapping that is only ever this ring's.
-        let (ring_fd, base) = unsafe { syscall::io_uring_setup(entries) }
-            .expect("Poller::new: io_uring_setup failed");
-        let params = unsafe { &*(base as *const IoUringParams) };
-        let sq_size = params.sq_ring_size;
-        let cq_size = params.cq_ring_size;
+        // The inbox owns its page and the kernel maps it: one call, and no
+        // second lifetime for a mapping that is only ever this inbox's.
+        let (inbox, base) = unsafe { syscall::inbox_setup(entries) }
+            .expect("Poller::new: inbox_setup failed");
+        let layout = unsafe { &*(base as *const RingLayout) };
+        let submission_ring_size = layout.submission_ring_size;
+        let completion_ring_size = layout.completion_ring_size;
         // The whole point of the sizing: `capacity` registrations fit the
         // submission ring with no mid-batch flush, and the completions they can
         // produce fit the completion ring.
-        assert!(sq_size >= capacity && cq_size >= 2 * capacity,
-            "Poller::new: kernel built {sq_size}/{cq_size} rings for {capacity} handles");
-        Self { ring_fd, base, capacity, sq_size, cq_size }
+        assert!(submission_ring_size >= capacity && completion_ring_size >= 2 * capacity,
+            "Poller::new: kernel built {submission_ring_size}/{completion_ring_size} rings for {capacity} handles");
+        Self { inbox, base, capacity, submission_ring_size, completion_ring_size }
     }
 
-    /// Submit a poll request for the given handle.
+    /// Watch the given handle for readiness.
     ///
-    /// `flags` are [`IORING_POLL_IN`] / [`IORING_POLL_OUT`].
+    /// `flags` are [`READABLE`] / [`WRITABLE`].
     /// `token` is returned in completions to identify which handle is ready.
-    pub fn poll_add(&self, handle: &impl AsHandle, flags: u32, token: u64) {
-        self.poll_add_fd(handle.as_handle(), flags, token);
+    pub fn watch(&self, handle: &impl AsHandle, flags: u32, token: u64) {
+        self.watch_raw(handle.as_handle(), flags, token);
     }
 
-    /// Submit a poll request for a raw fd.
+    /// Watch a raw handle for readiness.
     ///
-    /// Prefer [`poll_add`](Self::poll_add) when you have a typed handle.
-    pub fn poll_add_fd(&self, fd: RawHandle, flags: u32, token: u64) {
+    /// Prefer [`watch`](Self::watch) when you have a typed handle.
+    pub fn watch_raw(&self, handle: RawHandle, flags: u32, token: u64) {
         // A panic, because this is first-party code exceeding a bound it
         // declared itself. There used to be a mid-batch flush here instead;
         // that is what made completions reachable while the caller was still
@@ -111,42 +116,42 @@ impl Poller {
             self.pending(),
             self.capacity,
         );
-        let sq_hdr = unsafe {
-            &*(self.base.add(SQ_RING_OFF as usize) as *const IoUringRingHeader)
+        let ring = unsafe {
+            &*(self.base.add(SUBMISSION_RING_OFF as usize) as *const RingHeader)
         };
-        let tail = sq_hdr.tail.load(Ordering::Acquire);
-        let idx = tail & (self.sq_size - 1);
-        let sqe = unsafe {
-            &mut *(self.base.add(SQES_OFF as usize + idx as usize * core::mem::size_of::<IoUringSqe>()) as *mut IoUringSqe)
+        let tail = ring.tail.load(Ordering::Acquire);
+        let idx = tail & (self.submission_ring_size - 1);
+        let submission = unsafe {
+            &mut *(self.base.add(SUBMISSIONS_OFF as usize + idx as usize * core::mem::size_of::<Submission>()) as *mut Submission)
         };
-        *sqe = IoUringSqe::default();
-        sqe.op = IORING_OP_POLL_ADD;
-        sqe.fd = fd;
-        sqe.op_flags = flags;
-        sqe.user_data = token;
-        sq_hdr.tail.store(tail.wrapping_add(1), Ordering::Release);
+        *submission = Submission::default();
+        submission.op = OP_WATCH;
+        submission.handle = handle;
+        submission.op_flags = flags;
+        submission.token = token;
+        ring.tail.store(tail.wrapping_add(1), Ordering::Release);
     }
 
     /// Number of pending submissions (not yet flushed to the kernel).
     pub fn pending(&self) -> u32 {
-        let sq_hdr = unsafe {
-            &*(self.base.add(SQ_RING_OFF as usize) as *const IoUringRingHeader)
+        let ring = unsafe {
+            &*(self.base.add(SUBMISSION_RING_OFF as usize) as *const RingHeader)
         };
-        let head = sq_hdr.head.load(Ordering::Acquire);
-        let tail = sq_hdr.tail.load(Ordering::Acquire);
+        let head = ring.head.load(Ordering::Acquire);
+        let tail = ring.tail.load(Ordering::Acquire);
         tail.wrapping_sub(head)
     }
 
     /// Hand the queued submissions to the kernel.
     ///
-    /// The `expect` is sound because every error `io_uring_enter` can report is
-    /// about an argument this type owns — an over-deep batch, or a ring id that
-    /// is not this poller's fd. Nothing a peer process does reaches it: a
-    /// timeout or an empty completion queue is `Ok`.
+    /// The `expect` is sound because every error `inbox_submit` can report is
+    /// about an argument this type owns — an over-deep batch, or a handle that
+    /// is not this poller's inbox. Nothing a peer process does reaches it: a
+    /// timeout or an empty completion ring is `Ok`.
     fn submit(&self, min_complete: u32, timeout_nanos: u64) {
         let to_submit = self.pending();
-        syscall::io_uring_enter(self.ring_fd, to_submit, min_complete, timeout_nanos)
-            .expect("Poller::submit: io_uring_enter rejected the batch");
+        syscall::inbox_submit(self.inbox, to_submit, min_complete, timeout_nanos)
+            .expect("Poller::submit: inbox_submit rejected the batch");
     }
 
     /// Submit pending entries and wait for completions.
@@ -156,8 +161,8 @@ impl Poller {
     pub fn wait(&self, min_complete: u32, timeout_nanos: u64, mut f: impl FnMut(u64)) {
         self.submit(min_complete, timeout_nanos);
 
-        let cq_hdr = unsafe {
-            &*(self.base.add(CQ_RING_OFF as usize) as *const IoUringRingHeader)
+        let ring = unsafe {
+            &*(self.base.add(COMPLETION_RING_OFF as usize) as *const RingHeader)
         };
 
         // Unreachable, and kept for that reason: `capacity` bounds the
@@ -167,38 +172,39 @@ impl Poller {
         // wrong this fires and stays fired instead of turning into a caller
         // blocked forever on readiness that was thrown away — which is what it
         // was before anyone read this field at all.
-        let dropped = cq_hdr.dropped.load(Ordering::Relaxed);
+        let dropped = ring.dropped.load(Ordering::Relaxed);
         assert_eq!(
             dropped, 0,
             "Poller: the kernel dropped {dropped} completion(s) with capacity {} \
              and rings {}/{} — the sizing rule is wrong, not the caller.",
-            self.capacity, self.sq_size, self.cq_size,
+            self.capacity, self.submission_ring_size, self.completion_ring_size,
         );
 
         loop {
-            let head = cq_hdr.head.load(Ordering::Acquire);
-            let tail = cq_hdr.tail.load(Ordering::Acquire);
+            let head = ring.head.load(Ordering::Acquire);
+            let tail = ring.tail.load(Ordering::Acquire);
             if head == tail {
                 break;
             }
-            let idx = head & (self.cq_size - 1);
-            let cqe = unsafe {
-                &*(self.base.add(CQ_RING_OFF as usize + 16 + idx as usize * core::mem::size_of::<IoUringCqe>()) as *const IoUringCqe)
+            let idx = head & (self.completion_ring_size - 1);
+            let completion = unsafe {
+                &*(self.base.add(COMPLETION_RING_OFF as usize + 16 + idx as usize * core::mem::size_of::<Completion>()) as *const Completion)
             };
-            // Do not filter on `cqe.result`. A negative result is the kernel
-            // saying the registration is over and will never fire (`remove_fd`
-            // posts `-NotFound` when a watched handle closes, i.e. on any peer
-            // disconnect), and the caller must react to that exactly as to
-            // readiness — by looking at the handle again. A zero result is
-            // meaningful too: `IORING_OP_ACCEPT` reports fd 0 that way.
-            f(cqe.user_data);
-            cq_hdr.head.store(head.wrapping_add(1), Ordering::Release);
+            // Do not filter on `completion.result`. A negative result is the
+            // kernel saying the registration is over and will never fire
+            // (`cancel_by_source` posts `-NotFound` when a watched handle
+            // closes, i.e. on any peer disconnect), and the caller must react
+            // to that exactly as to readiness — by looking at the handle again.
+            // A zero result is meaningful too: `OP_ACCEPT` reports handle 0
+            // that way.
+            f(completion.token);
+            ring.head.store(head.wrapping_add(1), Ordering::Release);
         }
     }
 }
 
 impl Drop for Poller {
     fn drop(&mut self) {
-        syscall::close(self.ring_fd);
+        syscall::close(self.inbox);
     }
 }

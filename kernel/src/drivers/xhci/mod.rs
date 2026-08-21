@@ -1,6 +1,7 @@
 mod device;
 mod hid;
 mod legacy;
+pub mod usbd;
 mod wait;
 
 use wait::msc;
@@ -8,7 +9,7 @@ use wait::msc;
 /// The driver's whole surface to the rest of the kernel. Everything that waits
 /// lives under [`wait`] — see its own documentation for why that is a module
 /// boundary and not a type.
-pub use wait::boot::{init, PORT_POLL_NS, PORT_SETTLE_CEILING_NS};
+pub use wait::boot::{init, PORT_POLL, PORT_SETTLE_CEILING};
 pub use wait::msc::{storage_flush, storage_read, storage_write};
 
 use alloc::vec::Vec;
@@ -21,6 +22,7 @@ use crate::log;
 use super::pci::PciDevice;
 use super::DmaPool;
 use crate::sync::Lock;
+use toyos_untrusted::Untrusted;
 use toyos_xhci::job::{Await, Outcome, Outstanding, Stages};
 use toyos_xhci::port::{self as portmachine, GaveUp, Gone, PortState, Reset, Step};
 use toyos_xhci::recovery::{self, Act, EndpointState, NeedsConfigure, Recovery};
@@ -223,7 +225,7 @@ impl core::fmt::Display for Answer {
 /// `slot 1` names two different devices and nothing reading the log can tell
 /// which. That is not hypothetical: a harness assertion counting endpoint
 /// recoveries counted the boot disk's as a mouse's on three CI runs
-/// (`specs/issues/hardware/xhci-hid-break-counts-any-endpoint-3.md`), and the
+/// (`issues/hardware/xhci-hid-break-counts-any-endpoint-3.md`), and the
 /// same shape counted the boot stick's transport recovery as the disk under
 /// test's (`…/usb-transport-break-counts-the-boot-sticks-recovery.md`).
 ///
@@ -262,9 +264,37 @@ fn earliest(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     }
 }
 
-/// Put one control transfer's TRBs on an EP0 ring, and say whether it carries
-/// a data stage — which is what decides how many completions it produces and
-/// therefore what a caller has to wait for.
+/// Where a control transfer's completions come from.
+///
+/// **The addresses and not a count**, which is what [`Await::Transfer`]'s TRB
+/// address needs: a Transfer Event names the TRB that generated it, so the two
+/// stages of one control transfer are two named events rather than two
+/// anonymous ones on the same endpoint.
+#[derive(Clone, Copy)]
+struct ControlTrbs {
+    /// The Data Stage TRB, for a transfer that carries one. It is the stage
+    /// that says how many bytes arrived, so it is the one an operation is
+    /// submitted on.
+    data: Option<u64>,
+    /// The Status Stage TRB, which every control transfer has and which is the
+    /// device's verdict on the whole of it.
+    status: u64,
+}
+
+impl ControlTrbs {
+    /// What the driver waits for, as [`Outstanding::submit`] wants it: the
+    /// first completion owed, and whatever is owed after it.
+    fn awaits(self, slot: u8) -> (Await, Stages) {
+        let on = |trb| Await::Transfer { slot, dci: 1, trb };
+        match self.data {
+            Some(data) => (on(data), Stages::DataThenStatus(on(self.status))),
+            None => (on(self.status), Stages::One),
+        }
+    }
+}
+
+/// Put one control transfer's TRBs on an EP0 ring, and say where each of its
+/// completions will come from.
 ///
 /// Separate from the wait because the two ends have different callers: an
 /// endpoint recovery stepped across scheduler passes submits here and comes
@@ -278,7 +308,7 @@ fn enqueue_control(
     w_index: u16,
     data_buf: Option<u64>,
     data_len: u16,
-) -> bool {
+) -> ControlTrbs {
     let is_in = (bm_request_type & 0x80) != 0;
     let has_data = data_len > 0 && data_buf.is_some();
     let trt = if !has_data { 0u32 } else if is_in { 3 } else { 2 };
@@ -289,7 +319,7 @@ fn enqueue_control(
     setup.control = TRB_SETUP_STAGE | (1 << 6) | (trt << 16);
     ring.enqueue(setup);
 
-    if let Some(buf) = data_buf.filter(|_| has_data) {
+    let data_at = data_buf.filter(|_| has_data).map(|buf| {
         let mut data = Trb::ZERO;
         data.param = buf;
         data.status = data_len as u32;
@@ -301,14 +331,13 @@ fn enqueue_control(
         // of "how many bytes are actually in that buffer", and a descriptor
         // read has no other way to ask.
         data.control = TRB_DATA_STAGE | dir | (1 << 2) | (1 << 5);
-        ring.enqueue(data);
-    }
+        ring.enqueue(data)
+    });
 
     let mut status = Trb::ZERO;
     let status_dir = if has_data && is_in { 0 } else { 1u32 << 16 };
     status.control = TRB_STATUS_STAGE | (1 << 5) | status_dir;
-    ring.enqueue(status);
-    has_data
+    ControlTrbs { data: data_at, status: ring.enqueue(status) }
 }
 
 /// The line for an endpoint no sequence of commands takes back to Running.
@@ -384,7 +413,7 @@ fn port_answers() -> bool {
 /// does not reach the USB transport's completion at all. A USB flash stick's
 /// 4 KiB write, on the other hand, is tens of milliseconds — the erase block is
 /// the reason and every stick has one — and that is the whole of what the
-/// T14's audio pops are made of (`specs/known-issues.md` §4).
+/// T14's audio pops are made of (`issues/audio/disk-wait-pins-a-cpu.md`).
 ///
 /// What is replaced is *when the controller publishes the event*, not the
 /// event. The TRB really ran, the completion code is the controller's own and
@@ -560,15 +589,22 @@ impl TrbRing {
     }
 
     /// Where the controller should resume, with the cycle state it must expect.
+    ///
+    /// A TRB is 16 bytes, so the address is 16-byte aligned and bit 0 is free
+    /// for the cycle state. Parenthesised because `+` and `*` both bind tighter
+    /// than `|`, and this should not need that table to read.
     fn dequeue(&self) -> u64 {
-        self.base_phys + (self.tail as u64) * 16 | (self.cycle as u64)
+        (self.base_phys + (self.tail as u64) * 16) | (self.cycle as u64)
     }
 
-    /// Put `trb` on the ring and answer with **where it landed**, which for the
-    /// command ring is the only name a Command Completion Event gives it
-    /// (xHCI 1.2 §6.4.2.2). A caller matching on anything coarser than that —
-    /// "the next completion of any command" — takes the answer belonging to a
-    /// command that ran out its deadline and replied afterwards.
+    /// Put `trb` on the ring and answer with **where it landed**, which is the
+    /// only name the event carries: a Command Completion Event names its
+    /// Command TRB (xHCI 1.2 §6.4.2.2) and a Transfer Event names the Transfer
+    /// TRB that generated it (§6.4.2.1, with ED clear — no TRB this driver
+    /// enqueues sets Event Data). A caller matching on anything coarser than
+    /// that — "the next completion of any command", "the next completion on
+    /// this endpoint" — takes the answer belonging to an operation that ran out
+    /// its deadline and replied afterwards.
     fn enqueue(&mut self, mut trb: Trb) -> u64 {
         if self.cycle {
             trb.control |= TRB_CYCLE;
@@ -600,7 +636,11 @@ const PAGE: usize = 0x1000;
 // The pool's fixed head. Everything here is either the controller's own state
 // or enumeration scratch, and there is exactly one of each because enumeration
 // is serial — see `device::init_device`.
+// The whole table is `N * PAGE` and reads as one column of page numbers; the
+// two that reduce are not written differently from the four that do not.
+#[allow(clippy::erasing_op)]
 const OFF_DCBAA: usize     = 0 * PAGE; // (max_slots + 1) * 8, 2 KiB at most
+#[allow(clippy::identity_op)]
 const OFF_CMD_RING: usize  = 1 * PAGE;
 const OFF_ERST: usize      = 2 * PAGE;
 const OFF_EVT_RING: usize  = 3 * PAGE;
@@ -747,9 +787,19 @@ impl Layout {
 
     /// The block belonging to a 1-based slot id, or `None` when the controller
     /// handed back a slot the pool has no room for.
+    ///
+    /// `slot_id` is the controller's own answer to Enable Slot, not this
+    /// driver's — `issues/isolation/untrusted-sites-not-yet-adopted.md`
+    /// named this hand-rolled `checked_sub` + bound compare as exactly the
+    /// shape [`Untrusted::index`] replaces. `wrapping_sub` rather than
+    /// `checked_sub` is sound here only because `index` is the exit: slot 0
+    /// (xHCI 1.2 §4.5.1 — valid Device Slots start at 1) wraps to `u8::MAX`,
+    /// which is never `< dev_blocks` for a pool this small, so it is refused
+    /// by the same comparison that refuses every slot past the pool rather
+    /// than by a separate one.
     fn device(&self, slot_id: u8) -> Option<usize> {
-        let index = (slot_id as usize).checked_sub(1)?;
-        (index < self.dev_blocks).then(|| self.dev_base + index * DEV_STRIDE)
+        let index = Untrusted::new(slot_id).map(|v| v.wrapping_sub(1)).index(self.dev_blocks).ok()?;
+        Some(self.dev_base + index * DEV_STRIDE)
     }
 
     /// The `index`-th mass-storage block.
@@ -1129,15 +1179,21 @@ impl XhciController {
         let slot = ((event.control >> 24) & 0xFF) as u8;
 
         // **The outstanding operation first, and recorded rather than acted
-        // on.** The Command TRB pointer's low four bits are reserved in the
-        // event, so the address is masked out of it rather than compared whole.
-        // The second number each event kind carries goes with it: a Command
-        // Completion Event's Slot ID, which is the controller's answer to
-        // Enable Slot, and a Transfer Event's residue.
+        // on.** Both event kinds name the TRB they answer in their first two
+        // dwords — a Command Completion Event its Command TRB (§6.4.2.2), a
+        // Transfer Event the Transfer TRB that generated it (§6.4.2.1) — and the
+        // low four bits are reserved in both, so the address is masked out
+        // rather than compared whole. The second number each event kind carries
+        // goes with it: a Command Completion Event's Slot ID, which is the
+        // controller's answer to Enable Slot, and a Transfer Event's residue.
         let answers = match trb_type {
             EVENT_CMD_COMPLETE => Some((Await::Command { trb: event.param & !0xF }, slot as u32)),
             EVENT_TRANSFER => Some((
-                Await::Transfer { slot, dci: ((event.control >> 16) & 0x1F) as u8 },
+                Await::Transfer {
+                    slot,
+                    dci: ((event.control >> 16) & 0x1F) as u8,
+                    trb: event.param & !0xF,
+                },
                 event.status & 0x00FF_FFFF,
             )),
             _ => None,
@@ -1303,14 +1359,14 @@ impl XhciController {
                 self.outstanding.submit(what, on, Stages::One, deadline());
             }
             Act::ClearHalt => {
-                enqueue_control(
+                let trbs = enqueue_control(
                     &mut self.devices[at].ep0_ring, 0x02, 0x01, 0, ep_addr as u16, None, 0,
                 );
                 self.ring_doorbell(slot_id, 1);
-                let on = Await::Transfer { slot: slot_id, dci: 1 };
+                let (on, stages) = trbs.awaits(slot_id);
                 let what =
                     What::Recovering { slot_id, seq, issued: "CLEAR_FEATURE(ENDPOINT_HALT)" };
-                self.outstanding.submit(what, on, Stages::One, deadline());
+                self.outstanding.submit(what, on, stages, deadline());
             }
         }
     }
@@ -1836,7 +1892,7 @@ static XHCI: Lock<Vec<XhciController>> = Lock::new(Vec::new());
 /// `XHCI`, which is a ticket spinlock and therefore preemption off for its
 /// whole life. Called from a syscall, it makes that syscall's thread the
 /// driver's engine and stops the CPU rescheduling for as long as the bus takes.
-/// `fd::try_read` called it for `Descriptor::{Keyboard, Mouse}` so a read would
+/// The read path called it for the keyboard and mouse claims so a read would
 /// see a report that had just landed; on the T14 that made the compositor's own
 /// mouse read the hot-plug engine and froze the desktop for seconds at a time,
 /// with a live kernel and nothing dropped. A caller that wants fresh input

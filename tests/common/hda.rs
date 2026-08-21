@@ -1,8 +1,7 @@
 //! H4's audio arm, in the harness: soundd driving a real Intel HDA controller
 //! itself, read back off the device rather than off the guest's opinion.
-//! `specs/plans/hda-driver-plan.md` §6.3 built H0's own feasibility diagnostic
-//! ahead of this, then deleted it once the driver above answered every
-//! question it was asked for.
+//! H0's own feasibility diagnostic was built ahead of this, then deleted once
+//! the driver above answered every question it was asked for.
 
 use std::path::Path;
 use std::time::Duration;
@@ -19,8 +18,9 @@ use crate::common::serial::Serial;
 /// ([`Profile::Hda`]), so the capture is comparable by construction. What is
 /// asserted here is **harm** — the tone is present, continuous, and dithered —
 /// which is the fast tier's verdict. This is not a gate-A arm: it has no
-/// recorded distribution behind it, and §5.3's four baseline sections are
-/// unrecorded (`specs/plans/hda-driver-plan.md` §6.6).
+/// recorded distribution behind it, and the four HDA sections a gate-A arm
+/// would need in `tests/audio-baseline.toml` — `audio_tone_hda.smp1`, `.smp8`,
+/// `audio_tone_hda_load.smp1`, `.smp8` — are unrecorded.
 pub fn hda_tone(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
@@ -44,7 +44,7 @@ pub fn hda_tone(
 
     let result = qemu.run_test("test_rs_audio_tone", Duration::from_secs(30));
     if let Some(err) = &result.error {
-        return Err(err.clone());
+        return Err(err.to_string());
     }
     if result.exit_code != Some(0) {
         return Err(format!("the tone did not play: {:?}\n{}", result.exit_code, result.stdout));

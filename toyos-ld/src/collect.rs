@@ -571,9 +571,10 @@ fn parse_object(obj: &object::File, _name: &str) -> Result<ParsedObject, LinkErr
                 }),
             };
 
-            let addend = if subtrahend.is_some() {
-                0
-            } else if is_macho_instruction {
+            // A subtractor pair carries its displacement in the subtrahend, and
+            // a Mach-O instruction relocation carries none at all: both leave
+            // the addend at zero, for different reasons and by the same route.
+            let addend = if subtrahend.is_some() || is_macho_instruction {
                 0
             } else if reloc.has_implicit_addend() {
                 let data = &sections[local_sec.0].data;
@@ -1058,14 +1059,14 @@ pub(crate) fn gc_sections(state: &mut LinkState, entry: &str) {
     // .eh_frame sections are always roots — they're accessed by the runtime unwinder
     // via PT_GNU_EH_FRAME, not through symbol references.
     for (idx, sec) in state.sections.iter().enumerate() {
-        if sec.kind == SectionKind::InitArray || sec.kind == SectionKind::FiniArray
+        if (sec.kind == SectionKind::InitArray
+            || sec.kind == SectionKind::FiniArray
             || sec.kind.is_tls()
-            || sec.name == ".eh_frame"
+            || sec.name == ".eh_frame")
+            && !reachable[idx]
         {
-            if !reachable[idx] {
-                reachable[idx] = true;
-                queue.push_back(idx);
-            }
+            reachable[idx] = true;
+            queue.push_back(idx);
         }
     }
 
@@ -1257,7 +1258,7 @@ pub(crate) fn merge_string_sections(state: &mut LinkState) {
     let mut offset_remap: HashMap<(SectionIdx, u64), u64> = HashMap::new();
     let mut replaced_sections: HashSet<SectionIdx> = HashSet::new();
 
-    for (_, group) in &groups {
+    for group in groups.values() {
         if group.len() < 2 { continue; }
 
         // Parse strings from all sections and intern them.

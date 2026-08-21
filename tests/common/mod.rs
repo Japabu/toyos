@@ -21,6 +21,8 @@ pub mod iommu;
 #[allow(dead_code)]
 pub mod logread;
 #[allow(dead_code)]
+pub mod passcost;
+#[allow(dead_code)]
 pub mod qemu;
 #[allow(dead_code)]
 pub mod screen;

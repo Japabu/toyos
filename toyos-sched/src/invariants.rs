@@ -22,6 +22,10 @@ use crate::task::{SchedPayload, TaskKey, TaskState};
 pub enum Container {
     Running,
     Ready,
+    /// Killed, still holding a kernel stack, waiting to be dispatched so it
+    /// can unwind. Its state word reads `Ready`, because that is what it is —
+    /// a task the pick takes before the fair queue.
+    Dying,
     Parked,
     Zombie,
 }
@@ -34,6 +38,7 @@ pub fn residents<X: SchedPayload>(
         .map(|t| (t.key(), Container::Running))
         .into_iter()
         .chain(cpu.rq().keys().map(|k| (k, Container::Ready)))
+        .chain(cpu.dying().map(|t| (t.key(), Container::Dying)))
         .chain(cpu.parked().map(|p| (p.key(), Container::Parked)))
         .chain(cpu.zombie_key().map(|k| (k, Container::Zombie)))
 }
@@ -50,6 +55,20 @@ pub fn check_cpu<X: SchedPayload>(cpu: &CpuSched<X>) {
             TaskState::Running(id),
             "running task {:?} disagrees with its state word",
             running.key(),
+        );
+    }
+
+    for task in cpu.dying() {
+        assert_eq!(
+            task.shared().state(),
+            TaskState::Ready(id),
+            "dying task {:?} disagrees with its state word",
+            task.key(),
+        );
+        assert!(
+            task.shared().kill_pending(),
+            "a live task {:?} is in the dying list",
+            task.key(),
         );
     }
 

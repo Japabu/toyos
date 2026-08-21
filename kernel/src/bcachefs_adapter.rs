@@ -109,7 +109,7 @@ pub struct BcacheFsAdapter {
     ///
     /// Keyed by name and not by `FileId` because `open_backing` hands out a
     /// backing without opening a file at all — that is the one a spawned
-    /// program's text lives behind, and it outlives every fd. `Weak` so the
+    /// program's text lives behind, and it outlives every handle. `Weak` so the
     /// entry costs nothing once the last backing is dropped.
     blocks: HashMap<String, Weak<FileBlocks>>,
 }

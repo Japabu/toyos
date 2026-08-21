@@ -2,12 +2,12 @@
 //!
 //! `cargo run --example imgstat -- target/bootable.img`
 //!
-//! Every size in `specs/plans/boot-image-split.md` comes from here, and each of that
-//! plan's stages changes one of them — so the claim "the image is N bytes and
-//! M% of it is X" stays a command anyone can re-run rather than a figure that
-//! was true once. It parses the GPT, both FAT32 volumes and the initrd's
-//! bcachefs with the same three crates the build system writes them with, so it
-//! cannot drift from the writer the way a separate parser would.
+//! Every published size of a boot image comes from here — so the claim "the
+//! image is N bytes and M% of it is X" stays a command anyone can re-run rather
+//! than a figure that was true once. It parses the GPT, both FAT32 volumes and
+//! the initrd's bcachefs with the same three crates the build system writes
+//! them with, so it cannot drift from the writer the way a separate parser
+//! would.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -150,7 +150,7 @@ fn report_initrd(image: Vec<u8>) {
     );
 
     let mut by_size: Vec<_> = entries.iter().collect();
-    by_size.sort_by(|a, b| b.1.cmp(&a.1));
+    by_size.sort_by_key(|e| std::cmp::Reverse(e.1));
     println!("\n  largest entries:");
     for (name, size) in by_size.iter().take(20) {
         println!("      {size:>12}  {name}");

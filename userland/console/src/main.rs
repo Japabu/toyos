@@ -28,7 +28,7 @@ use std::os::toyos::process::CommandExt;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 
 use terminal::Console;
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::shm::SharedMemory;
 use toyos::endow;
 use toyos::port::{self, Connector};
@@ -62,8 +62,7 @@ const KEY_PAGE_DOWN: u8 = 0x4E;
 /// **A bound on this program's work, and no longer a statement about the
 /// kernel.** It read *"the kernel's log ring is 64 KiB
 /// (`kernel/src/drivers/log_ring.rs`), so no more than this was ever in it at
-/// one time"* — that file no longer exists
-/// (`specs/log-architecture-spec.md` §8.1), and what replaced it holds far
+/// one time"* — that file no longer exists, and what replaced it holds far
 /// more: a per-CPU ring of whole records, 512 KiB a shard and 4 MiB at the
 /// shipped eight CPUs, written to `/log` by a daemon that rotates on a byte
 /// count rather than by anything shaped like a ring.
@@ -141,12 +140,12 @@ fn main() {
     const TOKEN_CLIENT: u64 = 4;
 
     loop {
-        poller.poll_add_fd(toyos::RawHandle(shell.stdout.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDOUT);
-        poller.poll_add_fd(toyos::RawHandle(shell.stderr.as_raw_fd() as u32), IORING_POLL_IN, TOKEN_STDERR);
-        poller.poll_add(&kb, IORING_POLL_IN, TOKEN_KEYBOARD);
-        poller.poll_add_fd(host.acceptor_fd(), IORING_POLL_IN, TOKEN_LISTEN);
-        for fd in host.client_fds() {
-            poller.poll_add_fd(fd, IORING_POLL_IN, TOKEN_CLIENT);
+        poller.watch_raw(toyos::RawHandle(shell.stdout.as_raw_fd() as u32), READABLE, TOKEN_STDOUT);
+        poller.watch_raw(toyos::RawHandle(shell.stderr.as_raw_fd() as u32), READABLE, TOKEN_STDERR);
+        poller.watch(&kb, READABLE, TOKEN_KEYBOARD);
+        poller.watch_raw(host.acceptor_handle(), READABLE, TOKEN_LISTEN);
+        for client in host.client_handles() {
+            poller.watch_raw(client, READABLE, TOKEN_CLIENT);
         }
 
         let mut ready = [false; 5];
@@ -295,8 +294,8 @@ fn newest_kernel_logs() -> Vec<std::path::PathBuf> {
 /// anything logged after this program read it — for that the owner has a shell
 /// and `cat` on the file this names. Reading the cursor directly would show this
 /// boot live and with no file in the path, and it needs `logread` on this
-/// program's manifest row; `specs/log-architecture-spec.md` §5.1a declines to
-/// grant that until something here asks for it.
+/// program's manifest row — which it is not given until something here asks for
+/// it, because a right with no caller is a capability handed out for a plan.
 fn seed_kernel_log(console: &mut Console) -> usize {
     let mut log = Vec::new();
     for path in newest_kernel_logs() {

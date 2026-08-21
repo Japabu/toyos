@@ -1,6 +1,6 @@
 # ToyOS
 
-A production-grade operating system built from scratch in Rust. Modern x86-64 hardware (2020+), UEFI only; ARM64 planned — keep the architecture portable. The quality bar is shipping software: correct, efficient, minimal, zero technical debt.
+An operating system built from scratch in Rust, held to a production-grade engineering bar — the bar is the changes, not yet the product. Modern x86-64 hardware (2020+), UEFI only; ARM64 planned — keep the architecture portable. The quality bar is shipping software: correct, efficient, minimal, zero silent debt. A tracked weakness is still a weakness: the honest answer about current state is "known, tracked, still true" — never "we have an issue for that."
 
 ## Where the rest of this lives
 
@@ -8,21 +8,22 @@ A production-grade operating system built from scratch in Rust. Modern x86-64 ha
 
 | | |
 |---|---|
-| `kernel/CLAUDE.md` | which spec owns what, and the caveats that bite kernel work |
+| `kernel/CLAUDE.md` | the caveats that bite kernel work |
 | `userland/CLAUDE.md` | the server doctrine, and the caveats that bite userland work |
-| `tests/CLAUDE.md` | the caveats that bite the harness; the law is `specs/testing-strategy.md` |
+| `tests/CLAUDE.md` | the caveats that bite the harness |
 | `src/CLAUDE.md` | boot modes, the locks and slots, worktrees — the operational file |
-| `specs/testing-strategy.md` | the testing law: instruments, tiers, the PR gate, the nightly |
-| `specs/forks.md` | the ecosystem fork estate and the std library rules |
-| `specs/debugging.md` | LLDB, QMP, frozen guests, audio verification |
-| `specs/README.md` | the specs taxonomy: law, plans, assessments, reference, issues |
+| `issues/README.md` | the issue tracker: one file per issue, typed by kind; `ls` is the index |
+
+There are no spec documents. Rules live where they are enforced — a gate, a
+module header, the redlist — and everything else is an issue. Free text that
+merely describes the tree rots and is deleted, not maintained.
 
 A subdirectory `CLAUDE.md` loads when a file in that subtree is `Read`, and not from `Bash`. A rule whose violation is unrecoverable or invisible stays here; everything else lives where the work is.
 
 ## Principles
 
 - **Zero legacy.** No backwards compatibility, no fallbacks, no workarounds, no BIOS, no 32-bit. Research state-of-the-art OS design instead of replicating older OSes.
-- **Zero technical debt.** Dead code is deleted. Every abstraction earns its place.
+- **Zero silent debt.** Dead code is deleted; every abstraction earns its place. A discovered compromise has exactly two legal outcomes: remove it, or record it with ownership, evidence and an exit condition — and it stays a present-state weakness until removed.
 - **Fail fast, trust nothing.** Panics over silent degradation; exhaustive matches; the unimplemented dies loudly. Input that crossed a trust boundary is never trusted and never panics the kernel — it is refused.
 - **The kernel never crashes from userland.** A kernel bug crashes loudly; a userland bug never reaches it.
 - **Rust is first class.** Not POSIX, not C. Unrepresentable is best: prefer compile-time safety over runtime checks over tests.
@@ -56,11 +57,11 @@ The bar is not yet the tree. The standing failures are declared rather than remo
 
 - **toyos-ld** — custom linker for bootloader, kernel and all userland. Its output is reproducible, and the container types say so: anything iterated into the output is a `BTreeMap`/`BTreeSet`; a container asked only for membership stays hashed.
 - **toyos-cc** — minimal C compiler; exists to bootstrap tinycc and compile doomgeneric, not to grow. A layout or linkage construct it does not implement is refused by name — dropping one silently is a miscompilation.
-- **rust/** — Rust compiler/std fork with ToyOS platform support (submodule). Auto-bootstraps; kept current with upstream. Its rules: `specs/forks.md`.
+- **rust/** — Rust compiler/std fork with ToyOS platform support (submodule). Auto-bootstraps; kept current with upstream. Its rules: `src/forkcheck.rs`'s module header.
 
 ## Build & test
 
-`specs/testing-strategy.md` is the testing law. Operationally:
+The testing rules live where they are enforced: instruments and known reds in `src/redlist.rs`, tiers in `src/tiers.rs`, the PR gate and the nightly in `.github/workflows/`. Operationally:
 
 - `cargo run` builds everything (toolchain, kernel, bootloader, userland, initrd) and launches QEMU; `--build-only` skips the launch. `cargo test` runs the QEMU harness; `cargo test --workspace --exclude toyos-build` runs every host-crate suite.
 - **Agents verify through `cargo test`, never `cargo run`** — the run path opens a QEMU window on the owner's desktop by design; the harness runs headless.
@@ -72,8 +73,8 @@ The bar is not yet the tree. The standing failures are declared rather than remo
 src/               Build system (the root cargo project, package name: toyos-build; its Cargo.toml is also the host workspace, and a gate reds on a crate that joins neither members nor exclude)
 kernel/            Kernel
 kernel-loom/       Loom models of the kernel's lock-free concurrency, beside the kernel and not in it
-kernel-span/       Host harness for `kernel/src/mm/user_span.rs`, the same arrangement
-kernel-elide/      Host harness for `kernel/src/log/elide.rs`, the same arrangement
+toyos-userbound/   Every decision the kernel makes about the user/kernel boundary, pure
+toyos-elide/       Log elision decisions, pure
 bootloader/        UEFI bootloader
 userland/          All userland programs
 toyos-abi/         Kernel ABI (types, constants, syscall numbers, syscall wrappers)
@@ -86,17 +87,14 @@ toyos-fat32-check/ FAT32 checker from Microsoft's fatgen103 — the outside judg
 toyos-elf/         ELF64 decoding (no_std, no alloc, forbid(unsafe_code))
 toyos-gpt/         GPT parser (no_std, no alloc, forbid(unsafe_code))
 toyos-hda/         HDA codec decoding and output-path selection, pure
+toyos-mixer/       The mixer's decisions — samples, gain, dither, quantize — pure, corpus-certified
 toyos-pci/         MSI and MSI-X capability decoding, pure
 toyos-desktop/     Every decision the compositor makes, pure
 toyos-ld/          Custom linker
 toyos-cc/          Custom C compiler
 rust/              Rust compiler/std fork (submodule)
 tests/             Integration tests (QEMU-based)
-specs/             Living normative documents (specs/README.md is the taxonomy)
-specs/plans/       Staged intentions — a plan dies on completion
-specs/assessments/ Dated evidence, frozen
-specs/reference/   Non-normative fact sheets
-specs/issues/      Known issues, one file per issue — see its README
+issues/            The issue tracker: one file per issue, typed by kind — see its README
 system.toml        What to build and boot
 ```
 
@@ -104,26 +102,22 @@ system.toml        What to build and boot
 
 **One agent, one worktree, one branch.** `cargo run -- --worktree add <path>` makes one; never `git worktree add` by hand — the naive path clones the rust fork's history and takes the machine-global toolchain name from every other checkout. The primary checkout is not a workspace: it owns `rust/`, the rustup link and `main`; `cargo run -- --sync` moves it onto whatever GitHub merged.
 
-- Stay on the current task. File what you find in `specs/issues/` and do not go fix it; one file per issue, its README has the shape.
+- Stay on the current task. File what you find in `issues/` and do not go fix it; one file per issue, its README has the shape.
 - If something blocks, stop and report it. Don't work around it.
 - Never degrade audible or visual quality — even temporarily, even for a big win elsewhere — without the owner's explicit sign-off.
 - **Never truncate command output.** No `| head`, `| tail`, `| grep` to reduce it; long output runs in the background and is read from the file.
 - **Always be empirical.** Read actual output; run the code; investigate root causes instead of guessing.
 - **Every written number comes from a command that was run.** An estimate or datasheet bound says so. Write commit messages with `git commit -F <file>`, never `-m` — a double-quoted `-m` substitutes backticks and the shell runs them.
-- **Commit freely on your branch; land through a pull request.** `main` moves only through a merged PR, and `cargo run -- --pr` is the whole local half. `gh pr create --draft` at the first push — CI runs on PRs and nothing else; `gh pr ready` plus a written `--title`/`--body-file` when finished (never `--fill`); `gh pr merge --auto --merge`; `cargo run -- --sync` after it lands. Never merge into `main` by hand. Your branch must contain `origin/main` or the merge button stays shut. The PR's title and body become the merge commit's: write them as main's record. A modify/delete conflict is resolved by accounting for every hunk of the modified side, never by checking its headings survived. An ABI change lands on its own PR first; `Abi-Inseparable: <why>` declares the split that genuinely cannot be made. Every merge leaves `main`'s tip compiling.
+- **Commit freely on your branch; land through a pull request.** `main` moves only through a merged PR, and `cargo run -- --pr` is the whole local half. `gh pr create --draft` at the first push — CI runs on PRs and nothing else; `gh pr ready` plus a written `--title`/`--body-file` when finished (never `--fill`); `gh pr merge --auto --merge`; `cargo run -- --sync` after it lands. Never merge into `main` by hand. The owner eased the merge law (2026-08-20): a branch's checks are its own, `main`'s push-triggered run is the merged-result check, and a red on `main`'s tip is adjudicated at once, never left. The ease is a measured trade, not a free one — its instrument and threshold live in the tracker, and past the threshold the stronger serialization returns. A green armed branch lands regardless of staleness — nothing refreshes by hand. `gate-stage` reads the protection back and reports the regime; a required merge queue (organization-owned repositories only) restores the merged-result property, and the gate already recognises it. The PR's title and body become the merge commit's: write them as main's record. A modify/delete conflict is resolved by accounting for every hunk of the modified side, never by checking its headings survived. A merge that deletes a document also deletes every citation to it in the same merge, checked by searching the bare name as well as the path. An ABI change lands on its own PR first; `Abi-Inseparable: <why>` declares the split that genuinely cannot be made. Every merge leaves `main`'s tip compiling.
 - **Never rewrite history, and never touch `main`.** No `--amend`, no `rebase`, no `--force` — on your own branch as much as anywhere: a pushed hash may already be cited. `main` is protected — PR required, no force-push, no deletion, no bypass.
 - **A red is known only if `cargo run -- --known-red <test>` says so** (`src/redlist.rs`). A PR red not about the author's diff is adjudicated there and fixed at its owner, never re-run away.
+- **A high-risk change names its two checks.** Security boundaries, the scheduler, the ABI, filesystems, devices, memory management, concurrency primitives: the PR names the negative control or mutation that fails if the implementation is wrong, and one epistemically independent oracle — an external specification, a differential implementation, real hardware, a third-party checker, a formal model, or a recorded real failure. A second agent is not independence: five artifacts from one wrong model still agree.
 - **Host load is not an excuse.** A load-coincident audio failure is investigated as a real defect, never re-run away as noise; evidence against that assumption goes to the owner, not into quiet workarounds.
 - **Subagents wait in the foreground.** Background-task notifications do not reliably re-wake subagents: run long commands in the foreground with an explicit `timeout`, and for longer work background once and block with a few long foreground waits — never hundreds of polls. Always poll before sleeping.
-- **Subagents get an explicit model, never the session default.** The orchestrator scopes, dispatches and verifies; it does not hand-work. Judgment-bearing coding gets Opus or stronger; mechanical execution from an exact brief gets Sonnet; non-coding mechanical work gets Haiku; trivial edits need no agent.
-- **Durable facts go in the spec that owns the subject or the module header at the site — never in private agent memory, and almost never in a `CLAUDE.md`.** A `CLAUDE.md` is pointers and caveats; **an agent never edits one.** A rule that truly has no better home and whose violation is invisible or unrecoverable is *proposed as one sentence in the final report*, and the orchestrator places it or declines. The story of a change goes in its commit message; after each task, audit the spec or module header that owns what you changed.
+- **An agent never waits on CI.** It arms auto-merge, reports, and exits — a shell held open sleeping between checks is a stuck slot that looks like work. Sequencing across landings belongs to the orchestrator, done in passes on its own wake-ups; when several finished branches queue behind one another, they land as one batch PR rather than as one agent babysitting N cycles. (Learned 2026-08-19: five green PRs and a waiting agent, and nothing moved for an hour.)
+- **Subagents get an explicit model, never the session default.** The orchestrator scopes, dispatches and verifies; it does not hand-work. Match the tier to the judgment in the task, from current knowledge of the model lineup: judgment-bearing coding gets a frontier model, mechanical execution from an exact brief a mid tier, non-coding mechanical work the cheapest, and a trivial edit no agent at all. Never encode a temporary usage circumstance as a rule.
+- **Durable facts go in the module header at the site — never in private agent memory, and almost never in a `CLAUDE.md`.** A `CLAUDE.md` is pointers and caveats of the most general kind — it never cites an individual issue file, because it is not an issue tracker; **an agent never edits one.** A rule that truly has no better home and whose violation is invisible or unrecoverable is *proposed as one sentence in the final report*, and the orchestrator places it or declines. The story of a change goes in its commit message; after each task, audit the module header that owns what you changed.
 
 ## Planned work
 
-- `specs/scheduler-core-spec.md` — the ownership-typed scheduler core; nine negative gates prove the harnesses have teeth, never weaken one to make a change pass.
-- `specs/iommu-spec.md` + `specs/plans/iommu-plan.md` + `specs/plans/userspace-drivers-spec.md` — the IOMMU and the userspace drivers it makes safe.
-- `specs/plans/hda-driver-plan.md` — HDA on the T14; the line is who writes an address: soundd never holds a physical address.
-- `specs/completion-architecture-spec.md` — kill every wait: one completion primitive, one park site, a CPU never waits for a device, and a kill is answered by `Cancelled` rather than by discarding the stack.
-- `specs/plans/metal-boot-plan.md` — the T14 metal track; carries the metal session checklist.
-- `specs/plans/net-gate-plan.md`, `specs/plans/wlan-plan.md`, `specs/plans/introspection-plan.md`, `specs/plans/diagnostics-roadmap.md` — queued tracks.
-- `specs/device-test-strategy.md` — ground truth at the hardware boundary; device shape and lifecycle before protocol depth.
+Staged work is an issue like everything else: `rg -l 'kind: track' issues/` lists every open track.

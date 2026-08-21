@@ -4,11 +4,8 @@
 //! `fmt::Arguments` and nothing else. **There is no byte-oriented entry point**,
 //! and that is what makes "half a record" untypeable: the smallest thing this
 //! module accepts is a whole one.
-//!
-//! `specs/log-architecture-spec.md` §2.
 
 pub mod console;
-pub mod elide;
 pub mod nested;
 pub mod read;
 pub mod registry;
@@ -20,6 +17,7 @@ pub mod user;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use toyos_abi::log::{LogRecord, FLAG_EARLY, MAX_LOG_SHARDS, MAX_RECORD_MESSAGE};
+use crate::time::{Budget, Duration};
 
 pub use shard::Shard;
 pub use toyos_abi::log::Level;
@@ -54,7 +52,7 @@ pub unsafe fn publish_ap_shard(cpu: u32, shard: *mut Shard) {
 
 /// How long `SYS_SHUTDOWN` gives `/bin/logd` to make the last records durable.
 ///
-/// **Not `apic`'s `LOG_FILE_DRAIN_NANOS`, and the difference is what each one
+/// **Not `apic`'s `LOG_FILE_DRAIN`, and the difference is what each one
 /// bounds.** That one is a *panicking* machine, where the scheduler may be
 /// unable to pick logd at all and erring long costs the panel on a machine that
 /// is already lost. This is an orderly shutdown: every thread is healthy, the
@@ -64,7 +62,10 @@ pub unsafe fn publish_ap_shard(cpu: u32, shard: *mut Shard) {
 /// hundreds under `--slow-usb`. Two seconds is the same order as the
 /// transport's own `USB_TIMEOUT_NS` for one transfer, which is what puts a floor
 /// under how slow "answering, slowly" is allowed to look.
-const SHUTDOWN_DURABLE_NANOS: u64 = 2_000_000_000;
+const SHUTDOWN_DURABLE: Budget = Budget::of(
+    Duration::from_secs(2),
+    "the shutdown's last lines are on the console only, and it says so",
+);
 
 /// Wait, bounded, for `/bin/logd` to put everything committed so far on the
 /// device.
@@ -83,13 +84,13 @@ const SHUTDOWN_DURABLE_NANOS: u64 = 2_000_000_000;
 /// shutdown, which is the width most of the suite boots at.
 pub fn wait_for_durable() {
     let want = read::newest_committed_at_ns();
-    let deadline = crate::clock::nanos_since_boot().saturating_add(SHUTDOWN_DURABLE_NANOS);
+    let deadline = crate::clock::nanos_since_boot().saturating_add(SHUTDOWN_DURABLE.nanos());
     while user::durable_ns() < want {
         if crate::clock::nanos_since_boot() >= deadline {
             crate::log!(
                 "shutdown: /log did not answer in {}ms, so this shutdown's last lines are on the \
                  console only",
-                SHUTDOWN_DURABLE_NANOS / 1_000_000
+                SHUTDOWN_DURABLE.duration().millis()
             );
             return;
         }
@@ -214,7 +215,7 @@ fn reserve(guard: &crate::arch::LogCommitGuard) -> (Origin, u64) {
 ///
 /// It costs the tid of a process's *first* thread, which is `Tid(0)` and
 /// therefore also renders as absent:
-/// `specs/issues/diagnostics/a-record-cannot-name-thread-zero.md` is the entry,
+/// `issues/diagnostics/a-record-cannot-name-thread-zero.md` is the entry,
 /// and its fix is in the ABI's formatter rather than here.
 fn on_a_thread(id: u32) -> u32 {
     if id == u32::MAX { 0 } else { id }
@@ -282,7 +283,6 @@ pub fn emit(level: Level, args: core::fmt::Arguments) {
         // inside `sync.rs`, inside IRQ handlers, inside the scheduler and
         // inside every syscall's locked region — which is why the post is
         // `wake_direct` and not an ordinary queue wake.
-        // `specs/log-architecture-spec.md` §2.6a.
         console::Drain::Thread => {
             if shard::signal_after_commit(shard::log_waiter()) {
                 console::post_wake();

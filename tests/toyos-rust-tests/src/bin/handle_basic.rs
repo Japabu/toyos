@@ -1,8 +1,7 @@
 //! What a handle is, before anything is done with one.
 //!
-//! `specs/capability-endowment-spec.md` §8 requires this gate and nothing in
-//! the tree was it. Four properties of `HandleTable` that every other gate
-//! assumes and none of them exercises:
+//! Nothing in the tree was this gate. Five properties of `HandleTable` that
+//! every other gate assumes and none of them exercises:
 //!
 //! 1. **A closed slot is reissued at the next generation**, so a handle number
 //!    a process is still holding names *nothing* rather than whatever landed
@@ -16,15 +15,21 @@
 //! 4. **`SYS_HANDLE_DUP_AT` answers the slot's own generation and not the
 //!    number that went in**, which is the one place this ABI deliberately
 //!    breaks POSIX's `dup2` and the only thing that says so.
+//! 5. **And the reissuing stops.** A generation counter is finite, so property
+//!    1 has an end; by owner ruling of 2026-08-20 a slot that reaches it
+//!    retires for good rather than starting again, and the table is one slot
+//!    smaller from then on.
 //!
 //! The census arm underneath them is what makes the whole file a leak test as
 //! well: every object here is made and closed, per kind, so a handle path that
 //! forgets to decrement is a named kind rather than a total that drifted.
 
+use std::collections::BTreeSet;
+
 use toyos::census::Census;
 use toyos::AsHandle;
 use toyos_abi::handle::{Rights, HANDLE_INVALID};
-use toyos_abi::syscall::{self, SyscallError};
+use toyos_abi::syscall::{self, debug_action, SyscallError};
 use toyos_abi::RawHandle;
 
 /// A slot far above anything this process is using, so `dup2` onto it cannot
@@ -40,6 +45,7 @@ fn main() {
     rights_only_shrink();
     a_claim_shaped_handle_cannot_be_duplicated();
     dup_at_answers_the_slot_not_the_number();
+    a_spent_slot_retires_and_the_table_is_one_smaller();
     nothing_here_leaks();
     println!("a handle is a slot, a generation and a rights word, and it gives itself back");
 }
@@ -129,7 +135,7 @@ fn a_claim_shaped_handle_cannot_be_duplicated() {
 
 /// `dup2(h, slot)` answers `slot` at *that slot's* generation.
 ///
-/// POSIX says `dup2` returns `newfd`; here the answer carries a generation the
+/// POSIX says `dup2` returns the new descriptor; here the answer carries a generation the
 /// caller has no business choosing, so it equals the bare slot number only
 /// while that slot has never been closed. `userland/libc` says so at its own
 /// `dup2` and this is the gate under it.
@@ -176,6 +182,114 @@ fn dup_at_answers_the_slot_not_the_number() {
     );
     syscall::close(over);
     println!("  dup2: slot {SPARE_SLOT} answered generation 0, then 1, and a live replace kept it");
+}
+
+/// A slot at its last generation serves one more lifecycle and is then gone
+/// for good, and the table is one slot smaller for it.
+///
+/// **The owner's ruling of 2026-08-20, asserted near exhaustion rather than at
+/// it.** A slot has 1,048,575 lifecycles; running one out for real is two
+/// syscalls apiece, so the alternative to staging the last generation is a test
+/// nobody runs — which is exactly why a wrap could sit in this table unnoticed.
+/// [`debug_action::SLOT_TO_LAST_GENERATION`] moves the counter and nothing else:
+/// every install, close and refusal below is the shipped path.
+///
+/// What is asserted is the whole policy. The slot answers once more, through
+/// the ordinary allocating path and at the generation the ABI says is the last
+/// one. After that close, no path issues it again — not `dup`, which allocates,
+/// and not `dup2`, which names its own slot and so has no free list in front of
+/// it. And the loss is *exactly* one slot: the set of slots the table will hand
+/// out shrinks by this one and by nothing else, which is what says the ruling
+/// cost a slot rather than a region of them.
+///
+/// **The slot this stages is the last one, and that is the sharpest place to
+/// stage it.** The fill above grows the table to its cap and gives every slot
+/// back in ascending order, so the free list hands out the highest one first —
+/// slot 4095, whose encoding at `MAX_GENERATION` *is* `HANDLE_INVALID`. A tree
+/// that reissues an exhausted slot therefore does not merely repeat a number
+/// here; it hands out the one word the ABI promises no table ever issues, which
+/// is what the reverted-ruling run answers with: `Ok(RawHandle(4294967295))`.
+fn a_spent_slot_retires_and_the_table_is_one_smaller() {
+    let (_read, write) = toyos::pipe_pair().expect("a pipe of our own");
+    let source = write.as_handle();
+    let before = every_slot_the_table_will_issue(source);
+    println!("  table: {} slots free to this process of {}", before.len(), RawHandle::MAX_SLOTS);
+
+    // A slot of its own, put one lifecycle from the end while it is free — so
+    // no handle anybody holds becomes stale, and what comes back is the number
+    // the next install of it answers.
+    let doomed = syscall::dup(source).expect("a duplicate to spend");
+    let slot = doomed.slot();
+    syscall::close(doomed);
+    let last = RawHandle::new(slot, RawHandle::MAX_GENERATION - 1);
+    assert_eq!(
+        syscall::debug_with(debug_action::SLOT_TO_LAST_GENERATION, u64::from(slot)),
+        u64::from(last.0),
+        "the actuator did not stage slot {slot} at generation {}",
+        RawHandle::MAX_GENERATION - 1,
+    );
+
+    // **The one lifecycle it has left, served through the allocating path.**
+    // The free list is last-in-first-out and nothing else here takes a handle,
+    // so the next duplicate is this slot; if it ever is not, the assertion says
+    // so rather than passing having asked nothing.
+    let issued = syscall::dup(source).expect("a slot at its last generation is still a slot");
+    assert_eq!(issued, last, "the staged slot was not the one reissued");
+    assert_ne!(issued, HANDLE_INVALID, "a table issued the invalid handle");
+    // A working handle and not just a number: it resolves, and to the pipe.
+    let narrowed = syscall::dup_narrowed(issued, Rights::WRITE)
+        .expect("the last generation does not name what was put in it");
+    syscall::close(narrowed);
+    syscall::close(issued);
+
+    // And now there is no such slot. `dup2` is the path that names its own,
+    // and the word is the cap's: a slot the table no longer has.
+    assert_eq!(
+        syscall::dup2(source, slot),
+        Err(SyscallError::ResourceExhausted),
+        "dup2 reissued slot {slot} after its generations ran out",
+    );
+    let after = every_slot_the_table_will_issue(source);
+    assert!(!after.contains(&slot), "the allocating path issued retired slot {slot}");
+    let lost: Vec<u16> = before.difference(&after).copied().collect();
+    assert_eq!(lost, [slot], "the table lost slots other than the retired one");
+    assert_eq!(
+        after.len(),
+        before.len() - 1,
+        "the table is not one slot smaller: {} slots, then {}",
+        before.len(),
+        after.len(),
+    );
+    println!(
+        "  retirement: slot {slot} served generation {} and is gone; {} slots, then {}",
+        RawHandle::MAX_GENERATION - 1,
+        before.len(),
+        after.len(),
+    );
+}
+
+/// Every slot the table will hand out right now, by filling it and giving it
+/// all back.
+///
+/// **The only instrument userland has for the size of its own table**: nothing
+/// asks the kernel how big one is, so what a table *is* is the set of slots it
+/// answers with before it says `ResourceExhausted`. The refusal is a word and
+/// not a kill — a full table is a resource limit, which `handle_kill_policy`
+/// is the gate for — so this leaves the process able to say what it found.
+fn every_slot_the_table_will_issue(source: RawHandle) -> BTreeSet<u16> {
+    let mut taken = Vec::new();
+    loop {
+        match syscall::dup(source) {
+            Ok(h) => taken.push(h),
+            Err(SyscallError::ResourceExhausted) => break,
+            Err(e) => panic!("filling the table answered {e:?}"),
+        }
+    }
+    let slots = taken.iter().map(|h| h.slot()).collect();
+    for h in taken {
+        syscall::close(h);
+    }
+    slots
 }
 
 /// Every object above is made and closed, so nothing of any kind is left.

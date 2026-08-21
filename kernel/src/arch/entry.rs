@@ -1,10 +1,11 @@
 //! The one bracket every transition out of Ring 3 uses.
 //!
-//! `specs/user-machine-state.md` is the invariant: a transition out of Ring 3
-//! that can reach another task must save and restore **the whole** user machine
-//! state. These macros are the only text in the kernel naming an FP
-//! instruction, so "saved some of it" is not expressible — there is nothing to
-//! say it with.
+//! **The invariant**: a transition out of Ring 3 that can reach another task
+//! must save and restore **the whole** user machine state, and restore it as
+//! the transition's last act before returning to Ring 3 — after any point at
+//! which the task could have been switched. These macros are the only text in
+//! the kernel naming an FP instruction, so "saved some of it" is not
+//! expressible — there is nothing to say it with.
 //!
 //! **Contract.** [`save_user_state`] may be invoked at any stack alignment; it
 //! leaves `rsp` aligned to [`UserFpState`]'s alignment, which is also what a
@@ -17,8 +18,9 @@
 //! is set nowhere, so `XCR0` is 1 and `FXSAVE64` is complete rather than cheap.
 //! Every user thread's x87 register file, control, status and tag words, XMM0-15
 //! and `MXCSR` cross a ring transition intact — including a *pending unmasked
-//! x87 exception*, which used to be left on the CPU for whatever ran next
-//! (`specs/user-machine-state.md` §2).
+//! x87 exception*, which `FXSAVE64` carries across without raising it, so it
+//! reaches only the task that caused it. It used to be left on the CPU for
+//! whatever ran next.
 //!
 //! **The area is sized by the type, at every site, without the site saying so.**
 //! [`ring3_naked_asm`] appends the two `const` operands the templates name, so
@@ -73,7 +75,7 @@ impl Ring0Entry {
 // The bracket reserves `fp_bytes + fp_align` and aligns down, so the area fits
 // whatever the entry's incoming alignment was, and stashes the caller's `rsp`
 // in the slack immediately above it.
-const _: () = assert!(size_of::<UserFpState>() % align_of::<UserFpState>() == 0);
+const _: () = assert!(size_of::<UserFpState>().is_multiple_of(align_of::<UserFpState>()));
 const _: () = assert!(align_of::<UserFpState>() >= 8);
 
 /// `naked_asm!` for an entry that can reach another task, with the save area's

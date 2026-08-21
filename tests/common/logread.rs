@@ -9,8 +9,7 @@
 //!
 //! The gate runs *inside* `test-runner` rather than in a binary it spawns:
 //! `logread` is a `SysCap` dup and not a namespace entry, so it is not part of
-//! what the runner hands its children (`specs/capability-endowment-spec.md`
-//! §6.7a, `specs/log-architecture-spec.md` §3.2).
+//! what the runner hands its children.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -170,7 +169,7 @@ pub fn log_nested_emit(
 /// can cancel.
 ///
 /// **The L4 review's F1, gated.** `object::ops::close` handed every source the
-/// closing object named to `io_uring::remove_fd`, which cancels across every
+/// closing object named to `io_uring::cancel_by_source`, which cancels across every
 /// ring in the machine — right for a pipe whose other end has really gone, and
 /// wrong for a stream that outlives every handle. Every `SysCap` maps to
 /// `Source::Log`, so any process closing any capability posted `-NotFound` into

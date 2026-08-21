@@ -5,12 +5,10 @@ use toyos_abi::ring::Ring;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use toyos_sched::task::WaitClass;
 
 use crate::mm::PAGE_2M;
-use crate::sched::payload::KWaitQueue;
-use crate::sched::waitqs::new_queue;
-use crate::io_uring::RingId;
+use crate::completion::Watch;
+use crate::inbox::InboxId;
 use crate::id_map::{IdKey, IdMap};
 use crate::sync::Lock;
 use crate::user_ptr::{UserBytes, UserBytesMut};
@@ -110,7 +108,7 @@ mod handle {
 }
 
 // Pipe internals — owns physical memory, tracks refcounts only.
-// Mapping into user address spaces is managed by the FD layer.
+// Mapping into user address spaces is managed by the handle layer.
 
 pub const PIPE_SIZE: usize = PAGE_2M as usize;
 
@@ -137,13 +135,16 @@ struct Pipe {
     backing: Option<Backing>,
     readers: u32,
     writers: u32,
-    io_uring_watchers: Vec<RingId>,
-    /// This pipe end's waiter set (spec §8.6). Held by `Arc` so a blocking
-    /// site can clone it out from under the table lock and hold it across its
-    /// own park — the ticket and the registration borrow the queue, not the
-    /// table.
-    readers_wq: Arc<KWaitQueue>,
-    writers_wq: Arc<KWaitQueue>,
+    inbox_watchers: Vec<InboxId>,
+    /// This pipe end's waiter set (spec §8.6), as a completion subject. Held
+    /// by `Arc` so a blocking site can clone it out from under the table lock
+    /// and hold it across its own park.
+    ///
+    /// **One list per end where there were two.** The `KWaitQueue` beside each
+    /// of these went with the park it served: after §5.6 a reader arms here
+    /// and parks on its own queue.
+    readers_watch: Arc<Watch>,
+    writers_watch: Arc<Watch>,
     /// An RT thread wrote to this pipe and the boost has not been claimed
     /// yet. The next thread to consume data inherits transient RT priority —
     /// covering readers that were runnable (not blocked) at write time,
@@ -160,9 +161,9 @@ impl Pipe {
             backing: None,
             readers: 0,
             writers: 0,
-            io_uring_watchers: Vec::new(),
-            readers_wq: new_queue(WaitClass::Pipe),
-            writers_wq: new_queue(WaitClass::Pipe),
+            inbox_watchers: Vec::new(),
+            readers_watch: Arc::new(Watch::new()),
+            writers_watch: Arc::new(Watch::new()),
             rt_boost_pending: false,
         }
     }
@@ -303,13 +304,13 @@ pub fn try_write(pipe_id: PipeId, buf: &UserBytes) -> Option<PipeWrite> {
 
 pub fn has_data(pipe_id: PipeId) -> bool {
     with_pipes(|pipes| {
-        pipes.get(pipe_id).map_or(false, |p| p.available() > 0 || p.writers == 0)
+        pipes.get(pipe_id).is_some_and(|p| p.available() > 0 || p.writers == 0)
     })
 }
 
 pub fn has_space(pipe_id: PipeId) -> bool {
     with_pipes(|pipes| {
-        pipes.get(pipe_id).map_or(false, |p| p.space() > 0 || p.readers == 0)
+        pipes.get(pipe_id).is_some_and(|p| p.space() > 0 || p.readers == 0)
     })
 }
 
@@ -333,7 +334,7 @@ fn close_read(pipe_id: PipeId) {
             free_pipe(pipe);
             None // pipe freed, no one to wake
         } else if pipe.readers == 0 {
-            Some(pipe.io_uring_watchers.clone())
+            Some(pipe.inbox_watchers.clone())
         } else {
             None
         }
@@ -341,9 +342,9 @@ fn close_read(pipe_id: PipeId) {
     if let Some(watchers) = wake_writers {
         crate::scheduler::wake_pipe_writers(pipe_id);
         if !watchers.is_empty() {
-            crate::io_uring::complete_pending_for_event(
+            crate::inbox::complete_pending_for_event(
                 &watchers,
-                crate::io_uring::Source::PipeWritable(pipe_id),
+                crate::inbox::Source::PipeWritable(pipe_id),
             );
         }
     }
@@ -359,7 +360,7 @@ fn close_write(pipe_id: PipeId) {
             free_pipe(pipe);
             None // pipe freed, no one to wake
         } else if pipe.writers == 0 {
-            Some(pipe.io_uring_watchers.clone())
+            Some(pipe.inbox_watchers.clone())
         } else {
             None
         }
@@ -367,9 +368,9 @@ fn close_write(pipe_id: PipeId) {
     if let Some(watchers) = wake_readers {
         crate::scheduler::wake_pipe_readers(pipe_id);
         if !watchers.is_empty() {
-            crate::io_uring::complete_pending_for_event(
+            crate::inbox::complete_pending_for_event(
                 &watchers,
-                crate::io_uring::Source::PipeReadable(pipe_id),
+                crate::inbox::Source::PipeReadable(pipe_id),
             );
         }
     }
@@ -379,36 +380,52 @@ fn free_pipe(pipe: Pipe) {
     drop(pipe); // PhysPage freed via Drop
 }
 
-pub fn add_io_uring_watcher(pipe_id: PipeId, ring_id: RingId) {
+pub fn add_inbox_watcher(pipe_id: PipeId, inbox_id: InboxId) {
     with_pipes_mut(|pipes| {
         if let Some(pipe) = pipes.get_mut(pipe_id) {
-            if !pipe.io_uring_watchers.contains(&ring_id) {
-                pipe.io_uring_watchers.push(ring_id);
+            if !pipe.inbox_watchers.contains(&inbox_id) {
+                pipe.inbox_watchers.push(inbox_id);
             }
         }
     });
 }
 
-pub fn remove_io_uring_watcher(pipe_id: PipeId, ring_id: RingId) {
+pub fn remove_inbox_watcher(pipe_id: PipeId, inbox_id: InboxId) {
     with_pipes_mut(|pipes| {
         if let Some(pipe) = pipes.get_mut(pipe_id) {
-            pipe.io_uring_watchers.retain(|&id| id != ring_id);
+            pipe.inbox_watchers.retain(|&id| id != inbox_id);
         }
     });
 }
 
 /// The waiter set of this pipe's read end, cloned out for a blocking site or a
 /// wake path to hold on its own stack.
-pub fn readers_queue(pipe_id: PipeId) -> Option<Arc<KWaitQueue>> {
-    with_pipes(|pipes| pipes.get(pipe_id).map(|p| p.readers_wq.clone()))
-}
-
-pub fn writers_queue(pipe_id: PipeId) -> Option<Arc<KWaitQueue>> {
-    with_pipes(|pipes| pipes.get(pipe_id).map(|p| p.writers_wq.clone()))
-}
-
-pub fn io_uring_watchers(pipe_id: PipeId) -> Vec<RingId> {
+pub fn readers_queue(pipe_id: PipeId) -> Option<PipeEnd> {
     with_pipes(|pipes| {
-        pipes.get(pipe_id).map_or(Vec::new(), |p| p.io_uring_watchers.clone())
+        pipes.get(pipe_id).map(|p| PipeEnd {
+            watch: p.readers_watch.clone(),
+        })
+    })
+}
+
+pub fn writers_queue(pipe_id: PipeId) -> Option<PipeEnd> {
+    with_pipes(|pipes| {
+        pipes.get(pipe_id).map(|p| PipeEnd {
+            watch: p.writers_watch.clone(),
+        })
+    })
+}
+
+/// One end of a pipe, as a blocking site sees it: the queue it registers on
+/// and the subject it arms. Cloned out of the table together, because two
+/// lookups would be two acquisitions of `PIPES` on the path a pipe write
+/// already pays for.
+pub struct PipeEnd {
+    pub watch: Arc<Watch>,
+}
+
+pub fn inbox_watchers(pipe_id: PipeId) -> Vec<InboxId> {
+    with_pipes(|pipes| {
+        pipes.get(pipe_id).map_or(Vec::new(), |p| p.inbox_watchers.clone())
     })
 }

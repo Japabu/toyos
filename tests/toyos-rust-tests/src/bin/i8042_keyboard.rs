@@ -1,11 +1,11 @@
-//! Claims the keyboard fd and prints what arrives, one line per event.
+//! Claims the keyboard and prints what arrives, one line per event.
 //!
 //! Driven by eight host tests that boot a guest with no USB HID at all and
 //! inject through QMP once the ready line appears. Not a standalone test: on
 //! its own it would time out with nothing to report, which is why it is in
 //! RUST_SKIP.
 //!
-//! It holds a [`Translator`] because the kernel no longer does: the fd carries
+//! It holds a [`Translator`] because the kernel no longer does: the claim carries
 //! a HID usage and a modifier mask, and what those type is a layout, which is
 //! userland's. This is the same type and the same call `/bin/console` and
 //! every window client make, so `tr=` below is what a real surface would put
@@ -68,10 +68,10 @@ fn main() {
     println!("kev done seen={seen}");
 }
 
-/// The device-minting capability the test estate is endowed
-/// (`specs/capability-endowment-spec.md` §3). A claim is `/bin/init`'s to
-/// mint everywhere else; here test-runner passes a `DEVICE` duplicate down, so
-/// a boot can run several binaries that each need an input device.
+/// The device-minting capability the test estate is endowed. A claim is
+/// `/bin/init`'s to mint everywhere else; here test-runner passes a `DEVICE`
+/// duplicate down, so a boot can run several binaries that each need an input
+/// device.
 fn capability() -> SysCap {
     Endowments::get()
         .take(SYSCAP_LABEL)

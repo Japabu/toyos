@@ -553,20 +553,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "kernel-elide"
-version = "0.1.0"
-
-[[package]]
 name = "kernel-loom"
 version = "0.1.0"
 dependencies = [
  "loom",
  "toyos-abi",
 ]
-
-[[package]]
-name = "kernel-span"
-version = "0.1.0"
 
 [[package]]
 name = "lazy_static"
@@ -1037,6 +1029,7 @@ dependencies = [
  "toyos-gpt",
  "toyos-ld",
  "toyos-manifest",
+ "toyos-sched",
  "uuid",
 ]
 
@@ -1062,6 +1055,10 @@ dependencies = [
 
 [[package]]
 name = "toyos-elf"
+version = "0.1.0"
+
+[[package]]
+name = "toyos-elide"
 version = "0.1.0"
 
 [[package]]
@@ -1106,6 +1103,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "toyos-mixer"
+version = "0.1.0"
+
+[[package]]
 name = "toyos-pci"
 version = "0.1.0"
 
@@ -1131,6 +1132,14 @@ dependencies = [
  "rand",
  "toyos-sched",
 ]
+
+[[package]]
+name = "toyos-untrusted"
+version = "0.1.0"
+
+[[package]]
+name = "toyos-userbound"
+version = "0.1.0"
 
 [[package]]
 name = "toyos-wallclock"

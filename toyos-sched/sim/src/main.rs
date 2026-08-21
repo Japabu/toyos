@@ -17,7 +17,7 @@ usage: toyos-sched-sim <command> [args]
   sweep [seeds]                seed sweep over every scenario (default 10000)
   fuzz-sweep [steps]           fuzz-byte sweep per scenario (default 10000000)
   gate [seeds]                 the Stage 4 exit criterion: every scenario over a
-                               seed sweep, then all nine negative gates and both
+                               seed sweep, then all ten negative gates and both
                                controls
   measure <scenario> [seeds]   seed sweep over ONE scenario, with its worst
                                invariant-I5 service spread — the number spec
@@ -45,6 +45,7 @@ fn main() -> ExitCode {
             println!("old_steal_port          (negative gate: must fail)");
             println!("old_commit_before_pass  (negative gate: must fail)");
             println!("old_migrate_kept_the_corpse (negative gate: must fail)");
+            println!("old_rt_starved_the_corpse (negative gate: must fail)");
             println!("old_park_kept_the_lend  (negative gate: must fail)");
             println!("old_preemptible_window  (negative gate: must abort)");
             println!("fair_share_per_thread   (negative gate: must fail)");
@@ -111,6 +112,7 @@ fn main() -> ExitCode {
                     scenarios::old_steal_port(),
                     scenarios::old_commit_before_pass(),
                     scenarios::old_migrate_kept_the_corpse(),
+                    scenarios::old_rt_starved_the_corpse(),
                     scenarios::old_park_kept_the_lend(),
                     scenarios::fair_share_per_thread(),
                     scenarios::fair_double_charge(),

@@ -1,6 +1,6 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use crate::io_uring::RingId;
+use crate::inbox::InboxId;
 use crate::sync::Lock;
 use toyos_abi::syscall::SyscallError;
 
@@ -37,24 +37,24 @@ pub trait Nic: Send {
 
 static NIC: Lock<Option<Box<dyn Nic>>> = Lock::new(None);
 static NIC_INFO: Lock<Option<(NicInfo, crate::object::shm::Region)>> = Lock::new(None);
-static IO_URING_WATCHERS: Lock<Vec<RingId>> = Lock::new(Vec::new());
+static INBOX_WATCHERS: Lock<Vec<InboxId>> = Lock::new(Vec::new());
 
-pub fn add_io_uring_watcher(id: RingId) {
-    let mut w = IO_URING_WATCHERS.lock();
+pub fn add_inbox_watcher(id: InboxId) {
+    let mut w = INBOX_WATCHERS.lock();
     if !w.contains(&id) { w.push(id); }
 }
 
-pub fn remove_io_uring_watcher(id: RingId) {
-    IO_URING_WATCHERS.lock().retain(|&x| x != id);
+pub fn remove_inbox_watcher(id: InboxId) {
+    INBOX_WATCHERS.lock().retain(|&x| x != id);
 }
 
 /// Wake every thread blocked on an incoming frame.
 pub fn wake_waiters() {
-    crate::sched::waitqs::wake_all(&crate::sched::waitqs::NETWORK);
+    crate::sched::waitqs::wake_device(&crate::sched::waitqs::NETWORK_WATCH);
 }
 
-pub fn io_uring_watchers() -> Vec<RingId> {
-    IO_URING_WATCHERS.lock().clone()
+pub fn inbox_watchers() -> Vec<InboxId> {
+    INBOX_WATCHERS.lock().clone()
 }
 
 pub fn register(nic: Box<dyn Nic>) {
@@ -70,7 +70,7 @@ pub fn nic_info() -> Option<(NicInfo, crate::object::shm::Region)> {
 }
 
 pub fn has_packet() -> bool {
-    NIC.lock().as_ref().map_or(false, |nic| nic.has_packet())
+    NIC.lock().as_ref().is_some_and(|nic| nic.has_packet())
 }
 
 pub fn poll_rx() -> Option<(usize, usize)> {

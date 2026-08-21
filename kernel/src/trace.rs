@@ -52,7 +52,6 @@ use toyos_sched::hw::{TraceEvent, TraceKind};
 
 use crate::arch::percpu;
 
-pub const MAX_CPUS: usize = 8;
 pub const RING_CAPACITY: usize = 4096;
 
 /// Event kind discriminant. Stable — do not reorder; LLDB reads these by
@@ -103,7 +102,7 @@ pub enum Kind {
 /// true: the only reader is an LLDB hexdump, which sees a `u16` and has no
 /// symbol to check it against, so a variant inserted mid-list renames every
 /// event after it in every capture ever taken — including the ones already
-/// written down in `specs/assessments/metal-logs/`, which cannot be re-read.
+/// captured off metal, which cannot be re-read.
 /// The failure is silent, retroactive and unrecoverable, which is exactly the
 /// shape that belongs in a compile-time assertion rather than a test.
 ///
@@ -206,7 +205,7 @@ impl TraceRing {
 }
 
 #[no_mangle]
-pub static TRACE_RINGS: [TraceRing; MAX_CPUS] = [
+pub static TRACE_RINGS: [TraceRing; crate::sched::MAX_CPUS] = [
     TraceRing::new(), TraceRing::new(), TraceRing::new(), TraceRing::new(),
     TraceRing::new(), TraceRing::new(), TraceRing::new(), TraceRing::new(),
 ];
@@ -239,7 +238,7 @@ fn push(cpu: u32, timestamp_ns: u64, kind: Kind, pid: u32, tid: u32, data: u32) 
         return;
     }
     let cpu = cpu as usize;
-    if cpu >= MAX_CPUS { return; }
+    if cpu >= crate::sched::MAX_CPUS { return; }
     let ring = &TRACE_RINGS[cpu];
     let slot = ring.head.fetch_add(1, Ordering::Relaxed) as usize % RING_CAPACITY;
 

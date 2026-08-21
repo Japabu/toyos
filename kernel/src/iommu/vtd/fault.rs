@@ -1,22 +1,22 @@
 //! What the unit says when it blocks a transaction.
 //!
-//! `specs/iommu-spec.md` §7.1: faults are reported by an MSI the unit itself
-//! generates, never polled — a fault noticed a hundred milliseconds later is a
+//! **A fault is reported by an MSI the unit itself generates, never polled** —
+//! a fault noticed a hundred milliseconds later is a
 //! fault whose device has been retrying all along. The handler is bounded, does
 //! no allocation and takes no lock; the units it reads live in a fixed array of
 //! atomics, written once before the mask comes off and never again, which is
-//! the same discipline §7.2 prescribes for mapping a source-id to a process.
+//! the same discipline mapping a source-id to a process will need.
 //!
-//! §7.1 splits a fault on a kernel stream from one on a userspace-driver
-//! stream: the first is a kernel bug and stops the machine, the second is a
-//! driver bug and kills that process. At I2 there are no userspace drivers, so
+//! **A fault splits by whose stream it is on**: on a kernel stream it is a
+//! kernel bug and stops the machine, on a userspace driver's stream it is a
+//! driver bug and kills that process. There are no userspace drivers yet, so
 //! every stream on the machine is kernel-owned and every fault takes the first
 //! half. The kill path, the per-domain latch and the `need_resched` handoff
-//! that go with the second half arrive with I4, along with something to attach
-//! them to.
+//! that go with the second half arrive with per-driver domains, along with
+//! something to attach them to.
 //!
-//! Clearing Bus Master Enable on the offending function — §7.1's step 3, and
-//! what lets that handler stay simple — is not done here for the same reason.
+//! Clearing Bus Master Enable on the offending function — what lets that
+//! handler stay bounded — is not done here for the same reason.
 //! The next thing this path does is halt every CPU, so a device that has been
 //! told to stop and a machine that has stopped are indistinguishable, and the
 //! store would be a line no configuration in reach can show doing anything.
@@ -64,6 +64,12 @@ struct FaultUnit {
 }
 
 impl FaultUnit {
+    // A `const` holding atomics is copied at each use, so a write through one
+    // would go nowhere. This one is never written and never borrowed: its single
+    // use is the array repeat below, and every store in this file names
+    // `UNITS[index]`, which is the `static`. `borrow_interior_mutable_const`,
+    // the lint that fires on the losing-a-write shape, is silent here.
+    #[allow(clippy::declare_interior_mutable_const)]
     const EMPTY: Self =
         Self { regs: AtomicU64::new(0), records: AtomicU64::new(0), count: AtomicU32::new(0) };
 }

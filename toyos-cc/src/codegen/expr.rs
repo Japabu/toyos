@@ -345,7 +345,7 @@ impl Codegen {
             CType::common(&tt, &ft)
         };
         let common_sign = common_cty.signedness();
-        let merge_ty = Some(self.clif_type(&common_cty));
+        let merge_ty = self.clif_type(&common_cty);
 
         let cond_val = self.compile_expr(ctx, cond).raw();
         let cond_bool = self.to_bool(ctx, cond_val);
@@ -359,7 +359,7 @@ impl Codegen {
         ctx.builder.switch_to_block(then_block);
         ctx.builder.seal_block(then_block);
         let then_tv = self.compile_expr(ctx, then);
-        let val_ty = merge_ty.unwrap_or_else(|| ctx.builder.func.dfg.value_type(then_tv.raw()));
+        let val_ty = merge_ty;
         let then_val = self.coerce_typed(ctx, then_tv, val_ty);
         ctx.builder.ins().jump(merge, &[BlockArg::Value(then_val)]);
 
@@ -694,41 +694,47 @@ impl Codegen {
             let l_stride = Self::elem_stride(&lty);
             let r_stride = Self::elem_stride(&rty);
 
-            if l_stride.is_some() && r_stride.is_none() {
-                let stride = l_stride.unwrap();
-                let l = self.compile_expr(ctx, lhs).raw();
-                let r_tv = self.compile_expr(ctx, rhs);
-                let r = self.coerce_typed(ctx, r_tv, I64);
-                let r = if stride != 1 {
-                    let s = ctx.builder.ins().iconst(I64, stride);
-                    ctx.builder.ins().imul(r, s)
-                } else { r };
-                return self.compile_binop(ctx, op, TypedValue::signed(l), TypedValue::signed(r))
-                    .with_sign(Signedness::Unsigned);
-            }
-            if r_stride.is_some() && l_stride.is_none() && matches!(op, BinOp::Add) {
-                let stride = r_stride.unwrap();
-                let l_tv = self.compile_expr(ctx, lhs);
-                let l = self.coerce_typed(ctx, l_tv, I64);
-                let r = self.compile_expr(ctx, rhs).raw();
-                let l = if stride != 1 {
-                    let s = ctx.builder.ins().iconst(I64, stride);
-                    ctx.builder.ins().imul(l, s)
-                } else { l };
-                return self.compile_binop(ctx, op, TypedValue::signed(l), TypedValue::signed(r))
-                    .with_sign(Signedness::Unsigned);
-            }
-            // ptr - ptr => (ptr - ptr) / sizeof(*ptr)
-            if l_stride.is_some() && r_stride.is_some() && matches!(op, BinOp::Sub) {
-                let stride = l_stride.unwrap();
-                let l = self.compile_expr(ctx, lhs).raw();
-                let r = self.compile_expr(ctx, rhs).raw();
-                let diff = self.compile_binop(ctx, op, TypedValue::signed(l), TypedValue::signed(r)).raw();
-                if stride != 1 {
-                    let s = ctx.builder.ins().iconst(I64, stride);
-                    return TypedValue::signed(ctx.builder.ins().sdiv(diff, s));
+            // The three shapes C gives pointer arithmetic, and which side is a
+            // pointer is what tells them apart. One `match` rather than three
+            // `is_some`/`unwrap` pairs: the patterns are mutually exclusive, so
+            // this asks the same questions in the same order.
+            match (l_stride, r_stride) {
+                // ptr + n => ptr + n*sizeof(*ptr)
+                (Some(stride), None) => {
+                    let l = self.compile_expr(ctx, lhs).raw();
+                    let r_tv = self.compile_expr(ctx, rhs);
+                    let r = self.coerce_typed(ctx, r_tv, I64);
+                    let r = if stride != 1 {
+                        let s = ctx.builder.ins().iconst(I64, stride);
+                        ctx.builder.ins().imul(r, s)
+                    } else { r };
+                    return self.compile_binop(ctx, op, TypedValue::signed(l), TypedValue::signed(r))
+                        .with_sign(Signedness::Unsigned);
                 }
-                return TypedValue::signed(diff);
+                // n + ptr, which only addition allows
+                (None, Some(stride)) if matches!(op, BinOp::Add) => {
+                    let l_tv = self.compile_expr(ctx, lhs);
+                    let l = self.coerce_typed(ctx, l_tv, I64);
+                    let r = self.compile_expr(ctx, rhs).raw();
+                    let l = if stride != 1 {
+                        let s = ctx.builder.ins().iconst(I64, stride);
+                        ctx.builder.ins().imul(l, s)
+                    } else { l };
+                    return self.compile_binop(ctx, op, TypedValue::signed(l), TypedValue::signed(r))
+                        .with_sign(Signedness::Unsigned);
+                }
+                // ptr - ptr => (ptr - ptr) / sizeof(*ptr)
+                (Some(stride), Some(_)) if matches!(op, BinOp::Sub) => {
+                    let l = self.compile_expr(ctx, lhs).raw();
+                    let r = self.compile_expr(ctx, rhs).raw();
+                    let diff = self.compile_binop(ctx, op, TypedValue::signed(l), TypedValue::signed(r)).raw();
+                    if stride != 1 {
+                        let s = ctx.builder.ins().iconst(I64, stride);
+                        return TypedValue::signed(ctx.builder.ins().sdiv(diff, s));
+                    }
+                    return TypedValue::signed(diff);
+                }
+                _ => {}
             }
         }
         // Short-circuit evaluation for && and ||
@@ -855,15 +861,13 @@ impl Codegen {
         let lhs_ty = self.expr_type(ctx, lhs);
 
         // Array/struct assignment: emit memcpy
-        if op == AssignOp::Assign {
-            if lhs_ty.is_aggregate() || matches!(&lhs_ty, CType::Array(..)) {
-                let size = lhs_ty.size();
-                let dst = self.compile_addr(ctx, lhs);
-                let src = rhs_val; // for aggregates, compile_expr returns address
-                let size_val = ctx.builder.ins().iconst(I64, size as i64);
-                self.emit_memcpy(ctx, dst, src, size_val);
-                return TypedValue::unsigned(dst);
-            }
+        if op == AssignOp::Assign && (lhs_ty.is_aggregate() || matches!(&lhs_ty, CType::Array(..))) {
+            let size = lhs_ty.size();
+            let dst = self.compile_addr(ctx, lhs);
+            let src = rhs_val; // for aggregates, compile_expr returns address
+            let size_val = ctx.builder.ins().iconst(I64, size as i64);
+            self.emit_memcpy(ctx, dst, src, size_val);
+            return TypedValue::unsigned(dst);
         }
 
         // Bitfield assignment: read-modify-write
@@ -925,7 +929,7 @@ impl Codegen {
 
             // Detect struct return (uses sret convention)
             let is_struct_ret = self.func_ret_types.get(name)
-                .map(|t| Self::needs_sret(t))
+                .map(Self::needs_sret)
                 .unwrap_or(false);
 
             let ret_cty = self.func_ret_types.get(name).cloned();
@@ -1135,11 +1139,9 @@ impl Codegen {
                 }
             }
         }
-        if !is_sret {
-            if !matches!(&ret_cty, CType::Void) {
-                let ret_clif = self.clif_type(&ret_cty);
-                sig.returns.push(AbiParam::new(ret_clif));
-            }
+        if !is_sret && !matches!(&ret_cty, CType::Void) {
+            let ret_clif = self.clif_type(&ret_cty);
+            sig.returns.push(AbiParam::new(ret_clif));
         }
         let sret_addr = if is_sret {
             let size = ret_cty.size().max(1);

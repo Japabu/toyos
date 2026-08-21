@@ -23,10 +23,28 @@ check = []
 # the name, never enabled — the loom models exercise the primitives, and the
 # old protocol is the simulator's business.
 protocol-port = []
+# And likewise the kernel's stray-write tripwire, which compiles a layout
+# reader onto `CpuSched`. Declared so `cfg` checking knows the name; nothing
+# here enables it, because the models exercise the primitives and the
+# tripwire's subject is a whole record in a kernel `static`.
+tripwire = []
 # Model the mandatory preempt-disabled push away (spec §7.2). The
 # `preempted_producer_strands_suffix` case must FAIL under this feature —
 # `loom/tests/loom_mailbox.rs` asserts exactly that.
 no-preempt-guard = []
+# The negative control for the sleep handshake's kick edge (spec §7.3, §7.5).
+# It makes `mailbox.rs`'s `Doorbell::ring` read the doorbell's bits `Relaxed`
+# instead of `AcqRel`, so a producer can miss a consumer's freshly published
+# `SLEEPING` bit and elide the IPI that would have woken it, and
+# `loom_sleep.rs` must red under it — the one command that proves the model
+# has teeth:
+#
+#   cargo test -p toyos-sched-loom --features doorbell-kick-relaxed \
+#     --test loom_sleep
+#
+# Never on by default and never reachable from a kernel build, which declares
+# the same name only so `cfg` checking knows it.
+doorbell-kick-relaxed = []
 
 [dependencies]
 loom = "0.7"

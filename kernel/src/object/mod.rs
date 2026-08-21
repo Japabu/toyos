@@ -15,7 +15,21 @@
 //! killer's CPU. The stranded `Arc` leaks memory: bounded, visible in the
 //! [`census`], and unable to delay a semantic event.
 //!
-//! `specs/capability-endowment-spec.md` §2.
+//! **The count is drained on the killer's CPU; the event is not published
+//! there.** What a peer sees is the `on_zero_handles` hook, and that runs from
+//! [`ZERO_QUEUE`] on whichever CPU drains next — so a kill can return with the
+//! victim's read end still held and the peer's next write accepted. Measured,
+//! and the reason nothing may read "the count reached zero" as "the peer has
+//! been told": `issues/kernel/deferred-release-outlives-its-syscall.md`.
+
+// Every unsafe block under `object::` carries a `SAFETY:` comment —
+// measured and documented in full by
+// `issues/build/clippy-has-never-run-here.md`'s per-area plan.
+// `host-tests.yml`'s kernel clippy step already runs with `-D warnings`, so
+// `warn` here is what actually gates: a new undocumented block anywhere in
+// this module tree fails CI, while the rest of the kernel (not yet swept)
+// stays silent.
+#![warn(clippy::undocumented_unsafe_blocks)]
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -27,6 +41,7 @@ use crate::sync::Lock;
 pub mod device;
 pub mod file;
 pub mod handle;
+pub mod inbox;
 pub mod namespace;
 pub mod ops;
 pub mod pipe;
@@ -71,8 +86,8 @@ impl<T: Clone> Held<T> {
 
 /// A kernel object's identity.
 ///
-/// For diagnostics and for kernel-internal keys — an io_uring watch names the
-/// object it watches by this, because an fd number means nothing in another
+/// For diagnostics and for kernel-internal keys — an inbox watch names the
+/// object it watches by this, because a handle means nothing in another
 /// process's table. **Never an authority**: no syscall turns a koid into
 /// access to anything.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -283,7 +298,9 @@ kobject! {
     deferred Connection => service::ConnectionEnd,
     deferred Device => device::DeviceClaim,
     deferred Acceptor => port::Acceptor,
-    deferred IoUring => service::IoUringObject,
+    // The kind name is the ABI's: `toyos_abi::syscall::OBJECT_KINDS` carries it
+    // and `CENSUS_KIND` asserts the two lists agree name for name.
+    deferred Inbox => inbox::InboxObject,
     // Every mapping goes with the last handle, and the flush that makes that
     // safe waits for every other CPU — so it runs from the queue, with nothing
     // held, and never inline at a `close`.
@@ -326,7 +343,7 @@ static ZERO_QUEUE: Lock<Vec<KObjectRef>> = Lock::new(Vec::new());
 /// The drain runs at every syscall exit and every scheduler pass, and
 /// `Lock::lock` is a `fetch_add` — the one operation TCG cannot emit inline,
 /// and a few hundred a boot of it cost 350 ms of boot
-/// (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`). Written under the lock at
+/// (`issues/hardware/one-rmw-per-log-line-cost-350ms.md`). Written under the lock at
 /// both ends, so it never says "empty" over a queued object; a stale
 /// "non-empty" costs one drain that finds nothing.
 static ZERO_PENDING: AtomicBool = AtomicBool::new(false);
@@ -343,6 +360,27 @@ pub(crate) fn enqueue_zero_handles(object: KObjectRef) {
 /// loop — the same three sites, and for the same reason, as the wake drains
 /// beside them. Latency is one of those, which is microseconds; nothing here
 /// waits on anything.
+///
+/// **`ZERO_PENDING` is cleared before a single hook runs, so "the queue is
+/// empty" is not "the work is done" — and the CPU that queued an object is not
+/// the one guaranteed to release it.** Any of the three sites, on any other
+/// CPU, can take a batch out from under the syscall that filled it; that
+/// syscall then reaches its own drain site, is told there is nothing to do, and
+/// **returns to userland with its objects still unreleased**. Measured from
+/// userland as a 2 MiB staircase in `SYS_SYSINFO` across consecutive calls
+/// after a kill, which is one ring page at a time on the other CPU — and, since
+/// 2026-08-20, as a syscall answering the wrong word: `kill_while_blocked` sees
+/// a write to a killed peer's pipe or connection return `Ok(n)` where the ABI
+/// says `NotFound`, because the peer's `on_zero_handles` had not run yet.
+/// Memory is not lost — a killed process's pages do all come back,
+/// sub-millisecond — but a semantic event can be, so nothing may be written
+/// that assumes a release has happened because the call that caused it has
+/// returned. `issues/kernel/deferred-release-outlives-its-syscall.md`
+/// carries the measurement and the two shapes a fix could take; the release
+/// protocol itself belongs to the track in
+/// `issues/kernel/every-wait-in-this-kernel-is-a-spin.md`, whose sleep lock is
+/// what decides what a hook released from here may do — **none of these three
+/// drain sites can park, so no `on_zero_handles` hook may take a sleep lock.**
 pub fn drain_zero_handles() {
     while ZERO_PENDING.load(Ordering::Acquire) {
         // A hook may retire further objects — dropping a connection drops the

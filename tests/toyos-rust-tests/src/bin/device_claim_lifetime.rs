@@ -15,9 +15,8 @@
 //!
 //! **Minting is a capability now, and this binary holds one.** `SYS_OPEN_DEVICE`
 //! was first-come and ungated; `SYS_DEVICE_CLAIM` needs a `SysCap` carrying
-//! `Rights::DEVICE`, which reaches the test estate through test-runner
-//! (`specs/capability-endowment-spec.md` §4) and reaches this binary's own
-//! children because it also carries `Rights::DUP`.
+//! `Rights::DEVICE`, which reaches the test estate through test-runner and
+//! reaches this binary's own children because it also carries `Rights::DUP`.
 //!
 //! Roles: no argument is the test; `claimer` tries to take the mouse and
 //! reports what it got; `holder` takes it, says so, and waits to be killed.
@@ -71,11 +70,11 @@ fn test(cap: &SysCap) {
             let thief = claim_in_child(cap);
             panic!(
                 "dup handed back the mouse claim: a second descriptor is live \
-                 and another process's claim answered {thief:?} (stale fd {stale:?})"
+                 and another process's claim answered {thief:?} (stale handle {stale:?})"
             );
         }
         Err(SyscallError::PermissionDenied) => {}
-        Err(e) => panic!("dup of a device fd: expected PermissionDenied, got {e:?}"),
+        Err(e) => panic!("dup of a device handle: expected PermissionDenied, got {e:?}"),
     }
 
     // dup2 is the same operation with a caller-chosen slot, and must answer
@@ -83,22 +82,23 @@ fn test(cap: &SysCap) {
     // closable.
     match syscall::dup2(mouse, 9) {
         Err(SyscallError::PermissionDenied) => {}
-        other => panic!("dup2 of a device fd: expected PermissionDenied, got {other:?}"),
+        other => panic!("dup2 of a device handle: expected PermissionDenied, got {other:?}"),
     }
 
-    // A spawn `fd_map` is the third way to get a second descriptor, and it is
+    // A spawn slot map is the third way to get a second handle, and it is
     // the one that would put the claim in another process — where releasing it
     // is not even this process's to do.
-    match spawn_with_fd_map(mouse) {
+    match spawn_with_slot_map(mouse) {
         Err(SyscallError::PermissionDenied) => {}
-        other => panic!("spawn with a device fd in its fd_map: expected PermissionDenied, got {other:?}"),
+        other => panic!("spawn with a device handle in its slot map: expected PermissionDenied, got {other:?}"),
     }
 
     // **A claim answers no write at all**, and every device class answers that
-    // in one exhaustive match arm. The audio fd used to dispatch command bytes
+    // in one exhaustive match arm. The audio claim used to dispatch command bytes
     // — `0 => stop`, `1 => start`, `_ => {}` — and report the write's length
     // whichever arm ran, so a caller could not tell an accepted command from an
-    // ignored one. That dispatch was deleted with `kernel/src/fd.rs` (`a022811`);
+    // ignored one. That dispatch was deleted with the old descriptor layer
+    // (`a022811`);
     // this is what keeps a future one from arriving without a refusal, on the
     // one claim every machine shape has.
     match syscall::write(mouse, &[7]) {
@@ -152,7 +152,7 @@ fn test(cap: &SysCap) {
     drop(reclaimed);
 
     println!(
-        "device claim: dup, dup2, fd_map and a command byte refused; close and kill both release it"
+        "device claim: dup, dup2, slot map and a command byte refused; close and kill both release it"
     );
 }
 
@@ -171,12 +171,12 @@ fn claim_in_child(cap: &SysCap) -> Option<SyscallError> {
     }
 }
 
-/// `SYS_SPAWN` with `[[3, fd]]` as its fd_map.
+/// `SYS_SPAWN` with `[[3, handle]]` as its slot map.
 ///
 /// One mmap region for both blobs: `user_bytes` needs the window to be
 /// physically contiguous, and a stack buffer that straddled a page would make
-/// this pass on `BadAddress` without ever reaching `build_child_fds`.
-fn spawn_with_fd_map(fd: toyos_abi::RawHandle) -> Result<toyos_abi::RawHandle, SyscallError> {
+/// this pass on `BadAddress` without ever reaching `build_child_handles`.
+fn spawn_with_slot_map(handle: toyos_abi::RawHandle) -> Result<toyos_abi::RawHandle, SyscallError> {
     const REGION: usize = 4096;
     const SLOT_MAP_OFF: usize = 2048;
 
@@ -193,7 +193,7 @@ fn spawn_with_fd_map(fd: toyos_abi::RawHandle) -> Result<toyos_abi::RawHandle, S
     let argv = format!("{SELF_PATH}\0claimer\0");
     unsafe { core::ptr::copy_nonoverlapping(argv.as_ptr(), region, argv.len()) };
 
-    let pair = [3u32.to_ne_bytes(), fd.0.to_ne_bytes()].concat();
+    let pair = [3u32.to_ne_bytes(), handle.0.to_ne_bytes()].concat();
     unsafe {
         core::ptr::copy_nonoverlapping(pair.as_ptr(), region.add(SLOT_MAP_OFF), pair.len())
     };

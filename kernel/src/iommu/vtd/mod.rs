@@ -1,13 +1,15 @@
 //! Intel VT-d. Every register layout and every Intel name in this subsystem is
-//! at or below this module (`specs/iommu-spec.md` §3).
+//! at or below this module, by rule: nothing above `vtd/` may say `Dmar`,
+//! `Sagaw` or `SourceId`.
 //!
-//! Stage I2: the units are found, their capabilities decoded and described,
-//! every enumerated PCI function given a context entry naming one identity-
-//! mapped domain, and translation turned on. Nothing is *refused*: every
-//! observation §2.2 makes a refusal of at I5 appears here as a line naming the
-//! register value it decided on, and a unit this kernel cannot program is left
-//! switched off rather than made into a halt — which leaves that machine
-//! exactly as it boots today. A refusal that says only "unsupported" is a
+//! What is built: the units are found, their capabilities decoded and
+//! described, every enumerated PCI function given a context entry naming one
+//! identity-mapped domain, and translation turned on. Nothing is *refused*:
+//! every observation that will one day refuse a machine appears here as a line
+//! naming the register value it decided on, and a unit this kernel cannot
+//! program is left switched off rather than made into a halt — which leaves
+//! that machine exactly as it boots today. A refusal that says only
+//! "unsupported" is a
 //! refusal nobody can act on, and these are the lines that will be read off a
 //! laptop panel with no serial port.
 //!
@@ -30,6 +32,7 @@ use crate::iommu::{AddressWidth, StreamId};
 use crate::mm::paging::CachePolicy;
 use crate::mm::Mmio;
 use crate::sync::Lock;
+use crate::time::{Duration, Tripwire};
 
 use dmar::{Dmar, Malformed, Scope, Scopes, Structure};
 use queue::Queue;
@@ -69,7 +72,10 @@ const ROOT_TABLE_SET: u32 = 1 << 30;
 /// hardware that is not answering. Expiry is a panic for the same reason §5.5
 /// gives for an unacknowledged invalidation — a unit half-way through being
 /// enabled is a unit whose reach nothing can state.
-const COMMAND_TIMEOUT_NS: u64 = 1_000_000_000;
+const COMMAND_TIMEOUT: Tripwire = Tripwire::absurd(
+    Duration::from_secs(1),
+    "a unit half-way through being enabled is a unit whose reach nothing can state",
+);
 
 /// x86-64's architectural physical-address ceiling is 52 bits, so a register
 /// base at or above this is not an address at all. It is also what stops
@@ -201,7 +207,7 @@ impl Unit {
         if persistent {
             self.gcmd |= bit;
         }
-        let deadline = crate::clock::nanos_since_boot() + COMMAND_TIMEOUT_NS;
+        let deadline = crate::clock::nanos_since_boot() + COMMAND_TIMEOUT.nanos();
         loop {
             let gsts = self.regs.read_u32(GSTS_REG);
             if gsts & status != 0 {
@@ -225,7 +231,7 @@ impl Unit {
 /// would read plausible garbage as a capability register, which costs a wrong
 /// log line and, from I2 on, a register write into somebody's heap.
 fn window(base: u64) -> Option<Mmio> {
-    if base == 0 || base % REGISTER_WINDOW != 0 || base >= MAX_PHYS {
+    if base == 0 || !base.is_multiple_of(REGISTER_WINDOW) || base >= MAX_PHYS {
         return None;
     }
     Some(
@@ -603,8 +609,8 @@ impl Capabilities {
 
     /// `ECAP.SC`: a second-level page-table entry may carry the snoop-force
     /// bit, which makes a device's DMA snoop the CPU cache whatever the device
-    /// itself requested. `specs/plans/hda-driver-plan.md` §4.4 item 4 is why it is
-    /// read: an Intel HDA controller carries a vendor no-snoop control in its
+    /// itself requested. Read because an audio driver needs it: an Intel HDA
+    /// controller carries a vendor no-snoop control in its
     /// config space, and setting this bit in every mapping makes that control
     /// irrelevant — one layer down, with no config-write syscall.
     fn snoop_control(&self) -> bool {

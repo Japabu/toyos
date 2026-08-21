@@ -11,6 +11,7 @@
 use std::time::{Duration, Instant};
 
 use toyos::shm::SharedMemory;
+use toyos::AsHandle;
 use toyos::{ipc, Connection};
 use toyos_abi::RawHandle;
 use toyos_desktop::Window;
@@ -65,13 +66,13 @@ pub struct Client {
 /// A window, with the connection behind it.
 pub type Win = Window<Client>;
 
-/// A whole client message, off the fd and in memory.
+/// A whole client message, off the connection and in memory.
 ///
 /// `conn` is `Some` only for the first frame on a freshly accepted connection:
 /// `MSG_CREATE_WINDOW` keeps it, and every other message type answers on it
 /// and lets it close.
 pub struct ClientFrame {
-    pub fd: RawHandle,
+    pub handle: RawHandle,
     pub msg_type: u32,
     payload: [u8; MAX_KEPT_PAYLOAD],
     payload_len: usize,
@@ -79,8 +80,8 @@ pub struct ClientFrame {
 }
 
 impl ClientFrame {
-    pub fn new(fd: RawHandle, msg_type: u32) -> Self {
-        Self { fd, msg_type, payload: [0; MAX_KEPT_PAYLOAD], payload_len: 0, conn: None }
+    pub fn new(handle: RawHandle, msg_type: u32) -> Self {
+        Self { handle, msg_type, payload: [0; MAX_KEPT_PAYLOAD], payload_len: 0, conn: None }
     }
 
     pub fn set_payload(&mut self, bytes: &[u8]) {
@@ -151,15 +152,15 @@ impl From<ipc::TrySendError> for DropReason {
 /// A client the next removal pass will take out.
 pub type Dead = (RawHandle, DropReason);
 
-pub fn mark_dead(dead: &mut Vec<Dead>, fd: RawHandle, reason: DropReason) {
-    if !dead.iter().any(|(f, _)| *f == fd) {
-        dead.push((fd, reason));
+pub fn mark_dead(dead: &mut Vec<Dead>, handle: RawHandle, reason: DropReason) {
+    if !dead.iter().any(|(f, _)| *f == handle) {
+        dead.push((handle, reason));
     }
 }
 
 pub fn announce(dead: &[Dead]) {
-    for (fd, reason) in dead {
-        eprintln!("compositor: dropping client {} — {}", fd.0, reason.why());
+    for (handle, reason) in dead {
+        eprintln!("compositor: dropping client {} — {}", handle.0, reason.why());
     }
 }
 
@@ -185,7 +186,7 @@ pub fn note_closed(by: &str, client: RawHandle, remaining: usize) {
 /// which is the price of never blocking on it.
 pub fn deliver<T: ipc::IpcPayload>(dead: &mut Vec<Dead>, win: &Win, msg_type: u32, payload: &T) {
     if let Err(e) = win.client.conn.try_send(msg_type, payload) {
-        mark_dead(dead, win.client.conn.fd(), e.into());
+        mark_dead(dead, win.client.conn.as_handle(), e.into());
     }
 }
 
@@ -202,13 +203,13 @@ pub fn deliver_with_handles<T: ipc::IpcPayload>(
     payload: &T,
 ) {
     if let Err(e) = win.client.conn.try_send_with_handles(handles, msg_type, payload) {
-        mark_dead(dead, win.client.conn.fd(), e.into());
+        mark_dead(dead, win.client.conn.as_handle(), e.into());
     }
 }
 
 /// [`deliver`] for a message that is only its own header.
 pub fn deliver_signal(dead: &mut Vec<Dead>, win: &Win, msg_type: u32) {
     if let Err(e) = win.client.conn.try_signal(msg_type) {
-        mark_dead(dead, win.client.conn.fd(), e.into());
+        mark_dead(dead, win.client.conn.as_handle(), e.into());
     }
 }

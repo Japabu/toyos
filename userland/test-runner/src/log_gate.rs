@@ -6,7 +6,6 @@
 //! entry — it is a `SysCap` dup, exactly like `realtime`, which the estate does
 //! not hand down either. So the gate that reads the machine's log is the one
 //! process in a test image that holds the right from its own manifest row.
-//! `specs/log-architecture-spec.md` §3.2, §9.5.
 //!
 //! **The verdict is exact, not statistical.** Every sequence number a shard
 //! ever issued is either a record this reader took or one the kernel counted as
@@ -28,13 +27,12 @@
 //! of the nesting burst's own `done`. **The rule this shape exists to keep is
 //! general**: a workload whose liveness depends on a record the ring is allowed
 //! to drop is the same mistake wherever it appears.
-//! `specs/log-architecture-spec.md` §9.1 carries the measurement.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use toyos::log::{LogTail, Record, MAX_LOG_SHARDS};
-use toyos::poller::{Poller, IORING_POLL_IN};
+use toyos::poller::{Poller, READABLE};
 use toyos::syscap::SysCap;
 
 /// The first sequence number any shard issues — one, so a slot nothing has ever
@@ -252,7 +250,7 @@ fn gate(cap: &SysCap) -> Result<(), String> {
     let started = Instant::now();
     loop {
         if !armed {
-            poller.poll_add(cap, IORING_POLL_IN, LOG_TOKEN);
+            poller.watch(cap, READABLE, LOG_TOKEN);
             armed = true;
         }
         poller.wait(0, 0, |token| {
@@ -339,7 +337,7 @@ fn gate(cap: &SysCap) -> Result<(), String> {
             .map_err(|e| format!("the record-making child would not start: {e}"))?;
         let _ = child.wait();
         if !armed {
-            poller.poll_add(cap, IORING_POLL_IN, LOG_TOKEN);
+            poller.watch(cap, READABLE, LOG_TOKEN);
         }
         poller.wait(1, READINESS_WAIT_NANOS, |token| {
             assert_eq!(token, LOG_TOKEN, "the log poll completed with another token");

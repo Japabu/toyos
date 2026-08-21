@@ -1,10 +1,9 @@
 //! A batch of handles crossing a connection, and what happens at each point a
 //! peer can die.
 //!
-//! `specs/capability-endowment-spec.md` §8 requires this gate and nothing in
-//! the tree was it: the only two `handle_send` call sites in the whole test
-//! estate sent a `SharedMem`, which is why three of this branch's defects lived
-//! here unseen.
+//! Nothing in the tree was this gate: the only two `handle_send` call sites in
+//! the whole test estate sent a `SharedMem`, which is why three of this
+//! branch's defects lived here unseen.
 //!
 //! Five arms, one per point a batch can be at.
 //!
@@ -137,7 +136,7 @@ fn a_dead_peer_keeps_nothing() {
     let (read, write) = probe();
     let sending = syscall::dup(write.as_handle()).expect("a duplicate to send");
     assert_eq!(
-        syscall::handle_send(conn.fd(), &[sending]),
+        syscall::handle_send(conn.as_handle(), &[sending]),
         Err(SyscallError::Gone),
         "a connection whose peer has exited took a batch",
     );
@@ -158,12 +157,12 @@ fn a_full_queue_keeps_nothing() {
     let (read, write) = probe();
     for i in 0..MAX_QUEUED_BATCHES {
         let handle = syscall::dup(write.as_handle()).expect("a duplicate to send");
-        syscall::handle_send(conn.fd(), &[handle])
+        syscall::handle_send(conn.as_handle(), &[handle])
             .unwrap_or_else(|e| panic!("batch {i} of {MAX_QUEUED_BATCHES} was refused: {e:?}"));
     }
     let refused = syscall::dup(write.as_handle()).expect("one more duplicate");
     assert_eq!(
-        syscall::handle_send(conn.fd(), &[refused]),
+        syscall::handle_send(conn.as_handle(), &[refused]),
         Err(SyscallError::ResourceExhausted),
         "the {MAX_QUEUED_BATCHES}-batch queue took one more",
     );
@@ -194,7 +193,7 @@ fn an_unreceived_batch_is_released() {
 
     let region = toyos::shm::SharedMemory::create(4096).expect("a region to send");
     let sending = syscall::dup(region.as_handle()).expect("a duplicate to send");
-    syscall::handle_send(conn.fd(), &[sending]).expect("the peer took the batch");
+    syscall::handle_send(conn.as_handle(), &[sending]).expect("the peer took the batch");
     drop(region);
 
     child.kill().expect("kill the peer holding the batch");
@@ -229,7 +228,7 @@ fn a_senders_exit_does_not_retract_what_it_sent() {
     // **The handle resolves, which is the whole assertion.** The child made both
     // ends of the pipe and both went with it, so the write itself is refused for
     // the reader rather than for the handle — `NotFound`, which
-    // `specs/issues/isolation/a-broken-pipe-answers-not-found.md` is about and
+    // `issues/isolation/a-broken-pipe-answers-not-found.md` is about and
     // which `connect_before_serve` asserts too. A handle a dead sender's batch
     // no longer backed would instead end this process on `Stale`, so reaching
     // the next statement at all is the verdict.
@@ -266,7 +265,7 @@ fn an_immediate_object_is_flushed_off_the_idle_stack() {
 
     let (conn, mut child) = peer("connect-and-wait");
     marker(&mut child, "connect-and-wait");
-    syscall::handle_send(conn.fd(), &[file]).expect("the peer took the file");
+    syscall::handle_send(conn.as_handle(), &[file]).expect("the peer took the file");
     child.kill().expect("kill the peer holding the file");
     let _ = child.wait();
     drop(conn);
@@ -305,7 +304,7 @@ fn child(role: &str) -> ! {
         "send-and-exit" => {
             let (_read, write) = toyos::pipe_pair().expect("a pipe of our own");
             let handle = syscall::dup(write.as_handle()).expect("a duplicate to send");
-            syscall::handle_send(conn.fd(), &[handle]).expect("send the batch");
+            syscall::handle_send(conn.as_handle(), &[handle]).expect("send the batch");
             syscall::exit(0)
         }
         other => panic!("unknown role {other:?}"),

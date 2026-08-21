@@ -26,11 +26,21 @@ impl RawHandle {
     /// the kernel refuses by.
     pub const MAX_SLOTS: usize = 1 << Self::SLOT_BITS;
 
-    /// A slot is retired rather than reissued at this generation, so
-    /// [`HANDLE_INVALID`] — which encodes slot 4095 at this generation — is
-    /// never a handle anything holds.
+    /// **No table ever issues a handle at this generation.** A slot whose
+    /// counter would step to it retires instead — permanently, by owner ruling
+    /// of 2026-08-20 — so a spent slot is one the table no longer has rather
+    /// than one whose numbers start again. Two things rest on it: an ancient
+    /// handle can never come back to life, and [`HANDLE_INVALID`] — which
+    /// encodes slot 4095 at this generation — is a number nothing holds.
+    ///
+    /// The last generation a slot is issued at is therefore `MAX_GENERATION - 1`
+    /// (`kernel::object::handle`).
     pub const MAX_GENERATION: u32 = (1 << (32 - Self::SLOT_BITS)) - 1;
 
+    /// A generation past [`MAX_GENERATION`](Self::MAX_GENERATION) loses its
+    /// overflowing bits here rather than panicking, in every profile — which is
+    /// why the kernel's table retires a slot instead of counting past the field
+    /// and finding itself back at generation 0.
     pub const fn new(slot: u16, generation: u32) -> Self {
         Self((generation << Self::SLOT_BITS) | (slot as u32 & Self::SLOT_MASK))
     }
@@ -67,9 +77,9 @@ impl Rights {
     pub const TRANSFER: Rights = Rights(1 << 1);
     pub const READ: Rights = Rights(1 << 2);
     pub const WRITE: Rights = Rights(1 << 3);
-    /// Shared memory, a pipe's ring page, an io_uring ring.
+    /// Shared memory, a pipe's ring page, an [inbox](crate::inbox)'s rings.
     pub const MAP: Rights = Rights(1 << 4);
-    /// Block on it, or name it in an io_uring `POLL_ADD`.
+    /// Block on it, or name it in an [`OP_WATCH`](crate::inbox::OP_WATCH).
     pub const WAIT: Rights = Rights(1 << 5);
     /// Kill a process; on a `SysCap`, open one by pid.
     pub const MANAGE: Rights = Rights(1 << 6);
@@ -86,10 +96,28 @@ impl Rights {
     ///
     /// [`SYS_LOG_READ`]: crate::syscall::SYS_LOG_READ
     pub const LOG: Rights = Rights(1 << 9);
+    /// On a `SysCap`: power the machine off.
+    ///
+    /// [`SYS_SHUTDOWN`] ends every process there is and does not come back, so
+    /// it is the largest authority this capability carries — and it was the one
+    /// machine-wide authority that took no handle and no right at all, so any
+    /// process that could make a syscall could end the machine. It rides a bit
+    /// for the same reason minting a device claim and entering the real-time
+    /// band do: what can cut the power is exactly what `/bin/init` endowed, and
+    /// there is nothing a program can name to reach it otherwise.
+    ///
+    /// The kernel mints one capability carrying it, at boot, for `/bin/init`
+    /// (`kernel::loader::spawn_init`). `/bin/toybox` holds a narrowed duplicate
+    /// because `/bin/shutdown` is that binary under another name, and
+    /// `test-runner` holds one because `run shutdown` is how the suite ends a
+    /// guest and reads what reached the volume.
+    ///
+    /// [`SYS_SHUTDOWN`]: crate::syscall::SYS_SHUTDOWN
+    pub const POWER: Rights = Rights(1 << 10);
 
     /// Every bit that has a caller. A wider set than this is a bug in whoever
     /// composed it, not a right nobody uses.
-    pub const ALL: Rights = Rights(0x3ff);
+    pub const ALL: Rights = Rights(0x7ff);
 
     pub const fn from_bits(bits: u32) -> Option<Self> {
         if bits & !Self::ALL.0 == 0 { Some(Rights(bits)) } else { None }
@@ -120,7 +148,7 @@ impl Rights {
 /// refusal saying which right was missing.
 impl core::fmt::Debug for Rights {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        const NAMES: [(Rights, &str); 10] = [
+        const NAMES: [(Rights, &str); 11] = [
             (Rights::DUP, "DUP"),
             (Rights::TRANSFER, "TRANSFER"),
             (Rights::READ, "READ"),
@@ -131,6 +159,7 @@ impl core::fmt::Debug for Rights {
             (Rights::RT, "RT"),
             (Rights::DEVICE, "DEVICE"),
             (Rights::LOG, "LOG"),
+            (Rights::POWER, "POWER"),
         ];
         if self.0 == 0 {
             return f.write_str("NONE");
@@ -176,6 +205,26 @@ mod tests {
             HANDLE_INVALID,
             RawHandle::new((RawHandle::MAX_SLOTS - 1) as u16, RawHandle::MAX_GENERATION)
         );
+    }
+
+    /// **A generation past the field wraps here silently, in every profile** —
+    /// which is why retirement has to be a state the kernel's table keeps and
+    /// can never be an overflow it would notice.
+    ///
+    /// `<<` checks its shift *amount* and never the value, so the top bits go
+    /// without a panic even with debug assertions on. A counter stepped one past
+    /// `MAX_GENERATION` is therefore not a large generation, and not a trapped
+    /// one: it is generation 0 again, the very number every handle a slot was
+    /// first issued at carries.
+    #[test]
+    fn a_generation_past_the_field_is_generation_zero_again() {
+        for slot in [0u16, 900, 4095] {
+            assert_eq!(
+                RawHandle::new(slot, RawHandle::MAX_GENERATION + 1),
+                RawHandle::new(slot, 0),
+                "slot {slot} one past the last generation",
+            );
+        }
     }
 
     #[test]

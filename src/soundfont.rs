@@ -17,8 +17,7 @@
 //! A MUS lump names its instruments in its own header, so what doom needs is
 //! read rather than guessed, and one function answers it for both the producer
 //! and the gate. Deleting a preset doom never selects costs nothing audible:
-//! all 13 tracks render bit-exact against the full bank
-//! (`specs/assessments/doom-music-soundfont.md` §4).
+//! all 13 tracks render bit-exact against the full bank.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -556,10 +555,10 @@ pub fn subset(source: &[u8], want: &Instruments) -> Vec<u8> {
         let base = (smpl.len() / 2) as u32;
         let frames = s.end - s.start;
         smpl.extend_from_slice(&bank.smpl[s.start as usize * 2..s.end as usize * 2]);
-        smpl.extend(std::iter::repeat(0u8).take(SAMPLE_GUARD_FRAMES * 2));
+        smpl.extend(std::iter::repeat_n(0u8, SAMPLE_GUARD_FRAMES * 2));
         if has24 {
             sm24.extend_from_slice(&bank.sm24[s.start as usize..s.end as usize]);
-            sm24.extend(std::iter::repeat(0u8).take(SAMPLE_GUARD_FRAMES));
+            sm24.extend(std::iter::repeat_n(0u8, SAMPLE_GUARD_FRAMES));
         }
         samples.push(Sample {
             start: base,

@@ -1,6 +1,13 @@
+// Every unsafe block under `mm::` carries a `SAFETY:` comment — measured and
+// documented in full by `issues/build/clippy-has-never-run-here.md`'s
+// per-area plan. `host-tests.yml`'s kernel clippy step already runs with
+// `-D warnings`, so `warn` here is what actually gates: a new undocumented
+// block anywhere in this module tree fails CI, while the rest of the kernel
+// (not yet swept) stays silent.
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 pub mod pmm;
 pub mod paging;
-pub mod user_span;
 mod alloc;
 mod mmio;
 mod region;
@@ -16,7 +23,17 @@ pub use pmm::Region;
 /// All physical memory is mapped at this virtual offset.
 pub const PHYS_OFFSET: u64 = 0xFFFF_8000_0000_0000;
 
-pub use user_span::PAGE_2M;
+/// The kernel's one user page size, and the granularity a translation answers
+/// at. It lives in `toyos-userbound` with every refusal that turns on it; the
+/// rest of the kernel names it `mm::PAGE_2M`.
+pub use toyos_userbound::PAGE_2M;
+
+/// The hardware page size — every block-device transfer is a whole multiple
+/// of this, and it is what `paging::PAGE_SIZE_BIT` marks a PDE as mapping
+/// directly instead of through a PT. `mm` did not export a 4 KiB constant
+/// before this; a caller that reached for one and found nothing here is why
+/// more than one private copy exists elsewhere in the kernel.
+pub const PAGE_SIZE: u64 = 4096;
 
 /// Round `size` up to the next 2MB boundary.
 ///
@@ -84,7 +101,7 @@ impl UserAddr {
     /// The type's name is a claim, and this is the only constructor that makes
     /// it true of a number userland chose.
     pub fn checked(v: u64) -> Option<Self> {
-        user_span::is_user_addr(v).then_some(Self(v))
+        toyos_userbound::is_user_addr(v).then_some(Self(v))
     }
 
     pub const fn raw(self) -> u64 { self.0 }

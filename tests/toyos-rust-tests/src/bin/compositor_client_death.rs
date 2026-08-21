@@ -29,6 +29,7 @@ use std::os::toyos::process::CommandExt;
 use std::process::{exit, Command, Stdio};
 
 use toyos::endow;
+use toyos::AsHandle;
 use toyos::shm::SharedMemory;
 use toyos::{ipc, Connection};
 use toyos_abi::syscall::{self, SyscallError};
@@ -54,7 +55,7 @@ const PROBE_POLL_NS: u64 = 10_000_000;
 ///
 /// Two would do — `Close`, then `None` — and this is a handful more so the
 /// failure prints a stream rather than a single wrong answer. Each poll past
-/// the close costs nothing: the fd is ready, so none of them waits.
+/// the close costs nothing: the handle is ready, so none of them waits.
 const POLLS_AFTER_CLOSE: usize = 8;
 /// Long enough that a compositor still on its way to closing the connection is
 /// waited for rather than raced.
@@ -106,7 +107,7 @@ fn run() {
     // `MSG_CREATE_WINDOW` on one arrives with nothing to promote. The
     // compositor read that as its own bug.
     let doubled = Window::create(64, 64).expect("a window to send a second create on");
-    write_raw_fd(doubled.fd(), &create_frame(), "a second create");
+    write_handle(doubled.handle(), &create_frame(), "a second create");
     probe("a second create on a live window");
 
     // A clipboard frame with no region sent ahead of it. The receive is not a
@@ -125,11 +126,11 @@ fn run() {
 
     // The other side of a window ending: the client has to be able to leave.
     // `MSG_DESTROY_WINDOW` makes the compositor drop the connection, after
-    // which the fd is permanently read-ready at EOF — so a `poll_event` that
+    // which the handle is permanently read-ready at EOF — so a `poll_event` that
     // did not latch answered `Close` for as long as anybody kept asking, and a
     // client draining until `None` never got out. Two calls decide it.
     let mut ending = Window::create(64, 64).expect("a window to close from the inside");
-    ipc::signal(ending.fd(), window::MSG_DESTROY_WINDOW)
+    ipc::signal(ending.handle(), window::MSG_DESTROY_WINDOW)
         .expect("ask the compositor to destroy this window");
     // Named rather than kept, because `Event` is not `Debug` and a failure
     // here has to print the whole sequence it saw.
@@ -174,13 +175,13 @@ fn run() {
 /// to establish before dying.
 fn connect_and_go() {
     let conn = endow::service("compositor").expect("the compositor is not serving");
-    // The kernel clones the descriptor into the child's table
-    // (`loader::build_child_fds`), so the socket — and the pipes under it —
+    // The kernel clones the handle into the child's table
+    // (`loader::build_child_handles`), so the socket — and the pipes under it —
     // outlive this process.
     Command::new(SELF_PATH)
         .arg("finish")
-        .inherit_fd(RELAY_SOCKET.0, conn.fd().0)
-        .inherit_fd(RELAY_GO.0, 0)
+        .inherit_handle(RELAY_SOCKET.0, conn.as_handle().0)
+        .inherit_handle(RELAY_GO.0, 0)
         .spawn()
         .expect("spawn the process that finishes the request");
     println!("connected");
@@ -194,7 +195,7 @@ fn finish() {
     // after `wait` returns, and `wait` returning is the pid leaving the
     // process table.
     while let Ok(1) = syscall::read(RELAY_GO, &mut byte) {}
-    write_raw_fd(RELAY_SOCKET, &create_frame(), "finish");
+    write_handle(RELAY_SOCKET, &create_frame(), "finish");
 
     // **The answer is the non-vacuity witness, and it changed sides.** The
     // compositor used to say "the process behind it has exited" here, because
@@ -235,10 +236,10 @@ fn clipboard_shm(region: Option<toyos_abi::RawHandle>, len: u32, what: &str) {
 
 /// Every write here fits in the pipe it goes into, so a blocking `write` can
 /// only be the compositor's problem, never this binary's.
-fn write_raw_fd(fd: toyos_abi::RawHandle, bytes: &[u8], what: &str) {
+fn write_handle(handle: toyos_abi::RawHandle, bytes: &[u8], what: &str) {
     let mut offset = 0;
     while offset < bytes.len() {
-        match syscall::write(fd, &bytes[offset..]) {
+        match syscall::write(handle, &bytes[offset..]) {
             Ok(n) => offset += n,
             Err(e) => fail(&format!("[{what}] write failed after {offset} bytes: {e:?}")),
         }
@@ -249,7 +250,7 @@ fn write_raw_fd(fd: toyos_abi::RawHandle, bytes: &[u8], what: &str) {
 fn probe(what: &str) {
     let conn: Connection = endow::service("compositor")
         .unwrap_or_else(|e| fail(&format!("[{what}] the compositor is not serving: {e:?}")));
-    if let Err(e) = ipc::signal(conn.fd(), window::MSG_GET_RESOLUTION) {
+    if let Err(e) = ipc::signal(conn.as_handle(), window::MSG_GET_RESOLUTION) {
         fail(&format!("[{what}] could not ask the compositor for its resolution: {e:?}"));
     }
     let mut buf = [0u8; 16];

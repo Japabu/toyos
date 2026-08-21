@@ -62,6 +62,11 @@ impl Ring {
             capacity > 0 && capacity < (1usize << 31),
             "ring capacity {capacity} does not leave room for the cursor modulus"
         );
+        // SAFETY: the caller's contract above (`# Safety`) is exactly this
+        // write's precondition — `base` writable and aligned for
+        // `RingHeader` — and the `capacity` assert just above proves
+        // `total_size >= size_of::<RingHeader>()`, so the write lands inside
+        // the caller-promised region.
         unsafe {
             (base as *mut RingHeader).write(RingHeader {
                 flags: AtomicU32::new(0),
@@ -76,10 +81,21 @@ impl Ring {
     }
 
     fn header(&self) -> &RingHeader {
+        // SAFETY: `new`'s caller promised `base` writable and aligned for
+        // `RingHeader` for the life of this `Ring`, and `new` wrote a valid
+        // one there. The header is racily writable by any process holding
+        // the pipe (its own doc comment says so), which is why its one field
+        // is an `AtomicU32` accessed only through atomic ops below — never
+        // read or written as a plain `u32` — so a concurrent scribble is a
+        // torn or stale load, never a reference to invalid data.
         unsafe { &*(self.base as *const RingHeader) }
     }
 
     fn data_ptr(&self) -> *mut u8 {
+        // SAFETY: `capacity = total_size - size_of::<RingHeader>()` was
+        // asserted `> 0` in `new`, so this offset is strictly inside the
+        // `total_size`-byte region `new`'s caller promised — never dereferenced
+        // here, only computed.
         unsafe { self.base.add(core::mem::size_of::<RingHeader>()) }
     }
 
@@ -133,6 +149,17 @@ impl Ring {
         let data = self.data_ptr();
 
         let first = count.min(cap - offset);
+        // SAFETY: `offset < cap` and `first = count.min(cap - offset)`, so
+        // `data.add(offset)..+first` stays inside the `cap`-byte data
+        // region `data_ptr` computed, and the wrap slice `data..+(count -
+        // first)` does too since `count - first <= cap`. Handing `sink` a
+        // shared view of memory this same page's mapping lets another
+        // process write is this module's stated trust boundary (top-of-file
+        // doc comment): only `RingHeader.flags` is meant to race, and this
+        // struct's own cursors — kernel-side, never derived from the shared
+        // page — are what keep an adversarial write from becoming an
+        // out-of-bounds *kernel* access, not a claim that the data region
+        // itself is exclusive.
         unsafe {
             sink(0, core::slice::from_raw_parts(data.add(offset), first));
             if first < count {
@@ -159,6 +186,11 @@ impl Ring {
         let data = self.data_ptr();
 
         let first = count.min(cap - offset);
+        // SAFETY: same bounds argument as `read`'s matching block — `offset
+        // < cap` and `first = count.min(cap - offset)` keep both slices
+        // inside the `cap`-byte data region. `_mut` over a page this
+        // process's own pipe peer can also write is the same documented
+        // trust boundary `read` relies on, not re-derived here.
         unsafe {
             fill(0, core::slice::from_raw_parts_mut(data.add(offset), first));
             if first < count {
@@ -203,18 +235,28 @@ mod tests {
     impl Backing {
         fn new(total: usize) -> Self {
             let layout = Layout::from_size_align(total, core::mem::align_of::<RingHeader>()).unwrap();
+            // SAFETY: every caller passes a `total` (`PIPE_TOTAL` or a
+            // `const TOTAL`) that is a non-zero, hard-coded byte count, so
+            // `layout` has non-zero size.
             let ptr = unsafe { alloc_zeroed(layout) };
             assert!(!ptr.is_null(), "test backing allocation failed");
             Self { ptr, layout }
         }
 
         fn ring(&self) -> Ring {
+            // SAFETY: `ptr` was just allocated above with `layout`, whose
+            // alignment is `align_of::<RingHeader>()` and whose size is
+            // `layout.size()` — exactly `Ring::new`'s two preconditions —
+            // and `self` (and the memory it owns) outlives every `Ring` this
+            // method hands out, since nothing here ever drops `self` early.
             unsafe { Ring::new(self.ptr, self.layout.size()) }
         }
     }
 
     impl Drop for Backing {
         fn drop(&mut self) {
+            // SAFETY: `ptr`/`layout` are exactly what `new` allocated them
+            // with, and this is the only place that frees them.
             unsafe { dealloc(self.ptr, self.layout) }
         }
     }
@@ -371,6 +413,9 @@ mod tests {
         // The third value is where `capacity` used to sit; zero was the
         // divisor, and 0xFF.. the 4 GiB pointer offset.
         for pattern in [0x00u8, 0xFF, 0xA5] {
+            // SAFETY: `backing.ptr` is `TOTAL` bytes from `Backing::new`, and
+            // `TOTAL` (64 KiB) is far larger than `size_of::<RingHeader>()`
+            // (64 bytes), so the write stays inside the allocation.
             unsafe { core::ptr::write_bytes(backing.ptr, pattern, core::mem::size_of::<RingHeader>()) };
             let mut sent = std::vec![0u8; 3571];
             fill(&mut sent, pos);

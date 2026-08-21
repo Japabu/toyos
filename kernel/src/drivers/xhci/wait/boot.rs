@@ -10,6 +10,7 @@ use core::ptr::write_volatile;
 use core::sync::atomic::Ordering;
 
 use crate::log;
+use crate::time::{Budget, Cadence, Duration};
 use crate::mm::paging::CachePolicy;
 use crate::mm::Mmio;
 use crate::drivers::pci::PciDevice;
@@ -49,7 +50,10 @@ use toyos_xhci::Protocol;
 /// `tPollingLFPSTimeout` (360 ms, USB 3.2 §7.5.4.3) before it falls back, and
 /// the USB2 connect and debounce behind that add ~100 ms — and it sits under
 /// Linux's `HUB_DEBOUNCE_TIMEOUT`, which is 2000 ms in `drivers/usb/core/hub.c`.
-const EMPTY_BUS_NS: u64 = 1_000_000_000;
+const EMPTY_BUS: Budget = Budget::of(
+    Duration::from_secs(1),
+    "the scan reports the bus as empty and the boot goes on without whatever was slow",
+);
 
 /// When the driver stops waiting for a root hub that keeps changing its mind.
 ///
@@ -58,12 +62,18 @@ const EMPTY_BUS_NS: u64 = 1_000_000_000;
 /// naming the machine's port state and a scan of whatever is connected at that
 /// moment — a flapping port costs the boot a bounded second and a half, never
 /// the machine.
-pub const PORT_SETTLE_CEILING_NS: u64 = 1_500_000_000;
+pub const PORT_SETTLE_CEILING: Budget = Budget::of(
+    Duration::from_millis(1_500),
+    "the scan takes whatever is connected at that instant and names the port state",
+);
 
 /// How often the settle re-reads the port registers. Each pass is one MMIO read
 /// per port, so on the widest controller in reach this is 16 reads per
 /// millisecond of the debounce.
-pub const PORT_POLL_NS: u64 = 1_000_000;
+pub const PORT_POLL: Cadence = Cadence::every(
+    Duration::from_millis(1),
+    "one MMIO read per port, so sixteen reads per millisecond on the widest controller",
+);
 /// Wait for every root hub on the machine to stop changing its mind.
 ///
 /// **`PORTSC.CCS` is not a question that can be asked at an instant.** HCRST
@@ -101,18 +111,18 @@ fn await_connect_settle(controllers: &[XhciController]) {
         let debounced = seen
             .iter()
             .all(|(_, at)| now.saturating_sub(*at) >= PORT_DEBOUNCE_NS);
-        let looked_long_enough = !empty || now.saturating_sub(powered_at) >= EMPTY_BUS_NS;
+        let looked_long_enough = !empty || now.saturating_sub(powered_at) >= EMPTY_BUS.nanos();
         if debounced && looked_long_enough {
             return;
         }
-        if now.saturating_sub(powered_at) >= PORT_SETTLE_CEILING_NS {
+        if now.saturating_sub(powered_at) >= PORT_SETTLE_CEILING.nanos() {
             log!("xHCI: no root hub on this machine held one connect state for {} ms within \
                  {} ms; enumerating whatever is connected now",
-                PORT_DEBOUNCE_NS / 1_000_000, PORT_SETTLE_CEILING_NS / 1_000_000);
+                PORT_DEBOUNCE_NS / 1_000_000, PORT_SETTLE_CEILING.duration().millis());
             return;
         }
 
-        let next = now + PORT_POLL_NS;
+        let next = now + PORT_POLL.nanos();
         while crate::clock::nanos_since_boot() < next {
             core::hint::spin_loop();
         }
@@ -261,7 +271,19 @@ fn read_protocols(
 fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
     log!("xHCI: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
 
-    let bar_addr = pci_dev.read_bar_64(0);
+    // Refused for the same reason the missing-interrupt path just below is:
+    // leave the controller exactly as firmware left it, with nothing
+    // enumerated on it to claim otherwise, and say what the machine has. xHCI
+    // 1.2 §5.2.1 puts the capability registers in a memory BAR 0, so a
+    // controller answering otherwise is one this driver cannot address.
+    let bar_addr = match pci_dev.memory_bar(0) {
+        Ok(memory) => memory.address(),
+        Err(why) => {
+            log!("xHCI: NOT INITIALISED at PCI {:02x}:{:02x}.{} — its capability registers are in \
+                 BAR 0 and {}", pci_dev.bus, pci_dev.dev, pci_dev.func, why);
+            return None;
+        }
+    };
     pci_dev.enable_bus_master();
     log!("xHCI: BAR0={:#x}", bar_addr);
 
@@ -408,7 +430,11 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
     op_base.write_u64(OP_DCBAAP, dma.phys() + OFF_DCBAA as u64);
 
     let cmd_ring = TrbRing::init(dma.subslice(OFF_CMD_RING, PAGE));
-    op_base.write_u64(OP_CRCR, dma.phys() + OFF_CMD_RING as u64 | 1);
+    // CRCR bit 0 is RCS, the cycle state the controller starts on, and the
+    // pointer above it is 64-byte aligned — so the OR lands in that bit and
+    // nowhere else (xHCI 1.2 §5.4.5). Parenthesised because `+` binds tighter
+    // than `|`, and this should not need that table to read.
+    op_base.write_u64(OP_CRCR, (dma.phys() + OFF_CMD_RING as u64) | 1);
 
     let evt_ring_buf = dma.subslice(OFF_EVT_RING, PAGE);
     let erst = dma.ptr_at(OFF_ERST) as *mut ErstEntry;

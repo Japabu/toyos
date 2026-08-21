@@ -1,7 +1,6 @@
 //! The Intel HDA stub: bring-up, one output stream, and the allow-list.
 //!
-//! `specs/plans/hda-driver-plan.md` §4.1 is the design and §4.1.6 is the shape this
-//! file implements. **The line is who touches a register.** The kernel resets
+//! **The line is who touches a register.** The kernel resets
 //! the controller, allocates the PCM ring and the buffer descriptor list,
 //! programs every register whose value is an address or indexes one of those
 //! structures, acknowledges the interrupt and derives the completion mask from
@@ -12,7 +11,7 @@
 //! refused by name.
 //!
 //! Nothing here decides. The moment this file has to know which codec or which
-//! pin, the line has moved and §4.1.5's last bullet has fired.
+//! pin, the line has moved and this stub has become a driver.
 //!
 //! Register offsets, bit positions and the descriptor layout come from the
 //! Intel High Definition Audio specification.
@@ -31,6 +30,7 @@ use crate::mm::paging::CachePolicy;
 use crate::mm::Mmio;
 use crate::object::shm::Region;
 use crate::sync::Lock;
+use crate::time::{Delay, Duration};
 
 const CLASS_MULTIMEDIA: u8 = 0x04;
 const SUBCLASS_HDA: u8 = 0x03;
@@ -42,7 +42,13 @@ const COMMAND_MEMORY_SPACE: u16 = 1 << 1;
 const CAP_POWER_MANAGEMENT: u8 = 0x01;
 const PM_CONTROL_STATUS: u64 = 0x04;
 const PM_STATE_MASK: u16 = 0x3;
-const PM_D3HOT_RECOVERY_NS: u64 = 10_000_000;
+/// The recovery a device gets after being taken out of D3hot, which it may
+/// not be asked anything during. A [`Delay`]: nothing is waited *for* and
+/// nothing expires — spending it is the whole requirement.
+const PM_D3HOT_RECOVERY: Delay = Delay::from_spec(
+    Duration::from_millis(10),
+    "PCI Power Management: the mandated D3hot-to-D0 recovery time",
+);
 
 const GCAP: u64 = 0x00;
 const VMIN: u64 = 0x02;
@@ -115,7 +121,10 @@ const SETTLE_NS: u64 = 100_000_000;
 
 /// The delay the specification requires between releasing `CRST` and believing
 /// `STATESTS`: 25 frames at 48 kHz, rounded up to a millisecond.
-const CODEC_DETECT_NS: u64 = 1_000_000;
+const CODEC_DETECT: Delay = Delay::from_spec(
+    Duration::from_millis(1),
+    "HD Audio: 25 frames at 48kHz between releasing CRST and believing STATESTS",
+);
 
 /// How many refused register accesses are named in the log before the driver is
 /// told to stop asking.
@@ -211,28 +220,28 @@ pub fn isr_complete() {
     crate::preempt::set_need_resched();
 }
 
-/// Are completions pending? Lock-free — fd readiness, io_uring poll and the
-/// scheduler's park-time recheck all ask this.
+/// Are completions pending? Lock-free — handle readiness, an inbox watch and
+/// the scheduler's park-time recheck all ask this.
 pub fn has_pending() -> bool {
     ISR.mask.load(Ordering::Acquire) != 0
 }
 
-static IO_URING_WATCHERS: Lock<alloc::vec::Vec<crate::io_uring::RingId>> =
+static INBOX_WATCHERS: Lock<alloc::vec::Vec<crate::inbox::InboxId>> =
     Lock::new(alloc::vec::Vec::new());
 
-pub fn add_io_uring_watcher(id: crate::io_uring::RingId) {
-    let mut watchers = IO_URING_WATCHERS.lock();
+pub fn add_inbox_watcher(id: crate::inbox::InboxId) {
+    let mut watchers = INBOX_WATCHERS.lock();
     if !watchers.contains(&id) {
         watchers.push(id);
     }
 }
 
-pub fn remove_io_uring_watcher(id: crate::io_uring::RingId) {
-    IO_URING_WATCHERS.lock().retain(|&x| x != id);
+pub fn remove_inbox_watcher(id: crate::inbox::InboxId) {
+    INBOX_WATCHERS.lock().retain(|&x| x != id);
 }
 
-pub fn io_uring_watchers() -> alloc::vec::Vec<crate::io_uring::RingId> {
-    IO_URING_WATCHERS.lock().clone()
+pub fn inbox_watchers() -> alloc::vec::Vec<crate::inbox::InboxId> {
+    INBOX_WATCHERS.lock().clone()
 }
 
 /// Take the pending completions, or `None`.
@@ -327,10 +336,7 @@ fn read_permit(offset: u64, width: RegWidth) -> Result<&'static str, ()> {
 
 fn refuse(what: &str, offset: u64, width: RegWidth) -> SyscallError {
     if REFUSALS.fetch_add(1, Ordering::Relaxed) < MAX_NAMED_REFUSALS {
-        log!(
-            "hda: refused a {width:?} {what} of {offset:#x} — not on the allow-list \
-             (hda-driver-plan.md §4.1.3)"
-        );
+        log!("hda: refused a {width:?} {what} of {offset:#x} — not on the allow-list");
     }
     SyscallError::PermissionDenied
 }
@@ -390,7 +396,7 @@ fn start_stop(controller: &HdaController, value: u8) -> Result<(), SyscallError>
         if REFUSALS.fetch_add(1, Ordering::Relaxed) < MAX_NAMED_REFUSALS {
             log!(
                 "hda: refused SDnCTL {value:#04x} — stream reset clears the buffer descriptor \
-                 address, which is the kernel's (hda-driver-plan.md §4.1.3)"
+                 address, which is the kernel's"
             );
         }
         return Err(SyscallError::PermissionDenied);
@@ -426,9 +432,8 @@ pub fn init(devices: &[PciDevice]) {
 
     let mut live: alloc::vec::Vec<(&PciDevice, Mmio, u16, u16)> = alloc::vec::Vec::new();
     for pci in &controllers {
-        match probe(pci) {
-            Some((regs, gcap, statests)) => live.push((pci, regs, gcap, statests)),
-            None => {}
+        if let Some((regs, gcap, statests)) = probe(pci) {
+            live.push((pci, regs, gcap, statests));
         }
     }
 
@@ -707,7 +712,7 @@ fn power_up(pci: &PciDevice) {
         return;
     }
     cap.write_u16(PM_CONTROL_STATUS, pmcsr & !PM_STATE_MASK);
-    spin_ns(PM_D3HOT_RECOVERY_NS);
+    spin_ns(PM_D3HOT_RECOVERY.nanos());
 }
 
 /// Hold the controller in reset and release it, waiting for both edges: the bit
@@ -723,7 +728,7 @@ fn reset_controller(regs: Mmio) -> bool {
     if !crate::clock::settles(SETTLE_NS, || regs.read_u32(GCTL) & GCTL_CRST != 0) {
         return false;
     }
-    spin_ns(CODEC_DETECT_NS);
+    spin_ns(CODEC_DETECT.nanos());
     true
 }
 

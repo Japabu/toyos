@@ -1798,7 +1798,7 @@ dependencies = [
 [[package]]
 name = "mio"
 version = "1.2.0"
-source = "git+https://github.com/Japabu/mio?branch=toyos#e8068c286627f60a299f842726d998e909e032aa"
+source = "git+https://github.com/Japabu/mio?branch=toyos#c84d7e351712502707bf26e0d9d9cd25993463d5"
 dependencies = [
  "libc",
  "toyos",
@@ -3301,7 +3301,7 @@ dependencies = [
 [[package]]
 name = "socket2"
 version = "0.6.3"
-source = "git+https://github.com/Japabu/socket2?branch=toyos#b55ee41fc88613ce73c628c9eb503996eba80832"
+source = "git+https://github.com/Japabu/socket2?branch=toyos#19eb798d570ad63b04aaf0faef5c96b7aeca1063"
 dependencies = [
  "libc",
  "toyos",
@@ -3339,6 +3339,7 @@ dependencies = [
  "toyos",
  "toyos-abi",
  "toyos-hda",
+ "toyos-mixer",
 ]
 
 [[package]]
@@ -3652,6 +3653,10 @@ version = "0.1.0"
 dependencies = [
  "toyos-abi",
 ]
+
+[[package]]
+name = "toyos-mixer"
+version = "0.1.0"
 
 [[package]]
 name = "toyos-wallclock"

@@ -121,6 +121,13 @@ fn main() {
         toyos_build::redlist::dispatch(&root, &args);
         return;
     }
+    // Asks `gh`, not the toolchain, so it runs on the bare `ubuntu-latest`
+    // runner the nightly schedule gives it — no QEMU, no ToyOS toolchain.
+    // Same reason as the two above: before `check_prerequisites`.
+    if args.iter().any(|a| a == "--merge-health") {
+        toyos_build::mergehealth::dispatch(&root, &args);
+        return;
+    }
 
     check_prerequisites(&root);
     env::set_current_dir(&root).expect("Failed to cd to project root");
@@ -224,10 +231,9 @@ fn main() {
 
 /// `--kernel-param <name>`, repeatable: one actuator this *boot* arms, and the
 /// ordinary way to ask for one. `--kernel-feature <name>`, repeatable: one
-/// cargo feature this *build* carries, which after
-/// `specs/assessments/test-cost-audit.md` §5.9.7 is `fpu-save-nothing` and `sched-check`
-/// and nothing else. Unknown names are refused by name in [`build::build`],
-/// before any lock.
+/// cargo feature this *build* carries, which is `fpu-save-nothing` and
+/// `sched-check` and nothing else. Unknown names are refused by name in
+/// [`build::build`], before any lock.
 ///
 /// **Both are orthogonal to the boot mode on purpose.** Attaching a list to
 /// `Boot::Diag` was the other way to reach the same image, and it would have

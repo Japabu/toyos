@@ -10,6 +10,26 @@ use crate::cell::UnsafeCell;
 #[cfg(feature = "loom")]
 use loom::sync::atomic::{AtomicU32, Ordering};
 
+/// The load that decides ownership, and what it carries.
+///
+/// `try_lock` CASes `ticket`, but the atomic an unlock publishes through is
+/// `now` — so whichever operation reads `now` is the one that has to carry the
+/// acquire, and an acquire on `ticket` would synchronize with nothing.
+///
+/// **A cargo feature rather than a comment, because a model that has never
+/// failed proves nothing.** `kernel-loom`'s `lock-acquire-off` makes this
+/// `Relaxed` and `kernel-loom/tests/ticket_lock.rs` must red under it: the
+/// previous owner's writes are then unordered against the next owner's reads,
+/// which is exactly the class x86's TSO hides from every guest test in this
+/// tree. Loom drives `try_lock`'s load and not `lock`'s — the spin is an
+/// unbounded branch it cannot explore — so the model that fails is
+/// `try_lock_observes_the_previous_owners_writes`. No kernel build can turn the
+/// name on: the kernel declares it only so `cfg` checking knows it.
+#[cfg(not(feature = "lock-acquire-off"))]
+const ACQUIRED: Ordering = Ordering::Acquire;
+#[cfg(feature = "lock-acquire-off")]
+const ACQUIRED: Ordering = Ordering::Relaxed;
+
 /// Ticket spinlock. Provides mutual exclusion via `lock() -> LockGuard`.
 pub struct Lock<T> {
     ticket: AtomicU32,
@@ -48,7 +68,7 @@ impl<T> Lock<T> {
         let my_ticket = self.ticket.fetch_add(1, Ordering::Relaxed);
         let mut spins = 0u64;
         let mut next_warn = 50_000_000u64;
-        while self.now.load(Ordering::Acquire) != my_ticket {
+        while self.now.load(ACQUIRED) != my_ticket {
             core::hint::spin_loop();
             // A waiter answers TLB shootdowns. This spin is the one unbounded
             // wait in the kernel that routinely runs with `IF` clear — every
@@ -76,7 +96,7 @@ impl<T> Lock<T> {
 
     pub fn try_lock(&self) -> Option<LockGuard<'_, T>> {
         crate::preempt::disable();
-        let current = self.now.load(Ordering::Acquire);
+        let current = self.now.load(ACQUIRED);
         match self.ticket.compare_exchange(current, current + 1, Ordering::Relaxed, Ordering::Relaxed) {
             Ok(_) => Some(LockGuard { lock: self }),
             Err(_) => {
@@ -117,36 +137,4 @@ impl<T> Drop for LockGuard<'_, T> {
     }
 }
 
-// Lock<Option<T>> projection — lock and unwrap in one step
-
-impl<T> Lock<Option<T>> {
-    /// Lock and project through the Option, returning a guard that derefs to T.
-    /// Panics if the Option is None (i.e. not yet initialized).
-    pub fn lock_unwrap(&self) -> OptionGuard<'_, T> {
-        let guard = self.lock();
-        assert!(guard.is_some(), "lock_unwrap: not initialized");
-        OptionGuard { guard }
-    }
-}
-
-/// Guard that projects `LockGuard<Option<T>>` → `&T` / `&mut T`.
-/// Drops the underlying lock when dropped.
-pub struct OptionGuard<'a, T> {
-    guard: LockGuard<'a, Option<T>>,
-}
-
-impl<T> Deref for OptionGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        // SAFETY: lock_unwrap asserted Some
-        self.guard.as_ref().unwrap()
-    }
-}
-
-impl<T> DerefMut for OptionGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        // SAFETY: lock_unwrap asserted Some
-        self.guard.as_mut().unwrap()
-    }
-}
 

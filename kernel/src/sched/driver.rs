@@ -20,6 +20,14 @@
 //! release, no outgoing task to park. That is what park-before-switch buys, and
 //! it is sound only because a wake for the just-parked task is a *message to
 //! this same CPU*, which cannot be consumed before the switch completes.
+//!
+//! **What is *not* done by the time the pass ends is the save.** `switch`'s
+//! last instruction writes the outgoing context's `rsp`, and everything above
+//! it — the `with_cpu` return, `charge_cpu_time`, the publish, CR3, `TSS.rsp0`,
+//! the FS base — runs with that context still holding the stack pointer from
+//! the *previous* time it was switched away, or, for a task that never has
+//! been, `alloc_kernel_stack`'s entry frame. Any CPU that restores it inside
+//! that window lands on a stack this one is standing on.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -34,8 +42,8 @@ use toyos_sched::fair::Frontier;
 use toyos_sched::hw::{CpuId, Hw, Kicker, Machine, Nanos};
 use toyos_sched::mailbox::{mailbox, Kick, PreemptGuard, Urgency};
 use toyos_sched::msg::Msg;
-use toyos_sched::task::{RtState, TaskBuilder, TaskKey};
-use toyos_sched::waitq::{Cancelled, Commit, CurrentTask};
+use toyos_sched::task::{RtState, TaskBuilder, TaskKey, WaitClass};
+use toyos_sched::waitq::{Cancel, Cancelled, Commit, CurrentTask};
 
 use crate::arch::percpu;
 use crate::hw::HW;
@@ -72,7 +80,7 @@ pub fn preempt_off<R>(f: impl FnOnce(&PreemptOff) -> R) -> R {
 /// read-modify-writes.** `preempt::disable` is `lock add` and `enable` is a
 /// `lock sub` plus a `need_resched` poll that can reach `do_preempt`, which is
 /// a scheduling pass — and one locked RMW per log line cost 350 ms of boot
-/// (`specs/issues/hardware/one-rmw-per-log-line-cost-350ms.md`). `IrqGuard` is
+/// (`issues/hardware/one-rmw-per-log-line-cost-350ms.md`). `IrqGuard` is
 /// `pushfq`/`pop`/`cli` with `push`/`popfq` on drop: no locked operation at
 /// all, and on the dominant path `IF` is already clear.
 pub struct IrqOff(());
@@ -104,6 +112,57 @@ static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
 #[repr(align(64))]
 struct CpuTime(AtomicU64);
 static CPU_TIME_NS: [CpuTime; MAX_CPUS] = [const { CpuTime(AtomicU64::new(0)) }; MAX_CPUS];
+
+/// Nanoseconds between two pass-cost reports from one CPU.
+///
+/// The counters are cumulative since boot, so the *last* line a capture holds
+/// is the whole run and the ones before it cost only their own record — which
+/// makes this number a resolution rather than a sample size: the last report is
+/// at most this long before the end.
+///
+/// **A wall-clock cadence and not a per-`n`-passes one, because the second is a
+/// feedback loop.** A report is a log record, a record wakes `klogd`, and a
+/// wake is a pass — so "every N passes" makes the report rate drive the pass
+/// rate it is reporting on. Measured on the dev host, 2026-08-17: at one report
+/// per 64 passes cpu0 finished a boot plus `sched_stress` at 1,408 passes, and
+/// at one per 256 it never reached 256 at all. This clock is the guest's own
+/// and nothing the reports do moves it.
+#[cfg(feature = "sched-check")]
+const PASS_COST_REPORT_EVERY_NS: u64 = 200_000_000;
+
+/// When each CPU last reported, in nanoseconds since boot. Read and written by
+/// the owning CPU alone.
+#[cfg(feature = "sched-check")]
+static PASS_COST_REPORTED: [CpuTime; MAX_CPUS] = [const { CpuTime(AtomicU64::new(0)) }; MAX_CPUS];
+
+/// Publish this CPU's pass-cost distribution, at most once every
+/// [`PASS_COST_REPORT_EVERY_NS`].
+///
+/// **Outside the pass and inside the preempt-off region**, which is the only
+/// window that works: the measurement lands after `finish_inner` has consumed
+/// every borrow of the `CpuSched`, and `log::emit` may take no lock and does
+/// not — it fills a stack record and publishes it under one trap-state bracket
+/// (`log/mod.rs`), which is why it is already called from IRQ handlers and from
+/// inside the scheduler.
+///
+/// `now` is the pass's own sample rather than a fresh clock read: this is a
+/// cadence and not a measurement, and one read per pass is what the check build
+/// already pays.
+///
+/// A check build only. On the pass path between two reports this costs one
+/// relaxed load and one comparison, and everything about it — the histogram,
+/// the clock read that feeds it, the record — exists only where `sched-check`
+/// does.
+#[cfg(feature = "sched-check")]
+fn report_pass_costs(now: Nanos) {
+    let cpu = current_cpu();
+    let last = &PASS_COST_REPORTED[cpu.0 as usize].0;
+    if now.0 < last.load(Ordering::Relaxed) + PASS_COST_REPORT_EVERY_NS {
+        return;
+    }
+    last.store(now.0, Ordering::Relaxed);
+    crate::log!("{}", cpus().get(cpu).pass_costs().report(cpu));
+}
 
 pub fn cpus() -> &'static CpuHandles<KMsg> {
     let ptr = CPUS.load(Ordering::Acquire);
@@ -148,6 +207,11 @@ pub fn in_pass() -> bool {
 
 /// The only accessor. Panics on reentry: the busy flag is the typed
 /// replacement for `IN_SCHEDULE`, and a nested pass would alias `&mut`.
+///
+/// **It is also the whole of the window the tripwire watches.** Nothing else in
+/// the kernel writes `SCHEDS`: `init` fills it before any AP is released and
+/// [`try_with_cpu`] only reads, so between one exit from here and the next entry
+/// the record is a thing no code may change. `sched-tripwire` holds it to that.
 fn with_cpu<R>(f: impl FnOnce(&mut CpuSched<KernelPayload>) -> R) -> R {
     let cpu = percpu::cpu_id() as usize;
     assert!(
@@ -158,9 +222,182 @@ fn with_cpu<R>(f: impl FnOnce(&mut CpuSched<KernelPayload>) -> R) -> R {
     // this slot.
     let sched = unsafe { (*SCHEDS[cpu].0.get()).as_mut() }
         .unwrap_or_else(|| panic!("cpu {cpu} has no CpuSched"));
-    let result = f(sched);
+    #[cfg(feature = "sched-tripwire")]
+    tripwire::verify(cpu, sched);
+    let result = f(&mut *sched);
+    #[cfg(feature = "sched-tripwire")]
+    tripwire::record(cpu, sched);
     IN_PASS[cpu].store(false, Ordering::Release);
     result
+}
+
+/// The stray-write tripwire's storage and its two halves.
+///
+/// **What it is for.** Four kernel deaths are on record — 2026-08-19 and
+/// 2026-08-20, all under a loaded boot — whose entire content is a per-CPU
+/// scheduler record reading as a value no operation on it produces: a `BTreeMap`
+/// walked with `root == None` and `length != 0`, a `BTreeMap` node whose `len`
+/// overran its own key storage, and twice this file's own
+/// `cpu {n} has no CpuSched` on a CPU that had already completed a pass. Each is
+/// a *word that changed*, and the reports say only that one did. This says which
+/// word, in which field, from what to what — and prints
+/// [`crate::hw::report_contexts`] beside it, which is the other half of the one
+/// mechanism anyone has written down for the class.
+///
+/// **The shadow is per CPU and touched by that CPU alone**, inside `with_cpu`'s
+/// exclusive region, which is why an `UnsafeCell` is enough and no lock is
+/// wanted: this runs on the path a pass takes.
+#[cfg(feature = "sched-tripwire")]
+mod tripwire {
+    use super::{CpuSched, KernelPayload, MAX_CPUS};
+    use core::cell::UnsafeCell;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    /// Words of shadow per CPU, checked against the record it shadows below.
+    const WORDS: usize = 96;
+    const _: () = assert!(
+        core::mem::size_of::<CpuSched<KernelPayload>>().div_ceil(8) <= WORDS,
+        "the CpuSched outgrew its shadow: raise WORDS",
+    );
+
+    struct Shadow {
+        words: UnsafeCell<[u64; WORDS]>,
+        taken: AtomicBool,
+    }
+
+    // SAFETY: each element is read and written by the CPU whose index it is and
+    // by no other, inside `with_cpu`'s exclusive region.
+    unsafe impl Sync for Shadow {}
+
+    static SHADOW: [Shadow; MAX_CPUS] = [const {
+        Shadow {
+            words: UnsafeCell::new([0; WORDS]),
+            taken: AtomicBool::new(false),
+        }
+    }; MAX_CPUS];
+
+    /// The record's bytes as little-endian words, with the words covering the
+    /// one remotely-written field read back as zero.
+    ///
+    /// Byte reads rather than word reads, so a record whose size is not a
+    /// multiple of eight is not read past its own end. Volatile, because what
+    /// this wants is what is in the memory and not what the abstract machine
+    /// says should be.
+    fn snapshot(sched: &CpuSched<KernelPayload>, out: &mut [u64; WORDS]) {
+        let base = (sched as *const CpuSched<KernelPayload>).cast::<u8>();
+        let size = core::mem::size_of::<CpuSched<KernelPayload>>();
+        let (lo, hi) = CpuSched::<KernelPayload>::tripwire_remote_range();
+        for (i, word) in out.iter_mut().enumerate().take(size.div_ceil(8)) {
+            let off = i * 8;
+            if off < hi && off + 8 > lo {
+                *word = 0;
+                continue;
+            }
+            let mut bytes = [0u8; 8];
+            for (k, byte) in bytes.iter_mut().enumerate() {
+                if off + k >= size {
+                    break;
+                }
+                // SAFETY: `off + k < size`, so this addresses a byte of the very
+                // record `sched` borrows.
+                *byte = unsafe { core::ptr::read_volatile(base.add(off + k)) };
+            }
+            *word = u64::from_le_bytes(bytes);
+        }
+    }
+
+    /// Leaving the exclusive region: this is what the record is expected to
+    /// still look like when it is next entered.
+    pub fn record(cpu: usize, sched: &CpuSched<KernelPayload>) {
+        // Walked at *both* ends, which is what makes a red say when. A container
+        // that walks straight here and crookedly at the next entry was broken
+        // while no pass held the record; one that walks straight at entry and
+        // crookedly here was broken by the pass in between. Neither statement is
+        // available from one end alone.
+        walk(cpu, sched);
+        // SAFETY: this CPU's own slot, inside the exclusive region.
+        let slot = unsafe { &mut *SHADOW[cpu].words.get() };
+        snapshot(sched, slot);
+        SHADOW[cpu].taken.store(true, Ordering::Relaxed);
+    }
+
+    /// Entering it: anything that differs was written by something with no
+    /// business writing it.
+    pub fn verify(cpu: usize, sched: &CpuSched<KernelPayload>) {
+        if !SHADOW[cpu].taken.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut now = [0u64; WORDS];
+        snapshot(sched, &mut now);
+        // SAFETY: as `record`.
+        let was = unsafe { &*SHADOW[cpu].words.get() };
+        let words = CpuSched::<KernelPayload>::tripwire_words();
+        let mut hit = false;
+        for i in 0..words {
+            if was[i] == now[i] {
+                continue;
+            }
+            if !hit {
+                crate::log!("A STRAY WRITE REACHED cpu{cpu}'s CpuSched while no pass held it:");
+                hit = true;
+            }
+            crate::log!(
+                "  +{:#05x} {} was {:#018x}, is {:#018x}",
+                i * 8,
+                CpuSched::<KernelPayload>::tripwire_field(i * 8),
+                was[i],
+                now[i],
+            );
+        }
+        if hit {
+            let here = 0u64;
+            crate::hw::report_contexts(core::ptr::addr_of!(here) as u64, None);
+            panic!("cpu {cpu}: a stray write reached its CpuSched");
+        }
+        walk(cpu, sched);
+    }
+
+    /// The shadow covers this record's own bytes and says nothing about the heap
+    /// its three containers hang off — and the deaths this exists for are a
+    /// `BTreeMap` **node** as often as a `BTreeMap` header. So the containers are
+    /// walked here too.
+    ///
+    /// **What a red here buys is the moment.** A walk that panics or disagrees at
+    /// the *entry* to a pass proves the container was already broken before that
+    /// pass ran a single statement, which is what separates "this pass did it"
+    /// from "something wrote it while no pass held the record" — and combined
+    /// with a clean byte diff one line above, it says the write landed in the
+    /// heap rather than in the record.
+    /// **Every element is touched, and `count()` alone would not have been a
+    /// walk.** `RunQueue::tasks` is a `Chain` of two `ExactSizeIterator`s, so a
+    /// bare `.count()` is free for the optimiser to fold into the two lengths —
+    /// which is precisely the number the assertion would then be comparing it
+    /// against. Reading each task's key forces the traversal and the deref of
+    /// the record behind it, which is where a broken node is met.
+    fn walk(cpu: usize, sched: &CpuSched<KernelPayload>) {
+        let mut walked = 0usize;
+        let mut fingerprint = 0u64;
+        for task in sched.rq().tasks() {
+            walked += 1;
+            fingerprint ^= task.key().0;
+        }
+        assert_eq!(
+            walked,
+            sched.rq().len(),
+            "cpu {cpu}: the ready band walks {walked} tasks and calls itself {} long",
+            sched.rq().len(),
+        );
+        // Walked for the walk's sake: a corrupt node fails inside the iterator,
+        // which is the report wanted, and neither of these publishes a second
+        // length to disagree with.
+        for parked in sched.parked() {
+            fingerprint ^= parked.key().0;
+        }
+        for dying in sched.dying() {
+            fingerprint ^= dying.key().0;
+        }
+        core::hint::black_box(fingerprint);
+    }
 }
 
 /// A read-only peek for diagnostics that must not fail while a pass runs.
@@ -180,6 +417,10 @@ pub fn init() {
     let count = crate::arch::smp::cpu_count() as usize;
     assert!(count <= MAX_CPUS, "cpu count {count} exceeds MAX_CPUS");
     let mut handles = Vec::with_capacity(count);
+    // A CPU number rather than a walk of `SCHEDS`: it becomes the `CpuId` each
+    // mailbox and handle is built for, and `SCHEDS` is `MAX_CPUS` long whatever
+    // `count` is.
+    #[allow(clippy::needless_range_loop)]
     for cpu in 0..count {
         let (tx, rx) = mailbox::<KMsg>();
         handles.push(CpuHandle::new(CpuId(cpu as u32), tx));
@@ -239,15 +480,18 @@ fn placement() -> CpuId {
 /// Everything a new thread needs. `entry_rsp` points at the trampoline frame
 /// `alloc_kernel_stack` built.
 ///
-/// **`address_space: None` is a kernel thread and not an error.** It was one
-/// until L3 of `specs/log-architecture-spec.md`: `spawn` expected the `Option`
-/// and the field has always been one, so the whole of "the scheduler cannot
-/// host a kernel task" was a single `.expect` in the line below.
+/// **`address_space` is not an `Option`, and the history is worth one
+/// sentence.** "The scheduler cannot host a kernel task" was a single `.expect`
+/// here until `klogd` arrived; that became a two-armed `match` naming the
+/// kernel's `cr3` for a task that named no address space, and the second arm is
+/// gone because every kernel thread now names `mm::paging::kernel` itself. One
+/// declaration decides a task's `cr3`, which is the rule the root `CLAUDE.md`
+/// states for control registers and is the same rule here.
 pub struct NewTask {
     pub id: TaskId,
     pub kernel_stack: OwnedAlloc,
     pub entry_rsp: u64,
-    pub address_space: Option<PageTables>,
+    pub address_space: PageTables,
     pub fs_base: u64,
     pub share: Arc<KShare>,
 }
@@ -255,15 +499,12 @@ pub struct NewTask {
 /// Place a new task by message — never by reaching into the destination's
 /// queue (spec §9.4). Returns what the process table keeps.
 pub fn spawn(new: NewTask) -> ThreadSched {
-    // A task with no address space of its own runs in the kernel's, which is
-    // the address space every CPU is already in between two user threads —
-    // `idle_ctx` above names the same `cr3` for the same reason. There is
-    // nothing to take a reference to and nothing to release: the kernel's
-    // page tables outlive every task by construction.
-    let cr3 = match new.address_space.as_ref() {
-        Some(space) => space.lock().cr3(),
-        None => crate::mm::paging::kernel_cr3(),
-    };
+    // A kernel thread's is the kernel address space — the one every CPU is
+    // already in between two user threads, which is why `idle_ctx` above names
+    // the same `cr3`. Nothing is released when the task ends: that `Arc` is a
+    // clone of a leaked one, and the kernel's page tables outlive every task by
+    // construction.
+    let cr3 = new.address_space.lock().cr3();
     let kernel_stack_top = new.kernel_stack.ptr() as u64 + KERNEL_STACK_SIZE as u64;
     let ctx = KernelCtx {
         rsp: new.entry_rsp,
@@ -377,6 +618,11 @@ pub fn pass(dispose: Dispose) {
             current.ext().handle.publish(current.acct(), Some(now));
         }
     });
+    // The one report site, and `pass_block` is deliberately not a second one:
+    // every CPU with anything to run takes a timer tick through here, and a CPU
+    // with nothing to run is idling through here too.
+    #[cfg(feature = "sched-check")]
+    report_pass_costs(now);
     execute(action);
     crate::preempt::enable_no_resched();
 }
@@ -412,11 +658,15 @@ impl<'q> Ticket<'q> {
     /// preemption between reading the task and registering it would leave
     /// `CurrentTask` naming a CPU the thread no longer runs on, and
     /// `begin_commit` asserts on exactly that.
-    pub fn register(queue: &'q KWaitQueue) -> Self {
+    pub fn register(queue: &'q KWaitQueue, cancel: Cancel, class: WaitClass) -> Self {
         crate::preempt::disable();
         let shared = current_shared().expect("prepare_wait: no running thread");
         let current = CurrentTask::new(&shared, current_cpu());
-        Self(queue.prepare_wait(&current))
+        // **The class is the wait's and not the queue's**, because the queue is
+        // this thread's own parking place and has no subject —
+        // `WaitQueue::prepare_wait_as` carries the argument, and the blocked-time
+        // breakdown in `ProcessStats` is what it buys.
+        Self(queue.prepare_wait_as(&current, cancel, class))
     }
 
     /// The condition became true after registering: withdraw, and take the
@@ -447,9 +697,12 @@ impl<'q> Ticket<'q> {
 /// arrives behind the drain and is handled by the next pass, which finds the
 /// task parked.
 ///
-/// Returns once the thread runs again, whatever ended the park — or not at
-/// all, if a retire caught the thread mid-registration and the commit turned
-/// the block into an exit.
+/// **Returns on every path, and one of them changed.** A retire that catches a
+/// thread mid-registration used to turn the block into an exit and never come
+/// back; since the cancellable kill the `Commit::Killed` arm below is
+/// `dispose_none` — the thread keeps its stack, unwinds it, and takes the
+/// cancel from its next `completion::wait`. There is no disposition here that
+/// does not return.
 pub fn pass_block(ticket: Ticket<'_>, deadline: Option<Nanos>) {
     // No `preempt::disable()` of its own: the ticket has held the count raised
     // since the registration published `Committing`, and that guard *is* this
@@ -475,11 +728,14 @@ pub fn pass_block(ticket: Ticket<'_>, deadline: Option<Nanos>) {
             // not switch (spec §8.1). The pass still runs to its disposition,
             // because the quantum may have expired while we were deciding.
             Commit::AlreadyWoken => (pass.dispose_none().finish(), None),
-            // A retire landed while this thread was deciding to park. Parking
-            // is a safe point, so the kill is honoured here (spec §6.3, §7.6)
-            // — the registration is already withdrawn, and this switch does
-            // not return.
-            Commit::Killed => (pass.dispose_exit().finish(), None),
+            // A retire landed while this thread was deciding to park. **The
+            // thread keeps running and unwinds** — it does not exit here, and
+            // that is §7.2: this kernel does not unwind, so a switch that
+            // never returns abandons every guard on this stack. The
+            // registration is already withdrawn by `commit`, the word is back
+            // at `Running`, and the caller's next `completion::wait` reports
+            // the cancel that sends it home.
+            Commit::Killed => (pass.dispose_none().finish(), None),
         }
     });
     charge_cpu_time(now);
@@ -608,11 +864,11 @@ fn drain_irqs() {
 
     if crate::irq_ring::take(crate::irq_ring::IrqSource::Net).is_some() {
         crate::net::wake_waiters();
-        let watchers = crate::net::io_uring_watchers();
+        let watchers = crate::net::inbox_watchers();
         if !watchers.is_empty() {
-            crate::io_uring::complete_pending_for_event(
+            crate::inbox::complete_pending_for_event(
                 &watchers,
-                crate::io_uring::Source::Network,
+                crate::inbox::Source::Network,
             );
         }
     }
@@ -620,16 +876,16 @@ fn drain_irqs() {
         // One wait queue for both backends: an over-wake costs a recheck, and a
         // second queue would have to be chosen by whichever driver bound —
         // which is a fact the parking side does not have.
-        crate::sched::waitqs::wake_all(&crate::sched::waitqs::AUDIO);
+        crate::sched::waitqs::wake_device(&crate::sched::waitqs::AUDIO_WATCH);
         for (watchers, source) in [
             (
-                crate::drivers::virtio_sound::io_uring_watchers(),
-                crate::io_uring::Source::VirtioSound,
+                crate::drivers::virtio_sound::inbox_watchers(),
+                crate::inbox::Source::VirtioSound,
             ),
-            (crate::drivers::hda::io_uring_watchers(), crate::io_uring::Source::Hda),
+            (crate::drivers::hda::inbox_watchers(), crate::inbox::Source::Hda),
         ] {
             if !watchers.is_empty() {
-                crate::io_uring::complete_pending_for_event(&watchers, source);
+                crate::inbox::complete_pending_for_event(&watchers, source);
             }
         }
     }
@@ -707,16 +963,43 @@ pub fn current_shared() -> Option<Arc<KShared>> {
     try_with_cpu(|cpu| cpu.running().map(|t| t.shared().clone())).flatten()
 }
 
+/// The running task's cross-CPU face, which is where its completion inbox
+/// lives. `None` on a CPU with no task: boot, and the idle loop.
+pub fn current_handle() -> Option<Arc<crate::sched::payload::TaskHandle>> {
+    try_with_cpu(|cpu| cpu.running().map(|t| t.ext().handle.clone())).flatten()
+}
+
+/// The same face, borrowed rather than cloned, for a reader that does not
+/// outlive the peek. `None` on a CPU with no task, exactly as above.
+///
+/// It exists because [`current_handle`]'s `Arc::clone` is two uncontended
+/// read-modify-writes, and `scheduler::Operation::established` asks this
+/// question on every park token minted in the machine — the hot-path atomic
+/// `tests/CLAUDE.md` names as the one TCG prices unlike hardware.
+pub fn with_current_handle<R>(f: impl FnOnce(&crate::sched::payload::TaskHandle) -> R) -> Option<R> {
+    try_with_cpu(|cpu| cpu.running().map(|t| f(t.ext().handle.as_ref())))?
+}
+
+/// Whether the running task has been killed — one relaxed load, no clone.
+///
+/// Read on every return to Ring 3, which is why it takes no `Arc`: a refcount
+/// on that path is the read-modify-write §16.2 prices at hundreds of
+/// microseconds under TCG.
+pub fn current_kill_pending() -> bool {
+    try_with_cpu(|cpu| cpu.running().is_some_and(|t| t.shared().kill_pending())).unwrap_or(false)
+}
+
 pub fn current_cpu() -> CpuId {
     CpuId(percpu::cpu_id())
 }
 
+/// The address space the running task runs in.
+///
+/// **`None` means "no task is running", never "this task has no address
+/// space"** — the second reading stopped existing when the payload's field did
+/// (`KernelPayload::address_space`). Boot and an idle CPU are the two answers.
 pub fn current_address_space() -> Option<PageTables> {
-    try_with_cpu(|cpu| {
-        cpu.running()
-            .and_then(|t| t.ext().address_space.clone())
-    })
-    .flatten()
+    try_with_cpu(|cpu| cpu.running().map(|t| t.ext().address_space.clone())).flatten()
 }
 
 pub fn with_current_acct<R>(
@@ -743,6 +1026,29 @@ pub fn ready_len() -> usize {
 
 pub fn parked_len() -> usize {
     try_with_cpu(|cpu| cpu.parked().count()).unwrap_or(0)
+}
+
+/// Killed threads on this CPU that are unwinding or waiting to.
+///
+/// **The dump's fourth container, and it had no caller at all.**
+/// `CpuSched::dying_len`'s own doc says it exists "for a dump that has to say
+/// where every task is", and until this one nothing asked: a dying task's state
+/// word reads `Ready`, so the process-table census counted it, the CPU half
+/// could not see it, and `unheld = claimed − scheduled` reported a task nothing
+/// would ever run — on a healthy machine, for up to a quantum, on every thread
+/// teardown. That verdict is the whole reason the dump exists.
+pub fn dying_len() -> usize {
+    try_with_cpu(|cpu| cpu.dying_len()).unwrap_or(0)
+}
+
+/// Every dying thread on this CPU, in the order the pick will take them.
+pub fn for_each_dying(mut f: impl FnMut(TaskId)) -> bool {
+    try_with_cpu(|cpu| {
+        for task in cpu.dying() {
+            f(task.ext().id);
+        }
+    })
+    .is_some()
 }
 
 /// The thread this CPU has loaded, if any.

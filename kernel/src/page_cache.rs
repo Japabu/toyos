@@ -170,7 +170,7 @@ impl PageCache {
             // with the bound instead of with a number picked here: it is the
             // only evidence from outside the kernel that residency stays flat
             // while the eviction count climbs.
-            if self.evictions == 1 || self.evictions % self.max_slots as u64 == 0 {
+            if self.evictions == 1 || self.evictions.is_multiple_of(self.max_slots as u64) {
                 log!("page cache: {} evictions, {}/{} slots resident",
                     self.evictions, self.slot_to_block.len(), self.max_slots);
             }

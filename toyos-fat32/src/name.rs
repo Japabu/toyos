@@ -147,7 +147,7 @@ pub fn short_name_eq(short: &ShortName, query: &str) -> bool {
 pub fn lfn_checksum(short: &ShortName) -> u8 {
     let mut sum: u8 = 0;
     for &b in short {
-        sum = (sum >> 1) | (sum << 7);
+        sum = sum.rotate_right(1);
         sum = sum.wrapping_add(b);
     }
     sum
@@ -330,10 +330,10 @@ pub fn lfn_groups(name: &str) -> Result<(usize, [[u16; UNITS_PER_LFN_ENTRY]; MAX
 
     let groups = len.div_ceil(UNITS_PER_LFN_ENTRY);
     let mut out = [[0xFFFFu16; UNITS_PER_LFN_ENTRY]; MAX_LFN_ENTRIES];
-    for g in 0..groups {
-        for i in 0..UNITS_PER_LFN_ENTRY {
+    for (g, entry) in out.iter_mut().enumerate().take(groups) {
+        for (i, unit) in entry.iter_mut().enumerate() {
             let idx = g * UNITS_PER_LFN_ENTRY + i;
-            out[g][i] = if idx < len {
+            *unit = if idx < len {
                 units[idx]
             } else if idx == len {
                 0x0000

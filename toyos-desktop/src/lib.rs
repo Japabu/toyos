@@ -7,11 +7,10 @@
 //! compositor's, and it is the only caller.
 //!
 //! The split exists because a QEMU boot is a poor way to ask any of these
-//! questions. `specs/assessments/code-quality-review-2026-08.md` §1.1 is the doctrine, and
-//! the ladder it names ends here for the compositor: the arithmetic that
-//! decides what a frame costs is exercised on the host in milliseconds, and the
-//! guest tests are left to certify what only a guest can — that the right
-//! pixels reached a panel.
+//! questions. Every decision that can be a pure function is one the host
+//! exercises in milliseconds — the arithmetic that decides what a frame costs
+//! most of all — and the guest tests are left to certify what only a guest
+//! can: that the right pixels reached a panel.
 //!
 //! A window carries its client as an opaque `C` ([`Window`]), so reordering the
 //! stack cannot separate a window's geometry from the connection behind it.
@@ -45,4 +44,4 @@ pub use plan::{compose, content_blit, Blit, Layer};
 pub use rect::{Point, Rect};
 pub use stack::Stack;
 pub use taskbar::{Taskbar, MAX_STATUS_CHARS, STATUS_MARGIN};
-pub use window::{Window, WindowMode};
+pub use window::{Window, WindowId, WindowMode};

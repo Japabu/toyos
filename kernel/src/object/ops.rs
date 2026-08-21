@@ -14,7 +14,7 @@ use toyos_abi::syscall::{FileType, OpenFlags, SeekFrom, SyscallError};
 
 use crate::drivers::serial;
 use crate::file_cache;
-use crate::io_uring::Source;
+use crate::inbox::Source;
 use crate::pipe::{self, PipeId};
 use crate::process::PipeMap;
 use crate::user_ptr::{UserBytes, UserBytesMut};
@@ -49,7 +49,7 @@ pub fn initial_rights(object: &KObjectRef) -> Rights {
         }
         KObjectRef::Console(_) => BASE.union(Rights::READ).union(Rights::WRITE),
         KObjectRef::Acceptor(_) => BASE.union(Rights::READ),
-        KObjectRef::IoUring(_) => {
+        KObjectRef::Inbox(_) => {
             BASE.union(Rights::READ).union(Rights::WRITE).union(Rights::MAP)
         }
         // Every bit on a `SysCap` is an authority init decides per program, so
@@ -88,7 +88,7 @@ pub fn install(table: &mut HandleTable, object: KObjectRef) -> Result<RawHandle,
 /// Takes the VFS lock itself and gives it up before the object exists, so a
 /// refused install drops the `OpenFileState` — and re-takes the lock in its
 /// `Drop` — without the *VFS* lock held. **Not with nothing held**, which this
-/// used to claim: its one caller runs it inside `with_fd_owner_data`, so the
+/// used to claim: its one caller runs it inside `with_process_data`, so the
 /// process's own lock is still there. What the sequencing buys is that the VFS
 /// lock is not taken twice, and that is all it buys.
 pub fn open(table: &mut HandleTable, path: &str, flags: OpenFlags) -> u64 {
@@ -195,77 +195,22 @@ pub fn close(
             }
         }
     }
-    let sources = if ends_its_sources(&object) {
-        [read_source(&object), write_source(&object)]
-    } else {
-        [None, None]
-    };
+    // **The sources this handle really ends, and the type is what decides.**
+    // `cancel_by_source` cancels by source across every ring in the machine, so a
+    // source the object does not own takes other processes' polls with it —
+    // which is what a `Device(Keyboard)` claim used to do to every terminal
+    // read there was, because `Console` names [`Source::Keyboard`] too. It
+    // cannot happen from here any more: `cancel_by_source` takes only
+    // `EndedSource`, and `Source::ended_by_its_last_handle` is the one place
+    // that can make one.
+    let sources = [read_source(&object), write_source(&object)]
+        .map(|s| s.and_then(Source::ended_by_its_last_handle));
     if sources.iter().any(|s| s.is_some()) {
-        crate::io_uring::remove_fd(&sources);
+        crate::inbox::cancel_by_source(&sources);
     }
     Ok(())
 }
 
-/// Does releasing one handle to `object` end the sources it names?
-///
-/// **`io_uring::remove_fd` cancels by source across every ring in the machine**,
-/// which is what a pipe needs — a client closing its end must complete the
-/// server's poll on the other, and an fd number means nothing outside the
-/// process that owns it. It is also why the question has to be asked: a source
-/// that does *not* end when a handle does gets every poll on it cancelled by
-/// whoever happened to close a handle naming it, in every other process.
-///
-/// **Two rows answer `false` and both are named by a handle any number of
-/// processes hold.** `SysCap` maps to [`Source::Log`], and the machine's log is
-/// not something a capability going away ends: closing one is one process
-/// putting down its authority to read a stream that outlives every handle. That
-/// was live and latent — `ops::close` on *any* `SysCap` cancelled *every*
-/// pending log poll in the machine with `-NotFound`, which `/bin/logd`'s
-/// read-then-park loop turns from latent into a daemon that stops reading the
-/// moment anything anywhere closes a capability. `Console` maps to
-/// [`Source::Keyboard`] for the same reason and has the same shape: every
-/// process that has a console has its own object over the one keyboard (§4.4),
-/// so one of them closing stdin would cancel the compositor's key poll.
-///
-/// Every other row answers `true` because its source really is the object's:
-/// a pipe end, a connection, a port and a device claim each go away with their
-/// last handle, and a claim admits exactly one handle by construction, so
-/// "every ring watching it" is the one holder's.
-///
-/// **That argument is about the object and the condition it needs is about the
-/// source, which is not the same thing — and one `true` row does not meet it.**
-/// What makes cancelling safe is that no *other kind* of object names the same
-/// [`Source`]. A `Device(Keyboard)` claim names [`Source::Keyboard`], and so
-/// does every `Console` (see `read_source`), so the claim's holder closing its
-/// handle cancels every pending poll on stdin in the machine — which is what
-/// libc's terminal read arms — with `-NotFound`. That is a live
-/// cross-cancellation on this tree and not a hypothetical; what keeps it quiet
-/// is that the compositor takes the keyboard claim at boot and holds it until
-/// the machine stops, so nothing closes one first. It is stated here as the
-/// residual of this function rather than as a property it has, and it is filed
-/// rather than fixed on this branch — the fix is on the keyboard side, where a
-/// source would have to name its object the way a pipe's already does.
-fn ends_its_sources(object: &KObjectRef) -> bool {
-    match object {
-        KObjectRef::PipeRead(_)
-        | KObjectRef::PipeWrite(_)
-        | KObjectRef::Connection(_)
-        | KObjectRef::Acceptor(_)
-        | KObjectRef::Device(_) => true,
-        KObjectRef::Console(_) | KObjectRef::SysCap(_) => {
-            // The negative control: the behaviour above, restored, so
-            // `log_poll_outlives_a_close` reds on the tree that had it.
-            crate::actuator::log_close_cancels_any_syscap()
-        }
-        // No source at all, so the answer decides nothing.
-        KObjectRef::File(_)
-        | KObjectRef::IoUring(_)
-        | KObjectRef::Connector(_)
-        | KObjectRef::Namespace(_)
-        | KObjectRef::SharedMem(_)
-        | KObjectRef::Process(_) => false,
-    }
-}
 
 /// Release every handle a process holds. Called by exit *and by kill*, so the
 /// drops below are on the path a process taken down by another CPU follows —
@@ -282,7 +227,7 @@ pub fn pipe_id_read(object: &KObjectRef) -> Option<PipeId> {
         KObjectRef::PipeRead(r) => Some(r.id()),
         KObjectRef::Connection(c) => Some(c.rx()),
         KObjectRef::PipeWrite(_) | KObjectRef::File(_) | KObjectRef::Device(_)
-        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
+        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::Inbox(_)
         | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => None,
@@ -294,7 +239,7 @@ pub fn pipe_id_write(object: &KObjectRef) -> Option<PipeId> {
         KObjectRef::PipeWrite(w) => Some(w.id()),
         KObjectRef::Connection(c) => Some(c.tx()),
         KObjectRef::PipeRead(_) | KObjectRef::File(_) | KObjectRef::Device(_)
-        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
+        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::Inbox(_)
         | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => None,
@@ -326,7 +271,7 @@ pub fn read_source(object: &KObjectRef) -> Option<Source> {
         // the one program whose whole loop is read-then-park would be trapped
         // by a name that granted only the first.
         KObjectRef::SysCap(_) => Some(Source::Log),
-        KObjectRef::PipeWrite(_) | KObjectRef::File(_) | KObjectRef::IoUring(_)
+        KObjectRef::PipeWrite(_) | KObjectRef::File(_) | KObjectRef::Inbox(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => None,
     }
@@ -337,7 +282,7 @@ pub fn write_source(object: &KObjectRef) -> Option<Source> {
         KObjectRef::PipeWrite(w) => Some(Source::PipeWritable(w.id())),
         KObjectRef::Connection(c) => Some(Source::PipeWritable(c.tx())),
         KObjectRef::PipeRead(_) | KObjectRef::File(_) | KObjectRef::Device(_)
-        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
+        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::Inbox(_)
         | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => None,
@@ -487,7 +432,7 @@ pub fn try_read(object: &KObjectRef, buf: &mut UserBytesMut) -> Option<u64> {
             }
             Some(count as u64)
         }
-        KObjectRef::PipeWrite(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
+        KObjectRef::PipeWrite(_) | KObjectRef::Acceptor(_) | KObjectRef::Inbox(_)
         | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => Some(SyscallError::PermissionDenied.to_u64()),
@@ -556,7 +501,7 @@ pub fn try_write(object: &KObjectRef, buf: &UserBytes) -> Option<u64> {
             Some(buf.len() as u64)
         }
         KObjectRef::PipeRead(_) | KObjectRef::Device(_) | KObjectRef::Acceptor(_)
-        | KObjectRef::IoUring(_) | KObjectRef::SharedMem(_) | KObjectRef::SysCap(_)
+        | KObjectRef::Inbox(_) | KObjectRef::SharedMem(_) | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::Process(_) => {
             Some(SyscallError::PermissionDenied.to_u64())
@@ -618,7 +563,7 @@ pub fn fstat(object: &KObjectRef) -> Stat {
             size: m.size(),
             mtime: 0,
         },
-        KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
+        KObjectRef::Inbox(_) | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::Process(_) => plain(FileType::Unknown),
         KObjectRef::Device(d) => plain(match d.class() {
@@ -635,8 +580,8 @@ pub fn fstat(object: &KObjectRef) -> Stat {
 /// `SYS_FSYNC`: the file's bytes on the device, **and the device told to commit
 /// them**.
 ///
-/// **The second step is L6's, and it is a change to a shipped syscall's
-/// semantics rather than an implementation detail** (§12.4). This used to be
+/// **The second step is a change to a shipped syscall's semantics rather than
+/// an implementation detail**, and it arrived with `/bin/logd`. This used to be
 /// `flush_file` alone, which puts the data, the FAT and the directory entry on
 /// the volume and stops there — the stick's own write cache still holds them,
 /// so a power cut after a successful `fsync` could lose what it returned `Ok`
@@ -650,7 +595,13 @@ pub fn fstat(object: &KObjectRef) -> Stat {
 /// alternative considered and rejected was a second syscall for logd alone,
 /// which needs a number, needs discussion, and would make every *other*
 /// `fsync` in the machine quietly weaker than the one program that noticed.
-/// `log_is_durable_after_fsync` is the gate, and it reds on the old behaviour.
+///
+/// **What guards it is `usb_flush_optional`**, whose whole subject is a device
+/// that refuses SYNCHRONIZE CACHE: it reds the moment this call stops issuing
+/// one. `kernel_log_file`'s mid-run read of the image is the positive half.
+/// Neither separates *which* level a flush reached, so an `fsync` that went
+/// back to stopping at the page cache would still pass a clean shutdown — the
+/// refusing device is the only instrument that sees it.
 pub fn fsync(object: &KObjectRef) -> u64 {
     let KObjectRef::File(file) = object else {
         return SyscallError::PermissionDenied.to_u64();
@@ -715,7 +666,7 @@ pub fn has_data(object: &KObjectRef) -> bool {
                 !d.info_read() || crate::drivers::virtio_sound::has_pending()
             }
         },
-        KObjectRef::PipeWrite(_) | KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
+        KObjectRef::PipeWrite(_) | KObjectRef::Inbox(_) | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => false,
     }
@@ -727,7 +678,7 @@ pub fn has_space(object: &KObjectRef) -> bool {
         KObjectRef::Connection(c) => pipe::has_space(c.tx()),
         KObjectRef::File(_) | KObjectRef::Console(_) => true,
         KObjectRef::PipeRead(_) | KObjectRef::Device(_) | KObjectRef::Acceptor(_)
-        | KObjectRef::IoUring(_) | KObjectRef::SysCap(_)
+        | KObjectRef::Inbox(_) | KObjectRef::SysCap(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::SharedMem(_) | KObjectRef::Process(_) => false,
     }
@@ -750,7 +701,7 @@ pub fn mark_tty(object: &KObjectRef) -> u64 {
             0
         }
         KObjectRef::Connection(_) | KObjectRef::File(_) | KObjectRef::Device(_)
-        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::IoUring(_)
+        | KObjectRef::Console(_) | KObjectRef::Acceptor(_) | KObjectRef::Inbox(_)
         | KObjectRef::SysCap(_) | KObjectRef::SharedMem(_)
         | KObjectRef::Connector(_) | KObjectRef::Namespace(_)
         | KObjectRef::Process(_) => SyscallError::InvalidArgument.to_u64(),

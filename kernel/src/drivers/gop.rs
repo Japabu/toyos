@@ -79,8 +79,6 @@ pub fn init(
     let mtrr = mtrr::range_type(addr, aligned_size);
     let installed = crate::mm::paging::kernel()
         .lock()
-        .as_ref()
-        .unwrap()
         .direct_map_policy(addr)
         .expect("GOP: the scanout is mapped");
     assert!(

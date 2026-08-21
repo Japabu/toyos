@@ -8,7 +8,7 @@
 //! three times: four pure crates until 2026-08-08, `toyos-keymap` and
 //! `bcachefs` until 2026-08-14, and `toyos-abi` and `toyos-manifest` — 23 tests
 //! between them — which reached no workflow at all
-//! (`specs/issues/build/three-host-crates-are-tested-nowhere.md`, closed by the
+//! (`issues/build/three-host-crates-are-tested-nowhere.md`, closed by the
 //! commit that added this file).
 //!
 //! A third copy of the list would restore the defect, so there is exactly one:
@@ -108,6 +108,24 @@ pub fn is_member(root: &Path, crate_dir: &Path) -> bool {
 /// Everything else this is asked about — `kernel/`, `bootloader/`, `userland/`,
 /// the guest crates under `tests/` — is excluded from the workspace and keeps
 /// its own.
+///
+/// **One target directory per checkout, and never one across them.** Cargo's
+/// freshness for a path package is mtime rather than content, and `-C metadata`
+/// carries no checkout path, so two worktrees aimed at one directory contend for
+/// one artifact under one name: the tree whose sources are merely *older* is
+/// declared fresh, compiles nothing, and links the other branch's code, with no
+/// diagnostic anywhere. Measured — and `toyos-ld` is a member here, so what it
+/// would swap is the linker every guest binary is built with.
+///
+/// **`-Z checksum-freshness` fixes that and still cannot be relied on here**, so
+/// the rule above is about enablement and not about the feature: the flag is
+/// honoured by a nightly-capable cargo and *silently ignored* by any other, and
+/// nothing a `.cargo/config.toml` can say travels with the shared `target-dir`
+/// it would also carry. This host's rustup default is stable, and
+/// `src/toolchain.rs`'s `host_cargo` lends the `toyos` toolchain whatever cargo
+/// the machine has — stable's, on every CI runner. Sharing on with
+/// freshness off is the mis-link above, so this function joins one path and
+/// stays out of it.
 pub fn target_dir(root: &Path, crate_dir: &Path) -> PathBuf {
     if is_member(root, crate_dir) {
         root.join("target")
@@ -275,7 +293,7 @@ fn line_comment(path: &Path) -> Option<&'static str> {
 /// Every `build.rs` under `dir`, wherever it lives — a build script runs, so a
 /// path in one is a path something acts on.
 #[cfg(test)]
-fn build_scripts(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+fn build_scripts(dir: &Path, out: &mut Vec<PathBuf>) {
     let script = dir.join("build.rs");
     if script.is_file() {
         out.push(script);
@@ -286,7 +304,7 @@ fn build_scripts(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
         if name.starts_with('.') || name == "target" || name == "rust" {
             continue;
         }
-        build_scripts(root, &path, out);
+        build_scripts(&path, out);
     }
 }
 
@@ -301,7 +319,7 @@ mod tests {
     /// **The gate.** A crate added to this repository joins the host workspace
     /// or is excluded from it with a reason, and there is no third option.
     ///
-    /// This is the defect `specs/issues/build/three-host-crates-are-tested-nowhere.md`
+    /// This is the defect `issues/build/three-host-crates-are-tested-nowhere.md`
     /// recorded, and it had already recurred twice before that: a host-testable
     /// crate arrives, nobody adds it to the workflow's loop, and its tests run
     /// nowhere while reading as though they run everywhere. There is one list
@@ -424,7 +442,7 @@ mod tests {
     /// reads on a green build. For `toyos-ld` and `toyos-cc` that is not
     /// cosmetic: each is a `[programs]` guest binary as well as a host tool, and
     /// the `[profile.toyos]` they used to declare is what puts `overflow-checks`
-    /// into the image. Both crafted-ELF kernel panics in `specs/issues/` were
+    /// into the image. Both crafted-ELF kernel panics in `issues/` were
     /// *found* by an overflow check.
     #[test]
     fn no_member_declares_a_profile_or_a_patch_cargo_would_ignore() {
@@ -488,7 +506,7 @@ mod tests {
     ///
     /// The files scanned are the ones that *act* on a path: the workflows, this
     /// build system, and every `build.rs` in the tree. Prose is left alone —
-    /// `specs/issues/hardware/pre-flash-gate-missed-the-milestone.md` records a
+    /// `issues/hardware/pre-flash-gate-missed-the-milestone.md` records a
     /// flashed artifact built when `toyos-ld/target` was a real directory, and
     /// that record is not made truer by editing it.
     #[test]
@@ -501,7 +519,7 @@ mod tests {
             files.extend(entries.filter_map(Result::ok).map(|e| e.path()).filter(|p| p.is_file()));
         }
         let mut scripts = Vec::new();
-        build_scripts(&root, &root, &mut scripts);
+        build_scripts(&root, &mut scripts);
         files.extend(scripts);
         files.sort();
 

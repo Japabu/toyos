@@ -1,4 +1,4 @@
-//! Claims the mouse fd and prints every pointer event that arrives.
+//! Claims the mouse and prints every pointer event that arrives.
 //!
 //! Driven by the `i8042_mouse` host test, which paces its injection against
 //! these lines: a packet goes out for each one printed here, so this is the
@@ -58,10 +58,10 @@ fn main() {
     println!("mev done seen={seen}");
 }
 
-/// The device-minting capability the test estate is endowed
-/// (`specs/capability-endowment-spec.md` §3). A claim is `/bin/init`'s to
-/// mint everywhere else; here test-runner passes a `DEVICE` duplicate down, so
-/// a boot can run several binaries that each need an input device.
+/// The device-minting capability the test estate is endowed. A claim is
+/// `/bin/init`'s to mint everywhere else; here test-runner passes a `DEVICE`
+/// duplicate down, so a boot can run several binaries that each need an input
+/// device.
 fn capability() -> SysCap {
     Endowments::get()
         .take(SYSCAP_LABEL)

@@ -21,29 +21,29 @@ impl Process {
     /// second time answers the same thing and waiting long after the process is
     /// gone still answers.
     pub fn wait(&self) -> Result<i32, SyscallError> {
-        syscall::process_wait(self.0.fd())
+        syscall::process_wait(self.0.raw())
     }
 
     /// The exit code if it has already exited, `Err(WouldBlock)` if not.
     pub fn try_wait(&self) -> Result<i32, SyscallError> {
-        syscall::process_wait_nonblock(self.0.fd())
+        syscall::process_wait_nonblock(self.0.raw())
     }
 
     /// Kill it. `Ok` for one already dead: the caller asked for it to be gone.
     pub fn kill(&self) -> Result<(), SyscallError> {
-        syscall::process_kill(self.0.fd())
+        syscall::process_kill(self.0.raw())
     }
 
     pub fn stats(&self) -> Result<ProcessStats, SyscallError> {
         let mut stats = ProcessStats::default();
-        syscall::process_stats(self.0.fd(), &mut stats)?;
+        syscall::process_stats(self.0.raw(), &mut stats)?;
         Ok(stats)
     }
 
     /// A second handle carrying **less** — how a supervisor hands on the right
     /// to wait without the right to kill.
     pub fn narrowed(&self, rights: Rights) -> Result<Self, SyscallError> {
-        syscall::dup_narrowed(self.0.fd(), rights).map(|h| Self(OwnedHandle(h)))
+        syscall::dup_narrowed(self.0.raw(), rights).map(|h| Self(OwnedHandle(h)))
     }
 
     /// Give up ownership, for a handle about to be endowed or sent.
@@ -61,7 +61,7 @@ impl Process {
 
 impl AsHandle for Process {
     fn as_handle(&self) -> RawHandle {
-        self.0.fd()
+        self.0.raw()
     }
 }
 

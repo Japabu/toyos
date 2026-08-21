@@ -6,6 +6,14 @@
 //! gives the same numbers. The old shape — a snapshot the parent could read
 //! exactly once, only after the child died — is what the third case used to
 //! assert the opposite of.
+//!
+//! A fourth asks what the numbers *mean*. `blocked_io_ns`, `blocked_futex_ns`,
+//! `blocked_pipe_ns` and `blocked_ipc_ns` are four fields and not one because
+//! the breakdown is the instrument — it was built for the T14 wedge
+//! investigation, where "this process is blocked" was already known and
+//! "blocked on what" was the question. They are only four fields while
+//! something says which; when every park went in as `WaitClass::Other` they
+//! were permanently zero, and nothing here noticed.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::toyos::process::ChildExt;
@@ -22,6 +30,7 @@ fn main() {
     }
     exited_child();
     live_process();
+    blocked_time_names_what_it_waited_on();
     repeatable();
     refused_without_read();
     println!("all process_stats tests passed");
@@ -104,6 +113,74 @@ fn live_process() {
     println!("  live process: ok (pid={} wall={}ns)", s.pid, s.wall_ns);
     child.kill().expect("kill the held child");
     child.wait().expect("wait the held child");
+}
+
+/// The blocked-time breakdown is a breakdown.
+///
+/// The `held` child blocks reading a pipe its parent holds the write end of, so
+/// its wait is `WaitClass::Pipe` — and `blocked_pipe_ns` is the field that has
+/// to move, and what is asserted is that it moved at all — **against zero**.
+///
+/// The sentence that used to stand here claimed a stronger discrimination than
+/// the code performs: that the check was made "against `blocked_other_ns`
+/// rather than against zero", so that the two fields swapping would be caught.
+/// `blocked_other_ns` appears in this file only as a format argument, and the
+/// assertion twelve lines below has always read `blocked_pipe_ns > 0`. The gate
+/// does catch what it exists for — a tree that stopped classifying leaves pipe
+/// at zero — and it would not catch one that charged the same wait to both
+/// counters. The stronger form is not obviously sound either, which is why this
+/// is a correction to the sentence rather than to the assertion: the child does
+/// its own blocking during setup, so an ordering between two counters is a
+/// claim about the child's schedule and not about the classification.
+///
+/// **The park has to be over before the numbers exist**, and the first draft of
+/// this arm read them while the child was still in it. Blocked time is charged
+/// at the transition *out* of `Blocked` (`Task::charge_residency`, from
+/// `BlockedTask::wake`), so a thread that is parked right now has nothing
+/// recorded for the park it is in — unlike `cpu_ns`, where `TaskHandle::cpu_ns`
+/// adds the live slice. So the parent ends the wait, lets the child exit, and
+/// asks the object afterwards, which is what `exited_child` above already
+/// relies on. The gap is filed as
+/// `issues/diagnostics/blocked-time-is-invisible-while-the-park-lasts.md`.
+fn blocked_time_names_what_it_waited_on() {
+    let mut child = Command::new(SELF_PATH)
+        .arg("held")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn the held child");
+    let mut out = BufReader::new(child.stdout.take().expect("held stdout"));
+    let mut line = String::new();
+    out.read_line(&mut line).expect("the held child's marker");
+    assert_eq!(line.trim(), "running", "the held child said {line:?}");
+
+    // Long enough that the park is measurable at the accounting's resolution,
+    // and short enough that it is a margin rather than a bound: what is
+    // asserted is which counter moved, never how far.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Ending the park is what charges it. The child's `read` returns and it
+    // exits; its object keeps answering, which is this file's first arm.
+    child
+        .stdin
+        .take()
+        .expect("the held child's stdin")
+        .write_all(b"go\n")
+        .expect("release the held child");
+    child.wait().expect("wait the held child");
+
+    let s = stats_of(&child).expect("an exited child still answers");
+    assert!(
+        s.blocked_pipe_ns > 0,
+        "a child that parked reading a pipe charged {} ns to pipe and {} ns to other — the \
+         blocked-time breakdown says nothing if every park is unclassified",
+        s.blocked_pipe_ns,
+        s.blocked_other_ns,
+    );
+    println!(
+        "  blocked breakdown: ok (pipe={}ns io={}ns futex={}ns ipc={}ns other={}ns)",
+        s.blocked_pipe_ns, s.blocked_io_ns, s.blocked_futex_ns, s.blocked_ipc_ns,
+        s.blocked_other_ns,
+    );
 }
 
 /// Reading does not spend it. This asserted the opposite before the handle:

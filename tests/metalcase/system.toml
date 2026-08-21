@@ -21,10 +21,10 @@ assets = ["assets"]
 start = ["logd", "compositor", "soundd", "netd", "sshd", "test-runner"]
 
 # **Every image that carries a `TOYOS-LOG` partition runs this**, and every
-# image does. The kernel stopped writing files at L6 of
-# `specs/log-architecture-spec.md`, so a boot config without `logd` is a boot
-# whose `/log` is empty — `every_boot_config_runs_logd` is what refuses one.
-# It claims no device and serves no port yet (§5.1, §5.2): its whole authority
+# image does. The kernel keeps the record ring and writes no file at all, so a
+# boot config without `logd` is a boot whose `/log` is empty —
+# `every_boot_config_runs_logd` is what refuses one.
+# It claims no device and serves no port: its whole authority
 # is `logread`, which is `Rights::LOG | Rights::WAIT` on a `SysCap` duplicate.
 [programs.logd]
 syscap = ["logread"]
@@ -49,7 +49,7 @@ receives = ["netd", "launcher"]
 # The union its guest binaries need on this machine shape.
 # `logread` is the log gate's own: a spawned test binary does not inherit a
 # `SysCap` dup, so the gate that reads the kernel's records runs inside
-# `test-runner` itself (`specs/log-architecture-spec.md` §3.2, §9.5).
+# `test-runner` itself.
 [programs.test-runner]
 receives = ["compositor", "soundd", "netd"]
 syscap = ["logread"]

@@ -15,7 +15,7 @@
 //! can say "cpu 3 is not scheduling at all".
 //!
 //! Nothing here allocates, nothing waits on a lock it could find held, and
-//! every list is bounded. See `specs/issues/diagnostics/` for what it was built
+//! every list is bounded. See `issues/diagnostics/` for what it was built
 //! to settle.
 //!
 //! **This report cannot describe the state it is summoned to describe, and the
@@ -49,6 +49,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::{apic, percpu, smp};
 use crate::sched::payload::{SCHED_BLOCKED, SCHED_READY, SCHED_RUNNING};
+use crate::time::{Budget, Duration, Floor};
 
 use super::driver;
 use super::MAX_CPUS;
@@ -56,13 +57,23 @@ use super::MAX_CPUS;
 /// A deadline further out than this is not a wait, it is arithmetic that got
 /// away: no kernel site parks for an hour, and a `saturating_add` that
 /// overflowed lands at `u64::MAX` nanoseconds, which is 584 years.
-const ABSURD_HORIZON_NS: u64 = 3_600_000_000_000;
+///
+/// A [`Floor`] rather than any of the waiting kinds: nothing waits for it and
+/// nothing expires. It is a predicate *on* another duration, which is the one
+/// thing that kind is for.
+const ABSURD_HORIZON: Floor = Floor::policy(
+    Duration::from_secs(3_600),
+    "no kernel site parks for an hour, and an overflowed saturating_add lands 584 years out",
+);
 
 /// How long the asking CPU waits for its siblings before naming the silent
 /// ones. It spends this with preemption off, which is what any bounded wait in
 /// `drain_irqs` costs; a quarter second is far past a scheduler pass and far
 /// short of anything a person notices after pressing a key.
-const ANSWER_BUDGET_NS: u64 = 250_000_000;
+const ANSWER_BUDGET: Budget = Budget::of(
+    Duration::from_millis(250),
+    "the silent CPUs are named and their part of the report is missing",
+);
 
 /// Ordinary parked lines one CPU may print. A line the verdict depends on —
 /// overdue, absurd — is never counted against this, so truncation cannot hide
@@ -77,13 +88,19 @@ const CENSUS_LINES: u32 = 16;
 /// giving up on the first refusal costs the owner the half of the report that
 /// names a thread no CPU has. Whoever holds it in the case this facility is
 /// for is not going to finish, which is what the ceiling is for.
-const TABLE_BUDGET_NS: u64 = 20_000_000;
+const TABLE_BUDGET: Budget = Budget::of(
+    Duration::from_millis(20),
+    "the summary says the census is missing rather than naming the threads no CPU has",
+);
 
 /// How long a silent CPU gets to answer the NMI. Two orders of magnitude below
 /// the kick's budget because an NMI needs nothing of the target but the
 /// interrupt itself: no pass, no lock, no scheduler state. A CPU that has not
 /// answered in a millisecond is not going to.
-const NMI_BUDGET_NS: u64 = 1_000_000;
+const NMI_BUDGET: Budget = Budget::of(
+    Duration::from_millis(1),
+    "the CPU is reported silent with no instruction pointer beside it",
+);
 
 static IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static OWES: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
@@ -101,6 +118,11 @@ mod tally {
 
     pub static PARKED: AtomicU32 = AtomicU32::new(0);
     pub static READY: AtomicU32 = AtomicU32::new(0);
+    /// Killed threads unwinding, or waiting on a CPU to unwind. **A container
+    /// of its own**, because their state words read `Ready` and the census
+    /// counts them as such, so a verdict built without this one reports them as
+    /// held by nobody.
+    pub static DYING: AtomicU32 = AtomicU32::new(0);
     pub static RUNNING: AtomicU32 = AtomicU32::new(0);
     pub static NO_DEADLINE: AtomicU32 = AtomicU32::new(0);
     pub static PENDING: AtomicU32 = AtomicU32::new(0);
@@ -108,9 +130,10 @@ mod tally {
     pub static ABSURD: AtomicU32 = AtomicU32::new(0);
     pub static UNPRINTED: AtomicU32 = AtomicU32::new(0);
 
-    pub const ALL: [&AtomicU32; 8] = [
+    pub const ALL: [&AtomicU32; 9] = [
         &PARKED,
         &READY,
+        &DYING,
         &RUNNING,
         &NO_DEADLINE,
         &PENDING,
@@ -140,7 +163,7 @@ impl Verdict {
         match deadline {
             None => Self::Event,
             Some(at) if at <= now => Self::Overdue,
-            Some(at) if at - now > ABSURD_HORIZON_NS => Self::Absurd,
+            Some(at) if at - now > ABSURD_HORIZON.nanos() => Self::Absurd,
             Some(_) => Self::Pending,
         }
     }
@@ -191,6 +214,9 @@ pub fn request() {
     let from = crate::clock::nanos_since_boot();
     log!("=== blocked-task dump: {cpus} cpu(s), and this report takes the screen ===");
 
+    // A CPU number, not a walk of `OWES`: it is compared against `me`, and
+    // `OWES` is `MAX_CPUS` long whatever `cpus` is.
+    #[allow(clippy::needless_range_loop)]
     for cpu in 0..cpus {
         if cpu != me {
             OWES[cpu].store(true, Ordering::Release);
@@ -209,7 +235,7 @@ pub fn request() {
     // A pass reached by preemption cannot be holding a `Lock` — taking one
     // raises the preempt count — so spinning here cannot be blocking a sibling
     // on a lock this CPU's interrupted context owns.
-    let deadline = crate::clock::nanos_since_boot().saturating_add(ANSWER_BUDGET_NS);
+    let deadline = crate::clock::nanos_since_boot().saturating_add(ANSWER_BUDGET.nanos());
     let mut silent = 0;
     loop {
         if (0..cpus).all(|cpu| !OWES[cpu].load(Ordering::Acquire)) {
@@ -261,13 +287,15 @@ fn probe_silent(asked: &[bool; MAX_CPUS], cpus: usize) {
     }
     // Every flag set before any NMI goes out, for the same reason the kicks are
     // batched above: an instant answer must not find its own flag unwritten.
+    // A CPU number, not a walk of `asked`: it is the APIC id the NMI goes to.
+    #[allow(clippy::needless_range_loop)]
     for cpu in 0..cpus {
         if asked[cpu] {
             apic::send_nmi(cpu as u32);
         }
     }
 
-    let deadline = crate::clock::nanos_since_boot().saturating_add(NMI_BUDGET_NS);
+    let deadline = crate::clock::nanos_since_boot().saturating_add(NMI_BUDGET.nanos());
     while (0..cpus).any(|cpu| asked[cpu] && NMI_OWES[cpu].load(Ordering::Acquire)) {
         if crate::clock::nanos_since_boot() >= deadline {
             break;
@@ -301,14 +329,14 @@ fn probe_silent(asked: &[bool; MAX_CPUS], cpus: usize) {
 /// and the NMI really is what reaches it.
 ///
 /// Bounded and self-healing on purpose. The window is longer than
-/// [`ANSWER_BUDGET_NS`] so the CPU is named silent, and short enough that it
+/// [`ANSWER_BUDGET`] so the CPU is named silent, and short enough that it
 /// rejoins and the guest shuts down cleanly — which is itself part of the
 /// assertion, since a CPU the NMI merely interrupted must come back.
 #[cfg(feature = "boot-actuators")]
 pub(super) fn deaf_window() {
     /// Late enough that the machine is up and every CPU has joined.
     const ARM_AT_NS: u64 = 3_000_000_000;
-    /// Comfortably past [`ANSWER_BUDGET_NS`], so "silent" is not a race — and
+    /// Comfortably past [`ANSWER_BUDGET`], so "silent" is not a race — and
     /// bounded, so the CPU rejoins and the guest still shuts down.
     const DEAF_NS: u64 = 400_000_000;
     /// How long cpu0 waits for the victim to reach its idle loop and go deaf.
@@ -444,6 +472,22 @@ fn report_this_cpu() {
     let ready = driver::ready_len() as u32;
     tally::READY.fetch_add(ready, Ordering::Relaxed);
 
+    // **The dying list, which no reader of this dump could see.** A killed
+    // thread's word says `Ready(cpu)`, so the census below counts it — while
+    // `ready_len()` counts only `rq` and `for_each_parked` walks only `parked`,
+    // which made every teardown in flight an `unheld` false positive. The whole
+    // point of the verdict is to tell "a task nothing will ever run" from a
+    // busy machine, and this is a task that runs *next*.
+    let mut dying = 0u32;
+    let read_dying = driver::for_each_dying(|id| {
+        dying += 1;
+        tally::DYING.fetch_add(1, Ordering::Relaxed);
+        log!("  cpu{cpu} pid={} tid={} unwinding (killed)", id.0.raw(), id.1.raw());
+    });
+    if !read_dying {
+        log!("  cpu{cpu} !! a pass owns its scheduler state; nothing read from it");
+    }
+
     let mut ordinary = 0u32;
     let read = driver::for_each_parked(|task| {
         tally::PARKED.fetch_add(1, Ordering::Relaxed);
@@ -498,16 +542,26 @@ struct Census {
 fn census() -> Census {
     let mut c = Census::default();
     let mut printed = 0u32;
-    let deadline = crate::clock::nanos_since_boot().saturating_add(TABLE_BUDGET_NS);
+    let deadline = crate::clock::nanos_since_boot().saturating_add(TABLE_BUDGET.nanos());
     c.read = walk_threads(deadline, |thread| {
         c.threads += 1;
         if thread.zombie.is_some() {
             c.zombie += 1;
             return;
         }
+        // **A kernel thread is named whatever it is doing, and it is the one
+        // exception to the rule below.** `klogd`, `usbd` and `iod` are almost
+        // always blocked, so the CPUs' parked lines are where they appear — and
+        // those lines carry a pid and a tid and no name. On a machine that has
+        // gone quiet the question is *which* of the three is stuck, and a pid is
+        // not an answer to it.
+        let kernel = crate::sched::kthread::is_kernel_task(crate::scheduler::TaskId(
+            thread.pid,
+            thread.tid,
+        ));
         let (bucket, tag) = match thread.sched {
-            Some(SCHED_RUNNING) => (&mut c.running, None),
-            Some(SCHED_BLOCKED) => (&mut c.blocked, None),
+            Some(SCHED_RUNNING) => (&mut c.running, kernel.then_some("kernel")),
+            Some(SCHED_BLOCKED) => (&mut c.blocked, kernel.then_some("kernel")),
             Some(SCHED_READY) if thread.cpu_ns == 0 => {
                 c.never_ran += 1;
                 (&mut c.ready, Some("!! ready and has never run"))
@@ -519,9 +573,16 @@ fn census() -> Census {
         // Blocked and running threads are the CPUs' lines; printing them again
         // would push the ones only this half can see off the page.
         let Some(tag) = tag else { return };
-        printed += 1;
-        if printed > CENSUS_LINES {
-            return;
+        // The three kernel threads do not count against the budget and cannot
+        // flood it: `sched::kthread::MAX_KERNEL_TASKS` is the ceiling, and a
+        // shipping kernel's is three. Counting them would let a machine with
+        // enough ready threads push the very lines this exception exists for
+        // off the page.
+        if !kernel {
+            printed += 1;
+            if printed > CENSUS_LINES {
+                return;
+            }
         }
         log!(
             "  {tag}: pid={} tid={} {} cpu={}",
@@ -565,9 +626,11 @@ fn summary(cpus: usize, silent: u32, c: Census) {
         );
     }
     log!(
-        "== sched: {answered}/{cpus} cpu(s) answered — {} running, {} queued, {} parked",
+        "== sched: {answered}/{cpus} cpu(s) answered — {} running, {} queued, {} unwinding, \
+         {} parked",
         tally::RUNNING.load(Ordering::Relaxed),
         tally::READY.load(Ordering::Relaxed),
+        tally::DYING.load(Ordering::Relaxed),
         tally::PARKED.load(Ordering::Relaxed),
     );
     log!(
@@ -588,8 +651,13 @@ fn summary(cpus: usize, silent: u32, c: Census) {
     let overdue = tally::OVERDUE.load(Ordering::Relaxed);
     let absurd = tally::ABSURD.load(Ordering::Relaxed);
     if c.read {
+        // `DYING` is in the sum for the same reason `READY` is: the census
+        // counted those threads under `ready`, and a container the CPU half
+        // cannot see is exactly what `unheld` is meant to name — so leaving it
+        // out reports a healthy teardown as a lost task.
         let scheduled = tally::PARKED.load(Ordering::Relaxed)
             + tally::READY.load(Ordering::Relaxed)
+            + tally::DYING.load(Ordering::Relaxed)
             + tally::RUNNING.load(Ordering::Relaxed);
         let claimed = c.running + c.ready + c.blocked;
         log!(

@@ -60,8 +60,9 @@ const PF_PRESENT: u64 = 1 << 0;
 const PF_WRITE: u64 = 1 << 1;
 const PF_INSTRUCTION_FETCH: u64 = 1 << 4;
 
-// CS ring mask
-const RPL_MASK: u64 = 3;
+// The ring a `cs` names is `toyos_userbound::Ring`'s to decide and nobody
+// else's: a second reading of the RPL field beside it is a second place the
+// crash path can be told the wrong privilege level.
 
 // IDT entry (16 bytes in 64-bit mode)
 #[repr(C)]
@@ -329,7 +330,7 @@ extern "sysv64" fn stub_halt_all() {
 /// fault taken from Ring 3 can return through another task — and until this
 /// bracket existed it did so carrying whatever that task left in the registers.
 /// A demand-paging fault corrupting XMM produces a wrong number rather than a
-/// signal, which is why nothing had noticed (`specs/user-machine-state.md` §3).
+/// signal, which is why nothing had noticed.
 ///
 /// `rdi` is taken before the bracket because the bracket moves `rsp`: the frame
 /// [`trap_dispatch`] is handed is the one the pushes above built, and the CS
@@ -374,9 +375,31 @@ extern "sysv64" fn common_entry() {
 /// would silently drop requests its re-entry guard defers. A request that
 /// survives `do_preempt` on this path means the IN_SCHEDULE guard leaked;
 /// spinning on it would hang the CPU silently, so die loudly instead.
+///
+/// **The kill is checked at the *last* boundary and not the first, and the
+/// difference is a thread reaching Ring 3 after it was killed.** The loop below
+/// re-enables interrupts and gives this CPU away for a whole pass; a retire
+/// landing in that window — and the retire's kick is a targeted IPI aimed at
+/// exactly this CPU — was observed by nothing, because the one check had
+/// already run. So the check is the loop's own condition: it runs before every
+/// pass and again after the last one, with IF=0, and the return to Ring 3 is
+/// the statement immediately after it.
+///
+/// What remains is one instant wide and not one quantum: the kill bit is set
+/// by a remote CPU's plain atomic, so it can be raised between this check and
+/// the `iretq`. The bound that leaves is one interrupt delivery — the retire's
+/// `Urgency::Preempt` kick is already on its way, and the thread takes it in
+/// Ring 3 and comes straight back here.
 pub(crate) extern "sysv64" fn kernel_exit_to_user_check() {
     flush_ring0_timer_fires_to_trace();
-    while crate::preempt::need_resched() {
+    loop {
+        // A killed thread returns to Ring 3 exactly once more: never. Its
+        // kernel stack is empty here by definition, so this is where the
+        // unwind ends.
+        crate::scheduler::exit_if_killed();
+        if !crate::preempt::need_resched() {
+            return;
+        }
         assert!(!crate::scheduler::in_schedule_self(),
             "exit-to-user inside a scheduler pass");
         unsafe { core::arch::asm!("sti", options(nomem, nostack)); }

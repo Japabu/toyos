@@ -125,6 +125,20 @@ pub enum GptError {
     PartitionOverlap { index: u32 },
 }
 
+impl GptError {
+    /// Whether this refusal means the primary never became a CRC-verified
+    /// table at all, as opposed to becoming one and then answering "not
+    /// found" or "not sane". Only the first kind is worth retrying against
+    /// the backup: the other two already read the table successfully, and
+    /// retrying them would be comparing two copies instead of refusing.
+    fn primary_never_checked_out(self) -> bool {
+        !matches!(
+            self,
+            GptError::NotFound { .. } | GptError::PartitionRange { .. } | GptError::PartitionOverlap { .. }
+        )
+    }
+}
+
 /// One partition entry, after it has been checked against the disk it is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Partition {
@@ -182,6 +196,19 @@ struct Header {
 /// anything the array said allowed to mean something. A match found on the way
 /// through is held back until the array's CRC proves the bytes it came from
 /// were not garbage.
+///
+/// The primary copy at LBA 1 is tried first. UEFI puts a full second copy at
+/// the end of the device precisely so a torn write to the front is
+/// recoverable, so a primary that never became a checked table — a read that
+/// failed, a header that did not parse, an entry array whose CRC did not
+/// hold — is retried against the backup at `lba_count - 1` before this
+/// refuses. A primary that *did* become a checked table is trusted alone: the
+/// two copies are never compared, so [`GptError::NotFound`],
+/// [`GptError::PartitionRange`] and [`GptError::PartitionOverlap`] — every
+/// refusal that only exists once the array's CRC has already held — are never
+/// retried against the backup. That is the answer to what a disagreement
+/// between the two should do: refuse rather than pick, by construction,
+/// because this never reads both and chooses.
 pub fn locate(dev: &mut dyn Sectors, target: Guid) -> Result<Located, GptError> {
     let lba_bytes = dev.lba_bytes();
     if !(MIN_LBA_BYTES..=MAX_LBA_BYTES).contains(&lba_bytes) || !lba_bytes.is_power_of_two() {
@@ -199,8 +226,29 @@ pub fn locate(dev: &mut dyn Sectors, target: Guid) -> Result<Located, GptError> 
     read(dev, 0, block)?;
     check_protective_mbr(block)?;
 
-    read(dev, 1, block)?;
-    let header = parse_header(block, lba_bytes, lba_count)?;
+    match locate_at(dev, 1, target, lba_bytes, lba_count) {
+        Ok(located) => Ok(located),
+        Err(primary_err) if primary_err.primary_never_checked_out() => {
+            locate_at(dev, lba_count - 1, target, lba_bytes, lba_count).or(Err(primary_err))
+        }
+        Err(primary_err) => Err(primary_err),
+    }
+}
+
+/// `locate`'s work against one header, primary or backup — read it, check it,
+/// walk the array it names, and match `target` against what CRC-verified.
+fn locate_at(
+    dev: &mut dyn Sectors,
+    header_lba: u64,
+    target: Guid,
+    lba_bytes: u32,
+    lba_count: u64,
+) -> Result<Located, GptError> {
+    let mut block = [0u8; MAX_LBA_BYTES as usize];
+    let block = &mut block[..lba_bytes as usize];
+
+    read(dev, header_lba, block)?;
+    let header = parse_header(block, lba_bytes, lba_count, header_lba)?;
 
     let (found, used_entries) = scan_entries(dev, &header, target, lba_bytes)?;
     let Some(partition) = found else {
@@ -258,7 +306,7 @@ fn check_protective_mbr(lba0: &[u8]) -> Result<(), GptError> {
     Ok(())
 }
 
-fn parse_header(lba1: &[u8], lba_bytes: u32, lba_count: u64) -> Result<Header, GptError> {
+fn parse_header(lba1: &[u8], lba_bytes: u32, lba_count: u64, header_lba: u64) -> Result<Header, GptError> {
     if lba1.get(..8) != Some(&HEADER_SIGNATURE[..]) {
         return Err(GptError::NoHeader);
     }
@@ -275,7 +323,7 @@ fn parse_header(lba1: &[u8], lba_bytes: u32, lba_count: u64) -> Result<Header, G
         return Err(GptError::HeaderReserved(reserved));
     }
     let my_lba = le_u64(lba1, 24);
-    if my_lba != 1 {
+    if my_lba != header_lba {
         return Err(GptError::HeaderMisplaced(my_lba));
     }
 
@@ -295,7 +343,7 @@ fn parse_header(lba1: &[u8], lba_bytes: u32, lba_count: u64) -> Result<Header, G
     if entry_bytes < MIN_ENTRY_BYTES
         || !entry_bytes.is_power_of_two()
         || entry_bytes > lba_bytes
-        || lba_bytes % entry_bytes != 0
+        || !lba_bytes.is_multiple_of(entry_bytes)
     {
         return Err(GptError::EntrySize(entry_bytes));
     }
@@ -310,10 +358,18 @@ fn parse_header(lba1: &[u8], lba_bytes: u32, lba_count: u64) -> Result<Header, G
     let array_end = entry_array_lba
         .checked_add(array_lbas)
         .ok_or(GptError::EntryArrayMisplaced { lba: entry_array_lba, lbas: array_lbas })?;
-    // Below the header is the header's own block and the protective MBR;
-    // above it is data somebody may be using. Neither is somewhere an array
-    // can be, and a table that says otherwise describes a different disk.
-    if entry_array_lba < 2 || array_end > first_usable_lba {
+    // The primary's array sits between the header block and the first usable
+    // block; the backup's sits between the last usable block and its own
+    // header, at the top of the device — the mirror image, because the
+    // backup header is the *last* LBA rather than the second. Anywhere else
+    // is data somebody may be using, or off the device, and a table that says
+    // otherwise describes a different disk.
+    let misplaced = if header_lba == 1 {
+        entry_array_lba < 2 || array_end > first_usable_lba
+    } else {
+        entry_array_lba <= last_usable_lba || array_end > header_lba
+    };
+    if misplaced {
         return Err(GptError::EntryArrayMisplaced { lba: entry_array_lba, lbas: array_lbas });
     }
 

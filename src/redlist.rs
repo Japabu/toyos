@@ -1,10 +1,9 @@
 //! Which tests are known to go red, on which instrument, at what rate, and on
 //! whose evidence — as data rather than as prose.
 //!
-//! **The failure this exists to stop.** The list used to be paragraphs in
-//! `specs/issues/hardware/eleven-names-red-on-ci.md` and
-//! `specs/assessments/ci-plan-assessment-2026-08.md` §9.2, and a careful
-//! reader can read a paragraph backwards: `rg`ing a test
+//! **The failure this exists to stop.** The list used to be paragraphs — in
+//! `issues/hardware/eleven-names-red-on-ci.md` and in a CI assessment since
+//! deleted — and a careful reader can read a paragraph backwards: `rg`ing a test
 //! name in it hits the sentence that names the twelve tests that came *off* the
 //! list as readily as the table of the eleven that are on it, and the hit looks
 //! the same either way. That happened, and the answer given to the owner was the
@@ -56,10 +55,24 @@ use crate::day::Day;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// Which machine took the measurement. `specs/testing-strategy.md` §2 is the
-/// table of what each one can and cannot answer; a row without this is a row
-/// that will be read as being about whichever machine the reader is standing
-/// at.
+/// Which machine took the measurement. A row without this is a row that will be
+/// read as being about whichever machine the reader is standing at.
+///
+/// **Every defect class has exactly one owning instrument, and the owner's red
+/// is that class's alarm.** Four instruments carry the whole estate, and each is
+/// blind to something another sees: host suites own pure logic — decoders,
+/// validators, layouts, the build system's own gates, and the memory orderings
+/// x86 TSO hides — and are blind to anything needing a booted kernel; KVM guest
+/// shards own the booted kernel on native silicon and audible harm, and are
+/// blind to contention and to whatever the hypervisor absorbs; the TCG shard
+/// owns ISA breadth, the instruction paths the KVM hosts' CPUs never decode, and
+/// is blind to vendor-real semantics and to realistic instruction cost; metal
+/// owns what emulation absorbs — cache and control-register effects, PAT/MTRR,
+/// device timing, real latency — and is blind to anything needing repetition or
+/// isolation, being one manual machine. A defect found by a non-owning
+/// instrument transfers to its owner. Only three of the four can appear below:
+/// **metal is not an instrument here**, because the suite does not run on the
+/// T14.
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
 pub enum Instrument {
     /// A `guest` shard: KVM on four native x86-64 cores, `-cpu host`, **one
@@ -201,8 +214,8 @@ pub struct Red {
 /// `EXPECTED_FAILURES` entries use exactly this interval with exactly this
 /// justification — long enough that a fix already in flight lands first, short
 /// enough that nobody inherits it silently. The tree it is measured against
-/// bears it out: `specs/assessments/ci-plan-assessment-2026-08.md` §10.10 has
-/// nine consecutive `ci` runs on `main`, one of them green.
+/// bears it out: nine consecutive `ci` runs on `main` over that window, one of
+/// them green.
 pub const SHELF_LIFE_DAYS: i64 = 31;
 
 /// Every measurement, grouped by the campaign that took it.
@@ -228,7 +241,7 @@ pub const KNOWN_RED: &[Red] = &[
         what: "the transport broke 2 times; the injection is armed once per boot, so anything \
                else is a break this test did not stage",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     // ---------------------------------------------------------------------
@@ -246,7 +259,7 @@ pub const KNOWN_RED: &[Red] = &[
                recovery and no more",
         evidence: "PR #41 (`wt/toyos-i8042tier`), run 31684437719, job 94397136494 \
                    (\"guest (4)\"), sha 711730204800d7173558f7dd96644c5910fb8cf0",
-        source: "specs/issues/hardware/usb-transport-break-counts-the-boot-sticks-recovery.md",
+        source: "issues/hardware/usb-transport-break-counts-the-boot-sticks-recovery.md",
         measured: "2026-08-13",
     },
     Red {
@@ -254,7 +267,7 @@ pub const KNOWN_RED: &[Red] = &[
         instrument: Instrument::Ci,
         finding: Finding::fires(5, 5),
         standing: Standing::Disputed(
-            "`specs/assessments/ci-plan-assessment-2026-08.md` §9.3 says closed by `wt/toyos-fpu` \
+            "a since-deleted CI assessment said closed by `wt/toyos-fpu` \
              — `fxsave64`/`fxrstor64` on \
              all five Ring 3-reachable entries, with `fpu_isolation` as the gate that asks the \
              question on purpose. The write-up this row cites still counts it among the nine \
@@ -266,7 +279,7 @@ pub const KNOWN_RED: &[Red] = &[
                the next unrelated process scheduled on that CPU",
         evidence: "probe-rate run 31258202923; isolated by probe-x87 run 31260763462, two arms \
                    of three reps differing only in `fault_gate_child`'s control word",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -274,13 +287,12 @@ pub const KNOWN_RED: &[Red] = &[
         instrument: Instrument::Ci,
         finding: Finding::fires(5, 5),
         standing: Standing::Disputed(
-            "the same disagreement as `std_unwind`: \
-             `specs/assessments/ci-plan-assessment-2026-08.md` §9.3 says closed by \
-             `wt/toyos-fpu`, the cited write-up says not re-measured on CI",
+            "the same disagreement as `std_unwind`: the since-deleted CI assessment said \
+             closed by `wt/toyos-fpu`, the cited write-up says not re-measured on CI",
         ),
         what: "the same #MF, on the same sub-test — the one that panics on a thread",
         evidence: "probe-rate run 31258202923; probe-x87 run 31260763462",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -296,7 +308,7 @@ pub const KNOWN_RED: &[Red] = &[
         ),
         what: "soundd did not present a null sink on a device-less machine",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -308,7 +320,7 @@ pub const KNOWN_RED: &[Red] = &[
                `EXPECTED_FAILURES` entry covers: that entry names only \"the captured tone is not \
                one sine\"",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -317,12 +329,11 @@ pub const KNOWN_RED: &[Red] = &[
         finding: Finding::fires(2, 5),
         standing: Standing::Retired(
             "what the actuator stages is an *ordering* — the disk arrives after the scan — so the \
-             scan closes the window now and no host's boot speed can defeat it \
-             (`specs/assessments/ci-plan-assessment-2026-08.md` §10.9)",
+             scan closes the window now and no host's boot speed can defeat it",
         ),
         what: "the boot scan bound a disk, so the port was not held empty",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -335,7 +346,7 @@ pub const KNOWN_RED: &[Red] = &[
         ),
         what: "\"presenting a null sink\" never reached the boot console",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -346,7 +357,7 @@ pub const KNOWN_RED: &[Red] = &[
         what: "two *different* reasons in the two reps — the census half, and /bin/terminal racing \
                the compositor",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -361,7 +372,7 @@ pub const KNOWN_RED: &[Red] = &[
         ),
         what: "the rip resolved to `u128_div_rem`, not to the spin",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -370,15 +381,15 @@ pub const KNOWN_RED: &[Red] = &[
         finding: Finding::fires(1, 5),
         standing: Standing::Disputed(
             "two harness defects were fixed for it (the torn beat/pin pair, and a window that \
-             opens at the first full mask), and \
-             `specs/assessments/ci-plan-assessment-2026-08.md` §10.9's fixed arm was **1 of 10 \
-             again**, on a *different* line — `cpu6 last reached one 0.349s ago`. The \
+             opens at the first full mask), and the probe's fixed arm — run 31283095698, ten \
+             reps — was **1 of 10 again**, on a *different* line: \
+             `cpu6 last reached one 0.349s ago`. The \
              no-CPU-missing-from-two-consecutive-lines rule was written for that line and its rate \
              has not been re-measured",
         ),
         what: "2 of 12 heartbeats dropped a healthy CPU from the mask",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -388,7 +399,7 @@ pub const KNOWN_RED: &[Red] = &[
         standing: Standing::Stands,
         what: "nothing enumerated on the first controller",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     // The twelve that came off the list when `wt/toyos-clock` landed. **These are
@@ -402,7 +413,7 @@ pub const KNOWN_RED: &[Red] = &[
         what: "came off the list with `wt/toyos-clock`'s waits, and the \"a guest stops making \
                progress and pays its whole ceiling\" shape went with it",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -412,7 +423,7 @@ pub const KNOWN_RED: &[Red] = &[
         standing: Standing::Stands,
         what: "came off the list with `wt/toyos-clock`'s waits",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -423,7 +434,7 @@ pub const KNOWN_RED: &[Red] = &[
         what: "came off the list with `wt/toyos-clock`'s waits. Read the later row for this name \
                before treating it as retired",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -433,7 +444,7 @@ pub const KNOWN_RED: &[Red] = &[
         standing: Standing::Stands,
         what: "came off the list with `wt/toyos-clock`'s waits",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -445,7 +456,7 @@ pub const KNOWN_RED: &[Red] = &[
                each way on one tree — stalled in run 31264914759 and passed in 31266194663, same \
                commit, half an hour apart — which is a rate and not a reproduction",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -454,10 +465,10 @@ pub const KNOWN_RED: &[Red] = &[
         finding: Finding::quiet(5),
         standing: Standing::Stands,
         what: "came off the list with `wt/toyos-clock`'s waits. Distinct from the QEMU 8.2.2 red \
-               `specs/assessments/ci-plan-assessment-2026-08.md` §8.3 records, which was closed \
-               by putting the dev host's own QEMU in the container",
+               measured earlier in the same campaign, which was closed by putting the dev host's \
+               own QEMU in the container",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -467,7 +478,7 @@ pub const KNOWN_RED: &[Red] = &[
         standing: Standing::Stands,
         what: "came off the list with `wt/toyos-clock`'s waits",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -477,7 +488,7 @@ pub const KNOWN_RED: &[Red] = &[
         standing: Standing::Stands,
         what: "came off the list with `wt/toyos-clock`'s waits",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -487,7 +498,7 @@ pub const KNOWN_RED: &[Red] = &[
         standing: Standing::Stands,
         what: "came off the list with `wt/toyos-clock`'s waits",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -498,7 +509,7 @@ pub const KNOWN_RED: &[Red] = &[
         what: "0 of 5, and the write-up says only that it *coincides* with `wt/toyos-clock`'s \
                waits — nothing named a trigger for the KVM wedge it used to give",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/xhci-flap-wedges-under-kvm.md",
+        source: "issues/hardware/xhci-flap-wedges-under-kvm.md",
         measured: "2026-08-08",
     },
     Red {
@@ -511,7 +522,7 @@ pub const KNOWN_RED: &[Red] = &[
                which prints a timeout. It is **not** cover for the endpoint-count red under the \
                same name",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -522,7 +533,7 @@ pub const KNOWN_RED: &[Red] = &[
         what: "0 of 5 on CI — while the dev host has it reproducing alone on `main` in the same \
                week, and `main`'s own CI went red on it once since. Read all three rows",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-08",
     },
     Red {
@@ -534,7 +545,7 @@ pub const KNOWN_RED: &[Red] = &[
                and nothing in `toyos_xhci` changed between the two runs. A defect that stopped \
                appearing under an unchanged driver is a defect whose trigger nobody has named",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/xhci-flap-wedges-under-kvm.md",
+        source: "issues/hardware/xhci-flap-wedges-under-kvm.md",
         measured: "2026-08-08",
     },
     Red {
@@ -546,7 +557,7 @@ pub const KNOWN_RED: &[Red] = &[
                because the margin is inside the *guest's* boot and running alone moves it by \
                milliseconds rather than by a verdict",
         evidence: "probe-rate run 31258202923, tree f8f73e1, five reps",
-        source: "specs/issues/hardware/xhci-slow-connect-has-a-1ms-margin.md",
+        source: "issues/hardware/xhci-slow-connect-has-a-1ms-margin.md",
         measured: "2026-08-08",
     },
     Red {
@@ -560,7 +571,7 @@ pub const KNOWN_RED: &[Red] = &[
                log-ring regression was caught at all — no other gate in the suite noticed 350 ms — \
                and its own message names the fix: widen `SLOW_CONNECT_NS`, not the gate",
         evidence: "run 31261669826, the first on a tree carrying the harness's re-run-alone work",
-        source: "specs/issues/hardware/xhci-slow-connect-has-a-1ms-margin.md",
+        source: "issues/hardware/xhci-slow-connect-has-a-1ms-margin.md",
         measured: "2026-08-08",
     },
     // ---------------------------------------------------------------------
@@ -577,7 +588,7 @@ pub const KNOWN_RED: &[Red] = &[
         what: "`timed out after 88s` alone, against 4–26 s on the dev host. Nothing here is \
                diagnosed",
         evidence: "run 31247206462, red again alone",
-        source: "specs/issues/hardware/four-runner-reds-unclassified.md",
+        source: "issues/hardware/four-runner-reds-unclassified.md",
         measured: "2026-08-08",
     },
     Red {
@@ -588,7 +599,7 @@ pub const KNOWN_RED: &[Red] = &[
         what: "`the ring arm: timed out`, and `timed out after 9s` alone. The one of that run's \
                four that is still standing",
         evidence: "run 31247206462, red again alone",
-        source: "specs/issues/hardware/four-runner-reds-unclassified.md",
+        source: "issues/hardware/four-runner-reds-unclassified.md",
         measured: "2026-08-08",
     },
     Red {
@@ -599,7 +610,7 @@ pub const KNOWN_RED: &[Red] = &[
         what: "red alone in 22 s, having taken 152 s in the phase. Not diagnosed, and 0 of 5 in \
                the rate probe five days later",
         evidence: "run 31247206462, red again alone",
-        source: "specs/issues/hardware/four-runner-reds-unclassified.md",
+        source: "issues/hardware/four-runner-reds-unclassified.md",
         measured: "2026-08-08",
     },
     Red {
@@ -611,7 +622,7 @@ pub const KNOWN_RED: &[Red] = &[
                Green on the dev host in seconds and green under TCG on the same runner image and \
                the same QEMU",
         evidence: "run 31247206462, red again alone",
-        source: "specs/issues/hardware/xhci-flap-wedges-under-kvm.md",
+        source: "issues/hardware/xhci-flap-wedges-under-kvm.md",
         measured: "2026-08-08",
     },
     Red {
@@ -622,7 +633,7 @@ pub const KNOWN_RED: &[Red] = &[
         what: "`timed out after 75s` alone — a staged transfer error on a HID endpoint. Green on \
                the dev host and under TCG on the same runner image",
         evidence: "run 31247206462, red again alone",
-        source: "specs/issues/hardware/xhci-flap-wedges-under-kvm.md",
+        source: "issues/hardware/xhci-flap-wedges-under-kvm.md",
         measured: "2026-08-08",
     },
     Red {
@@ -634,7 +645,7 @@ pub const KNOWN_RED: &[Red] = &[
         ),
         what: "`bound 0 pointer sources` alone, over 8 plug/unplug cycles under a live compositor",
         evidence: "run 31247206462, red again alone",
-        source: "specs/issues/hardware/xhci-flap-wedges-under-kvm.md",
+        source: "issues/hardware/xhci-flap-wedges-under-kvm.md",
         measured: "2026-08-08",
     },
     Red {
@@ -647,7 +658,7 @@ pub const KNOWN_RED: &[Red] = &[
                TCG on the same runner image and the same QEMU, and green on the dev host, because \
                KVM runs the guest ~50× further between the host's two QMP writes",
         evidence: "run 31246245541, `debian:sid`/QEMU 11.0.3/KVM, `--jobs 1`, alone",
-        source: "specs/issues/hardware/xhci-flap-wedges-under-kvm.md",
+        source: "issues/hardware/xhci-flap-wedges-under-kvm.md",
         measured: "2026-08-08",
     },
     // ---------------------------------------------------------------------
@@ -665,7 +676,7 @@ pub const KNOWN_RED: &[Red] = &[
                the compositor spawned at 0.347 s, the terminal at 0.349 s, and the terminal exiting \
                at 0.849 s one millisecond before the compositor maps its framebuffer",
         evidence: "probe-green run 31282019974, tree 98e7247, ten reps",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
+        source: "issues/kernel/desktop-window-child-freeze.md",
         measured: "2026-08-09",
     },
     Red {
@@ -677,7 +688,7 @@ pub const KNOWN_RED: &[Red] = &[
         ),
         what: "`compiler_builtins::int::specialized_div_rem::u128_div_rem+0x99`",
         evidence: "probe-green run 31282019974, tree 98e7247, ten reps",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-09",
     },
     Red {
@@ -690,7 +701,7 @@ pub const KNOWN_RED: &[Red] = &[
         ),
         what: "2 of 11 beats dropped a CPU from the mask",
         evidence: "probe-green run 31282019974, tree 98e7247, ten reps",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-09",
     },
     Red {
@@ -711,7 +722,7 @@ pub const KNOWN_RED: &[Red] = &[
                rather than chance — soundd prints a client's removal exactly while the kernel \
                prints that client's exit",
         evidence: "probe-green run 31282019974 rep 10, and run 31271983043 on `main`",
-        source: "specs/log-architecture-spec.md §4.4",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-09",
     },
     // ---------------------------------------------------------------------
@@ -725,7 +736,7 @@ pub const KNOWN_RED: &[Red] = &[
         standing: Standing::Stands,
         what: "0 of 10 against 2 of 10 in the arm before it",
         evidence: "probe-green fixed arm, run 31283095698, ten reps",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-09",
     },
     Red {
@@ -735,7 +746,7 @@ pub const KNOWN_RED: &[Red] = &[
         standing: Standing::Stands,
         what: "0 of 10 against 1 of 10 in the arm before it",
         evidence: "probe-green fixed arm, run 31283095698, ten reps",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-09",
     },
     Red {
@@ -747,12 +758,11 @@ pub const KNOWN_RED: &[Red] = &[
                green. It is the one name left between `main` and §10.4's three-consecutive-greens \
                trigger",
         evidence: "probe-green fixed arm, run 31283095698, ten reps",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
+        source: "issues/kernel/desktop-window-child-freeze.md",
         measured: "2026-08-09",
     },
     // ---------------------------------------------------------------------
-    // Single `ci` runs on `main`, `specs/assessments/ci-plan-assessment-2026-08.md`
-    // §10.9 and §10.10.
+    // Single `ci` runs on `main`, each red once and adjudicated on its own.
     // ---------------------------------------------------------------------
     Red {
         test: "dump_nmi_probe",
@@ -767,7 +777,7 @@ pub const KNOWN_RED: &[Red] = &[
                100 ms for the victim to reach its idle loop and on that runner it took 251 ms. \
                0 of 20 probe reps and 2 of 2 in one shard job",
         evidence: "run 31284962381, `main` at 1ed6f39",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-09",
     },
     Red {
@@ -779,7 +789,7 @@ pub const KNOWN_RED: &[Red] = &[
                into a boot `scan_ports` runs, true at 253 ms on the dev host and false at 407 ms \
                on that runner",
         evidence: "run 31286199802, `main` at 8d3f5b7",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.9",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-09",
     },
     Red {
@@ -788,9 +798,9 @@ pub const KNOWN_RED: &[Red] = &[
         finding: Finding::Seen,
         standing: Standing::Stands,
         what: "keystroke 14 of 30. Bisected on the dev host to `f96d52e`, a merge whose two parents \
-               are both green — see `specs/issues/diagnostics/screen-pager-keys-red-on-main.md`",
+               are both green — see `issues/diagnostics/screen-pager-keys-red-on-main.md`",
         evidence: "run 31287853270, `main` at 53d29d5",
-        source: "specs/assessments/ci-plan-assessment-2026-08.md §10.10",
+        source: "issues/diagnostics/screen-pager-keys-red-on-main.md",
         measured: "2026-08-09",
     },
     // ---------------------------------------------------------------------
@@ -811,7 +821,7 @@ pub const KNOWN_RED: &[Red] = &[
         evidence: "`main`'s fifteen most recent completed `ci` runs, 2026-08-09 to 2026-08-11: red \
                    in 31289459932 (a76a078) and 31331494794 (0e48d2e), read with \
                    `gh run view --log-failed`",
-        source: "specs/issues/hardware/xhci-hid-break-counts-any-endpoint-3.md",
+        source: "issues/hardware/xhci-hid-break-counts-any-endpoint-3.md",
         measured: "2026-08-11",
     },
     Red {
@@ -823,7 +833,7 @@ pub const KNOWN_RED: &[Red] = &[
                it` — the timeout shape the probe measured at 0 of 5, twice in one job, and \
                `ALONE: red again`. So that 0 of 5 is not cover for it either",
         evidence: "run 31422708833, `main` at 2572e4b, shard 10",
-        source: "specs/issues/hardware/eleven-names-red-on-ci.md",
+        source: "issues/hardware/eleven-names-red-on-ci.md",
         measured: "2026-08-10",
     },
     // ---------------------------------------------------------------------
@@ -845,7 +855,7 @@ pub const KNOWN_RED: &[Red] = &[
                the wide run's message regardless, because that line always carries the original text",
         evidence: "PR #22 (`wt/toyos-endow`), run 31424496450 attempt 1, job 93586744461 \
                    (\"guest (5)\"), sha 73d0761b",
-        source: "specs/issues/hardware/xhci-hid-break-counts-any-endpoint-3.md",
+        source: "issues/hardware/xhci-hid-break-counts-any-endpoint-3.md",
         measured: "2026-08-10",
     },
     Red {
@@ -859,7 +869,7 @@ pub const KNOWN_RED: &[Red] = &[
                shape. 9s alone rules out host contention for this instance",
         evidence: "PR #35 (`codex/debug-wait-census`), run 31601325987, job 94129283847 \
                    (\"guest (5)\"), sha d522424e",
-        source: "specs/issues/hardware/xhci-hid-break-counts-any-endpoint-3.md",
+        source: "issues/hardware/xhci-hid-break-counts-any-endpoint-3.md",
         measured: "2026-08-12",
     },
     Red {
@@ -872,41 +882,63 @@ pub const KNOWN_RED: &[Red] = &[
                so it failed once and passed once. That is a rate and not a classification`. The \
                name is 0 of 5 in the probe and declared closed in a write-up",
         evidence: "run 31396171916, `main` at 7af7c20, shard 2",
-        source: "specs/issues/hardware/metal-sim-pointer-churn-red-again-on-main.md",
+        source: "issues/hardware/metal-sim-pointer-churn-red-again-on-main.md",
         measured: "2026-08-10",
     },
     // ---------------------------------------------------------------------
     // Invariant P on KVM. The dev-host row below predicted this case and said
     // what it would mean: "if invariant P ever fires on a KVM shard, this file
-    // does not cover it". It has. The two rows are the same assert on two
-    // accelerators and they are not one measurement — the magnitudes differ by
-    // three orders and so do the call sites.
+    // does not cover it". It has, twice. The two rows are the same assert on
+    // two accelerators and they are not one measurement — magnitude separates
+    // them, not call site: `driver::idle_loop` fired under both accelerators,
+    // three orders of magnitude apart, so only the size of the overshoot says
+    // which one ran.
     // ---------------------------------------------------------------------
     Red {
         test: "sched_check_build",
         instrument: Instrument::Ci,
-        finding: Finding::fires(2, 91),
-        standing: Standing::Stands,
-        what: "`invariant P: a scheduler pass took 277260 ns, budget 200000 ns` on cpu1 in \
-               `driver::idle_loop`, and `200569 ns` on cpu0 in `timer_handler` -> `driver::pass` \
-               while `test_rs_sched_stress` pid=7 was in syscall 8 — the assert firing on native \
-               x86-64 under KVM, at 1.140 s and 1.449 s of guest uptime, on two different EPYC \
-               SKUs. `schedule_no_return: panicked inside a pass, cannot rejoin` halts every CPU \
-               1 ms later, which is the whole of the ~385 s of silence each run then reported as \
-               `STALLED:`. **The red is the panic and the stall is its shadow**: `run_test_paced` \
-               ends early on `KERNEL PANIC` only, which the CPU-exception path prints and a Rust \
-               `panic!` does not, so the wait ran its full ceiling on a machine halted since \
-               second two and the summary said the run `established nothing about this tree`",
-        evidence: "run 31936533470, job 95139261820 (a push to `main`, EPYC 9V74) and PR #95's \
-                   run 31946183485, job 95162423932 (sha 4ec5d01, EPYC 7763) — both \"guest (8)\", \
-                   2026-08-16, both with the panic in the capture. The denominator is a survey of \
-                   the 100 most recent `ci` runs (2026-08-15 16:57 to 2026-08-17 13:29 UTC): 91 in \
-                   which the shard carrying this name actually ran it, 9 excluded as non-samples \
-                   for a cancelled shard. A third STALL (run 31890991692, job 95027203184, \
-                   2026-08-15) is in neither number — it predates the window, and its `serial:` \
-                   was empty because `in_test` never became true, so its lines went to \
-                   `TestResult::before` and the caller drops that",
-        source: "specs/issues/kernel/the-check-build-guest-stopped-answering-on-kvm-twice.md",
+        finding: Finding::Seen,
+        standing: Standing::Retired(
+            "the assert is gone. Elapsed time across a pass is wall clock and a guest's wall \
+             clock advances while the hypervisor has its vCPU, so the quantity carried a term \
+             the kernel neither observes nor controls; `toyos-sched` records the distribution \
+             and `tests/common/passcost.rs` judges it. **What retires this row is the panic, \
+             which cannot happen again.** The replacement's first shape gated the 90th \
+             percentile at `MAX_PASS_NS` on the argument that a busy host moves the maximum \
+             and not the mass — an observed rate rather than a bound, and **measured false on \
+             2026-08-18**: host load moves every order statistic, median as much as tail. So \
+             the line is now the accelerator's own recorded sample, and for this instrument \
+             that sample is sixteen CI runs and 7 612 passes with **zero over 200 000 ns**, \
+             largest single pass 173 906 ns, 90th percentile 32 768 ns. The gate on this \
+             instrument is therefore *tighter* than the number this row's assert stood over, \
+             and a red under it is a fresh measurement rather than this one returning. A wider \
+             survey taken the day before this retirement, never landed as its own commit, found \
+             a second firing and a third sighting: run 31936533470, a push to `main`, `277260 \
+             ns` on cpu1 in `driver::idle_loop` rather than `timer_handler`, 2026-08-16 08:28 \
+             UTC — so the two KVM firings shared a call site with the TCG row below and only \
+             magnitude told them apart. Of the 100 most recent `ci` runs through 2026-08-17 \
+             13:29 UTC, 91 actually ran this shard and two fired, a rate of 2 of 91 that this \
+             retirement supersedes rather than inherits: the assert those two firings are of \
+             does not exist to fire a third time",
+        ),
+        what: "`invariant P: a scheduler pass took 200569 ns, budget 200000 ns` — the assert \
+               firing on native x86-64 under KVM, in `timer_handler` -> `driver::pass` -> \
+               `SchedPass::finish` while `test_rs_sched_stress` pid=7 was in syscall 8, at 1.449 s \
+               of guest uptime. `schedule_no_return: panicked inside a pass, cannot rejoin` halts \
+               every CPU 1 ms later, which is the whole of the 383 s of silence the run then \
+               reported as `STALLED:`. **The red is the panic and the stall is its shadow**: \
+               `run_test_paced` ends early on `KERNEL PANIC` only, which the CPU-exception path \
+               prints and a Rust `panic!` does not, so the wait ran its full 382 s ceiling on a \
+               machine that had been halted since second two and the summary said the run \
+               `established nothing about this tree`",
+        evidence: "PR #95 (`wt/toyos-harness2`), run 31946183485, job 95162423932 (\"guest (8)\"), \
+                   sha 4ec5d01, on an Azure 4-core EPYC 7763 with `/dev/kvm` — so KVM nested in a \
+                   hypervisor guest. One firing, not a rate: the earlier STALL under this name \
+                   (run 31890991692, job 95027203184, guest 8, 2026-08-15) printed an empty \
+                   `serial:` because `in_test` never became true, so its lines went to \
+                   `TestResult::before` and the caller drops that — its cause is unrecorded and is \
+                   not counted here",
+        source: "issues/kernel/the-check-build-guest-stopped-answering-on-kvm-twice.md",
         measured: "2026-08-16",
     },
     // ---------------------------------------------------------------------
@@ -918,7 +950,13 @@ pub const KNOWN_RED: &[Red] = &[
         test: "sched_check_build",
         instrument: Instrument::DevHostAlone,
         finding: Finding::fires(2, 2),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the panic is gone and the machine survives, so what this row measured cannot \
+             happen. The red under this name on this instrument is now the harness's \
+             pass-cost gate refusing a distribution, which is the row below — a different \
+             measurement of the same emulator, and the guest runs `sched_stress` to \
+             completion under it",
+        ),
         what: "`invariant P: a scheduler pass took 1684167 ns, budget 200000 ns`, panicking in \
                `driver::idle_loop` before userland — then 1749243 ns on cpu1 in the isolated \
                re-run. The dev host emulates x86-64 instruction by instruction while the guest \
@@ -934,8 +972,61 @@ pub const KNOWN_RED: &[Red] = &[
                    `Instrument::Ci` row above. The TCG explanation of *this* magnitude stands — \
                    nothing on KVM has come within five times it — but the implied claim about the \
                    other accelerator does not",
-        source: "specs/issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
+        source: "issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
         measured: "2026-08-15",
+    },
+    Red {
+        test: "sched_check_build",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(6, 10),
+        standing: Standing::Retired(
+            "the dev host takes no verdict on pass cost any more, so this red cannot be \
+             produced. What retired it is the experiment this row's own last paragraph asked \
+             for: 2026-08-18, six repetitions an arm, quiet and loaded interleaved in one \
+             session, twelve CPU-runs each. **0 of 12 quiet CPU-runs over the budget at the \
+             90th percentile against 9 of 12 loaded; 6 of 6 runs green against 6 of 6 red**, \
+             with the arms separated by boot width 1.74x-2.34x against 2.66x-2.78x and \
+             nothing else. The whole distribution translates one power-of-two bucket under \
+             host load — median 65 536 -> 131 072 ns, p90 131 072 -> 262 144 ns — and 200 000 \
+             sits between the two, which is the entirety of why the verdict flipped. So \
+             `tests/common/passcost.rs` records that sample and, because it spans four buckets \
+             on one unchanged tree, has cross-arch TCG report its distribution and judge no \
+             magnitude at all. `sched_check_build` still gates the clean boot, the three \
+             check-build asserts and `sched_stress` on this instrument; only the cost half is \
+             now CI's alone",
+        ),
+        what: "`this distribution has mass over the budget: nine passes in ten must be provably \
+               under 200000 ns and it cannot show that` — the harness's pass-cost gate, which \
+               replaced the panic, refusing a distribution the *host* inflated. The guest is \
+               fine either way: `sched_stress` runs to completion and prints `all sched_stress \
+               tests passed`. **Contention moves this guest's median by a factor of eight and \
+               the gate follows it**: with the machine to itself, `cpu0: 168 passes, p50 < \
+               16384 ns, p90 < 131072 ns, max 1504209 ns, 7 over the 200000 ns budget` and it \
+               passes; in the same suite's 12-wide phase, `cpu0: 134 passes, p50 < 131072 ns, \
+               p90 < 262144 ns, max 1745977 ns, 14 over` and it reds. **Note the maxima on the \
+               green side**: 1974235 ns and 2543303 ns in the serial tail of the run that ended \
+               263 of 263 green — nine and twelve times the budget, refused by nothing, where \
+               the assert this replaced would have halted the machine on any one of them. \
+               Every red measured carried `p50 < 131072 ns` against `p50 < 16384` or `< 32768 \
+               ns` on every green — the median moving with the 90th percentile, which is the \
+               observation the controlled experiment then confirmed and which is why no line \
+               over this distribution survives on this instrument",
+        evidence: "`cargo test` on `wt/toyos-invariantp`, 2026-08-17, ten CPU-runs over three \
+                   sessions. Every one of the six reds was taken beside other guests: four \
+                   under another agent's suite on the shared host (`fastest boot 2330 ms \
+                   against the reference 1320 ms`, 1.77x) and two in a 12-wide parallel phase. \
+                   Every one of the four greens had the machine to itself — an isolated re-run \
+                   at 1.02x and the serial tail at 1.05x. `sched_check_build` is `Sched::Serial` \
+                   since the same day, on this measurement, which removes the second half of \
+                   this row's own cause. Not evidence about KVM in either direction — the dev \
+                   host boots no KVM guest. **This row is also the counter-evidence to the \
+                   gate's own warrant**: 14 of 134 and 19 of 140 passes over budget is 10–13 %, \
+                   which is correlated inflation with mass in it rather than the handful of \
+                   samples the gate's argument assumed a busy machine produces. The controlled \
+                   experiment that turned that counter-evidence into the retirement above is in \
+                   `tests/common/passcost.rs`",
+        source: "issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
+        measured: "2026-08-17",
     },
     Red {
         test: "screen_pager_keys",
@@ -947,7 +1038,7 @@ pub const KNOWN_RED: &[Red] = &[
                1.05× the reference boot and the failure was byte-identical to the ones taken at \
                load 11–16. Bisected to `f96d52e`, a merge whose two parents are both green",
         evidence: "`main` at b36cf64, three runs alone in one session; seven boots across the bisect",
-        source: "specs/issues/diagnostics/screen-pager-keys-red-on-main.md",
+        source: "issues/diagnostics/screen-pager-keys-red-on-main.md",
         measured: "2026-08-08",
     },
     Red {
@@ -959,7 +1050,7 @@ pub const KNOWN_RED: &[Red] = &[
                #88's exemption is right not to cover, so any landing whose gate is `cargo test` is \
                red on `main` for this and an agent will read it as theirs",
         evidence: "`main` at 6d11938, alone",
-        source: "specs/issues/audio/hda-tone-red-beyond-its-exemption.md",
+        source: "issues/audio/hda-tone-red-beyond-its-exemption.md",
         measured: "2026-08-07",
     },
     Red {
@@ -979,7 +1070,7 @@ pub const KNOWN_RED: &[Red] = &[
                it is not the audio path and not load in any way a re-run answers; it is which two \
                writers happen to collide",
         evidence: "landing-1786130703-71774.log, a documentation-only branch",
-        source: "specs/log-architecture-spec.md §4.4",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-07",
     },
     Red {
@@ -992,7 +1083,7 @@ pub const KNOWN_RED: &[Red] = &[
         ),
         what: "green 3 of 3 alone on a quiet host, against the splice red in the same session",
         evidence: "the same session as the splice above",
-        source: "specs/log-architecture-spec.md §4.4",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-07",
     },
     Red {
@@ -1006,7 +1097,7 @@ pub const KNOWN_RED: &[Red] = &[
                session\" and its own listing is four reds, one green and \"twice more GREEN\", \
                which is seven. smp=8 failed the same rule twice on 2026-08-07",
         evidence: "2026-08-04 session, 5408cfb with the bundle stashed and bundle D alternating",
-        source: "specs/issues/audio/audio-tone-load-fast-tier-intermittent.md",
+        source: "issues/audio/audio-tone-load-fast-tier-intermittent.md",
         measured: "2026-08-04",
     },
     Red {
@@ -1018,7 +1109,7 @@ pub const KNOWN_RED: &[Red] = &[
                where every red carried 76–297 ms — soundd not being scheduled rather than a cost \
                per period",
         evidence: "task #58's A/B session, `main`'s tip against a branch, one host",
-        source: "specs/issues/audio/audio-tone-load-fast-tier-intermittent.md",
+        source: "issues/audio/audio-tone-load-fast-tier-intermittent.md",
         measured: "2026-08-07",
     },
     // The contention class. Every one of these is a verdict that expires on the
@@ -1033,7 +1124,7 @@ pub const KNOWN_RED: &[Red] = &[
                the summing fix installed, so that mechanism is not what this is. A/B in one session \
                put `main`'s kernel red with the identical line and the branch green",
         evidence: "two full suites in one worktree while a second held six of the twelve guest slots",
-        source: "specs/issues/build/parallel-tests-red-under-other-suites.md",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-07",
     },
     Red {
@@ -1045,7 +1136,7 @@ pub const KNOWN_RED: &[Red] = &[
                figure moved 277→619 ms across three runs of one boot with no code change, and it is \
                already `Sched::Serial`, so intra-suite width is not what reaches it",
         evidence: "a landing gate, then alone minutes later on both trees",
-        source: "specs/issues/build/parallel-tests-red-under-other-suites.md",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-04",
     },
     Red {
@@ -1056,7 +1147,7 @@ pub const KNOWN_RED: &[Red] = &[
         what: "`nothing typed at the terminal window reached a shell`, `ALONE … GREEN`, on a branch \
                that touches neither the compositor nor the terminal",
         evidence: "one full suite on a host carrying three to four concurrent suites",
-        source: "specs/issues/build/parallel-tests-red-under-other-suites.md",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-05",
     },
     Red {
@@ -1068,7 +1159,7 @@ pub const KNOWN_RED: &[Red] = &[
                the same tree moments later, on a branch that touches neither netd nor the network \
                stack",
         evidence: "a landing gate, then alone on the same tree",
-        source: "specs/issues/build/parallel-tests-red-under-other-suites.md",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-05",
     },
     Red {
@@ -1081,7 +1172,7 @@ pub const KNOWN_RED: &[Red] = &[
                tail and the harness never re-ran it alone; run alone moments later it passes in \
                23 s. Nothing should widen its millisecond",
         evidence: "one full suite; the run's `[host-slots]` lines name all three worktrees",
-        source: "specs/issues/build/parallel-tests-red-under-other-suites.md",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-07",
     },
     Red {
@@ -1093,14 +1184,43 @@ pub const KNOWN_RED: &[Red] = &[
                verdict is the dump's content, but *reaching* the dump crosses a compositor, a \
                terminal and a shell, and that step is a wall-clock margin",
         evidence: "one full suite under load, and a second landing gate in the eight-landing regime",
-        source: "specs/issues/build/parallel-tests-red-under-other-suites.md",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-07",
     },
+    // ---------------------------------------------------------------------
+    // **`fd_lifetime` is `handle_lifetime` since 2026-08-20.** The rename is
+    // the fd/inbox wave's
+    // (`issues/design-debt/fd-is-libc-jargon-and-the-tree-still-speaks-it.md`).
+    // Every reading in the three rows below was taken before it, so the harness
+    // lines they quote and the command they name printed and spelled
+    // `fd_lifetime` at the time; all three have been re-spelled to the live
+    // name, because a row naming a test that no longer exists matches nothing,
+    // adjudicates nothing, and hands whoever re-runs it a command that fails.
+    // ---------------------------------------------------------------------
     Red {
-        test: "fd_lifetime",
+        test: "handle_lifetime",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(4, 7),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the reading was early, not polluted — 2026-08-19, and both halves of this row's \
+             argument are withdrawn. CI run 32237424649 put it red on `Instrument::Ci`, where \
+             there is one guest per machine, and the harness's `ALONE` re-run — a fresh boot \
+             carrying that binary and nothing else — was red again on the same failure. So \
+             `ALONE … GREEN every time` is false and the neighbours are not what this is. \
+             Twenty kill rounds alone in the guest at `8e9f851` say what it is: in ten of them \
+             the deficit after `wait` decays **two megabytes at a time** across eight \
+             back-to-back `SYS_SYSINFO` calls — `[12, 10, 10, 10, 8, 6, 4, 2]` MiB — and free \
+             memory returns to its baseline every single round, drift zero. Nothing leaks; the \
+             test reads before the release has run. `object::drain_zero_handles` clears \
+             `ZERO_PENDING` before it runs a hook, so a batch another CPU took is \
+             indistinguishable from an empty queue and the killing syscall returns with its \
+             objects unreleased — caught in a kernel trace as eight `RingRef` frees landing \
+             after `kill_process` returned, and as a second CPU taking a batch mid-kill. Both \
+             binaries now settle before reading (`issues/build/free-memory-verdicts-share-a-boot.md`), \
+             and the kernel half is `issues/kernel/deferred-release-outlives-its-syscall.md`. \
+             **`Sched::Serial` would have retired nothing**, which is why that proposal is \
+             recorded as ruled out rather than left standing",
+        ),
         what: "`a killed process kept 16777216 bytes of its io_urings`, `ALONE … GREEN` every \
                time. `kill_releases_ring` asks `SYS_SYSINFO` for the **machine's** free memory \
                either side of a kill, and it shares the `tests/testcases` boot with every other \
@@ -1114,9 +1234,54 @@ pub const KNOWN_RED: &[Red] = &[
                    boot invokes. Two earlier sevens on the same two trees gave 1 of 7 and 2 of 7, \
                    so the rate this row carries is the widest of four readings and not the only \
                    one",
-        source: "specs/issues/build/free-memory-verdicts-share-a-boot.md",
+        source: "issues/build/free-memory-verdicts-share-a-boot.md",
         measured: "2026-08-15",
     },
+    // ---------------------------------------------------------------------
+    // `wt/toyos-fdleak`, 2026-08-19, at `8e9f851`. The run that broke the row
+    // above it out of its explanation, and the two dev-host readings taken
+    // against it. Kept as three rows because they are three measurements on
+    // three instruments and no one of them says what the others do.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "handle_lifetime",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Retired(
+            "the settle landed: both free-memory verdicts read once the machine has stopped \
+             giving memory back — samples 10 ms apart until two agree, bounded at a hundred, \
+             the last reading handed back either way. A liveness bound and not a margin, so a \
+             kernel that frees nothing is quiescent on the first pair and reds at once",
+        ),
+        what: "`a killed process kept 16777216 bytes of its io_urings` — the **whole** 16 MiB \
+               the holder allocated, against a 6 MiB threshold, so the release had made no \
+               progress at all when the reading was taken. `ALONE handle_lifetime: red again, the \
+               same failure both times`, which on a shared-block name is a fresh boot carrying \
+               that binary and nothing else",
+        evidence: "CI run 32237424649 (PR #126, job `guest (1)`); `main` red at `8e9f851` on \
+                   `ci` and on `gate A, thorough` the same day",
+        source: "issues/build/free-memory-verdicts-share-a-boot.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "handle_lifetime",
+        instrument: Instrument::DevHostAlone,
+        finding: Finding::quiet(20),
+        standing: Standing::Stands,
+        what: "twenty consecutive filtered runs of the unmodified binary, all green — which is \
+               why every dev-host sighting of this name had said `ALONE … GREEN` and why the \
+               defect was read as its neighbours' page churn. The dev host is two CPUs under \
+               TCG; CI is four under KVM, and the race widens with the CPU count",
+        evidence: "20 × `cargo test --test toyos-build -- handle_lifetime` on one quiet dev host, \
+                   `wt/toyos-fdleak` at `8e9f851`",
+        source: "issues/build/free-memory-verdicts-share-a-boot.md",
+        measured: "2026-08-19",
+    },
+    // `shm_release_reclaims` gets no row: it has the same instrument with the
+    // same hole and it took the same settle, but nothing here measured it red,
+    // and a `Seen` written from an argument rather than a run is exactly the
+    // overstatement this index refuses. `issues/build/free-memory-verdicts-share-a-boot.md`
+    // carries it.
     Red {
         test: "screen_console_scroll",
         instrument: Instrument::DevHostLoaded,
@@ -1127,7 +1292,7 @@ pub const KNOWN_RED: &[Red] = &[
                killed ran 778.9 s with four other `--land` processes on the host, on a branch whose \
                whole delta was two documentation lines",
         evidence: "a landing gate on a documentation-only branch",
-        source: "specs/issues/build/parallel-tests-red-under-other-suites.md",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-07",
     },
     Red {
@@ -1141,7 +1306,7 @@ pub const KNOWN_RED: &[Red] = &[
                the staged break — a wall-clock margin on the recovery path, not a recovery that \
                failed",
         evidence: "a landing gate on a branch whose delta was one documentation commit",
-        source: "specs/issues/build/parallel-tests-red-under-other-suites.md",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-07",
     },
     Red {
@@ -1154,7 +1319,7 @@ pub const KNOWN_RED: &[Red] = &[
                processes queued on the integration lock at once. Guest slots bound guests, and a \
                landing storm is not made of guests",
         evidence: "the eight-landing regime, 2026-08-07",
-        source: "specs/issues/build/parallel-tests-red-under-other-suites.md",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-07",
     },
     Red {
@@ -1169,7 +1334,7 @@ pub const KNOWN_RED: &[Red] = &[
         what: "`ALONE: GREEN` twice and `ALONE: red again` once across four full suites in one \
                session",
         evidence: "four full suites on `wt/toyos-tlbfix`, 2026-08-07",
-        source: "specs/issues/build/desktop-window-child-holds-a-lane.md",
+        source: "issues/build/desktop-window-child-holds-a-lane.md",
         measured: "2026-08-07",
     },
     Red {
@@ -1183,7 +1348,7 @@ pub const KNOWN_RED: &[Red] = &[
                never ran` and passed in 6 s",
         evidence: "PR #33 run 31472702284, job 93736011023, merge ref \
                    1d19104d1b832da1aaad43906e0673cb87db93ba",
-        source: "specs/issues/diagnostics/blocked-dump-cannot-fire-on-a-total-freeze.md",
+        source: "issues/diagnostics/blocked-dump-cannot-fire-on-a-total-freeze.md",
         measured: "2026-08-11",
     },
     Red {
@@ -1196,7 +1361,7 @@ pub const KNOWN_RED: &[Red] = &[
                the retired compositor-overlay red under the same test name",
         evidence: "one 12-wide full suite on 2026-08-09 while a second worktree's suite was live, \
                    then the harness's isolated re-run",
-        source: "specs/issues/diagnostics/blocked-dump-cannot-fire-on-a-total-freeze.md",
+        source: "issues/diagnostics/blocked-dump-cannot-fire-on-a-total-freeze.md",
         measured: "2026-08-09",
     },
     Red {
@@ -1214,7 +1379,7 @@ pub const KNOWN_RED: &[Red] = &[
                ~250 s of every run and whichever desktop the duration profile ranked next went in \
                beside it",
         evidence: "seven full runs in one worktree, one session",
-        source: "specs/issues/build/desktop-window-child-holds-a-lane.md",
+        source: "issues/build/desktop-window-child-holds-a-lane.md",
         measured: "2026-08-06",
     },
     Red {
@@ -1227,7 +1392,7 @@ pub const KNOWN_RED: &[Red] = &[
                alone, with its own verdict line rather than the typing one, so the message is not \
                the tell and the pair of durations is",
         evidence: "seven full runs in one worktree, one session",
-        source: "specs/issues/build/desktop-window-child-holds-a-lane.md",
+        source: "issues/build/desktop-window-child-holds-a-lane.md",
         measured: "2026-08-06",
     },
     Red {
@@ -1245,7 +1410,7 @@ pub const KNOWN_RED: &[Red] = &[
         what: "hit 10/10 across four invocations in the 12-wide parallel phase, with the harness's \
                re-run-alone pass reporting GREEN each time",
         evidence: "four invocations by an agent landing unrelated documentation",
-        source: "specs/issues/kernel/desktop-window-child-freeze.md",
+        source: "issues/kernel/desktop-window-child-freeze.md",
         measured: "2026-08-06",
     },
     Red {
@@ -1263,7 +1428,7 @@ pub const KNOWN_RED: &[Red] = &[
                stalled five seconds on `tlb: cpu N has not flushed for generation …`",
         evidence: "two `--land` gates on `wt/toyos-boot` and five A/B runs against `main` at \
                    6d11938, one session",
-        source: "specs/issues/audio/wide-phase-reds-under-load.md",
+        source: "issues/audio/wide-phase-reds-under-load.md",
         measured: "2026-08-07",
     },
     Red {
@@ -1274,7 +1439,7 @@ pub const KNOWN_RED: &[Red] = &[
         what: "FAIL 10 s in the wide phase, PASS 4 s alone on the branch and 5 s alone on `main`, \
                with the same two `tlb:` lines in the capture",
         evidence: "two `--land` gates on `wt/toyos-boot`, one session",
-        source: "specs/issues/audio/wide-phase-reds-under-load.md",
+        source: "issues/audio/wide-phase-reds-under-load.md",
         measured: "2026-08-07",
     },
     // ---------------------------------------------------------------------
@@ -1294,7 +1459,24 @@ pub const KNOWN_RED: &[Red] = &[
         test: "i8042_undecoded_bytes",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(3, 14),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the counters are one word, 2026-08-17 — and this retirement is a measurement where \
+             the one it replaces was an argument. `kernel/src/drivers/i8042/tally.rs` is a single \
+             `u64` the ISR writes **once, after the burst**, low half the interrupts that put a \
+             byte in the ring and high half those that found none, and `Counts` can only be built \
+             by one load: there is no subtraction left to be wrong and no instant at which the \
+             halves disagree. Moving that write to the end also ends the producer this row's own \
+             line actually had — `IRQS` moved on the way *in*, so a reader between the pin and the \
+             first `push_isr` held a count of arrived bytes with no byte anywhere — and `RX_BYTES` \
+             is now counted in `pop` rather than after the drain, so a byte in mid-decode is on \
+             one side of the report's `has_bytes` guard rather than neither. Between them `N \
+             interrupts and 0 bytes, nothing decoded` is unprintable. **Measured in both \
+             directions**: `kernel-loom/tests/i8042_tally.rs` reds with the two counters put back \
+             (`Counts { carried: 1, empty: 0 }` for an interrupt that carried nothing) and passes \
+             with the word, and a third model asserts the old shape really is read torn so the \
+             file cannot pass vacuously. **Nine full `cargo test` suites, 9 green.** Not cover for \
+             the CI row under this name, which is a different producer and still stands",
+        ),
         what: "`the line names no byte: [kernel 0.418 cpu1] i8042: 1 interrupts and 0 bytes, \
                nothing decoded — first seen at 418ms`. The test takes the *first* `nothing \
                decoded` line in the capture and assumes it is the one its injection produced, and \
@@ -1309,16 +1491,28 @@ pub const KNOWN_RED: &[Red] = &[
                only after draining and finding nothing (`:693`), with the port-drain loop between \
                them, while `report_health` computes `carried = IRQS - EMPTY_IRQS` (`:390`) and \
                prints whenever `carried > 0`. A reader landing inside that window sees \
-               `carried = 1` for an interrupt that carried nothing, and prints this row's line \
-               exactly. The window is the bring-up polling init this row always named. Observed \
+               `carried = 1` for an interrupt that carried nothing. Observed \
                again 2 of 6 full suites on 2026-08-17 (`1 interrupts and 0 bytes … first seen at \
                449ms`, PR #106's author, on a tree containing the fix). Whether the test half — \
                anchoring on `===I8042_READY===` — holds is a separate question and is not decided \
-               here",
+               here. \
+               \n\n**The withdrawal above went on to say the torn read `prints this row's line \
+               exactly`, and that clause was wrong** (corrected 2026-08-17, PR #114). The torn \
+               read is real and is fixed, but it is not what produced this line, and the boot \
+               order says so: the reporting CPU is `cpu1`, an AP, and `i8042::init` runs on the \
+               BSP *before* `smp::boot_aps` — so at the bring-up interrupt this row always named \
+               there is no second CPU in existence to land inside the ISR's window. What did \
+               produce it is a different window in the same handler: `IRQS` was incremented on \
+               **entry**, ahead of the first `push_isr`, so a reader between the pin asserting and \
+               the first byte reaching the ring held a count of arrived bytes with no byte \
+               anywhere — `carried = 1`, `RX_BYTES = 0`, `has_bytes()` false, which is this line. \
+               Both windows close the same way and did, in PR #111. **The withdrawal itself \
+               stands**: retiring on reasoning alone was wrong whichever mechanism the reasoning \
+               named, and that is the half worth keeping",
         evidence: "fourteen full `cargo test` suites in one session on `wt/toyos-logd`: 2 of the 9 \
                    with the window bounded and 1 of the 5 without; `main` (4d8c2e9) 0 of 7 and \
                    this branch 0 of 5 before the byte ring went, both recorded in the source below",
-        source: "specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md",
+        source: "issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md",
         measured: "2026-08-15",
     },
     Red {
@@ -1361,7 +1555,14 @@ pub const KNOWN_RED: &[Red] = &[
         test: "i8042_undecoded_bytes",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::fires(6, 10),
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the same one word as the row above, 2026-08-17, and this rate is the one the nine \
+             green suites were run against: back to back with no gap, on a host another \
+             worktree's suite was taking guest slots from, and **two of the nine collapsed \
+             machine-wide** — 160 and 172 reds on `Broken pipe` and `QEMU disconnected` — with \
+             this name passing inside both. That is the load this row says the rate tracks, at \
+             more of it than the row was measured under, with nothing to track",
+        ),
         what: "the same line, and **the rate tracks host load** — 6 of 10 with the suites run back \
                to back and the load average never below 6.4, against the 3 of 14 above with the \
                host allowed to settle between them, on one tree in one session. The harness's \
@@ -1369,11 +1570,15 @@ pub const KNOWN_RED: &[Red] = &[
                exactly that. A bring-up race whose window is the driver's own polling init is what \
                a rate that moves with the host looks like; a defect in what this branch changed is \
                not. **Retired with the row above on 2026-08-16 and withdrawn with it on \
-               2026-08-17** — the torn read that row records is what this rate is a rate of, and a \
-               rate cannot be retired by a fix that does not reach its cause",
+               2026-08-17** — a rate cannot be retired by a fix that does not reach its cause. \
+               The withdrawal named the torn read as that cause and **that attribution was wrong** \
+               (corrected 2026-08-17, PR #114): this is a rate of the entry-time increment, not of \
+               the subtraction, for the reason the row above sets out — no AP exists to read \
+               anything at the bring-up interrupt. The withdrawal was still right to be made, \
+               which is the durable half of it",
         evidence: "ten consecutive full `cargo test` suites on `wt/toyos-logd`'s tip, loads \
                    6.4-9.7, immediately after the fourteen above",
-        source: "specs/issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md",
+        source: "issues/kernel/an-i8042-interrupt-arrives-with-no-byte-during-init.md",
         measured: "2026-08-15",
     },
     Red {
@@ -1387,7 +1592,7 @@ pub const KNOWN_RED: &[Red] = &[
                panic, so its own subject is untouched and the red names the workload. \
                `ALONE: GREEN`",
         evidence: "the same ten consecutive suites as the row above, loads 6.4-9.7",
-        source: "specs/issues/build/sshd-panics-when-netd-exits-before-it-binds.md",
+        source: "issues/build/sshd-panics-when-netd-exits-before-it-binds.md",
         measured: "2026-08-15",
     },
     // ---------------------------------------------------------------------
@@ -1411,7 +1616,7 @@ pub const KNOWN_RED: &[Red] = &[
                    `[host-slots]` naming `toyos-capwin`'s suite on the same host; the run's own \
                    width line was `fastest boot 1380 ms against the reference 1320 ms`, 1.05x, so \
                    this is not the slow-phase shape",
-        source: "specs/issues/build/qemu-exits-clean-before-ready.md",
+        source: "issues/build/qemu-exits-clean-before-ready.md",
         measured: "2026-08-15",
     },
     Red {
@@ -1424,7 +1629,7 @@ pub const KNOWN_RED: &[Red] = &[
         evidence: "the same full `cargo test` on `wt/toyos-ciwall`; the same day the signature also \
                    took `log_backing_read_error` on `wt/toyos-logd56` and, through the screendump \
                    wait rather than the ready marker, `screen_console_shell` on `wt/toyos-capwin`",
-        source: "specs/issues/build/qemu-exits-clean-before-ready.md",
+        source: "issues/build/qemu-exits-clean-before-ready.md",
         measured: "2026-08-15",
     },
     // ---------------------------------------------------------------------
@@ -1443,8 +1648,12 @@ pub const KNOWN_RED: &[Red] = &[
             "the string is the whole defect and it is now declared once: \
              `common::volumes::LOG_ON_CONSOLE_AND_FILE` is what the assertion reads, beside \
              `NO_LOG_ALERT`, which its Fast-tier sibling `screen_log_absent` already read that \
-             way, and its doc names `report_log_destination` as the writer. \
-             `specs/testing-strategy.md` §1.3 is the rule the copy broke (2026-08-16)",
+             way, and its doc names `report_log_destination` as the writer. The rule the copy \
+             broke: a test asserting on a kernel or daemon log line reads that line from one \
+             named constant — the writer's own where the crate is reachable, otherwise a single \
+             declaration in `tests/common/` that cites the writer — and never a literal copied \
+             at the assertion, because a copy has nothing holding it to the sentence it copied \
+             and a reworded line then reds a gate that is measuring nothing (2026-08-16)",
         ),
         what: "`\"log: this boot is on the console and in\" is not on screen five seconds after the \
                boot finished`, and `red again` alone in both runs. The mode is not what is broken: \
@@ -1471,8 +1680,66 @@ pub const KNOWN_RED: &[Red] = &[
         evidence: "run 31900050723, job 95049280131 (`guest (3)`), `wt/toyos-ciwall`; green in the \
                    sibling dispatch 31900045901 minutes earlier on the same names and the same \
                    image",
-        source: "specs/issues/build/sshd-panics-when-netd-exits-before-it-binds.md",
+        source: "issues/build/sshd-panics-when-netd-exits-before-it-binds.md",
         measured: "2026-08-15",
+    },
+    Red {
+        test: "boot_partition_identity",
+        instrument: Instrument::Ci,
+        finding: Finding::fires(1, 4),
+        standing: Standing::Stands,
+        what: "**the same signature, and the producer is not established** — `sshd: cannot bind \
+               0.0.0.0:22: netd error` at `sshd/src/main.rs:359:23`, the identical bytes to the \
+               row above. That is as far as the message goes and this row goes no further: the \
+               write-up's own finding is that the std fork flattens every `io::Error` kind to \
+               the string `netd error`, so four candidate paths print this line and no capture \
+               of it can say which one ran. **What matches beyond the message is the timing \
+               shape**, which is the part worth recording: `spawn: /bin/sshd pid=6` at 0.559 s \
+               and `exit: netd pid=5 code=0` at 0.566 s, so the bind went into a teardown \
+               already in progress — the same direction as the earlier CI capture, where the \
+               gap was 23 ms, and the opposite of the clean-exit arm in the same write-up, \
+               where sshd started after netd was gone. `ALONE: GREEN, and it was alone both \
+               times — nothing the harness controls differed, so it failed once and passed \
+               once. That is a rate and not a classification`. Shard 1's other 173 names passed",
+        evidence: "run 32044008591, job 95428160739 (`guest (1)`), PR #116 on \
+                   `wt/toyos-invariantp` — a diff of documentation and `src/redlist.rs` strings \
+                   with no code in it at all, which is what says the race is not the branch's. \
+                   The denominator is this branch's four CI runs that reached a verdict — \
+                   32043101865, 32044008591, 32044756253 and 32047352064 — of which only the \
+                   second was red under this name; a fifth (32044676027) was cancelled and says \
+                   nothing",
+        source: "issues/build/sshd-panics-when-netd-exits-before-it-binds.md",
+        measured: "2026-08-17",
+    },
+    Red {
+        test: "handle_kill_policy",
+        instrument: Instrument::Ci,
+        finding: Finding::fires(1, 4),
+        standing: Standing::Stands,
+        what: "`16 more killed processes left more live objects behind: [(\"Process\", 6, 7)]` — \
+               `the_kills_release_what_they_held`'s machine-wide live-object census, one \
+               `Process` higher on the second sample than the first. `ALONE: GREEN, and it was \
+               alone both times — nothing the harness controls differed, so it failed once and \
+               passed once. That is a rate and not a classification`; shard 2's other twelve \
+               names passed. **The first CI sighting of a signature recorded so far only on the \
+               dev host**, where the write-up added it the same day at 1 of 6 and recorded it \
+               green on all twelve KVM shards of that tree. That bears on its explanation \
+               rather than its severity: the dev-host bullet leans partly on other *suites* \
+               sharing the machine, and a CI shard is one guest per machine with `--jobs 1`, so \
+               what survives here is the other half of it — a machine-wide census taken on a \
+               shared boot, perturbed by a co-resident test's reap that had not landed yet. \
+               **Consistent with that mechanism, not established as it**: nothing in this \
+               capture identifies which process the extra `Process` object belonged to",
+        evidence: "run 32047352064, job 95438242676 (`guest (2)`), `wt/toyos-invariantp` at its \
+                   merge of `origin/main`, so the tree carries main's own commits as well as \
+                   this branch's. **Not this branch's code, and that is checkable rather than \
+                   asserted**: the only kernel code this branch adds is behind `sched-check` \
+                   (forwarding to `toyos-sched/check`), `handle_kill_policy` boots no such \
+                   kernel, and `src/build.rs`'s artifact gate measures 0 of 3 check-build \
+                   literals in the shipping image on every build. Same denominator as the row \
+                   above: this branch's four CI runs that reached a verdict, red in one",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-17",
     },
     Red {
         test: "usb_boot_stick_pulled",
@@ -1488,7 +1755,7 @@ pub const KNOWN_RED: &[Red] = &[
                times — a rate and not a classification`",
         evidence: "run 31900050723, job 95049280131 (`guest (3)`), the serial phase; green in the \
                    sibling dispatch 31900045901 on the byte-identical kernel",
-        source: "specs/issues/kernel/io-uring-enter-trips-the-one-queue-invariant.md",
+        source: "issues/kernel/io-uring-enter-trips-the-one-queue-invariant.md",
         measured: "2026-08-15",
     },
     // ---------------------------------------------------------------------
@@ -1557,8 +1824,434 @@ pub const KNOWN_RED: &[Red] = &[
         evidence: "PR #94 run 31944633004, job 95158684534 (`guest (2)`); the isolated re-run in \
                    the same job reported the whole sequence, `2 interrupts and 6 bytes … no event \
                    from [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5]`",
-        source: "specs/issues/kernel/the-i8042-mute-verdict-cannot-revise-a-line-it-said-too-early.md",
+        source: "issues/kernel/the-i8042-mute-verdict-cannot-revise-a-line-it-said-too-early.md",
         measured: "2026-08-16",
+    },
+    Red {
+        test: "screen_console_shell",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`no \\`i8042:\\` line above the prompt: \\`/boot/toyos/kernel.log\\` never reached the \
+               scrollback` — **and the panel it printed disproves that sentence**: every line on \
+               it is stamped `0.000` and comes from the first screenful of the boot, so the seed \
+               reached the console and the view was at its *head*. The assertion wants the end of \
+               the seed and `screendump_while` stops at the first frame carrying the prompt, so \
+               nothing orders the seed's paint against it. `ALONE: GREEN, and it was alone both \
+               times — a rate and not a classification`. **Not about the diff it was found on**, \
+               which is the i8042 interrupt tally: that change writes no boot line and removes \
+               none, so the set of `i8042:` lines this test looks for is identical either side of \
+               it",
+        evidence: "PR #111 run 32040411208, job 95418635461 (`guest (3)`); the isolated re-run in \
+                   the same job was green",
+        source: "issues/diagnostics/console-scrollback-can-sit-at-the-head-of-the-seeded-log.md",
+        measured: "2026-08-17",
+    },
+    // ---------------------------------------------------------------------
+    // PR #128 run 32249152467, job `guest (2)`, 2026-08-19. Shard 2/12 at
+    // `--jobs 1 --host-slots 0` — the log reads `--- parallel, 1 wide ---`, so
+    // one guest on the machine and no contention to appeal to. **Two i8042
+    // names in one shard, in one phase, and a first sighting for both**:
+    // `--known-red` answered `NOT ON THE LIST` for each. New names, so they get
+    // rows of their own rather than joining the family's existing ones — the
+    // undecoded-bytes rows are a different producer and merging would make
+    // three failures read as one. Each was re-run as its group and passed
+    // twice, and the run is red on the rate.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "i8042_keyboard",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Retired(
+            "the script outran QEMU's sixteen-byte PS/2 queue. 26 set-1 bytes went out on a \
+             `thread::sleep` clock, so the bound held only while the guest kept draining, and \
+             past the queue `ps2_queue()` drops one byte at a time and says nothing — a lost \
+             make takes its break with it (`handle_key` queues nothing for a usage nothing \
+             holds), which is exactly `0x29` missing entirely, and a lost `0xE0` leaves a press \
+             with no release, which is exactly the `usage 0x50: 1 presses, 0 releases` the \
+             isolated re-run produced. Reproduced deterministically by putting the same 26 bytes \
+             into one `input-send-event`: `i8042: drain bytes=16 keys=15` and `0 dropped, 0 \
+             overruns, 0 lost edges`. The test is paced against the guest's own `kev` lines now \
+             — one group outstanding, four bytes at most",
+        ),
+        what: "`no event for HID usage 0x29 in [KeyLine { usage: 11, modifiers: 0, translated: \
+               \"h\" }, …]` — twenty `KeyLine`s carrying the rest of the scripted sequence and \
+               translating it: `h e l l o`, shift-`B` (`usage: 5`, `modifiers: 1`, `\"B\"`), then \
+               `usage: 80` → `\\u{1b}[D` and `usage: 77` → `\\u{1b}[F`. Escape is `0x29` and is \
+               nowhere. **One structural oddity, recorded and not read as a cause**: the second \
+               `usage: 225` press/release pair encloses no key event, where the first encloses \
+               the `B`. `ALONE: GREEN, and it was alone both times — a rate and not a \
+               classification`",
+        evidence: "PR #128 run 32249152467, job `guest (2)`, shard 2/12 at `--jobs 1`; re-run as \
+                   its group twice in the same job, `PASS (5s)` and `PASS (6s)`. In the same \
+                   phase `i8042_mouse` passed with `0 keys, 0 undecoded` in its tally where both \
+                   re-run boots reported `28 keys, 12 undecoded` — three separate boots, so an \
+                   accompanying observation and not a shared-guest claim",
+        source: "tests/toyos.rs QEMU_PS2_QUEUE",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "i8042_no_spurious_wake",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Retired(
+            "the same over-subscription — twenty bytes against a sixteen-byte queue — and the \
+             same missing bound. What a drain carries is whatever the ISR found in the ring, so \
+             a host injecting on a wall clock was asserting on a batching it did not control: \
+             the capture's own `bytes=8 keys=2` is the Pause and the key that followed it 50 ms \
+             later taken together, which is a guest that did not drain for 50 ms. Each piece is \
+             paid for now before the next goes out — a Pause by a drain the driver logged, a key \
+             by its two `kev` lines — so the zero-event drain is arranged rather than hoped for",
+        ),
+        what: "`no drain produced zero events — the stimulus never landed` — **and the capture it \
+               prints contradicts its second clause**: the kernel names all six bytes of the \
+               test's own Pause, `no event from [0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5]`, so the \
+               stimulus landed. What is missing is a drain carrying *only* it — the drain that \
+               took it reports `bytes=8 keys=2` and the next `bytes=12 keys=4`, so neither has \
+               zero events. Alone the same test reports `2 zero-event drains, none woke; 3 real \
+               ones, all did`. Whether a real key byte sharing that drain is the instrument's \
+               fault or the batching's is **not** decided here. `ALONE: GREEN, and it was alone \
+               both times — a rate and not a classification`",
+        evidence: "PR #128 run 32249152467, job `guest (2)`, the same shard and phase as this \
+                   run's `i8042_keyboard` row; re-run as its group twice in the same job, \
+                   `PASS (227ms)` and `PASS (222ms)`",
+        source: "tests/toyos.rs QEMU_PS2_QUEUE",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "screen_console_panic",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`the fatal report never took the screen back from the console — which would make \
+               /bin/console a downgrade on the machine it is for`, at 96 s against the suite's \
+               usual seconds, so the shape is a handoff waited for and never observed. First \
+               sighting: `--known-red` answered `NOT ON THE LIST`. **Not about the diff it was \
+               found on**, which is PR #141's merge-queue package — workflow triggers and \
+               CLAUDE.md prose, no kernel byte. `ALONE: GREEN, and it was alone both times — \
+               nothing the harness controls differed, so it failed once and passed once. That is \
+               a rate and not a classification`",
+        evidence: "PR #141 run 32306139422, job 96239259411 (`guest (3)`), 2026-08-19; the \
+                   isolated re-run in the same job was green",
+        source: "issues/panic-path/the-fatal-report-once-left-the-screen-to-the-console.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "log_poll_outlives_a_close",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`kernel panic: DOUBLE PANIC — the guest went quiet because every CPU is halted, \
+               not because it was still working. The panic is the finding and the guard never \
+               got to be one`. The kernel's complete last words were `[kernel 0.991 cpu0] DOUBLE \
+               PANIC` — no first-panic text, no location, which is the second finding. `ALONE: \
+               GREEN — it fails only beside other guests`; the load was two worktrees' full \
+               suites interleaved over the shared twelve guest slots. **Not about the diff it \
+               was found on**, a census-settling change inside `handle_kill_policy`'s own guest \
+               binary",
+        evidence: "dev host, 2026-08-19 22:21 UTC, `cargo test` in wt/toyos-hkpfix beside \
+                   wt/toyos-freshness's suite; 267 of 268 passed, this one red at 25 s in the \
+                   parallel phase, green alone in the same run",
+        source: "issues/panic-path/a-double-panic-at-boots-edge-says-nothing-but-its-name.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "screen_console_clear",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`the graffiti actuator did not reach the panel: 0 of 2073600 pixels are \
+               [0, 192, 0] and the 8px strip below the cells is not`, at 127 s against a \
+               fast-tier price — a panel that never received the write inside a window two \
+               orders above its cost, not a wrong pixel. The same run's `durations` job then \
+               refused the 126,762 ms reading against the 10,000 ms line, correctly: that \
+               number is this stall and must never be committed as a price. First sighting; \
+               same evening and same shape as `screen_console_panic`'s row — composition \
+               under a loaded host loses the panel's update. **Not about the diff it was \
+               found on**, a tier declaration and a duration table (PR #135). `ALONE: GREEN, \
+               and it was alone both times`",
+        evidence: "PR #135 run 32303408773, job 96231120463 (`guest (11)`), 2026-08-19; the \
+                   isolated re-run in the same job was green",
+        source: "issues/diagnostics/the-panel-once-took-no-pixels-for-two-minutes-under-load.md",
+        measured: "2026-08-19",
+    },
+    Red {
+        test: "console_line_atomicity",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`writer A declared 1000 whole lines and the capture carries 995` — five lines \
+               of one writer's thousand missing from the shared capture, the name's first \
+               sighting on THIS instrument: its standing rows are the loaded dev host's \
+               (fires 1 of 3 there), and CI runs one guest per machine, so whatever loses \
+               the lines here is not host contention. `ALONE: GREEN, and it was alone both \
+               times — a rate and not a classification`. **Not about the diff it was found \
+               on**, an issues-and-prose capability audit (PR #166)",
+        evidence: "PR #166 run 32364721784, job 96411690231 (`guest (10)`), 2026-08-20; the \
+                   isolated re-run in the same job was green",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-20",
+    },
+    Red {
+        test: "exit_wait_storm",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`timed out after 12s, with the guest still talking 13s ago (245 console \
+               line(s) while it ran) — it was working and did not finish`, and the same \
+               run's `durations` job refused the 13,058 ms reading against the 10,000 ms \
+               line — correctly: the committed price is 200 ms, so the number is the \
+               partition's co-scheduling, a 65x wall stretch on a storm of exiting \
+               children, not the test's own cost. First sighting; `--known-red` answered \
+               NOT ON THE LIST. **Not about the diff it was found on**, one issue file \
+               (PR #147)",
+        evidence: "PR #147 run 32331741273, job 96313605393 (`guest (1)`), 2026-08-20; the \
+                   same run's `guest (11)` red on `screen_console_clear`, that family's \
+                   second CI sighting",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-20",
+    },
+    Red {
+        test: "tlb_shootdown_waits",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`exit code 101` at 53 ms — the guest binary's own assertion, and the \
+               2026-08-20 lock-conversion pass already recorded the sharper point when the \
+               same name red on a loaded dev host, ALONE: GREEN: the assertion that fires \
+               is the test's own *control*, so it is the one assertion in the suite that \
+               cannot tell a slow host from a broken measurement. **Not about the diff it \
+               was found on**, two issue files and a tests/CLAUDE.md bullet (PR #150)",
+        evidence: "PR #150 run 32334225614, job 96320634405 (`guest (5)`), 2026-08-20; the \
+                   dev-host sighting the same night is in the source issue",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-20",
+    },
+    // ---------------------------------------------------------------------
+    // `wt/toyos-purecrates`, dev host, 2026-08-18: three full `cargo test` runs
+    // in one session, on a branch whose whole delta is three kernel files
+    // moving into two pure crates with no line of their logic changed — every
+    // moved file `diff`s against its original as doc comments, one `use` path
+    // and two test paths. All twelve KVM shards of that commit are green
+    // (PR #124). Three runs, three different names red, each `ALONE … GREEN`,
+    // and each red twice over on the second and third: this is the dev-host
+    // load family and the rows say so. Adjudicated here rather than re-run
+    // away, per the root CLAUDE.md — each of these answered `NOT ON THE LIST`
+    // when it was asked, which is the gap this campaign closes.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "console_line_atomicity",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 3),
+        standing: Standing::Stands,
+        what: "`kernel panic: DOUBLE FAULT on CPU 1 (pid=Some(Pid(2)) tid=Some(Tid(0)))`, 21 s \
+               against the 9 s it passed in the run before. **A kernel death and not a verdict**, \
+               and the first dev-host one the panic vocabulary has named rather than reported as \
+               silence. `ALONE … GREEN`, which that vocabulary's own write-up says is not evidence \
+               against a panic — one reached under contention does not reproduce alone either. \
+               The kernel's report is not in *this* record: the arm printed \
+               `tail(&result.stdout)`, which is the userland half of the capture, and the report \
+               sat unread in `TestResult::serial`. That is closed at the field rather than at the \
+               arm — `TestResult::error` is a `WaitVerdict`, which cannot be built without the \
+               capture it was reached on — so the next sighting arrives with `cr2`, the page \
+               walk, the backtrace and `[ist1] used N of M` under the sentence",
+        evidence: "three full `cargo test` runs in one session on `wt/toyos-purecrates`, twelve \
+                   wide, `fastest boot 1522 ms against the reference 1320 ms` on the run that \
+                   red",
+        source: "issues/kernel/a-double-fault-on-cpu-1-under-a-wide-suite.md",
+        measured: "2026-08-18",
+    },
+    Red {
+        test: "console_line_atomicity",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 3),
+        standing: Standing::Stands,
+        what: "`writer A declared 1000 whole lines and the capture carries 798` — the \
+               non-vacuity count, not the atomicity assertion, and the filed reading of this \
+               message holds: **`0 mixed` means the mechanism held**. A second sighting of the \
+               2026-08-15 defect with the other writer and a different count, `ALONE … GREEN`",
+        evidence: "the same session's third run, twelve wide, `fastest boot 1381 ms against the \
+                   reference 1320 ms`",
+        source: "issues/build/console-line-atomicity-reds-on-a-short-capture.md",
+        measured: "2026-08-18",
+    },
+    Red {
+        test: "handle_kill_policy",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 3),
+        standing: Standing::Stands,
+        what: "`16 more killed processes left more live objects behind: [(\"Process\", 6, 7)]` — \
+               byte-identical to the 2026-08-17 sighting on an unrelated branch, numbers \
+               included, which is what a machine-wide census either side of a kill on a shared \
+               boot is expected to do. `cargo test --test toyos-build -- handle_kill_policy` on \
+               the same tree straight afterwards: `PASS handle_kill_policy (615ms)`",
+        evidence: "the same session's first run, twelve wide",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-18",
+    },
+    // ---------------------------------------------------------------------
+    // `wt/toyos-spawnrule`, dev host, 2026-08-19: three full `cargo test` runs
+    // in one session on a branch whose whole behaviour change is one line of
+    // `SYS_SPAWN`'s slot-map resolution. **Two kernel deaths and one clean
+    // run**, at three different host widths: 1.02x red, 1.07x green 268 of 268,
+    // 1.41x red — and the kernel source under the first and third differs from
+    // the green one's by comments alone, so no statement compiled differently
+    // between them.
+    //
+    // The first of those two deaths was `process_lifecycle`'s Ring 0 fetch at
+    // `0x0` inside `SYS_READ`, and its row is gone with the defect: it was a
+    // `context_switch` restoring a task another CPU was still standing on, and
+    // a red under that name now is a new measurement rather than this one. The
+    // second is the row below, and it was the last of the session still
+    // unaccounted for; it is the same defect, and the row's `Retired` reason
+    // carries what decided that.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "sched_stress",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 3),
+        standing: Standing::Retired(
+            "the same defect as the four Ring 0 fetches filed beside it, and it was fixed \
+             before this row was ever re-measured: `navigate.rs:161` is `init_front().unwrap()`, \
+             which `BTreeMap::iter` reaches only when the map's `root` reads `None` and its \
+             `length` does not — a pair no sequence of inserts and removes produces, so the \
+             panic reports corruption of the record rather than a scheduler decision. That \
+             record is `CpuSched` in `static SCHEDS`, and `SchedPass`'s own `&mut CpuSched` is \
+             a local on the kernel stack the pre-fix `pop_surplus` handed to two CPUs at once, \
+             a few hundred instructions before `apply_timer` walks the map. Measured \
+             2026-08-20, same host, one-word A/B: 0 kernel deaths in 3,600 boots on this tree, \
+             2 in 3,120 with `pop_surplus(None)` restored — both of them `cpu 7 has no \
+             CpuSched` at `sched/driver.rs:219`, the same static reading as a value only a \
+             stray write produces, and both after cpu7 had already completed a pass. 20 loaded \
+             `sched_stress` runs green at 4.27x-8.00x host width against the 1.41x that took \
+             this one. A red under this name now is a new measurement",
+        ),
+        what: "`QEMU disconnected` — the kernel panicked at \
+               `alloc/src/collections/btree/navigate.rs:161`, `Option::unwrap()` on `None` \
+               **inside `BTreeMap`'s own immutable iterator**, walking a CPU's `parked` map \
+               from `SchedPass::apply_timer`. A map whose length disagrees with its nodes, not \
+               an absent deadline. It took the shared boot with it: 129 further names in the \
+               same run answered `Failed to flush QEMU stdin: … BrokenPipe`, so 130 of that \
+               run's reds are one event and only this one is a measurement",
+        evidence: "the same session's third run and the most loaded of the three, `fastest boot \
+                   1867 ms against the reference 1320 ms`; `ALONE sched_stress: GREEN` and \
+                   `PASS (2s)` in the same run",
+        source: "src/redlist.rs",
+        measured: "2026-08-19",
+    },
+    // ---------------------------------------------------------------------
+    // The same session's last two runs, after the branch merged `origin/main`
+    // at `bf54143`. Both red, both `ALONE … GREEN`, neither about the diff.
+    // The first was `i8042_kbd_echo`'s Ring 0 fetch at `0x1b`, and its row is
+    // gone with the defect for the reason the block above gives. The second is
+    // below, and it is the only one of that session's five reds that was never
+    // a kernel death.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "screen_console_shell",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 2),
+        standing: Standing::Stands,
+        what: "`typed \\`echo zqjxk\\` at the prompt and no row of the panel is its output` — a \
+               **different assertion** from this name's 2026-08-17 CI row, which is about the \
+               seeded `i8042:` line. 786 s against `PASS (2s)` alone in the same run, and the \
+               panel it decoded carries only the first frames of boot, so the guest never \
+               reached the prompt inside the window. The one red of this session's five that \
+               is not a kernel death",
+        evidence: "the fifth run of the same session, `fastest boot 1622 ms against the \
+                   reference 1320 ms`, 1.23x width; `ALONE screen_console_shell: GREEN`",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-19",
+    },
+    // Found auditing the merge-health backfill
+    // (`issues/build/the-eased-merge-law-carries-a-threshold.md`), not by
+    // anyone working the diff it rode on.
+    Red {
+        test: "console_locale_detect",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`STALLED: waiting for the wizard to ask for a key under /bin/console — the \
+               console did not lend it the keyboard — it never stopped talking and never got \
+               there`. Same shape as `desktop_locale_detect`'s terminal-boot-race family — a \
+               wizard waiting for a key it was never handed — but against `/bin/console` rather \
+               than `/bin/terminal`, so it is not provably the same race and is not folded into \
+               it. First sighting: `--known-red` answered `NOT ON THE LIST`. **Not about the \
+               diff it was found on**, which is #142's log-redesign decision record, no kernel \
+               byte. `ALONE: GREEN, and it was alone both times — a rate and not a \
+               classification`",
+        evidence: "push-triggered `ci` run 32314166262, job 96263949273 (`guest (9)`), headSha \
+                   eba06ad6, 2026-08-19",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-20",
+    },
+    // ---------------------------------------------------------------------
+    // `wt/toyos-i8042deep`, dev host, 2026-08-19. Adjudicated here rather than
+    // re-run away: each answered `NOT ON THE LIST` when it was asked, and the
+    // branch they appeared on touches no kernel file at all — its whole delta
+    // is `tests/toyos.rs` and this file.
+    //
+    // Two of the three were `i8042_budget_expiry` and `nvme_large_device`,
+    // machine-wide Ring 0 deaths at `0x1b` that reded whichever guest was
+    // booting. Their rows are gone with the defect — a `context_switch`
+    // restoring a task another CPU was still standing on — so a red under
+    // either name now is a new measurement and must be read as one. The one
+    // that stays below is not a kernel death.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "diskless_boot",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`[qemu] QEMU died before ===READY=== (status: Ok(ExitStatus(unix_wait_status(0))))`. \
+               **QEMU exited zero**, so this is neither a panicked guest nor a wall-clock guard \
+               reporting the content it meant to assert — the process went away cleanly before \
+               the guest was ready, which nothing in the register explains. 7 s under load \
+               against 3 s alone; `ALONE: GREEN`. Not investigated",
+        evidence: "the same run as this session's `nvme_large_device` row",
+        source: "issues/build/parallel-tests-red-under-other-suites.md",
+        measured: "2026-08-19",
+    },
+    // ---------------------------------------------------------------------
+    // `wt/toyos-killwrite`, dev host, 2026-08-20, on `e4c2c8ff` — `main`'s own
+    // tip, unmodified. The row
+    // `issues/kernel/a-killed-peer-still-takes-a-write.md` said was owed: the
+    // name answered `NOT ON THE LIST` when that file was written, so a landing
+    // gate that hit it had nothing to check the red against. Two rows, because
+    // one name measured on two instruments in one session is two measurements.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "kill_while_blocked",
+        instrument: Instrument::DevHostAlone,
+        finding: Finding::fires(2, 53),
+        standing: Standing::Stands,
+        what: "`a pipe whose only reader was killed mid-read still took a write` (arm 1) once, \
+               and `a connection whose peer was killed mid-read still took a write`, \
+               `left: Ok(22)` `right: Err(NotFound)` (arm 2) once — **one red on each of the two \
+               arms**, which is what says they are one mechanism rather than two paths of \
+               different speeds. It is not a classification: `ALONE … GREEN` both times, and \
+               `Sched::Serial` would retire it no better than it retired `handle_lifetime`. The \
+               release a peer's answer rides runs from `object::drain_zero_handles`, and the \
+               killing syscall's own drain site can be robbed of the batch by any other CPU's",
+        evidence: "53 × `cargo test --test toyos-build -- kill_while_blocked` in one session, the \
+                   host reporting 1.68x–2.70x width throughout; the same session staged the \
+                   mechanism at 4 of 5 by removing the syscall-exit drain",
+        source: "issues/kernel/a-killed-peer-still-takes-a-write.md",
+        measured: "2026-08-20",
+    },
+    Red {
+        test: "kill_while_blocked",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::quiet(4),
+        standing: Standing::Stands,
+        what: "four consecutive full fast tiers, 272 tests each, and it did not fire in any of \
+               them. **This retires nothing and is here so that it cannot be read as retiring \
+               anything**: the first sighting of this defect was inside a 272-test run, and four \
+               runs is not a denominator that reaches a rate of two in fifty-three",
+        evidence: "4 × `cargo test --test toyos-build`, same tree and session as this name's \
+                   dev-host-alone rate",
+        source: "issues/kernel/a-killed-peer-still-takes-a-write.md",
+        measured: "2026-08-20",
     },
 ];
 
@@ -2048,7 +2741,7 @@ mod tests {
             ),
             (
                 "a write-up that does not resolve",
-                Red { source: "specs/nowhere-at-all.md", ..ok },
+                Red { source: "nowhere-at-all.md", ..ok },
                 "does not resolve",
             ),
             (

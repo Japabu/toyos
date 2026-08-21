@@ -7,6 +7,7 @@ use alloc::alloc::{alloc_zeroed, Layout};
 use crate::arch::{apic, percpu, syscall};
 use crate::clock;
 use crate::drivers::acpi::MadtInfo;
+use crate::time::{Budget, Delay, Duration};
 use crate::{log, process};
 
 const TRAMPOLINE_PAGE: u64 = 0x8000;
@@ -219,19 +220,38 @@ pub fn boot_aps(madt: &MadtInfo, boot_cr3: u64) {
 
         AP_STARTED.store(false, Ordering::Release);
 
-        // INIT-SIPI-SIPI sequence
+        // INIT-SIPI-SIPI sequence. Both delays are spent rather than waited
+        // on: nothing is polled across either and neither can fail.
+        const AFTER_INIT: Delay =
+            Delay::from_spec(Duration::from_millis(10), "SDM §8.4.4.1, after the INIT IPI");
+        /// SDM §8.4.4.1 asks 200us here; a millisecond is the same shape with
+        /// room, and it is paid once per AP at boot.
+        const BETWEEN_SIPIS: Delay =
+            Delay::from_spec(Duration::from_millis(1), "SDM §8.4.4.1, between the two SIPIs");
         apic::send_init(ap_id);
-        delay_ms(10);
+        delay(AFTER_INIT);
 
         apic::send_sipi(ap_id, TRAMPOLINE_VECTOR);
-        delay_ms(1);
+        delay(BETWEEN_SIPIS);
 
         if !AP_STARTED.load(Ordering::Acquire) {
             apic::send_sipi(ap_id, TRAMPOLINE_VECTOR);
         }
 
-        // Wait up to 100ms for AP to complete initialization
-        let deadline = clock::nanos_since_boot() + 100_000_000;
+        // How long an AP gets to reach `ap_entry` before it is declared
+        // absent by name and the machine boots without it.
+        //
+        // **A [`Budget`] and not the `Tripwire` offered as the alternative to
+        // finding a source.** Its expiry is already a degraded
+        // answer that says so — "failed to start!", one fewer CPU, a machine
+        // that boots — and making it a panic would be a behaviour change,
+        // which C1's own gate forbids. The number itself still has no source:
+        // SDM §8.4.4.1's numbers are the two delays above, not this.
+        const AP_START: Budget = Budget::of(
+            Duration::from_millis(100),
+            "the AP is named as failed to start and the machine boots one CPU short",
+        );
+        let deadline = clock::nanos_since_boot() + AP_START.nanos();
         while !AP_STARTED.load(Ordering::Acquire) {
             if clock::nanos_since_boot() >= deadline { break; }
             core::hint::spin_loop();
@@ -270,8 +290,10 @@ extern "C" fn ap_entry() -> ! {
     // GS base was set by the trampoline; finish percpu init (GDT, CR4).
     percpu::init_ap(percpu::percpu_ptr());
     syscall::init();
+    // Calibration is one global measurement done on the BSP; `arm_one_shot`
+    // programs divide and LVT per call, so there is nothing left for an AP to
+    // do here.
     apic::init_ap();
-    apic::init_timer_ap();
 
     AP_STARTED.store(true, Ordering::Release);
 
@@ -291,9 +313,12 @@ extern "C" fn ap_entry() -> ! {
     process::ap_idle();
 }
 
-fn delay_ms(ms: u64) {
+/// Spend a [`Delay`]. Boot only: there is no scheduler to give the CPU back
+/// to, which is what the enclosing function's own presence in §4.4's
+/// allow-list records.
+fn delay(span: Delay) {
     let start = clock::nanos_since_boot();
-    while clock::nanos_since_boot() - start < ms * 1_000_000 {}
+    while clock::nanos_since_boot() - start < span.nanos() {}
 }
 
 // Real mode → protected mode → long mode → Rust entry.
