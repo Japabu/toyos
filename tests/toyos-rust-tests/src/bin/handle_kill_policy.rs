@@ -34,6 +34,16 @@
 //! does have an error channel — the CQE — and these arms are what say so, one
 //! per kind, plus the direction in which an object has no readiness at all.
 //!
+//! **`retired-stale` is `stale` at the end of a slot's life rather than in the
+//! middle of it.** A generation counter is finite, and by owner ruling of
+//! 2026-08-20 a slot that spends its last one retires instead of starting
+//! again — so a handle to it names a slot the table no longer has. The answer
+//! must be the same kill, and the answer that would be a defect is the one a
+//! wrapping counter gives: the object, alive again, to whoever kept the number.
+//! `handle_basic` is where the retirement itself is asserted; here it is only
+//! the policy, which is the half that must not quietly become survivable
+//! because the slot is now a different kind of gone.
+//!
 //! **`spawn-stale` is the one arm that is not a call refusing its own
 //! argument.** A slot map is a parent deciding what its child is born holding,
 //! and the kernel skipped a pair it could not resolve — so the child started
@@ -52,7 +62,7 @@ use toyos::census::Census;
 use toyos::poller::{Poller, READABLE, WRITABLE};
 use toyos::AsHandle;
 use toyos_abi::handle::Rights;
-use toyos_abi::syscall::{self, MmapFlags, MmapProt, SpawnArgs, SyscallError};
+use toyos_abi::syscall::{self, debug_action, MmapFlags, MmapProt, SpawnArgs, SyscallError};
 use toyos_abi::RawHandle;
 
 const SELF_PATH: &str = "/bin/test_rs_handle_kill_policy";
@@ -110,6 +120,13 @@ const FATAL: &[(&str, &str)] = &[
     // having asked for nothing — and the parent was told its spawn happened as
     // asked. Ruled a kill on 2026-08-19 (`object::HandleError`).
     ("spawn-stale", "a spawn's slot map naming a handle this process closed"),
+    // The far end of `stale`, and the arm that says the retirement ruling of
+    // 2026-08-20 did not buy safety by making a dead slot answer. A slot whose
+    // generations ran out is gone from the table for good, so a handle to it is
+    // a number that can never name anything again — the caller is ended for it
+    // exactly as it is for a slot it closed a moment ago, and what it must
+    // never be given is a live object.
+    ("retired-stale", "a slot whose generations ran out and cannot come back"),
 ];
 
 fn main() {
@@ -458,6 +475,31 @@ fn fatal_role(role: &str) -> ! {
             drop(read);
             let started = spawn_naming(closed);
             panic!("a spawn naming a handle this process closed answered {started:?}");
+        }
+        // A slot spent to its last generation, used one lifecycle further. The
+        // staging is all survivable — a free slot's generation is moved, the
+        // slot is taken and given back through the ordinary paths — and what is
+        // fatal is the read after the close, which names a slot the table has
+        // retired. It must be the same kill a slot closed a moment ago gets:
+        // the one answer that would be a defect is the object coming back.
+        "retired-stale" => {
+            let (_read, write) = toyos::pipe_pair().expect("a pipe to spend");
+            let source = write.as_handle();
+            let doomed = syscall::dup(source).expect("a duplicate to spend");
+            let slot = doomed.slot();
+            syscall::close(doomed);
+            let last = RawHandle::new(slot, RawHandle::MAX_GENERATION - 1);
+            assert_eq!(
+                syscall::debug_with(debug_action::SLOT_TO_LAST_GENERATION, u64::from(slot)),
+                u64::from(last.0),
+                "the actuator did not stage slot {slot}",
+            );
+            let issued = syscall::dup(source).expect("a slot at its last generation still serves");
+            assert_eq!(issued, last, "the staged slot was not the one reissued");
+            syscall::close(issued);
+            let mut buf = [0u8; 8];
+            let n = syscall::read_nonblock(issued, &mut buf);
+            panic!("a handle to a retired slot answered {n:?}");
         }
         // The kill is the process's, not the thread's: a handle fault raised on
         // any thread ends every thread. Asserted from the exit code, which the
