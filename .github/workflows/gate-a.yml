@@ -1,10 +1,12 @@
 name: gate A, thorough
 
-# `tests/audio-baseline.toml`'s thorough tier, N boots per config taken strictly
-# one at a time in one full partition. The job's guest has the runner to itself
-# — the quiet host the recorded sample was attested on.
+# `tests/audio-baseline.toml`'s thorough tier: N boots per config taken strictly
+# one at a time, as two shards on GitHub-hosted runners or one full partition on
+# the T14. Either way a guest has its runner to itself — the quiet host the
+# recorded sample was attested on — and either way the shards are a partition of
+# the same configs, so the number of them changes the wall clock and no verdict.
 #
-# Same `debian:sid`/QEMU 11.1.0 container the twelve shards run, since a QEMU
+# Same QEMU 11.1.0 container the twelve shards run, since a QEMU
 # version this job does not share with the rest of CI and the dev host would
 # make the one arm that exists to be compared a third instrument. What still
 # differs from the dev host, deliberately, is the accelerator (KVM against
@@ -41,11 +43,15 @@ jobs:
     timeout-minutes: 180
     strategy:
       fail-fast: false
-      # One benchmark lane at a time on the T14, whatever else carries the
+      # Two shards on GitHub-hosted runners, as this gate has always run: each
+      # gets a machine to itself, so splitting the configs halves the wall
+      # clock and changes no verdict. The T14 is one machine, so a second lane
+      # there would put two guests on the cores this gate exists to have to
+      # itself — one partition, `max-parallel: 1`, whatever else carries the
       # `toyos` label later.
-      max-parallel: 1
+      max-parallel: ${{ needs.route.outputs.trusted == 'yes' && 1 || 2 }}
       matrix:
-        shard: [1]
+        shard: ${{ fromJSON(needs.route.outputs.trusted == 'yes' && '[1]' || '[1,2]') }}
     # `--device=/dev/kvm`, exactly as the shards: the hosted node ships
     # `crw-rw---- root:kvm` and root opens it with no chmod, and the T14
     # image's own user is in that group (`.github/runner/Dockerfile`).
@@ -139,10 +145,13 @@ jobs:
       # populates it, so the fallback is reached only on the trigger that has
       # no other way to say 30.
       - name: gate
+        env:
+          SHARD_COUNT: ${{ needs.route.outputs.trusted == 'yes' && 1 || 2 }}
         run: |
           cargo test --test toyos-build -- \
             --audio-gate ${{ inputs.iterations || '30' }} \
-            --shard ${{ matrix.shard }}/1 --host-slots 0 2>&1 | tee /tmp/gate-a.log
+            --shard ${{ matrix.shard }}/$SHARD_COUNT --host-slots 0 2>&1 \
+            | tee /tmp/gate-a.log
           exit "${PIPESTATUS[0]}"
 
       - name: gate sample
