@@ -52,3 +52,67 @@ landed between the two arms and `--land` merged them in, so the arms differ by
 more than the change under test and no comparison between them means anything.
 What H3 has instead: a full suite green at 289/289 with all four audio configs
 clean, and ten standalone runs of the audio family. None of that is a rate.
+
+## 2026-08-21: the CI nightly's red was never this, and its verdicts were never read
+
+**The dev-host finding above stands unchanged.** What follows is about a
+different instrument — `gate-a.yml` on a GitHub runner — and it must not be
+conflated with it. Nobody re-ran the dev-host arm; nothing here re-runs an audio
+verdict away.
+
+`gate-a.yml`'s `gate` step ended in `exit "${PIPESTATUS[0]}"`. The runner logs
+the shell it picked for that container on every step — `shell: sh -e {0}` — and
+that shell has no `PIPESTATUS` array. Every run answered
+
+```
+/__w/_temp/<uuid>.sh: 4: Bad substitution
+##[error]Process completed with exit code 2.
+```
+
+on the line *after* the gate had printed its verdict. Without `pipefail` the
+pipeline's status was `tee`'s 0, so `-e` never fired on the harness's own code;
+the step's exit was dash's 2 for a failed expansion, and it was 2 whatever the
+audio said. `gate-a.yml` has therefore **never once reported its verdict**:
+every run it has ever had is a `failure`, including the ones that passed.
+
+The verdict each shard actually printed, read out of the job logs (artifacts
+expire at 30 days; these lines do not):
+
+| run | date | shard 1 | shard 2 |
+|---|---|---|---|
+| 31386117376 | 08-10 (dispatch, `wt/toyos-ciwave2`) | FAILED `audio_tone.smp8` wake lateness median 6658 → 8496 (z=4.27) | FAILED `audio_tone_load.smp8` wake lateness median 7134 → 9520 (z=6.05) |
+| 31771577360 | 08-14 | FAILED `audio_tone.smp8` wake lateness median 6658 → 8673 (z=5.41) | PASS |
+| 31862912891 | 08-15 | PASS | PASS |
+| 31925451196 | 08-16 | PASS | PASS |
+| 31992902784 | 08-17 | FAILED at iteration 25, `audio_tone.smp8` instrument broken — suspend structure | FAILED `audio_tone_load.smp1` wake lateness median 5765 → 17684 (z=4.61) |
+| 32097206141 | 08-18 | PASS | PASS |
+| 32213928799 | 08-19 | PASS | PASS |
+| 32330040225 | 08-20 | PASS | PASS |
+| 32445243829 | 08-21 | PASS | PASS |
+
+Thirteen shard-runs PASS, five FAILED, eighteen exits of 2.
+
+**Two consequences, and they point opposite ways.**
+
+The thirteen PASSes mean the standing sentence "the thorough tier reds on
+`main`" was being sourced from a red that was not a verdict. It is not evidence
+that the dev-host finding above is stale: `gate-a-has-no-runner-baseline` already
+establishes that a runner arm compared against the dev host's sample is a
+cross-instrument comparison, and since the 2026-08-15 re-record the runner's
+numbers are one-sidedly *better* than the recorded ones (08-21 shard 1:
+`wake_lat_us recorded 7052/8972/22744 fresh 4002/6034/9942`), which is a
+comparison that cannot red. A PASS of that comparison certifies little. The
+dev-host question is still open and still needs the dev host.
+
+The five FAILEDs are the harm. Two on 08-10 and one on 08-14 are the
+cross-instrument shape `gate-a-has-no-runner-baseline` explains. **The two on
+08-17 are not**, and nobody has looked at them: they sit between a PASS night and
+a PASS night on the same baseline, and shard 1's is not a statistic at all but
+the instrument refusing —
+`no 'soundd: suspended' after the last client removal; no 'virtio-sound: stream 0
+stopped' after the last client removal — the device is still running with no
+clients`. That is filed apart as `gate-a-suspend-structure-verdict-unread`.
+
+The exit code is fixed in `.github/workflows/gate-a.yml` (`set -o pipefail`, the
+idiom every other workflow in `.github/` already uses). Nothing about how a
+verdict is *reached* changed.

@@ -1258,8 +1258,14 @@ pub const KNOWN_RED: &[Red] = &[
                progress at all when the reading was taken. `ALONE handle_lifetime: red again, the \
                same failure both times`, which on a shared-block name is a fresh boot carrying \
                that binary and nothing else",
+        // The `gate A, thorough` half of this citation was struck 2026-08-21.
+        // That workflow ended its step in `exit "${PIPESTATUS[0]}"` under a shell
+        // with no `PIPESTATUS`, so it reported `failure` on every run it ever had
+        // whatever the audio said — and on 2026-08-19 both of its shards printed
+        // `[gate A] PASS`. It was never evidence of anything about `main`. The
+        // `ci` half is a verdict, and it is what this row rests on.
         evidence: "CI run 32237424649 (PR #126, job `guest (1)`); `main` red at `8e9f851` on \
-                   `ci` and on `gate A, thorough` the same day",
+                   `ci` the same day",
         source: "issues/build/free-memory-verdicts-share-a-boot.md",
         measured: "2026-08-19",
     },

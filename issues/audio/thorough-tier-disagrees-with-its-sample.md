@@ -48,3 +48,16 @@ host anyway, which is what makes them comparable to each other.
 **Consequence for anything landing while this is open:** the thorough tier cannot
 serve as a pass/fail gate. That branch used it as an A/B instead, which is what it could
 still answer, and landed on the fast tier plus the full suite.
+
+**2026-08-21 — the heading says "on `main`", and that has to be read as "on the
+dev host".** The measurements above are dev-host measurements and they stand.
+What cannot be added to them is the CI nightly: `gate-a.yml` reported `failure`
+on every run it has ever had for a reason that was not a verdict at all — see
+`thorough-tier-reds-on-unmodified-main` for the mechanism and for what each
+shard actually printed. Thirteen of its eighteen shard-runs printed PASS against
+this same recorded sample. That does **not** resolve the two readings above:
+`gate-a-has-no-runner-baseline` shows a runner arm against the dev host's sample
+is cross-instrument, and since the 2026-08-15 re-record the runner's wake
+latencies sit below the recorded ones, so its PASS is a comparison that could not
+have failed. The next step named above — the thorough tier on the dev host, on
+the commit the sample was recorded against — is unchanged and still nobody's.
