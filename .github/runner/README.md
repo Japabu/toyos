@@ -26,6 +26,41 @@ to the content-keyed cache before Actions cleans the checkout. It uses hard
 links when the workspace and cache share a filesystem and falls back to a
 normal copy when they do not.
 
+## The job-start hook
+
+`accept-trusted.sh` is what decides which GitHub event may run a job on this
+machine, and a persistent runner attached to a public repository has nothing
+else between a fork's branch and a laptop that keeps state between jobs. It
+refuses any repository but `ToyOSOrg/ToyOS`; on `pull_request` it reads the
+event payload and refuses a head outside the repository; on `schedule` and
+`workflow_dispatch` it refuses a workflow that is not `main`'s; and it refuses
+every other event type by name. `require-manual.sh` beside it is the narrower
+predecessor — dispatches from `main` and nothing else — kept so the machine can
+be locked down without editing a file on it.
+
+Both are installed by an operator, as root, because the runner account has no
+sudo:
+
+```sh
+sudo sh .github/runner/install-hook.sh            # or: require-manual
+```
+
+Read back what is actually running, from any checkout that can reach the
+machine — the point of this section is that the answer is a diff and not a
+belief:
+
+```sh
+ssh t14 cat /usr/local/libexec/toyos-runner/accept-trusted.sh \
+  | diff -u .github/runner/accept-trusted.sh -
+ssh t14 sha256sum /usr/local/libexec/toyos-runner/accept-trusted.sh \
+                  /usr/local/libexec/toyos-runner/require-manual.sh
+ssh t14 grep ACTIONS_RUNNER_HOOK_JOB_STARTED /home/t14/actions-runner/.env
+```
+
+A non-empty diff means the machine is running a revision that is not this one:
+either the operator step has not been run since the file changed, or somebody
+edited the machine. Neither is a state to leave.
+
 ## Rebuild the image
 
 From a trusted checkout on the T14:
