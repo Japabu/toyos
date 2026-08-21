@@ -184,6 +184,48 @@ mod tests {
         assert_eq!(jobs(bad).iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["a", "b"]);
     }
 
+    /// The other declaration a workflow matches on by hand.
+    ///
+    /// `ci.yml`'s `durations` job renders the price verdict only where the
+    /// profile was measured: on a T14 lane it matches
+    /// [`crate::durations::TIER_DISAGREEMENT`] in the merge output, prints it
+    /// as a warning and exits 0, and every other way `--merge-durations` can
+    /// refuse still reds. That telling-apart is a string in a shell script
+    /// against a string in Rust, and the failure mode is silent in exactly one
+    /// direction — reword the panic and the workflow stops recognising the one
+    /// verdict it is allowed to soften, while both files still read perfectly.
+    /// So the two are held together here.
+    ///
+    /// The job's own guard is the same shape: `route.yml`'s `trusted` output is
+    /// what says where the lane ran, and `runner.name` would answer about the
+    /// hosted machine this job itself runs on.
+    #[test]
+    fn the_softened_duration_verdict_is_the_one_the_merge_actually_raises() {
+        let path = repo_root().join(".github/workflows/ci.yml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} is a gate and is not readable: {e}", path.display()));
+        assert!(
+            text.contains(crate::durations::TIER_DISAGREEMENT),
+            "ci.yml no longer matches {:?}, so its `durations` job either fails a T14 lane on \
+             a verdict that instrument cannot render, or softens a refusal that is not the \
+             price verdict",
+            crate::durations::TIER_DISAGREEMENT
+        );
+        let (_, durations) = jobs(&text)
+            .into_iter()
+            .find(|(name, _)| name == "durations")
+            .expect("ci.yml renders the duration verdict in a job called `durations`");
+        assert!(
+            durations.contains("needs.route.outputs.trusted"),
+            "the `durations` job stopped reading where the guest lane ran, so it renders the \
+             price verdict against a profile the measuring machine may never have taken"
+        );
+        assert!(
+            !text.contains("${{ runner.name"),
+            "where a lane ran is `route.yml`'s answer, not the name of the runner reading it"
+        );
+    }
+
     /// The declaration is read by a shell and by this crate, so both have to
     /// agree that it holds one version and nothing else.
     #[test]
