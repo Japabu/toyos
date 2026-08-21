@@ -446,6 +446,36 @@ pub struct SounddCounters {
     pub max_batch: u32,
 }
 
+/// The two numbers this boot drew for its clocks, off the kernel's own boot
+/// lines: the TSC period against the HPET (`kernel/src/clock.rs`) and the LAPIC
+/// timer's tick rate against that (`kernel/src/arch/apic.rs`).
+///
+/// **They are here because they are the only per-boot draws that scale every
+/// armed timer for the boot's whole life**, which is the shape
+/// `issues/audio/t14-wake-lateness-is-bimodal-per-boot.md` is looking for: a
+/// wake latency that is one of two values, decided at boot and steady inside
+/// it, cannot come from anything re-decided per wake. Both calibrations are
+/// busy-wait windows on a virtual machine, so both are exactly the kind of
+/// number a host that stalls the guest mid-window would move.
+///
+/// Printed, never asserted: what a correct pair looks like on a given host is
+/// not something this harness knows, and a threshold nobody measured is the
+/// problem `tests/audio-baseline.toml` exists to avoid.
+pub fn boot_clocks(boot_log: &str) -> String {
+    let field = |marker: &str, upto: char| {
+        boot_log.find(marker).map(|at| {
+            let rest = &boot_log[at + marker.len()..];
+            let end = rest.find(upto).unwrap_or(rest.len());
+            rest[..end].trim().to_string()
+        })
+    };
+    format!(
+        "tsc {} lapic {}",
+        field("TSC: ", ' ').unwrap_or_else(|| "?".into()),
+        field("LAPIC timer: ", '\n').unwrap_or_else(|| "?".into()),
+    )
+}
+
 /// Kernel logging shares the virtio-console with userspace and is not
 /// line-atomic, so a kernel message lands wherever it lands — including
 /// mid-word inside soundd's stats line, which pushes that line's tail onto

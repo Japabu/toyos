@@ -2,9 +2,15 @@
 //!
 //! The counters are the instrument `tests/audio-baseline.toml` thresholds are
 //! written against, so each has to mean exactly one thing and keep meaning it.
-//! The decision in here is [`MixStats::period`]: which periods count as
-//! starvation and which are the design working. Emitting the report is soundd's
-//! — one line, one `write` — and everything it needs is public below.
+//! Emitting the report is soundd's — one line, one `write` — and everything it
+//! needs is public below.
+//!
+//! Two decisions live here, and both are about what one number may stand for.
+//! [`MixStats::period`]: which periods count as starvation and which are the
+//! design working. [`WorstWake`]: that a late wake is attributed to the half of
+//! the path it happened in, because "soundd was late" and "the device was late"
+//! are different defects with different owners and `max_wake_lat_ns` on its own
+//! says neither.
 
 /// Counters for one reporting window. A window covers streaming only: zeroed
 /// when the first client arrives, flushed when the last one leaves, so no
