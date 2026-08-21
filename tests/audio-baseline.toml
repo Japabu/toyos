@@ -131,6 +131,38 @@
 # the owner's ruling and this file both want a mechanism first, and a candidate
 # is not one.
 #
+# WHAT THIS SAMPLE IS A SAMPLE OF, measured 2026-08-21 rather than argued. Every
+# number below was taken on the dev host under cross-arch TCG. `gate-a.yml` now
+# routes to the self-hosted T14 (Intel i5-1135G7, KVM, the same QEMU 11.1.0),
+# and the thorough tier there compares a T14 sample against this one — two
+# instruments. That was an argument before; the control it lacked has now been
+# run. Four interleaved 15-iteration blocks on an idle T14 (A,B,A,B; no CI job
+# container on the machine for any of the 240 boots; 1-min load 0.2-1.74), arm A
+# = `960b96e3`, the tree this sample was recorded on, arm B = `53101d08`:
+#
+#   max_wake_lat_us median   recorded   T14 arm A   T14 arm B   A vs B, n=30
+#     audio_tone.smp1             8972       20314       19994   z=1.49  same
+#     audio_tone.smp8             9249       14069        4088   z=5.37  B faster
+#     audio_tone_load.smp1        5765        2764        4352   z=4.12  B slower
+#     audio_tone_load.smp8        6097       12676        3904   z=5.48  B faster
+#
+# **Arm A fails this file on the T14 and arm B does not.** Both of arm A's
+# blocks red `audio_tone.smp1` against the sample below (median 8972 -> 20438
+# z=5.03, and -> 20144 z=4.67); both of arm B's pass. So the tree the sample was
+# recorded on reds its own sample on that host, harder than `main` does — which
+# is the negative control saying the level difference is the instrument and not
+# a regression. The first readable T14 gate A run (32479089989) failed
+# `audio_tone.smp1` at 8972 -> 17186, z=4.36; that verdict is this.
+#
+# Harm was null on both arms: dropouts 0/120 and 0/120, underruns 0 in all 240
+# config-runs, ceiling breaches 1/120 (arm A) and 0/120 (arm B).
+#
+# NO RE-RECORD IS TAKEN FOR THAT EITHER, and this sample must not be replaced by
+# a T14 one: it is the dev host's, and the dev host still runs the fast tier.
+# What a per-host baseline needs before it can be written — a schema that has a
+# host dimension at all, and a T14 distribution that stops being bimodal — is in
+# `issues/audio/gate-a-has-no-runner-baseline.md`.
+#
 # Why the counters are here at all: the wav is a rare-event detector. One 3s
 # tone samples ~1100 device periods once per run, so it only fires when a
 # dropout happens to land inside the tone — a 0-10% per-run event that cannot

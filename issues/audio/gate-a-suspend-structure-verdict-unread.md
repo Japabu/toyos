@@ -39,6 +39,24 @@ the 2026-08-15 re-record. These two are after it, and they sit between a
 two-shard PASS night (08-16) and a two-shard PASS night (08-18) on the same
 recorded sample. A level difference does not come and go for one night.
 
+**Shard 2's half of that is now adjudicated, and the paragraph above was half
+right.** The 2026-08-21 same-session A/B on the T14
+(`issues/audio/gate-a-has-no-runner-baseline.md`) shows the level difference is
+real *and* that it comes and goes: on a KVM host `max_wake_lat_us` is bimodal
+per boot, ~4 ms or ~20 ms, and which mode an `smp=1` config draws moves between
+runs of the same tree — see
+`issues/audio/t14-wake-lateness-is-bimodal-per-boot.md`. A night that draws the
+slow mode reds and a night that draws the fast one passes, on one unmodified
+tree, which is exactly the 08-16 PASS / 08-17 FAILED / 08-18 PASS sequence.
+`audio_tone_load.smp1` is also the one config where `main` sits worse than the
+baseline tree on the T14 (z=4.12 pooled, but z=3.57 and z=2.09 across the two
+interleaved block pairs), so shard 2's `5765 -> 17684` is that same unstable
+config and needs no separate hunt.
+
+What that does **not** settle is a hosted baseline: the 08-17 run was a
+GitHub-hosted runner of an unnamed vendor, and the T14 control speaks for the
+T14. A hosted verdict still has no hosted sample to be read against.
+
 **Shard 1's is the one to take first.** `soundd: suspended` and
 `virtio-sound: stream 0 stopped` are the two lines that say the idle path
 released the device; their absence says a boot left the device running with no
