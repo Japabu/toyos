@@ -71,12 +71,24 @@ use std::path::Path;
 /// device timing, real latency — and is blind to anything needing repetition or
 /// isolation, being one manual machine. A defect found by a non-owning
 /// instrument transfers to its owner. Only three of the four can appear below:
-/// **metal is not an instrument here**, because the suite does not run on the
-/// T14.
+/// **metal is not an instrument here**, because nothing below is ToyOS on bare
+/// hardware. The T14 does run the suite — since `985f3834` it runs every
+/// trusted event's — but it runs it in QEMU under KVM, which is [`Ci`].
+///
+/// [`Ci`]: Instrument::Ci
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
 pub enum Instrument {
-    /// A `guest` shard: KVM on four native x86-64 cores, `-cpu host`, **one
-    /// guest per machine**, `--jobs 1`, nothing else on the box.
+    /// A `guest` lane: KVM on native x86-64 cores, `-cpu host`, **one guest per
+    /// machine**, `--jobs 1`, nothing else on the box.
+    ///
+    /// **Two machines wear this name and they do not price alike.**
+    /// `.github/workflows/route.yml` sends a fork's pull request and a
+    /// merge-queue ref to twelve GitHub-hosted shards of four EPYC cores each,
+    /// and every other event to one 1/1 lane on the T14's i5-1135G7. A row has
+    /// to say which in its [`Red::evidence`], because the difference is not
+    /// noise: one tip measured `xhci_full_speed_device` at 6,845 ms in the
+    /// first and 12,156 ms in the second on one day
+    /// (`issues/build/the-duration-profile-is-enforced-where-it-was-not-measured.md`).
     Ci,
     /// The dev host with the test run by itself. Cross-arch TCG on arm64.
     DevHostAlone,
@@ -2258,6 +2270,36 @@ pub const KNOWN_RED: &[Red] = &[
                    dev-host-alone rate",
         source: "issues/kernel/a-killed-peer-still-takes-a-write.md",
         measured: "2026-08-20",
+    },
+    // ---------------------------------------------------------------------
+    // The T14 guest lane, 2026-08-21. `985f3834` moved every trusted event's
+    // `guest` job from twelve hosted shards to one 1/1 lane on the T14, and
+    // `tests/test-durations` still holds what twelve hosted shards measured. The
+    // durations gate compares the two and reds — on `main`'s own tip as readily
+    // as on a pull request, and on a different set of names each run.
+    //
+    // **Not a red about the tree, and the row is here so nobody re-derives
+    // that.** `main`'s tip measured 6,845 ms in the profile's own hosted
+    // twelve-way shape hours earlier (merge-queue run 32505371471, green, no
+    // name over the ceiling), and twenty interleaved reps an arm on the T14
+    // cannot tell that tip from the tree the profile was recorded on:
+    // p = 0.42, and each arm put 2 of 20 reps over the line.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "xhci_full_speed_device",
+        instrument: Instrument::Ci,
+        finding: Finding::fires(3, 3),
+        standing: Standing::Stands,
+        what: "the durations gate and not the test, which passes: `xhci_full_speed_device \
+               measured 10166 ms in CI, over the 10000 ms line, but xhci_full_speed_device \
+               remains Fast` — 10,166 ms on the pull request, and 11,076 and 12,156 ms on \
+               `main`'s own tip, against a committed 6,900 ms that twelve hosted shards \
+               measured and still measure",
+        evidence: "the three consecutive T14 1/1 `guest` lanes of 2026-08-21: runs 32498159547 \
+                   (`main` 07f89c8b, 9 names over the ceiling), 32506479551 (`main` 13953023, \
+                   5) and 32513441183 (PR #199, 1)",
+        source: "issues/build/the-duration-profile-is-enforced-where-it-was-not-measured.md",
+        measured: "2026-08-21",
     },
 ];
 
