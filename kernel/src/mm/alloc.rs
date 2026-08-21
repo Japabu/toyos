@@ -77,6 +77,200 @@ unsafe impl dlmalloc::Allocator for KernelPageSource {
     }
 }
 
+/// The heap tripwire: a band of known bytes on each side of every allocation,
+/// read back when it is freed and, for the allocations that matter most, while
+/// they are still live.
+///
+/// **It exists because the allocator's own answer was too expensive.**
+/// `dlmalloc` carries Doug Lea's full consistency checker behind its `debug`
+/// cargo feature — `check_malloc_state` walks all 32 smallbins, all 32
+/// treebins and every chunk of every segment at the head of *every* `malloc`
+/// and `free`. That is the right oracle at the wrong price: this heap runs to
+/// several MiB by the end of boot, so the walk is O(heap) per allocation and a
+/// TCG guest carrying it does not finish a boot in a storm's lifetime. The
+/// bands below cost two writes per allocation and two reads per free, and they
+/// answer the question this class actually poses — *is something writing
+/// outside an allocation it owns* — rather than the one the checker answers,
+/// which is whether the free lists still hang together afterwards.
+///
+/// What each side catches:
+///
+/// * The **tail** catches an overrun off the end. 32 bytes, which is
+///   `dlmalloc`'s `min_chunk_size` on x86-64, so a near miss lands here and not
+///   in the next chunk's header where it would be indistinguishable from
+///   allocator state.
+/// * The **head** catches an underrun, and it is as wide as the request's
+///   alignment. That is not a rounding accident: a task's kernel stack is
+///   `OwnedAlloc::new(KERNEL_STACK_SIZE, 4096)`, so under this feature it gets
+///   **4096 bytes of head band**, and a kernel stack that walks off its own
+///   bottom writes into that band instead of into the neighbouring chunk. It is
+///   the guard page `arch::percpu` gives every *idle* stack, in the one form
+///   available to an allocation that comes out of the heap.
+///
+/// Neither band is swept — there is no registry of live allocations to sweep —
+/// so a band is read at `dealloc`, which is late, and by [`check_live`] at
+/// whatever site cares, which is not. `sched::driver`'s pass reads the running
+/// task's bands every pass, which is the both-ends pattern `sched-tripwire`
+/// established: a band broken at the entry to a pass was broken before that
+/// pass ran a statement.
+///
+/// **The one behaviour it changes.** A request within `head + TAIL` bytes of
+/// `MAX_HEAP_ALLOC` fits the ceiling and its banded form does not, so it is
+/// answered `null` here and would have succeeded without the feature.
+/// `OwnedAlloc::new` hands that back as `None`; a `Vec` would reach
+/// `handle_alloc_error`. This is a diagnostic build and the window is 4 KiB
+/// wide at the very top of a 2 MiB ceiling, so it is recorded rather than
+/// papered over.
+#[cfg(feature = "heap-tripwire")]
+mod tripwire {
+    use core::alloc::Layout;
+
+    /// Bytes past the payload.
+    const TAIL: usize = 32;
+    /// The narrowest head band. Every alignment up to this divides it, so the
+    /// payload stays aligned whichever arm `head` takes.
+    const MIN_HEAD: usize = 32;
+
+    /// The last 32 bytes of the head band, immediately before the payload.
+    const OPEN: u64 = 0x4845_4144_5a4f_4e45;
+    const CLOSE: u64 = 0x5a4f_4e45_4441_4548;
+    /// Every head byte before those 32, and every tail byte.
+    const FILL: u8 = 0x5a;
+
+    /// Head bytes for a request of this alignment.
+    const fn head(align: usize) -> usize {
+        if align > MIN_HEAD { align } else { MIN_HEAD }
+    }
+
+    /// What is actually asked of `dlmalloc`.
+    pub fn outer(layout: Layout) -> Layout {
+        let size = layout.size() + head(layout.align()) + TAIL;
+        // The alignment is unchanged and the size only grew, so the only way
+        // this fails is a size past `isize::MAX` — which the `MAX_HEAP_ALLOC`
+        // assert in the caller has already refused.
+        Layout::from_size_align(size, layout.align()).expect("heap-tripwire: banded layout")
+    }
+
+    /// Write the bands and hand back the payload. A null base stays null: a
+    /// refused allocation is still refused.
+    ///
+    /// # Safety
+    /// `base` is null, or points at `outer(layout)` bytes the caller owns.
+    pub unsafe fn arm(base: *mut u8, layout: Layout) -> *mut u8 {
+        if base.is_null() {
+            return base;
+        }
+        let head = head(layout.align());
+        let payload = base.add(head);
+        core::ptr::write_bytes(base, FILL, head - 32);
+        payload.sub(32).cast::<u64>().write_unaligned(OPEN);
+        payload.sub(24).cast::<u64>().write_unaligned(layout.size() as u64);
+        payload.sub(16).cast::<u64>().write_unaligned(layout.align() as u64);
+        payload.sub(8).cast::<u64>().write_unaligned(CLOSE);
+        core::ptr::write_bytes(payload.add(layout.size()), FILL, TAIL);
+        payload
+    }
+
+    /// Read the bands back and hand back what `dlmalloc` was given.
+    ///
+    /// # Safety
+    /// `ptr` and `layout` are a pair this module's [`arm`] produced.
+    pub unsafe fn disarm(ptr: *mut u8, layout: Layout) -> (*mut u8, Layout) {
+        check(ptr, layout, "dealloc");
+        // The rest of the head band, which [`check`] deliberately skips. Only
+        // here: it is `align - 32` bytes wide, 4064 of them on a kernel stack,
+        // and a live site pays that on every visit.
+        let head = head(layout.align());
+        for i in 0..head - 32 {
+            let byte = ptr.sub(head).add(i).read();
+            assert!(
+                byte == FILL,
+                "HEAP TRIPWIRE (dealloc): {ptr:?} was written {} bytes BELOW its {}-byte \
+                 allocation — head band byte +{i} of {} is {byte:#04x}, want {FILL:#04x}",
+                head - i, layout.size(), head - 32,
+            );
+        }
+        (ptr.sub(head), outer(layout))
+    }
+
+    /// The two edges of an allocation that is still live: the record
+    /// immediately below the payload, and the whole tail band.
+    ///
+    /// **The record and not the whole head band, and that is the design.** Both
+    /// are eight-word reads, so a caller on the scheduler's pass path can
+    /// afford them — and the record sits at the very top of the head band,
+    /// immediately below the payload, which is the first thing a stack walking
+    /// off its own bottom writes. Widening this to the full band would buy
+    /// nothing a stack overflow does not already trip, at 508 more reads per
+    /// pass.
+    ///
+    /// # Safety
+    /// `ptr` and `layout` are a pair this module's [`arm`] produced, and
+    /// nothing is freeing that allocation concurrently.
+    pub unsafe fn check(ptr: *mut u8, layout: Layout, site: &str) {
+        let open = ptr.sub(32).cast::<u64>().read_unaligned();
+        let size = ptr.sub(24).cast::<u64>().read_unaligned();
+        let align = ptr.sub(16).cast::<u64>().read_unaligned();
+        let close = ptr.sub(8).cast::<u64>().read_unaligned();
+        assert!(
+            open == OPEN && close == CLOSE
+                && size == layout.size() as u64
+                && align == layout.align() as u64,
+            "HEAP TRIPWIRE ({site}): the head record of {ptr:?} is not the one that was written \
+             — open {open:#018x} (want {OPEN:#018x}), close {close:#018x} (want \
+             {CLOSE:#018x}), recorded {size}/{align}, holder says {}/{}. On a 4096-aligned \
+             allocation this is the first word a kernel stack running off its own bottom \
+             reaches.",
+            layout.size(), layout.align(),
+        );
+        for i in 0..TAIL / 8 {
+            let word = ptr.add(layout.size()).cast::<u64>().add(i).read_unaligned();
+            assert!(
+                word == u64::from_ne_bytes([FILL; 8]),
+                "HEAP TRIPWIRE ({site}): {ptr:?} was written past its {}-byte allocation — \
+                 tail band word +{} is {word:#018x}",
+                layout.size(), i * 8,
+            );
+        }
+    }
+}
+
+/// The tripwire's absent half: every entry point, costing nothing.
+#[cfg(not(feature = "heap-tripwire"))]
+mod tripwire {
+    use core::alloc::Layout;
+
+    #[inline(always)]
+    pub fn outer(layout: Layout) -> Layout { layout }
+
+    /// # Safety
+    /// Trivially sound: it hands back its argument.
+    #[inline(always)]
+    pub unsafe fn arm(base: *mut u8, _layout: Layout) -> *mut u8 { base }
+
+    /// # Safety
+    /// Trivially sound: it hands back its arguments.
+    #[inline(always)]
+    pub unsafe fn disarm(ptr: *mut u8, layout: Layout) -> (*mut u8, Layout) { (ptr, layout) }
+}
+
+/// Read the bands of a *live* heap allocation.
+///
+/// For an allocation whose corruption would otherwise not be found until it is
+/// freed, and whose freeing is far too late — the kernel stacks, which are
+/// freed only once the task that ran off one is already gone.
+///
+/// Behind the feature rather than a no-op without it, because its one caller is
+/// too: a shipping kernel that could call this could only be told "no".
+///
+/// # Safety
+/// `ptr` and `layout` are a pair `GlobalAlloc::alloc` returned, and nothing is
+/// freeing that allocation concurrently.
+#[cfg(feature = "heap-tripwire")]
+pub unsafe fn check_live(ptr: *mut u8, layout: Layout, site: &str) {
+    tripwire::check(ptr, layout, site)
+}
+
 struct KernelAllocator {
     dlmalloc: Lock<dlmalloc::Dlmalloc<KernelPageSource>>,
     phase: AtomicU8,
@@ -140,16 +334,27 @@ unsafe impl GlobalAlloc for KernelAllocator {
                 assert!(layout.size() <= MAX_HEAP_ALLOC,
                     "GlobalAlloc: {} bytes exceeds MAX_HEAP_ALLOC ({}) — a caller is using alloc for page-scale memory",
                     layout.size(), MAX_HEAP_ALLOC);
-                let mut dlm = self.dlmalloc.lock();
-                dlm.malloc(layout.size(), layout.align())
+                // The bands are written after the lock is dropped and read
+                // before it is taken, so the tripwire never runs inside
+                // `dlmalloc.lock()` — the DESIGN RULE above is what makes that
+                // placement load-bearing rather than tidy: a band that fails
+                // inside the lock would abandon the heap with the lock held,
+                // and the report would never reach the wire.
+                let outer = tripwire::outer(layout);
+                let base = {
+                    let mut dlm = self.dlmalloc.lock();
+                    dlm.malloc(outer.size(), outer.align())
+                };
+                tripwire::arm(base, layout)
             }
         }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if is_early_ptr(ptr) { return; }
+        let (base, outer) = tripwire::disarm(ptr, layout);
         let mut dlm = self.dlmalloc.lock();
-        dlm.free(ptr, layout.size(), layout.align());
+        dlm.free(base, outer.size(), outer.align());
     }
 }
 

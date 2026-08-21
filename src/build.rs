@@ -1640,6 +1640,15 @@ mod tests {
                 "boot-actuators",
                 "debug-wait",
                 "fpu-save-nothing",
+                // `sched-tripwire`'s twin one layer down: a band of known bytes
+                // on each side of every heap allocation, read back at `dealloc`
+                // and — for the running task's kernel stack — at every pass. It
+                // earns a build of its own because the bands change what
+                // `GlobalAlloc::alloc` returns, which no boot parameter can
+                // reach: an allocation minted under one arm and freed under the
+                // other is a miscomputed base address. No suite builds it, so a
+                // full run pays nothing and a boot storm asks for it by name.
+                "heap-tripwire",
                 // `wake-fence-off`'s twin, for the completion core: turned on
                 // only by `kernel-loom`, to make the inbox's record
                 // publication relaxed and prove `inbox` reds without the

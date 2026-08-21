@@ -242,6 +242,15 @@ pub fn report_contexts(rsp: u64, subject: Option<u64>) {
             ),
         }
     }
+    // The depth ladder's answer, if this kernel carries one. Zero means either
+    // no `heap-tripwire` or no task stack that ever reached the shallowest
+    // rung, and the two are told apart by which kernel was booted — a fact the
+    // capture already carries. A task kernel stack is 128 KiB of the same
+    // dlmalloc arena as the `BTreeMap` nodes this class keeps killing, so how
+    // close one has ever come to its own bottom is the first thing to rule out.
+    if let Some((used, of)) = crate::sched::driver::stack_high_water() {
+        crate::log!("  Task kernel stacks: deepest {used} of {of} bytes");
+    }
 }
 
 /// The frame `context_switch` is about to pop, when its return slot is not a

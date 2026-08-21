@@ -13,6 +13,11 @@ mod mmio;
 mod region;
 mod unmapped;
 
+/// Only the ladder in `sched::driver` reads a live allocation's bands, and it
+/// is behind the same feature — so exporting this unconditionally would be a
+/// name nothing in a shipping kernel can call.
+#[cfg(feature = "heap-tripwire")]
+pub use alloc::check_live as check_heap_bands;
 pub use mmio::Mmio;
 pub use region::KernelSlice;
 pub use unmapped::Unmapped;

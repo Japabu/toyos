@@ -217,3 +217,163 @@ neighbours in one arena, which is a shape worth ruling in or out early.
   ready band, the park map and the dying list at both ends of the driver's
   exclusive region — so a red says *when*, and a red at the entry means the
   container was already broken before that pass ran a statement.
+
+---
+
+## 2026-08-21: the heap gets its own tripwire, three candidates close, and the class stops
+
+`sched-tripwire` cleared its own subject and handed the class to the heap. This
+session asked the heap the same question — *did anything write outside an
+allocation it owns* — closed three of the four mechanisms that were open, and
+found that the instrument built to catch the class makes it stop happening.
+
+### The headline: 7,205 boots, no deaths
+
+Same host, same recipe, same twelve-wide shape, thirty minutes, against the arms
+already on record above:
+
+| arm | kernel | boots | deaths | one per |
+|---|---|---|---|---|
+| A | `e4c2c8ff`, untouched | 6,576 | 1 | 6,576 |
+| B | + `sched-tripwire` | 7,136 | 12 | 595 |
+| C | + that diff, feature off | 6,361 | 2 | 3,181 |
+| **H** | **+ `sched-tripwire` + `heap-tripwire`** | **7,205** | **0** | **—** |
+
+Arm H differs from arm B in exactly one thing: the heap bands. Under arm B's
+measured rate, 7,205 boots expect **12.1** deaths; H has none. Poisson,
+p ≈ 5.5 × 10⁻⁶. The boot rate is arm B's — slot 5 was on its 425th boot 1,318 s
+in, 3.1 s a boot against arm B's 3.0 — so this is not fewer boots, and the one
+capture the script kept is a guest that missed its 30 s ceiling, not a panic.
+
+**And no band fired in any of those 7,205 boots.**
+
+### What that does and does not establish
+
+Two readings survive it, and this session cannot separate them:
+
+* **The bands absorb it.** The writer overruns by no more than 32 bytes past the
+  end of an allocation, or by no more than the alignment before its start, and
+  the band now takes the write that used to land in the neighbouring chunk. That
+  no band *fired* is consistent with this and not evidence against it: a band is
+  read at `dealloc` and — for the running task's kernel stack — at every pass,
+  and nowhere else. An allocation that lives from early boot to `compositor:
+  ready` is never freed inside a boot, so its band is never read.
+* **The bands displace it.** Every allocation in the machine moves by between 32
+  and 4,096 bytes, so whatever pointer arithmetic goes wrong now lands somewhere
+  that does not matter. This is the ordinary way a heisenbug answers an
+  instrument.
+
+**What separates them is a sweep**, and there are two shapes for one. Widen the
+head band to carry an intrusive `prev`/`next` and put every live allocation on a
+list, which costs a lock on every allocation; or scan for the bands instead of
+listing them — `KernelPageSource` is the only thing that hands `dlmalloc` a page,
+so the kernel knows every 2 MiB page the heap owns, and a scan for the head
+record's magic at eight-byte alignment finds every band in it without a registry
+at all. Either one, run once per boot at the completion marker, turns "no band
+fired" into either a named victim or a real negative. That is what is owed next,
+and it is why `heap-tripwire` is a poor arm for *reproducing* the class even
+though it is a good one for bounding it.
+
+### What the allocator already answers, and has never once complained
+
+`dlmalloc` is **unmodified crates.io `0.2.13`** (`kernel/Cargo.lock`), so nothing
+in it is ours to have broken. More to the point, its `Dlmalloc::free` already
+runs an *unconditional* check on every `dealloc` this kernel has ever done —
+`validate_size` (`src/lib.rs:143`, `src/dlmalloc.rs:1196`):
+
+```rust
+let psize = Chunk::size(Chunk::from_mem(ptr));
+let min_overhead = self.overhead_for(p);
+assert!(psize >= size + min_overhead);
+assert!(psize <= size + max_overhead);
+```
+
+That is every `dealloc`'s `(ptr, layout)` pair checked against the chunk header
+the allocator itself wrote, in the **shipping** build, and it has not fired in
+any capture on record. The PMM says the same thing one layer down with
+`assert!(!bm.is_free(idx), "double free of physical page")`
+(`kernel/src/mm/pmm.rs:308`). **So the class is neither a mismatched free nor a
+double free.** What is left is a write landing outside the allocation that owns
+it — which is what the bands were built to ask about.
+
+### Task kernel stacks are not the writer, and here is the number
+
+The most attractive unread hypothesis was this file's own closing note: a kernel
+stack is 128 KiB of the same dlmalloc arena as the `BTreeMap` nodes, with one
+canary word and no unmapped page beneath it. `arch::percpu` says in its own words
+what that costs, because it fixed it for the *other* two stack kinds —
+`IDLE_GUARD_SIZE`: *"an overflow used to land in the heap and be found later,
+somewhere else, as a corrupted allocation."* Idle stacks got an unmapped guard
+page, IST1 a fill-pattern guard. Task kernel stacks got neither.
+
+It also explained the amplifier: `sched-tripwire`'s `verify` puts a `[u64; 96]` —
+**768 bytes** — on the stack at every entry to `with_cpu`'s exclusive region,
+which is on the deepest path in the kernel, and 7.2× is what an extra 768 bytes
+per pass would look like against a stack that was nearly full.
+
+It is wrong. The depth ladder, on a clean two-CPU boot of the shape the storm
+uses:
+
+```
+kstack: a task kernel stack has been at least  4096 of 131072 bytes deep (tid=0)
+kstack: a task kernel stack has been at least  8192 of 131072 bytes deep (tid=0)
+kstack: a task kernel stack has been at least 16384 of 131072 bytes deep (tid=0)
+```
+
+and never the 32 KiB rung. **16 KiB of 128 KiB, with 96 KiB of headroom** — a
+margin 768 bytes cannot bridge. The amplifier remains measured and unexplained,
+and it is not stack depth.
+
+### The deferred release cannot be the writer either
+
+`issues/kernel/deferred-release-outlives-its-syscall.md` was the standing
+candidate: releases that run after the kill has returned, on another CPU. It is
+a real defect and it is not this one. `ZERO_QUEUE` is a `Lock<Vec<KObjectRef>>`
+(`kernel/src/object/mod.rs:339`) and every `KObjectRef` variant holds an
+`Arc<T>` (`:195`), so the queue **owns a strong reference** for as long as a
+batch is in flight, and `run_zero_handles` runs on `&self` through it. An
+object's heap node cannot be freed before, or while, a hook holds a reference
+into it. The asynchrony that queue produces is *semantic* — a syscall answering
+`Ok(22)` where the ABI says `NotFound` — and never a lifetime one.
+
+### What landed: `heap-tripwire`
+
+A band of known bytes on each side of every heap allocation
+(`kernel/src/mm/alloc.rs`), read back when it is freed and, for the running
+task's kernel stack, at every scheduler pass.
+
+* The **tail** is 32 bytes — `dlmalloc`'s `min_chunk_size` on x86-64 — so a near
+  miss lands there rather than in the next chunk's header, where it would be
+  indistinguishable from allocator state.
+* The **head** is as wide as the request's alignment. That is the design and not
+  a rounding accident: `alloc_kernel_stack` asks for `(KERNEL_STACK_SIZE, 4096)`,
+  so a task kernel stack gets **4,096 bytes of head band**, whose last 32 bytes —
+  the record carrying the size and alignment the allocation was made with — sit
+  immediately below the lowest usable stack word. A stack running off its own
+  bottom writes there first. It is the guard page the idle stacks have, in the
+  one form available to an allocation that comes out of the heap.
+* The **ladder** is nine volatile reads per pass at fixed depths, reported by
+  `hw::report_contexts` on every kernel crash.
+
+**Not `dlmalloc/debug`, and that is measured rather than preferred.** The crate
+carries Doug Lea's own checker behind that feature, and `check_malloc_state`
+walks all 32 smallbins, all 32 treebins and every chunk of every segment at the
+head of *every* `malloc` and `free`. It is the better oracle at O(heap) per
+allocation on a heap that reaches several MiB — a price a TCG boot storm cannot
+pay.
+
+### A hazard the instrument found in itself, which is worth the arm it cost
+
+The first draft logged the high water the moment it rose, from inside
+`check_stack_canary` — which runs inside `with_cpu`'s exclusive region. **Four of
+the first twelve-wide arm's guests wedged in six minutes**, every one in the
+spawn burst, every one with the previously-logged rung as its last line, and
+every one recorded as a hang rather than a panic. `sched-tripwire`'s three arms
+had no hang between them.
+
+`crate::log!` is not a leaf. The log's own readiness path reaches
+`driver::pass` — `post_readiness+0x98` above `pass+0x94` is in one of this file's
+own captures — so **a log emitted from inside a pass can re-enter the pass**.
+`sched-tripwire`'s own `log!` gets away with it only because a `panic!` follows
+and it never has to return. The number now lives in an atomic that nothing logs
+from where it is written.
