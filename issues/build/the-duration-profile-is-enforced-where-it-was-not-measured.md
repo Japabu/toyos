@@ -180,6 +180,37 @@ there is no dispatched run to point at): the `HOSTED` expression traced by
 hand through the affected consumers, `cargo test --lib` green throughout.
 Prospective until the first hosted nightly actually runs, 2026-08-22 03:00Z.
 
+## 2026-08-22: the enforcing instrument is the measuring one again
+
+The routing was moved for a different reason — the T14's one worker had
+thirteen runs of branch traffic queued behind one nightly gate A, and
+`issues/build/the-t14-has-one-lane-and-the-nightly-wants-three.md` carries that
+measurement — and this file is downstream of it. `route.yml`'s `HOSTED` now
+covers `merge_group`, `pull_request` from anywhere, `push`, and `ci.yml`'s
+`schedule`; only a `workflow_dispatch` and a non-`ci.yml` `schedule` reach the
+T14.
+
+So the gap this file is about is now a corner rather than the common case: a
+pull request's guest lane is twelve hosted shards again, which is the shape
+`tests/test-durations` was measured in, and the price verdict renders for real
+on the run that introduces a name. The softening in `ci.yml`'s `durations` job
+stays, because a dispatched T14 lane is still a whole partition measured on the
+wrong instrument, and `src/ci.rs`'s
+`the_softened_duration_verdict_is_the_one_the_merge_actually_raises` still holds
+the match string. Two of the three bullets below moved with it:
+
+* the `UNMEASURED` round trip takes its one bought measurement on the hosted
+  shards again, on the pull request itself, so an author no longer commits a
+  T14 number into a hosted profile or waits for the merge queue to adjudicate
+  one;
+* `src/redlist.rs`'s `xhci_full_speed_device` row is a record of four T14 lanes
+  that a pull request no longer runs.
+
+What is unchanged is the fact this file exists for: `tests/test-durations` holds
+one number per test with no record of which machine took it, and the two
+machines that wear `Instrument::Ci` do not price alike. A dispatch, a nightly
+gate A, or any future routing that puts a lane back on the T14 meets it again.
+
 ## What remains
 
 * **`src/redlist.rs`'s `xhci_full_speed_device` row is now about a warning.**
