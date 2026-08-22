@@ -5,12 +5,13 @@
 //! workload, and a scenario that takes ten thousand steps to quiesce buys one
 //! schedule per second instead of a thousand.
 
+use toyos_sched::cpu::Balance;
 use toyos_sched::queue::FairOrder;
 use toyos_sched::task::WaitClass;
 
 use crate::vm::RUN_CHUNK_NS;
 use crate::workload::{
-    AgeShape, BalanceShape, BlockShape, ChargeShape, IrqSpec, MigrateShape, Op, ParkShape,
+    AgeShape, BlockShape, ChargeShape, IrqSpec, MigrateShape, Op, ParkShape,
     PlacementShape, ProcSpec, Protocol, QueueSpec, Scenario, Script, ShareShape, WindowShape,
 };
 
@@ -41,7 +42,7 @@ fn scenario(
         share: ShareShape::PerProcess,
         charge: ChargeShape::Honest,
         placement: PlacementShape::LeastLoadedRotating,
-        balance: BalanceShape::Pull,
+        balance: Balance::Pull,
         order: FairOrder::InsertSequence,
         pass_cost_ns: 0,
         fair_allowance_ns: 0,
@@ -1394,7 +1395,7 @@ pub const STORM_ROUNDS: usize = 4;
 ///
 /// `sim/tests/policy.rs` measures how long the machine takes to start working
 /// and how long it takes to finish, against a bound derived from the protocol,
-/// with [`BalanceShape::None`] as the control.
+/// with [`Balance::None`] as the control.
 pub fn lopsided_placement(cpus: usize, threads: usize, work: u64) -> Scenario {
     let mut scenario = scenario(
         "lopsided_placement",

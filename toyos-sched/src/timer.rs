@@ -10,6 +10,14 @@
 //! have to remember to retire both. It did not — `fire_deadlines` discarded the
 //! index entry of a claim it lost and left the entry's copy standing, which is
 //! a CPU reporting a deadline nothing will fire.
+//!
+//! **Not every arming is a deadline.** [`TimerPlan::no_later_than`] lets a caller
+//! pull the arming forward for a reason nothing in this module knows about — a
+//! CPU that wants waking to look for work again. It moves the instant in one
+//! direction only, which is what keeps invariant T out of it: the invariant
+//! bounds the armed instant from above by the earliest event the CPU owes, so
+//! an extra wake before that instant is a spurious pass and never a missed
+//! deadline.
 
 use crate::hw::Nanos;
 
@@ -33,6 +41,23 @@ impl TimerPlan {
             (Some(q), None) => TimerPlan::Arm(q),
             (None, Some(d)) => TimerPlan::Arm(d),
             (None, None) => TimerPlan::Stop,
+        }
+    }
+
+    /// Pull the arming forward to `at`, if a caller has a reason to be woken
+    /// that no parked deadline and no quantum accounts for — today
+    /// [`crate::cpu::Balance::PullWithRearm`]'s re-probe, and nothing else.
+    ///
+    /// One direction only, and that is what keeps invariant T out of it: the
+    /// invariant bounds the armed instant from *above* by the earliest event the
+    /// CPU owes, so a plan that only ever moves earlier cannot violate it. A
+    /// method that could move the arming later would be a missed deadline
+    /// waiting for a caller.
+    pub fn no_later_than(self, at: Option<Nanos>) -> Self {
+        match (self, at) {
+            (_, None) => self,
+            (TimerPlan::Stop, Some(at)) => TimerPlan::Arm(at),
+            (TimerPlan::Arm(planned), Some(at)) => TimerPlan::Arm(planned.min(at)),
         }
     }
 

@@ -31,7 +31,7 @@ use crate::mailbox::{
 };
 use crate::msg::Msg;
 use crate::queue::RunQueue;
-use crate::sync::{Arc, AtomicU32, Ordering};
+use crate::sync::{fence, Arc, AtomicU32, Ordering};
 #[cfg(feature = "check")]
 use crate::sync::AtomicU64;
 use crate::task::{
@@ -273,6 +273,36 @@ pub struct CpuSched<X: SchedPayload> {
     /// bounded by the quantum arm, which is what keeps invariant I4's new term
     /// exactly one chunk wide.
     aged_grant: bool,
+    /// How many times this CPU has re-armed its timer purely to probe again
+    /// since it last dispatched anything — [`Balance::PullWithRearm`]'s bound.
+    ///
+    /// **Counted up from zero and cleared at every dispatch, rather than
+    /// counted down from an allowance.** The allowance lives in the policy, and
+    /// a CPU has no policy until a pass hands it one: a countdown initialized
+    /// here would start at zero on a CPU that had never run a pass, so the one
+    /// CPU the re-arm exists for — the one that halted at boot before any
+    /// sibling published a surplus — would be the one CPU it never fired on.
+    /// Measured that way round: 0 of 20 seeds at eight CPUs, which is
+    /// [`Balance::Pull`]'s own number exactly.
+    ///
+    /// Clearing it at every dispatch is what makes the bound per *idle period*
+    /// rather than per run: a CPU that is given work and later goes idle again
+    /// gets the same allowance, and one that has spent it halts for good until
+    /// something real wakes it — so a machine with nothing to run stops ticking
+    /// after `times × every_ns` instead of waking for ever.
+    idle_probes_spent: u32,
+    /// Where [`Balance::PushOnSurplus`]'s next push starts looking for a
+    /// sleeping CPU.
+    ///
+    /// A pass pushes to **one** CPU, and without this it is the same CPU every
+    /// time: the target posts its probe and halts again with SLEEPING still
+    /// published, so the next pass re-pokes the CPU that is already coming and
+    /// the CPU behind it waits for the first one's probe to be *answered*. Two
+    /// passes per sleeper instead of one, measured at 130,000,000 ns of probe
+    /// gap on an eight-CPU lopsided machine against the 44,000,000 ns four CPUs
+    /// cost. The cursor makes consecutive pushes walk the machine, so `k`
+    /// sleeping CPUs are reached in `k` passes.
+    push_cursor: u32,
     loaded: Loaded,
     loaded_ctx: *mut X::Ctx,
     idle_ctx: Box<X::Ctx>,
@@ -310,6 +340,8 @@ impl<X: SchedPayload> CpuSched<X> {
             steal_requests: Vec::new(),
             quantum_end: Nanos::ZERO,
             aged_grant: false,
+            idle_probes_spent: 0,
+            push_cursor: 0,
             loaded: Loaded::Idle,
             loaded_ctx,
             idle_ctx,
@@ -394,6 +426,18 @@ impl<X: SchedPayload> CpuSched<X> {
 
     pub fn mailbox_is_empty(&self) -> bool {
         self.mailbox.is_empty()
+    }
+
+    /// Is a steal probe from this CPU still on its way to a victim?
+    ///
+    /// The node's in-flight flag *is* the answer (spec §7.7), so this asks the
+    /// mechanism rather than a shadow of it. It exists for one reader: the
+    /// simulator's probe-gap instrument, which measures how long a halted CPU
+    /// sits with a surplus published next door and no probe outstanding — the
+    /// quantity [`Balance::PullWithRearm`] and [`Balance::PushOnSurplus`] are
+    /// judged on.
+    pub fn probe_outstanding(&self) -> bool {
+        self.steal_probe.in_flight()
     }
 
     /// The number of ready tasks, republished to the handle every pass for
@@ -500,6 +544,8 @@ impl<X: SchedPayload> CpuSched<X> {
                 (core::mem::offset_of!(Self, steal_requests), "steal_requests"),
                 (core::mem::offset_of!(Self, quantum_end), "quantum_end"),
                 (core::mem::offset_of!(Self, aged_grant), "aged_grant"),
+                (core::mem::offset_of!(Self, idle_probes_spent), "idle_probes_spent"),
+                (core::mem::offset_of!(Self, push_cursor), "push_cursor"),
                 (core::mem::offset_of!(Self, loaded), "loaded"),
                 (core::mem::offset_of!(Self, loaded_ctx), "loaded_ctx"),
                 (core::mem::offset_of!(Self, idle_ctx), "idle_ctx"),
@@ -577,6 +623,131 @@ impl<X: SchedPayload> CpuSched<X> {
     }
 }
 
+/// What the balance path does — the one policy value in [`Env`].
+///
+/// [`Balance::Pull`] is what ships and what spec §7.7 and §9.4's pull half
+/// describe: an idle pass probes the CPU publishing the most surplus, a loaded
+/// pass answers a probe out of `pop_surplus`, and nothing else moves a task
+/// between CPUs. [`Balance::None`] is the control that says what the rest of the
+/// protocol does without it.
+///
+/// **The other two are candidate cures, and neither is shipped.** The pull path
+/// is one-shot: [`SchedPass::post_steal_probe`] posts at most one probe per idle
+/// trip and returns without posting anything if no CPU publishes a surplus of
+/// two, so a CPU that reached its idle pass while every sibling still published
+/// zero halts with no probe outstanding and nothing in this protocol wakes it —
+/// there is no push half, and a loaded CPU never announces that it has surplus.
+/// Measured on a lopsided machine at 20 seeds per width, 0 of 20 seeds reach
+/// every CPU at eight; `sim/tests/policy.rs` carries the tables and
+/// `issues/kernel/an-idle-cpu-that-slept-before-the-surplus-is-never-probed.md`
+/// carries the decision the two below are owed against.
+///
+/// Both cost an idle CPU wakes it is currently right to be without
+/// (`kernel/CLAUDE.md`: anything added to the idle loop is an audio change), so
+/// they exist here to be **measured**, behind a knob the simulator selects and
+/// the kernel does not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Balance {
+    /// No probe and no answer. A task woken or placed onto a busy CPU waits
+    /// there until that CPU's own queue reaches it.
+    None,
+    /// Spec §7.7 and §9.4's pull half, one-shot — what `kernel::sched::driver`
+    /// selects.
+    Pull,
+    /// Pull, plus a **bounded re-arm**: a CPU that halts with nothing to run
+    /// programs its one-shot timer `every_ns` ahead so it wakes and probes
+    /// again, up to `times` times per idle period. The counter is refilled the
+    /// moment the CPU dispatches anything, so the bound is per idle period and
+    /// a machine that stays idle past `times × every_ns` stops ticking
+    /// altogether.
+    ///
+    /// It needs no observation of anything: the timer fires whether or not a
+    /// sibling ever published a surplus, which is the whole difference between
+    /// this and the push below.
+    PullWithRearm { every_ns: u64, times: u32 },
+    /// Pull, plus a **push**: a pass that publishes a surplus of at least
+    /// `threshold` rings the doorbell of one CPU that reads SLEEPING, which
+    /// makes that CPU's own idle pass run again and probe.
+    ///
+    /// **It rests on an observation, and the observation is one half of
+    /// Dekker's pair** — see [`balance_fence`]. The pusher stores its surplus
+    /// and then loads the sleeper's SLEEPING bit; the sleeper stores SLEEPING
+    /// and then loads the surplus. Without a `SeqCst` fence between each side's
+    /// store and its load, both may miss, and the CPU sleeps through a surplus
+    /// exactly as it does under [`Balance::Pull`] — a narrower window on the
+    /// same defect. `toyos-sched/loom/tests/loom_push.rs` is the model.
+    PushOnSurplus { threshold: u32 },
+}
+
+impl Balance {
+    /// Does the pull half run at all? Every cure is built on it — a push and a
+    /// re-arm both end in a `StealRequest` that a loaded pass has to answer.
+    pub fn pulls(self) -> bool {
+        !matches!(self, Balance::None)
+    }
+
+    /// The re-arm's period and repeat count, or `None` for a policy without
+    /// one.
+    pub fn rearm(self) -> Option<(u64, u32)> {
+        match self {
+            Balance::PullWithRearm { every_ns, times } => Some((every_ns, times)),
+            _ => None,
+        }
+    }
+
+    /// The surplus at which a pass pushes, or `None` for a policy that never
+    /// pushes.
+    pub fn push_threshold(self) -> Option<u32> {
+        match self {
+            Balance::PushOnSurplus { threshold } => Some(threshold),
+            _ => None,
+        }
+    }
+}
+
+/// The store/load barrier [`Balance::PushOnSurplus`] is made of.
+///
+/// The push is the store-buffer litmus test wearing scheduler clothes. The CPU
+/// that gained surplus does
+///
+/// ```text
+/// surplus.store(n);  ...  doorbell.load()   // "is anybody asleep?"
+/// ```
+///
+/// and the CPU going to sleep does
+///
+/// ```text
+/// doorbell.store(SLEEPING);  ...  surplus.load()   // "is there anything to steal?"
+/// ```
+///
+/// Each side stores to one location and loads the other. With plain accesses
+/// both loads may return the pre-store value — on x86 because a store sits in
+/// the store buffer while a later load bypasses it, and in the C11 model because
+/// nothing orders a store against a subsequent load at all. Both sides then
+/// decide "nothing to do", and the sleeper halts with a surplus published and no
+/// probe outstanding: [`Balance::Pull`]'s defect reproduced in a window a few
+/// nanoseconds wide instead of a few milliseconds.
+///
+/// A `SeqCst` fence between each side's store and its load is what forbids that
+/// outcome, and it is a real instruction on the push path — `mfence` on x86 —
+/// which is part of what the push costs. **A cargo feature rather than a
+/// comment, because a model that has never failed proves nothing**:
+/// `toyos-sched-loom`'s `push-fence-relaxed` weakens it to a release fence,
+/// which orders stores against stores and nothing against a later load, and
+/// `loom/tests/loom_push.rs` must red under it. No kernel build can turn the
+/// name on; the crate declares it only so `cfg` checking knows it.
+#[cfg(not(feature = "push-fence-relaxed"))]
+const PUSH_FENCE: Ordering = Ordering::SeqCst;
+#[cfg(feature = "push-fence-relaxed")]
+const PUSH_FENCE: Ordering = Ordering::Release;
+
+/// The barrier [`PUSH_FENCE`] describes, as the one function both halves of the
+/// push call — so the loom model exercises the shipped ordering rather than a
+/// restatement of it.
+pub fn balance_fence() {
+    fence(PUSH_FENCE);
+}
+
 /// The environment a pass runs against. One value, threaded by reference, so
 /// that a pass cannot be constructed without the pieces that make its effects
 /// deliverable.
@@ -587,10 +758,9 @@ pub struct Env<'e, H: Hw, P: PreemptGuard> {
     /// The pass runs preempt-disabled (spec §6.2), which is also what its own
     /// mailbox pushes need (N3).
     pub preempt: &'e P,
-    /// Whether an idle pass probes for work and a loaded pass answers probes
-    /// (spec §7.7, §9.4's pull half). A field and not a `cfg` so that both
-    /// settings stay compiled and simulatable.
-    pub steal: bool,
+    /// What the balance path does (spec §7.7, §9.4's pull half). A field and not
+    /// a `cfg` so that every setting stays compiled and simulatable.
+    pub balance: Balance,
 }
 
 impl<H: Hw, P: PreemptGuard> Clone for Env<'_, H, P> {
@@ -1494,9 +1664,14 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
             // Both are sampled after the pick, so neither counts the task this
             // CPU is about to run.
             let handle = self.env.cpus.get(self.cpu.id);
+            let surplus = self.cpu.rq.fair_len() as u32;
             handle.publish_load((self.cpu.rq.len() + self.cpu.dying.len()) as u32);
-            handle.publish_surplus(self.cpu.rq.fair_len() as u32);
+            handle.publish_surplus(surplus);
+            self.push_on_surplus(surplus);
             if self.cpu.running.is_some() {
+                // The re-arm's allowance is per idle period, so a CPU that is
+                // given work starts its next one with a full one.
+                self.cpu.idle_probes_spent = 0;
                 return self.switch_to_current();
             }
             if !self.cpu.is_idle() {
@@ -1694,7 +1869,7 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
     /// per-CPU scheduler record reading as a value no operation on it can
     /// produce is inside what that yields.
     fn answer_steal_requests(&mut self) {
-        if !self.env.steal {
+        if !self.env.balance.pulls() {
             self.cpu.steal_requests.clear();
             return;
         }
@@ -1712,9 +1887,22 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
     }
 
     fn apply_timer(&mut self) -> TimerApplied {
+        self.apply_timer_no_later_than(None)
+    }
+
+    /// [`Self::apply_timer`], with a wake this CPU wants for a reason the
+    /// deadline machinery knows nothing about — [`Balance::PullWithRearm`]'s
+    /// re-arm, and nothing else.
+    ///
+    /// It can only move the arming **earlier**, which is why it cannot break
+    /// invariant T: the invariant says the armed instant is no later than the
+    /// earliest event this CPU owes ([`crate::invariants::check_timer`]), and an
+    /// extra wake before that instant is a spurious pass, not a missed
+    /// deadline.
+    fn apply_timer_no_later_than(&mut self, extra: Option<Nanos>) -> TimerApplied {
         let deadline = self.cpu.earliest_deadline();
         let quantum = self.cpu.running.as_ref().map(|_| self.cpu.quantum_end);
-        let plan = TimerPlan::compute(quantum, deadline);
+        let plan = TimerPlan::compute(quantum, deadline).no_later_than(extra);
         match plan {
             TimerPlan::Arm(at) => self.env.hw.set_timer(at),
             TimerPlan::Stop => self.env.hw.stop_timer(),
@@ -1778,8 +1966,21 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
     /// arrived in between — stay awake and decide again.
     fn try_sleep(&mut self) -> Result<Action<<H as Hw>::Payload>, ()> {
         self.post_steal_probe();
-        let timer = self.apply_timer();
+        let rearm = self.rearm_deadline();
+        let timer = self.apply_timer_no_later_than(rearm);
         let arm: SleepArm<'_> = self.env.cpus.get(self.cpu.id).doorbell().arm_sleep();
+        // [`Balance::PushOnSurplus`]'s other half, and the half that makes the
+        // push an ordering rather than a hope: SLEEPING is published above, so
+        // reading the surplus *here*, behind the fence, is the load that pairs
+        // with the pusher's read of that bit. `post_steal_probe`'s own read is
+        // before the store and answers nothing about it.
+        if self.probe_still_owed() {
+            arm.abandon();
+            self.env.cpus.get(self.cpu.id).doorbell().begin_pass();
+            self.cpu.drain(self.env, self.now);
+            self.cpu.fire_deadlines(self.env, self.now);
+            return Err(());
+        }
         match arm.confirm(&self.cpu.mailbox) {
             Ok(quiesced) => Ok(Action::Idle(SleepToken::new(quiesced, timer))),
             Err(_awake) => {
@@ -1791,31 +1992,51 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
         }
     }
 
+    /// When [`Balance::PullWithRearm`] wants this CPU back, and the allowance it
+    /// spends to ask.
+    ///
+    /// `None` under every other policy and once the allowance is gone, which is
+    /// what makes the tick stop: a machine with nothing to run halts for good
+    /// after `times` probes rather than waking for ever.
+    fn rearm_deadline(&mut self) -> Option<Nanos> {
+        let (every_ns, times) = self.env.balance.rearm()?;
+        if self.cpu.idle_probes_spent >= times {
+            return None;
+        }
+        self.cpu.idle_probes_spent += 1;
+        Some(self.now.after(every_ns))
+    }
+
+    /// Did a surplus appear after this CPU published SLEEPING?
+    ///
+    /// Only [`Balance::PushOnSurplus`] asks, and only to close its own Dekker
+    /// window (see [`balance_fence`]): if the pusher missed our SLEEPING bit, we
+    /// must not also miss its surplus. Answering `true` sends the pass round
+    /// again, and the second trip's `post_steal_probe` reads the surplus behind
+    /// the same fence and posts — which is why this terminates: a probe in
+    /// flight is an answer, so the question is asked at most once per halt.
+    fn probe_still_owed(&self) -> bool {
+        if self.env.balance.push_threshold().is_none() {
+            return false;
+        }
+        if self.cpu.probe_outstanding() {
+            return false;
+        }
+        balance_fence();
+        self.best_victim().is_some()
+    }
+
     /// One probe at a time (spec §7.7): if the previous one is still in
     /// flight the claim fails and we simply do not post another — the
     /// outstanding probe will be answered, and this CPU sleeps with its
     /// doorbell armed.
     fn post_steal_probe(&mut self) {
-        if !self.env.steal {
+        if !self.env.balance.pulls() {
             return;
         }
-        // **Chosen by surplus and not by load**, which are two numbers because
-        // they answer two questions — see [`CpuHandle::surplus`]. The guard is
-        // the same inequality [`SchedPass::answer_steal_requests`] enforces
-        // (`fair_len() > 1`), read one CPU away: a victim that would refuse the
-        // probe is not probed, and the probe is spent on a CPU that can answer
-        // it.
-        let Some((victim, _)) = (0..self.env.cpus.len())
-            .map(|i| CpuId(i as u32))
-            .filter(|&cpu| cpu != self.cpu.id)
-            .map(|cpu| (cpu, self.env.cpus.get(cpu).surplus()))
-            .max_by_key(|&(_, surplus)| surplus)
-        else {
+        let Some(victim) = self.best_victim() else {
             return;
         };
-        if self.env.cpus.get(victim).surplus() < 2 {
-            return;
-        }
         let Some(slot) = self.cpu.steal_probe.claim() else {
             return;
         };
@@ -1828,6 +2049,66 @@ impl<H: Hw, P: PreemptGuard> SchedPass<'_, '_, H, P, Disposed> {
         ) == Kick::Send
         {
             self.env.hw.kick(victim);
+        }
+    }
+
+    /// The CPU a probe would be spent on, or `None` if none is worth probing.
+    ///
+    /// **Chosen by surplus and not by load**, which are two numbers because they
+    /// answer two questions — see [`CpuHandle::surplus`]. The guard is the same
+    /// inequality [`SchedPass::answer_steal_requests`] enforces
+    /// (`fair_len() > 1`), read one CPU away: a victim that would refuse the
+    /// probe is not probed, and the probe is spent on a CPU that can answer it.
+    ///
+    /// Factored out of [`SchedPass::post_steal_probe`] because
+    /// [`SchedPass::probe_still_owed`] must ask the *same* question after
+    /// publishing SLEEPING; two spellings of one inequality is how a push that
+    /// wakes a CPU its victim would refuse gets written.
+    fn best_victim(&self) -> Option<CpuId> {
+        let (victim, surplus) = (0..self.env.cpus.len())
+            .map(|i| CpuId(i as u32))
+            .filter(|&cpu| cpu != self.cpu.id)
+            .map(|cpu| (cpu, self.env.cpus.get(cpu).surplus()))
+            .max_by_key(|&(_, surplus)| surplus)?;
+        (surplus >= 2).then_some(victim)
+    }
+
+    /// [`Balance::PushOnSurplus`]: this pass has just published `surplus`, so
+    /// tell one sleeping CPU that there is something to come and get.
+    ///
+    /// **One CPU per pass, and a doorbell ring rather than a message.** The ring
+    /// is what [`crate::mailbox::Doorbell`] already does for every producer, and
+    /// its edge-coalescing does the rest: only the 0→1 kick edge on a target
+    /// that reads SLEEPING costs an IPI, so a target that already has one coming
+    /// is not kicked twice. The woken CPU finds an empty mailbox, runs its idle
+    /// pass again and posts an ordinary probe — the push adds no second way to
+    /// move a task, only a way to make the pull path run.
+    ///
+    /// The fence is [`balance_fence`]'s, and it is the price: an `mfence` on the
+    /// exit of every pass that has surplus, which under [`Balance::Pull`] costs
+    /// nothing because this returns before reaching it.
+    fn push_on_surplus(&mut self, surplus: u32) {
+        let Some(threshold) = self.env.balance.push_threshold() else {
+            return;
+        };
+        if surplus < threshold {
+            return;
+        }
+        balance_fence();
+        let n = self.env.cpus.len();
+        let me = self.cpu.id.0 as usize;
+        let base = self.cpu.push_cursor as usize;
+        let Some(target) = (0..n)
+            .map(|offset| (base + offset) % n)
+            .filter(|&cpu| cpu != me)
+            .map(|cpu| CpuId(cpu as u32))
+            .find(|&cpu| self.env.cpus.get(cpu).doorbell().sleeping())
+        else {
+            return;
+        };
+        self.cpu.push_cursor = (target.0 + 1) % n as u32;
+        if self.env.cpus.get(target).poke() == Kick::Send {
+            self.env.hw.kick(target);
         }
     }
 }
@@ -1925,6 +2206,23 @@ impl<M: SchedMsg> CpuHandle<M> {
     ) -> Kick {
         self.post.post(slot, msg, preempt);
         self.doorbell.ring(urgency)
+    }
+
+    /// Ring the doorbell with **no message behind it** — the whole of
+    /// [`Balance::PushOnSurplus`]'s effect on the target.
+    ///
+    /// A wake with nothing queued is exactly what the doorbell already tolerates
+    /// on the consumer side: `begin_pass` clears the edge, the drain finds an
+    /// empty mailbox, and the pass decides again from scratch. What the target
+    /// gains is that its idle disposition runs a second time, with the pusher's
+    /// surplus now visible to it.
+    ///
+    /// The returned [`Kick`] is the caller's obligation exactly as
+    /// [`Self::post`]'s is. `Urgency::Normal`, so the coalescing rule of §7.3
+    /// applies: a target that already has an IPI coming costs nothing, and a
+    /// busy target costs nothing at all.
+    pub fn poke(&self) -> Kick {
+        self.doorbell.ring(Urgency::Normal)
     }
 
     /// Post a message that carries its own node — the ownership-transferring
@@ -2087,9 +2385,10 @@ mod tests {
         frontier: Frontier,
         preempt: NoPreempt,
         next_key: u64,
-        /// `Env::steal`. Off by default because most tests want a CPU's queue
-        /// to stay where they put it; the probe's own tests turn it on.
-        steal: bool,
+        /// `Env::balance`. [`Balance::None`] by default because most tests want
+        /// a CPU's queue to stay where they put it; the probe's own tests turn
+        /// the pull half on.
+        balance: Balance,
     }
 
     impl World {
@@ -2108,7 +2407,7 @@ mod tests {
                 frontier: Frontier::new(),
                 preempt: NoPreempt,
                 next_key: 1,
-                steal: false,
+                balance: Balance::None,
             }
         }
 
@@ -2128,7 +2427,7 @@ mod tests {
                     cpus: &self.handles,
                     frontier: &self.frontier,
                     preempt: &self.preempt,
-                    steal: self.steal,
+                    balance: self.balance,
                 },
             )
         }
@@ -3029,7 +3328,7 @@ mod tests {
     fn a_steal_probe_goes_to_surplus_and_not_to_a_cpu_full_of_corpses() {
         const C2: CpuId = CpuId(2);
         let mut w = World::new(3);
-        w.steal = true;
+        w.balance = Balance::Pull;
 
         // cpu1: one live task running, three corpses queued behind it. Three
         // units of work, none of them stealable.
@@ -3112,7 +3411,7 @@ mod tests {
     #[test]
     fn a_cpu_does_not_hand_over_the_context_it_is_still_standing_on() {
         let mut w = World::new(2);
-        w.steal = true;
+        w.balance = Balance::Pull;
 
         let tasks: Vec<_> = (0..3).map(|_| w.spawn(C1)).collect();
         w.run_a_pass(C1);
