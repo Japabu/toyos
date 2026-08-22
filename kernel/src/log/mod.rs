@@ -5,6 +5,13 @@
 //! and that is what makes "half a record" untypeable: the smallest thing this
 //! module accepts is a whole one.
 
+// Every `unsafe` block under `log::` has either stopped existing or carries a
+// `SAFETY:` saying why it could not — the reduction-before-documentation sweep
+// `issues/build/clippy-has-never-run-here.md` records. `host-tests.yml`'s two
+// kernel clippy invocations both run with `-D warnings`, so `warn` here is what
+// gates: a new undocumented block anywhere in this module tree fails CI.
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 pub mod console;
 pub mod nested;
 pub mod read;
