@@ -388,45 +388,93 @@ struct Inbox {
 }
 
 impl Inbox {
-    // **The four accessors below all reach into one 2 MiB page the owning
-    // process also maps writable, and all four are irreducible for the same
-    // reason**: the ABI *is* a fixed byte layout at fixed offsets in shared
-    // memory (`toyos_abi::inbox`'s three `_OFF` constants), so somebody has to
-    // turn an address into a typed view, and the only safe way to do it —
-    // owning the bytes — is exactly what a shared ring cannot do.
+    // **Every accessor below reaches into one 2 MiB page the owning process
+    // also maps writable, and not one of them hands back a Rust reference to
+    // a value that process can change.** That is the rule `user_ptr.rs`'s
+    // [`UserBytes`] header states for the other direction of the same boundary,
+    // and it applies here for the same reason: a `&T` carries `dereferenceable`
+    // — and, for a `T` with no interior mutability, `noalias` and `readonly` —
+    // into LLVM, so the compiler is entitled to fold, hoist or duplicate reads
+    // of bytes another thread of that process rewrites between any two
+    // instructions.
     //
-    // What is *not* settled, and is filed rather than answered here, is that
-    // the first three hand back a `&`: a Rust shared reference over a page a
-    // second thread of that process can rewrite carries `dereferenceable` into
-    // LLVM, which is the argument `user_ptr.rs`'s [`UserBytes`] header makes
-    // against exactly this shape. Every read through them today is either an
-    // atomic or a whole-struct copy taken once, which is why nothing is broken
-    // — see `issues/build/ring-rs-shared-slice-over-a-userland-writable-page.md`
-    // for the same question on the ABI side, and
-    // `issues/kernel/inbox-rings-are-borrowed-not-copied.md` for this one.
+    // What this replaces handed back `&RingHeader` and `&Submission`. The
+    // sharper of the two was `&RingHeader`: three of its four fields are
+    // atomics, but `ring_size` is a plain `u32` a process can store to at any
+    // moment, so the reference itself was a data race whatever the kernel then
+    // read through it. `&Submission` was worse in the other way — `Submission`
+    // is all integers and therefore `Freeze`, so that borrow really did carry
+    // `noalias`, and the one-`*`-copy the caller took was a copy the compiler
+    // was free to split back apart.
+    //
+    // So the ring headers are reached one atomic word at a time
+    // (`AtomicU32::from_ptr`, which is the only way to do an atomic operation
+    // in Rust and is *sound* over shared memory: an atomic's `UnsafeCell` is
+    // what tells LLVM the bytes may change), and a submission is a
+    // `read_volatile` of the whole entry — one read, not one that may be split,
+    // folded or repeated. No reference covers `ring_size`, and the kernel never
+    // reads it: it holds `submission_size`/`completion_size` itself.
+    //
+    // The ABI is still a fixed byte layout at fixed offsets in shared memory
+    // (`toyos_abi::inbox`'s three `_OFF` constants), so somebody still has to
+    // turn an address into a typed access, and that much is irreducible. The
+    // field offsets come from `offset_of!` rather than from constants written
+    // out here, so the layout is claimed once, where the struct is.
     //
     // [`UserBytes`]: crate::user_ptr::UserBytes
 
-    fn submission_header(&self) -> &RingHeader {
+    /// One atomic word of one ring header.
+    ///
+    /// `&AtomicU32` and never `&RingHeader` — the block above says why.
+    fn ring_word(&self, ring_off: u64, field_off: usize) -> &core::sync::atomic::AtomicU32 {
+        let ptr = self.shm_phys.as_mut_ptr::<u8>();
         // SAFETY: `shm_phys` is the direct-map base of the whole 2 MiB page
-        // this `Inbox` owns for its lifetime, and `SUBMISSION_RING_OFF`
-        // (0x1000) plus `size_of::<RingHeader>()` is far inside it — so the
-        // reference names live, aligned memory (the offset is page-aligned;
-        // `RingHeader` needs 4). Nothing the kernel reads through it is a
-        // plain field: `head`, `tail` and `dropped` are atomics, and
-        // `ring_size` is written once in `create` and never read back here, so
-        // a process rewriting the page cannot make the kernel observe a torn
-        // value.
-        unsafe { &*(self.shm_phys.as_mut_ptr::<u8>().add(SUBMISSION_RING_OFF as usize) as *const RingHeader) }
+        // this `Inbox` owns for its lifetime, and both ring offsets (0x1000 and
+        // 0x2000) plus `size_of::<RingHeader>()` are far inside it. The offsets
+        // are page-aligned and `field_off` is `offset_of!` over a `#[repr(C)]`
+        // struct of `u32`-sized fields, so the result is 4-aligned, which is
+        // what `AtomicU32` needs. The `&AtomicU32` is sound over a page the
+        // process writes because an atomic is exactly the type that says so:
+        // its `UnsafeCell` withdraws `noalias`/`readonly`, and every access
+        // through it is an atomic operation.
+        //
+        // Irreducible: `AtomicU32::from_ptr` is the only way to perform an
+        // atomic operation on memory Rust does not own, and a shared ring is
+        // memory Rust cannot own.
+        unsafe {
+            core::sync::atomic::AtomicU32::from_ptr(
+                ptr.add(ring_off as usize + field_off) as *mut u32,
+            )
+        }
     }
 
-    fn completion_header(&self) -> &RingHeader {
-        // SAFETY: `submission_header`'s argument at `COMPLETION_RING_OFF`
-        // (0x2000).
-        unsafe { &*(self.shm_phys.as_mut_ptr::<u8>().add(COMPLETION_RING_OFF as usize) as *const RingHeader) }
+    fn submission_head(&self) -> &core::sync::atomic::AtomicU32 {
+        self.ring_word(SUBMISSION_RING_OFF, core::mem::offset_of!(RingHeader, head))
     }
 
-    fn submission_at(&self, index: u32) -> &Submission {
+    fn submission_tail(&self) -> &core::sync::atomic::AtomicU32 {
+        self.ring_word(SUBMISSION_RING_OFF, core::mem::offset_of!(RingHeader, tail))
+    }
+
+    fn completion_head(&self) -> &core::sync::atomic::AtomicU32 {
+        self.ring_word(COMPLETION_RING_OFF, core::mem::offset_of!(RingHeader, head))
+    }
+
+    fn completion_tail_word(&self) -> &core::sync::atomic::AtomicU32 {
+        self.ring_word(COMPLETION_RING_OFF, core::mem::offset_of!(RingHeader, tail))
+    }
+
+    fn completion_dropped(&self) -> &core::sync::atomic::AtomicU32 {
+        self.ring_word(COMPLETION_RING_OFF, core::mem::offset_of!(RingHeader, dropped))
+    }
+
+    /// One submission entry, copied out.
+    ///
+    /// By value and by `read_volatile`, so what the kernel goes on to decide
+    /// with is a snapshot it took once. A `&Submission` was a borrow the
+    /// compiler could assume stable over a page the submitting process still
+    /// maps.
+    fn submission_at(&self, index: u32) -> Submission {
         let ptr = self.shm_phys.as_mut_ptr::<u8>();
         // SAFETY: same page and same lifetime. `index` is masked by
         // `submission_size` at the one call site (`claim_submission`), and
@@ -434,10 +482,17 @@ impl Inbox {
         // `MAX_SUBMISSION_DEPTH` (256) that the *kernel* holds — never read
         // back out of the page — so the furthest entry ends at
         // `SUBMISSIONS_OFF` (0x4000) + 256 * `size_of::<Submission>()`, inside
-        // the 2 MiB page. `Submission` is all integers, so every bit pattern
-        // is a value, and the caller copies the whole struct out with one `*`
-        // before looking at any field.
-        unsafe { &*(ptr.add(SUBMISSIONS_OFF as usize + index as usize * core::mem::size_of::<Submission>()) as *const Submission) }
+        // the 2 MiB page. `SUBMISSIONS_OFF` is page-aligned and `Submission` is
+        // 8-aligned with a size that is a multiple of 8, so every entry is
+        // aligned. `Submission` is all integers, so every bit pattern is a
+        // value — which is what makes reading one out of a page userland writes
+        // a *value* the kernel then has to validate, rather than undefined
+        // behaviour.
+        //
+        // Irreducible: the entry is at a fixed offset in shared memory and the
+        // safe spelling is a reference, which is the borrow the block above
+        // refuses.
+        unsafe { (ptr.add(SUBMISSIONS_OFF as usize + index as usize * core::mem::size_of::<Submission>()) as *const Submission).read_volatile() }
     }
 
     /// The address of one completion entry. A pointer and not a `&mut`: this
@@ -448,12 +503,9 @@ impl Inbox {
         // SAFETY: same page and same lifetime; `index` is masked by
         // `completion_size` at the one call site, which is twice the
         // submission depth and so at most 512 entries past
-        // `COMPLETION_RING_OFF + 16` — inside the 2 MiB page.
-        //
-        // The one accessor of the four that hands back a raw pointer instead of
-        // a reference, and the doc comment above says why. It is also the
-        // shape the other three should have; that is what the filed issue asks.
-        unsafe { ptr.add(COMPLETION_RING_OFF as usize + 16 + index as usize * core::mem::size_of::<Completion>()) as *mut Completion }
+        // `COMPLETION_RING_OFF + size_of::<RingHeader>()` — inside the 2 MiB
+        // page.
+        unsafe { ptr.add(COMPLETION_RING_OFF as usize + core::mem::size_of::<RingHeader>() + index as usize * core::mem::size_of::<Completion>()) as *mut Completion }
     }
 
     /// Post a completion, or record a drop if the ring reports itself full.
@@ -464,32 +516,34 @@ impl Inbox {
     /// not a kill: `complete_pending_for_event` calls this on the *waker's*
     /// thread, which belongs to a different process.
     fn post_completion(&self, user_data: u64, result: i32, flags: u32) {
-        let completion_ring = self.completion_header();
         let tail = self.completion_tail.get();
-        if tail.wrapping_sub(completion_ring.head.load(Ordering::Acquire)) >= self.completion_size {
-            completion_ring.dropped.fetch_add(1, Ordering::Relaxed);
+        if tail.wrapping_sub(self.completion_head().load(Ordering::Acquire)) >= self.completion_size {
+            self.completion_dropped().fetch_add(1, Ordering::Relaxed);
             return;
         }
         let idx = tail & (self.completion_size - 1);
         // One write of the whole entry, before the tail below publishes it.
         // SAFETY: `idx` is masked to the ring's size, and the whole instance is
-        // touched under the `INBOXES` lock, so nothing else is writing here.
+        // touched under the `INBOXES` lock, so no other *kernel* writer is
+        // here. The owning process can write the same bytes, and this is one
+        // store of the whole entry rather than three field stores for that
+        // reason; what makes it publication is the `Release` on the tail below.
         unsafe { self.completion_at(idx).write(Completion { token: user_data, result, flags }) };
         self.completion_tail.set(tail.wrapping_add(1));
-        completion_ring.tail.store(tail.wrapping_add(1), Ordering::Release);
+        self.completion_tail_word().store(tail.wrapping_add(1), Ordering::Release);
     }
 
     /// Count available completions (unread by userspace). Measured against the
     /// kernel's own tail; a process that rewrites `head` can only ever
     /// mislead itself about how many completions are waiting for it.
     fn completion_count(&self) -> u32 {
-        let head = self.completion_header().head.load(Ordering::Acquire);
+        let head = self.completion_head().load(Ordering::Acquire);
         self.completion_tail.get().wrapping_sub(head)
     }
 
     /// Completions this ring has thrown away. Cumulative, never cleared.
     fn dropped(&self) -> u32 {
-        self.completion_header().dropped.load(Ordering::Relaxed)
+        self.completion_dropped().load(Ordering::Relaxed)
     }
 }
 
@@ -502,6 +556,54 @@ pub fn init() {
 /// Largest submission ring a process may ask for. Bounds every quantity in
 /// `submit_submissions` that a process can influence.
 const MAX_SUBMISSION_DEPTH: u32 = 256;
+
+/// Lay out a freshly allocated inbox page: the [`RingLayout`] at offset 0 and
+/// the two [`RingHeader`]s at their ABI offsets.
+///
+/// Takes the address from [`SharedMemObject::phys_before_mapping`], which is
+/// the whole of what makes these writes exclusive — the page belongs to nobody
+/// but the kernel until `map_into` runs.
+///
+/// Whole-struct `ptr::write`s and no `&mut`: the accessors' block above refuses
+/// a reference over this page on principle, and a rule with one exception "for
+/// the window where it is still ours" is a rule that has to be re-derived every
+/// time the statements move.
+fn write_ring_page(base: DirectMap, submission_size: u32, completion_size: u32) {
+    use core::sync::atomic::AtomicU32;
+
+    let base = base.as_mut_ptr::<u8>();
+    // SAFETY: `base` is the direct-map address of a whole freshly allocated
+    // 2 MiB page the caller's `SharedMemObject` owns and has not mapped
+    // anywhere, so offset 0 is live, page-aligned memory far larger than
+    // `RingLayout`, and both ring offsets (0x1000, 0x2000) are page-aligned and
+    // far inside it. Nothing else can see any of it yet, so these are ordinary
+    // exclusive writes.
+    //
+    // Irreducible: the ABI is a byte layout at fixed offsets in a page that is
+    // about to be shared, and the safe spelling of a store into one is a
+    // reference.
+    unsafe {
+        (base as *mut RingLayout).write(RingLayout {
+            submission_ring_off: SUBMISSION_RING_OFF,
+            completion_ring_off: COMPLETION_RING_OFF,
+            submissions_off: SUBMISSIONS_OFF,
+            submission_ring_size: submission_size,
+            completion_ring_size: completion_size,
+            features: 0,
+            _pad: 0,
+        });
+        for (off, ring_size) in
+            [(SUBMISSION_RING_OFF, submission_size), (COMPLETION_RING_OFF, completion_size)]
+        {
+            (base.add(off as usize) as *mut RingHeader).write(RingHeader {
+                head: AtomicU32::new(0),
+                tail: AtomicU32::new(0),
+                ring_size,
+                dropped: AtomicU32::new(0),
+            });
+        }
+    }
+}
 
 /// Create an inbox and map its rings into the caller. Answers the reference
 /// and the address the rings are at.
@@ -516,53 +618,20 @@ pub fn create(depth: u32) -> Result<(InboxRef, u64), SyscallError> {
     let pid = process::current_process();
     let addr_space = process::current_address_space();
     let shm = SharedMemObject::create(crate::mm::PAGE_2M)?;
+
+    // **The page is built before it is mapped, and the order is the fix.** This
+    // used to `map_into` first and then write the layout and the two headers,
+    // so a sibling thread of the calling process could be writing the same
+    // bytes while the kernel initialised them. Nothing was ever observed going
+    // wrong — the caller has not returned from `SYS_INBOX_SETUP`, so nothing in
+    // userland knows the address — but "no thread knows the address" is not "no
+    // thread may write it", and a wild store from a sibling reaches an address
+    // nobody named. `phys_before_mapping` is what refuses the reversed order
+    // rather than leaving it to a comment.
+    write_ring_page(shm.phys_before_mapping(), submission_size, completion_size);
+
     let shm_vaddr = shm.map_into(pid, &addr_space)?;
     let shm_phys = shm.phys();
-
-    let base = shm_phys.as_mut_ptr::<u8>();
-
-    // Zero the entire page first (alloc_zeroed does this, but be explicit)
-    // Write params at offset 0
-    //
-    // **These three `&mut`s are the sharpest instance of what the accessors
-    // above are filed for**, because `map_into` two lines up has already put
-    // this page in the calling process's address space: a sibling thread of
-    // that process can be writing the same bytes while these references exist,
-    // and a `&mut` says nothing else may touch them at all. Nothing has been
-    // observed going wrong — the caller has not returned from `SYS_INBOX_SETUP`
-    // yet, so nothing knows the address — and the cheap half of the fix is to
-    // build the headers *before* `map_into` rather than after. Not done here
-    // because it is the user/kernel boundary's semantics and this is a
-    // documentation sweep: `issues/kernel/inbox-rings-are-borrowed-not-copied.md`.
-    //
-    // SAFETY: `base` is the direct-map address of a whole freshly allocated
-    // 2 MiB page this `SharedMemObject` owns, so offset 0 is live, page-aligned
-    // memory far larger than `RingLayout`; the reference is used for seven
-    // field stores and dropped before the next statement.
-    let params = unsafe { &mut *(base as *mut RingLayout) };
-    params.submission_ring_off = SUBMISSION_RING_OFF;
-    params.completion_ring_off = COMPLETION_RING_OFF;
-    params.submissions_off = SUBMISSIONS_OFF;
-    params.submission_ring_size = submission_size;
-    params.completion_ring_size = completion_size;
-    params.features = 0;
-    params._pad = 0;
-
-    // SAFETY: `params`'s argument at `SUBMISSION_RING_OFF` (0x1000), inside
-    // the same 2 MiB page and 4-aligned; used for four field stores and
-    // dropped before the next statement.
-    let submission_header = unsafe { &mut *(base.add(SUBMISSION_RING_OFF as usize) as *mut RingHeader) };
-    submission_header.head = core::sync::atomic::AtomicU32::new(0);
-    submission_header.tail = core::sync::atomic::AtomicU32::new(0);
-    submission_header.ring_size = submission_size;
-    submission_header.dropped = core::sync::atomic::AtomicU32::new(0);
-
-    // SAFETY: the same argument at `COMPLETION_RING_OFF` (0x2000).
-    let completion_header = unsafe { &mut *(base.add(COMPLETION_RING_OFF as usize) as *mut RingHeader) };
-    completion_header.head = core::sync::atomic::AtomicU32::new(0);
-    completion_header.tail = core::sync::atomic::AtomicU32::new(0);
-    completion_header.ring_size = completion_size;
-    completion_header.dropped = core::sync::atomic::AtomicU32::new(0);
 
     let inbox_id = {
         let mut guard = INBOXES.lock();
@@ -702,9 +771,8 @@ fn submit_submissions(inbox_id: InboxId, count: u32) -> Result<(), SyscallError>
 /// entries either way.
 fn claim_submission(inbox_id: InboxId) -> Result<Option<Submission>, SyscallError> {
     with_instance(inbox_id, |instance| {
-        let submission_ring = instance.submission_header();
-        let head = submission_ring.head.load(Ordering::Acquire);
-        let tail = submission_ring.tail.load(Ordering::Acquire);
+        let head = instance.submission_head().load(Ordering::Acquire);
+        let tail = instance.submission_tail().load(Ordering::Acquire);
         let available = tail.wrapping_sub(head);
         if available == 0 {
             return Ok(None);
@@ -712,8 +780,8 @@ fn claim_submission(inbox_id: InboxId) -> Result<Option<Submission>, SyscallErro
         if available > instance.submission_size {
             return Err(SyscallError::InvalidArgument);
         }
-        let submission = *instance.submission_at(head & (instance.submission_size - 1));
-        submission_ring.head.store(head.wrapping_add(1), Ordering::Release);
+        let submission = instance.submission_at(head & (instance.submission_size - 1));
+        instance.submission_head().store(head.wrapping_add(1), Ordering::Release);
         Ok(Some(submission))
     })?
 }

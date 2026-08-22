@@ -759,11 +759,12 @@ pub fn futex_wait(
         // through `UserBytes` would need the syscall's `SyscallContext`, which
         // returned long before this closure runs from the scheduler.
         //
-        // What is *not* discharged: this is a plain deref where the value can
-        // change under the compiler, and a `read_volatile` is what it should
-        // be. Filed rather than changed on the scheduler's own path:
-        // `issues/kernel/user-pages-still-read-through-a-plain-deref.md`.
-        let word = unsafe { *phys_addr.as_ptr::<u32>() };
+        // `read_volatile` and not a plain deref, for `copy_in`'s reason and one
+        // sharper: this closure is a *predicate* `completion::wait_until` may
+        // evaluate more than once, and a plain load is one the compiler may
+        // hoist out of that, fold with a neighbour or split in two. One read of
+        // the word per evaluation is the whole protocol.
+        let word = unsafe { phys_addr.as_ptr::<u32>().read_volatile() };
         word != expected
     };
     let _ = completion::wait_until(

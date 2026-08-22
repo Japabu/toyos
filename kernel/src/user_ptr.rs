@@ -9,6 +9,17 @@
 //! are copied, and bulk buffers are a [`UserBytes`] / [`UserBytesMut`] window
 //! the kernel reads or writes but never borrows — see [`UserBytes`] for why the
 //! borrow was the bug.
+//!
+//! **Every read of a single user word in this kernel is a `read_volatile`, and
+//! the two that are not in this module obey it too**: the futex word the
+//! scheduler evaluates on each wake check, and the crash dump's walk of a dying
+//! process's memory. A plain load is one the compiler may hoist out of a loop,
+//! fold with a neighbour or split in two, and another thread of the same
+//! process can change the bytes between any two instructions — so "the kernel
+//! read this once" is a claim only the volatile spelling makes. The bulk
+//! windows are the deliberate exception and [`UserBytes`] says why: there the
+//! absence of the reference is what buys it, and per-byte volatile would cost
+//! the copy several times its throughput for nothing.
 
 use alloc::string::String;
 use alloc::vec;

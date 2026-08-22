@@ -159,11 +159,20 @@ pub fn init_cr0(cpu_id: u32) {
             // coherency is *not* maintained, so a line this AP's caches held
             // from before is otherwise served to a CPU that has just been told
             // it is.
+            // SAFETY: `write_cr0` asks the caller to own the whole machine
+            // configuration, and this file *is* that owner — the value here is
+            // the CPU's own live `CR0` with `CD` set and `NW` cleared, so no
+            // other bit moves. `wbinvd` asks to be inside a no-fill window,
+            // which the write on the line above has just opened; that ordering
+            // is SDM Vol. 3A §11.5.3 and is the whole point of the pair.
             unsafe {
                 cpu::write_cr0((live | cr0::CD) & !cr0::NW);
                 cpu::wbinvd();
             }
         }
+        // SAFETY: `write_cr0`'s contract, discharged by the declaration itself —
+        // `CR0` is a constant this file computes for every CPU in the machine,
+        // and its doc comment argues every bit in it and every bit left out.
         unsafe { cpu::write_cr0(CR0) };
     }
     bench::report(cpu_id, before);
@@ -185,6 +194,12 @@ pub fn init_cr0(cpu_id: u32) {
 pub fn init(cpu_id: u32) {
     let declared = declaration(cpu_id);
     if !skipped(cpu_id) {
+        // SAFETY: `write_cr4` is `#GP` on a bit this CPU does not define, on
+        // clearing `PAE`/`LA57` in long mode, and on raising `PCIDE` while
+        // `CR3[11:0]` is non-zero. `declaration` has just asked CPUID for every
+        // optional bit and asserted `LA57` is clear; `PAE` is in
+        // `CR4_REQUIRED`; and both call sites of this function run on the kernel
+        // address space, whose PCID is 0.
         unsafe { cpu::write_cr4(declared) };
         cpu::wrmsr(efer::MSR, EFER);
         if declared & cr4::SMAP != 0 {
@@ -397,6 +412,11 @@ mod bench {
         let mut acc = 0u64;
         let mut i = 0;
         while i < PROBE.len() {
+            // SAFETY: `i < PROBE.len()` is the loop condition, so the index is
+            // in bounds and the pointer is into a live `static`. `read_volatile`
+            // because the whole measurement is that the load actually happens —
+            // a plain read of a zeroed `static` is one the optimiser may fold to
+            // a constant, and then the number is the instrument's own noise.
             acc = acc.wrapping_add(unsafe { core::ptr::read_volatile(&raw const PROBE[i]) });
             i += STRIDE;
         }
