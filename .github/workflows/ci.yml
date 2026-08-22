@@ -217,8 +217,11 @@ jobs:
       - name: rust
         if: steps.local.outputs.cache != 'yes'
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
+          # To a file first, never `curl | sh`: under `sh -e` the pipeline's
+          # status is sh's, so a reset download was a green step and the next
+          # one died on `rustup: not found` (run 32580794553, `guest (6)`).
+          curl --proto '=https' --tlsv1.2 -sSf -o "$RUNNER_TEMP/rustup-init.sh" https://sh.rustup.rs
+          sh "$RUNNER_TEMP/rustup-init.sh" -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: install the toolchain
@@ -450,8 +453,11 @@ jobs:
       - name: rust
         if: steps.local.outputs.cache != 'yes'
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
+          # To a file first, never `curl | sh`: under `sh -e` the pipeline's
+          # status is sh's, so a reset download was a green step and the next
+          # one died on `rustup: not found` (run 32580794553, `guest (6)`).
+          curl --proto '=https' --tlsv1.2 -sSf -o "$RUNNER_TEMP/rustup-init.sh" https://sh.rustup.rs
+          sh "$RUNNER_TEMP/rustup-init.sh" -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: install the toolchain
@@ -553,8 +559,11 @@ jobs:
 
       - name: rust
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
+          # To a file first, never `curl | sh`: under `sh -e` the pipeline's
+          # status is sh's, so a reset download was a green step and the next
+          # one died on `rustup: not found` (run 32580794553, `guest (6)`).
+          curl --proto '=https' --tlsv1.2 -sSf -o "$RUNNER_TEMP/rustup-init.sh" https://sh.rustup.rs
+          sh "$RUNNER_TEMP/rustup-init.sh" -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: install the toolchain

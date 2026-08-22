@@ -703,6 +703,31 @@ pub fn discard_capture() {
     CAPTURED.store(false, Ordering::Relaxed);
 }
 
+/// Re-freeze the captured report, so a line the kernel writes *after*
+/// [`capture`] is part of what the panel paints.
+///
+/// **One caller and it is why this exists**: `apic::wait_for_log_file` says on
+/// the record ring that its budget is spent and the panel is the only copy —
+/// and it says it after [`capture`] has already run, so on the one machine that
+/// wait exists for the sentence reached no channel at all. The T14 has no
+/// serial port, and `/log` is the thing that did not answer. A promise the
+/// kernel makes in a doc comment and delivers nowhere is not a promise.
+///
+/// **Only refreshes a capture that is already there.** A fatal path that never
+/// ran the panic handler paints [`live_tail`], which re-peeks the shards and
+/// therefore carries the line already; taking the snapshot for it would freeze
+/// a report it deliberately reads live.
+///
+/// Same CPU, same panic, and before this CPU has taken [`PAINTING`] — so it
+/// adds no reader/writer pair that [`capture`]'s own argument did not already
+/// have.
+pub fn refresh_capture() {
+    if !CAPTURED.load(Ordering::Relaxed) {
+        return;
+    }
+    capture();
+}
+
 /// The tail of the live shards, for callers with nothing captured. Consumes
 /// nothing — a record drain moves a cursor and leaves every shard where it was
 /// — so a later `panic_flush` reports the same records identically.
