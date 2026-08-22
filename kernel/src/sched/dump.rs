@@ -617,6 +617,12 @@ fn walk_threads(deadline: u64, mut f: impl FnMut(crate::process::ThreadCensus<'_
 /// what a photograph catches.
 fn summary(cpus: usize, silent: u32, c: Census) {
     let answered = cpus - silent as usize;
+    // Where this machine's interrupts have been landing, before the verdict and
+    // after the per-CPU lines. A CPU that answered nothing still reports here:
+    // the counters are its own `PerCpu`'s and a sibling reads them, so this part
+    // of the report needs nothing of the CPU it describes — which is exactly the
+    // question a silent CPU leaves open.
+    crate::irq_census::log_census();
     // Every count in the summary is written before the word it counts, so a
     // reader — and the gate — takes the field from the word rather than from a
     // position in the line.

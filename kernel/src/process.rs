@@ -1257,6 +1257,15 @@ fn teardown_resources(
             data.peak_memory / (1024 * 1024), data.alloc_count, data.free_count);
     }
 
+    // **The machine's interrupt census, at the one recurring moment every boot
+    // reaches and every capture carries.** It is not this process's — the
+    // counters are cumulative and machine-wide — but they are monotonic, so the
+    // last such line in a capture is that boot's whole census and the difference
+    // between two of them is what the interval cost. `SYS_SHUTDOWN` is not a
+    // substitute: the QEMU harness ends a guest by killing it, so nothing after
+    // the last process exit ever reaches a capture.
+    crate::irq_census::log_census();
+
     ops::close_all(&mut data.handles);
     data.elf.elf_alloc.take();
     data.elf.loaded_libs.clear();

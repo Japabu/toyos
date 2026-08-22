@@ -382,6 +382,15 @@ const GRAFFITI: [u8; 3] = [0x00, 0xC0, 0x00];
 /// tidy.
 const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("ioapic_topology", Sched::Parallel, Tier::Fast),
+    // The interrupt census adds up, and every device interrupt is still cpu0's.
+    // **The second half is what makes this the track's instrument rather than a
+    // tidiness check**: it states the present-state fact
+    // `issues/kernel/every-interrupt-lands-on-the-boot-cpu.md` opens with, so
+    // the day a placement policy lands this test is the first thing that reds
+    // and the first number against a number. Parallel: every verdict is
+    // arithmetic over counters the guest printed, and there is no clock in any
+    // of it.
+    ("irq_census_conservation", Sched::Parallel, Tier::Fast),
     ("control_regs", Sched::Parallel, Tier::Fast),
     ("control_regs_negative", Sched::Parallel, Tier::Fast),
     ("input_merge", Sched::Parallel, Tier::Fast),
@@ -9432,6 +9441,132 @@ fn run_machine_test(
             );
             Ok(())
         }
+        "irq_census_conservation" => {
+            use common::irqcensus::{Census, DEVICE_SOURCES};
+            // Four CPUs, because both halves of this test are vacuous on one.
+            // The census has to be able to *say* an AP took an interrupt before
+            // "every device interrupt is cpu0's" means anything.
+            let options = BootOptions { smp: 4, ..BootOptions::default() };
+            let mut qemu =
+                QemuInstance::boot_with_options(test_config, c_bins, rust_bins, options);
+            let boot = qemu.boot_log().to_string();
+            // Two processes, so the run carries at least two censuses per CPU
+            // and their monotonicity is checkable. `echo` because the subject is
+            // the machine's interrupt counters and not what the program did.
+            let first = qemu.run_test("echo one", Duration::from_secs(30));
+            let second = qemu.run_test("echo two", Duration::from_secs(30));
+            let capture = format!(
+                "{boot}\n{}\n{}\n{}\n{}",
+                first.before, first.serial, second.before, second.serial
+            );
+
+            // Every line, in order, so a later census can be compared with an
+            // earlier one on the same CPU.
+            let mut lines: Vec<Census> = Vec::new();
+            for line in capture.lines() {
+                match Census::parse(line) {
+                    None => continue,
+                    Some(Ok(census)) => lines.push(census),
+                    Some(Err(why)) => return Err(format!("{why}\nline: {line}")),
+                }
+            }
+            if lines.is_empty() {
+                return Err(format!(
+                    "no `irq: cpu` census in the capture — a process exited and the kernel \
+                     said nothing:\n{capture}"
+                ));
+            }
+
+            // 1. The law. `total` is counted by its own increment beside each
+            //    source's, never derived from them, so this is a real
+            //    conservation statement: a source whose increment went missing
+            //    leaves the total ahead of the sum.
+            for census in &lines {
+                if census.total != census.sum_of_sources() {
+                    return Err(format!(
+                        "cpu{} counted {} interrupt(s) and attributed {} to sources — a source \
+                         is not being counted: {census:?}",
+                        census.cpu,
+                        census.total,
+                        census.sum_of_sources(),
+                    ));
+                }
+            }
+
+            // 2. Monotonic: a counter that went backwards is a torn read or a
+            //    word two CPUs are writing, which is what the no-`lock` argument
+            //    in `kernel/src/irq_census.rs` rests on being impossible.
+            let mut newest: std::collections::BTreeMap<u32, Census> = Default::default();
+            for census in &lines {
+                if let Some(prev) = newest.get(&census.cpu) {
+                    if census.total < prev.total {
+                        return Err(format!(
+                            "cpu{}'s census went backwards, {} then {}: {prev:?} then {census:?}",
+                            census.cpu, prev.total, census.total,
+                        ));
+                    }
+                }
+                newest.insert(census.cpu, census.clone());
+            }
+
+            // 3. The machine is real: the boot CPU took interrupts, and so did
+            //    at least one AP — otherwise (4) says nothing.
+            let cpu0 = newest
+                .get(&0)
+                .ok_or_else(|| format!("no cpu0 in the census: {newest:?}"))?;
+            if cpu0.total == 0 {
+                return Err(format!("cpu0 took no interrupts at all: {cpu0:?}"));
+            }
+            let aps: Vec<&Census> = newest.values().filter(|c| c.cpu != 0).collect();
+            if aps.len() < 3 {
+                return Err(format!(
+                    "a 4-CPU machine reported {} AP(s); the census cannot see them all: {newest:?}",
+                    aps.len()
+                ));
+            }
+            if !aps.iter().any(|c| c.total > 0) {
+                return Err(format!("no AP took a single interrupt: {newest:?}"));
+            }
+
+            // 4. **The present-state fact this whole track is about.** Every
+            //    message-signalled interrupt is addressed to physical
+            //    destination 0 (`drivers::pci`'s `MSG_ADDR`) and the one I/O
+            //    APIC pin goes to the BSP, so no AP may have a device count at
+            //    all. This is what reds the day a placement policy lands, and
+            //    that red is the improvement.
+            let mut delivered = 0;
+            for name in DEVICE_SOURCES {
+                delivered += cpu0.source(name);
+                for ap in &aps {
+                    if ap.source(name) != 0 {
+                        return Err(format!(
+                            "cpu{} took {} `{name}` interrupt(s); every device vector is \
+                             addressed to physical destination 0, so this machine's delivery \
+                             policy has changed: {ap:?}",
+                            ap.cpu,
+                            ap.source(name),
+                        ));
+                    }
+                }
+            }
+            if delivered == 0 {
+                return Err(format!(
+                    "not one device interrupt on the whole machine, so \"they are all on \
+                     cpu0\" is vacuous: {newest:?}"
+                ));
+            }
+
+            let share = cpu0.total as f64
+                / newest.values().map(|c| c.total).sum::<u64>() as f64
+                * 100.0;
+            eprintln!(
+                "  [irq] {} cpu(s), {} interrupt(s), {delivered} of them device deliveries — \
+                 all on cpu0, which took {share:.1}% of everything",
+                newest.len(),
+                newest.values().map(|c| c.total).sum::<u64>(),
+            );
+            Ok(())
+        }
         "ioapic_topology" => {
             // Everything the I/O APIC driver says happens in Phase 2, long
             // before the virtio-console exists, so the 16550 file is where a
@@ -14474,6 +14609,12 @@ fn main() {
          build(s): {kernels:?}",
         kernels.len(),
     );
+
+    // Where this run's interrupts landed, aggregated over every guest that
+    // said. `issues/kernel/every-interrupt-lands-on-the-boot-cpu.md`'s step 4:
+    // the number its later change is measured against, produced by an ordinary
+    // run rather than by `--nocapture`, so a CI shard's own log carries it.
+    eprint!("{}", common::irqcensus::summary());
 
     eprint!("{}", tally.summary(total, suite_start.elapsed(), suite_start.suspended()));
     std::process::exit(tally.exit_code());

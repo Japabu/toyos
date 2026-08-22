@@ -4,6 +4,7 @@ use super::device_irq::device_irq_entry;
 /// may interrupt a CPU that holds the controller lock, which disables
 /// preemption and not interrupts.
 extern "sysv64" fn hda_handler() {
+    crate::irq_census::irq_took!(Hda);
     crate::drivers::hda::isr_complete();
     crate::arch::apic::eoi();
 }
