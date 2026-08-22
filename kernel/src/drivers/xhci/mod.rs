@@ -553,6 +553,51 @@ pub fn recheck_ports() {
 
 const RING_SIZE: usize = 256; // TRBs per ring (one page = 256 * 16)
 
+/// Clear `len` bytes of `dma` at `off`, and answer with the region that was
+/// cleared.
+///
+/// **One clearer instead of twelve.** Bringing an input context, an output
+/// context, a transfer ring, the enumeration scratch page, a CBW or a CSW up is
+/// the same operation every time, and each of the twelve sites spelled it out
+/// as its own `unsafe` block — some through `KernelSlice::zero`, some through a
+/// raw `write_bytes(dma.ptr_at(off), 0, len)` that bounded the offset and said
+/// nothing about the length. `subslice` asserts `off + len <= dma.size()` for
+/// all of them.
+pub(super) fn zero_dma(dma: KernelSlice, off: usize, len: usize) -> KernelSlice {
+    let region = dma.subslice(off, len);
+    // SAFETY: irreducible — `KernelSlice::zero` is an `unsafe fn` and there is
+    // no safe way to clear DMA memory. Bounded by the `subslice` above, which
+    // asserts the region is inside this controller's pool. Exclusive at every
+    // call site: each clears a structure before the command or transfer that
+    // hands it to the controller is enqueued, and enumeration is serial — one
+    // slot holds one operation, and a port inside an effect is not decided
+    // about.
+    unsafe { region.zero() }
+    region
+}
+
+/// Point the Device Context Base Address Array's `slot` entry at `phys`, or
+/// clear it with a zero.
+///
+/// **The DCBAA's one writer.** `address_device_trb`, `slot_gone` and
+/// `init_one`'s scratchpad setup each had their own
+/// `write_volatile((dma.ptr_at(OFF_DCBAA) as *mut u64).add(n), …)`, which
+/// bounded nothing: `ptr_at` checks the offset of the array's *base* and the
+/// `.add(n)` past it was unchecked. Slot 0 is the scratchpad array pointer
+/// rather than a device context, which is why `init_one` is a caller.
+pub(super) fn write_dcbaa(dma: KernelSlice, slot: usize, phys: u64) {
+    let entry =
+        dma.subslice(OFF_DCBAA + slot * core::mem::size_of::<u64>(), core::mem::size_of::<u64>());
+    // SAFETY: irreducible — a volatile write has no safe spelling, and the
+    // controller reads this array whenever it is given a slot id, so the store
+    // may not be elided or reordered against the command that follows it.
+    // Bounded by the `subslice` above; `slot` is a slot id the controller
+    // itself allocated, which `MaxSlotsEn` capped at `layout.dev_blocks` when
+    // `OP_CONFIG` was written, and the array is sized for that. Aligned:
+    // `OFF_DCBAA` is page-aligned and entries are 8 bytes.
+    unsafe { write_volatile(entry.base().cast::<u64>(), phys) }
+}
+
 /// Event Ring Segment Table entry (16 bytes).
 #[repr(C)]
 struct ErstEntry {
@@ -561,9 +606,13 @@ struct ErstEntry {
     _reserved: u32,
 }
 
+/// **`buf` and not a `*mut Trb`.** The ring's base was a raw pointer beside its
+/// own physical address, so every write through it was an unbounded
+/// `write_volatile(base.add(i), trb)`; a `KernelSlice` carries the length as
+/// well, which is what [`TrbRing::put`] checks each TRB against.
 #[derive(Clone, Copy)]
 struct TrbRing {
-    base: *mut Trb,
+    buf: KernelSlice,
     base_phys: u64,
     tail: u16,
     cycle: bool,
@@ -580,12 +629,31 @@ impl TrbRing {
     /// stale TRBs.
     fn init(buf: KernelSlice) -> Self {
         assert!(buf.size() >= RING_SIZE * core::mem::size_of::<Trb>());
-        unsafe { buf.zero(); }
+        zero_dma(buf, 0, buf.size());
+        let ring = Self { buf, base_phys: buf.phys(), tail: 0, cycle: true };
         let mut link = Trb::ZERO;
         link.param = buf.phys();
         link.control = TRB_LINK | (1 << 1); // TC (Toggle Cycle)
-        unsafe { write_volatile((buf.base() as *mut Trb).add(RING_SIZE - 1), link); }
-        Self { base: buf.base() as *mut Trb, base_phys: buf.phys(), tail: 0, cycle: true }
+        ring.put(RING_SIZE - 1, link);
+        ring
+    }
+
+    /// One TRB at ring index `at`.
+    ///
+    /// **The ring's one writer.** `init` and both arms of `enqueue` each had
+    /// their own `write_volatile(base.add(i), trb)`, off a raw pointer that
+    /// carried no length; this goes through `KernelSlice::subslice`, which
+    /// asserts the whole 16-byte TRB is inside the ring.
+    fn put(&self, at: usize, trb: Trb) {
+        let slot = self.buf.subslice(at * core::mem::size_of::<Trb>(), core::mem::size_of::<Trb>());
+        // SAFETY: irreducible — a volatile write has no safe spelling, and the
+        // controller is reading this ring concurrently, which is exactly what
+        // volatile is for: the Cycle bit in `trb.control` is what tells the
+        // controller the TRB is complete, so this store may not be split,
+        // merged or reordered against its neighbours. Bounded by the `subslice`
+        // above. Aligned: a `KernelSlice` for a ring is page-aligned out of the
+        // pool and `at * 16` keeps that.
+        unsafe { write_volatile(slot.base().cast::<Trb>(), trb) }
     }
 
     /// Where the controller should resume, with the cycle state it must expect.
@@ -612,7 +680,7 @@ impl TrbRing {
             trb.control &= !TRB_CYCLE;
         }
         let at = self.base_phys + (self.tail as u64) * 16;
-        unsafe { write_volatile(self.base.add(self.tail as usize), trb); }
+        self.put(self.tail as usize, trb);
         self.tail += 1;
 
         if self.tail as usize >= RING_SIZE - 1 {
@@ -620,7 +688,7 @@ impl TrbRing {
             link.param = self.base_phys;
             link.control = TRB_LINK | (1 << 1); // TC (Toggle Cycle)
             if self.cycle { link.control |= TRB_CYCLE; }
-            unsafe { write_volatile(self.base.add(self.tail as usize), link); }
+            self.put(self.tail as usize, link);
             self.tail = 0;
             self.cycle = !self.cycle;
         }
@@ -994,6 +1062,10 @@ impl XhciController {
         self.pool.slice()
     }
 
+    fn write_dcbaa(&self, slot: usize, phys: u64) {
+        write_dcbaa(self.dma(), slot, phys);
+    }
+
     /// This controller's `slot_id`, as a [`Slot`] a log line can name a device
     /// by. Never construct one of these from a bare slot id: the controller is
     /// half the identity.
@@ -1120,6 +1192,15 @@ impl XhciController {
     /// that dequeues an event it did not ask for owes it to whoever did, which
     /// is what `dispatch_event` is.
     fn next_event(&mut self) -> Option<Trb> {
+        // SAFETY: irreducible — a volatile read has no safe spelling, and this
+        // is a read of memory the controller writes by DMA: volatile is what
+        // makes the poll observe the Cycle bit flipping rather than reading it
+        // once. In range: `event_head` is kept `% RING_SIZE` by
+        // `advance_event_ring` and `event_ring` points at the whole
+        // `OFF_EVT_RING` page, which is `RING_SIZE * size_of::<Trb>()` exactly.
+        // Racing the controller by design — the Cycle bit checked on the next
+        // line is the protocol's own answer to whether the entry is complete
+        // (xHCI 1.2 §4.9.2).
         let event = unsafe { read_volatile(self.event_ring.add(self.event_head as usize)) };
         if ((event.control & 1) != 0) != self.event_phase {
             return None;
@@ -1735,10 +1816,7 @@ impl XhciController {
         if outcome.succeeded() {
             // After the command, never before: until it completes the
             // controller may still be writing this device's output context.
-            unsafe {
-                let dcbaa = self.dma().ptr_at(OFF_DCBAA) as *mut u64;
-                write_volatile(dcbaa.add(slot as usize), 0);
-            }
+            self.write_dcbaa(slot as usize, 0);
             log!("xHCI: slot {slot} disabled");
         } else {
             log!("xHCI: Disable Slot failed: {}", Answer(outcome));
@@ -1821,9 +1899,19 @@ impl XhciController {
     /// input context is. That sentence is what `Endpoint`'s private field is
     /// for; before it, a struct literal under `xhci` could put this write
     /// 12,880 bytes in.
-    fn write_ctx32(&self, ctx_base: *mut u8, ctx_index: usize, dword: usize, val: u32) {
+    fn write_ctx32(&self, ctx: KernelSlice, ctx_index: usize, dword: usize, val: u32) {
         let offset = (ctx_index * self.context_size) + (dword * 4);
-        unsafe { write_volatile(ctx_base.add(offset) as *mut u32, val); }
+        let at = ctx.subslice(offset, core::mem::size_of::<u32>());
+        // SAFETY: irreducible — a volatile write has no safe spelling, and the
+        // controller reads an input context the moment the command naming it is
+        // enqueued. Bounded by the `subslice` above, which is the check the
+        // paragraph on this function used to argue by hand: `ctx` is the
+        // `PAGE`-long input-context region, and `subslice` refuses an offset
+        // past it rather than leaving `Endpoint::dci`'s private field as the
+        // only thing standing between a struct literal and a write 12,880 bytes
+        // in. Aligned: `context_size` is 32 or 64 and `dword * 4` keeps
+        // 4-alignment from a page-aligned base.
+        unsafe { write_volatile(at.base().cast::<u32>(), val) }
     }
 
     /// The Endpoint State the controller published for (`dev_block`'s device,
@@ -1835,7 +1923,15 @@ impl XhciController {
     /// everything by one.
     fn endpoint_state(&self, dev_block: usize, dci: u8) -> EndpointState {
         let at = dev_block + DEV_OUT_CTX + dci as usize * self.context_size;
-        EndpointState::decode(unsafe { read_volatile(self.dma().ptr_at(at) as *const u32) })
+        let dword = self.dma().subslice(at, core::mem::size_of::<u32>());
+        // SAFETY: irreducible — a volatile read has no safe spelling, and this
+        // dword is written by the controller by DMA, so it must be re-read
+        // every time rather than cached. Bounded by the `subslice` above, where
+        // `ptr_at` bounded only the offset; `dci` is 2..=31 by construction
+        // (`Endpoint::dci`'s field is private) and `DEV_OUT_CTX` is a half-page
+        // region sized for 32 contexts. Aligned: `context_size` is 32 or 64
+        // from a page-aligned block base.
+        EndpointState::decode(unsafe { read_volatile(dword.base().cast::<u32>()) })
     }
 
     fn advance_event_ring(&mut self) {

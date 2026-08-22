@@ -410,20 +410,28 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
     op_base.write_u32(OP_CONFIG, layout.dev_blocks as u32);
 
     let dma = pool.slice();
-    unsafe { dma.zero(); }
+    super::super::zero_dma(dma, 0, dma.size());
 
     if layout.scratch_count > 0 {
-        let array = dma.ptr_at(layout.scratch_array) as *mut u64;
         for i in 0..layout.scratch_count {
             let buf = dma.phys() + (layout.scratch_buffers + i * PAGE) as u64;
-            unsafe { write_volatile(array.add(i), buf); }
-        }
-        unsafe {
-            write_volatile(
-                dma.ptr_at(OFF_DCBAA) as *mut u64,
-                dma.phys() + layout.scratch_array as u64,
+            let entry = dma.subslice(
+                layout.scratch_array + i * core::mem::size_of::<u64>(),
+                core::mem::size_of::<u64>(),
             );
+            // SAFETY: irreducible — a volatile write has no safe spelling, and
+            // the controller reads this array as soon as DCBAA[0] points at it.
+            // Bounded by the `subslice` above, where the previous form
+            // (`(dma.ptr_at(scratch_array) as *mut u64).add(i)`) bounded only
+            // the array's base; `scratch_count` is the controller's own
+            // HCSPARAMS2 figure and `Layout` sized the pool for exactly that
+            // many. Aligned: `scratch_array` is page-aligned and entries are 8
+            // bytes. Exclusive: DCBAA[0] is written after this loop, so the
+            // controller has not been told the array exists.
+            unsafe { write_volatile(entry.base().cast::<u64>(), buf) }
         }
+        // DCBAA slot 0 is the scratchpad array pointer, not a device context.
+        super::super::write_dcbaa(dma, 0, dma.phys() + layout.scratch_array as u64);
         log!("xHCI: {} scratchpad buffers configured", layout.scratch_count);
     }
 
@@ -437,9 +445,14 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
     op_base.write_u64(OP_CRCR, (dma.phys() + OFF_CMD_RING as u64) | 1);
 
     let evt_ring_buf = dma.subslice(OFF_EVT_RING, PAGE);
-    let erst = dma.ptr_at(OFF_ERST) as *mut ErstEntry;
+    let erst = dma.subslice(OFF_ERST, core::mem::size_of::<ErstEntry>());
+    // SAFETY: irreducible — a volatile write has no safe spelling, and the
+    // controller reads this table the moment `IR0_ERSTBA` is written three
+    // lines below. Bounded by the `subslice` above. Aligned: `OFF_ERST` is
+    // page-aligned and `ErstEntry` is 16 bytes with alignment 8. Exclusive: the
+    // controller has not been given the table's address yet.
     unsafe {
-        write_volatile(erst, ErstEntry {
+        write_volatile(erst.base().cast::<ErstEntry>(), ErstEntry {
             ring_base: evt_ring_buf.phys(),
             ring_size: RING_SIZE as u32,
             _reserved: 0,

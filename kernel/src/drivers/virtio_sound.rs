@@ -239,6 +239,16 @@ fn pop_completion() -> Option<AudioCompletionRecord> {
             timestamp_nanos: SPILL.timestamp.load(Ordering::Relaxed),
         });
     }
+    // SAFETY: irreducible — the ring is an `UnsafeCell` array because the
+    // producer is an ISR that may take no lock, so no `Lock`-shaped container
+    // can hold it; a `Cell` is not `Sync`, and `AudioCompletionRecord` is 16
+    // bytes, too wide for an atomic. Sound on the same single-producer,
+    // single-consumer discipline the producer states: `tail != head` was just
+    // established, so this slot is inside `[tail, head)` and the producer will
+    // not write it until the ring has wrapped past it — and the `Acquire` load
+    // of `head` above pairs with the producer's `Release` store, so the
+    // record's contents are visible. `pop_completion` runs under `CONTROLLER`,
+    // which serialises consumers.
     let rec = unsafe { *ring.slots[(tail % RECORD_RING_CAP) as usize].get() };
     ring.tail.store(tail.wrapping_add(1), Ordering::Release);
     Some(rec)
@@ -382,6 +392,12 @@ pub fn init(devices: &[PciDevice]) {
     let dma_shared = DmaPool::alloc(abi::SHARED_BYTES);
     let kernel_mem = dma_kernel.slice();
     let shared = dma_shared.slice();
+    // SAFETY: irreducible — `KernelSlice::zero` is an `unsafe fn` and there is
+    // no safe way to clear DMA memory. Bounded by `zero` itself, which writes
+    // exactly the region's own `size`. Exclusive: the pool was allocated two
+    // lines above and nothing else holds a slice of it — the device has not
+    // been told about it and the userland mapping of this window does not exist
+    // until `set_audio_info` publishes it.
     unsafe { shared.zero() };
 
     let device = VirtioDevice::init(pci, VIRTIO_F_VERSION_1);

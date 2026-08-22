@@ -485,6 +485,12 @@ pub fn init(devices: &[PciDevice]) {
     let pcm = super::DmaPool::alloc(PERIODS * PERIOD_BYTES);
     let bdl_slice = bdl.slice();
     let pcm_slice = pcm.slice();
+    // SAFETY: irreducible — `KernelSlice::zero` is an `unsafe fn` and there is
+    // no safe way to clear DMA memory. Bounded by `zero`, which writes exactly
+    // each region's own `size`. Exclusive: both pools were allocated on the two
+    // lines above and no address of either has reached the controller yet — the
+    // BDL pointer registers are written thirty lines below, after the stream has
+    // been reset.
     unsafe {
         bdl_slice.zero();
         pcm_slice.zero();
@@ -493,6 +499,14 @@ pub fn init(devices: &[PciDevice]) {
     let entries = stream::build_bdl(pcm_slice.phys(), PERIOD_BYTES as u32, PERIODS)
         .expect("hda: the pipeline's own shape builds a descriptor list");
     for (i, entry) in entries.iter().enumerate() {
+        // SAFETY: irreducible — `KernelSlice::write` is an `unsafe fn`; this is
+        // the buffer descriptor list the controller reads, and it has to be
+        // written as bytes at spec offsets. Bounded by `write`, which asserts
+        // each field is inside the pool: `build_bdl` returns exactly `PERIODS`
+        // entries and the pool was allocated `PERIODS * 16` bytes, so the
+        // largest offset is `(PERIODS - 1) * 16 + 12`. Exclusive for the same
+        // reason as the zeroing above — the controller has not been given the
+        // list's address yet.
         unsafe {
             bdl_slice.write::<u64>(i * 16, entry.address);
             bdl_slice.write::<u32>(i * 16 + 8, entry.length);
