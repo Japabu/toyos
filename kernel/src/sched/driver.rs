@@ -1510,8 +1510,11 @@ pub(crate) unsafe extern "C" fn context_switch(old_rsp: *mut u64, new_rsp: u64) 
 ///
 /// The call is placed after `mov rsp, rsi` and not before it deliberately: the
 /// subject is the incoming frame read *through the register the machine will
-/// actually use*, so a `ctx.rsp` that changed after the check is caught by the
-/// stack pointer itself rather than by re-reading the field the check read.
+/// actually use*, so what it reports is where the machine is standing and not
+/// what a field says. That is what lets it tell the two apart now that
+/// `hw::check_switch_frame` returns the word it validated — the stack pointer
+/// is that word, and a `ctx.rsp` written after the check moves the field and
+/// nothing else.
 ///
 /// It is sound to `call` here. The return address lands eight bytes below the
 /// frame, which is inside the incoming task's own kernel stack — `switch-witness`

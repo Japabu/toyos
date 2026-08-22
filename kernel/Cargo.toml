@@ -222,7 +222,7 @@ heap-band-nohead = ["heap-tripwire"]
 stack-witness = []
 # **The seven words, and the pointer to them.** Every instrument this class owns
 # asks its question at `hw::check_switch_frame`, which reads `ctx.rsp`, tests it
-# and returns; the frame is popped in `sched::driver::context_switch` a few
+# and returns it; the frame is popped in `sched::driver::context_switch` a few
 # hundred instructions later, past the preempt swap, the TSS handover, a
 # `mov cr3` and a `wrfsbase`, and nothing between them tests anything. 18,064
 # boots of `stack-witness` say the value the check sees is always sound, and one
@@ -233,22 +233,28 @@ stack-witness = []
 # So this copies the eight words at the check and compares them from inside
 # `context_switch`, one instruction after `mov rsp, rsi` and one before the first
 # `pop`, against the stack pointer the machine is standing on. It reads `ctx.rsp`
-# there too: `Hw::switch` loads that field **twice** — the `mov cr3` between the
-# two forbids the compiler from forwarding the first — so the value the machine
-# switches onto is not the value anything validated, and the two loads disagreeing
-# is a thing this can see and nothing else can.
+# there too, and the two are separate claims: that the machine stands on the word
+# the check validated, and that nothing wrote the field in the window. They used
+# to be one claim, and it did not hold — `Hw::switch` loaded that field **twice**,
+# the `mov cr3` between them forbidding the compiler from forwarding the first, so
+# the value switched onto was not the value validated. `hw::check_switch_frame`
+# now returns the word it validated and there is one load; this is what says so at
+# run time.
 #
 # It turns on `stack-witness` rather than standing alone, and that is a soundness
 # requirement and not a preference: the compare is a `call`, whose return address
 # lands eight bytes below the frame, so the frame has to be inside a real stack
 # before the call happens. `stack-witness`'s third test is what establishes that.
 switch-witness = ["stack-witness"]
-# The negative controls for the instrument above — `kernel/src/hw.rs`'s
-# `switch_witness_mutate` carries what each stages. One write per boot, at the
-# 20,000th switch: `frame` writes the `rbx` slot of a frame the check has just
-# validated, `rsp` moves the field up by eight after the check, which is the
-# double load staged. A witness that does not fire under either has not been
-# shown to be able to fire at all.
+# The negative controls — `kernel/src/hw.rs`'s `switch_witness_mutate` carries
+# what each stages. One write per boot, at the ninth switch (`MUTATE_AT`, and
+# small because it was measured): `frame` writes the `rbx` slot of a frame the
+# check has just validated, and is the control for the instrument — a witness that
+# does not fire under it has not been shown to be able to fire at all. `rsp` moves
+# the field up by eight after the check, and is the control for the **single
+# load**: the switch stands on the validated word, so the report says `THE SAME`
+# with the field `CHANGED SINCE THE CHECK`. A switch that re-read the field says
+# `MOVED` instead, which is what this tree printed before the load was made one.
 switch-witness-mutate-frame = ["switch-witness"]
 switch-witness-mutate-rsp = ["switch-witness"]
 # **Is this kernel running with the direction flag set.** No gate clears `DF`:
