@@ -596,6 +596,10 @@ pub struct NewTask {
     pub address_space: PageTables,
     pub fs_base: u64,
     pub share: Arc<KShare>,
+    /// The process's symbol table, cloned from the entry that owns it — see
+    /// [`KernelPayload::symbols`]. A kernel thread names an empty one, which is
+    /// what it has: `SymbolTable::empty` resolves nothing and refuses nothing.
+    pub symbols: Arc<crate::symbols::SymbolTable>,
 }
 
 /// Place a new task by message — never by reaching into the destination's
@@ -627,6 +631,7 @@ pub fn spawn(new: NewTask) -> ThreadSched {
             kernel_stack: new.kernel_stack,
             address_space: new.address_space,
             handle: handle.clone(),
+            symbols: new.symbols,
         },
         rt: RtState::default(),
     }
@@ -1125,6 +1130,25 @@ pub fn current_handle() -> Option<Arc<crate::sched::payload::TaskHandle>> {
 /// `tests/CLAUDE.md` names as the one TCG prices unlike hardware.
 pub fn with_current_handle<R>(f: impl FnOnce(&crate::sched::payload::TaskHandle) -> R) -> Option<R> {
     try_with_cpu(|cpu| cpu.running().map(|t| f(t.ext().handle.as_ref())))?
+}
+
+/// The symbol table of the task this CPU is running.
+///
+/// **The crash report's route to a name, and it takes no lock at all.** The
+/// table is immutable for its whole life and the `Arc` is the lifetime: a clone
+/// taken here outlives anything the process's teardown can do, so the report
+/// reads bytes nobody is freeing. The peek is this CPU's own record, and a
+/// report cannot be preempted out of it — `preempt::enable` declines the slow
+/// path while `PerCpu::fault_state` is non-zero — so no pass can start
+/// underneath the read.
+///
+/// `None` has two causes and a caller that prints one must say which
+/// (`process::SymbolLookup`): a pass already held this CPU's record when the
+/// report began, which is what a kernel panic *inside* `driver::pass` looks
+/// like; or the CPU is running nothing, which is the idle context and boot
+/// before the first task.
+pub fn current_symbols() -> Option<Arc<crate::symbols::SymbolTable>> {
+    try_with_cpu(|cpu| cpu.running().map(|t| t.ext().symbols.clone())).flatten()
 }
 
 /// Whether the running task has been killed — one relaxed load, no clone.
