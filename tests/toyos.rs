@@ -1036,6 +1036,16 @@ const T14_COLS: usize = 1920 / 8;
 /// failing loudly if it drifts.
 const FATAL_HALT_NONCE: &str = "SYS_DEBUG: fatal halt 4b1d9e2c";
 
+/// What `apic::wait_for_log_file` says when its `LOG_FILE_DRAIN` is spent —
+/// the second, degraded half of the kernel's promise about a fatal report.
+///
+/// `screen_fatal_halt_composited` reads it off the *panel*, because the machine
+/// that wait exists for has no serial port and `/log` is the thing that did not
+/// answer. Kept in sync with `kernel/src/arch/apic.rs::LOG_DRAIN_EXPIRED` by
+/// this comment and by that test turning every spent budget into a red if it
+/// drifts.
+const LOG_DRAIN_EXPIRED: &str = "the report did not reach /log";
+
 /// How far a corpus case gets before it stops, and what it says when it does.
 ///
 /// There is no `Run`. Seventeen of these built at the moment this list was
@@ -4127,8 +4137,30 @@ fn run_screen_test(
             // The probe fires 5 s after the claim; the poll is for that plus
             // the pager cycling pages.
             const MARKER: &str = "metal-panic-probe";
-            let dump = qemu.screendump_until(MARKER, Duration::from_secs(40));
+            // **Watched for on the way past, not looked for afterwards.**
+            // `halt_all_cpus` paints `Page::Last` and only then does
+            // `page_forever` start cycling, so the expiry line — the newest
+            // record there is — is on the panel from the paint until the
+            // first `PAGE_HOLD` turns. Polling for it once this loop has
+            // finished would be polling a pager that has moved on, and
+            // waiting out a whole cycle to be sure costs every green run
+            // `pages * PAGE_HOLD` to learn nothing.
+            let expired = std::cell::Cell::new(false);
+            let dump = qemu.screendump_while(
+                Duration::from_secs(40),
+                Duration::from_millis(100),
+                |d| {
+                    let text = d.text();
+                    if text.contains(LOG_DRAIN_EXPIRED) {
+                        expired.set(true);
+                    }
+                    text.contains(MARKER)
+                },
+            );
             let text = dump.text();
+            if text.contains(LOG_DRAIN_EXPIRED) {
+                expired.set(true);
+            }
             print_screen(name, &text);
             if !text.contains(MARKER) {
                 return Err(format!(
@@ -4152,29 +4184,77 @@ fn run_screen_test(
             // existed solely as a photograph; that is the state this asserts
             // against, and it is what made three investigations argue from
             // JPEGs.
+            //
+            // **Asserted as the disjunction the kernel actually promises.**
+            // `apic::LOG_FILE_DRAIN` is a `Budget`, so its expiry is a
+            // *degraded answer* and not a broken one: the kernel gives
+            // `/bin/logd` half a second and, when that is spent, says
+            // `LOG_DRAIN_EXPIRED` where the reader of a muted machine is. So
+            // there are three outcomes and only the third is a defect — the
+            // report is on the stick; it is not, and the panel says why; or it
+            // is neither written nor declared, which is a machine that lost its
+            // own last words in silence. Asserting the first alone made a spent
+            // budget a red the kernel never promised to avoid, and it fired 1
+            // in 30 on a dev host with no other guest on it (2026-08-22).
             drop(qemu);
             let (name, on_device) =
                 common::volumes::newest_log(&image_path, log_start, log_len)?;
             let on_device = String::from_utf8_lossy(&on_device).into_owned();
             if !on_device.contains(MARKER) {
                 return Err(format!(
-                    "/log/{name} stops at {} bytes and never carries {MARKER:?} — the panic \
-                     painted the panel and reached no file, so reading this machine still means \
-                     photographing it",
+                    "/log/{name} stops at {} bytes and never carries {MARKER:?} — this boot wrote \
+                     no log at all, so the drain's own verdict is not what is wrong here",
                     on_device.len()
                 ));
             }
-            if !on_device.contains("PANIC:") {
+            let on_the_stick = on_device.contains("PANIC:");
+            if !on_the_stick && !expired.get() {
+                // The third outcome, and it carries its evidence: what a red
+                // here needs is where `/bin/logd` stopped and whether the
+                // volume it stopped on is intact, and a muted guest has no
+                // console to have said either on.
+                let volume = std::fs::read(&image_path)
+                    .map_err(|e| format!("read the image back: {e}"))?;
+                let complaints = toyos_fat32_check::check(&volume[log_start..log_start + log_len]);
+                let verdict = if complaints.is_empty() {
+                    "the checker is silent on the volume".to_string()
+                } else {
+                    format!(
+                        "the checker has something to say:\n{}",
+                        toyos_fat32_check::describe(&complaints)
+                    )
+                };
                 return Err(format!(
-                    "/log/{name} carries the marker without the panic banner, so what reached \
-                     the stick is not the report"
+                    "/log/{name} carries the marker without the panic banner and the panel never \
+                     said {LOG_DRAIN_EXPIRED:?} — the report was neither written nor declared \
+                     lost.\nthe file is {} bytes, ending {:?}\n{verdict}\ndecoded screen:\n{text}",
+                    on_device.len(),
+                    on_device.lines().rev().take(3).collect::<Vec<_>>().join(" | ")
                 ));
             }
             let _ = std::fs::remove_file(&image_path);
-            eprintln!(
-                "  [panic] the fatal report is on the panel and in /log/{name} ({} bytes)",
-                on_device.len()
-            );
+            // **Both green outcomes name themselves, because the interesting
+            // number about this gate is which one it took.** A budget that is
+            // spent is not a defect and is also not nothing: `durable` is the
+            // word logd publishes *after* its `fsync` returns, so a spent
+            // budget with the banner on the stick means logd had written past
+            // the banner and had not yet said so.
+            match (on_the_stick, expired.get()) {
+                (true, false) => eprintln!(
+                    "  [panic] the fatal report is on the panel and in /log/{name} ({} bytes)",
+                    on_device.len()
+                ),
+                (true, true) => eprintln!(
+                    "  [panic] BUDGET SPENT, and the banner reached /log/{name} anyway ({} bytes): \
+                     logd wrote past it without publishing `durable` in time",
+                    on_device.len()
+                ),
+                (false, _) => eprintln!(
+                    "  [panic] BUDGET SPENT: the report is on the panel only; /log/{name} is {} \
+                     bytes and the panel carries {LOG_DRAIN_EXPIRED:?}",
+                    on_device.len()
+                ),
+            }
             if dump.fill() != FILL_FATAL {
                 return Err(format!(
                     "the panel still carries {:?} rather than the fatal fill, so the compositor's \

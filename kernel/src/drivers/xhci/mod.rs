@@ -14,13 +14,11 @@ pub use wait::msc::{storage_flush, storage_read, storage_write};
 
 use alloc::vec::Vec;
 use core::num::NonZeroU8;
-use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 use crate::mm::Mmio;
-use crate::mm::KernelSlice;
+use crate::mm::Dma;
 use crate::log;
 use super::pci::PciDevice;
-use super::DmaPool;
 use crate::sync::Lock;
 use toyos_untrusted::Untrusted;
 use toyos_xhci::job::{Await, Outcome, Outstanding, Stages};
@@ -570,21 +568,14 @@ const RING_SIZE: usize = 256; // TRBs per ring (one page = 256 * 16)
 ///
 /// **One clearer instead of twelve.** Bringing an input context, an output
 /// context, a transfer ring, the enumeration scratch page, a CBW or a CSW up is
-/// the same operation every time, and each of the twelve sites spelled it out
-/// as its own `unsafe` block — some through `KernelSlice::zero`, some through a
-/// raw `write_bytes(dma.ptr_at(off), 0, len)` that bounded the offset and said
-/// nothing about the length. `subslice` asserts `off + len <= dma.size()` for
-/// all of them.
-pub(super) fn zero_dma(dma: KernelSlice, off: usize, len: usize) -> KernelSlice {
-    let region = dma.subslice(off, len);
-    // SAFETY: irreducible — `KernelSlice::zero` is an `unsafe fn` and there is
-    // no safe way to clear DMA memory. Bounded by the `subslice` above, which
-    // asserts the region is inside this controller's pool. Exclusive at every
-    // call site: each clears a structure before the command or transfer that
-    // hands it to the controller is enqueued, and enumeration is serial — one
-    // slot holds one operation, and a port inside an effect is not decided
-    // about.
-    unsafe { region.zero() }
+/// the same operation every time, and each of the twelve sites spelled it out as
+/// its own `unsafe` block. Exclusive at every call site: each clears a structure
+/// before the command or transfer that hands it to the controller is enqueued,
+/// and enumeration is serial — one slot holds one operation, and a port inside
+/// an effect is not decided about.
+pub(super) fn zero_dma<'pool>(dma: Dma<'pool>, off: usize, len: usize) -> Dma<'pool> {
+    let region = dma.subview(off, len);
+    region.zero();
     region
 }
 
@@ -597,21 +588,20 @@ pub(super) fn zero_dma(dma: KernelSlice, off: usize, len: usize) -> KernelSlice 
 /// bounded nothing: `ptr_at` checks the offset of the array's *base* and the
 /// `.add(n)` past it was unchecked. Slot 0 is the scratchpad array pointer
 /// rather than a device context, which is why `init_one` is a caller.
-pub(super) fn write_dcbaa(dma: KernelSlice, slot: usize, phys: u64) {
-    let entry =
-        dma.subslice(OFF_DCBAA + slot * core::mem::size_of::<u64>(), core::mem::size_of::<u64>());
-    // SAFETY: irreducible — a volatile write has no safe spelling, and the
-    // controller reads this array whenever it is given a slot id, so the store
-    // may not be elided or reordered against the command that follows it.
-    // Bounded by the `subslice` above; `slot` is a slot id the controller
-    // itself allocated, which `MaxSlotsEn` capped at `layout.dev_blocks` when
-    // `OP_CONFIG` was written, and the array is sized for that. Aligned:
-    // `OFF_DCBAA` is page-aligned and entries are 8 bytes.
-    unsafe { write_volatile(entry.base().cast::<u64>(), phys) }
+pub(super) fn write_dcbaa(dma: Dma<'_>, slot: usize, phys: u64) {
+    // Volatile because the controller reads this array whenever it is given a
+    // slot id, so the store may not be elided or reordered against the command
+    // that follows it. Bounded for the whole entry; `slot` is a slot id the
+    // controller itself allocated, which `MaxSlotsEn` capped at
+    // `layout.dev_blocks` when `OP_CONFIG` was written, and the array is sized
+    // for that. Aligned: `OFF_DCBAA` is page-aligned and entries are 8 bytes,
+    // which the volatile discipline asserts rather than assumes.
+    dma.write::<u64>(OFF_DCBAA + slot * core::mem::size_of::<u64>(), phys)
 }
 
 /// Event Ring Segment Table entry (16 bytes).
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct ErstEntry {
     ring_base: u64,
     ring_size: u32,
@@ -620,11 +610,12 @@ struct ErstEntry {
 
 /// **`buf` and not a `*mut Trb`.** The ring's base was a raw pointer beside its
 /// own physical address, so every write through it was an unbounded
-/// `write_volatile(base.add(i), trb)`; a `KernelSlice` carries the length as
-/// well, which is what [`TrbRing::put`] checks each TRB against.
+/// `write_volatile(base.add(i), trb)`; a [`Dma`] view carries the length as
+/// well, which is what [`TrbRing::put`] checks each TRB against — and the
+/// volatile discipline, which is what a ring the controller is consuming needs.
 #[derive(Clone, Copy)]
 struct TrbRing {
-    buf: KernelSlice,
+    buf: Dma<'static>,
     base_phys: u64,
     tail: u16,
     cycle: bool,
@@ -639,7 +630,7 @@ impl TrbRing {
     /// run, so recovery is this plus a Set TR Dequeue Pointer naming
     /// [`Self::dequeue`] — the two have to agree or the endpoint resumes on
     /// stale TRBs.
-    fn init(buf: KernelSlice) -> Self {
+    fn init(buf: Dma<'static>) -> Self {
         assert!(buf.size() >= RING_SIZE * core::mem::size_of::<Trb>());
         zero_dma(buf, 0, buf.size());
         let ring = Self { buf, base_phys: buf.phys(), tail: 0, cycle: true };
@@ -654,18 +645,16 @@ impl TrbRing {
     ///
     /// **The ring's one writer.** `init` and both arms of `enqueue` each had
     /// their own `write_volatile(base.add(i), trb)`, off a raw pointer that
-    /// carried no length; this goes through `KernelSlice::subslice`, which
-    /// asserts the whole 16-byte TRB is inside the ring.
+    /// carried no length; this is bounded for the whole 16-byte TRB against the
+    /// ring.
     fn put(&self, at: usize, trb: Trb) {
-        let slot = self.buf.subslice(at * core::mem::size_of::<Trb>(), core::mem::size_of::<Trb>());
-        // SAFETY: irreducible — a volatile write has no safe spelling, and the
-        // controller is reading this ring concurrently, which is exactly what
-        // volatile is for: the Cycle bit in `trb.control` is what tells the
-        // controller the TRB is complete, so this store may not be split,
-        // merged or reordered against its neighbours. Bounded by the `subslice`
-        // above. Aligned: a `KernelSlice` for a ring is page-aligned out of the
-        // pool and `at * 16` keeps that.
-        unsafe { write_volatile(slot.base().cast::<Trb>(), trb) }
+        // Volatile because the controller is reading this ring concurrently,
+        // which is exactly what the discipline is for: the Cycle bit in
+        // `trb.control` is what tells the controller the TRB is complete, so
+        // this store may not be split, merged or reordered against its
+        // neighbours. Bounded for the whole 16-byte TRB, and aligned — a ring's
+        // view is page-aligned out of the pool and `at * 16` keeps that.
+        self.buf.write(at * core::mem::size_of::<Trb>(), trb)
     }
 
     /// Where the controller should resume, with the cycle state it must expect.
@@ -956,10 +945,10 @@ fn setup_packet(bm_request_type: u8, b_request: u8, w_value: u16, w_index: u16, 
         | ((w_length as u64) << 48)
 }
 
-// SAFETY: XhciController contains raw pointers to DMA memory that is valid
-// for the lifetime of the controller. Access is serialized by the Lock.
-unsafe impl Send for XhciController {}
-
+/// **`Send` is derived, not asserted.** The `unsafe impl Send` that stood here
+/// existed because this struct held raw pointers into DMA memory — the event
+/// ring and every [`TrbRing`]. They are [`Dma`] views now, which carry their own
+/// `Send`, so every field is `Send` on its own and the auto trait applies.
 pub struct XhciController {
     /// The function this controller is, so every line about it after `init_one`
     /// has returned can still name which of the machine's controllers it means.
@@ -987,11 +976,22 @@ pub struct XhciController {
     /// controller: every offset in `Layout` is relative to a pool base, so two
     /// controllers sharing one pool put both their DCBAAs, both their command
     /// rings and both their slot 1 device contexts at the same address.
-    pool: DmaPool,
+    ///
+    /// A leaked view and not a [`DmaPool`], and the leak is late on purpose:
+    /// `init_one` allocates a pool, brings the controller up through a *borrowed*
+    /// view, and calls `DmaPool::leak` only once the last refusal is behind it —
+    /// so a controller this driver declines still gives its pages back. What
+    /// forces the leak is this struct: a `DmaPool` field here plus a `TrbRing`
+    /// borrowing it is a self-reference, which is exactly the shape the track
+    /// says to stop at rather than contort a driver around.
+    pool: Dma<'static>,
 
     cmd_ring: TrbRing,
 
-    event_ring: *const Trb,
+    /// The event ring, as the region rather than as a pointer into it — so
+    /// `next_event`'s read is bounded against the page instead of against
+    /// `event_head` being kept `% RING_SIZE` somewhere else.
+    event_ring: Dma<'static>,
     event_head: u16,
     event_phase: bool,
 
@@ -1070,8 +1070,8 @@ pub struct XhciController {
 }
 
 impl XhciController {
-    pub(super) fn dma(&self) -> KernelSlice {
-        self.pool.slice()
+    pub(super) fn dma(&self) -> Dma<'static> {
+        self.pool
     }
 
     fn write_dcbaa(&self, slot: usize, phys: u64) {
@@ -1204,16 +1204,16 @@ impl XhciController {
     /// that dequeues an event it did not ask for owes it to whoever did, which
     /// is what `dispatch_event` is.
     fn next_event(&mut self) -> Option<Trb> {
-        // SAFETY: irreducible — a volatile read has no safe spelling, and this
-        // is a read of memory the controller writes by DMA: volatile is what
-        // makes the poll observe the Cycle bit flipping rather than reading it
-        // once. In range: `event_head` is kept `% RING_SIZE` by
-        // `advance_event_ring` and `event_ring` points at the whole
-        // `OFF_EVT_RING` page, which is `RING_SIZE * size_of::<Trb>()` exactly.
-        // Racing the controller by design — the Cycle bit checked on the next
-        // line is the protocol's own answer to whether the entry is complete
-        // (xHCI 1.2 §4.9.2).
-        let event = unsafe { read_volatile(self.event_ring.add(self.event_head as usize)) };
+        // Volatile is what makes this poll observe the Cycle bit flipping rather
+        // than reading it once. In range: `event_head` is kept `% RING_SIZE` by
+        // `advance_event_ring` and `event_ring` covers the whole `OFF_EVT_RING`
+        // page, which is `RING_SIZE * size_of::<Trb>()` exactly — and the read is
+        // bounded against that rather than against the arithmetic. Racing the
+        // controller by design: the Cycle bit checked on the next line is the
+        // protocol's own answer to whether the entry is complete (xHCI 1.2
+        // §4.9.2).
+        let event: Trb =
+            self.event_ring.read(self.event_head as usize * core::mem::size_of::<Trb>());
         if ((event.control & 1) != 0) != self.event_phase {
             return None;
         }
@@ -1546,7 +1546,7 @@ impl XhciController {
             recovery::Command::ResetEndpoint => TRB_RESET_ENDPOINT,
             recovery::Command::StopEndpoint => TRB_STOP_ENDPOINT,
             recovery::Command::SetDequeue => {
-                *ring = TrbRing::init(self.dma().subslice(ring_at, PAGE));
+                *ring = TrbRing::init(self.dma().subview(ring_at, PAGE));
                 trb.param = ring.dequeue();
                 TRB_SET_TR_DEQUEUE
             }
@@ -1911,19 +1911,17 @@ impl XhciController {
     /// input context is. That sentence is what `Endpoint`'s private field is
     /// for; before it, a struct literal under `xhci` could put this write
     /// 12,880 bytes in.
-    fn write_ctx32(&self, ctx: KernelSlice, ctx_index: usize, dword: usize, val: u32) {
+    fn write_ctx32(&self, ctx: Dma<'static>, ctx_index: usize, dword: usize, val: u32) {
         let offset = (ctx_index * self.context_size) + (dword * 4);
-        let at = ctx.subslice(offset, core::mem::size_of::<u32>());
-        // SAFETY: irreducible — a volatile write has no safe spelling, and the
-        // controller reads an input context the moment the command naming it is
-        // enqueued. Bounded by the `subslice` above, which is the check the
+        // Volatile because the controller reads an input context the moment the
+        // command naming it is enqueued. Bounded, which is the check the
         // paragraph on this function used to argue by hand: `ctx` is the
-        // `PAGE`-long input-context region, and `subslice` refuses an offset
-        // past it rather than leaving `Endpoint::dci`'s private field as the
-        // only thing standing between a struct literal and a write 12,880 bytes
-        // in. Aligned: `context_size` is 32 or 64 and `dword * 4` keeps
-        // 4-alignment from a page-aligned base.
-        unsafe { write_volatile(at.base().cast::<u32>(), val) }
+        // `PAGE`-long input-context region, and the write refuses an offset past
+        // it rather than leaving `Endpoint::dci`'s private field as the only
+        // thing standing between a struct literal and a write 12,880 bytes in.
+        // Aligned: `context_size` is 32 or 64 and `dword * 4` keeps 4-alignment
+        // from a page-aligned base.
+        ctx.write::<u32>(offset, val)
     }
 
     /// The Endpoint State the controller published for (`dev_block`'s device,
@@ -1935,15 +1933,13 @@ impl XhciController {
     /// everything by one.
     fn endpoint_state(&self, dev_block: usize, dci: u8) -> EndpointState {
         let at = dev_block + DEV_OUT_CTX + dci as usize * self.context_size;
-        let dword = self.dma().subslice(at, core::mem::size_of::<u32>());
-        // SAFETY: irreducible — a volatile read has no safe spelling, and this
-        // dword is written by the controller by DMA, so it must be re-read
-        // every time rather than cached. Bounded by the `subslice` above, where
-        // `ptr_at` bounded only the offset; `dci` is 2..=31 by construction
-        // (`Endpoint::dci`'s field is private) and `DEV_OUT_CTX` is a half-page
-        // region sized for 32 contexts. Aligned: `context_size` is 32 or 64
-        // from a page-aligned block base.
-        EndpointState::decode(unsafe { read_volatile(dword.base().cast::<u32>()) })
+        // Volatile because this dword is written by the controller by DMA, so it
+        // must be re-read every time rather than cached. Bounded for the whole
+        // dword, where `ptr_at` bounded only the offset; `dci` is 2..=31 by
+        // construction (`Endpoint::dci`'s field is private) and `DEV_OUT_CTX` is
+        // a half-page region sized for 32 contexts. Aligned: `context_size` is
+        // 32 or 64 from a page-aligned block base.
+        EndpointState::decode(self.dma().read::<u32>(at))
     }
 
     fn advance_event_ring(&mut self) {

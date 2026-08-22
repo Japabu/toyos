@@ -1,17 +1,14 @@
-use core::ptr::read_volatile;
-
 use alloc::boxed::Box;
 
 use super::pci::PciDevice;
 use super::virtio::{BufDir, DescSlot, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
 use toyos_abi::syscall::SyscallError;
-use crate::mm::{PAGE_2M, KernelSlice};
+use crate::mm::{Dma, Unaligned, PAGE_2M};
 use crate::gpu::{FLAG_HARDWARE_CURSOR, Gpu, GpuInfo};
 use crate::log;
 use crate::mm::paging::CachePolicy;
 use crate::object::shm::{Pages, Region};
-use crate::sync::Lock;
 
 const VIRTIO_VENDOR: u16 = 0x1AF4;
 const VIRTIO_GPU_DEVICE: u16 = 0x1050; // 0x1040 + device_id 16
@@ -46,12 +43,6 @@ const CURSOR_RESOURCE_ID: u32 = 3;
 
 const REQ_OFFSET: usize = 0x000;
 const RESP_OFFSET: usize = 0x800;
-
-static DMA: Lock<Option<DmaPool>> = Lock::new(None);
-
-fn dma() -> KernelSlice {
-    DMA.lock().as_ref().unwrap().slice()
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -191,38 +182,33 @@ struct FbAlloc {
     phys_addrs: [u64; 2],
 }
 
-/// Put `value` at `at` in a command or response buffer.
-///
-/// **The one writer of DMA memory in this driver.** Five call sites used to
-/// spell `copy_nonoverlapping(&cmd as *const _ as *const u8, self.req_ptr,
-/// size_of::<T>())` — three of them via a `from_raw_parts` byte view built for
-/// no other purpose — and every one of them was an `unsafe` block making the
-/// same claim. `KernelSlice::write` writes the same bytes and checks the bound
-/// while it is at it.
-fn put<T: Copy>(buf: KernelSlice, at: usize, value: T) {
-    // SAFETY: irreducible — `KernelSlice::write` is an `unsafe fn` and there is
-    // no safe way to put a command into DMA memory. Bounded: `write` asserts
-    // `at + size_of::<T>() <= buf.size()`, and both buffers are 0x800 bytes
-    // against commands of at most `size_of::<RespEdid>()`. Exclusive: every
-    // caller is between one `submit_and_wait` and the next, so the device holds
-    // no descriptor naming this buffer while the write lands.
-    unsafe { buf.write(at, value) }
-}
-
 struct GpuController {
     device: VirtioDevice,
-    controlq: Virtqueue,
-    cursorq: Virtqueue,
+    controlq: Virtqueue<'static>,
+    cursorq: Virtqueue<'static>,
     control_slot: Option<DescSlot>,
     cursor_slot: Option<DescSlot>,
-    /// The four command and response buffers. `KernelSlice`s and not the raw
-    /// pointer/physical-address pairs they replaced, which is what makes every
-    /// field of this struct `Send` on its own and deleted `unsafe impl Send for
-    /// GpuController {}`.
-    req: KernelSlice,
-    resp: KernelSlice,
-    cursor_req: KernelSlice,
-    cursor_resp: KernelSlice,
+    /// The four command and response buffers, as [`Dma`] views rather than the
+    /// raw pointer/physical-address pairs they replaced — which is what makes
+    /// every field of this struct `Send` on its own and deleted
+    /// `unsafe impl Send for GpuController {}`.
+    ///
+    /// **The request buffers take the unaligned discipline and the response
+    /// buffers the volatile one**, and that is the difference between writing a
+    /// command and reading an answer. A command is written between one
+    /// `submit_and_wait` and the next, so no descriptor names the buffer while
+    /// the write lands and the bytes are a specification's layout rather than an
+    /// ABI's. A response is memory the device filled, and volatile is what says
+    /// the bytes are not this CPU's to cache.
+    ///
+    /// `'static` because the pool is leaked at `init`: the compositor's display
+    /// is never unbound, and the `static Lock<Option<DmaPool>>` this replaces was
+    /// never cleared either — it just did not say so.
+    req: Dma<'static, Unaligned>,
+    resp: Dma<'static>,
+    cursor_req: Dma<'static, Unaligned>,
+    #[allow(dead_code)] // the cursor queue's answers are not read
+    cursor_resp: Dma<'static>,
     width: u32,
     height: u32,
     resource: u32,
@@ -233,22 +219,16 @@ struct GpuController {
 impl GpuController {
     /// What the device wrote into the control response buffer.
     ///
-    /// **The one reader of DMA memory in this driver.** Volatile because the
-    /// device wrote these bytes and nothing in the type system says so; bounded
-    /// through `subslice`, which asserts the whole `T` is inside the buffer
-    /// where `ptr_at` would only have asserted the offset was.
+    /// **The one reader of DMA memory in this driver**, and the reason `resp`
+    /// carries the volatile discipline: the device wrote these bytes, so the
+    /// load is not this CPU's to cache, and it is bounded for the whole `T`
+    /// where `ptr_at` would only have bounded the offset.
     fn answer<T: Copy>(&self) -> T {
-        // SAFETY: irreducible — a volatile read has no safe spelling, and this
-        // is the driver's only one. Sound because `subslice` just asserted
-        // `size_of::<T>() <= resp.size()` (0x800, against a largest `T` of
-        // `RespEdid`), the buffer is 8-aligned within a page-aligned DMA pool
-        // and every `T` read here has alignment 8 or less, and the transfer
+        // Bounded for all of `T` against a 0x800-byte buffer, and the transfer
         // that filled it has completed: `submit_and_wait` returned, and
-        // `poll_used`'s `fence(Acquire)` orders the device's writes before
-        // this read.
-        unsafe {
-            read_volatile(self.resp.subslice(0, core::mem::size_of::<T>()).base().cast::<T>())
-        }
+        // `poll_used`'s `fence(Acquire)` orders the device's writes before this
+        // read.
+        self.resp.read(0)
     }
 
     /// Put one command struct in the request buffer, submit it, and answer with
@@ -259,7 +239,7 @@ impl GpuController {
     /// unsafe blocks for a view nothing else used. Writing the `T` itself
     /// writes the same bytes.
     fn command_of<Req: Copy, Resp: Copy>(&mut self, req: &Req) -> Resp {
-        put(self.req, 0, *req);
+        self.req.write(0, *req);
 
         let slot = self.control_slot.take().expect("GPU: no control slot");
         let returned = self.controlq.submit_and_wait(
@@ -329,8 +309,8 @@ impl GpuController {
 
         let cmd_size = core::mem::size_of::<ResourceAttachBacking>();
         let entry_size = core::mem::size_of::<MemEntry>();
-        put(self.req, 0, cmd);
-        put(self.req, cmd_size, entry);
+        self.req.write(0, cmd);
+        self.req.write(cmd_size, entry);
 
         let slot = self.control_slot.take().expect("GPU: no control slot");
         self.control_slot = Some(self.controlq.submit_and_wait(
@@ -383,7 +363,7 @@ impl GpuController {
     }
 
     fn cursor_command<T: Copy>(&mut self, req: &T) {
-        put(self.cursor_req, 0, *req);
+        self.cursor_req.write(0, *req);
         let slot = self.cursor_slot.take().expect("GPU: no cursor slot");
         self.cursor_slot = Some(self.cursorq.submit_and_wait(
             slot,
@@ -542,13 +522,13 @@ fn fb_size_bytes(width: u32, height: u32) -> Option<u32> {
 pub fn init(devices: &[PciDevice]) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     let pci_dev = *devices.iter().find(|d| d.is_id(VIRTIO_VENDOR, VIRTIO_GPU_DEVICE))?;
     log!("VirtIO GPU: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
-    *DMA.lock() = Some(DmaPool::alloc(DMA_SIZE));
-    let dma = dma();
+    // Leaked rather than held in a `static`: the display is never unbound.
+    let dma = DmaPool::alloc(DMA_SIZE).leak();
 
     let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1 | VIRTIO_GPU_F_EDID);
 
-    let mut controlq = Virtqueue::new(dma.subslice(OFF_CONTROLQ, 0x1000), 16);
-    let mut cursorq = Virtqueue::new(dma.subslice(OFF_CURSORQ, 0x1000), 16);
+    let mut controlq = Virtqueue::new(dma.subview(OFF_CONTROLQ, 0x1000), 16);
+    let mut cursorq = Virtqueue::new(dma.subview(OFF_CURSORQ, 0x1000), 16);
 
     device.setup_queue(0, &mut controlq);
     device.setup_queue(1, &mut cursorq);
@@ -563,10 +543,10 @@ pub fn init(devices: &[PciDevice]) -> Option<(Box<dyn Gpu>, GpuInfo)> {
     drop(control_slots);
     drop(cursor_slots);
 
-    let ctrl_bufs = dma.subslice(OFF_CONTROLQ_BUFS, 0x1000);
-    let cursor_bufs = dma.subslice(OFF_CURSORQ_BUFS, 0x1000);
+    let ctrl_bufs = dma.subview(OFF_CONTROLQ_BUFS, 0x1000);
+    let cursor_bufs = dma.subview(OFF_CURSORQ_BUFS, 0x1000);
     // Each half of a buffer page: request at 0, response at `RESP_OFFSET`, and
-    // the length is what `KernelSlice` asserts every write and read against.
+    // the length is what every write and read is bounded against.
     const HALF: usize = RESP_OFFSET - REQ_OFFSET;
 
     let mut gpu = GpuController {
@@ -575,10 +555,10 @@ pub fn init(devices: &[PciDevice]) -> Option<(Box<dyn Gpu>, GpuInfo)> {
         cursorq,
         control_slot: Some(control_slot),
         cursor_slot: Some(cursor_slot),
-        req: ctrl_bufs.subslice(REQ_OFFSET, HALF),
-        resp: ctrl_bufs.subslice(RESP_OFFSET, HALF),
-        cursor_req: cursor_bufs.subslice(REQ_OFFSET, HALF),
-        cursor_resp: cursor_bufs.subslice(RESP_OFFSET, HALF),
+        req: ctrl_bufs.subview(REQ_OFFSET, HALF).unaligned(),
+        resp: ctrl_bufs.subview(RESP_OFFSET, HALF),
+        cursor_req: cursor_bufs.subview(REQ_OFFSET, HALF).unaligned(),
+        cursor_resp: cursor_bufs.subview(RESP_OFFSET, HALF),
         width: 0,
         height: 0,
         resource: 1,

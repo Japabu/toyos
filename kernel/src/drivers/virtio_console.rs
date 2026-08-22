@@ -19,8 +19,7 @@ use super::pci::PciDevice;
 use super::virtio::{BufDir, DescSlot, Virtqueue, VirtioDevice, VIRTIO_F_VERSION_1};
 use super::DmaPool;
 use crate::log;
-use crate::mm::KernelSlice;
-use crate::sync::Lock;
+use crate::mm::{Dma, Unaligned};
 
 const VIRTIO_VENDOR: u16 = 0x1AF4;
 const VIRTIO_CONSOLE_DEVICE: u16 = 0x1043; // 0x1040 + device_id 3
@@ -44,18 +43,27 @@ struct RxPending {
     pos: u32,
 }
 
-/// **The buffers are `KernelSlice`s and not raw pointers, and that is what
-/// deleted this type's `unsafe impl Send`.** Every field is now `Send` on its
-/// own — `KernelSlice` carries its own impl, and it also carries the bounds the
-/// bare `*mut u8` did not, so the TX copy and the RX byte read below are
-/// checked against the buffer's length instead of against a comment.
+/// **The buffers are [`Dma`] views and not raw pointers, and that is what
+/// deleted this type's `unsafe impl Send`.** Every field is `Send` on its own,
+/// and a view carries the bounds the bare `*mut u8` did not, so the TX copy and
+/// the RX byte read below are checked against the buffer's length rather than
+/// against a comment.
+///
+/// `'static` because the pool is leaked at `init`: this console is the kernel's
+/// log channel for the life of the boot and is never unbound. The `static`
+/// holding the pool alive is gone with it — `Dma<'static>` is the same claim
+/// made in the type, and it is the only way to obtain one.
 struct VConsole {
     device: VirtioDevice,
-    rx: Virtqueue,
-    tx: Virtqueue,
-    tx_buf: KernelSlice,
+    rx: Virtqueue<'static>,
+    tx: Virtqueue<'static>,
+    tx_buf: Dma<'static>,
     tx_slot: Option<DescSlot>,
-    rx_bufs: [KernelSlice; RX_BUF_COUNT],
+    /// The RX buffers under the unaligned discipline: what is read out of one is
+    /// a single byte the device has already delivered — its descriptor came back
+    /// through the used ring and has not been refilled — so nothing is racing
+    /// the read and there is no alignment to keep.
+    rx_bufs: [Dma<'static, Unaligned>; RX_BUF_COUNT],
     /// Maps virtqueue desc id → rx_buf index (filled at refill, read at poll).
     desc_to_rx: [u8; QUEUE_SIZE as usize],
     /// Currently-draining RX buffer (slot recovered from used ring but not
@@ -82,12 +90,6 @@ unsafe impl Sync for ConsoleCell {}
 /// outer lock is what serializes concurrent access to the VConsole state.
 static CONSOLE: ConsoleCell = ConsoleCell(UnsafeCell::new(MaybeUninit::uninit()));
 static READY: AtomicBool = AtomicBool::new(false);
-
-/// Holds the `DmaPool` so its physical pages stay live for the device's
-/// lifetime. Single-write at init, never read after — a `Lock` rather than the
-/// `static mut` this was, which cost an `unsafe` block to assign and gave
-/// nothing back for it.
-static DMA_HOLDER: Lock<Option<DmaPool>> = Lock::new(None);
 
 #[inline]
 pub fn is_ready() -> bool {
@@ -146,14 +148,12 @@ pub fn write_bytes_locked(bytes: &[u8]) {
         let mut off = 0;
         while off < bytes.len() {
             let n = (bytes.len() - off).min(TX_BUF_SIZE);
-            // SAFETY: irreducible — `KernelSlice::copy_from` is an `unsafe fn`
-            // and there is no safe way to put bytes into DMA memory. Its bound
-            // is checked: `copy_from` asserts `n <= tx_buf.size()`, which is
-            // `TX_BUF_SIZE`, and `n` is `min`ed against exactly that. Nothing
-            // else may be touching the buffer — the caller holds
-            // `serial::BackendGuard`, and the previous chunk's
-            // `submit_and_wait` returned, so the device is done with it.
-            unsafe { c.tx_buf.copy_from(0, &bytes[off..off + n]) };
+            // Bounded by `copy_from`, which refuses more than `tx_buf.size()`
+            // — `TX_BUF_SIZE`, which `n` is `min`ed against. Nothing else may be
+            // touching the buffer: the caller holds `serial::BackendGuard`, and
+            // the previous chunk's `submit_and_wait` returned, so the device is
+            // done with it.
+            c.tx_buf.copy_from(0, &bytes[off..off + n]);
             let slot = c.tx_slot.take().expect("vconsole: no tx slot");
             c.tx_slot = Some(c.tx.submit_and_wait(
                 slot,
@@ -183,14 +183,10 @@ pub fn try_read_byte_locked() -> Option<u8> {
             c.rx_pending = Some(RxPending { buf_idx, slot, len, pos: 0 });
         }
         let p = c.rx_pending.as_mut().unwrap();
-        // SAFETY: irreducible — `KernelSlice::read` is an `unsafe fn` and this
-        // is a read of memory the device wrote by DMA. Bounded twice over:
-        // `read` asserts `pos + 1 <= RX_BUF_SIZE`, and `pos < len` is the loop
-        // condition below with `len` already bounded by `poll_used` to the
-        // chain this driver published. The device is not writing this buffer —
-        // its descriptor came back through the used ring and has not been
-        // refilled.
-        let byte: u8 = unsafe { c.rx_bufs[p.buf_idx].read(p.pos as usize) };
+        // Bounded twice over: `read` refuses `pos + 1 > RX_BUF_SIZE`, and
+        // `pos < len` is the loop condition below with `len` already bounded by
+        // `poll_used` to the chain this driver published.
+        let byte: u8 = c.rx_bufs[p.buf_idx].read(p.pos as usize);
         p.pos += 1;
         if p.pos >= p.len {
             let p = c.rx_pending.take().unwrap();
@@ -216,14 +212,15 @@ pub fn init(devices: &[PciDevice]) -> bool {
     };
     log!("virtio-console: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
 
-    let dma = DmaPool::alloc(DMA_SIZE);
-    let dma_slice = dma.slice();
-    *DMA_HOLDER.lock() = Some(dma);
+    // Leaked rather than held in a `static`: the console is never unbound, and
+    // `Dma<'static>` says that where a `Lock<Option<DmaPool>>` nobody read only
+    // implied it.
+    let dma = DmaPool::alloc(DMA_SIZE).leak();
 
     let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1);
 
-    let mut rx = Virtqueue::new(dma_slice.subslice(OFF_RXVQ, 0x1000), QUEUE_SIZE);
-    let mut tx = Virtqueue::new(dma_slice.subslice(OFF_TXVQ, 0x1000), QUEUE_SIZE);
+    let mut rx = Virtqueue::new(dma.subview(OFF_RXVQ, 0x1000), QUEUE_SIZE);
+    let mut tx = Virtqueue::new(dma.subview(OFF_TXVQ, 0x1000), QUEUE_SIZE);
 
     device.setup_queue(0, &mut rx);
     device.setup_queue(1, &mut tx);
@@ -231,10 +228,10 @@ pub fn init(devices: &[PciDevice]) -> bool {
     device.enable_queue(1);
     device.activate();
 
-    let tx_buf = dma_slice.subslice(OFF_TX_BUF, TX_BUF_SIZE);
+    let tx_buf = dma.subview(OFF_TX_BUF, TX_BUF_SIZE);
 
-    let rx_bufs: [KernelSlice; RX_BUF_COUNT] = core::array::from_fn(|i| {
-        dma_slice.subslice(OFF_RX_BUFS + i * RX_BUF_SIZE as usize, RX_BUF_SIZE as usize)
+    let rx_bufs: [Dma<'static, Unaligned>; RX_BUF_COUNT] = core::array::from_fn(|i| {
+        dma.subview(OFF_RX_BUFS + i * RX_BUF_SIZE as usize, RX_BUF_SIZE as usize).unaligned()
     });
 
     let mut tx_slots = tx.initial_slots();
