@@ -6,73 +6,61 @@ opened: 2026-08-11
 
 # A guest QEMU exited 0 before `===READY===`, and the harness has no account of it
 
-Seen once on 2026-08-11, on `wt/toyos-std` at 7a8c12d, in the serial phase of a
-full `cargo test`:
+`wait_for_ready`'s `RecvTimeoutError::Disconnected` arm in `tests/common/qemu.rs`
+reports a QEMU that went away before the ready marker as
 
 ```
-FAIL kernel_heartbeat: [qemu] QEMU died before ===READY=== (status: Ok(ExitStatus(unix_wait_status(0))))
-  FAIL  kernel_heartbeat  (2s)
+FAIL <name>: [qemu] QEMU died before ===READY=== (status: Ok(ExitStatus(unix_wait_status(0))))
 ```
 
-`qemu.rs:2852` is the panic. What makes it worth a file is the **status**: QEMU
-exited *successfully*, two seconds in, before the guest said anything at all —
-so this is neither a crash nor a wedge nor a timeout, and the capture holds no
-serial output to bisect. The recorded `kernel_heartbeat` red
-(`issues/hardware/eleven-names-red-on-ci.md`, 1/5 on CI) is a different
-thing entirely: beats that dropped a CPU from the mask, from a machine that
-booted.
+and nothing else. It formats the exit status and drops both `seen` — every line
+the guest had already written, held in that same function — and the UART log
+the guest's early boot goes to. Both exist at the moment it fires, and neither
+reaches the message. `TestResult::error` carries a kernel's death report since
+#125, but this panic is not that field. The capture holds nothing to bisect and
+the test's name is the whole of the evidence, which is how a real one-in-N boot
+failure and a host hiccup read alike.
 
-Not reproducible on that tree: green on the harness's own alone re-run and green
-on five further runs of `cargo test --test toyos-build -- kernel_heartbeat`, six
-for six. It landed immediately after `xhci_flap`'s red in the same serial phase,
-with two other agents building on the host.
+**That is the whole defect, and it is the harness's.** The sightings that opened
+this file are explained, and the explanation is why the arm's silence matters.
 
-**Four names in one day, on three worktrees, 2026-08-15.** The signature is not
-`kernel_heartbeat`'s and it is not one tree's:
+## What the exit status says, and what the sightings were
 
-- `screen_fatal_halt` and `double_fault_stack`, both in the 106.4 s parallel
-  phase of one full `cargo test` on `wt/toyos-ciwall` (the one-accumulator
-  tree, landed as `81cfe22`), each `[qemu] QEMU died before ===READY===
-  (status: Ok(ExitStatus(unix_wait_status(0))))` from `tests/common/qemu.rs`,
-  in a run that was 256 passed and 4 failed. Both `ALONE: GREEN`, and both
-  green again when run by name minutes later — 3 s and 2 s.
-- `log_backing_read_error`, the identical message, on `wt/toyos-logd56`'s suite
-  the same afternoon. `ALONE: GREEN`.
-- `screen_console_shell`, the same *exit status* through a different wait —
-  `[qemu] QEMU died before the screendump (status: exit status: 0)` — on
-  `wt/toyos-capwin`'s suite. `ALONE: GREEN`.
+The harness passes `-no-reboot`, and its own `screendump` comment says what that
+buys: a guest that triple-faults exits QEMU. So a status-0 exit before the
+marker is a guest that **reset itself** during boot having said nothing — not a
+QEMU that could not start or open a device, which exits non-zero with a message,
+and not a QEMU the host reaped, which exits on a signal.
 
-**Neither the guest nor the phase's width explains it.** The four names have
-nothing in common but a boot: two panic-screen tests, a fault test, a log-device
-test and a console test, on three different configs. The ciwall run's own load
-proxy says the host was not slow — `host: fastest boot 1380 ms against the
-reference 1320 ms — liveness ceilings paid at 1.05x width` — while its
-`[host-slots]` lines name a second worktree's suite holding guest slots beside
-it (`all 12 held by 2 holder(s): pid 103 (toyos-ciwall: sched_check_build),
-pid 3077 (toyos-capwin: c_capture_ignores_daemon_lines)`). So what is shared is
-another suite on the machine, not a margin any one guest was near.
+A guest resetting silently during a loaded boot was the class PR #202 closed on
+2026-08-22: no Ring 0 entry cleared the direction flag, so an interrupt taken
+inside `compiler_builtins::mem::memmove`'s `std` window handed the kernel a set
+`DF` and every later `memcpy`/`memset` wrote its bytes *below* its destination.
+37 deaths in 13,960 twelve-wide `bootable.img` boots without the `cld`, 25 of
+them silent — QEMU gone, no marker — and 0 of any kind in 7,418 with it. PR #198
+parked one such death under `-action shutdown=pause` and read `RFL=[D--Z-P-]`
+with a non-canonical RIP off it: `DF` set, at a `ret` off a frame that was no
+stack. Under this harness's `-no-reboot` the same reset is a status-0 exit.
 
-The defect is the diagnosis, not the boot. A QEMU that exits 0 before the ready
-marker should say why — whether it never got its arguments, could not open a
-device, or was reaped by something — and the harness should keep whatever it did
-write. Today the test's name is all the evidence there is, which is how a real
-one-in-N boot failure would be indistinguishable from a host hiccup.
+The sightings, all on the dev host with other builds or suites on the machine,
+every one `ALONE: GREEN` — `kernel_heartbeat` (2026-08-11, `wt/toyos-std`, six
+for six green afterwards), `screen_fatal_halt` and `double_fault_stack` (both
+2026-08-15 in one 106.4 s phase on `wt/toyos-ciwall`, `1.05x` width, a second
+worktree's suite holding slots), `log_backing_read_error` (`wt/toyos-logd56`,
+same day), `screen_console_shell` through the screendump wait (`wt/toyos-capwin`,
+same day), and `hda_two_live_refused` (2026-08-19, `wt/toyos-tlb`, red only on
+the cold run that compiled 110 C tests and three kernels beside the guests). Six
+names with nothing in common but a boot, on five trees, following the host's
+build load and not the tree — which is what a class whose rate rises with
+interrupts per unit of guest work looks like from outside. The two redlist rows
+(`screen_fatal_halt`, `double_fault_stack`) are retired on this reading, as is
+`diskless_boot`'s identical 2026-08-19 row.
 
-**A sixth name, 2026-08-19, and the first one with a controlled comparison.**
-`hda_two_live_refused` on `wt/toyos-tlb`, parallel phase of a full `cargo test`,
-the identical message and `ALONE: GREEN`, in a run that was 267 passed and 1
-failed. What this one adds is not another load proxy but three runs of one
-machine: the failing run was the cold one, compiling 110 C tests and three
-kernels beside the guests (parallel phase 113.3 s); the same tree with its diff
-stashed was 268 of 268 warm (52.9 s), and the diff restored was 268 of 268 again
-(47.6 s). On this host it followed what else was building and not what was in the
-tree — which agrees with the ciwall reading that what is shared is another build
-on the machine.
+## What is owed
 
-**And the diagnosis is still exactly as this file left it**, including after
-#125. `TestResult::error` carries a kernel's death report now, but this panic is
-not that field: it is `wait_for_ready`'s own `RecvTimeoutError::Disconnected`
-arm in `tests/common/qemu.rs`, which formats the exit status and drops both
-`seen` — every line the guest had already written, held in that same function —
-and the UART log the guest's early boot goes to. Both exist at the moment it
-fires, and neither reaches the message.
+The arm keeps what it has. A QEMU that exits 0 before the ready marker should
+report the lines the guest did write and the UART log — a silent reset then
+arrives with the last thing the kernel said before it, which for this class was
+the spawn burst and for the next class will be whatever that class's last line
+is. `issues/build/a-failure-message-drops-the-lines-before-the-test-started.md`
+is the general form of the same hole on the other side of the marker.
