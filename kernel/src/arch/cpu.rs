@@ -11,20 +11,29 @@
 //! The split between `pub fn` and `pub unsafe fn` here is that second half. A
 //! function is `unsafe` when the caller can choose a value that breaks the
 //! machine — `write_cr0`, `write_cr4`, `write_cr3`, `lidt`, `ltr`, `wbinvd`,
-//! `wrmsr`, `outb`, `outw`, `wrfsbase` — and safe when it cannot. **Two
-//! wrappers are safe today and should not be**: `invlpg` and `invpcid` take a
-//! caller-chosen value that reaches hardware, and they are the rest of
-//! `issues/kernel/arch-cpu-safe-wrappers-that-are-not.md`.
+//! `wrmsr`, `outb`, `outw`, `wrfsbase` — and safe when it cannot.
+//!
+//! **Two wrappers take a caller-chosen value and are safe anyway, and each
+//! argues it in its own doc comment rather than in a `SAFETY:` block.**
+//! [`invlpg`] and [`invpcid`] *discard* translations, which is the direction
+//! that cannot make an access unsound; keeping a stale entry is what would.
+//! `invpcid`'s two faults are removed rather than argued away — the `#GP` on a
+//! descriptor type above 3 is unrepresentable ([`Invpcid`]) and the `#UD` on a
+//! CPU without the feature is an argument the caller can only get by asking
+//! ([`PcidActive`]). [`inb`] is safe because a read has no value for a caller to
+//! get wrong.
 //!
 //! **Where an `unsafe fn` here has a closed set of callers, the honest form is
 //! one safe wrapper that discharges the choice, not an `unsafe` block apiece.**
 //! `arch::apic::Reg` is that for the eighteen x2APIC `wrmsr` calls, and
 //! `mm::paging::activate_kernel` is the pattern it follows. Where the set is not
 //! closed — a port a device's firmware description names, an MSR that *is* the
-//! machine's one declaration — the block sits at the call and its `SAFETY:` says
-//! why that value is the right one.
+//! machine's one declaration — the block sits at the call and its `SAFETY:`
+//! says why that value is the right one.
 
 use core::arch::asm;
+
+use super::control_regs::PcidActive;
 
 #[inline]
 pub fn rdmsr(msr: u32) -> u64 {
@@ -264,30 +273,69 @@ pub unsafe fn write_cr3(value: u64) {
     asm!("mov cr3, {}", in(reg) value, options(nostack));
 }
 
+/// Discard this CPU's translation for one linear address.
+///
+/// **Safe with an argument nothing checks, and the reason is the direction.**
+/// `invlpg` takes the address as a *tag* and never dereferences it: an unmapped
+/// or non-canonical one invalidates nothing and does not fault. Discarding a
+/// translation cannot make a memory access unsound — keeping a stale one is what
+/// would — so there is no value of `addr` a caller can get wrong in the
+/// direction this module's `unsafe` exists for.
 #[inline]
 pub fn invlpg(addr: u64) {
-    // SAFETY: `invlpg` takes an address as a *tag*, not as an operand it
-    // dereferences — an unmapped or non-canonical one invalidates nothing and
-    // does not fault. Discarding a translation can never make memory access
-    // unsound; keeping a stale one is what would.
+    // SAFETY: one instruction with no memory operand the compiler can see. The
+    // doc comment above is the whole argument and it is why this wrapper is
+    // safe; irreducible because Rust has no operation for a TLB entry.
     unsafe { asm!("invlpg [{}]", in(reg) addr, options(nostack)); }
 }
 
-/// INVPCID — invalidate TLB entries by type.
-/// Type 0: single (pcid, addr). Type 1: all for pcid. Type 2: all PCIDs.
+/// What one [`invpcid`] discards — the descriptor type, SDM Vol. 3A §4.10.4.1.
+///
+/// **A type and not a number, because `INVPCID` is `#GP` on a type above 3.**
+/// That is the one way a caller could break the instruction, and here it is
+/// unrepresentable rather than checked.
+///
+/// Three variants and not four: type 3 — every PCID *except* the global entries
+/// — has no issuer in this kernel, because there are no global entries to except
+/// (`PAGE_GLOBAL` appears nowhere, which `mm::paging`'s header states). This is
+/// the closed set of what this kernel discards, and a fourth variant nothing
+/// constructs would be dead code with a discriminant.
+#[derive(Clone, Copy)]
+#[repr(u64)]
+pub enum Invpcid {
+    /// One linear address, in one PCID.
+    Address = 0,
+    /// Every entry tagged with one PCID, global pages excepted.
+    SinglePcid = 1,
+    /// Every entry in every PCID, global pages included.
+    AllIncludingGlobal = 2,
+}
+
+/// Discard TLB entries by descriptor type.
+///
+/// **Safe for [`invlpg`]'s reason, and it takes two removals to be so.** The
+/// `#GP` on a descriptor type above 3 is gone by construction ([`Invpcid`]).
+/// The `#UD` on a CPU without the feature is not a value a caller passes — it is
+/// a fact about the machine — so this takes the answer to that question as an
+/// argument ([`PcidActive`]) rather than a comment asking every caller to have
+/// asked it. Unlike `rdfsbase`'s `#UD`, it cannot be discharged by pointing at
+/// `CR4_REQUIRED`: `PCIDE` is in `CR4_OPTIONAL`.
+///
+/// A panic here would be the wrong refusal even so — `flush_tlb_all` is reached
+/// from vector 0xFE's handler and from `Lock::lock`'s spin, which `arch::tlb`'s
+/// header requires to take no lock and to be safe from anywhere — so the
+/// impossible call has no spelling instead of a message.
 #[inline]
-pub fn invpcid(kind: u64, pcid: u64, addr: u64) {
-    let desc: [u64; 2] = [pcid, addr];
-    // SAFETY: the descriptor operand is the local `desc`, sixteen bytes read by
-    // the CPU and declared `readonly`. `invpcid` is `#UD` without CPUID's
-    // `INVPCID` bit and `#GP` on a `kind` above 3 — `control_regs` refuses
-    // `PCIDE` on a CPU without the former, and the three callers in `arch::tlb`
-    // pass literal kinds. As with `invlpg`, discarding translations is the safe
-    // direction.
+pub fn invpcid(_have: PcidActive, kind: Invpcid, pcid: u16, addr: u64) {
+    let desc: [u64; 2] = [pcid as u64, addr];
+    // SAFETY: the descriptor operand is the local `desc` — sixteen bytes the CPU
+    // reads and nothing writes, declared `readonly`. The instruction's two
+    // faults are the doc comment's subject and both are already gone by the time
+    // this line runs. Irreducible: Rust has no operation for a TLB entry.
     unsafe {
         asm!(
             "invpcid {0}, [{1}]",
-            in(reg) kind,
+            in(reg) kind as u64,
             in(reg) desc.as_ptr(),
             options(nostack, readonly),
         );

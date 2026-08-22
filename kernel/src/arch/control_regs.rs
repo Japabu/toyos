@@ -232,6 +232,33 @@ pub fn pcid_active() -> bool {
     DECLARED_CR4.load(Ordering::Acquire) & cr4::PCIDE != 0
 }
 
+/// Proof that this machine's declaration carries `PCIDE`, and therefore that
+/// `INVPCID` is not `#UD` on any CPU in it.
+///
+/// **The one requirement [`cpu::invpcid`](super::cpu::invpcid) cannot discharge
+/// for itself.** Its other fault — `#GP` on a descriptor type above 3 — is a
+/// value a caller passes, and [`Invpcid`](super::cpu::Invpcid) makes that
+/// unrepresentable. This one is not a value at all; it is a fact about the
+/// silicon, and `CR4_OPTIONAL` is where this kernel admits the fact can go
+/// either way. So the wrapper takes the *answer* rather than trusting the caller
+/// to have asked the question, and a call that skipped the check has no
+/// spelling.
+///
+/// Zero-sized, so it costs nothing: an `Option<PcidActive>` is one byte, and the
+/// `if let` a caller writes is the `if` it was writing anyway.
+///
+/// It cannot go stale. [`DECLARED_CR4`] is written once, by whichever CPU
+/// reaches [`declaration`] first, and every CPU after it asserts the same
+/// value — nothing in this kernel ever clears `PCIDE`.
+pub struct PcidActive(());
+
+impl PcidActive {
+    /// `Some` where the declaration carries `PCIDE`, `None` where it does not.
+    pub fn ask() -> Option<Self> {
+        pcid_active().then_some(Self(()))
+    }
+}
+
 /// What this CPU says [`CR4_REQUIRED`] and [`CR4_OPTIONAL`] come to, checked
 /// against what the BSP said.
 ///
