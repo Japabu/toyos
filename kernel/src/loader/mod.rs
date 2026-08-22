@@ -587,8 +587,16 @@ pub fn spawn(
                 log!("spawn: {}: cannot allocate a {}-byte TLS template", path, tls.memsz);
                 return Err(SyscallError::ResourceExhausted.into());
             };
-            if elf::read_backing_into(backing.as_ref(), tls_file_off, tls_buf.ptr(), tls.filesz as usize)
-                .is_err()
+            // `slice` bounds `filesz` against the `memsz`-sized buffer it was
+            // taken from, so the `filesz <= memsz` that `Layout::parse` refuses
+            // a `PT_TLS` without is now checked here too — against the
+            // allocation, rather than argued from the parser two crates away.
+            if elf::read_backing_into(
+                backing.as_ref(),
+                tls_file_off,
+                tls_buf.slice(tls.filesz as usize),
+            )
+            .is_err()
             {
                 log!("spawn: {}: the TLS template could not be read off the device", path);
                 return Err(SyscallError::NotFound.into());

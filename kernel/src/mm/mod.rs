@@ -34,7 +34,7 @@ pub use alloc::hold_lock as hold_heap_lock;
 pub use alloc::sweep_stats;
 pub use dma::{Dma, DmaPool, Unaligned};
 pub use mmio::Mmio;
-pub use region::KernelSlice;
+pub use region::{Allocation, KernelSlice};
 pub use unmapped::Unmapped;
 
 use crate::MemoryMapEntry;

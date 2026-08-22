@@ -325,21 +325,27 @@ impl ModuleImage {
     }
 }
 
-/// Read from a file backing straight into a destination pointer, without a heap
-/// buffer in between.
+/// Read `dst.size()` bytes from a file backing straight into `dst`, without a
+/// heap buffer in between.
+///
+/// **The destination is a window and not a `(*mut u8, usize)` pair**, and that
+/// is the whole of what bounds this function: `dst` came from an allocation
+/// that sized it, so the length read is the length allocated and neither this
+/// loop nor any caller can name a third number. The pair this replaced made the
+/// "valid for `len` bytes" requirement real at three call sites and enforced it
+/// at none of them.
 ///
 /// `Err` on the first page the store would not give up, with the destination
-/// holding zeros from there on. Both callers refuse rather than continue: an
+/// holding zeros from there on. Every caller refuses rather than continues: an
 /// image assembled from a failed read is a process built out of a hole, and the
 /// fault it eventually takes says nothing about the disk that caused it.
 #[must_use = "an image assembled from a failed read is zeros, not the program"]
 pub(crate) fn read_backing_into(
     backing: &dyn crate::file_backing::FileBacking,
     offset: u64,
-    dst: *mut u8,
-    len: usize,
+    dst: KernelSlice,
 ) -> crate::block::BlockResult {
-    let mut remaining = len;
+    let mut remaining = dst.size();
     let mut file_off = offset;
     let mut buf_off = 0usize;
     let mut page_buf = [0u8; 4096];
@@ -347,28 +353,14 @@ pub(crate) fn read_backing_into(
         let off_in_block = (file_off % 4096) as usize;
         let chunk = (4096 - off_in_block).min(remaining);
         backing.read_page(file_off - off_in_block as u64, &mut page_buf)?;
-        // SAFETY: `dst` must be valid for `len` bytes starting at `buf_off ==
-        // 0` and every later `buf_off` stays under `len` by this loop's own
-        // arithmetic (`remaining` only shrinks by `chunk`, never past 0) —
-        // but *that* `dst` is valid for `len` bytes at all is not checked by
-        // this function; it is established at each call site (every current
-        // one is, by hand: `elf::mod::load_shared_lib` passes a
-        // `KernelSlice::subslice`'s own `(base, size)`, `loader::spawn`'s TLS
-        // read sizes its buffer from `memsz` and reads `filesz`, which
-        // `toyos_elf::Layout::parse` already refused to accept above `memsz`,
-        // and `loader::symbols::read_backtrace_table` partitions one
-        // allocation of `syms.size + strs.size` into exactly two writes of
-        // `syms.size` and `strs.size`). Nothing in `read_backing_into`'s
-        // signature makes a future caller re-derive any of that — filed as
-        // issues/kernel/raw-pointer-writers-not-marked-unsafe-in-loader.md
-        // rather than changed here.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                page_buf[off_in_block..off_in_block + chunk].as_ptr(),
-                dst.add(buf_off),
-                chunk,
-            );
-        }
+        // SAFETY: `copy_from` asserts `buf_off + chunk <= dst.size()` against
+        // the allocation `dst` was built from, so the write lands inside it —
+        // the loop's own arithmetic (`remaining` shrinks by `chunk` and never
+        // past 0) is now a second argument rather than the only one. `page_buf`
+        // is this frame's stack array and `dst` is heap or PMM pages, so the
+        // two cannot overlap, and nothing else can see `dst` while a caller is
+        // still filling it.
+        unsafe { dst.copy_from(buf_off, &page_buf[off_in_block..off_in_block + chunk]) };
         file_off += chunk as u64;
         buf_off += chunk;
         remaining -= chunk;
@@ -410,12 +402,12 @@ pub fn load_shared_lib(
     let alloc =
         PageAlloc::new(load_size, crate::mm::pmm::Category::Elf).ok_or("dlopen: allocation failed")?;
     let t1 = crate::clock::nanos_since_boot();
-    // SAFETY: `alloc` is the fresh `PageAlloc::new(load_size, ...)` above —
-    // `alloc.ptr()` is valid for exactly `load_size` bytes for as long as
-    // `alloc` lives, matching `from_raw`'s `# Safety` exactly. `alloc` is
-    // moved into `LoadedLib::memory` below (`LibMemory::Owned`), so the
-    // memory outlives `image`'s use for the whole `LoadedLib`.
-    let image = unsafe { KernelSlice::from_raw(alloc.ptr(), load_size) };
+    // The window is the allocation's own. `load_size` sized the request and is
+    // not repeated here: what every offset in this function is bounded against
+    // is what the PMM actually handed over, so a `load_size` that drifted from
+    // the allocation cannot become a write past it. Every past out-of-bounds in
+    // this loader was that drift.
+    let image = alloc.window();
 
     // SAFETY: `image` was just built from the fresh, exclusively-owned
     // `alloc` above — nothing else has a reference to it yet, so `zero`'s
@@ -433,7 +425,7 @@ pub fn load_shared_lib(
     // whatever the PMM handed out after this allocation.
     for seg in layout.segments() {
         let dst = image.subslice((seg.vaddr - vaddr_min) as usize, seg.filesz as usize);
-        read_backing_into(backing, seg.file_offset, dst.base(), dst.size())
+        read_backing_into(backing, seg.file_offset, dst)
             .map_err(|_| "a segment could not be read off the device")?;
     }
     let t3 = crate::clock::nanos_since_boot();

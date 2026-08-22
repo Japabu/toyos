@@ -548,9 +548,10 @@ pub fn open_home() -> Option<Mounted<PageCacheBlockIO, ReadWrite>> {
 /// **It takes the image and not `(ptr, len)`, and that is the whole of what
 /// this function used to get wrong about its own signature.** A raw pointer and
 /// a length handed to something that reads through them is a call that ought to
-/// be `unsafe` — the pattern
-/// `issues/kernel/raw-pointer-writers-not-marked-unsafe-in-loader.md` records
-/// two more of in `elf::`. Taking a `SliceBlockIO` moves the claim to
+/// be `unsafe` — `elf::read_backing_into` and
+/// `elf::index::RelocationIndex::apply_to_page` were the last two of that shape
+/// in this kernel, and both take a `mm::KernelSlice` now, which carries the
+/// length the allocation gave it. Taking a `SliceBlockIO` moves the claim to
 /// `SliceBlockIO::new`, which is already an `unsafe fn` and already states it,
 /// so there is one claim about the initrd region in the whole kernel and it is
 /// made where the region is named.

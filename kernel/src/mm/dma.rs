@@ -52,9 +52,9 @@
 //!
 //! `Dma<'pool>` borrows the [`DmaPool`] it came out of, so a view can never
 //! outlive the pages it names. That is the residual
-//! `issues/design-debt/kernelslice-from-raw-cannot-check-itself.md` records —
-//! "the type cannot check that the region it names outlives it" — closed for DMA
-//! memory by construction rather than by adjacency.
+//! `issues/design-debt/kernelslice-outlives-its-allocation.md` still records for
+//! [`super::KernelSlice`] — closed for DMA memory here by construction rather
+//! than by adjacency.
 //!
 //! A driver whose device outlives every scope is served by [`DmaPool::leak`],
 //! which consumes the pool, never gives its pages back, and answers with
