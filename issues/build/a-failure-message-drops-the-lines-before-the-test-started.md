@@ -20,10 +20,10 @@ run `31890991692`, job `95027203184`, `guest 8`, 2026-08-15, printed an **empty*
 produced — a panic among them, if there was one — went to `before`, and the
 `sched_check_build` arm formats only `result.serial`. The uploaded
 `shard-N-serial` artifact does not cover it either: the 16550 log ends where the
-kernel switches to virtio-console, at 0.377 s of guest uptime.
-`issues/kernel/the-check-build-guest-stopped-answering-on-kvm-twice.md`
-records that sighting as undecided for exactly this reason, and says so rather
-than reading the second sighting across onto it.
+kernel switches to virtio-console, at 0.377 s of guest uptime. That sighting
+stays undecided for exactly this reason — the harness deliberately does not
+read the run's other, decided sighting (a confirmed invariant-P panic on the
+same test name, two days later) across onto it.
 
 The shape of the fix: every caller that reports `result.error` reports `before`
 and `started` with it. `started` is what tells the reader which of the two

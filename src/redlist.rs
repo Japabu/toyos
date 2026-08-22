@@ -953,7 +953,7 @@ pub const KNOWN_RED: &[Red] = &[
                    `serial:` because `in_test` never became true, so its lines went to \
                    `TestResult::before` and the caller drops that — its cause is unrecorded and is \
                    not counted here",
-        source: "issues/kernel/the-check-build-guest-stopped-answering-on-kvm-twice.md",
+        source: "tests/common/passcost.rs",
         measured: "2026-08-16",
     },
     // ---------------------------------------------------------------------
@@ -987,7 +987,7 @@ pub const KNOWN_RED: &[Red] = &[
                    `Instrument::Ci` row above. The TCG explanation of *this* magnitude stands — \
                    nothing on KVM has come within five times it — but the implied claim about the \
                    other accelerator does not",
-        source: "issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
+        source: "tests/common/passcost.rs",
         measured: "2026-08-15",
     },
     Red {
@@ -1040,7 +1040,7 @@ pub const KNOWN_RED: &[Red] = &[
                    samples the gate's argument assumed a busy machine produces. The controlled \
                    experiment that turned that counter-evidence into the retirement above is in \
                    `tests/common/passcost.rs`",
-        source: "issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
+        source: "tests/common/passcost.rs",
         measured: "2026-08-17",
     },
     Red {
