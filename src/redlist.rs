@@ -2471,6 +2471,51 @@ pub const KNOWN_RED: &[Red] = &[
         source: "issues/panic-path/a-crash-report-conceded-a-frame-to-a-concurrent-one.md",
         measured: "2026-08-22",
     },
+    // ---------------------------------------------------------------------
+    // `/log`'s `fsync` under contention. The sighting first, then the rate that
+    // reproduced it — two measurements of one defect, on two sessions, and the
+    // second is the one that names the mechanism because the failure arm had
+    // been dropping the kernel's own lines until `wt/toyos-fsync`.
+    // ---------------------------------------------------------------------
+    Red {
+        test: "esp_filesystem",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`fsync the blob: Kind(Other)` at `src/bin/esp_files.rs:130:22` — the five checks \
+               before it passed, so only the `/log` write path failed and only at the flush. \
+               Which layer refused is not in this evidence: the harness reported the guest's \
+               stdout and dropped the kernel log, which is where every `log!` on that path lands",
+        evidence: "`wt/toyos-returnrule` at 02a087fd, dev host, 2026-08-21, one full `cargo test` \
+                   of 79 guests at `fastest boot 2058 ms … 1.56x width`; the harness's own re-run \
+                   answered `ALONE esp_filesystem: GREEN` (4 s)",
+        source: "issues/boot-media/fsync-on-log-returns-other-under-a-loaded-host.md",
+        measured: "2026-08-21",
+    },
+    Red {
+        test: "esp_filesystem",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::fires(1, 73),
+        standing: Standing::Stands,
+        what: "`fsync the blob: Kind(Other)`, and with the kernel log kept the producer is two \
+               2 s deadlines in series: `USB_TIMEOUT_NS` breached on the status phase of a \
+               WRITE(10) (`transport broke on SCSI 0x2a: no answer in the status phase in \
+               2000 ms`, both endpoints still Running, so a live device), Reset Recovery \
+               succeeded in 1 ms, and attempt 2 was then refused unissued because \
+               `block::OPERATION` is also 2 s (`SCSI 0x2a not issued: 2000ms`). \
+               `MAX_TRANSPORT_ATTEMPTS` is unreachable whenever the break was a timeout. The \
+               guest spent `syscall_wall=2108ms` in that one `SYS_FSYNC`. Dated: the same \
+               break was absorbed by the retry on CI on 2026-08-13 (`SCSI 0x35 completed on \
+               attempt 2`), which `block::OPERATION` made impossible when it landed in \
+               5479129d on 2026-08-20, one day before the first sighting",
+        evidence: "`wt/toyos-fsync` at 8c0f9526, dev host, 2026-08-22 12:09:11Z-13:09:27Z, 73 \
+                   consecutive full 12-wide suites of 272 tests; `wt/toyos-dmapool` shared the \
+                   twelve guest slots for 21 of them, the red among those. The red's own pass \
+                   measured `1.05x width` — the loop's median — so the aggregate width does not \
+                   predict it; `ALONE esp_filesystem: GREEN` again",
+        source: "issues/boot-media/fsync-on-log-returns-other-under-a-loaded-host.md",
+        measured: "2026-08-22",
+    },
 ];
 
 // ---------------------------------------------------------------------------
