@@ -44,7 +44,31 @@ pub const SYS_THREAD_JOIN: u64 = 41;
 pub const SYS_CLOCK_REALTIME: u64 = 42;
 pub const SYS_GPU_SET_CURSOR: u64 = 43;
 pub const SYS_GPU_MOVE_CURSOR: u64 = 44;
+/// A header describing the machine, optionally followed by the roster of every
+/// live thread in it. See [`sysinfo`].
+///
+/// **Two answers under one number, and only the second is authority.** The
+/// header is a machine fact like [`SYS_CPU_COUNT`]; the entries name, size and
+/// time every process there is, so writing one demands [`Rights::ROSTER`] on a
+/// `SysCap`. Which of the two a call asks for is the buffer's own length: a
+/// buffer with no room for an entry asks for the header, and the capability is
+/// not consulted at all.
+///
+/// [`Rights::ROSTER`]: crate::handle::Rights::ROSTER
 pub const SYS_SYSINFO: u64 = 45;
+
+/// Bytes of machine header [`SYS_SYSINFO`] writes first: total memory, used
+/// memory, the CPU count, the entry count, the uptime, and the busy and
+/// available CPU nanoseconds a percentage is derived from.
+///
+/// **The one definition.** The kernel writes this layout and every reader
+/// decodes it, so a second spelling is a reader that walks off by a field.
+pub const SYSINFO_HEADER_SIZE: usize = 48;
+
+/// Bytes per roster entry, after the header: pid, tid, scheduler state, whether
+/// it is a secondary thread, resident memory, CPU nanoseconds, and a 28-byte
+/// name.
+pub const SYSINFO_ENTRY_SIZE: usize = 64;
 // Syscall numbers 46-48 unused (formerly SYS_NET_INFO/SYS_NET_SEND/SYS_NET_RECV:
 // an ungated frame-copy path that no program ever used — netd drives the NIC
 // through its DMA descriptor instead).
@@ -1446,10 +1470,26 @@ pub unsafe fn shm_map(shm: RawHandle) -> Result<*mut u8, SyscallError> {
         .map(|addr| core::ptr::with_exposed_provenance_mut(addr as usize))
 }
 
-/// Query system information (memory, CPUs, processes).
-/// Returns the number of bytes written to `buf`.
-pub fn sysinfo(buf: &mut [u8]) -> usize {
-    let n = syscall(SYS_SYSINFO, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0);
+/// The machine's [header](SYSINFO_HEADER_SIZE), then as much of the process
+/// roster as `buf` has room for. Answers the number of bytes written.
+///
+/// **`syscap` is consulted only for the roster.** A `buf` shorter than
+/// `SYSINFO_HEADER_SIZE + SYSINFO_ENTRY_SIZE` cannot hold an entry, so nothing
+/// is demanded and [`HANDLE_INVALID`] is what a header-only caller passes —
+/// which is what [`crate::handle::Rights::ROSTER`] leaves ambient. A longer
+/// `buf` is a request for the roster, and the ordinary handle rules apply to
+/// `syscap`: a capability without the bit is refused with a word, and a handle
+/// the caller does not hold ends it.
+///
+/// [`HANDLE_INVALID`]: crate::handle::HANDLE_INVALID
+pub fn sysinfo(syscap: RawHandle, buf: &mut [u8]) -> usize {
+    let n = syscall(
+        SYS_SYSINFO,
+        syscap.0 as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+        0,
+    );
     if SyscallError::from_u64(n).is_some() { 0 } else { n as usize }
 }
 
@@ -1462,8 +1502,9 @@ pub fn nanosleep(nanos: u64) {
 /// source's own set.
 ///
 /// A wire encoding of `Option<Rights>`, decoded at the syscall boundary and
-/// never carried inward: `Rights` is nine bits, so this value is not one. The
-/// two wrappers below are the only writers, so no caller ever spells it.
+/// never carried inward: `Rights::ALL` is twelve bits, so this value is not a
+/// rights set and never becomes one. The two wrappers below are the only
+/// writers, so no caller ever spells it.
 pub const RIGHTS_UNCHANGED: u64 = u64::MAX;
 
 /// A second handle to the same object, carrying what the first carries.
