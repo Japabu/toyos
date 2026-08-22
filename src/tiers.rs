@@ -44,6 +44,25 @@
 //! freshest CI price for everything the fast tier did execute. Dev-host TCG
 //! timings remain useful optimisation evidence, but they do not decide which
 //! side of a KVM CI cutoff a test belongs on.
+//!
+//! **The nightly renders the verdict; a landing renders only its own names,
+//! 2026-08-22.** The rule here is unchanged and so is the ceiling — what moved
+//! is which run's red stops a landing. A pull request's and a merge-queue
+//! composition's `durations` job refuses a price verdict only for the names
+//! that change registered or re-tiered, and prints every other one as a
+//! `::warning::`; the nightly's twelve hosted shards pass no base and refuse
+//! them all, and a nightly red is fixed by a pull request the next day like
+//! every other nightly red. The reason is a measurement, not a preference: over
+//! six hosted twelve-shard runs a per-shard common price factor explains 57% of
+//! a name's run-to-run variance and spreads 1.28x p10–p90
+//! (`issues/build/a-shards-boot-width-does-not-price-its-tests.md`), so a name
+//! priced anywhere near a line reads over it on some runs by shard luck alone —
+//! and under the required merge queue that red dequeues the whole composition,
+//! every pull request behind it included. [`ci_profile_verdicts`] is the shape
+//! that filtering needs: one verdict per name, each saying whether it is about a
+//! price. A verdict about the *declaration* — a marker on a Nightly row, a
+//! duplicate row, an empty `guards`, a rider on a carrier that is not Nightly —
+//! is true whoever measured it and is refused on every run.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -94,10 +113,21 @@ pub const FAST_CEILING_MS: u64 = 10_000;
 /// about that test, not a coin landing. `xhci_full_speed_device`'s 47% is
 /// exactly that finding, and it is why margin does not make it a straddler.
 ///
-/// Both directions are this line's, and both live in [`validate_ci_profile`]:
+/// Both directions are this line's, and both live in [`ci_profile_verdicts`]:
 /// a Fast name may not be priced in `(FAST_COMMIT_MS, FAST_CEILING_MS]`, and a
 /// [`Why::Cost`] row returns to Fast only at or under it. **A straddler cannot
 /// be Fast.**
+///
+/// **Margin is not enough by itself, and 2026-08-22 measured why.** A fifth of
+/// room does not make a *variable* name safe: `xhci_full_speed_device` is
+/// committed at 6,900 ms with 31% of margin and was priced 4,700, 6,816, 6,900,
+/// 7,456, 7,499 and 9,890 ms over six hosted twelve-shard runs — the 9th most
+/// variable of 83 Fast names, and the last of those six reded merge-queue
+/// composition 32550410305 in the band. No tier holds such a name under a rule
+/// that reads one sample per run, so the answer is not a wider band but a
+/// narrower *audience*: a landing renders the price verdict only for the names
+/// it touched, and the nightly renders it for all of them. The module header
+/// carries that rule and the measurement behind it.
 pub const FAST_COMMIT_MS: u64 = FAST_CEILING_MS * 4 / 5;
 
 /// A committed profile row that exists only to put a new registration into one
@@ -155,7 +185,7 @@ pub struct Relegated {
     /// The last measurement recorded for this row, in milliseconds — for
     /// `audio_tone_load`, which registers one test but emits an `(smp=1)` and
     /// an `(smp=8)` label, the sum of both as last recorded. Documentation,
-    /// not a fixture: `validate_ci_profile` checks a fresh profile's tier
+    /// not a fixture: [`ci_profile_verdicts`] checks a fresh profile's tier
     /// *placement*, never this field against it, so a nightly run refreshing
     /// every Nightly label does not have to reproduce this number. A human
     /// updates it by hand when a "returns to Fast" or "belongs Nightly"
@@ -781,14 +811,49 @@ pub fn relegated_ms() -> u64 {
     RELEGATED.iter().map(|r| r.ci_ms).sum()
 }
 
-/// Validate the complete CI duration profile against the declared tiers.
+/// One thing the tier rule has to say about one registered name.
+///
+/// The name is carried beside the sentence because *which* run renders a
+/// verdict is decided per name: `src/durations.rs` refuses the ones the change
+/// under measurement registered or re-tiered and prints the rest as warnings,
+/// and it cannot do that against a block of prose.
+pub struct Verdict {
+    /// The registration name — `canonical_profile_name` of the label for a
+    /// price verdict, `Relegated::test` for a row verdict.
+    pub name: String,
+    /// **Whether this verdict is about a measured price.** Only a priced
+    /// verdict may be softened to a warning by a run that did not touch the
+    /// name: it is the one kind whose truth depends on which shard ran the
+    /// test rather than on what the tree says. A marker on a Nightly row, a
+    /// duplicate row, an empty `guards`, missing evidence and a rider on a
+    /// carrier that is not Nightly are all facts about the declaration, true on
+    /// every run, and are refused on every run.
+    pub priced: bool,
+    /// The sentence, naming the name, the price and what is wrong with it.
+    pub message: String,
+}
+
+/// Validate the complete CI duration profile against the declared tiers: every
+/// verdict the rule renders against `ci`, one per finding, each carrying the
+/// registered name it is about and whether it is about a price.
 ///
 /// This is production code because `--merge-durations` is the required gate.
 /// A filtered Rust unit-test invocation can exit successfully after running
 /// zero tests, so CI must not depend on a test name remaining spelled a
 /// particular way for the policy verdict to execute.
-pub fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
-    let mut errors = Vec::new();
+///
+/// The whole verdict, every name: what the nightly renders, and what
+/// `src/durations.rs` filters by name on a pull request or a merge-queue
+/// composition. Nothing here knows about a base — the filtering is the caller's,
+/// because the rule and the audience are two decisions and only one of them is
+/// this module's.
+pub fn ci_profile_verdicts(ci: &BTreeMap<String, u64>) -> Vec<Verdict> {
+    /// A verdict about the declaration: true whoever measured it.
+    fn fact(name: &str, message: String) -> Verdict {
+        Verdict { name: name.to_string(), priced: false, message }
+    }
+
+    let mut errors: Vec<Verdict> = Vec::new();
     let mut seen = BTreeSet::new();
     let nightly = relegated_names();
 
@@ -796,9 +861,12 @@ pub fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
         let name = canonical_profile_name(label);
         if ms == UNMEASURED_MS {
             if nightly.contains(name) {
-                errors.push(format!(
-                    "{label} is marked UNMEASURED but {name} is Nightly, so fast CI cannot \
-                     execute it to replace the marker; bootstrap it as Fast"
+                errors.push(fact(
+                    name,
+                    format!(
+                        "{label} is marked UNMEASURED but {name} is Nightly, so fast CI cannot \
+                         execute it to replace the marker; bootstrap it as Fast"
+                    ),
                 ));
             }
             continue;
@@ -807,27 +875,36 @@ pub fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
             continue;
         }
         if ms > FAST_CEILING_MS {
-            errors.push(format!(
-                "{label} measured {ms} ms in CI, over the {FAST_CEILING_MS} ms line, \
-                 but {name} remains Fast"
-            ));
+            errors.push(Verdict {
+                name: name.to_string(),
+                priced: true,
+                message: format!(
+                    "{label} measured {ms} ms in CI, over the {FAST_CEILING_MS} ms line, \
+                     but {name} remains Fast"
+                ),
+            });
         } else if ms > FAST_COMMIT_MS {
-            errors.push(format!(
-                "{label} is priced at {ms} ms — over the {FAST_COMMIT_MS} ms a Fast test may be \
-                 committed at and under the {FAST_CEILING_MS} ms line — and {name} remains \
-                 Fast: priced without margin, so relegate it or make it faster. A price this \
-                 close to the line is decided by which partition ran it, and reds whichever \
-                 pull request measures it next"
-            ));
+            errors.push(Verdict {
+                name: name.to_string(),
+                priced: true,
+                message: format!(
+                    "{label} is priced at {ms} ms — over the {FAST_COMMIT_MS} ms a Fast test \
+                     may be committed at and under the {FAST_CEILING_MS} ms line — and {name} \
+                     remains Fast: priced without margin, so relegate it or make it faster. A \
+                     price this close to the line is decided by which partition ran it, and \
+                     reds whichever pull request measures it next"
+                ),
+            });
         }
     }
 
     for row in RELEGATED {
         if !seen.insert(row.test) {
-            errors.push(format!("{} has two tier rows", row.test));
+            errors.push(fact(row.test, format!("{} has two tier rows", row.test)));
         }
         if row.guards.trim().is_empty() {
-            errors.push(format!("{} says nothing about what it guards", row.test));
+            errors
+                .push(fact(row.test, format!("{} says nothing about what it guards", row.test)));
         }
         let labels: Vec<(&str, u64)> = ci
             .iter()
@@ -835,10 +912,13 @@ pub fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
             .map(|(label, &ms)| (label.as_str(), ms))
             .collect();
         if labels.is_empty() {
-            errors.push(format!(
-                "{} is in the nightly tier but has missing CI evidence; an unmeasured \
-                 test stays Nightly, but its evidence must be restored",
-                row.test
+            errors.push(fact(
+                row.test,
+                format!(
+                    "{} is in the nightly tier but has missing CI evidence; an unmeasured \
+                     test stays Nightly, but its evidence must be restored",
+                    row.test
+                ),
             ));
             continue;
         }
@@ -854,24 +934,32 @@ pub fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
             // same test over the line. A relegated test comes back only when
             // its price has room to move.
             Why::Cost if labels.iter().all(|(_, ms)| *ms <= FAST_COMMIT_MS) => {
-                errors.push(format!(
-                    "{} is Nightly for Cost, but every current CI label is at or under \
-                     the {FAST_COMMIT_MS} ms commitment line and it belongs Fast: {labels:?}",
-                    row.test
-                ));
+                errors.push(Verdict {
+                    name: row.test.to_string(),
+                    priced: true,
+                    message: format!(
+                        "{} is Nightly for Cost, but every current CI label is at or under \
+                         the {FAST_COMMIT_MS} ms commitment line and it belongs Fast: {labels:?}",
+                        row.test
+                    ),
+                });
             }
             Why::RidesTheBootOf(carrier) => {
                 if !labels.iter().all(|(_, ms)| *ms <= FAST_COMMIT_MS) {
-                    errors.push(format!(
-                        "{} is priced without margin itself and must be Why::Cost, not a \
-                         rider on {carrier}: {labels:?}",
-                        row.test
-                    ));
+                    errors.push(Verdict {
+                        name: row.test.to_string(),
+                        priced: true,
+                        message: format!(
+                            "{} is priced without margin itself and must be Why::Cost, not a \
+                             rider on {carrier}: {labels:?}",
+                            row.test
+                        ),
+                    });
                 }
                 if !nightly.contains(carrier) {
-                    errors.push(format!(
-                        "{} rides {carrier}, but {carrier} is not Nightly",
-                        row.test
+                    errors.push(fact(
+                        row.test,
+                        format!("{} rides {carrier}, but {carrier} is not Nightly", row.test),
                     ));
                 }
             }
@@ -879,13 +967,24 @@ pub fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
         }
     }
 
-    if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
+    errors
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// Every verdict as one block of prose, which is what an assertion about
+    /// the whole rule reads. `src/durations.rs` renders them one at a time
+    /// because it decides each one's audience separately; nothing here does.
+    fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
+        let verdicts = ci_profile_verdicts(ci);
+        if verdicts.is_empty() {
+            return Ok(());
+        }
+        Err(verdicts.into_iter().map(|v| v.message).collect::<Vec<_>>().join("\n"))
+    }
 
     fn committed_profile() -> BTreeMap<String, u64> {
         let path =

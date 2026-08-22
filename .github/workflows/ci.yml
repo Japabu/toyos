@@ -614,6 +614,26 @@ jobs:
   # execution label, a short shard set, an erased Fast label, a committed
   # `UNMEASURED` marker past its one bought run — still reds here on either
   # machine.
+  #
+  # **The second axis: which names, 2026-08-22.** A pull request and a
+  # merge-queue composition pass `--tier-base <sha>` naming what they are a
+  # change *to*, and `--merge-durations` then refuses the price verdict only for
+  # the names that change registered or re-tiered in `tests/toyos.rs` or gave a
+  # different `Why` in `src/tiers.rs`. Every other price verdict prints as a
+  # `::warning::` and the job exits 0. The nightly passes no base and refuses
+  # them all — a nightly red is fixed by a pull request the next day, like every
+  # other nightly red. The two axes compose and neither replaces the other: the
+  # T14 softening below still applies to whatever refusal survives the base.
+  #
+  # Why: a per-shard common price factor explains 57% of a name's run-to-run
+  # variance across six hosted twelve-shard runs and spreads about 1.28x p10 to
+  # p90, and it is not the shard's boot width, so nothing normalises it away
+  # (issues/build/a-shards-boot-width-does-not-price-its-tests.md). A name
+  # priced near a line reads over it on some runs by shard luck alone, and under
+  # a required merge queue that red dequeues the whole composition — every pull
+  # request behind it included. `src/durations.rs`'s module header carries the
+  # rule; `src/ci.rs` holds this file's `--tier-base` against the flag the
+  # command declares, the same way it holds the softened verdict's wording.
   durations:
     needs: [route, guest]
     if: always()
@@ -621,6 +641,14 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          # `--tier-base` reads `tests/toyos.rs` and `src/tiers.rs` *at the
+          # base*, so the base commit has to be in this clone; a depth-1
+          # checkout does not have it and the command refuses rather than
+          # guessing. The whole history is 53 MiB packed over 2,323 commits
+          # (`git count-objects -vH`), against the artifacts and the cargo build
+          # this job already pays for.
+          fetch-depth: 0
 
       - uses: actions/cache@v4
         with:
@@ -654,6 +682,15 @@ jobs:
           # GitHub-hosted on every event, so its own runner answers about the
           # wrong machine entirely.
           GUEST_LANE_TRUSTED: ${{ needs.route.outputs.trusted }}
+          # What this run is a change *to*, from the event that produced it.
+          # Empty on `schedule`, `push` and `workflow_dispatch` — none of them
+          # is a change under review — and empty means the whole verdict, never
+          # none of it. `merge_group` first: a queued composition is measured
+          # against the `main` the queue built it on, not against the base the
+          # pull request opened from.
+          TIER_BASE: >-
+            ${{ github.event.merge_group.base_sha
+                || github.event.pull_request.base.sha }}
         run: |
           set -o pipefail
           if ! ls /tmp/durations/*/test-durations.shard-* >/dev/null 2>&1; then
@@ -686,7 +723,17 @@ jobs:
           # artifact — so it is written whether or not the merge refused, which
           # is why the status is caught here instead of ending the step.
           status=0
-          cargo run -- --merge-durations /tmp/durations 2>&1 | tee /tmp/merged.log || status=$?
+          # Unquoted on purpose: an empty `TIER_BASE` must contribute no
+          # argument at all, and `--tier-base ''` would be read as a base this
+          # run named and could not resolve. `set -u` is not on, and the two
+          # words are a flag and a sha with no whitespace in either.
+          base_arg=""
+          if [ -n "$TIER_BASE" ]; then
+            base_arg="--tier-base $TIER_BASE"
+          fi
+          # shellcheck disable=SC2086
+          cargo run -- --merge-durations /tmp/durations $base_arg 2>&1 \
+            | tee /tmp/merged.log || status=$?
           {
             echo "### the duration profile"
             echo ""

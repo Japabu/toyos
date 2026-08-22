@@ -13480,7 +13480,7 @@ fn check_shard_partition(all_tests: &[TestDef]) {
 ///
 /// **The line here is `FAST_COMMIT_MS`, not `FAST_CEILING_MS`** — the price a
 /// test may be *committed* at, which is where the fast tier's margin rule bites
-/// on a registration. `validate_ci_profile` says the same of a merged
+/// on a registration. `tiers::ci_profile_verdicts` says the same of a merged
 /// measurement; two gates on one policy may not disagree about where it is.
 fn assert_fast_profile_label(
     label: &str,
