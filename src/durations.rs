@@ -54,6 +54,16 @@
 //! `Everything` there and the full verdict reds — fixed by a pull request the
 //! next day like every other nightly red.
 //!
+//! **A Rust guest test's registration is its file.** `tests/toyos.rs` discovers
+//! `tests/toyos-rust-tests/src/bin/<name>.rs` from the binaries it built and no
+//! table ever names it, so the scan reads that directory as a source beside the
+//! two tables: a file added, deleted or edited there names its stem, by the
+//! stem rule the discovery itself applies. Without it a discovered name was
+//! invisible to the scan — PR #218 registered `netd_gone_mid_bind` and its
+//! `durations` job on run `32568941432` said the verdict was "rendered for no
+//! name", and only the committed `UNMEASURED` marker's own refusal, which no
+//! base softens, kept that landing red at all.
+//!
 //! The reason is measured. Over six hosted twelve-shard runs — 72 shard-runs,
 //! 640 observations, 130 names — a per-shard common price factor explains 57%
 //! of the run-to-run variance a name shows and spreads about 1.28x from p10 to
@@ -309,16 +319,26 @@ fn render_verdict(
     out
 }
 
-/// Every registered name this change registered, re-tiered, re-scheduled, or
-/// moved into, out of, or across `src/tiers.rs`'s `RELEGATED`.
+/// Where a Rust guest test's whole declaration lives: one file per test, named
+/// for it, and no row anywhere.
+const RUST_TEST_BINS: &str = "tests/toyos-rust-tests/src/bin";
+
+/// Every name this change registered, re-tiered, re-scheduled, or moved into,
+/// out of, or across `src/tiers.rs`'s `RELEGATED`.
 ///
-/// Two files answer it and no third: `tests/toyos.rs` is where a name's
-/// `(name, Sched, Tier)` row lives, and `src/tiers.rs`'s `RELEGATED` is where
-/// its `Why` does. A change to either is a change to what tier that name
-/// claims, which is exactly the claim the price verdict grades. Everything else
-/// a diff can touch — a kernel path, a test body, a `ci_ms` note — may well
-/// move a price, and deliberately does not enter here: a name whose price moved
-/// without its declaration moving is what the nightly is for.
+/// Three sources answer it and no fourth. `tests/toyos.rs` is where a name's
+/// `(name, Sched, Tier)` row lives and `src/tiers.rs`'s `RELEGATED` is where
+/// its `Why` does; a change to either is a change to what tier that name
+/// claims, which is exactly the claim the price verdict grades. The third is a
+/// directory rather than a table, because a Rust guest test has no row at all:
+/// `tests/toyos.rs`'s `discover_rust_tests` finds it among the built binaries,
+/// so [`RUST_TEST_BINS`]`/<name>.rs` *is* its registration and touching that file
+/// is registering, deregistering or redefining the name it is called.
+///
+/// Everything else a diff can touch — a kernel path, a registered test's body,
+/// a `ci_ms` note — may well move a price, and deliberately does not enter
+/// here: a name whose price moved without its declaration moving is what the
+/// nightly is for.
 fn touched_names(root: &Path, base: &str) -> BTreeSet<String> {
     let registered = changed(
         &registrations(&at_base(root, base, "tests/toyos.rs")),
@@ -328,7 +348,30 @@ fn touched_names(root: &Path, base: &str) -> BTreeSet<String> {
         &relegation_whys(&at_base(root, base, "src/tiers.rs")),
         &relegation_whys(&at_head(root, "src/tiers.rs")),
     );
-    registered.union(&relegated).cloned().collect()
+    let discovered = discovered_names(&changed_under(root, base, RUST_TEST_BINS));
+    registered.union(&relegated).chain(discovered.iter()).cloned().collect()
+}
+
+/// The Rust guest tests a set of changed paths names, by the rule the suite
+/// discovers them with.
+///
+/// One binary per `.rs` file directly under [`RUST_TEST_BINS`], the name being
+/// the file stem — `src/build.rs`'s `build_toyos_bins` strips exactly that
+/// suffix off exactly those entries, and `discover_rust_tests` takes the
+/// resulting binary names. Nothing else may live there: a subdirectory or a
+/// file that is not `.rs` panics that build rather than becoming a test, so a
+/// path this drops is one no profile can ever hold a price for. A change
+/// elsewhere under `tests/toyos-rust-tests/` — the crate's manifest, `src/tone.rs`,
+/// a cdylib subcrate — is a body change like any other and names nothing.
+fn discovered_names(paths: &[String]) -> BTreeSet<String> {
+    let prefix = format!("{RUST_TEST_BINS}/");
+    paths
+        .iter()
+        .filter_map(|path| path.strip_prefix(&prefix))
+        .filter(|entry| !entry.contains('/'))
+        .filter_map(|entry| entry.strip_suffix(".rs"))
+        .map(str::to_string)
+        .collect()
 }
 
 /// The keys the two sides disagree about, added and removed included.
@@ -350,28 +393,52 @@ fn at_head(root: &Path, path: &str) -> String {
 }
 
 /// The same file at the base this run was asked to measure against.
+fn at_base(root: &Path, base: &str, path: &str) -> String {
+    git_reading_base(root, &["show", &format!("{base}:{path}")])
+}
+
+/// Every path under `dir` that differs between the base and this checkout,
+/// a rename counted as the two names it is.
+///
+/// The two sides are the two [`at_base`] and [`at_head`] read: `git diff <base>
+/// -- <dir>` with no second commit compares the named commit against the
+/// working tree, which in the job that runs this is the head commit itself.
+/// `--no-renames` is the load-bearing flag — with detection on, a renamed test
+/// prints only its new path and the name it stopped being would go unnamed.
+/// The one thing git cannot see here is a file nothing has ever added; a
+/// checkout is a commit, so that is a hand-run's hazard and not the gate's.
+fn changed_under(root: &Path, base: &str, dir: &str) -> Vec<String> {
+    git_reading_base(root, &["diff", "--name-only", "--no-renames", base, "--", dir])
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// `git` in this checkout, asked something only the base can answer.
 ///
 /// **A base that was named and cannot be read is a refusal, never a silent
 /// widening or a silent narrowing.** The usual cause is a depth-1 checkout: the
-/// base commit is not in the clone, `git show` says so, and the fix is
+/// base commit is not in the clone, git says so, and the fix is
 /// `fetch-depth: 0` on the job rather than a guess about which names moved.
-fn at_base(root: &Path, base: &str, path: &str) -> String {
+fn git_reading_base(root: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["show", &format!("{base}:{path}")])
+        .args(args)
         .output()
-        .unwrap_or_else(|e| panic!("running git show {base}:{path}: {e}"));
+        .unwrap_or_else(|e| panic!("running git {}: {e}", args.join(" ")));
     assert!(
         out.status.success(),
-        "git show {base}:{path} failed ({}): {}. {TIER_BASE_FLAG} names the commit this change \
+        "git {} failed ({}): {}. {TIER_BASE_FLAG} names the commit this change \
          is measured against, so it must be in this clone — a depth-1 checkout does not have \
          it, and `fetch-depth: 0` is what puts it there. Refusing rather than guessing which \
          names this change touched",
+        args.join(" "),
         out.status,
         String::from_utf8_lossy(&out.stderr).trim(),
     );
-    String::from_utf8(out.stdout).unwrap_or_else(|e| panic!("{base}:{path} is not UTF-8: {e}"))
+    String::from_utf8(out.stdout)
+        .unwrap_or_else(|e| panic!("git {} did not answer UTF-8: {e}", args.join(" ")))
 }
 
 /// Rust source with every `//`/`/* */` comment and every string literal's
@@ -1119,12 +1186,7 @@ mod tests {
         git(&dir, &["init", "-q", "-b", "main"]);
         git(&dir, &["add", "-A"]);
         git(&dir, &["commit", "-qm", "base"]);
-        let base = String::from_utf8(
-            Command::new("git").arg("-C").arg(&dir).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
+        let base = head_sha(&dir);
 
         fs::write(dir.join("tests/toyos.rs"), registrations("Nightly")).unwrap();
         fs::write(
@@ -1140,6 +1202,96 @@ mod tests {
         assert!(enforced.renders("retiered"));
         assert!(!enforced.renders("kept"));
         assert!(enforced.scope().contains("retiered"), "{}", enforced.scope());
+    }
+
+    /// **A Rust guest test is registered by its file**, and this is the run
+    /// that showed the scan could not see one: PR #218 added
+    /// `netd_gone_mid_bind.rs`, no table anywhere named it, and the
+    /// `durations` job on run `32568941432` rendered the price verdict "for no
+    /// name" on the very change that introduced it.
+    ///
+    /// The base/head pair below is that shape, with the other two directions
+    /// beside it. A file added under `tests/toyos-rust-tests/src/bin/` names
+    /// its stem, a deleted one names the test it stopped being, an edited one
+    /// names its own — and a change elsewhere in the same crate, which
+    /// registers no binary, names nothing.
+    #[test]
+    fn a_discovered_guest_test_is_named_by_the_file_that_registers_it() {
+        let dir = std::env::temp_dir().join("toyos-durations-discovered");
+        let _ = fs::remove_dir_all(&dir);
+        let bins = dir.join(RUST_TEST_BINS);
+        let crate_src = dir.join("tests/toyos-rust-tests/src");
+        fs::create_dir_all(&bins).unwrap();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("tests/toyos.rs"),
+            "const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[];\n\
+             const SCREEN_TESTS: &[(&str, Sched, Tier)] = &[];\n\
+             const AUDIO_TESTS: &[(&str, Tier)] = &[];\n",
+        )
+        .unwrap();
+        fs::write(dir.join("src/tiers.rs"), "pub const RELEGATED: &[Relegated] = &[\n];\n")
+            .unwrap();
+        for name in ["kept", "edited", "removed"] {
+            fs::write(bins.join(format!("{name}.rs")), "fn main() {}\n").unwrap();
+        }
+        fs::write(crate_src.join("tone.rs"), "// the tone every audio test plays\n").unwrap();
+        fs::write(dir.join("tests/toyos-rust-tests/Cargo.toml"), "[package]\n").unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "base"]);
+        let base = head_sha(&dir);
+
+        fs::write(bins.join("netd_gone_mid_bind.rs"), "fn main() {}\n").unwrap();
+        fs::write(bins.join("edited.rs"), "fn main() { assert!(true) }\n").unwrap();
+        fs::remove_file(bins.join("removed.rs")).unwrap();
+        fs::write(crate_src.join("tone.rs"), "// reworded\n").unwrap();
+        fs::write(dir.join("tests/toyos-rust-tests/Cargo.toml"), "[package]\nedition = \"2021\"\n")
+            .unwrap();
+        // Committed rather than left in the working tree: the job that runs
+        // this scans a checkout, and a file nothing has ever added is the one
+        // change `git diff` cannot see.
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "head"]);
+
+        let touched = touched_names(&dir, &base);
+        assert_eq!(
+            touched,
+            ["edited", "netd_gone_mid_bind", "removed"]
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<BTreeSet<_>>(),
+            "kept, tone.rs and the manifest are the ones nothing may name"
+        );
+
+        let args: Vec<String> =
+            vec!["--merge-durations".into(), "d".into(), TIER_BASE_FLAG.into(), base];
+        let enforced = Enforced::from_args(&dir, &args);
+        assert!(enforced.renders("netd_gone_mid_bind"));
+        assert!(!enforced.renders("kept"));
+        assert!(enforced.scope().contains("netd_gone_mid_bind"), "{}", enforced.scope());
+
+        // The stem rule is the build's: one binary per `.rs` file directly in
+        // that directory. A subdirectory or a file that is not `.rs` panics
+        // `build_toyos_bins` rather than becoming a test, so naming one here
+        // would name a price no profile can hold.
+        assert!(discovered_names(&[
+            format!("{RUST_TEST_BINS}/nested/main.rs"),
+            format!("{RUST_TEST_BINS}/notes.txt"),
+            "tests/toyos-rust-tests/src/tone.rs".to_string(),
+        ])
+        .is_empty());
+    }
+
+    fn head_sha(dir: &Path) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("run git rev-parse");
+        assert!(out.status.success(), "git rev-parse HEAD in {}", dir.display());
+        String::from_utf8(out.stdout).expect("a sha is UTF-8").trim().to_string()
     }
 
     fn git(dir: &Path, args: &[&str]) {
