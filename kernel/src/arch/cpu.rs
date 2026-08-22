@@ -356,16 +356,31 @@ pub unsafe fn ltr(selector: u16) {
     asm!("ltr {:x}", in(reg) selector as u64, options(nostack));
 }
 
+/// `sti`, and **not a drop-in for a site that spells the instruction bare.**
+///
+/// The `options(nomem, nostack)` here is honest about the instruction — it
+/// writes one `RFLAGS` bit and touches nothing — and that is exactly what makes
+/// it the wrong helper for a caller whose reason for the `cli`/`sti` is the
+/// *compiler barrier*: a bare `asm!("sti")` carries an implicit memory clobber,
+/// so no load or store may be moved across it. `arch::mod`'s
+/// `LogCommitGuard::close` and `percpu_fetch_add` spell all three of theirs bare
+/// and say so at the site, because what has to stay on the closed side of the
+/// window is the shard selection, the `xadd` and the body publication.
+/// Substituting this function there would delete that barrier and change no
+/// visible line.
+///
+/// Whether IF *should* be set at all is the caller's; `hw::IrqGuard` is the type
+/// for callers that want it restored rather than set.
 #[inline]
 pub fn enable_interrupts() {
-    // SAFETY: one `RFLAGS` bit, no memory. Whether IF *should* be set here is
-    // the caller's — this is the instruction, and `hw::IrqGuard` is the type for
-    // callers that want it restored rather than set.
+    // SAFETY: one `RFLAGS` bit, no memory — which is what the options claim and
+    // what the doc comment above says a barrier-seeking caller must not accept.
     unsafe {
         asm!("sti", options(nomem, nostack));
     }
 }
 
+/// `cli`, with [`enable_interrupts`]'s caveat about the missing barrier.
 #[inline]
 pub fn disable_interrupts() {
     // SAFETY: `enable_interrupts`'s argument. Masking interrupts cannot make
