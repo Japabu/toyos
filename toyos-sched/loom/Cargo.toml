@@ -45,6 +45,16 @@ no-preempt-guard = []
 # Never on by default and never reachable from a kernel build, which declares
 # the same name only so `cfg` checking knows it.
 doorbell-kick-relaxed = []
+# The negative control for `Balance::PushOnSurplus`'s ordering. It weakens
+# `cpu.rs`'s `balance_fence` from a `SeqCst` fence to a release one, which
+# orders stores against stores and nothing against a later load — so the push's
+# surplus store and the sleeper's SLEEPING store may each be missed by the
+# other's read, and the CPU halts with a surplus published and no probe
+# outstanding. `loom_push.rs` must red under it:
+#
+#   cargo test -p toyos-sched-loom --features push-fence-relaxed --test loom_push
+#
+push-fence-relaxed = []
 
 [dependencies]
 loom = "0.7"

@@ -307,7 +307,20 @@ pub fn esp_filesystem(
         return Err(format!("the guest stopped answering: {err}\nserial:\n{}", result.serial));
     }
     if result.exit_code != Some(0) {
-        return Err(format!("esp_files failed:\n{}", result.stdout));
+        // **The kernel's own lines, not just the guest binary's.** Every failure
+        // this test can produce on the write path — `write_page`, `set_len`,
+        // `flush_meta`, the FSInfo write, the device cache flush — reaches
+        // userland as one `SyscallError::Io`, which `std` flattens to
+        // `Kind(Other)`; *which* layer refused is in a `log!` line and nowhere
+        // else (`fat32_adapter::refused`, `usb_storage`'s three trait methods,
+        // `xhci::wait::msc`'s `log_refusal` and its budget line). Reporting
+        // `stdout` alone left `fsync the blob: Kind(Other)` as the whole of the
+        // evidence for a real 2026-08-21 sighting, and the next author with no
+        // more to go on than the one before.
+        return Err(format!(
+            "esp_files failed:\n{}\nkernel log while the test ran:\n{}{}",
+            result.stdout, result.before, result.serial
+        ));
     }
     serial::Serial::named("test serial", result.serial.as_str()).must_be_clean()?;
     for line in result.stdout.lines().filter(|l| l.contains("PASS")) {

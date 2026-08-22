@@ -41,3 +41,11 @@ loom = []
 # negative control (spec §7.3, §7.5). No kernel build reaches it; the crate
 # declares it only so `cfg` checking knows the name.
 doorbell-kick-relaxed = []
+# Declared, never enabled here: `toyos-sched-loom` turns this on to weaken the
+# `SeqCst` fence `cpu.rs`'s `balance_fence` puts between the push half's surplus
+# store and its read of a target's SLEEPING bit, and
+# `loom/tests/loom_push.rs` must red when it does — `Balance::PushOnSurplus`'s
+# own negative control. No kernel build reaches it, and no kernel build selects
+# that policy either; the crate declares the name only so `cfg` checking knows
+# it.
+push-fence-relaxed = []
