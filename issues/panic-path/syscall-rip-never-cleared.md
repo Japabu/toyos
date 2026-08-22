@@ -23,8 +23,7 @@ honest predicate is a per-CPU "in syscall" depth.
 
 ## 2026-08-20: the block does not merely lie, it truncates the report
 
-Measured, in a 12-wide boot storm capture of
-`issues/kernel/a-btreemap-panicked-inside-its-own-insert-in-a-scheduler-pass.md`:
+Measured, in a 12-wide `bootable.img` boot storm capture of a kernel death:
 
 ```
 [kernel 0.557 cpu0 tid=1]   Syscall: num=90 user_rip=0x1000003d458 user_rsp=0xfffe8007b0

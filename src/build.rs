@@ -1639,6 +1639,27 @@ mod tests {
             [
                 "boot-actuators",
                 "debug-wait",
+                // Does this kernel reach a pass, a trap or a syscall with the
+                // direction flag set. No gate clears `DF` and
+                // `compiler_builtins::mem::memmove` sets it across three `rep`
+                // string operations, so before `arch::entry`'s `cld` it could be
+                // — and every `rep movs`/`rep stos` after that writes backwards.
+                // Its own build: a `pushfq` and a test on three hot paths, and
+                // the negative control for that `cld` in both directions.
+                "df-witness",
+                // Its control: a `std` one instruction before the reader that
+                // must refuse it. The witness fired zero times on an unclean
+                // kernel, which is a fact about where the flag reaches and would
+                // be indistinguishable from a broken reader without this.
+                "df-witness-mutate",
+                // The kernel this tree had before `arch::entry`'s `cld`: the
+                // instruction gone and `DF` back out of the `SYSCALL` mask, so a
+                // build carrying it inherits a set direction flag from whatever
+                // it interrupted. The negative control for that fix, and its own
+                // build for `fpu-save-nothing`'s reason — the defect is in a
+                // `naked_asm!` body on every ring transition, where a boot
+                // parameter would have to be a branch.
+                "entry-df-unclean",
                 "fpu-save-nothing",
                 // The two band shapes that separate the two readings
                 // `heap-tripwire`'s own result left standing — the bands absorb
@@ -1651,6 +1672,13 @@ mod tests {
                 // experiment in two arms and refuse to build together.
                 "heap-band-nohead",
                 "heap-band-notail",
+                // The sweep's lock hold without the sweep. `heap-sweep` and
+                // `sched-tripwire` both multiply this class and both spend time
+                // on the pass path; only the sweep also holds `dlmalloc`'s lock
+                // while it does. This arm and `pass-spin` below spend one
+                // `HOLD_NS` with and without that lock, which is the one
+                // variable nobody has varied.
+                "heap-lockspin",
                 // The sweep that reads every live band rather than only the
                 // ones a `dealloc` reaches. Its own build for `heap-tripwire`'s
                 // reason twice over: the walk takes `dlmalloc`'s lock on the
@@ -1678,6 +1706,9 @@ mod tests {
                 "lock-acquire-off",
                 "log-commit-release-off",
                 "loom",
+                // `heap-lockspin`'s other arm: the same visit to the pass path,
+                // for the same span, without the allocator's lock.
+                "pass-spin",
                 "reap-raise-relaxed",
                 "sched-check",
                 // The stray-write tripwire on the per-CPU `CpuSched` record: a
@@ -1698,6 +1729,25 @@ mod tests {
                 // `Relaxed` and `kernel-loom/tests/sleep_lock.rs` reds. Costs
                 // no kernel build, for the same reason as the six above it.
                 "sleeplock-acquire-off",
+                // The two comparisons that ask who else is standing on a task's
+                // kernel stack: the words a Ring 3 entry takes its stack from,
+                // against the running task's own top, at every pass; and the one
+                // driver field this class has been caught changing inside a
+                // single call. Its own build because both halves are readers on
+                // hot paths, so it has to be in both arms of any comparison.
+                "stack-witness",
+                // The one window this class has never measured: the eight words
+                // `context_switch` pops, copied at `check_switch_frame` and
+                // compared from inside the switch, one instruction before the
+                // first `pop`, against the stack pointer the machine is standing
+                // on. Its own build for `stack-witness`'s reason and one more —
+                // the compare is a `call`, so the frame has to have been proven
+                // to be inside a real stack, which is why it turns that feature
+                // on. Its two mutation controls sit beside it, each staging one
+                // arm of what it watches.
+                "switch-witness",
+                "switch-witness-mutate-frame",
+                "switch-witness-mutate-rsp",
                 "test-actuators",
                 // Costs no kernel build at all, for `loom`'s reason: declared
                 // so `cfg` checking knows the name, and turned on only by
