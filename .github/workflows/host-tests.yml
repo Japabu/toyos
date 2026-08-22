@@ -69,6 +69,7 @@ jobs:
             ~/.cargo/git/db
             target
             userland/target
+            toyos/target
             kernel/target
             bootloader/target
           key: host-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
@@ -109,7 +110,9 @@ jobs:
       # other `kernel-loom` model controls, `debug-wait`, `sched-check` and
       # `fpu-save-nothing` — so `cargo test --lib`, `kernel-loom`'s own suites
       # and `--debug` already close that set, and this gate has no business in
-      # it. Measured against a warm kernel target (`cargo clean -p kernel`,
+      # it. `toyos/` is not linted here either, for the same reason userland is
+      # not: it is a sysroot source, excluded from the host workspace, and its
+      # ordinary build is the custom target. Measured against a warm kernel target (`cargo clean -p kernel`,
       # then both invocations back to back, 2026-08-20): the added invocation
       # costs about **1.6 s** more — the same tree, checked twice, not a
       # second target directory.
@@ -571,11 +574,33 @@ jobs:
               | tee -a /tmp/host.log
           done
 
+      # The SDK's own decisions. `toyos/` is excluded from the host workspace
+      # because it compiles against the ToyOS sysroot and is a path dependency
+      # of `rust/library/std` — but *some* of what it holds is a total function
+      # over kernel words, and `net::hangup` is the one that decides whether a
+      # program whose netd has gone leaves quietly or panics across the boot
+      # (`issues/build/sshd-panics-when-netd-exits-before-it-binds.md`). Its
+      # `lib.rs` is `no_std` for every build but this one, and this one links no
+      # syscall.
+      #
+      # Named here rather than folded into the loop above: it is not under
+      # `userland/`, it has its own lockfile and its own workspace, and it needs
+      # `--target` for a different reason — there is no `.cargo/config.toml`
+      # beside it, so this is the host triple said out loud rather than one
+      # overridden.
+      - name: toyos SDK host tests
+        run: |
+          set -e -o pipefail
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          echo "=== toyos" | tee -a /tmp/host.log
+          cargo test --manifest-path toyos/Cargo.toml --target "$host" 2>&1 \
+            | tee -a /tmp/host.log
+
       # The root package's `--lib`, one `--workspace` over the other host-tested
       # members, `kernel-loom`'s no-loom command, eight negative-control runs
       # (`wake-fence-off` plus the five `kernel-loom` gained 2026-08-17, and
-      # `toyos-sched-loom`'s `no-preempt-guard` and `doorbell-kick-relaxed`) and
-      # the three userland crates. A red is still one line somewhere among them,
+      # `toyos-sched-loom`'s `no-preempt-guard` and `doorbell-kick-relaxed`),
+      # the three userland crates and the SDK. A red is still one line somewhere among them,
       # and `--workspace` prints a `Running ...` line naming the binary rather
       # than the `=== <crate>` the other steps echo, so the summary matches both
       # shapes.
