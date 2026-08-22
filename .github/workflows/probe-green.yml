@@ -7,6 +7,17 @@ name: green-probe
 # is the open question this shape is next aimed at — edit the name list below
 # and push to `ci/probe-green` to run it.
 #
+# **Which machine a probe measures is the trigger's answer**, since `route.yml`
+# routes every `push` hosted (2026-08-22): a push to `ci/probe-green` gets ten
+# GitHub-hosted reps with a runner each and needs nothing landed, and a
+# `workflow_dispatch` gets the T14 one rep at a time — but the runner's hook
+# refuses a dispatch of anything but `main`'s copy of a workflow
+# (`.github/runner/accept-trusted.sh`), so a T14 probe costs landing the name
+# list below first. A rate is about a quiet machine either way — neither shape
+# puts two guests on one host — but the two do not price a test alike, so a
+# rate carries the lane it was taken on, and a question about the T14's own
+# silicon is what is worth that landing.
+#
 # It never fails: a probe that reds is a probe whose own summary nobody reads.
 
 on:
