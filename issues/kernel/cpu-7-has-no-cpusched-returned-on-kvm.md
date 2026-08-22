@@ -47,9 +47,7 @@ printing `joining scheduler` one millisecond later and cpu4/5/6 never having
 switched. `driver.rs:212` states the invariant this contradicts in as many
 words: *"`init` fills `SCHEDS` before any AP is released"*. Either that ordering
 does not hold on the KVM bring-up path, or the slot was filled and something
-wrote it back to `None` — which is the class
-`issues/kernel/a-btreemap-panicked-inside-its-own-insert-in-a-scheduler-pass.md`
-tracks, and whose current suspect is the kernel heap rather than the scheduler.
+wrote it back to `None`.
 
 **And the instrument is new.** Every previous measurement of this class is the
 dev host under cross-arch TCG; `tests/CLAUDE.md` warns that TCG is one vendor's
@@ -73,9 +71,61 @@ shows when the vCPUs are not all running at once. What the load buys is a
 running one on a deliberately oversubscribed KVM host is a cheaper instrument
 than 6,576 TCG boots per sighting.
 
+## A second sighting the same day, on the dev host, on the newer tree
+
+2026-08-21, `wt/toyos-bimodal` at `fa5eb83b` (`main` `13953023` plus a soundd
+stats-line instrument), dev host, cross-arch TCG, plain `cargo test` — the
+12-wide fast tier. One death in 275 tests:
+
+```
+[kernel 1.366 cpu1] PANIC: panicked at src/sched/driver.rs:264:28:
+cpu 1 has no CpuSched
+[kernel 1.367 cpu1]     0xffff80007d15419c  core::panicking::panic_fmt+0x2c
+[kernel 1.367 cpu1]     0xffff80007d122f03  kernel::sched::driver::with_cpu::<...>+0x283
+[kernel 1.367 cpu1]     0xffff80007d08c234  kernel::sched::driver::pass+0x94
+[kernel 1.367 cpu1]     0xffff80007d08cb76  kernel::sched::driver::idle_loop+0x26
+[kernel 1.367 cpu1]   Contexts: cpu1 crashed at rsp=0xffff800000e41d98, asking about ctx 0x0
+[kernel 1.367 cpu1]   cpu0 is on ctx 0xffff800000debd48 pid=0 tid=0 ...
+```
+
+Byte-for-byte the same shape — `idle_loop -> pass -> with_cpu`, `asking about
+ctx 0x0`, during bring-up — at the same site: `driver.rs:264` is the `:224`
+above after `main` grew `kernel/src/sched/driver.rs` by 157 lines and
+`kernel/src/mm/alloc.rs` by 651 between `53101d08` and `13953023`. So **the heap
+sweep and the scheduler work that landed between the two sightings did not
+remove it**, and it is not specific to KVM, to eight vCPUs or to the audio
+configs: this one was a four-CPU boot on a host running twelve guests at once.
+
+The red it produced was named `swiss_german_layout`, which was only the test
+whose boot it landed in — `tests/CLAUDE.md`'s "that red's name is the workload,
+never the cause". The harness's own `ALONE:` line then reported it GREEN alone
+and blamed the test's `Sched::Parallel`, which is the misreading the same file
+warns about two lines later. Anyone meeting a lone `Init process crashed during
+boot` under an unrelated test name should search the capture for this panic
+before believing the name.
+
+## 2026-08-21: the stray-write class this was read as a sighting of is resolved
+
+The dev host's `BTreeMap`-inside-its-own-`insert` class — a per-CPU scheduler
+record reading as a value no operation on it produces — was resolved that day:
+no Ring 0 entry cleared the direction flag, `compiler_builtins::mem::memmove`
+sets it across three `rep` string operations with interrupts enabled, and every
+`memcpy`/`memset` reached from an entry taken inside that window wrote the `n`
+bytes *below* its destination. `arch::entry::ring3_naked_asm`'s `cld` and
+`arch::syscall::init`'s `DF` in `IA32_FMASK` close it: 17 deaths in 7,059
+twelve-wide boots without them, 0 in 7,418 with them.
+
+`SCHEDS` is `static` and a `None` written back into it is exactly what a
+backwards `memset`/`memcpy` landing in `.bss` produces, so **both sightings
+above are consistent with that mechanism and need no bring-up ordering bug at
+all** — the second one, a TCG boot under a twelve-guest host, is the exposure
+that mechanism predicts. The fix is architecture-neutral and applies to the KVM
+path unchanged. What is owed is a re-measurement, not a new hypothesis.
+
 ## Whoever takes it
 
-Read `driver.rs:429`'s fill against the AP release path first — it is a
-one-reader question and it either holds or it does not, which is worth settling
-before spending storms on the heap hypothesis. If it holds, this joins the heap
-class and the KVM host is the new instrument for it.
+Re-run the oversubscribed-KVM recipe this file records on a kernel carrying the
+`cld` — the T14, a CI image by digest, `--device=/dev/kvm`, a contended host. A
+sighting that survives it is a real bring-up ordering question and
+`driver.rs`'s fill against the AP release path is the one-reader thing to read
+first; a clean run of the same width closes this.

@@ -220,6 +220,76 @@ heap-band-nohead = ["heap-tripwire"]
 # the kernel a rate was measured on and it has to be in *both* arms of any
 # comparison. It compiles no decision — every line is a reader and a panic.
 stack-witness = []
+# **The seven words, and the pointer to them.** Every instrument this class owns
+# asks its question at `hw::check_switch_frame`, which reads `ctx.rsp`, tests it
+# and returns; the frame is popped in `sched::driver::context_switch` a few
+# hundred instructions later, past the preempt swap, the TSS handover, a
+# `mov cr3` and a `wrfsbase`, and nothing between them tests anything. 18,064
+# boots of `stack-witness` say the value the check sees is always sound, and one
+# parked guest says the value the `popfq` used was not — a frame at
+# `0xffff800000c00640`, inside the per-CPU region, which every check that runs at
+# the check would have passed.
+#
+# So this copies the eight words at the check and compares them from inside
+# `context_switch`, one instruction after `mov rsp, rsi` and one before the first
+# `pop`, against the stack pointer the machine is standing on. It reads `ctx.rsp`
+# there too: `Hw::switch` loads that field **twice** — the `mov cr3` between the
+# two forbids the compiler from forwarding the first — so the value the machine
+# switches onto is not the value anything validated, and the two loads disagreeing
+# is a thing this can see and nothing else can.
+#
+# It turns on `stack-witness` rather than standing alone, and that is a soundness
+# requirement and not a preference: the compare is a `call`, whose return address
+# lands eight bytes below the frame, so the frame has to be inside a real stack
+# before the call happens. `stack-witness`'s third test is what establishes that.
+switch-witness = ["stack-witness"]
+# The negative controls for the instrument above — `kernel/src/hw.rs`'s
+# `switch_witness_mutate` carries what each stages. One write per boot, at the
+# 20,000th switch: `frame` writes the `rbx` slot of a frame the check has just
+# validated, `rsp` moves the field up by eight after the check, which is the
+# double load staged. A witness that does not fire under either has not been
+# shown to be able to fire at all.
+switch-witness-mutate-frame = ["switch-witness"]
+switch-witness-mutate-rsp = ["switch-witness"]
+# **Is this kernel running with the direction flag set.** No gate clears `DF`:
+# an interrupt or trap gate clears `TF`, `NT`, `RF`, `VM` and `IF`, and `SYSCALL`
+# clears exactly what `IA32_FMASK` names. `compiler_builtins::mem::memmove`'s
+# overlapping-copy path is `std` … `rep movsb`/`rep movsq`/`rep movsb` … `cld`,
+# three string operations wide with interrupts enabled for all of it — so before
+# `arch::entry`'s `cld` a timer tick landing inside a large overlapping copy
+# handed the kernel a set `DF`, and every `memcpy`, `memset` and forward
+# `memmove` after it wrote the `n` bytes *below* its destination.
+#
+# `arch::cpu::df_witness` asks at a scheduler pass, at `trap_dispatch` and at
+# `syscall_handler`, and panics naming the site. It is the negative control for
+# the fix in both directions: on a kernel without the `cld` it fires, and on one
+# with it, it must not. Its own build because it is a `pushfq` and a test on three
+# hot paths, so a kernel carrying it is not the kernel a rate was measured on.
+df-witness = []
+# The witness's own control: a `std` one instruction before the reader that must
+# refuse it, at `sched::driver::pass`. An instrument that has never fired has not
+# been shown able to, and this one fired zero times in 2,463 boots of an
+# `entry-df-unclean` kernel — which is a fact about *where* the flag reaches, and
+# would be indistinguishable from a broken reader without this.
+df-witness-mutate = ["df-witness"]
+# **The kernel this tree had before the `cld`**, and the only way to have a
+# negative control for it: `arch::entry::ring3_naked_asm` drops the instruction
+# and `arch::syscall::init` puts `DF` back out of the `SYSCALL` mask, so a build
+# carrying this inherits a set direction flag from whatever it interrupted
+# exactly as every kernel before 2026-08-21 did.
+#
+# It replaces the *behaviour* and not a verdict, which is `fpu-save-nothing`'s
+# argument one file over: everything else about the entry — the pushes, the FP
+# bracket, the preempt count, the exit-to-user check — is the shipped one, and
+# what is absent is one instruction. A control that flipped an assertion would
+# make its own gate vacuous.
+#
+# Measured 2026-08-21, twelve-wide `bootable.img` boot storms, thirty minutes
+# each, `sched-tripwire stack-witness` in both arms, silent deaths counted by
+# parking the guest on its reset action and reading the vCPUs over QMP:
+# **17 deaths in 7,059 boots with this on, 0 in 7,418 with it off**
+# (Poisson, expected 17.86, p = 1.7e-8).
+entry-df-unclean = []
 # The amplifier's own control, in two arms that differ by one lock.
 #
 # Two instruments now multiply this class and neither writes anything a machine

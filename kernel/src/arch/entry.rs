@@ -79,10 +79,61 @@ const _: () = assert!(size_of::<UserFpState>().is_multiple_of(align_of::<UserFpS
 const _: () = assert!(align_of::<UserFpState>() >= 8);
 
 /// `naked_asm!` for an entry that can reach another task, with the save area's
-/// size and alignment supplied from [`UserFpState`].
+/// size and alignment supplied from [`UserFpState`], and the **`cld` every Ring 0
+/// entry owes itself** ahead of the body.
+///
+/// **The direction flag is not cleared by the hardware and this kernel's own
+/// `memmove` sets it.** An interrupt or trap gate clears `TF`, `NT`, `RF`, `VM`
+/// and — for an interrupt gate — `IF`; `DF` is in none of those lists
+/// (SDM Vol. 3A §6.12.1). `SYSCALL` clears exactly the bits `IA32_FMASK` names,
+/// and `arch::syscall::init` now names `DF` among them for the same reason.
+/// Meanwhile `compiler_builtins::mem::memmove`'s overlapping-copy path is
+/// `std` … `rep movsb` / `rep movsq` / `rep movsb` … `cld`, three string
+/// operations wide and interruptible for all of it, so a timer tick landing
+/// inside a large overlapping copy hands the whole kernel a set `DF` — and
+/// `memcpy` and `memset` are `rep movs`/`rep stos` **forward**, which under a set
+/// `DF` write the `n` bytes *below* their destination instead of at it.
+///
+/// That writes real data — a return address, a rodata pointer, a live frame — at
+/// an address nothing meant to touch, which is a corrupted `BTreeMap` node, a
+/// corrupted `dlmalloc` free list or a null `Arc` a boot later and somewhere
+/// else. It does not stay in the interrupted flow either: `context_switch`'s
+/// `pushfq` saves the set `DF` into a context's frame and a later `popfq`
+/// restores it onto a different execution.
+///
+/// Measured, twelve-wide `bootable.img` boot storms, `sched-tripwire`
+/// `stack-witness` in both arms, thirty minutes each on 2026-08-21: **17 deaths
+/// in 7,059 boots without this instruction, 0 in 7,418 with it.**
+///
+/// Here rather than at each of the five sites, because a Ring 0 entry that forgot
+/// it would be invisible: the machine keeps running and something else dies, a
+/// boot later, somewhere else. The two `ring0` gates are not routed through this
+/// macro and answer for themselves — `idt::nmi` clears it, and `stub_halt_all`
+/// never executes another instruction.
 ///
 /// The body must end with a trailing comma, as every `naked_asm!` in this
 /// kernel already does.
+#[cfg(not(feature = "entry-df-unclean"))]
+macro_rules! ring3_naked_asm {
+    ($($body:tt)*) => {
+        core::arch::naked_asm!(
+            "cld",
+            $($body)*
+            fp_bytes = const core::mem::size_of::<$crate::arch::fpu::UserFpState>(),
+            fp_align = const core::mem::align_of::<$crate::arch::fpu::UserFpState>(),
+        )
+    };
+}
+
+/// The negative control (`entry-df-unclean`, declared in `kernel/Cargo.toml`):
+/// the kernel this tree had before the `cld` above, and the one 2026-08-21's
+/// storm measured seventeen deaths in seven thousand boots on.
+///
+/// One instruction, and it replaces the *behaviour* rather than a verdict — the
+/// same argument `fpu-save-nothing` makes for the bracket it takes out.
+/// `arch::syscall::init` answers this name too, putting `DF` back out of the
+/// `SYSCALL` mask, so the control is the whole defect and not half of it.
+#[cfg(feature = "entry-df-unclean")]
 macro_rules! ring3_naked_asm {
     ($($body:tt)*) => {
         core::arch::naked_asm!(

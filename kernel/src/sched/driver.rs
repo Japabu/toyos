@@ -686,6 +686,18 @@ fn env(preempt: &PreemptOff) -> Env<'_, crate::hw::KernelHw, PreemptOff> {
 /// travels *with* the context across the switch (`Hw::switch`) instead of being
 /// inherited by whoever lands on the CPU next.
 pub fn pass(dispose: Dispose) {
+    // The witness's own negative control (`df-witness-mutate`): set the flag one
+    // instruction before the reader that must refuse it. Nothing runs in between,
+    // so the machine never executes a string operation with it set — the panic is
+    // the next statement.
+    #[cfg(feature = "df-witness-mutate")]
+    // SAFETY: a build that exists to stage the defect, and the reader below
+    // panics before any `rep movs` can run.
+    unsafe {
+        core::arch::asm!("std", options(nomem, nostack))
+    };
+    #[cfg(feature = "df-witness")]
+    crate::arch::cpu::df_witness("a scheduler pass");
     crate::preempt::disable();
     // A pass *is* the reschedule the request asks for, so it owns the clear —
     // and it must clear before it drains, so a request raised by this pass's
@@ -1308,13 +1320,13 @@ fn check_stack_canary(payload: &KernelPayload) {
 /// Does every Ring 3 → Ring 0 entry this CPU can take land on the stack of the
 /// task this CPU is actually running, and is this CPU standing on it?
 ///
-/// **The question a corrupted word cannot answer and this can.** The class in
-/// `issues/kernel/a-btreemap-panicked-inside-its-own-insert-in-a-scheduler-\
-/// pass.md` keeps producing *kernel text* words inside kernel data — a
-/// deterministic `0xffff8000_7cae_3310` over `MscDevice::block`, a stack's own
-/// `stack_top + 16` one word above its top — and a mid-function text address in
-/// a data field is a **return address**, which means something executed with
-/// that address as its stack pointer. There are exactly two words in this
+/// **The question a corrupted word cannot answer and this can.** A stray-write
+/// class chased across 2026-08-19..21 kept producing *kernel text* words inside
+/// kernel data — a deterministic `0xffff8000_7cae_3310` over `MscDevice::block`,
+/// a stack's own `stack_top + 16` one word above its top — and a mid-function
+/// text address in a data field is a **return address**, which means something
+/// executed with that address as its stack pointer. There are exactly two words
+/// in this
 /// machine that aim an execution at a stack it did not grow: `kernel_rsp`, which
 /// `syscall` loads, and `tss.rsp0`, which every interrupt from Ring 3 loads.
 /// `Hw::switch` writes both from the incoming context's `kernel_stack_top`, so
@@ -1332,6 +1344,14 @@ fn check_stack_canary(payload: &KernelPayload) {
 /// decides nothing, which is why a kernel carrying it schedules exactly as one
 /// without it — and why the arm it belongs to is still not the arm a rate was
 /// measured on (`heap-sweep`'s note).
+///
+/// **It has never fired, and the writer it was built for was something else.**
+/// 18,064 boots across 2026-08-21's arms and 7,059 more the day the class was
+/// closed: `kernel_rsp` and `tss.rsp0` always agreed with the running task's own
+/// stack top, and no pass ever ran on a foreign `rsp`. The text words in data
+/// fields came from a `memcpy` running *backwards* — `arch::entry`'s `cld` — and
+/// not from an execution standing on the wrong stack. Kept because it answers a
+/// question nothing else can, and because a negative this wide is worth having.
 #[cfg(feature = "stack-witness")]
 fn check_stack_ownership(payload: &KernelPayload) {
     let bottom = payload.kernel_stack.ptr() as u64;
@@ -1389,27 +1409,87 @@ fn stack_depth(payload: &KernelPayload) {
     DEEPEST.fetch_max(used, Ordering::Relaxed);
 }
 
+/// The outgoing half of [`context_switch`]: seven words onto the stack this CPU
+/// is leaving, the address of them into the outgoing context, and the incoming
+/// context's saved `rsp` into the register file.
+///
+/// A macro rather than nine lines, because [`context_switch`] exists in two
+/// builds and the instruction sequence must be **one** text: an instrument that
+/// changed the switch it instruments would measure itself.
+macro_rules! switch_save {
+    () => {
+        "pushfq
+         push rbp
+         push rbx
+         push r12
+         push r13
+         push r14
+         push r15
+         mov [rdi], rsp
+         mov rsp, rsi"
+    };
+}
+
+/// The incoming half: the seven words this class keeps being killed by, and the
+/// `ret` that is the last instruction able to say anything at all.
+macro_rules! switch_restore {
+    () => {
+        "pop r15
+         pop r14
+         pop r13
+         pop r12
+         pop rbx
+         pop rbp
+         popfq
+         ret"
+    };
+}
+
 /// Callee-saved register save/restore. Unchanged from the old scheduler — the
 /// switch was never the part that was wrong.
+#[cfg(not(feature = "switch-witness"))]
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn context_switch(old_rsp: *mut u64, new_rsp: u64) {
+    naked_asm!(switch_save!(), switch_restore!());
+}
+
+/// The same switch with [`crate::hw::switch_witness_verify`] between the stack
+/// pointer moving and the first `pop`.
+///
+/// **The window between the check and the pop, and it measured to zero.**
+/// `hw::check_switch_frame` reads `ctx.rsp`, validates it and the return slot,
+/// and returns; the frame is popped a few hundred instructions later — past the
+/// preempt swap, the TSS handover, a `mov cr3` and a `wrfsbase` — and nothing in
+/// between tested it. In 6,901 twelve-wide storm boots on 2026-08-21, against 20
+/// deaths of the class in those same boots, this fired **not once**: no word of a
+/// frame ever changed in the window and `ctx.rsp` never moved under it. So
+/// neither "another CPU wrote the frame after the check" nor "this CPU's own
+/// interrupt path spilled onto it" is what was killing the machine, and the
+/// writer was found one layer out — `arch::entry`'s `cld`.
+///
+/// The call is placed after `mov rsp, rsi` and not before it deliberately: the
+/// subject is the incoming frame read *through the register the machine will
+/// actually use*, so a `ctx.rsp` that changed after the check is caught by the
+/// stack pointer itself rather than by re-reading the field the check read.
+///
+/// It is sound to `call` here. The return address lands eight bytes below the
+/// frame, which is inside the incoming task's own kernel stack — `switch-witness`
+/// turns on `stack-witness` for exactly that reason, whose third test refuses a
+/// `ctx.rsp` that is not inside the stack its own `kernel_stack_top` names. The
+/// callee is an ordinary `extern "C"` function, so the six registers about to be
+/// popped are preserved by the ABI and every register it may clobber is dead
+/// here: `rdi` was consumed by `mov [rdi], rsp`, `rsi` by `mov rsp, rsi`, and a
+/// resumed context's caller-saved registers are dead across the `call
+/// context_switch` it returns to (`loader::start`'s three trampolines take their
+/// arguments in `r12`/`r13`/`r14`, which are callee-saved).
+#[cfg(feature = "switch-witness")]
 #[unsafe(naked)]
 pub(crate) unsafe extern "C" fn context_switch(old_rsp: *mut u64, new_rsp: u64) {
     naked_asm!(
-        "pushfq",
-        "push rbp",
-        "push rbx",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        "mov [rdi], rsp",
-        "mov rsp, rsi",
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rbx",
-        "pop rbp",
-        "popfq",
-        "ret",
+        switch_save!(),
+        "mov rdi, rsp",
+        "call {verify}",
+        switch_restore!(),
+        verify = sym crate::hw::switch_witness_verify,
     );
 }
