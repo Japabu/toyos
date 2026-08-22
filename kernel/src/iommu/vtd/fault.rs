@@ -24,9 +24,11 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::iommu::StreamId;
-use crate::mm::Mmio;
+use crate::mm::{DirectMap, Mmio};
 
-use super::{FECTL_REG, FEADDR_REG, FEDATA_REG, FEUADDR_REG, FSTS_REG, MAX_UNITS};
+use super::{
+    FECTL_REG, FEADDR_REG, FEDATA_REG, FEUADDR_REG, FSTS_REG, MAX_UNITS, REGISTER_WINDOW,
+};
 
 /// The LAPIC window, physical destination 0, fixed delivery, edge — the same
 /// address every device MSI in this kernel targets. The unit's fault event is
@@ -50,14 +52,25 @@ const RECORD_FAULT: u32 = 1 << 31;
 
 /// A programmed unit, in the shape an interrupt handler can read.
 ///
-/// Three atomics rather than the `Mmio` handles themselves: the handler may
-/// take no lock, so a `Lock<Vec<Unit>>` is not reachable from it, and these are
-/// written once during the boot phase that programs the unit — before its mask
-/// comes off, so there is no moment at which the handler can see half of one.
+/// Three atomics rather than the `Mmio` handle itself: the handler may take no
+/// lock, so a `Lock<Vec<Unit>>` is not reachable from it, and these are written
+/// once during the boot phase that programs the unit — before its mask comes
+/// off, so there is no moment at which the handler can see half of one.
+///
+/// **The window is rebuilt from the address rather than dereferenced through
+/// it.** An `Mmio` is two words and no atomic holds two, but the second word is
+/// [`REGISTER_WINDOW`] for every unit there is, so the address is the whole of
+/// what has to be published — and [`Mmio::over_phys`] turns it back into a
+/// window whose bound the handler's every read and write is checked against.
 struct FaultUnit {
-    /// Virtual base of the register window, or 0 for a slot no unit uses.
+    /// *Physical* base of the register window, or 0 for a slot no unit uses.
+    ///
+    /// Physical and not virtual because that is what rebuilds the window, and
+    /// zero stays the sentinel it was: `vtd::window` refuses a register base of
+    /// 0 before a unit is ever described, so no armed unit can have one.
     regs: AtomicU64,
-    /// Virtual base of the first fault recording register.
+    /// Where the first fault recording register sits *inside* that window —
+    /// `CAP.FRO`, which is how it was declared in the first place.
     records: AtomicU64,
     /// How many there are.
     count: AtomicU32,
@@ -89,9 +102,11 @@ impl Records {
     ///
     /// These are the unit's own numbers and are checked like any other
     /// device's: one claiming 256 records at an offset near the top of the
-    /// window describes a range past the 4 KiB that is mapped, and reading it
-    /// would read whatever the direct map has after it. Such a unit is refused
-    /// by name rather than served with a walk truncated to fit.
+    /// window describes a range past the 4 KiB that is mapped. Such a unit is
+    /// refused by name here, rather than served with a walk truncated to fit —
+    /// and rather than left to the window's own bound, which would notice the
+    /// same thing as a panic in an interrupt handler and say nothing about
+    /// which register made the claim.
     pub fn fit(self, window: u64) -> bool {
         self.offset + self.count as u64 * 16 <= window
     }
@@ -102,23 +117,22 @@ impl Records {
 /// Before translation is enabled, so the very first transaction the unit blocks
 /// is one it can report.
 pub fn arm(index: usize, regs: Mmio, found: Records, vector: u8) {
-    let records = regs.addr() + found.offset;
     let count = found.count;
 
     // Firmware may have left records behind — its own DMA remapping, or a warm
     // reset. Cleared before the mask comes off, so the first event this kernel
     // takes is about a transaction this kernel's tables blocked.
     for i in 0..count {
-        clear_record(records + i as u64 * 16);
+        clear_record(regs, found.offset + i as u64 * 16);
     }
     let stale = regs.read_u32(FSTS_REG);
     regs.write_u32(FSTS_REG, stale & FSTS_WRITE_ONE_TO_CLEAR);
 
-    UNITS[index].records.store(records, Ordering::Relaxed);
+    UNITS[index].records.store(found.offset, Ordering::Relaxed);
     UNITS[index].count.store(count, Ordering::Relaxed);
     // Last, and with a release: it is what the handler tests, so every field it
     // will read has to be in place before this one is.
-    UNITS[index].regs.store(regs.addr(), Ordering::Release);
+    UNITS[index].regs.store(DirectMap::phys_of(regs.addr() as *const u8), Ordering::Release);
 
     regs.write_u32(FEDATA_REG, vector as u32);
     regs.write_u32(FEADDR_REG, MSG_ADDR);
@@ -126,15 +140,31 @@ pub fn arm(index: usize, regs: Mmio, found: Records, vector: u8) {
     regs.write_u32(FECTL_REG, 0);
 }
 
+/// The window an armed unit's registers live in, from the address [`arm`]
+/// published.
+fn window(phys: u64) -> Mmio {
+    // SAFETY: `phys` is the physical base `vtd::window` handed to
+    // `paging::map_mmio`, republished here by `arm` — a `REGISTER_WINDOW`-wide
+    // mapping this kernel made at boot and never unmaps, checked against
+    // `MAX_PHYS` and 4 KiB alignment before it was mapped at all. Volatile is
+    // what a register access has to be, which is `over_phys`'s other half.
+    unsafe { Mmio::over_phys(DirectMap::from_phys(phys), REGISTER_WINDOW) }
+}
+
 /// The unit raised its fault event.
 pub fn service() {
     let mut faults = 0usize;
     for (index, unit) in UNITS.iter().enumerate() {
-        let regs = unit.regs.load(Ordering::Acquire);
-        if regs == 0 {
+        let phys = unit.regs.load(Ordering::Acquire);
+        if phys == 0 {
             continue;
         }
-        faults += drain(index, regs, unit.records.load(Ordering::Relaxed), unit.count.load(Ordering::Relaxed));
+        faults += drain(
+            index,
+            window(phys),
+            unit.records.load(Ordering::Relaxed),
+            unit.count.load(Ordering::Relaxed),
+        );
     }
 
     if faults > 0 {
@@ -148,20 +178,20 @@ pub fn service() {
     crate::arch::apic::eoi();
 }
 
-fn drain(index: usize, regs: u64, records: u64, count: u32) -> usize {
-    let status = read_u32(regs + FSTS_REG);
+fn drain(index: usize, regs: Mmio, records: u64, count: u32) -> usize {
+    let status = regs.read_u32(FSTS_REG);
     if status & FSTS_OVERFLOW != 0 {
         log!("iommu: unit{index} fault recording overflowed — earlier faults are lost");
     }
     if status & FSTS_PENDING == 0 {
-        write_u32(regs + FSTS_REG, status & FSTS_WRITE_ONE_TO_CLEAR);
+        regs.write_u32(FSTS_REG, status & FSTS_WRITE_ONE_TO_CLEAR);
         return 0;
     }
 
     let mut seen = 0usize;
     for i in 0..count {
         let record = records + i as u64 * 16;
-        let high = read_u64(record + 8);
+        let high = regs.read_u64(record + 8);
         if high & (1u64 << 63) == 0 {
             continue;
         }
@@ -173,19 +203,19 @@ fn drain(index: usize, regs: u64, records: u64, count: u32) -> usize {
         let reason = ((high >> 32) & 0xFF) as u8;
         log!(
             "iommu: DMA FAULT unit{index} stream={stream} addr={:#018x} access={} reason={reason:#04x} {}",
-            read_u64(record) & !0xFFF,
+            regs.read_u64(record) & !0xFFF,
             if high & (1u64 << 62) != 0 { "read" } else { "write" },
             reason_name(reason),
         );
-        clear_record(record);
+        clear_record(regs, record);
         seen += 1;
     }
-    write_u32(regs + FSTS_REG, status & FSTS_WRITE_ONE_TO_CLEAR);
+    regs.write_u32(FSTS_REG, status & FSTS_WRITE_ONE_TO_CLEAR);
     seen
 }
 
-fn clear_record(record: u64) {
-    write_u32(record + 12, RECORD_FAULT);
+fn clear_record(regs: Mmio, record: u64) {
+    regs.write_u32(record + 12, RECORD_FAULT);
 }
 
 /// The reasons worth a name rather than a number (§7.1).
@@ -222,16 +252,4 @@ fn reason_name(reason: u8) -> &'static str {
         0x26 => "interrupt-source-id-verification-failed",
         _ => "unnamed",
     }
-}
-
-fn read_u32(at: u64) -> u32 {
-    unsafe { core::ptr::read_volatile(at as *const u32) }
-}
-
-fn write_u32(at: u64, value: u32) {
-    unsafe { core::ptr::write_volatile(at as *mut u32, value) }
-}
-
-fn read_u64(at: u64) -> u64 {
-    unsafe { core::ptr::read_volatile(at as *const u64) }
 }

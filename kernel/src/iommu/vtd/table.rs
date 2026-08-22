@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 
 use crate::iommu::{AddressWidth, Iova, StreamId};
 use crate::mm::pmm::{self, Category, PhysPage};
-use crate::mm::{DirectMap, PAGE_2M};
+use crate::mm::{DirectMap, Mmio, PAGE_2M};
 
 /// A remapping table is 4 KiB whatever it holds: 256 root or context entries
 /// of 16 bytes, or 512 second-level entries of 8.
@@ -109,9 +109,33 @@ impl Table {
         self.phys
     }
 
-    fn slot(self, index: usize) -> *mut u64 {
-        assert!(index < TABLE_BYTES / 8, "iommu: slot {index} is outside a 4 KiB table");
-        DirectMap::from_phys(self.phys).as_mut_ptr::<u64>().wrapping_add(index)
+    /// The table's 4 KiB, as a window that bounds every access in it.
+    ///
+    /// **The whole table and not a slot**, which is the difference between a
+    /// bound on the offset and a bound on the offset *and* the length: an
+    /// index, a byte offset and a 32-bit field are all checked against the
+    /// same 4 KiB here, rather than each against an `assert!` of its own that
+    /// the next accessor could be written without.
+    fn window(self) -> Mmio {
+        // SAFETY: `self.phys` is 4 KiB out of a 2 MiB `Category::Dma` page
+        // `Tables::alloc` took and never hands back (its doc comment is why),
+        // or that same address read back out of a table entry this module
+        // wrote — the unit only ever *reads* these tables, so an entry is this
+        // kernel's own store and not a device's. Either way the direct map
+        // covers it for the life of the machine. Volatile is what the access
+        // has to be, which is the other half of `over_phys`'s contract: the
+        // unit walks this memory without snooping the CPU cache (`ECAP.C` is
+        // clear on the only unit anyone here can boot — the module header), so
+        // a store the compiler merged or elided is an entry the unit never
+        // sees.
+        unsafe { Mmio::over_phys(DirectMap::from_phys(self.phys), TABLE_BYTES as u64) }
+    }
+
+    /// The eight bytes slot `index` occupies, bounded before anything touches
+    /// them — including the `clflush`, whose operand is an address and carries
+    /// no length of its own.
+    fn slot(self, index: usize) -> Mmio {
+        self.window().subregion(index as u64 * 8, 8)
     }
 
     /// Write one 64-bit slot and push it out of the cache.
@@ -120,13 +144,13 @@ impl Table {
     /// without its flush is the `ECAP.C = 0` corruption §5.2 exists to prevent,
     /// left to review instead of to the compiler.
     fn write(self, index: usize, value: u64) {
-        let at = self.slot(index);
-        unsafe { core::ptr::write_volatile(at, value) };
-        flush(at as usize);
+        let slot = self.slot(index);
+        slot.write_u64(0, value);
+        flush(slot.addr() as usize);
     }
 
     fn read(self, index: usize) -> u64 {
-        unsafe { core::ptr::read_volatile(self.slot(index)) }
+        self.slot(index).read_u64(0)
     }
 
     /// A 16-byte entry — root, context, or invalidation descriptor — low half
@@ -138,7 +162,7 @@ impl Table {
     }
 
     fn flush_all(self) {
-        let base = DirectMap::from_phys(self.phys).as_ptr::<u8>() as usize;
+        let base = self.window().addr() as usize;
         for offset in (0..TABLE_BYTES).step_by(LINE_BYTES) {
             flush(base + offset);
         }
@@ -147,10 +171,9 @@ impl Table {
     /// Write a 32-bit field the *unit* will read — the invalidation queue's
     /// completion status, before it is armed.
     pub fn write_u32(self, byte_offset: usize, value: u32) {
-        assert!(byte_offset + 4 <= TABLE_BYTES, "iommu: {byte_offset} is outside a 4 KiB table");
-        let at = (DirectMap::from_phys(self.phys).as_mut_ptr::<u8>() as usize) + byte_offset;
-        unsafe { core::ptr::write_volatile(at as *mut u32, value) };
-        flush(at);
+        let field = self.window().subregion(byte_offset as u64, 4);
+        field.write_u32(0, value);
+        flush(field.addr() as usize);
     }
 
     /// Read a 32-bit field the unit wrote, from memory rather than from a
@@ -160,10 +183,9 @@ impl Table {
     /// cache is a unit whose stores are not guaranteed to land in it either, so
     /// the line is dropped before the read instead of trusted.
     pub fn read_device_u32(self, byte_offset: usize) -> u32 {
-        assert!(byte_offset + 4 <= TABLE_BYTES, "iommu: {byte_offset} is outside a 4 KiB table");
-        let at = (DirectMap::from_phys(self.phys).as_ptr::<u8>() as usize) + byte_offset;
-        flush(at);
-        unsafe { core::ptr::read_volatile(at as *const u32) }
+        let field = self.window().subregion(byte_offset as u64, 4);
+        flush(field.addr() as usize);
+        field.read_u32(0)
     }
 }
 
@@ -174,6 +196,15 @@ impl Table {
 /// The fence is what makes the flush globally visible before the MMIO write
 /// that tells the unit to look.
 fn flush(addr: usize) {
+    // SAFETY: irreducible — there is no safe spelling of `clflush`, and no
+    // narrower one either: the instruction takes an address and no length, so
+    // the bound has to be somewhere else. It is: every caller above takes its
+    // operand from an [`Mmio`] subregion already checked against the table's
+    // 4 KiB, and `flush_all` walks a range it derives from `TABLE_BYTES`.
+    // Neither instruction reads or writes memory the compiler can see —
+    // `clflush` moves a line the CPU already holds and `mfence` orders what is
+    // in flight — so a line outside the table would cost a flush and change
+    // nothing, which is why `nostack, preserves_flags` is the whole option set.
     unsafe {
         core::arch::asm!(
             "clflush [{addr}]",
