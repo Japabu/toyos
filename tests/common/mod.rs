@@ -19,6 +19,8 @@ pub mod hostload;
 #[allow(dead_code)]
 pub mod iommu;
 #[allow(dead_code)]
+pub mod irqcensus;
+#[allow(dead_code)]
 pub mod logread;
 #[allow(dead_code)]
 pub mod passcost;

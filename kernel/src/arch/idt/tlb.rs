@@ -56,5 +56,6 @@ pub(super) extern "sysv64" fn tlb_flush_entry() {
 }
 
 fn flush() {
+    crate::irq_census::irq_took!(Tlb);
     crate::arch::tlb::serve_ipi();
 }

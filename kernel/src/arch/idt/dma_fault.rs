@@ -9,6 +9,7 @@ use super::device_irq::device_irq_entry;
 /// `irq_ring` record and sets no `need_resched`; at this stage every stream on
 /// the machine is kernel-owned, so the handler's own verdict is to stop.
 extern "sysv64" fn dma_fault_handler() {
+    crate::irq_census::irq_took!(DmaFault);
     crate::iommu::fault_interrupt();
 }
 

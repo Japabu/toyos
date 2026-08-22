@@ -65,5 +65,6 @@ pub(super) extern "sysv64" fn nmi_entry() {
 }
 
 extern "sysv64" fn note(rip: u64) {
+    crate::irq_census::irq_took!(Nmi);
     crate::sched::dump::note_nmi(rip);
 }

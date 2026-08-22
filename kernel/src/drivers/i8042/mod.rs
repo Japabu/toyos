@@ -697,6 +697,7 @@ fn buffer_full(status: u8) -> bool {
 /// Rust half of the pin-interrupt handler. Read the module doc before adding
 /// anything to it.
 pub extern "sysv64" fn handler() {
+    crate::irq_census::irq_took!(I8042);
     let timestamp = crate::clock::nanos_since_boot();
     // No compare-exchange: delivery is pinned to one CPU behind an interrupt
     // gate, so this handler cannot nest and there is no second writer.

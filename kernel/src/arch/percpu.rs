@@ -1,5 +1,5 @@
 use core::mem::{offset_of, size_of};
-use core::sync::atomic::{AtomicU32, AtomicU8};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8};
 
 use alloc::alloc::alloc_zeroed;
 use core::alloc::Layout;
@@ -114,6 +114,15 @@ pub struct PerCpu {
     /// executes an instruction. That is why `emit` needs no check — an absent
     /// shard is not a state this field can be in.
     log_shard: u64,                        // offset 264
+    /// Interrupt deliveries this CPU has taken: the machine's total, then one
+    /// counter per `irq_census::Source`.
+    ///
+    /// **Written by one `add qword ptr gs:[…], 1` per counter and by nothing
+    /// else** — `irq_census::irq_took!` is the only writer and it runs in
+    /// interrupt handlers on this CPU. `AtomicU64` because a sibling reads them
+    /// to print the census; no `lock` prefix, for the reasons `irq_census`'
+    /// module header states.
+    pub irq_counts: [AtomicU64; crate::irq_census::SLOTS], // offset 272
 }
 
 // GDT layout:
@@ -219,6 +228,10 @@ pub(crate) const OFF_NEED_RESCHED: u32 = offset_of!(PerCpu, need_resched) as u32
 /// Read by `preempt::enable`'s slow path, which declines to reschedule a CPU
 /// that is inside a fault or panic report.
 pub(crate) const OFF_FAULT_STATE: u32 = offset_of!(PerCpu, fault_state) as u32;
+/// Where this CPU's interrupt counters start. `irq_census::slot_offset` derives
+/// every `add qword ptr gs:[…]` in the interrupt handlers from it, so the
+/// instrument names no number of its own.
+pub const OFF_IRQ_COUNTS: u32 = offset_of!(PerCpu, irq_counts) as u32;
 
 const _: () = assert!(OFF_SELF_PTR == 0);
 const _: () = assert!(OFF_CPU_ID == 8);
@@ -238,6 +251,7 @@ const _: () = assert!(OFF_LAST_SEEN_RING0_FIRES == 252);
 const _: () = assert!(OFF_FAULT_STATE == 256);
 const _: () = assert!(OFF_LAST_ARMED_TICKS == 260);
 const _: () = assert!(offset_of!(PerCpu, log_shard) == 264);
+const _: () = assert!(OFF_IRQ_COUNTS == 272);
 
 /// Every GS-relative access this kernel makes, as `const`-generic primitives.
 ///
@@ -513,6 +527,12 @@ fn alloc_percpu(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
     percpu.gdt = GDT_ENTRIES;
     percpu.init_tss_descriptor();
     percpu.log_shard = alloc_log_shard(cpu_id);
+    // The counters themselves are reached through `gs:`; this is what lets a
+    // *sibling* read them, and it is published here for the same reason the log
+    // shard is — the whole block exists before the CPU it belongs to has run an
+    // instruction, so there is no window in which the census misses a CPU that
+    // is already taking interrupts.
+    crate::irq_census::publish(cpu_id, percpu.irq_counts.as_ptr());
     ptr
 }
 

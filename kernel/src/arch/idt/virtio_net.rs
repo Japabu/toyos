@@ -5,6 +5,7 @@ use crate::irq_ring::IrqSource;
 /// are drained by the record's consumer (`sched::driver::drain_irqs` → netd
 /// wake), never here.
 extern "sysv64" fn virtio_net_handler() {
+    crate::irq_census::irq_took!(Net);
     let timestamp = crate::clock::nanos_since_boot();
     crate::irq_ring::isr_publish(IrqSource::Net, timestamp);
     // Force a scheduler entry on IRQ return so drain_irqs converts the

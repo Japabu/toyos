@@ -59,6 +59,12 @@ pub(super) extern "sysv64" fn timer_entry() {
         "iretq",
 
         "2:",
+        // The census's two `add`s, written here because this branch has no
+        // Rust half to put them in — `timer_handler` carries the Ring 3 path's
+        // pair. No register and no `lock` (`irq_census`), and the flags they
+        // write are dead: the `test` above has already branched.
+        "add qword ptr gs:[{irq_total}], 1",
+        "add qword ptr gs:[{irq_timer}], 1",
         "push rax",
         "push rcx",
         "push rdx",
@@ -78,10 +84,15 @@ pub(super) extern "sysv64" fn timer_entry() {
         "iretq",
         handler = sym timer_handler,
         exit_to_user = sym crate::arch::idt::kernel_exit_to_user_check,
+        irq_total = const crate::irq_census::slot_offset(crate::irq_census::TOTAL),
+        irq_timer = const crate::irq_census::slot_offset(
+            1 + crate::irq_census::Source::Timer as usize
+        ),
     );
 }
 
 extern "sysv64" fn timer_handler() {
+    crate::irq_census::irq_took!(Timer);
     // Only the Ring 3 tick reaches here — the stub above branches away first
     // — so the interrupted context is user code and this CPU holds no `Lock`.
     // Everything below rests on that: the pass at the bottom drains the input

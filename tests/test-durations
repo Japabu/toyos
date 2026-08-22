@@ -199,6 +199,7 @@ ioapic_topology 3142
 iommu_context_absent 5731
 iommu_discovery 18600
 iommu_empty_domain 5691
+irq_census_conservation 5056
 kernel_heartbeat 5634
 kernel_log_file 13152
 keyboard_claim_close_spares_stdin 4580

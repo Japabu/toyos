@@ -1810,6 +1810,10 @@ fn sys_shutdown(syscap: RawHandle) -> u64 {
     }
     log!("Syncing filesystems...");
     crate::vfs::lock().sync_all();
+    // The machine's whole interrupt census, before the last process on it stops
+    // being able to say anything. Every other site prints a running total; this
+    // is the one that is final.
+    crate::irq_census::log_census();
     log!("Shutting down.");
     // **§6.3, in order, and the order is the whole of it.** At the moment they
     // are written these last two lines exist nowhere but the shards, and

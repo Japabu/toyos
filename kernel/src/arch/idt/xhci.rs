@@ -5,6 +5,7 @@ use crate::irq_ring::IrqSource;
 /// is polled by the record's consumer (`drivers::xhci::poll_if_pending`),
 /// never here.
 extern "sysv64" fn xhci_handler() {
+    crate::irq_census::irq_took!(Xhci);
     let timestamp = crate::clock::nanos_since_boot();
     crate::irq_ring::isr_publish(IrqSource::Xhci, timestamp);
     // Force a scheduler entry on IRQ return so drain_irqs polls the
