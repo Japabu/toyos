@@ -74,6 +74,17 @@ impl OwnedAlloc {
     pub fn new(size: usize, align: usize) -> Option<Self> {
         if size > crate::mm::MAX_HEAP_ALLOC { return None; }
         let layout = Layout::from_size_align(size, align).ok()?;
+        // SAFETY: `alloc_zeroed` requires a non-zero-size layout, and
+        // `Layout::from_size_align` has just produced this one from a size the
+        // guard above bounded — a zero size is refused by the allocator by
+        // returning null, which `NonNull::new` turns into `None` rather than a
+        // dangling `OwnedAlloc`.
+        //
+        // Irreducible: this is the raw allocator, and the safe wrapper over it
+        // is `Box`/`Vec`, neither of which can express "give me `size` bytes
+        // at `align`, decided at run time, or tell me you cannot" — `Box`
+        // needs a type and aborts instead of answering. Answering is the whole
+        // reason this type exists (`PT_TLS` sizes come out of an ELF).
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })?;
         Some(Self { ptr, layout })
     }
@@ -88,16 +99,45 @@ impl OwnedAlloc {
     /// so a slice longer than the buffer passes every check the slice makes.
     pub fn slice(&self, len: usize) -> crate::mm::KernelSlice {
         assert!(len <= self.size(), "OwnedAlloc::slice: {} > {}", len, self.size());
+        // SAFETY: `from_raw` asks that `base` be valid for `len` bytes for as
+        // long as the slice lives, and the assert above plus `&self` are
+        // exactly that: `len` is inside this allocation and the `OwnedAlloc`
+        // outlives the borrow, so the pages cannot be freed under it.
+        //
+        // Irreducible, and this method is *why*: `KernelSlice::from_raw` is
+        // unsafe because it cannot check a length against an allocation it
+        // knows nothing about (`issues/design-debt/
+        // kernelslice-from-raw-cannot-check-itself.md`). Here the allocation
+        // is known, so this is the one place the check can be made — which is
+        // a reduction already taken, not one still owed.
         unsafe { crate::mm::KernelSlice::from_raw(self.ptr(), len) }
     }
 }
 
 impl Drop for OwnedAlloc {
     fn drop(&mut self) {
+        // SAFETY: `ptr`/`layout` are the pair `new` got back from
+        // `alloc_zeroed` and neither field is reachable from outside this
+        // module, so this is the same layout at the same address, freed once —
+        // `OwnedAlloc` is move-only and has no `Clone`.
+        //
+        // Irreducible: `Drop` is where a raw allocation is returned, and the
+        // safe alternative (`Box<[u8]>`) cannot carry a run-time alignment.
         unsafe { dealloc(self.ptr.as_ptr(), self.layout); }
     }
 }
 
+// SAFETY: `OwnedAlloc` is `NonNull<u8>` plus its `Layout`, and it is `!Send`
+// only because `NonNull` is. The bytes behind it are an ordinary kernel heap
+// allocation with exactly one owner — the type is move-only, hands out no
+// copy of the pointer that outlives `&self`, and frees in its own `Drop` — so
+// moving that owner to another CPU carries the whole allocation with it and
+// leaves nothing behind to race with.
+//
+// Irreducible: `NonNull`'s `!Send` is deliberate and this is the only way to
+// say "this particular raw pointer is owned". Replacing it with a `Box<[u8]>`
+// (which is `Send`) is what would make the impl unnecessary, and that is the
+// run-time-alignment problem `new` above explains.
 unsafe impl Send for OwnedAlloc {}
 
 // PageAlloc — contiguous 2MB physical pages from PMM
@@ -242,13 +282,43 @@ impl UserStack {
 
     pub fn size(&self) -> u64 { self.size }
 
-    /// Convert a user virtual address on this stack to a kernel direct-map pointer.
-    /// Panics if the address is outside this stack.
-    fn kern_ptr(&self, user_addr: u64) -> *mut u8 {
+    /// Copy `src` onto this stack, at the *user* address `user_addr`.
+    ///
+    /// **The whole write is bounds-checked, where the `kern_ptr` accessor this
+    /// replaced checked only the address it handed back.** Every caller then
+    /// wrote `n` bytes through that pointer and nothing anywhere checked `n`:
+    /// the argv strings ran one byte past the checked address, the metadata
+    /// block `args.len() + 2` words past it. Both were in fact inside the
+    /// stack — `write_argv` derives every offset by subtracting from `top()` —
+    /// but that was an argument, not a check, and it is a check now.
+    ///
+    /// Panics rather than refuses because `user_addr` and `src.len()` are the
+    /// kernel's own arithmetic over its own freshly allocated pages, never a
+    /// number that crossed the boundary.
+    fn write_at(&self, user_addr: u64, src: &[u8]) {
         let offset = user_addr.checked_sub(self.vaddr.raw())
             .expect("UserStack: address below stack base");
-        assert!(offset < self.size, "UserStack: address above stack top");
-        DirectMap::from_phys(self.phys.phys() + offset).as_mut_ptr::<u8>()
+        assert!(
+            offset.checked_add(src.len() as u64).is_some_and(|end| end <= self.size),
+            "UserStack::write_at {offset}+{} past a {}-byte stack",
+            src.len(),
+            self.size
+        );
+        let kptr = DirectMap::from_phys(self.phys.phys() + offset).as_mut_ptr::<u8>();
+        // SAFETY: the assert above proves `[offset, offset + src.len())` lies
+        // inside this stack, whose pages are one physically contiguous
+        // allocation — so the direct-map address of `phys + offset` is
+        // writable for `src.len()` bytes. `src` is a slice the caller owns and
+        // the destination is kernel-only until `loader::start` hands the
+        // address space to Ring 3, so the ranges cannot overlap and nothing
+        // else is looking.
+        //
+        // Irreducible: the destination is a physical page reached through the
+        // direct map, and the safe spelling would be a `&mut [u8]` over memory
+        // that becomes a user mapping — the borrow `user_ptr.rs`'s header
+        // refuses. One raw copy behind one bounds check is the shape
+        // [`crate::user_ptr::UserBytesMut`] already uses for the same problem.
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), kptr, src.len()) };
     }
 
     /// Write argc, argv pointers, and string data onto this stack.
@@ -258,24 +328,18 @@ impl UserStack {
         let mut argv_ptrs: Vec<u64> = Vec::with_capacity(args.len());
         for arg in args.iter().rev() {
             sp -= (arg.len() + 1) as u64;
-            let kptr = self.kern_ptr(sp);
-            unsafe {
-                core::ptr::copy_nonoverlapping(arg.as_ptr(), kptr, arg.len());
-                *kptr.add(arg.len()) = 0;
-            }
+            self.write_at(sp, arg.as_bytes());
+            self.write_at(sp + arg.len() as u64, &[0u8]);
             argv_ptrs.push(sp);
         }
         argv_ptrs.reverse();
         let metadata_qwords = args.len() + 2;
         sp = (sp - metadata_qwords as u64 * 8) & !15;
-        let ksp = self.kern_ptr(sp) as *mut u64;
-        unsafe {
-            *ksp = args.len() as u64;
-            for (i, ptr) in argv_ptrs.iter().enumerate() {
-                *ksp.add(1 + i) = *ptr;
-            }
-            *ksp.add(1 + args.len()) = 0;
+        self.write_at(sp, &(args.len() as u64).to_ne_bytes());
+        for (i, ptr) in argv_ptrs.iter().enumerate() {
+            self.write_at(sp + (1 + i as u64) * 8, &ptr.to_ne_bytes());
         }
+        self.write_at(sp + (1 + args.len() as u64) * 8, &0u64.to_ne_bytes());
         sp
     }
 }
@@ -1034,6 +1098,21 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         // Rebase fs_base and internal TLS pointers from physical to virtual
         let tls_rebase = tls_vaddr.raw() as i64 - tls_phys as i64;
         let fs_base = (fs_base as i64 + tls_rebase) as u64;
+        // SAFETY: `tls_alloc` is the block `setup_tls`/`setup_combined_tls`
+        // just built and this scope still owns it, so every address below is
+        // inside one contiguous allocation reached through the direct map, and
+        // no other CPU can see it — `vma_map` has published the *virtual*
+        // range into an address space whose only thread has not been created
+        // yet. The offsets are the ones the same two functions wrote: `fs_base
+        // - tls_vaddr` is the thread pointer they placed, and the DTV's length
+        // at word 1 is a count they wrote, not one read back from userland.
+        //
+        // Irreducible: what this does is rewrite pointers *stored inside* a
+        // TLS image from physical to virtual, so it walks a self-referential
+        // structure by address. There is no Rust type for a DTV whose entries
+        // point into itself, and building one would be modelling the psABI's
+        // memory layout rather than writing it — the same untyped-by-nature
+        // work `elf::reloc` does one level down.
         unsafe {
             let tls_base_ptr = DirectMap::from_phys(tls_phys).as_mut_ptr::<u8>();
             let tp_kern = tls_base_ptr.add((fs_base - tls_vaddr.raw()) as usize);
@@ -1280,12 +1359,12 @@ fn release_process(code: i32) {
         let table = guard.as_mut().unwrap();
         let Some(proc) = table.get_mut(process_pid) else {
             drop(guard);
-            unsafe { crate::mm::paging::kernel_cr3().activate(); }
+            crate::mm::paging::activate_kernel();
             return;
         };
         if proc.threads.get(tid).is_none() || !proc.claim_teardown() {
             drop(guard);
-            unsafe { crate::mm::paging::kernel_cr3().activate(); }
+            crate::mm::paging::activate_kernel();
             return;
         }
         let other_tids: Vec<Tid> = proc.threads.iter()
@@ -1297,7 +1376,7 @@ fn release_process(code: i32) {
          proc.main_tid, other_tids)
     };
 
-    unsafe { crate::mm::paging::kernel_cr3().activate(); }
+    crate::mm::paging::activate_kernel();
 
     // Phase 2: retire every other thread. Each one is provably out of the
     // scheduler when retire_task returns — not queued, not parked, not
@@ -1375,7 +1454,7 @@ pub fn thread_exit(code: i32) -> ! {
 fn release_thread(process_pid: Pid, tid: Tid, code: i32) -> Tid {
     // Thread-only exit path: release this thread's mappings, zombify, wake parent.
     let addr_space = current_address_space();
-    unsafe { crate::mm::paging::kernel_cr3().activate(); }
+    crate::mm::paging::activate_kernel();
 
     let tls = {
         let tdata_arc = current_data();
@@ -1663,6 +1742,24 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
                         }
                         io_reads += 1;
                         let valid = if vma_offset + 4096 <= *file_size { 4096 } else { (*file_size - vma_offset) as usize };
+                        // SAFETY: `page_ptr` is `page_alloc`'s direct-map base
+                        // and `page_alloc` is a local of this function that
+                        // nothing else can see — the frame is not mapped into
+                        // any address space until `map_window` below. The
+                        // destination range is inside it: `page_offset` is
+                        // `vaddr - region_start` with `vaddr < region_end_full`
+                        // and the window is `page_2m` wide, and `valid <= 4096`
+                        // by the line above, so the last byte written is below
+                        // `region_start + page_2m`. `page_buf` is a stack array
+                        // this loop owns, so the ranges cannot overlap.
+                        //
+                        // Irreducible **here**, and filed rather than fixed:
+                        // the reduction is a bounds-checked window type over
+                        // `PageAlloc`, and the obvious spelling of one — a safe
+                        // `&mut [u8]` — is the borrow `user_ptr.rs`'s header
+                        // refuses, because these same pages become a user
+                        // mapping four statements later. See
+                        // `issues/kernel/pagealloc-has-no-checked-window.md`.
                         unsafe {
                             core::ptr::copy_nonoverlapping(
                                 page_buf.as_ptr(),
@@ -1684,6 +1781,16 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         while offset < page_2m {
             let page_elf_offset = (region_start + offset).wrapping_sub(elf_base);
             if ri.has_relocs_in_page(page_elf_offset) {
+                // SAFETY: `offset < page_2m` is this loop's own condition and
+                // `page_ptr` is the base of a `page_2m`-byte allocation this
+                // function still owns, so the result names a 4 KiB page inside
+                // it — which is what `apply_to_page` writes through.
+                //
+                // Irreducible for the same reason as the copy above, plus one
+                // of its own: `apply_to_page` takes a `*mut u8` without being
+                // an `unsafe fn`, so the validity requirement is real and not
+                // type-enforced —
+                // `issues/kernel/raw-pointer-writers-not-marked-unsafe-in-loader.md`.
                 total_relocs = total_relocs.saturating_add(
                     ri.apply_to_page(page_elf_offset, unsafe { page_ptr.add(offset as usize) }) as u16
                 );
@@ -1796,6 +1903,19 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
     let read_user = |virt: u64| -> Option<u64> {
         if !virt.is_multiple_of(8) { return None; }
         let phys = addr_space.lock().translate(UserAddr::new(virt))?;
+        // SAFETY: `translate` answered `Some`, so `virt` is mapped in this
+        // process right now and `phys` is its direct-map address; the `virt %
+        // 8` guard above makes the `u64` naturally aligned, and one aligned
+        // `u64` cannot straddle the 2 MiB page the single translation answered
+        // for. Reading through the direct map rather than `virt` is what keeps
+        // SMAP on.
+        //
+        // Irreducible, and it is a *crash report* — the value is printed and
+        // decides nothing, so the fact that another thread of the dying
+        // process could rewrite it between two lines of the dump is the
+        // report's subject rather than a hazard. Filed, with the futex read
+        // that has the same shape and does not have that excuse:
+        // `issues/kernel/user-pages-still-read-through-a-plain-deref.md`.
         Some(unsafe { *phys.as_ptr::<u64>() })
     };
 

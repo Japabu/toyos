@@ -1,5 +1,19 @@
 #![no_std]
 #![no_main]
+// **Every unsafe block in this kernel carries a `SAFETY:` comment unless a
+// `mod` line below says otherwise.** The lint is `allow` by default and this
+// kernel is one crate with no `-p` scoping, so an *area* is gated at the
+// source rather than on `host-tests.yml`'s command line; `-D warnings`, which
+// both kernel clippy invocations already pass, is what turns this `warn` into
+// a hard error. Written here as one crate-level `warn` plus a shrinking list
+// of `allow`ed module trees — rather than one attribute per swept file — so
+// that what is still owed is five lines in one place, and a *new* file added
+// beside this one is gated the day it appears instead of the day somebody
+// remembers to give it an attribute.
+//
+// `issues/build/clippy-has-never-run-here.md` carries the per-area ledger and
+// the owner's ruling the sweeps run under: reduction before documentation.
+#![warn(clippy::undocumented_unsafe_blocks)]
 extern crate alloc;
 
 /// Debugger spin gate. When `--debug` is active, the kernel spins here until
@@ -15,10 +29,17 @@ mod sleeplock;
 mod sync;
 mod id_map;
 
+// The five module trees the sweep has not reached. Each `allow` is deleted by
+// the pull request that documents that area, and the list is the whole of what
+// the kernel still owes the lint — 107, 121, 8, 8 and 2 blocks when it was
+// measured (2026-08-22).
+#[allow(clippy::undocumented_unsafe_blocks, reason = "arch/: not yet swept")]
 mod arch;
+#[allow(clippy::undocumented_unsafe_blocks, reason = "drivers/: not yet swept")]
 mod drivers;
 
 #[macro_use]
+#[allow(clippy::undocumented_unsafe_blocks, reason = "log/: not yet swept")]
 mod log;
 mod actuator;
 mod mm;
@@ -48,8 +69,10 @@ mod symbols;
 mod process;
 mod loader;
 mod scheduler;
+#[allow(clippy::undocumented_unsafe_blocks, reason = "sched/: not yet swept")]
 mod sched;
 mod hw;
+#[allow(clippy::undocumented_unsafe_blocks, reason = "iommu/: not yet swept")]
 mod iommu;
 mod preempt;
 mod irq_ring;
@@ -100,7 +123,7 @@ use toyos_abi::boot::{KernelArgs, MemoryMapEntry};
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+    cpu::disable_interrupts();
 
     // **Before every branch below, including the early one.** Everything this
     // path does next can die; what this copies is what a *second* panic still
@@ -149,6 +172,13 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
         // capture above has already copied the ring, so what render() paints
         // afterwards is byte-identical either way.
         drivers::panic_console::capture();
+        // SAFETY: `panic_flush` writes the 16550 directly, bypassing the ring
+        // and the backend lock, and is `unsafe` because a second writer mid-
+        // transmission interleaves two reports into one unreadable line. This
+        // CPU has `IF` clear from the top of the handler and every other CPU
+        // is about to be halted, so nothing else can be inside the port.
+        // Irreducible: "no other writer exists right now" is a fact about the
+        // whole machine at this instant, and no type in this kernel holds it.
         unsafe { drivers::serial::panic_flush(); }
         drivers::panic_console::render();
         cpu::halt();
@@ -167,6 +197,16 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     }
 
     let rbp: u64;
+    // SAFETY: one register-to-register `mov`. It reads no memory (`nomem`),
+    // touches no stack (`nostack`) and writes no flags, so the only thing it
+    // can do is produce this frame's base pointer — which the kernel is built
+    // with `-Cforce-frame-pointers=yes` to guarantee is a real frame pointer
+    // and not a general-purpose register.
+    //
+    // Irreducible here, and unlike the `cli` two lines up it has no `arch::cpu`
+    // equivalent to call: `read_rsp` is that module's only stack-register
+    // reader, and adding a `read_rbp` beside it belongs to the `arch/` sweep,
+    // not to this one.
     unsafe { core::arch::asm!("mov {}, rbp", out(reg) rbp, options(nomem, nostack)); }
 
     arch::idt::exceptions::crash_report(
@@ -185,6 +225,9 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // happens here and the paint happens in halt_all_cpus. A recovering panic
     // captures and never paints, which is the property, not an accident.
     drivers::panic_console::capture();
+    // SAFETY: the early branch's argument, at the other depth — `IF` is clear
+    // on this CPU and a panic that turns out fatal halts every other one
+    // before anything else writes the port. Irreducible for the same reason.
     unsafe { drivers::serial::panic_flush(); }
 
     // If in syscall context: kill the process, rejoin scheduler. This panic
@@ -684,6 +727,15 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     // one instruction whose whole architectural meaning is #UD, so what arrives
     // at the handler is a real fault and not a simulated one.
     if actuator::test_kernel_fault() {
+        // SAFETY: `ud2` is the one instruction whose whole architectural
+        // meaning is "raise #UD", so it reads and writes nothing — `nomem`
+        // and `nostack` are exact — and the fault it raises is caught by an
+        // IDT this boot phase has already installed.
+        //
+        // Irreducible on purpose: the point of this actuator is that the
+        // handler receives a *real* fault, so anything that wrapped the
+        // instruction in a safe abstraction would be simulating the thing
+        // under test.
         unsafe { core::arch::asm!("ud2", options(nomem, nostack)) };
     }
 
@@ -717,7 +769,7 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
 #[cfg(feature = "boot-actuators")]
 fn pre_idle_wedge() -> ! {
     log!("pre-idle-wedge: the boot stops here, and this line is the last thing this machine says");
-    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+    cpu::disable_interrupts();
     loop {
         core::hint::spin_loop();
     }
