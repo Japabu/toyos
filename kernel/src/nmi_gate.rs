@@ -23,18 +23,22 @@
 //! - **ring0** — everything else, which on an aimed storm is the victim inside
 //!   the syscall it was making.
 //!
-//! **Which accelerator is running the guest decides whether the window is
-//! reachable at all, and only one of them can.** Under TCG, QEMU checks for a
-//! pending interrupt between translation blocks and `syscall` ends one, so an
+//! **Which accelerator is running the guest decides how often the window is
+//! reached, and on KVM it is the host that decides.** Under TCG, QEMU checks for
+//! a pending interrupt between translation blocks and `syscall` ends one, so an
 //! NMI pending across it is delivered at `syscall_entry+0` — the dev host reads
-//! 36 to 47 window arrivals per 3,000. Under KVM an NMI to a running vCPU is a
-//! host kick, a VM exit and an injection at the next VM entry, and that entry is
-//! never one of those three instructions: **0 of 6,000 on the hosted lane**
-//! (run 32584121311, two boots, 2,451 and 438 of the same NMIs arriving in
-//! Ring 3, so the aim was right and the delivery point is simply elsewhere).
-//! That is a fact about the instrument. What KVM still witnesses is the machine
-//! taking 3,000 aimed NMIs with IST2 in place and going on working, and what
-//! proves the *window* on both is the `nmi-without-ist` control's `#DF`.
+//! 36 to 58 window arrivals per 3,000, run after run. Under KVM an NMI to a
+//! running vCPU is a host kick, a VM exit and an injection at the next VM entry,
+//! and **that entry is wherever the kick's exit landed**. Both ends of that have
+//! been measured on the hosted lane: **0 of 6,000** (run 32584121311, two boots,
+//! 2,451 and 438 of the same NMIs arriving in Ring 3, so the aim was right and
+//! the injection point was elsewhere) and **64 of 64** (run 32587665835, the
+//! exit landing on the `syscall` boundary and the injection on the entry's first
+//! instruction every time, so the storm stopped at [`ENOUGH`] after 64
+//! deliveries). Neither number is a fact about this kernel, which is why the
+//! gate asserts on neither. What every host witnesses is the machine taking
+//! aimed NMIs with IST2 in place and going on working, and what proves the
+//! *window* everywhere is the `nmi-without-ist` control's `#DF`.
 //!
 //! **The storm is triggered by the victim and aimed at it, and neither used to
 //! be true.** It armed at three seconds of wall clock and sprayed every sibling;
