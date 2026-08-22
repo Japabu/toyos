@@ -10,8 +10,8 @@ use toyos_sched::task::WaitClass;
 
 use crate::vm::RUN_CHUNK_NS;
 use crate::workload::{
-    AgeShape, BlockShape, ChargeShape, IrqSpec, MigrateShape, Op, ParkShape, ProcSpec, Protocol,
-    QueueSpec, Scenario, Script, ShareShape, WindowShape,
+    AgeShape, BalanceShape, BlockShape, ChargeShape, IrqSpec, MigrateShape, Op, ParkShape,
+    PlacementShape, ProcSpec, Protocol, QueueSpec, Scenario, Script, ShareShape, WindowShape,
 };
 
 const MS: u64 = 1_000_000;
@@ -40,6 +40,8 @@ fn scenario(
         age: AgeShape::BoundedDeferral,
         share: ShareShape::PerProcess,
         charge: ChargeShape::Honest,
+        placement: PlacementShape::LeastLoadedRotating,
+        balance: BalanceShape::Pull,
         order: FairOrder::InsertSequence,
         pass_cost_ns: 0,
         fair_allowance_ns: 0,
@@ -1084,6 +1086,12 @@ pub fn by_name(name: &str) -> Option<Scenario> {
     if let Some(rest) = name.strip_prefix("wakeup_storm:") {
         return two_numbers(rest).map(|(cpus, waiters)| wakeup_storm(cpus, waiters));
     }
+    // `lopsided_placement:<cpus>:<threads>` at the suite's own per-thread work,
+    // for the same reason: the recovery it measures is a curve in both numbers.
+    if let Some(rest) = name.strip_prefix("lopsided_placement:") {
+        return two_numbers(rest)
+            .map(|(cpus, threads)| lopsided_placement(cpus, threads, WORK));
+    }
     match name {
         "old_steal_port" => Some(old_steal_port()),
         "old_migrate_kept_the_corpse" => Some(old_migrate_kept_the_corpse()),
@@ -1358,6 +1366,54 @@ pub fn wakeup_storm(cpus: usize, waiters: usize) -> Scenario {
 
 /// How many storms one [`wakeup_storm`] run raises.
 pub const STORM_ROUNDS: usize = 4;
+
+/// **The adversarial machine**: `threads` pure-CPU threads, every one of them
+/// spawned onto cpu0 of a `cpus`-wide machine, and nothing that ever blocks.
+///
+/// Spawn placement is least-loaded-with-rotation, so under the shipped policy a
+/// burst is spread the instant it is made and a lopsided machine cannot arise
+/// from a workload at all. That is what left the balance path measured only by
+/// what [`wakeup_storm`] happens to produce — an idle CPU probing a busy one a
+/// few times per run. This stages the state the path exists for and nothing
+/// else does: every runnable thread on one CPU, the rest of the machine with
+/// nothing to run, and the *only* mechanism that can change that the pull half
+/// of §7.7.
+///
+/// Shape, and why each part of it:
+///
+/// * **Nothing blocks and nothing wakes.** A blocked thread is placed again
+///   when it wakes, so any blocking would let the wake path launder the
+///   adversary's placement into a legal one and the recovery being measured
+///   would be somebody else's.
+/// * **One process.** The threads share a fair share, so what is measured is
+///   the *machine* finishing a fixed amount of work and never a split between
+///   two claimants — `share_gain` is where that question lives.
+/// * **Every thread carries the same `work`.** The makespan is then a rate:
+///   `threads × work` of CPU delivered by `cpus` CPUs, against the
+///   `threads × work / cpus` a work-conserving machine would take.
+///
+/// `sim/tests/policy.rs` measures how long the machine takes to start working
+/// and how long it takes to finish, against a bound derived from the protocol,
+/// with [`BalanceShape::None`] as the control.
+pub fn lopsided_placement(cpus: usize, threads: usize, work: u64) -> Scenario {
+    let mut scenario = scenario(
+        "lopsided_placement",
+        cpus,
+        // No wait queues: a queue nobody blocks on would only be scaffolding.
+        Vec::new(),
+        vec![process("crowd", vec![0; threads], vec![Script::new(vec![Op::Run(work)])])],
+    )
+    .with_placement(PlacementShape::AllOn(0));
+    scenario.max_tasks = threads + 1;
+    // `share_gain`'s term, with `threads` in place of its `threads + 1`: every
+    // thread's work is chopped into `RUN_CHUNK_NS` execution steps and each
+    // quantum boundary costs a pass on top. The idle passes and steal probes a
+    // wide machine spends on top of that are what the fourfold reserve is for —
+    // measured over the sweep `sim/tests/policy.rs` runs: 677 steps at 2 CPUs
+    // and 8 threads, 1,681 at 4 and 16, 6,851 at 4 and 64, 8,897 at 8 and 64.
+    scenario.max_steps = 20_000 + 4 * threads * (work / RUN_CHUNK_NS) as usize;
+    scenario
+}
 
 /// Negative gate for invariant I9: [`lend_then_block`] under commit `9c2fc4d`'s
 /// park, which cleared the borrowed window only `if now >= until`.

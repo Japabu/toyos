@@ -805,6 +805,25 @@ mod tests {
         read_profile(&root().join("tests/test-durations"))
     }
 
+    /// The committed profile with every `UNMEASURED` marker replaced by an
+    /// ordinary Fast price. The tier tests below mutate one name and ask what
+    /// the verdict says about *that* name; a branch that registered a new test
+    /// carries a marker in the committed file, and the marker's own refusal
+    /// ("may not land") would otherwise answer every one of them before their
+    /// mutation is reached — which it did, on 2026-08-22, to three unrelated
+    /// tests on the first branch to register a name after they were written.
+    /// The marker's rule has its own test,
+    /// `an_unmeasured_marker_buys_one_red_measurement_commit`.
+    fn measured_profile() -> BTreeMap<String, u64> {
+        committed_profile()
+            .into_iter()
+            .map(|(name, ms)| {
+                let ms = if ms == crate::tiers::UNMEASURED_MS { 1_000 } else { ms };
+                (name, ms)
+            })
+            .collect()
+    }
+
     /// A run measuring a change that touched exactly these names.
     fn touched(names: &[&str]) -> Enforced {
         Enforced::Touched {
@@ -920,10 +939,10 @@ mod tests {
     /// run is the one rendering it.
     #[test]
     fn a_changed_name_priced_without_margin_is_refused_on_a_pull_request_run() {
-        let mut profile = committed_profile();
+        let mut profile = measured_profile();
         profile.insert(A_FAST_NAME.to_string(), FAST_COMMIT_MS + 1);
 
-        let rendered = render_verdict(&profile, &committed_profile(), &touched(&[A_FAST_NAME]));
+        let rendered = render_verdict(&profile, &measured_profile(), &touched(&[A_FAST_NAME]));
         assert!(rendered.warned.is_empty(), "{:?}", rendered.warned);
         let refusal = rendered.refused.join("\n");
         assert!(refusal.contains(A_FAST_NAME), "{refusal}");
@@ -942,9 +961,9 @@ mod tests {
     /// change under measurement went near.
     #[test]
     fn an_untouched_name_is_a_warning_on_a_landing_and_a_refusal_on_the_nightly() {
-        let mut profile = committed_profile();
+        let mut profile = measured_profile();
         profile.insert(A_FAST_NAME.to_string(), FAST_COMMIT_MS + 1);
-        let before = committed_profile();
+        let before = measured_profile();
 
         let landing = render_verdict(&profile, &before, &touched(&["some_other_test"]));
         assert!(landing.refused.is_empty(), "{:?}", landing.refused);
@@ -979,9 +998,9 @@ mod tests {
     /// would otherwise let a deleted test's profile row rot on every landing.
     #[test]
     fn a_declaration_verdict_is_refused_at_every_base() {
-        let mut profile = committed_profile();
+        let mut profile = measured_profile();
         profile.remove("desktop_window_child");
-        let rendered = render_verdict(&profile, &committed_profile(), &touched(&[]));
+        let rendered = render_verdict(&profile, &measured_profile(), &touched(&[]));
         assert!(rendered.warned.is_empty(), "{:?}", rendered.warned);
         let refusal = rendered.refused.join("\n");
         assert!(refusal.contains("desktop_window_child"), "{refusal}");

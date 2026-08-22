@@ -218,6 +218,13 @@ impl Parkable {
 /// exactly the failure `block::OPERATION` exists to stop, arriving one layer
 /// lower. The guard restores what it displaced rather than clearing the slot,
 /// so the outer operation survives the inner one ending.
+///
+/// **Both halves of that paragraph are gated in a guest and can only be.** This
+/// type reaches [`percpu::cpu_id`] and [`driver::current_handle`], and `kernel/`
+/// is outside the host workspace, so nothing off a booted machine can construct
+/// one: `kernel/src/sched_gate.rs` establishes three of them with known
+/// deadlines in both homes and prints what every level observed, and the
+/// `operation_nesting` test recomputes the running minimum from what it printed.
 #[must_use = "an operation lasts exactly as long as this guard"]
 pub struct Operation {
     /// The handle whose slot this establishment wrote, or `None` for the

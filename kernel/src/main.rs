@@ -5,9 +5,9 @@
 // kernel is one crate with no `-p` scoping, so an *area* is gated at the
 // source rather than on `host-tests.yml`'s command line; `-D warnings`, which
 // both kernel clippy invocations already pass, is what turns this `warn` into
-// a hard error. Written here as one crate-level `warn` plus a shrinking list
-// of `allow`ed module trees — rather than one attribute per swept file — so
-// that what is still owed is five lines in one place, and a *new* file added
+// a hard error. Written here as one crate-level `warn` plus a list of
+// `allow`ed module trees — rather than one attribute per swept file — so
+// that whatever is still owed is a list in one place, and a *new* file added
 // beside this one is gated the day it appears instead of the day somebody
 // remembers to give it an attribute.
 //
@@ -29,20 +29,20 @@ mod sleeplock;
 mod sync;
 mod id_map;
 
-// The five module trees the sweep has not reached. Each `allow` is deleted by
-// the pull request that documents that area, and the list is the whole of what
-// the kernel still owes the lint — 107, 121, 8, 8 and 2 blocks when it was
-// measured (2026-08-22). An area that instead gates itself with its own
-// `#![warn(...)]` inside its `mod.rs`, the way `mm/`, `object/`, `elf/` and
-// `loader/` already do, wins over the line here — the inner attribute is the
-// more specific one — so this list is never a way to un-gate a swept tree,
-// only a record of the ones nobody has swept.
-#[allow(clippy::undocumented_unsafe_blocks, reason = "arch/: not yet swept")]
+// Every module tree is swept (the last two landed 2026-08-22), so no `mod` line
+// below carries an `#[allow(clippy::undocumented_unsafe_blocks, reason = …)]`.
+// A tree that cannot be gated the day it appears takes that attribute, and the
+// pull request that sweeps it deletes it again; the list of such lines is the
+// whole of what the kernel owes the lint, and
+// `issues/build/clippy-has-never-run-here.md` carries the per-area record. An
+// area that gates itself with its own `#![warn(...)]` inside its `mod.rs`, the
+// way every swept area does, wins over a line here — the inner attribute is
+// the more specific one — so such a list is never a way to un-gate a swept
+// tree, only a record of the ones nobody has swept.
 mod arch;
 mod drivers;
 
 #[macro_use]
-#[allow(clippy::undocumented_unsafe_blocks, reason = "log/: not yet swept")]
 mod log;
 mod actuator;
 mod mm;
@@ -56,6 +56,8 @@ mod input_merge_test;
 mod usb_gate;
 #[cfg(feature = "boot-actuators")]
 mod nvme_gate;
+#[cfg(feature = "boot-actuators")]
+mod sched_gate;
 mod block;
 mod gpt;
 mod page_cache;
@@ -72,10 +74,8 @@ mod symbols;
 mod process;
 mod loader;
 mod scheduler;
-#[allow(clippy::undocumented_unsafe_blocks, reason = "sched/: not yet swept")]
 mod sched;
 mod hw;
-#[allow(clippy::undocumented_unsafe_blocks, reason = "iommu/: not yet swept")]
 mod iommu;
 mod preempt;
 mod irq_ring;
@@ -591,6 +591,15 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     vfs::init();
     process::init();
     scheduler::init();
+    // The task-less half of the operation-nesting gate: a boot phase runs on
+    // the BSP with no current task, so what it establishes in is the per-CPU
+    // slot. `iod`'s body runs the other half. Here rather than earlier because
+    // this is the phase that owns the scheduler; it touches no device, waits
+    // for nothing and leaves no establishment behind.
+    #[cfg(feature = "boot-actuators")]
+    if actuator::sched_operation_nesting() {
+        sched_gate::run("boot");
+    }
     pipe::init();
     inbox::init();
 
