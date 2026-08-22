@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use bcachefs::Extent;
+use bcachefs::{BlockIO, BlockNum, Extent, SliceBlockIO};
 use crate::block::{BlockError, BlockResult};
 use crate::page_cache;
 use crate::sync::Lock;
@@ -139,89 +139,58 @@ impl FileBacking for NvmeBacking {
 }
 
 /// File backed by initrd memory (RAM). No PageCache, no disk I/O.
+///
+/// **The image bounds the extents, and the image is what this holds.** The
+/// extent list comes out of the bcachefs btree *inside the initrd*, so it is
+/// input that crossed a trust boundary and a corrupt or hostile image names
+/// blocks past its own end. This type used to carry the initrd's base address
+/// and the *file's* size, which bounds how many bytes are copied and says
+/// nothing about where the block is — so there was no comparison to make and
+/// none was made. It carries the image instead, and every read goes through
+/// [`SliceBlockIO::block`], which is the one thing that knows the length a
+/// block number has to be under.
 pub struct InitrdBacking {
-    /// Base address of the initrd in kernel virtual memory.
-    initrd_base: *const u8,
+    image: SliceBlockIO,
     extents: Vec<Extent>,
     size: u64,
 }
 
-// SAFETY: initrd memory is static and immutable for the kernel's lifetime —
-// the bootloader placed it, nothing frees it and nothing writes it — so the
-// raw pointer that makes this type `!Send` names memory that is equally valid
-// from every CPU. Irreducible: the initrd arrives as an address and a length
-// from `KernelArgs`, and there is no `&'static [u8]` to be had before the
-// kernel has decided the region is real.
-unsafe impl Send for InitrdBacking {}
-// SAFETY: same reasoning, plus what `Sync` adds: every method takes `&self`
-// and only ever reads through `initrd_base`, so concurrent readers see the
-// same immutable image.
-unsafe impl Sync for InitrdBacking {}
-
 impl InitrdBacking {
-    pub fn new(initrd_base: *const u8, extents: Vec<Extent>, size: u64) -> Self {
-        Self { initrd_base, extents, size }
-    }
-
-    /// Convert a file byte offset to a pointer into initrd memory.
-    fn file_offset_to_ptr(&self, file_offset: u64) -> Option<*const u8> {
-        let block_idx = file_offset / BLOCK_SIZE_U64;
-        let off_in_block = (file_offset % BLOCK_SIZE_U64) as usize;
-        let mut cursor = 0u64;
-        for ext in &self.extents {
-            let count = ext.block_count as u64;
-            if block_idx < cursor + count {
-                let initrd_block = ext.start_block + (block_idx - cursor);
-                // SAFETY: `initrd_base` names the whole initrd image, which is
-                // one contiguous region the bootloader placed and nothing
-                // frees, and `extents` are block numbers *within* that image
-                // — so the result is an address inside it whenever the extent
-                // list is honest.
-                //
-                // **Irreducible today, and the "whenever" is a real gap**:
-                // `InitrdBacking` is given the *file's* size and never the
-                // image's, so nothing here can check `initrd_block` against
-                // the end of the initrd. The extents come from the bcachefs
-                // btree inside that same image, so a corrupt image reads
-                // whatever follows it rather than being refused. Filed as
-                // `issues/kernel/initrd-extents-are-not-bounded-by-the-image.md`
-                // — the fix is a length this type does not carry, so it is a
-                // change to three call sites in `bcachefs_adapter.rs` and not
-                // to this line.
-                let ptr = unsafe {
-                    self.initrd_base.add(initrd_block as usize * BLOCK_SIZE + off_in_block)
-                };
-                return Some(ptr);
-            }
-            cursor += count;
-        }
-        None
+    pub fn new(image: SliceBlockIO, extents: Vec<Extent>, size: u64) -> Self {
+        Self { image, extents, size }
     }
 }
 
 impl FileBacking for InitrdBacking {
-    /// Never `Err`: the initrd is one image already in memory, so there is no
-    /// device under this to refuse.
+    /// `Err` for a block the image does not reach — a corrupt extent list, and
+    /// the only way this can fail: there is no device under an initrd to refuse
+    /// a transfer.
+    ///
+    /// A refusal and not zeros, because the two are different facts and the
+    /// caller acts on them differently: a hole past the extent list is zeros
+    /// (the file genuinely has none there), while an extent naming a block the
+    /// image does not hold is a filesystem this kernel cannot read, and
+    /// `handle_page_fault` leaves that fault unhandled rather than handing a
+    /// process a page of zeros where its code should be.
     fn read_page(&self, file_offset: u64, buf: &mut [u8; BLOCK_SIZE]) -> BlockResult {
         buf.fill(0);
         if file_offset >= self.size {
             return Ok(());
         }
-        if let Some(ptr) = self.file_offset_to_ptr(file_offset & !(BLOCK_SIZE_U64 - 1)) {
-            let valid = BLOCK_SIZE.min((self.size - file_offset) as usize);
-            // SAFETY: `ptr` is `file_offset_to_ptr`'s answer for a
-            // block-aligned offset, so it is the start of a `BLOCK_SIZE` block
-            // of the initrd, and `valid <= BLOCK_SIZE` bounds the read inside
-            // it. `buf` is a `&mut [u8; BLOCK_SIZE]` the caller owns, in kernel
-            // memory, so it cannot overlap the immutable image.
-            //
-            // Irreducible: the source is a raw region the bootloader placed;
-            // it inherits `file_offset_to_ptr`'s open gap above, and nothing
-            // else here can be moved to a safe operation.
-            unsafe {
-                core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), valid);
-            }
-        }
+        // Past the extent list: a hole, and zeros are the file's own bytes.
+        let Some(block) = offset_to_block(&self.extents, file_offset) else {
+            return Ok(());
+        };
+        let Some(bytes) = self.image.block(BlockNum::new(block)) else {
+            log!(
+                "initrd: an extent names block {block}, which is not inside the \
+                 {}-block image it was read out of",
+                self.image.block_count()
+            );
+            return Err(BlockError);
+        };
+        let valid = BLOCK_SIZE.min((self.size - file_offset) as usize);
+        buf[..valid].copy_from_slice(&bytes[..valid]);
         Ok(())
     }
 

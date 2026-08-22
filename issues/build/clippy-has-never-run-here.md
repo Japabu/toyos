@@ -245,22 +245,39 @@ counts are what the ruling asks for: removed beside documented.
 | **total** | **76** | **13** | **63** | |
 
 Four findings came out of writing the justifications, filed rather than fixed
-because each is a decision past a documentation sweep:
+because each was a decision past a documentation sweep. **All four were decided
+and fixed on 2026-08-22**, which is what the sweep's own report predicted would
+be worth more than the comments were:
 
-- `issues/kernel/inbox-rings-are-borrowed-not-copied.md` — six of `inbox.rs`'s
-  seven blocks mint `&`/`&mut` over a page the process maps writable, which is
-  the shape `user_ptr.rs`'s `UserBytes` header argues against. Three of them are
-  `&mut`, and `create` maps the page into the process *before* building the
-  headers — the cheap half of the fix is a reordering.
-- `issues/kernel/initrd-extents-are-not-bounded-by-the-image.md` —
-  `InitrdBacking` is given the *file's* size and never the image's, so nothing
-  bounds an extent against the end of the initrd it came out of.
-- `issues/kernel/user-pages-still-read-through-a-plain-deref.md` — the futex
-  word and the crash dump read user memory with `*ptr` where `copy_in` uses
-  `read_volatile`, on a stated argument the two do not follow.
-- `issues/kernel/pagealloc-has-no-checked-window.md` — the demand-paging fill's
-  two raw writes want a bounded window type, and the obvious `&mut [u8]` is the
-  borrow that is wrong for pages about to become a user mapping.
+- Six of `inbox.rs`'s seven blocks minted `&`/`&mut` over a page the process
+  maps writable, which is the shape `user_ptr.rs`'s `UserBytes` header argues
+  against; three were `&mut`, and `create` mapped the page into the process
+  *before* building the headers. **Decided and fixed**: the page is built before
+  it is mapped and `SharedMemObject::phys_before_mapping` refuses the reversed
+  order; the ring headers are reached one `&AtomicU32` at a time and a
+  submission is a `read_volatile` of the whole entry, so no reference over that
+  page exists at all.
+- `InitrdBacking` was given the *file's* size and never the image's, so nothing
+  bounded an extent against the end of the initrd it came out of. **Decided and
+  fixed 2026-08-22**: it holds the image (`bcachefs::SliceBlockIO`, now `Copy`)
+  and reads through `SliceBlockIO::block`, which is the one thing that knows
+  both the block number and the length. `file_backing.rs` and
+  `bcachefs_adapter.rs` now contain no `unsafe` at all — the `Send`/`Sync` pair,
+  the extent-to-pointer path and the copy out of it are gone, and the one
+  remaining claim about the initrd region is `SliceBlockIO::new`'s, made once in
+  `main.rs` where the region is named. A reduction, not a comment.
+- The futex word and the crash dump read user memory with `*ptr` where
+  `copy_in` uses `read_volatile`. **Decided and fixed 2026-08-22**: both are
+  `read_volatile`, and the rule is now `user_ptr.rs`'s module header rather
+  than a per-site preference.
+- The demand-paging fill's two raw writes wanted a bounded window type, and the
+  obvious `&mut [u8]` is the borrow that is wrong for pages about to become a
+  user mapping. **Decided and fixed 2026-08-22**: no new type — `PageAlloc`
+  gained a safe `window()` that hands back the `mm::KernelSlice` this kernel
+  already has, sized from the allocation it owns, and `UserStack` holds one
+  instead of its own private bound. That is also half of
+  `issues/design-debt/kernelslice-from-raw-cannot-check-itself.md`'s named fix
+  shape; the loader and `DmaPool` still name their own sizes, so it stays open.
 
 One correctness fix landed with the sweep rather than being filed, because
 writing the comment is what found it and the fix is a deleted token:
