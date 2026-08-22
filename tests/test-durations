@@ -144,6 +144,7 @@ control_regs 7243
 control_regs_negative 3872
 control_regs_verdict 0
 debug_float 11
+debug_trap 18446744073709551615
 demand_paging_sse 12
 desktop_audio_client 13791
 desktop_locale_detect 4510

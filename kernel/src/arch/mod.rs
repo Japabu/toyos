@@ -20,7 +20,6 @@
 pub mod apic;
 pub mod control_regs;
 pub mod cpu;
-pub mod debug;
 pub mod entry;
 pub mod fpu;
 pub mod idt;
@@ -35,10 +34,15 @@ pub mod tlb;
 /// preempted on this CPU.
 ///
 /// **Both IF and TF are clear.** IF excludes IRQ delivery and scheduler
-/// preemption; TF matters independently because Ring 3 may set it and a #DB
-/// handler logs before returning. Leaving TF set lets that handler reserve a
-/// whole newer generation while the interrupted writer is halfway through its
-/// slot body.
+/// preemption. TF used to matter independently — Ring 3 could set it, `SYSCALL`
+/// did not mask it, and the `#DB` handler logged before returning, so a
+/// single-stepping thread could reserve a whole newer generation while the
+/// interrupted writer was halfway through its slot body. Neither half of that is
+/// true now: `arch::syscall::init` puts `TF` in `IA32_FMASK` and every gate
+/// clears it, so no Ring 0 code in this kernel runs with it set, and `#DB` from
+/// Ring 3 ends the process instead of reporting. The branch below is therefore
+/// unreachable rather than load-bearing
+/// (`issues/kernel/the-log-guard-still-clears-a-flag-ring-0-cannot-hold.md`).
 ///
 /// The bracket is deliberately narrower than formatting: it covers only the
 /// shard pointer and identity reads, the unlocked `xadd`, and the body

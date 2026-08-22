@@ -201,24 +201,43 @@ pub fn init() {
         // `LSTAR` is an IDT slot by another name: the one thing `syscall` can
         // reach.
         cpu::wrmsr(MSR_LSTAR, Ring3Entry::new(syscall_entry).addr());
-        // Mask IF (bit 9), DF (bit 10) and AC (bit 18) on `SYSCALL` entry.
+        // The four `RFLAGS` bits a Ring 3 thread may not hand the kernel.
         //
-        // **DF is here because `SYSCALL` clears exactly what this word names and
-        // nothing else.** A Ring 3 thread's direction flag is its own and stays
-        // its own — `sysretq` restores `RFLAGS` from `r11`, which the entry saved
-        // before the mask applied — but a kernel that inherits a set one runs
-        // every `rep movs`/`rep stos` backwards, writing the `n` bytes *below* a
-        // destination instead of at it. `arch::entry::ring3_naked_asm`'s `cld`
-        // carries the whole argument; this is the same fix on the one entry where
-        // the hardware lets a mask word make it.
+        // **`SYSCALL` clears exactly what this word names and nothing else**, so
+        // every bit left out of it is a Ring 3 thread's flag running Ring 0 code.
+        // A thread's own copy survives either way: the CPU puts the pre-mask
+        // `RFLAGS` in `r11` and `sysretq` restores it, so what this decides is
+        // only what the *kernel* runs with.
+        //
+        // - `DF` — a kernel that inherits a set direction flag runs every
+        //   `rep movs`/`rep stos` backwards, writing the `n` bytes *below* a
+        //   destination instead of at it. `arch::entry::ring3_naked_asm`'s `cld`
+        //   carries the whole argument; this is the same fix on the one entry
+        //   where the hardware lets a mask word make it.
+        // - `TF` — **without it, three Ring 3 instructions halt the machine.**
+        //   The single-step trap after a `popfq` that set `TF` is deferred by
+        //   exactly one instruction, and if that instruction is `syscall` the
+        //   `#DB` is taken at `LSTAR` with CPL already 0 and `rsp` still the
+        //   *user* stack, because the entry has not reached `mov rsp, gs:[16]`.
+        //   The `#DB` gate has no IST, so the CPU builds its frame there — a
+        //   supervisor write to a user page, which SMAP refuses — and the `#PF`
+        //   lands on the same stack and escalates. Measured on this tree before
+        //   the bit was added: `DOUBLE FAULT on CPU 1`, `rip=syscall_entry+0x0`,
+        //   `cr2 = rsp - 8` on a `P=1 W=1 U=1` page, every CPU halted.
+        //   `debug_trap`'s `tf-syscall` arm is the gate.
+        // - `IF` and `AC` — interrupts stay masked for the whole of a syscall,
+        //   and `RFLAGS.AC` clear is what makes SMAP bind at all.
         //
         // `entry-df-unclean` is `arch::entry`'s negative control and this is its
-        // other half: the mask this kernel carried before, so the arm stages the
-        // whole defect rather than the gates' share of it.
-        cpu::wrmsr(
-            MSR_FMASK,
-            if cfg!(feature = "entry-df-unclean") { 0x40200 } else { 0x40600 },
-        );
+        // other half: it takes `DF` back out, so the arm stages the whole defect
+        // rather than the gates' share of it. It takes nothing else out — a
+        // control that removed two bits would be measuring two things.
+        const TF: u64 = 1 << 8;
+        const IF: u64 = 1 << 9;
+        const DF: u64 = 1 << 10;
+        const AC: u64 = 1 << 18;
+        let df = if cfg!(feature = "entry-df-unclean") { 0 } else { DF };
+        cpu::wrmsr(MSR_FMASK, TF | IF | AC | df);
     }
 }
 
