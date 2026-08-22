@@ -29,15 +29,15 @@ mod sleeplock;
 mod sync;
 mod id_map;
 
-// The five module trees the sweep has not reached. Each `allow` is deleted by
-// the pull request that documents that area, and the list is the whole of what
-// the kernel still owes the lint — 107, 121, 8, 8 and 2 blocks when it was
-// measured (2026-08-22). An area that instead gates itself with its own
-// `#![warn(...)]` inside its `mod.rs`, the way `mm/`, `object/`, `elf/` and
-// `loader/` already do, wins over the line here — the inner attribute is the
-// more specific one — so this list is never a way to un-gate a swept tree,
-// only a record of the ones nobody has swept.
-#[allow(clippy::undocumented_unsafe_blocks, reason = "arch/: not yet swept")]
+// The module trees the sweep has not reached. Each `allow` is deleted by the
+// pull request that documents that area, and the list is the whole of what the
+// kernel still owes the lint; `issues/build/clippy-has-never-run-here.md`
+// carries the per-area counts, which move as areas land and are not restated
+// here. An area that instead gates itself with its own `#![warn(...)]` inside
+// its `mod.rs`, the way `arch/`, `mm/`, `object/`, `elf/` and `loader/` already
+// do, wins over the line here — the inner attribute is the more specific one —
+// so this list is never a way to un-gate a swept tree, only a record of the ones
+// nobody has swept.
 mod arch;
 mod drivers;
 

@@ -1226,6 +1226,22 @@ pub fn activate_kernel() {
     unsafe { kernel_cr3().activate() };
 }
 
+/// [`activate_kernel`] for a CPU that does not have `CR4.PCIDE` yet.
+///
+/// Safe for exactly [`activate_kernel`]'s reason — the tables are the
+/// boot-built kernel ones — and separate from it because `activate` sets
+/// `CR3[63]` (`NOFLUSH`) whenever the *machine* has declared `PCIDE`, and that
+/// bit is reserved on a CPU that has not set it yet. An AP reaches this before
+/// `percpu::init_ap` runs `control_regs::init` on it, so the machine says yes
+/// and this CPU is not ready to be asked.
+pub fn load_kernel_flush() {
+    // SAFETY: `load_flush`'s requirement is page tables that are valid and
+    // live; `KERNEL_CR3` names the kernel address space, built once in `init`,
+    // never torn down, mapping the whole kernel image and the direct map — so
+    // the code and stack this call returns onto stay mapped across it.
+    unsafe { kernel_cr3().load_flush() };
+}
+
 /// Map a device's registers into the kernel's direct map and tell every CPU.
 ///
 /// The lock and the shootdown are separate statements, and that is the whole
