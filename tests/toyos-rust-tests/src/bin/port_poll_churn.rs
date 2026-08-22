@@ -1,6 +1,8 @@
-//! The window `issues/kernel/ring0-jump-to-zero-under-port-polls.md`
-//! names: the last `Acceptor` handle going while an `io_uring` poll still
-//! references the port.
+//! The window a Ring 0 fetch at address zero was once blamed on: the last
+//! `Acceptor` handle going while an `io_uring` poll still references the port.
+//! The fault turned out to be the direction-flag class and not this window —
+//! the port code was audited sound — and the churn stays because the window is
+//! real whatever first pointed at it.
 //!
 //! A poll on an acceptor is the one registration that holds its object rather
 //! than naming it by number — `Source::Port(Arc<PortShared>)` — so the order in

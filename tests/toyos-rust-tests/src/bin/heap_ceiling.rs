@@ -95,8 +95,8 @@ fn sysinfo_refuses_rather_than_allocating_past_the_ceiling() {
 /// Whether `SYS_SYSINFO` filled its header. The ABI wrapper reports an error
 /// as `0`, and the header is the smallest buffer it accepts.
 fn sysinfo_answers() -> bool {
-    let mut buf = [0u8; 48];
-    toyos_abi::syscall::sysinfo(&mut buf) == buf.len()
+    let mut buf = [0u8; toyos::system::SYSINFO_HEADER_SIZE];
+    toyos::system::sysinfo(&mut buf) == buf.len()
 }
 
 /// The documented ceiling is a size the heap actually serves.

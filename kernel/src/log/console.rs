@@ -231,8 +231,7 @@ pub fn drain_locked(guard: &mut BackendGuard) {
 /// was right about the spin and wrong about the consequence — an unarmed
 /// `klogd` never wakes, so it never reaches `user::post_readiness`, so **the one
 /// machine shape this whole design exists for posts no log readiness at all**
-/// and `/bin/logd` parks for ever with `/log` unwritten
-/// (`issues/diagnostics/a-console-less-machine-posts-no-log-readiness.md`).
+/// and `/bin/logd` parks for ever with `/log` unwritten.
 ///
 /// Advancing costs nothing that machine had: the records stay in their shards
 /// for the panel, which reads them through `snapshot_committed` and not through

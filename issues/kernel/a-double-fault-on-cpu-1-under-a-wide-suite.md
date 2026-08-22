@@ -186,8 +186,8 @@ samples against one observation and it establishes no rate whatsoever; it is
 recorded so nobody counts it as evidence in either direction.
 
 Nothing here is a repro recipe, and there is no cheap one to offer: a `#DF`
-reached only beside eleven other guests does not reproduce alone, and
-`issues/kernel/ring0-jump-to-zero-under-port-polls.md` says the same of its own.
+reached only beside eleven other guests does not reproduce alone, as the Ring 0
+fetch at address zero of 2026-08-09 did not either.
 
 **One recipe was cheap for the neighbouring class and nobody had tried it**,
 which is worth a sentence here because the move transfers: booting the ordinary

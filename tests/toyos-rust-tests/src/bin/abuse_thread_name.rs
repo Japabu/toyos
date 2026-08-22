@@ -15,16 +15,34 @@
 //! back a truncated `over` after the second call; the refusal reads back
 //! `at_bound`, unchanged.
 
+use std::sync::OnceLock;
+
+use toyos::endow::{Endowments, SYSCAP_LABEL};
+use toyos::syscap::SysCap;
 use toyos_abi::syscall;
 
 const THREAD_NAME_LEN: usize = 28;
-const HEADER_SIZE: usize = 48;
-const ENTRY_SIZE: usize = 64;
+const HEADER_SIZE: usize = toyos::system::SYSINFO_HEADER_SIZE;
+const ENTRY_SIZE: usize = toyos::system::SYSINFO_ENTRY_SIZE;
 /// Comfortably past any thread count the shared boot runs concurrently — the
 /// parallel phase widths seen in CI are single digits.
 const SYSINFO_CAP: usize = 1024;
 
+/// The estate's system capability, taken once — taking is a swap, and a name
+/// is read back several times below.
+fn cap() -> &'static SysCap {
+    static CAP: OnceLock<SysCap> = OnceLock::new();
+    CAP.get_or_init(|| {
+        Endowments::get()
+            .take(SYSCAP_LABEL)
+            .expect("test-runner endows every binary it spawns a system capability")
+    })
+}
+
 /// This process's own main-thread name field out of `SYS_SYSINFO`.
+///
+/// Even one's own name comes back in the machine-wide roster, which costs
+/// `Rights::ROSTER` on a `SysCap`: there is no narrower question in the ABI.
 ///
 /// `None` only if this thread's own entry is missing from the answer, which
 /// `SYSINFO_CAP` is sized well past — a `None` here is `SYSINFO_CAP` too
@@ -32,7 +50,7 @@ const SYSINFO_CAP: usize = 1024;
 fn own_name() -> Option<[u8; THREAD_NAME_LEN]> {
     let pid = syscall::getpid().0;
     let mut buf = vec![0u8; HEADER_SIZE + SYSINFO_CAP * ENTRY_SIZE];
-    let n = syscall::sysinfo(&mut buf);
+    let n = cap().roster(&mut buf);
     assert!(n >= HEADER_SIZE, "sysinfo returned {n} bytes, need at least the {HEADER_SIZE}-byte header");
 
     let mut off = HEADER_SIZE;

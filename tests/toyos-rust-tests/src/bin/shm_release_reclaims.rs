@@ -30,9 +30,9 @@ const REGION: usize = 4096;
 const SERVICE: &str = "region";
 
 fn free_bytes() -> u64 {
-    let mut buf = [0u8; 48];
-    let n = syscall::sysinfo(&mut buf);
-    assert!(n >= 48, "sysinfo returned {n} bytes");
+    let mut buf = [0u8; toyos::system::SYSINFO_HEADER_SIZE];
+    let n = toyos::system::sysinfo(&mut buf);
+    assert_eq!(n, buf.len(), "sysinfo returned {n} bytes");
     let total = u64::from_le_bytes(buf[0..8].try_into().unwrap());
     let used = u64::from_le_bytes(buf[8..16].try_into().unwrap());
     total - used
