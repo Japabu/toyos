@@ -292,6 +292,8 @@ suspend_detector 20
 suspend_invalidates_a_verdict 0
 swiss_german_layout 5355
 syscall_cost 92
+syscall_window_nmi 6825
+syscall_window_nmi_controls 13090
 tlb_shootdown_waits 107
 toybox_cp_volume 18616
 toybox_file_tools 205

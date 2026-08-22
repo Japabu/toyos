@@ -58,6 +58,8 @@ mod usb_gate;
 mod nvme_gate;
 #[cfg(feature = "boot-actuators")]
 mod sched_gate;
+#[cfg(feature = "boot-actuators")]
+mod nmi_gate;
 mod block;
 mod gpt;
 mod page_cache;

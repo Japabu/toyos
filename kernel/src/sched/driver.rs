@@ -1086,6 +1086,13 @@ extern "C" fn idle_loop() -> ! {
         if crate::actuator::dump_deaf_cpu() {
             super::dump::deaf_window();
         }
+        // The idle loop for the same reason, from the other side: the CPU that
+        // storms is the one with nothing to run, and the CPU under observation
+        // is whichever one is spinning on `syscall` from Ring 3.
+        #[cfg(feature = "boot-actuators")]
+        if crate::actuator::syscall_window_nmi() {
+            crate::nmi_gate::storm();
+        }
         // Here and not from a syscall: the panic handler recovers rather than
         // paints when a userland thread is current, and this context has none.
         #[cfg(feature = "boot-actuators")]

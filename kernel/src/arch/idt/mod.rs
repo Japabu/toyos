@@ -221,10 +221,16 @@ macro_rules! exception_stub {
 /// is no third spelling and no default, for the same reason the error-code
 /// column has none. Every `dispatched` vector goes through `common_entry`,
 /// which brackets, so their rows do not repeat the answer.
+///
+/// **The `ist` column is a claim about `rsp` and not about depth**: a vector
+/// that carries one takes its frame on the stack `percpu::IST_STACKS` names
+/// whatever `rsp` holds, which is the only answer for a vector that can arrive
+/// while `rsp` is not a kernel stack at all. Both kinds of row may have one, and
+/// [`IST_VECTORS`] is what the assertions below read.
 macro_rules! idt_vectors {
     (
         dispatched { $($ex:ident = $exnum:literal, $stub:ident, $err:ident $(, ist $ist:literal)?;)* }
-        direct { $($ring:tt $direct:ident = $dnum:literal, $entry:path;)* }
+        direct { $($ring:tt $direct:ident = $dnum:literal, $entry:path $(, ist $dist:literal)?;)* }
     ) => {
         /// IDT vector assignments — CPU exceptions and hardware interrupts.
         #[repr(usize)]
@@ -248,13 +254,24 @@ macro_rules! idt_vectors {
 
         $(exception_stub!($stub, $ex, $err);)*
 
+        /// Every vector whose row carries an `ist` index, and the index.
+        ///
+        /// Read by the assertions under the table: which vectors need one is a
+        /// property of where they can arrive, so it is stated once, checked at
+        /// compile time, and never re-derived from the entries at runtime.
+        const IST_VECTORS: &[(usize, u8)] = &[
+            $($((Vector::$ex as usize, $ist),)?)*
+            $($((Vector::$direct as usize, $dist),)?)*
+        ];
+
         fn install_gates(idt: &mut Idt) {
             $(
                 idt.entries[Vector::$ex as usize] =
                     IdtEntry::ring3(Ring3Entry::new($stub))$(.with_ist($ist))?;
             )*
             $(
-                idt.entries[Vector::$direct as usize] = direct_gate!($ring, $entry);
+                idt.entries[Vector::$direct as usize] =
+                    direct_gate!($ring, $entry)$(.with_ist($dist))?;
             )*
         }
     };
@@ -296,7 +313,7 @@ idt_vectors! {
         PageFault          = 0x0E, stub_pf, error_code;
         X87FloatingPoint   = 0x10, stub_mf, no_error_code;
         AlignmentCheck     = 0x11, stub_ac, error_code;
-        MachineCheck       = 0x12, stub_mc, no_error_code;
+        MachineCheck       = 0x12, stub_mc, no_error_code, ist 3;
         SimdFloatingPoint  = 0x13, stub_xm, no_error_code;
         Virtualization     = 0x14, stub_ve, no_error_code;
         ControlProtection  = 0x15, stub_cp, error_code;
@@ -304,8 +321,12 @@ idt_vectors! {
     direct {
         // Diagnostic only, and sent by `sched::dump` alone — see `idt/nmi.rs`.
         // Ring 0 because it arrives between arbitrary instructions, including
-        // inside another entry's own save, and it reschedules nothing.
-        ring0 Nmi          = 0x02, nmi::nmi_entry;
+        // inside another entry's own save, and it reschedules nothing. IST2
+        // because "arbitrary instructions" includes the three of `SYSCALL` entry
+        // that run at CPL 0 on the user's stack, where a frame pushed at `rsp`
+        // is a supervisor write to a user page: SMAP refuses it, the `#PF` lands
+        // on the same stack, and the machine takes a `#DF`.
+        ring0 Nmi          = 0x02, nmi::nmi_entry, ist 2;
         ring3 Timer        = 0x20, timer::timer_entry;
         ring3 Xhci         = 0x21, xhci::xhci_entry;
         ring3 VirtioNet    = 0x22, virtio_net::virtio_net_entry;
@@ -318,6 +339,52 @@ idt_vectors! {
         ring3 TlbFlush     = 0xFE, tlb::tlb_flush_entry;
     }
 }
+
+/// The three vectors that can arrive while `rsp` is not a kernel stack, and
+/// therefore the three that must carry an IST index.
+///
+/// **Checked here rather than tested, because a missing index is invisible
+/// until the machine is already dying.** `SYSCALL` switches CPL and `RIP` and
+/// nothing else, so `arch::syscall`'s entry runs three instructions at CPL 0 on
+/// the user's stack and its exit one more between `pop rsp` and `sysretq`; a
+/// frame the CPU builds there is a supervisor write to a user page, SMAP refuses
+/// it, and the `#PF` escalates to `#DF` (measured 2026-08-22 with `TF`, then
+/// masked). `#DF` is on the list because it is where that escalation lands, NMI
+/// because nothing masks it, `#MC` because an abort with no report is a machine
+/// that went down saying nothing.
+///
+/// A vector *without* an IST is not asserted about: an ordinary fault from Ring
+/// 3 arrives after the CPU has already switched to `tss.rsp0`, and one from
+/// Ring 0 arrives on a kernel stack by definition.
+const _: () = {
+    const fn ist_of(vector: usize) -> u8 {
+        let mut i = 0;
+        while i < IST_VECTORS.len() {
+            if IST_VECTORS[i].0 == vector {
+                return IST_VECTORS[i].1;
+            }
+            i += 1;
+        }
+        0
+    }
+    assert!(ist_of(0x08) == 1, "#DF must take its frame on IST1");
+    assert!(ist_of(0x02) == 2, "an NMI must take its frame on IST2");
+    assert!(ist_of(0x12) == 3, "#MC must take its frame on IST3");
+    // Every index names a stack `percpu::alloc_ist_stacks` actually allocates,
+    // and no two vectors share one: an IST stack is not re-entrant, so two
+    // vectors on one index is a frame written over another frame.
+    let mut i = 0;
+    while i < IST_VECTORS.len() {
+        let (_, ist) = IST_VECTORS[i];
+        assert!(ist >= 1 && ist as usize <= percpu::IST_STACKS, "no stack for that IST index");
+        let mut j = i + 1;
+        while j < IST_VECTORS.len() {
+            assert!(IST_VECTORS[j].1 != ist, "two vectors share one IST stack");
+            j += 1;
+        }
+        i += 1;
+    }
+};
 
 /// Halt IPI — received when another CPU calls halt_all_cpus(). Never returns.
 #[unsafe(naked)]
@@ -510,6 +577,15 @@ pub fn init() {
     install_gates(&mut IDT.lock());
     #[cfg(feature = "boot-actuators")]
     install_actuator_gates(&mut IDT.lock());
+    // **The kernel this tree had until 2026-08-22**, and the negative control on
+    // vector 2's `ist 2`: the gate keeps its handler and its ring and loses the
+    // one byte that decides which stack the CPU builds the frame on.
+    // Nothing on the host side can reach that state — the IDT is the guest's own
+    // memory, and no QEMU device or machine property edits it.
+    #[cfg(feature = "boot-actuators")]
+    if crate::actuator::nmi_without_ist() {
+        IDT.lock().entries[Vector::Nmi as usize].ist = 0;
+    }
 
     let ptr = IdtPointer {
         limit: (core::mem::size_of::<Idt>() - 1) as u16,

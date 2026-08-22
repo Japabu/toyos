@@ -114,6 +114,17 @@ pub struct PerCpu {
     /// executes an instruction. That is why `emit` needs no check — an absent
     /// shard is not a state this field can be in.
     log_shard: u64,                        // offset 264
+    /// Non-zero while this CPU is inside its NMI handler, written by
+    /// `arch::idt::nmi`'s entry and by nothing else.
+    ///
+    /// **The checked half of a proof.** IST2 is not re-entrant, so a second NMI
+    /// entered while the first is still on that stack would write its frame over
+    /// the first's; the architecture blocks NMI delivery from entry until the
+    /// handler's `iretq` (SDM Vol. 3A §6.7.1), and the handler cannot fault, so
+    /// no such entry exists — and this word is what turns that argument into an
+    /// observation rather than an assumption.
+    nmi_active: u32,                       // offset 272
+    _pad276: [u8; 4],                      // offset 276..280
 }
 
 // GDT layout:
@@ -219,6 +230,9 @@ pub(crate) const OFF_NEED_RESCHED: u32 = offset_of!(PerCpu, need_resched) as u32
 /// Read by `preempt::enable`'s slow path, which declines to reschedule a CPU
 /// that is inside a fault or panic report.
 pub(crate) const OFF_FAULT_STATE: u32 = offset_of!(PerCpu, fault_state) as u32;
+/// Set and cleared by `arch::idt::nmi`'s naked entry, which is the only writer
+/// and hardcodes this displacement like every other stub.
+pub(crate) const OFF_NMI_ACTIVE: u32 = offset_of!(PerCpu, nmi_active) as u32;
 
 const _: () = assert!(OFF_SELF_PTR == 0);
 const _: () = assert!(OFF_CPU_ID == 8);
@@ -238,6 +252,7 @@ const _: () = assert!(OFF_LAST_SEEN_RING0_FIRES == 252);
 const _: () = assert!(OFF_FAULT_STATE == 256);
 const _: () = assert!(OFF_LAST_ARMED_TICKS == 260);
 const _: () = assert!(offset_of!(PerCpu, log_shard) == 264);
+const _: () = assert!(OFF_NMI_ACTIVE == 272);
 
 /// Every GS-relative access this kernel makes, as `const`-generic primitives.
 ///
@@ -414,7 +429,7 @@ const IDLE_STACK_SIZE: usize = crate::process::KERNEL_STACK_SIZE;
 /// not fault — it rewrites whatever is underneath, and the damage surfaces
 /// later and elsewhere.
 ///
-/// Unmapped rather than [`IST1_GUARD_SIZE`]'s fill pattern, and the difference
+/// Unmapped rather than [`IST_GUARD_SIZE`]'s fill pattern, and the difference
 /// is the stack, not the taste: #PF has no IST, so a frame pushed past the
 /// bottom faults again on the same stack and the CPU takes a #DF — which
 /// *does* have a stack, and reports. On IST1 there is no such second chance,
@@ -426,8 +441,36 @@ const IDLE_STACK_SIZE: usize = crate::process::KERNEL_STACK_SIZE;
 /// else, as a corrupted allocation.
 const IDLE_GUARD_SIZE: usize = 4096;
 
-/// The double fault stack. Only #DF uses IST1, and what runs on it is the
-/// whole crash report plus `halt_all_cpus` — render, then `panic_flush`.
+/// **Every IST stack this machine has, and which vector takes which.**
+///
+/// The index is the `ist` column of `arch::idt`'s table, and the reason each row
+/// has one is the same: the CPU builds the frame on the stack this names
+/// *whatever `rsp` holds*, so a vector that can arrive while `rsp` is not a
+/// kernel stack is a vector that must have one (SDM Vol. 3A §6.14.5). Three
+/// instructions of `SYSCALL` entry and one of its exit run at CPL 0 on the
+/// user's stack, and an exception taken there writes its frame to a user page
+/// from CPL 0 — which SMAP refuses, so the `#PF` lands on the same stack and
+/// escalates to `#DF`. That was measured on this tree
+/// (`arch::syscall::init`'s `TF` note carries the capture).
+///
+/// - **IST1, `#DF`** — the crash report's own stack, and the reason the number
+///   below is what it is.
+/// - **IST2, NMI** — vector 2 arrives between arbitrary instructions and is not
+///   maskable, so the window above is reachable by it whenever anything sends
+///   one; `sched::dump` does, on Ctrl+Alt+D.
+/// - **IST3, `#MC`** — an abort, so the machine is going down either way; the
+///   stack is what lets it say so instead of triple-faulting on the way.
+///
+/// `Tss::ist` is a seven-entry array and a gate's `ist` byte indexes it from 1,
+/// so IST*n* is `ist[n - 1]`.
+pub(crate) const IST_STACKS: usize = 3;
+
+/// The double fault stack, and now every IST stack: one size, for the reason
+/// [`IDLE_STACK_SIZE`] gives — which stack a handler is on is not a question its
+/// code should have to answer. What runs on IST1 is the whole crash report plus
+/// `halt_all_cpus` — render, then `panic_flush` — and the nested-NMI report on
+/// IST2 ends in the same `halt_all_cpus`, so the deepest of the three decides
+/// the number for all of them.
 ///
 /// It was 4096, and the byte ring's `drain_to_serial` put a 4096-byte buffer on it, so the
 /// report overflowed the stack it was being written from and corrupted the
@@ -472,7 +515,10 @@ const IDLE_GUARD_SIZE: usize = 4096;
 ///
 /// It was 4,512 before the record ring, so the ring's net cost is 2,176 bytes
 /// of a stack with 9,696 still free.
-const IST1_STACK_SIZE: usize = 16384;
+///
+/// At [`IST_STACKS`] stacks and a guard each it costs 60 KiB per CPU, against
+/// the 20 KiB one stack cost while `#DF` was the only vector with one.
+const IST_STACK_SIZE: usize = 16384;
 
 /// Filled with [`STACK_FILL`] and never written by anything legitimate, so an
 /// overflow is observable after the fact.
@@ -481,7 +527,7 @@ const IST1_STACK_SIZE: usize = 16384;
 /// on the double fault stack is a triple fault, which resets the machine and
 /// takes the report with it. Detecting the overflow is worth more here than
 /// trapping it, because the report is the entire reason this stack exists.
-const IST1_GUARD_SIZE: usize = 4096;
+const IST_GUARD_SIZE: usize = 4096;
 
 /// Chosen so a zeroed or ASCII byte cannot be mistaken for untouched stack.
 const STACK_FILL: u8 = 0xA5;
@@ -714,26 +760,36 @@ pub fn idle_stack_high_water() -> usize {
         .unwrap_or(0)
 }
 
-fn alloc_ist1_stack(percpu: &mut PerCpu) {
-    let total = IST1_GUARD_SIZE + IST1_STACK_SIZE;
-    let layout = Layout::from_size_align(total, 4096).unwrap();
-    // SAFETY: `alloc_percpu`'s argument — non-zero size, power-of-two alignment,
-    // never freed. The 4096 is not decoration: `IST1_GUARD_SIZE` is a page and
-    // the guard's detection rests on it starting at one.
-    let base = unsafe { alloc_zeroed(layout) };
-    assert!(!base.is_null(), "percpu: IST1 stack alloc failed");
-    // SAFETY: `total` bytes from `base`, which is exactly the allocation just
-    // made and asserted non-null. Same irreducibility as `alloc_idle_stack`'s
-    // fill: what is being written is a stack the CPU will switch to on #DF, not
-    // a Rust value that could hold a borrow.
-    unsafe { core::ptr::write_bytes(base, STACK_FILL, total) };
-    let top = base as u64 + total as u64;
-    // SAFETY: `Tss` is `repr(C, packed)`, so `&raw mut percpu.tss.ist[0]` is a
-    // well-formed but possibly unaligned pointer into a live `PerCpu` this
-    // function holds `&mut` to — which is precisely `write_unaligned`'s domain
-    // and why the plain assignment it replaces would be undefined.
-    unsafe { core::ptr::write_unaligned(&raw mut percpu.tss.ist[0], top); }
+/// One stack per [`IST_STACKS`] row, filled and guarded alike.
+///
+/// **Every one of them, in one loop, because a vector whose row says `ist n` and
+/// whose `ist[n - 1]` is zero is a vector that faults to address 0.** The CPU
+/// does not check: it loads the TSS word and pushes there.
+fn alloc_ist_stacks(percpu: &mut PerCpu) {
+    let total = IST_GUARD_SIZE + IST_STACK_SIZE;
+    for slot in 0..IST_STACKS {
+        let layout = Layout::from_size_align(total, 4096).unwrap();
+        // SAFETY: `alloc_percpu`'s argument — non-zero size, power-of-two
+        // alignment, never freed. The 4096 is not decoration: `IST_GUARD_SIZE`
+        // is a page and the guard's detection rests on it starting at one.
+        let base = unsafe { alloc_zeroed(layout) };
+        assert!(!base.is_null(), "percpu: IST{} stack alloc failed", slot + 1);
+        // SAFETY: `total` bytes from `base`, which is exactly the allocation just
+        // made and asserted non-null. Same irreducibility as `alloc_idle_stack`'s
+        // fill: what is being written is a stack the CPU will switch to on a
+        // fault, not a Rust value that could hold a borrow.
+        unsafe { core::ptr::write_bytes(base, STACK_FILL, total) };
+        let top = base as u64 + total as u64;
+        // SAFETY: `Tss` is `repr(C, packed)`, so `&raw mut percpu.tss.ist[slot]`
+        // is a well-formed but possibly unaligned pointer into a live `PerCpu`
+        // this function holds `&mut` to — which is precisely `write_unaligned`'s
+        // domain and why the plain assignment it replaces would be undefined.
+        // `slot < IST_STACKS <= 7`, which is `Tss::ist`'s length.
+        unsafe { core::ptr::write_unaligned(&raw mut percpu.tss.ist[slot], top); }
+    }
 }
+
+const _: () = assert!(IST_STACKS <= 7, "a TSS has seven IST slots");
 
 /// The IST1 stack top this CPU's TSS holds, if it looks like one.
 ///
@@ -751,7 +807,7 @@ fn ist1_top() -> Option<u64> {
     // corrupt, so the read is checked afterwards rather than trusted. Unaligned
     // because `Tss` is `repr(C, packed)`.
     let top = unsafe { core::ptr::read_unaligned(&raw const (*percpu).tss.ist[0]) };
-    let total = (IST1_GUARD_SIZE + IST1_STACK_SIZE) as u64;
+    let total = (IST_GUARD_SIZE + IST_STACK_SIZE) as u64;
     let base = top.checked_sub(total)?;
     (crate::mm::is_kernel_addr(base) && top % 4096 == 0).then_some(top)
 }
@@ -771,23 +827,23 @@ fn ist1_top() -> Option<u64> {
 pub fn ist1_report() {
     let Some(top) = ist1_top() else { return };
     let rsp = cpu::read_rsp();
-    let stack_bottom = top - IST1_STACK_SIZE as u64;
+    let stack_bottom = top - IST_STACK_SIZE as u64;
     if rsp < stack_bottom || rsp > top {
         return;
     }
 
-    let guard_base = stack_bottom - IST1_GUARD_SIZE as u64;
-    let intact = words(guard_base, IST1_GUARD_SIZE).all(|w| w == STACK_FILL_WORD);
-    let untouched = words(stack_bottom, IST1_STACK_SIZE)
+    let guard_base = stack_bottom - IST_GUARD_SIZE as u64;
+    let intact = words(guard_base, IST_GUARD_SIZE).all(|w| w == STACK_FILL_WORD);
+    let untouched = words(stack_bottom, IST_STACK_SIZE)
         .take_while(|&w| w == STACK_FILL_WORD)
         .count()
         * 8;
-    let used = IST1_STACK_SIZE - untouched;
+    let used = IST_STACK_SIZE - untouched;
 
     crate::drivers::serial::panic_raw(b"\n[ist1] used ");
     crate::drivers::serial::panic_raw_dec(used as u64);
     crate::drivers::serial::panic_raw(b" of ");
-    crate::drivers::serial::panic_raw_dec(IST1_STACK_SIZE as u64);
+    crate::drivers::serial::panic_raw_dec(IST_STACK_SIZE as u64);
     crate::drivers::serial::panic_raw(if intact {
         b" bytes, guard intact\n"
     } else {
@@ -819,12 +875,12 @@ pub fn init_bsp(lapic_id: u32) {
     // pointer is into the `&mut PerCpu` above.
     unsafe { core::ptr::write_unaligned(&raw mut percpu.tss.rsp0, cpu::read_rsp()); }
     alloc_idle_stack(percpu);
-    alloc_ist1_stack(percpu);
+    alloc_ist_stacks(percpu);
 
     // SAFETY: `load_gdt` asks to be called exactly once per CPU during init, and
     // this is the BSP's one call — `init_ap` is every AP's. The GDT and TSS it
     // loads are this `PerCpu`'s own, filled by `alloc_percpu` and
-    // `alloc_ist1_stack` above.
+    // `alloc_ist_stacks` above.
     unsafe { percpu.load_gdt(); }
     super::control_regs::init(0);
     super::fpu::init();
@@ -855,7 +911,7 @@ pub fn alloc_ap(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
     // INIT-SIPI yet, so the CPU it belongs to has executed no instruction.
     let percpu = unsafe { &mut *ptr };
     alloc_idle_stack(percpu);
-    alloc_ist1_stack(percpu);
+    alloc_ist_stacks(percpu);
     ptr
 }
 
