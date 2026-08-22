@@ -7,37 +7,19 @@
 //! is refused by name — never truncated to fit, and never trusted because the
 //! transfer that carried them succeeded.
 
-use crate::mm::KernelSlice;
+//! **This file is the tree's one user of [`crate::mm::Unaligned`]**, and the
+//! reason is the Command Block Wrapper: USB BOT 1.0 §5.1 and §5.2 lay a CBW and
+//! a CSW out as bytes at fixed offsets, and neither is a structure a Rust ABI
+//! would produce. Nothing races those two reads and writes either — a CBW is
+//! written before the transfer naming it is enqueued and a CSW is read after
+//! `framed_phase` returned `Ok` — so the volatile discipline would be claiming
+//! an ordering the transport already provides. Everything else here moves whole
+//! buffers with `copy_from`/`copy_to`, which both disciplines share.
+//!
+//! `read_dma` and `write_dma`, the sweep's local four-caller wrappers for those
+//! two copies, are `Dma::copy_to` and `Dma::copy_from` now.
 
-/// Copy `dst.len()` bytes out of the DMA window at `off`.
-///
-/// **One reader instead of four.** `hold`, the read half of `transfer`,
-/// `request_sense` and `bring_up`'s `read_scratch` all spelled
-/// `copy_nonoverlapping(dma.ptr_at(off) as *const u8, out.as_mut_ptr(),
-/// out.len())` in an `unsafe` block of its own, with the bound stated nowhere;
-/// `subslice` asserts `off + dst.len() <= dma.size()` for all of them.
-fn read_dma(dma: &KernelSlice, off: usize, dst: &mut [u8]) {
-    let region = dma.subslice(off, dst.len());
-    // SAFETY: irreducible — `KernelSlice::as_slice` is an `unsafe fn` and there
-    // is no safe way to view DMA memory as bytes. Bounded by the `subslice`
-    // above. No aliasing `&mut` and no device write in flight: every caller is
-    // after a completed transfer (`scsi`/`bot` returned) or, in `hold`'s case,
-    // between the CBW and the data phase, and a device block is one device's —
-    // `MscDevice::block` indexes the pool's mass-storage blocks one to one.
-    dst.copy_from_slice(unsafe { region.as_slice() });
-}
-
-/// Copy `src` into the DMA window at `off`. The write half of [`read_dma`],
-/// and bounded the same way.
-fn write_dma(dma: &KernelSlice, off: usize, src: &[u8]) {
-    // SAFETY: irreducible — `KernelSlice::copy_from` is an `unsafe fn` and
-    // there is no safe way to put bytes into DMA memory. Bounded by
-    // `copy_from`, which asserts `off + src.len() <= dma.size()`. Exclusive:
-    // both callers write before the transfer naming the window is enqueued.
-    unsafe { dma.copy_from(off, src) }
-}
-
-
+use crate::mm::{Dma, Unaligned};
 
 use crate::log;
 use crate::scheduler::Operation;
@@ -309,7 +291,7 @@ mod transport_break {
 pub(in crate::drivers::xhci) mod short_read {
     use core::sync::atomic::{AtomicBool, Ordering};
 
-    use crate::mm::KernelSlice;
+    use crate::mm::Dma;
 
     /// How many bytes at the end of the buffer the controller is made not to
     /// have moved. One 512-byte sector out of the 4096 a block read asks for:
@@ -336,25 +318,25 @@ pub(in crate::drivers::xhci) mod short_read {
 
     /// Copy the last [`SHORT_BY`] bytes of the buffer at `at` out, if this is
     /// the transfer that was asked for.
-    pub fn hold(dma: &KernelSlice, at: usize, len: u32, eligible: bool) -> Option<Held> {
+    pub fn hold(dma: Dma<'static>, at: usize, len: u32, eligible: bool) -> Option<Held> {
         if !eligible || len < SHORT_BY || !ARMED.swap(false, Ordering::Relaxed) {
             return None;
         }
         let at = at + (len - SHORT_BY) as usize;
         let mut bytes = [0u8; SHORT_BY as usize];
-        super::read_dma(dma, at, &mut bytes);
+        dma.copy_to(at, &mut bytes);
         Some(Held { at, bytes })
     }
 
     /// Put it back, and add the bytes it covers to the controller's residue.
     pub fn release(
-        dma: &KernelSlice,
+        dma: Dma<'static>,
         held: Option<Held>,
         completion: Option<(u32, u32)>,
     ) -> Option<(u32, u32)> {
         let Some(held) = held else { return completion };
         let (code, residue) = completion?;
-        super::write_dma(dma, held.at, &held.bytes);
+        dma.copy_from(held.at, &held.bytes);
         Some((code, residue + SHORT_BY))
     }
 }
@@ -429,17 +411,19 @@ fn flush_sense() -> Option<(u8, u8, u8)> {
 /// **Because `dev.block` is a stack slot and it changed inside one call.** Two
 /// of the nine deaths of one storm arm are byte-identical —
 /// `KernelSlice OOB: offset=0xffff80007cae3310 size=0xd total=0x200000` out of
-/// `bot`'s status phase — and `0xd` is `CSW_LEN`, `0x200000` is the DMA pool, so
-/// the offset is `dev.block + MSC_CSW` and `block` was holding a **kernel text
-/// address**. The command phase twenty lines earlier had already subsliced the
-/// same field successfully, so the write landed during the wait.
+/// `bot`'s status phase (the wording is the bound this driver had before
+/// `mm::Dma`; the same refusal now reads `DMA: 13 byte(s) at … run past a region
+/// of …`) — and `0xd` is `CSW_LEN`, `0x200000` is the DMA pool, so the offset is
+/// `dev.block + MSC_CSW` and `block` was holding a **kernel text address**. The
+/// command phase twenty lines earlier had already narrowed the same field
+/// successfully, so the write landed during the wait.
 ///
 /// [`XhciController::with_storage`] copies the whole `Disk` out of
 /// `self.msc[at]` onto its own frame and writes it back afterwards, so the
 /// `&mut MscDevice` every phase holds points into **this task's kernel stack**,
 /// at a fixed depth, above the frames that are running. A mid-function text
 /// address landing there is a *return address*: something executed with that
-/// slot as its stack pointer. The `KernelSlice` bounds check is what noticed,
+/// slot as its stack pointer. The DMA bounds check is what noticed,
 /// and it notices far too late to say where — this says where, the moment the
 /// phase that waited comes back.
 #[cfg(feature = "stack-witness")]
@@ -640,7 +624,7 @@ impl XhciController {
             ];
 
             if let Host::From(src) = &host {
-                write_dma(&dma, dev.block + MSC_DATA, &src[offset..offset + bytes]);
+                dma.copy_from(dev.block + MSC_DATA, &src[offset..offset + bytes]);
             }
 
             match self.scsi(dev, &cdb, 10, data_phys, bytes as u32, !write, until) {
@@ -660,7 +644,7 @@ impl XhciController {
             }
 
             if let Host::Into(dst) = &mut host {
-                read_dma(&dma, dev.block + MSC_DATA, &mut dst[offset..offset + bytes]);
+                dma.copy_to(dev.block + MSC_DATA, &mut dst[offset..offset + bytes]);
             }
             done += batch;
         }
@@ -772,7 +756,7 @@ impl XhciController {
         match self.bot(dev, &cdb, 6, phys, 18, true) {
             Ok(Bot::Done { delivered }) if delivered >= 14 => {
                 let mut resp = [0u8; 18];
-                read_dma(&dma, dev.block + MSC_SCRATCH, &mut resp);
+                dma.copy_to(dev.block + MSC_SCRATCH, &mut resp);
                 (resp[2] & 0x0F, resp[12], resp[13])
             }
             _ => (0, 0, 0),
@@ -825,24 +809,20 @@ impl XhciController {
         let tag = dev.next_tag();
         #[cfg(feature = "stack-witness")]
         let entered_with = block_witness(dev);
-        let cbw = super::super::zero_dma(dma, dev.block + MSC_CBW, CBW_LEN as usize);
-        // SAFETY: irreducible — `KernelSlice::write`/`copy_from` are `unsafe
-        // fn`s and a Command Block Wrapper is bytes at fixed offsets (USB
-        // BOT 1.0 §5.1), so there is no safe form of writing one. Bounded by
-        // each `write`/`copy_from`, which assert against `CBW_LEN`: the last
-        // field ends at `15 + cdb_len` and `cdb_len <= 16` was asserted on
-        // entry, against a `CBW_LEN` of 31. Exclusive: the transfer naming this
-        // block has not been enqueued yet, and a device block belongs to one
-        // device.
-        unsafe {
-            cbw.write::<u32>(0, CBW_SIGNATURE.to_le());
-            cbw.write::<u32>(4, tag.to_le());
-            cbw.write::<u32>(8, data_len.to_le());
-            cbw.write::<u8>(12, if data_in { 0x80 } else { 0x00 });
-            cbw.write::<u8>(13, 0); // LUN 0: this driver binds one logical unit
-            cbw.write::<u8>(14, cdb_len);
-            cbw.copy_from(15, &cdb[..cdb_len as usize]);
-        }
+        // The unaligned discipline, and the file header says why. Bounded by
+        // each write against `CBW_LEN`: the last field ends at `15 + cdb_len`,
+        // `cdb_len <= 16` was asserted on entry, and `CBW_LEN` is 31. Exclusive:
+        // the transfer naming this block has not been enqueued yet, and a device
+        // block belongs to one device.
+        let cbw: Dma<'static, Unaligned> =
+            super::super::zero_dma(dma, dev.block + MSC_CBW, CBW_LEN as usize).unaligned();
+        cbw.write::<u32>(0, CBW_SIGNATURE.to_le());
+        cbw.write::<u32>(4, tag.to_le());
+        cbw.write::<u32>(8, data_len.to_le());
+        cbw.write::<u8>(12, if data_in { 0x80 } else { 0x00 });
+        cbw.write::<u8>(13, 0); // LUN 0: this driver binds one logical unit
+        cbw.write::<u8>(14, cdb_len);
+        cbw.copy_from(15, &cdb[..cdb_len as usize]);
 
         let cbw_phys = dma.phys() + (dev.block + MSC_CBW) as u64;
         self.framed_phase(dev, false, cbw_phys, CBW_LEN, "command")?;
@@ -857,14 +837,14 @@ impl XhciController {
             }
             #[cfg(feature = "boot-actuators")]
             let held = short_read::hold(
-                &dma,
+                dma,
                 (data_phys - dma.phys()) as usize,
                 data_len,
                 data_in && cdb.first() == Some(&0x28),
             );
             let completion = self.bulk(dev, data_in, data_phys, data_len);
             #[cfg(feature = "boot-actuators")]
-            let completion = short_read::release(&dma, held, completion);
+            let completion = short_read::release(dma, held, completion);
             match completion {
                 Some((CC_SUCCESS | CC_SHORT_PACKET, unmoved)) => {
                     moved = data_len.saturating_sub(unmoved);
@@ -900,22 +880,19 @@ impl XhciController {
 
         #[cfg(feature = "stack-witness")]
         block_witness_holds(dev, entered_with);
-        let csw = dma.subslice(dev.block + MSC_CSW, CSW_LEN as usize);
-        // SAFETY: irreducible — `KernelSlice::read` is an `unsafe fn` and a
-        // Command Status Wrapper is bytes at fixed offsets (USB BOT 1.0 §5.2).
-        // Bounded by each `read`, which asserts against the `CSW_LEN`-byte
-        // subslice; the last field is a `u8` at 12 of 13. The transfer has
-        // completed — `framed_phase` returned `Ok` above — so the device is not
-        // writing this block. Every number read here is the device's and is
-        // checked on the lines below, never believed.
-        let (signature, csw_tag, residue, status) = unsafe {
-            (
-                u32::from_le(csw.read::<u32>(0)),
-                u32::from_le(csw.read::<u32>(4)),
-                u32::from_le(csw.read::<u32>(8)),
-                csw.read::<u8>(12),
-            )
-        };
+        // The unaligned discipline again, for the CSW's half of the header's
+        // argument. Bounded by each read against the `CSW_LEN`-byte subview; the
+        // last field is a `u8` at 12 of 13. The transfer has completed —
+        // `framed_phase` returned `Ok` above — so the device is not writing this
+        // block. Every number read here is the device's and is checked on the
+        // lines below, never believed.
+        let csw = dma.subview(dev.block + MSC_CSW, CSW_LEN as usize).unaligned();
+        let (signature, csw_tag, residue, status) = (
+            u32::from_le(csw.read::<u32>(0)),
+            u32::from_le(csw.read::<u32>(4)),
+            u32::from_le(csw.read::<u32>(8)),
+            csw.read::<u8>(12),
+        );
         if signature != CSW_SIGNATURE {
             return Err(Broke::Csw { what: "signature", got: signature, want: CSW_SIGNATURE });
         }
@@ -1087,8 +1064,8 @@ pub(in crate::drivers::xhci) fn prepare(
 
     let (in_dci, out_dci) = (info.in_ep.dci(), info.out_ep.dci());
     let dma = ctrl.dma();
-    let in_ring = TrbRing::init(dma.subslice(block + MSC_IN_RING, PAGE));
-    let out_ring = TrbRing::init(dma.subslice(block + MSC_OUT_RING, PAGE));
+    let in_ring = TrbRing::init(dma.subview(block + MSC_IN_RING, PAGE));
+    let out_ring = TrbRing::init(dma.subview(block + MSC_OUT_RING, PAGE));
 
     let input_ctx = super::super::zero_dma(dma, OFF_INPUT_CTX, PAGE);
     ctrl.write_ctx32(input_ctx, 0, 1, 1 | (1u32 << in_dci) | (1u32 << out_dci));
@@ -1239,7 +1216,7 @@ fn bring_up(ctrl: &mut XhciController, dev: &mut MscDevice) -> bool {
         super::super::zero_dma(dma, dev.block + MSC_SCRATCH, MSC_SCRATCH_LEN);
         match ctrl.scsi(dev, cdb, cdb_len, scratch_phys, want, true, until) {
             Scsi::Ok { delivered } if delivered as usize >= out.len() => {
-                read_dma(&dma, dev.block + MSC_SCRATCH, out);
+                dma.copy_to(dev.block + MSC_SCRATCH, out);
                 true
             }
             Scsi::Refused { key, asc, ascq } => {
