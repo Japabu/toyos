@@ -4,16 +4,55 @@ use super::{cpu, percpu};
 use crate::log;
 use crate::time::{Budget, Delay, Duration, Floor};
 
-// x2APIC MSR addresses (base 0x800 + xAPIC_offset >> 4)
-const IA32_APIC_BASE_MSR: u32 = 0x1B;
-const X2APIC_ID: u32 = 0x802;
-const X2APIC_SVR: u32 = 0x80F;
-const X2APIC_EOI: u32 = 0x80B;
-const X2APIC_ICR: u32 = 0x830;
-const X2APIC_LVT_TIMER: u32 = 0x832;
-const X2APIC_TIMER_INIT: u32 = 0x838;
-const X2APIC_TIMER_CURRENT: u32 = 0x839;
-const X2APIC_TIMER_DIVIDE: u32 = 0x83E;
+/// The local APIC registers this file reads and writes, and the only MSRs it
+/// can name.
+///
+/// **The type is what makes [`Reg::write`] safe.** `cpu::wrmsr` is `unsafe`
+/// because its caller picks the register, and one wrong pick repoints
+/// `SYSCALL` (`IA32_LSTAR`), moves every `gs:` access in the kernel
+/// (`IA32_GS_BASE`) or turns bit 63 of every paging entry back into a reserved
+/// bit (`IA32_EFER.NXE`). This enum is that pick made once: every variant is an
+/// architectural local-APIC register that programs interrupt delivery and
+/// reaches no memory and no control transfer, so no value of it can make an
+/// access unsound. It is private to this module, so the closure is a property of
+/// the file rather than a rule a future caller has to remember — the discharge
+/// `mm::paging::activate_kernel` makes for `Cr3::activate`.
+///
+/// Addresses are x2APIC's: 0x800 plus the xAPIC MMIO offset shifted right four.
+/// `ApicBase` is not one of those — it is the architectural MSR that turns
+/// x2APIC on (SDM Vol. 3A §12.12.1).
+#[derive(Clone, Copy)]
+#[repr(u32)]
+enum Reg {
+    ApicBase = 0x1B,
+    Id = 0x802,
+    Eoi = 0x80B,
+    Svr = 0x80F,
+    Icr = 0x830,
+    LvtTimer = 0x832,
+    TimerInit = 0x838,
+    TimerCurrent = 0x839,
+    TimerDivide = 0x83E,
+}
+
+impl Reg {
+    #[inline]
+    fn read(self) -> u64 {
+        cpu::rdmsr(self as u32)
+    }
+
+    #[inline]
+    fn write(self, value: u64) {
+        // SAFETY: `cpu::wrmsr` asks its caller to own the MSR it names and the
+        // value it writes. `Reg` is the first half discharged by construction —
+        // the type's own doc comment argues why no variant of it can be the
+        // wrong register — and the second half is this module's: every value
+        // below is a local-APIC programming word built here from architectural
+        // field encodings, so a reserved-bit `#GP` would be a bug in this file
+        // and never in a caller's argument.
+        unsafe { cpu::wrmsr(self as u32, value) };
+    }
+}
 
 pub const TIMER_VECTOR: u8 = 0x20;
 
@@ -26,12 +65,12 @@ static X2APIC_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Enable x2APIC mode on this CPU. Sets global enable (bit 11) + x2APIC (bit 10)
 /// in IA32_APIC_BASE, then software-enables via SVR.
 fn enable_x2apic() {
-    let mut base = cpu::rdmsr(IA32_APIC_BASE_MSR);
+    let mut base = Reg::ApicBase.read();
     base |= (1 << 11) | (1 << 10);
-    cpu::wrmsr(IA32_APIC_BASE_MSR, base);
+    Reg::ApicBase.write(base);
 
-    let svr = cpu::rdmsr(X2APIC_SVR);
-    cpu::wrmsr(X2APIC_SVR, svr | (1 << 8) | 0xFF);
+    let svr = Reg::Svr.read();
+    Reg::Svr.write(svr | (1 << 8) | 0xFF);
 }
 
 /// Initialize the BSP's Local APIC in x2APIC mode.
@@ -47,24 +86,24 @@ pub fn init_ap() {
 }
 
 pub fn id() -> u32 {
-    cpu::rdmsr(X2APIC_ID) as u32
+    Reg::Id.read() as u32
 }
 
 /// Send INIT IPI to the specified APIC ID.
 pub fn send_init(apic_id: u32) {
     // ICR: destination in high 32 bits, 0x4500 = delivery INIT, level assert
-    cpu::wrmsr(X2APIC_ICR, ((apic_id as u64) << 32) | 0x4500);
+    Reg::Icr.write(((apic_id as u64) << 32) | 0x4500);
 }
 
 /// Send Startup IPI (SIPI) with the given vector (trampoline page number).
 pub fn send_sipi(apic_id: u32, vector: u8) {
-    cpu::wrmsr(X2APIC_ICR, ((apic_id as u64) << 32) | 0x4600 | vector as u64);
+    Reg::Icr.write(((apic_id as u64) << 32) | 0x4600 | vector as u64);
 }
 
 /// Send EOI.
 #[inline]
 pub fn eoi() {
-    cpu::wrmsr(X2APIC_EOI, 0);
+    Reg::Eoi.write(0);
 }
 
 /// Send an IPI to **this** CPU (self shorthand), for the one caller that needs
@@ -80,13 +119,13 @@ pub fn send_self(vector: u8) {
         return;
     }
     // Destination shorthand = self (0b01 << 18), fixed delivery, level assert.
-    cpu::wrmsr(X2APIC_ICR, 0x0004_4000 | vector as u64);
+    Reg::Icr.write(0x0004_4000 | vector as u64);
 }
 
 /// Send an IPI to all CPUs except self (shorthand destination).
 fn ipi_all_excluding_self(vector: u8) {
     // destination shorthand = all-excluding-self (0b11 << 18), fixed delivery
-    cpu::wrmsr(X2APIC_ICR, 0x000C_0000 | vector as u64);
+    Reg::Icr.write(0x000C_0000 | vector as u64);
 }
 
 /// Ask every other CPU to flush its TLB. The *asking* only — `arch::tlb` owns
@@ -106,7 +145,7 @@ pub(super) fn tlb_ipi() {
 pub fn kick_cpu(cpu_id: u32) {
     if !X2APIC_ENABLED.load(Ordering::Relaxed) { return; }
     let apic_id = crate::arch::smp::apic_id_for(cpu_id);
-    cpu::wrmsr(X2APIC_ICR, ((apic_id as u64) << 32) | 0x4000 | TIMER_VECTOR as u64);
+    Reg::Icr.write(((apic_id as u64) << 32) | 0x4000 | TIMER_VECTOR as u64);
 }
 
 /// Send an NMI to one CPU. Same targeted write as [`kick_cpu`] with delivery
@@ -122,7 +161,7 @@ pub fn kick_cpu(cpu_id: u32) {
 pub fn send_nmi(cpu_id: u32) {
     if !X2APIC_ENABLED.load(Ordering::Relaxed) { return; }
     let apic_id = crate::arch::smp::apic_id_for(cpu_id);
-    cpu::wrmsr(X2APIC_ICR, ((apic_id as u64) << 32) | 0x4400);
+    Reg::Icr.write(((apic_id as u64) << 32) | 0x4400);
 }
 
 /// How long a dying machine gives `/bin/logd` to put the report on `/log`.
@@ -303,7 +342,7 @@ fn wait_for_log_file() {
 pub fn halt_all_cpus() -> ! {
     wait_for_log_file();
     if X2APIC_ENABLED.load(Ordering::Relaxed) {
-        cpu::wrmsr(X2APIC_ICR, 0x000C_0000 | 0xFD);
+        Reg::Icr.write(0x000C_0000 | 0xFD);
     }
     // Before the flush, not after. Rendering consumes nothing and has no
     // unbounded loop, so putting it ahead of the proven channel costs the
@@ -334,11 +373,11 @@ pub fn halt_all_cpus() -> ! {
 /// Does not start the timer — the scheduler arms one-shot timers on demand.
 pub fn init_timer() {
     // Divide by 1 for maximum resolution
-    cpu::wrmsr(X2APIC_TIMER_DIVIDE, 0b1011);
+    Reg::TimerDivide.write(0b1011);
 
     // Masked one-shot mode for calibration
-    cpu::wrmsr(X2APIC_LVT_TIMER, 1 << 16);
-    cpu::wrmsr(X2APIC_TIMER_INIT, 0xFFFF_FFFF);
+    Reg::LvtTimer.write(1 << 16);
+    Reg::TimerInit.write(0xFFFF_FFFF);
 
     // The window the tick rate is counted over. Nothing expires: what elapses
     // is what is being measured.
@@ -350,11 +389,11 @@ pub fn init_timer() {
     while crate::clock::nanos_since_boot() - start < CALIBRATION.nanos() {}
     let elapsed = crate::clock::nanos_since_boot() - start;
 
-    let remaining = cpu::rdmsr(X2APIC_TIMER_CURRENT) as u32;
+    let remaining = Reg::TimerCurrent.read() as u32;
     let ticks_elapsed = 0xFFFF_FFFFu32.wrapping_sub(remaining);
     let ticks_10ms = (ticks_elapsed as u64 * 10_000_000 / elapsed) as u32;
 
-    cpu::wrmsr(X2APIC_TIMER_INIT, 0);
+    Reg::TimerInit.write(0);
     TIMER_TICKS.store(ticks_10ms, Ordering::Release);
     // Fallback for any Ring 0 fire before the scheduler arms its first quantum.
     percpu::set_last_armed_ticks(OneShot::ticks(ticks_10ms as u64).0);
@@ -387,7 +426,7 @@ const MIN_ONE_SHOT: Floor = Floor::policy(
 );
 
 /// A count the CPU can make progress under, and the only thing that reaches
-/// `X2APIC_TIMER_INIT` or `last_armed_ticks`.
+/// [`Reg::TimerInit`] or `last_armed_ticks`.
 ///
 /// The floor is in the constructor rather than at the three call sites because
 /// the assembly stub reloads the remembered count with no Rust in the path: an
@@ -412,12 +451,12 @@ impl OneShot {
 
     /// Program it, and remember it for the Ring 0 stub's reload.
     fn arm(self) {
-        cpu::wrmsr(X2APIC_TIMER_DIVIDE, 0b1011);
+        Reg::TimerDivide.write(0b1011);
         // An AP reaches its first idle before it has ever run a task, so before
         // this register has ever been written — and an LVT resets masked.
-        cpu::wrmsr(X2APIC_LVT_TIMER, TIMER_VECTOR as u64);
+        Reg::LvtTimer.write(TIMER_VECTOR as u64);
         percpu::set_last_armed_ticks(self.0);
-        cpu::wrmsr(X2APIC_TIMER_INIT, self.0 as u64);
+        Reg::TimerInit.write(self.0 as u64);
     }
 }
 
@@ -443,7 +482,7 @@ pub fn arm_within(nanos: u64) {
     let want = OneShot::after(nanos);
     // A running count never reaches zero without the fire that reloads it, so
     // zero is `stop_timer` and not an expiry an instant away.
-    let remaining = cpu::rdmsr(X2APIC_TIMER_CURRENT) as u32;
+    let remaining = Reg::TimerCurrent.read() as u32;
     let ticks = if remaining == 0 { want.0 } else { want.0.min(remaining) };
     OneShot::ticks(ticks as u64).arm();
 }
@@ -455,6 +494,6 @@ pub fn arm_within(nanos: u64) {
 /// [`OneShot`], because it is not an interval.
 pub fn stop_timer() {
     percpu::set_last_armed_ticks(0);
-    cpu::wrmsr(X2APIC_TIMER_INIT, 0);
+    Reg::TimerInit.write(0);
     crate::trace::trace(crate::trace::Kind::TimerStop, 0);
 }

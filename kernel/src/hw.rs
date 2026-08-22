@@ -682,6 +682,13 @@ impl Hw for KernelHw {
         // them from live Box-backed task records (or this CPU's own idle
         // context). A record is only freed by `release`, which runs in a later
         // pass — i.e. never while its context is the one being switched.
+        //
+        // `cpu::wrfsbase` asks its caller to own the FS base it installs, and
+        // this is the one place in the kernel that does: `incoming.fs_base` was
+        // either `rdfsbase`'d off this same register when that task was switched
+        // away (the line below), or built by `loader::tls` inside the task's own
+        // mapped TLS block — so it is canonical by construction, and the thread
+        // it belongs to is the one this switch is making current.
         unsafe {
             (*save).fs_base = cpu::rdfsbase();
             (*save).preempt = crate::preempt::count();

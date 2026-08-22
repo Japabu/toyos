@@ -1748,6 +1748,70 @@ fn check_fault_gates(result: &TestResult) -> bool {
     ok & check_symbols_were_read("fault_gates", &result.serial)
 }
 
+/// The guest asserts its children died; this asserts *what the kernel said* —
+/// and, harder, what it did not say.
+///
+/// **The absences are the half the exit code cannot carry.** Vector 1 used to
+/// reach a debugger-session aid that dumped registers, disarmed `DR7`/`DR6`,
+/// walked a backtrace and returned to resume, and a Ring 3 process reached it
+/// with one instruction. A kernel that put that handler back would still let
+/// `debug_trap`'s children die if some *later* instruction faulted, so the
+/// verdict has to be that the report is not in the window at all. `DOUBLE FAULT`
+/// is the other absence and it is not hypothetical: without `TF` in
+/// `IA32_FMASK`, `popfq` followed by `syscall` takes the `#DB` at
+/// `syscall_entry+0x0` with `rsp` still the user stack, and every CPU halts.
+fn check_debug_trap(result: &TestResult) -> bool {
+    if !check_rust_result(result) {
+        return false;
+    }
+
+    let mut ok = true;
+    // `crash_report_exception`'s default arm for a Ring 3 fault, with
+    // `vector_name(Vector::Debug)` after it. Matched as a whole line rather than
+    // as a substring, because the binary's own name carries the word `debug`.
+    let named = result
+        .serial
+        .lines()
+        .any(|l| l.contains("FATAL tid=") && l.trim_end().ends_with(": debug"));
+    if !named {
+        eprintln!(
+            "FAIL rs::debug_trap: no `FATAL tid=N: debug` line — the kernel ended the children \
+             but not as a #DB, so the vector reached somewhere else\nserial:\n{}",
+            result.serial
+        );
+        ok = false;
+    }
+
+    let absences: &[(&str, &str)] = &[
+        (
+            "DB TRAP",
+            "the #DB handler's UART marker is in the window: a Ring 3 trap reached a kernel \
+             report path",
+        ),
+        (
+            "HARDWARE WATCHPOINT",
+            "the watchpoint report is in the window: a Ring 3 trap made the kernel walk kernel \
+             state and resume",
+        ),
+        (
+            "DOUBLE FAULT",
+            "a Ring 3 debug trap escalated to #DF — the #DB frame was built on a stack the CPU \
+             could not write, which is `TF` missing from IA32_FMASK",
+        ),
+        (
+            "KERNEL PANIC",
+            "the kernel blamed itself for a trap a Ring 3 process raised",
+        ),
+    ];
+    for (needle, msg) in absences {
+        if result.serial.contains(needle) {
+            eprintln!("FAIL rs::debug_trap: {msg}\nserial:\n{}", result.serial);
+            ok = false;
+        }
+    }
+    ok
+}
+
 /// The clients `test_rs_null_sink_client_exits` runs in series, and so the
 /// number of removals soundd owes. One constant, because the wait below and the
 /// count above have to be the same number or the wait is for something else.
@@ -1808,6 +1872,7 @@ fn check_for(name: &str) -> fn(&TestResult) -> bool {
         "audio_idle_suspend" => check_audio_idle_suspend,
         "null_sink_client_exits" => check_null_sink_client_exits,
         "fault_gates" => check_fault_gates,
+        "debug_trap" => check_debug_trap,
         _ => check_rust_result,
     }
 }

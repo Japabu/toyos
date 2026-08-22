@@ -426,8 +426,20 @@ fn flush_ring0_timer_fires_to_trace() {
 ///
 /// The default arm is every other fault, and it is the one that decides on the
 /// saved CS: from Ring 3 the process dies named, from Ring 0 the kernel says so
-/// and halts. The three ahead of it are the exceptions that are not that —
-/// #DB resumes, and #DF and #MC are aborts with no instruction to return to.
+/// and halts. The two ahead of it are the exceptions that are not that — #DF
+/// and #MC are aborts with no instruction to return to.
+///
+/// **#DB is on the default arm and used to have one of its own.** Vector 1 is
+/// reachable from Ring 3 by two ordinary instruction sequences — `INT1`, which
+/// is not subject to `INT n`'s DPL check against the gate, and an `RFLAGS.TF`
+/// a `popfq` sets — so it is a userland bug like `#BP` and `#UD` and ends the
+/// process the same way. It used to reach a debugger-session aid that logged a
+/// register dump, disarmed `DR7`/`DR6` and *returned to resume*: a Ring 3 trap
+/// walked kernel state and then carried on, and with `TF` still set it did so
+/// once per instruction for as long as the process ran. Nothing arms a
+/// watchpoint in this kernel — `arch::debug`'s tools were deleted before this —
+/// so the handler had no other caller and went with them. The gate stays: a
+/// vector without one escalates to `#DF`, which halts the machine.
 extern "sysv64" fn trap_dispatch(frame: *mut TrapFrame) {
     #[cfg(feature = "df-witness")]
     crate::arch::cpu::df_witness("trap_dispatch");
@@ -439,7 +451,6 @@ extern "sysv64" fn trap_dispatch(frame: *mut TrapFrame) {
     // way a handler can write `rip`/`rsp` back for the `iretq`.
     let frame = unsafe { &mut *frame };
     match Vector::from_raw(frame.vector) {
-        Vector::Debug => exceptions::debug_handler(frame),
         Vector::DoubleFault => exceptions::double_fault_handler(frame),
         Vector::MachineCheck => exceptions::machine_check_handler(frame),
         Vector::PageFault => {
@@ -452,29 +463,45 @@ extern "sysv64" fn trap_dispatch(frame: *mut TrapFrame) {
 }
 
 /// Disable the legacy 8259 PIC.
+///
+/// The four ports at the top of this file are the pair's fixed architectural
+/// addresses and the only I/O ports this module names.
 fn disable_pic() {
-    outb(PIC1_CMD, 0x11);
-    io_wait();
-    outb(PIC2_CMD, 0x11);
-    io_wait();
+    // SAFETY: `outb` asks its caller to own the port and the byte it sends.
+    // Every port here is one of the 8259 pair's four, which no other device
+    // decodes on any machine this kernel targets; the bytes are the documented
+    // ICW1..ICW4 initialisation followed by `0xFF` in both mask registers, which
+    // silences the device rather than arming it, and none of them reaches memory.
+    //
+    // **One block, because the sequence is the safety argument.** A PIC left
+    // half-initialised keeps delivering its power-on vectors — 8..15 and 112..119
+    // — into an IDT whose gates at those numbers belong to `#DF`, `#GP`, `#PF`
+    // and the rest, and there is no point between these writes where that is a
+    // state the machine may be left in.
+    unsafe {
+        outb(PIC1_CMD, 0x11);
+        io_wait();
+        outb(PIC2_CMD, 0x11);
+        io_wait();
 
-    outb(PIC1_DATA, 32);
-    io_wait();
-    outb(PIC2_DATA, 40);
-    io_wait();
+        outb(PIC1_DATA, 32);
+        io_wait();
+        outb(PIC2_DATA, 40);
+        io_wait();
 
-    outb(PIC1_DATA, 4);
-    io_wait();
-    outb(PIC2_DATA, 2);
-    io_wait();
+        outb(PIC1_DATA, 4);
+        io_wait();
+        outb(PIC2_DATA, 2);
+        io_wait();
 
-    outb(PIC1_DATA, 0x01);
-    io_wait();
-    outb(PIC2_DATA, 0x01);
-    io_wait();
+        outb(PIC1_DATA, 0x01);
+        io_wait();
+        outb(PIC2_DATA, 0x01);
+        io_wait();
 
-    outb(PIC1_DATA, 0xFF);
-    outb(PIC2_DATA, 0xFF);
+        outb(PIC1_DATA, 0xFF);
+        outb(PIC2_DATA, 0xFF);
+    }
 }
 
 pub fn init() {
