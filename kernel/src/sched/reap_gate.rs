@@ -3,12 +3,20 @@
 //! `scheduler::reap_poisoned` used to take `PROCESS_TABLE` unconditionally, on
 //! every trip round the idle loop, whether or not there was anything in it to
 //! reap — and on a machine with nothing to run that is every CPU, continuously.
-//! The crash report's `process::with_user_symbols` reads the same table through
-//! a `try_lock` it must not block on, so the housekeeping was a standing
-//! aggressor against the one reader that cannot wait: a fault taken while some
-//! CPU sat between the top of the loop and its `pass` lost the faulting
-//! function's name to a lock that was merely held. This gate is what makes the
-//! common case — nothing to reap — cost no lock at all.
+//! The crash report reads the same table through a `try_lock` it must not block
+//! on, so the housekeeping was a standing aggressor against the one reader that
+//! cannot wait: a fault taken while some CPU sat between the top of the loop and
+//! its `pass` lost the faulting function's name to a lock that was merely held.
+//! This gate is what makes the common case — nothing to reap — cost no lock at
+//! all.
+//!
+//! The name went a second way as well, and this gate was never going to reach
+//! it: the table's other takers — every spawn, every demand-paged fault, every
+//! exit — are work rather than housekeeping, and a report that raced one of
+//! those lost the symbol just the same. Since 2026-08-22 a report reads its
+//! symbols off the running task instead (`process::resolve_user_symbol`), so
+//! what is left here is `process::dump_crash_diagnostics`, which still asks the
+//! table for the faulting process's page-fault trace.
 //!
 //! Pure, and deliberately free of any `crate::` reference: `kernel-loom/`
 //! compiles this file with `feature = "loom"` on, so the models below drive the

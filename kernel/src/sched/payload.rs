@@ -23,6 +23,7 @@ use crate::completion::{Inbox, Watch};
 use crate::mm::paging::Cr3;
 use crate::scheduler::OperationSlot;
 use crate::process::{OwnedAlloc, PageTables, ProcessAccounting, TaskId};
+use crate::symbols::SymbolTable;
 use crate::sync::Lock;
 
 /// The environment's small shared cell. The kernel's `Lock` already raises the
@@ -93,6 +94,27 @@ pub struct KernelPayload {
     /// The cross-CPU-readable face of this task. A `CpuSched` is `!Sync`, so a
     /// remote `ps` cannot walk it; what it can read is here.
     pub handle: Arc<TaskHandle>,
+    /// This task's process's symbol table — every thread of a process carries a
+    /// clone of the one `Arc` its [`ProcessEntry`] holds.
+    ///
+    /// **Here so that a crash report never has to ask the process table for a
+    /// name.** The report runs on the CPU whose task faulted, and this is that
+    /// task's own; `driver::current_symbols` is the read and
+    /// `process::resolve_user_symbol` is the whole of what asks. A `pid` plus a
+    /// table walk was the shape before, and the walk was a `try_lock` that could
+    /// only ever lose — every spawn, every demand-paged fault and every exit in
+    /// the machine takes that lock, so a report that raced one printed a bare
+    /// address for a symbol its own backtrace named a line later.
+    ///
+    /// **On the payload and not on the [`TaskHandle`]** even though the handle
+    /// is the other thing a running task carries: the handle outlives the task
+    /// — the process table keeps one in every [`ThreadSched`] until the entry is
+    /// reaped — and these are megabytes of the process's own pages. The payload
+    /// is released by `Hw::release`, after the task is off every CPU, which is
+    /// exactly the last instant a report on it could still be reading.
+    ///
+    /// [`ProcessEntry`]: crate::process::ProcessEntry
+    pub symbols: Arc<SymbolTable>,
 }
 
 impl SchedPayload for KernelPayload {
