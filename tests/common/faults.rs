@@ -530,6 +530,13 @@ fn storm(
         rust_bins,
         BootOptions {
             kernel_params: params,
+            // `double_fault_stack`'s profile and for its reason: on Metal the
+            // 16550 *is* the console, so `serial::panic_raw`'s bytes and the
+            // ordinary log stream arrive on one channel and one reader sees
+            // both. The nested-NMI report is a raw write — that handler may not
+            // reach the log ring at all (`arch::idt::nmi`) — so on any other
+            // profile it lands on a UART nothing here is reading.
+            profile: qemu::Profile::Metal,
             // Four, so that the scheduler has somewhere to put the spinner that
             // is not the CPU whose idle loop does the storming.
             smp: 4,

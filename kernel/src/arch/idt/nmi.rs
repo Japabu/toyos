@@ -58,6 +58,10 @@
 //! [`nested_nmi`], which reports straight to the UART and halts the machine.
 //! Silent corruption of the one diagnostic that answers a wedged CPU is worth
 //! less than a machine that stops and says so.
+//!
+//! **Neither path here may `log!`, and the dying one no more than the ordinary
+//! one** — the reason is the shard and not the severity, and it is the whole of
+//! `src/sourcegate.rs`'s `nmi_does_not_log`.
 
 use core::arch::naked_asm;
 
@@ -158,27 +162,28 @@ extern "sysv64" fn note(rip: u64, cs: u64, rsp: u64) {
 
 /// A second NMI on a stack the first is still standing on.
 ///
-/// **The UART first and the ring second, and the order is the argument.**
+/// **Straight to the UART, and to nothing else — this path may not log either.**
+/// The rule the module header states does not relax because the machine is
+/// dying: the context this NMI interrupted may be between its own reservation's
+/// `xadd` and its body publication, so a record emitted from here would take a
+/// newer generation of the same shard slot and garble the very ring
+/// `halt_all_cpus` is about to paint. `src/sourcegate.rs`'s `nmi_does_not_log`
+/// is the gate, and it caught exactly that on the first draft of this function.
+///
 /// `panic_raw` is an `outb` loop with no lock in it, so it cannot be blocked by
-/// whatever the two interrupted contexts were holding — and it reaches a machine
-/// with a 16550, which is the T14's shape and the diagnostic boot's. The `log!`
-/// after it is what puts the same sentence on the console and on the panel of a
-/// machine that has neither; by the time it runs the report is already out, so a
-/// ring that wedges costs the evidence nothing. It is allowed to log at all
-/// because a halt follows it, which is `kernel/CLAUDE.md`'s condition.
+/// whatever either interrupted context was holding. The cost is that a machine
+/// with no 16550 — the T14 as the owner flashes it — halts here with the panel
+/// showing whatever the ring already had. That is the honest trade: this path is
+/// unreachable in a correct kernel, and the alternative is corrupting the report
+/// on every machine to have a sentence on one.
 extern "sysv64" fn nested_nmi(rip: u64, rsp: u64) -> ! {
-    let cpu = crate::arch::percpu::cpu_id();
     let serial = crate::drivers::serial::panic_raw;
     serial(b"\n[nmi] NESTED NMI on cpu ");
-    crate::drivers::serial::panic_raw_dec(u64::from(cpu));
+    crate::drivers::serial::panic_raw_dec(u64::from(crate::arch::percpu::cpu_id()));
     serial(b": a second NMI entered while IST2 was still in use.\n[nmi]   rip=");
     crate::drivers::serial::panic_raw_hex(rip);
     serial(b" rsp=");
     crate::drivers::serial::panic_raw_hex(rsp);
     serial(b"\n[nmi]   the outer handler's frame is gone; the machine stops here.\n");
-    crate::log!(
-        "NESTED NMI on cpu {cpu}: a second NMI entered while IST2 was still in use, \
-         rip={rip:#018x} rsp={rsp:#018x} — the outer handler's frame is gone"
-    );
     crate::arch::apic::halt_all_cpus()
 }
