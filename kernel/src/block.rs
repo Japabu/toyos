@@ -30,15 +30,31 @@ pub type DeviceId = u32;
 /// **2 s, and the derivation is two terms.** Below: one whole
 /// `USB_TIMEOUT_NS`, so a caller that has spent more than a single transfer's
 /// entire allowance on commands that are *completing* is talking to a device
-/// too slow to serve, and no healthy device can reach it. Above: the refusal is
+/// too slow to serve. Above: the refusal is
 /// taken between commands and never inside one, so the overshoot is the command
 /// in flight — one more transfer bound at worst — and `2 + 2` leaves a second
 /// of the daemon's 5 s for it to notice with.
+///
+/// **What the derivation does not cover, and this doc used to claim it did.**
+/// The clock is [`crate::clock::now`], which is the TSC, and a TCG guest's TSC
+/// advances with the *host's* real time; [`begin_operation`] is also called
+/// above the `XHCI` ticket lock, so lock-wait and any host descheduling of the
+/// vCPU thread are charged to this budget. A healthy device therefore can reach
+/// it — the same is now recorded one layer down for `USB_TIMEOUT_NS` — and what
+/// the caller is told when it does is the sentence below.
 ///
 /// **A [`Budget`] and not a [`crate::time::Tripwire`]**: expiry is a degraded
 /// answer, named. The operation is refused, the device is *not* marked failed —
 /// nothing was in flight when the refusal was taken — and the caller gets the
 /// `Err` every other refused transfer produces.
+///
+/// **That last clause is a defect and not a design**, and it is where this
+/// budget's cost lands. `/bin/logd` gives its volume up permanently on any `Err`
+/// from `SYS_FSYNC` and keeps it across a slow one, because "busy" and "gone"
+/// want different answers — and the whole path from [`BlockError`] up flattens
+/// them into one `SyscallError::Io`, so it cannot.
+/// `issues/boot-media/fsync-on-log-returns-other-under-a-loaded-host.md` carries
+/// the reading and what a second bit would cost.
 pub const OPERATION: Budget = Budget::of(
     Duration::from_secs(2),
     "the block-device operation is refused with an I/O error, and the caller's \

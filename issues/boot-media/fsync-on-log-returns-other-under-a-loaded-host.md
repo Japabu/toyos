@@ -39,14 +39,156 @@ busy, then either the error is spurious and `logd` ends a boot's log for nothing
 or it is real and a durability claim has a load-dependent hole. `Kind(Other)`
 does not say which.
 
-The measurement to take: the path from `sync_all` through `object/ops.rs`'s
-`fsync` to the FAT32 adapter's flush, asking which layer manufactures the error
-and whether any deadline in it is a wall-clock one — a deadline sized on an
-unloaded host is exactly what a 1.56x-width run breaks. `usb-slow-device` (kernel
-feature) already stages a slowed device round trip and is where the negative
-control lives.
-
 Not caused by the change it was seen on: `02a087fd` moves three tier
 declarations and one validator constant, and touches no kernel, driver,
 filesystem or SDK code at all. It did change the fast partition's composition
 (272 tests rather than 275), which changes what runs beside what.
+
+## The device under `/log` in this test, established by reading
+
+`esp_filesystem` boots `Profile::Metal` (`tests/common/volumes.rs:286-295`),
+whose `Shape` sets `storage_bus: "xhci.0"` (`tests/common/qemu.rs:1381`), and the
+boot image is attached as `usb-storage,bus=xhci.0` (`:3062-3066`). So `/boot` and
+`/log` are **USB mass storage over xHCI**, not NVMe and not virtio: the flush is
+SCSI SYNCHRONIZE CACHE (10), opcode `0x35`, issued at
+`kernel/src/drivers/xhci/wait/msc.rs:551`. `virtio` is `Absent` in this shape and
+the NVMe namespace is a separate scratch disk.
+
+## What `Kind(Other)` can mean here
+
+`rust/library/std/src/sys/fs/toyos.rs:13-24` names six `SyscallError` variants
+and sends *everything else* to `io::ErrorKind::Other`. Of the five it does not
+name — `Unknown`, `BadAddress`, `NotSupported`, `Io`, `Gone` — only
+`SyscallError::Io` is reachable on the fsync path. So the sighting's
+`Kind(Other)` is `SyscallError::Io` and nothing else: a **device or volume I/O
+refusal**, never a refused input (`InvalidArgument`/`PermissionDenied`/`NotFound`
+all have their own kinds) and never resource exhaustion (`ResourceExhausted` maps
+to `OutOfMemory`).
+
+## Every error site on the path, and what kind each is
+
+`(a)` wall-clock or tick-count deadline · `(b)` device status · `(c)` refused
+input · `(d)` resource exhaustion. Read-only frames marked *sysroot*.
+
+| site | what refuses | kind |
+|---|---|---|
+| `rust/library/std/src/sys/fs/toyos.rs:297,236-238` | `sync_all` → `File::fsync` → `syscall::fsync`, mapped by `to_io_error` (*sysroot*) | — |
+| `rust/library/std/src/sys/fs/toyos.rs:13-24` | flattens `Io` (and four others) to `Kind(Other)` (*sysroot*) | — |
+| `kernel/src/arch/syscall.rs:337` | handle is not one, or lacks `Rights::WRITE` | (c) |
+| `kernel/src/object/ops.rs:606-608` | the object is not a `File` → `PermissionDenied` | (c) |
+| `kernel/src/object/ops.rs:619-621` | `vfs.flush_file` refused | pass-through |
+| `kernel/src/object/ops.rs:627-629` | `vfs.sync_for_path` refused | pass-through |
+| `kernel/src/vfs.rs:523,525` | empty mount or empty fs path → `InvalidArgument` | (c) |
+| `kernel/src/vfs.rs:524` | `resolve_fs` found nothing → `NotFound` | (c) |
+| `kernel/src/vfs.rs:545` | `fs.write_page` refused (one call per dirty page; the blob is eleven) | pass-through |
+| `kernel/src/vfs.rs:551` | `fs.update_metadata` refused | pass-through |
+| `kernel/src/vfs.rs:683` | `sync_mount` on a name that is not mounted → `NotFound` | (c) |
+| `kernel/src/vfs.rs:713-726` | `sync_for_path` → `sync_mount`, or the root's `sync` | pass-through |
+| `kernel/src/fat32_adapter.rs:751,777` | no open-file record for the `FileId` → `NotFound` (kernel invariant) | (c) |
+| `kernel/src/fat32_adapter.rs:752-755` | `Fat32::write` refused | pass-through |
+| `kernel/src/fat32_adapter.rs:779-783` | `set_len` / `flush_meta` refused | pass-through |
+| `kernel/src/fat32_adapter.rs:810-812` | `Fat32::sync` refused — deliberately unlogged, so this one leaves no line | pass-through |
+| `kernel/src/fat32_adapter.rs:549-569` | `as_syscall_error`: `Io`/`NotFat32`/`Truncated`/`CorruptChain`/`CorruptDirectory` → `Io`; `NoSpace`/`TooLarge`/`LimitExceeded` → `ResourceExhausted`; the rest → `InvalidArgument` | (b)/(d)/(c) |
+| `toyos-fat32/src/fs.rs:901-910` | `Fat32::sync`: the FSInfo write, then `dev.flush()` | pass-through |
+| `toyos-fat32/src/fs.rs:193,468,524` | a `scratch`/slice bound → `Error::Io` — a kernel invariant reported as a device fact | (c) *misreported as (b)* |
+| `toyos-fat32/src/error.rs:46-49` | `From<IoError> for Error` → `Error::Io`: every device refusal becomes one word here | (b) |
+| `kernel/src/fat32_adapter.rs:203-208` | `locate`: the request leaves the partition → `IoError` | (c) |
+| `kernel/src/fat32_adapter.rs:337-338,353-354,357-359` | the volume slot is empty → `IoError` | (c) |
+| `kernel/src/fat32_adapter.rs:339-348` | `fat-backing-read-fails` actuator (reads only) | injected |
+| `kernel/src/fat32_adapter.rs:223,263,289,299,359` | `read_blocks`/`write_blocks`/`flush` refused | pass-through |
+| **`kernel/src/block.rs:42-46,61-63`** | **`OPERATION` — 2 s, `Deadline::at(clock::now() + 2 s)`** | **(a)** |
+| `kernel/src/drivers/usb_storage.rs:104-129` | the three trait methods; each opens a fresh 2 s budget **before** `xhci::storage_*` takes the `XHCI` ticket lock | (a) composition |
+| `kernel/src/drivers/xhci/mod.rs:2054-2066` | `with_disk`: `XHCI.lock()`, then no disk under that index → `None` → `false` | (b) |
+| `kernel/src/drivers/xhci/wait/msc.rs:546-548` | `dev.failed` — a disk recovery already gave up on | (b) |
+| `kernel/src/drivers/xhci/wait/msc.rs:553-556,571-578` | `flush_sense()` actuators; `Scsi::Refused` → `log_refusal` → `false` | (b) |
+| `kernel/src/drivers/xhci/wait/msc.rs:607-613` | `lba + count` past the disk's block count | (c) |
+| `kernel/src/drivers/xhci/wait/msc.rs:646-660` | short transfer, `Scsi::Refused`, `Scsi::Broken` | (b) |
+| **`kernel/src/drivers/xhci/wait/msc.rs:723-728`** | **`until.reached(clock::now())` → `Scsi::Broken`, `block::OPERATION`'s 2 s** | **(a)** |
+| `kernel/src/drivers/xhci/wait/msc.rs:741-747` | `reset_recovery` failed → `dev.failed = true` | (b) |
+| `kernel/src/drivers/xhci/wait/msc.rs:751-753` | `MAX_TRANSPORT_ATTEMPTS` (3) exhausted | (b), each attempt's break may be (a) |
+| `kernel/src/drivers/xhci/wait/msc.rs:799-807` | `framed_phase`: `Short`, `Code`, `Silence` | (b), `Silence` is (a) |
+| `kernel/src/drivers/xhci/wait/msc.rs:919-938` | CSW signature, tag, residue, phase error | (b) |
+| **`kernel/src/drivers/xhci/wait/mod.rs:363-375`** | **`wait_transfer`: `USB_TIMEOUT_NS`, 2 s (`xhci/mod.rs:376,383`)** | **(a)** |
+| `kernel/src/drivers/xhci/wait/mod.rs:384-386` | the port reads disconnected → `None` | (b) |
+
+Two `(a)` deadlines, both 2 s, and **both are host wall clock**:
+`kernel/src/clock.rs:103-117`'s `nanos_since_boot` is the TSC, and a TCG guest's
+TSC advances with the host's real time rather than with the guest's work. Nothing
+on this path is bounded by operation count or by guest ticks.
+
+## Where the deadlines are paid, and what a loaded host does to them
+
+`kernel/src/drivers/usb_storage.rs:123` opens the 2 s budget and *then*
+`xhci::storage_flush` takes the `XHCI` ticket lock
+(`kernel/src/drivers/xhci/mod.rs:2055`), so `XHCI` lock-wait and any host
+descheduling of the vCPU thread are charged to the *device's* budget. This is the
+composition `issues/audio/disk-wait-pins-a-cpu.md` measures from the other side:
+four ticket spinlocks deep, preemption off, for the whole round trip.
+
+**A live device has already been recorded reaching one of these bounds.**
+`issues/hardware/usb-transport-break-counts-the-boot-sticks-recovery.md` carries
+the log, on a host measured at 2.30x width, of the boot stick's *own* flush:
+
+    [kernel 2.616 cpu0] usb-storage: transport broke on SCSI 0x35: no answer in the status phase in 2000 ms
+    [kernel 2.896 cpu0] usb-storage: SCSI 0x35 completed on attempt 2
+
+Same opcode, same device class, same partition — `USB_TIMEOUT_NS` breached on the
+status phase of SYNCHRONIZE CACHE by a stick that answered the identical command
+280 ms later. `MAX_TRANSPORT_ATTEMPTS` is 3
+(`kernel/src/drivers/xhci/wait/msc.rs:87`), so that run was one recovery short of
+this issue's failure. That falsifies the constant's own claim that "nothing but a
+dead device can reach it".
+
+## What a spurious refusal costs
+
+`/bin/logd` treats any `Err` from `sync_all` as final: `userland/logd/src/main.rs:274-286`
+sets `volume = None` and the boot's log is console-only from that point, for the
+rest of the boot. `LOG_WRITE_BUDGET` (`:123`, 5 s) is explicitly *not* the policy
+for errors — its own doc says "an **error** ends it at once" — and it bounds only
+the case where the calls succeed slowly. So logd is written to tell "busy" from
+"gone" and the kernel gives it one word for both.
+
+## What was measured, 2026-08-22, dev host
+
+- `usb-slow-device` (2 ms per mass-storage bulk completion,
+  `kernel/src/drivers/xhci/mod.rs:1208-1242`) **does not stage this**. Armed on
+  the `esp_filesystem` path it is `PASS esp_filesystem (3s)` at 1.53x width. The
+  arithmetic says why: `msc_flush` is one SCSI command, three bulk transfers,
+  6 ms — three orders of magnitude under either 2 s bound. The negative control
+  the first draft of this file named is the wrong instrument for it.
+- `usb-flush-fails` (SCSI sense `0x04/0x44/0x00` on `0x35`) **does** stage the
+  userland symptom exactly: `fsync the blob: Kind(Other)` at
+  `src/bin/esp_files.rs:130:22`, `ALONE esp_filesystem: red again`. So the
+  observed panic is one `SyscallError::Io` from the flush and nothing narrower.
+- The deadline branch is the *same* value by construction, not by experiment:
+  `msc.rs:727` returns `Scsi::Broken` and `msc.rs:571-578` maps `Scsi::Broken`
+  and a transport failure to the identical `false`. A budget refusal — which
+  `kernel/src/block.rs:38-41` says is "a degraded answer" that does not mark the
+  device failed — and a stick that cannot flush are indistinguishable from
+  `FatFs::sync` upwards.
+- Baseline `esp_filesystem` alone: green at 1.56x, 1.53x, 1.49x and 1.48x width,
+  i.e. at the sighting's own width. `toyos-fat32-check` is silent on the volume
+  before and after every one of those boots.
+
+## What is owed
+
+1. **The two `(a)` bounds are host wall clock and are documented as unreachable
+   by a live device.** The tree has nothing to convert them *to* — every other
+   bounded wait in it is `clock::settles` on the same TSC — and for real hardware
+   a time bound is the correct bound, so this is not a "replace the clock" fix.
+   What is wrong is that the refusal is *reported as a device failure*.
+2. **`BlockError` is one bit and a budget refusal is not a device fact.**
+   `kernel/src/block.rs:65-84` argues for one bit on the ground that "above this
+   trait there is exactly one thing to do with the answer" — which is false for
+   the one consumer that matters: logd retries nothing on an error and gives up
+   permanently, but would keep the volume for a refusal that means "your budget,
+   not this stick". The ABI already has the word and needs no change:
+   `SyscallError::WouldBlock`, which `rust/library/std/src/sys/fs/toyos.rs:19`
+   already maps to `io::ErrorKind::WouldBlock`. Threading it costs a variant in
+   `BlockError`, in `toyos-fat32`'s `IoError`/`Error`, and one arm in
+   `as_syscall_error` — three crates, one of them the pure FAT32 crate, against a
+   documented decision. **Owner's call, not an agent's.**
+3. `Broke::Silence`'s `Display` (`kernel/src/drivers/xhci/wait/msc.rs:233-237`)
+   says "no answer in the {phase} phase in 2000 ms" on both exits from
+   `wait_transfer` — including `wait/mod.rs:384-386`, where the port read
+   disconnected and no 2000 ms elapsed. A pulled stick is logged as a timeout.
