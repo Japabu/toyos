@@ -1,0 +1,17 @@
+# A member of the host workspace (root `Cargo.toml`), like toyos-userbound,
+# toyos-untrusted and toyos-pci: it is pure, it has no dependencies, and its
+# tests run on the host.
+#
+# What lives here is where a typed access into a DMA region lands and whether it
+# may land there. The kernel's `mm::Dma` is the only caller; it is a crate
+# rather than a private function in `kernel/src/mm/dma.rs` because the whole
+# table below costs milliseconds on the host and a boot in a guest, and because
+# a bound that panics in the kernel cannot be asked a question — it can only be
+# survived.
+
+[package]
+name = "toyos-dma"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false

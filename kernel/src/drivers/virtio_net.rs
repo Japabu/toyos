@@ -5,10 +5,9 @@ use super::virtio::{BufDir, DescSlot, Virtqueue, VirtqueueRegions, VirtioDevice,
 use super::DmaPool;
 use crate::mm::paging::CachePolicy;
 use crate::log;
-use crate::mm::KernelSlice;
+use crate::mm::Dma;
 use crate::net::NicInfo;
 use crate::object::shm::Region;
-use crate::sync::Lock;
 use toyos_abi::syscall::SyscallError;
 
 const VIRTIO_VENDOR: u16 = 0x1AF4;
@@ -37,21 +36,20 @@ const DMA_SIZE: usize       = OFF_TX_BUF + TX_BUF_LEN;
 
 const VIRTIO_NET_VECTOR: u8 = 0x22;
 
-static DMA: Lock<Option<DmaPool>> = Lock::new(None);
-
-fn dma() -> KernelSlice {
-    DMA.lock().as_ref().unwrap().slice()
-}
-
-/// **The RX buffers are `KernelSlice`s and not raw pointers, and that is what
-/// deleted this type's `unsafe impl Send`.** A `KernelSlice` knows its own
-/// physical address and its own length, so `rx_phys` went with the pointers.
+/// **The RX buffers are [`Dma`] views and not raw pointers, and that is what
+/// deleted this type's `unsafe impl Send`.** A view knows its own physical
+/// address and its own length, so `rx_phys` went with the pointers.
+///
+/// `'static` because the pool is leaked at `init`: a NIC this kernel has bound
+/// is bound for the boot, its RX buffers are mapped into `netd`, and the
+/// `static Lock<Option<DmaPool>>` that used to hold the pages alive said all
+/// that only by existing.
 struct VirtioNic {
     device: VirtioDevice,
-    rxq: Virtqueue,
-    txq: Virtqueue,
+    rxq: Virtqueue<'static>,
+    txq: Virtqueue<'static>,
     tx_phys: u64,
-    rx_bufs: [KernelSlice; RX_BUF_COUNT],
+    rx_bufs: [Dma<'static>; RX_BUF_COUNT],
     // Maps virtqueue descriptor index -> rx_bufs index
     desc_to_buf: [u16; RX_QUEUE_SIZE as usize],
     /// The RX queue's refusal count as of the last line this driver wrote
@@ -68,14 +66,12 @@ struct VirtioNic {
 
 impl VirtioNic {
     fn refill_rx(&mut self, buf_idx: usize, slot: DescSlot) {
-        // SAFETY: irreducible — `KernelSlice::zero` is an `unsafe fn` and there
-        // is no safe way to clear DMA memory. Bounded by construction: the
-        // subslice is exactly `NET_HDR_SIZE` bytes at the front of a
-        // `RX_BUF_SIZE` buffer, and `subslice` asserts that. Exclusive: this
-        // runs before the descriptor is handed back to the device, so nothing
-        // is writing the buffer, and `buf_idx` came from `desc_to_buf`, whose
-        // every entry `poll_used` bounded to this queue.
-        unsafe { self.rx_bufs[buf_idx].subslice(0, NET_HDR_SIZE).zero() };
+        // Bounded by construction: the subview is exactly `NET_HDR_SIZE` bytes
+        // at the front of a `RX_BUF_SIZE` buffer. This runs before the
+        // descriptor is handed back to the device, so nothing is writing the
+        // buffer, and `buf_idx` came from `desc_to_buf`, whose every entry
+        // `poll_used` bounded to this queue.
+        self.rx_bufs[buf_idx].subview(0, NET_HDR_SIZE).zero();
         let desc_id = self.rxq.submit(
             slot,
             &[(self.rx_bufs[buf_idx].phys(), RX_BUF_SIZE, BufDir::Writable)],
@@ -182,23 +178,24 @@ pub fn init(devices: &[PciDevice]) {
         }
     };
     log!("VirtIO net: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
-    *DMA.lock() = Some(DmaPool::alloc(DMA_SIZE));
-    let dma = dma();
+    // Leaked rather than held in a `static`: this NIC is never unbound and its
+    // RX window is handed to `netd`, so the pages outlive every scope by design.
+    let dma = DmaPool::alloc(DMA_SIZE).leak();
     pci_dev.enable_bus_master();
 
     let device = VirtioDevice::init(&pci_dev, VIRTIO_F_VERSION_1 | VIRTIO_NET_F_MAC);
 
     // RX queue: 256 entries, separate pages for desc/avail/used
     let rxq_regions = VirtqueueRegions::from_separate(
-        dma.subslice(OFF_RXQ_DESC, 0x1000),
-        dma.subslice(OFF_RXQ_AVAIL, 0x1000),
-        dma.subslice(OFF_RXQ_USED, 0x1000),
+        dma.subview(OFF_RXQ_DESC, 0x1000),
+        dma.subview(OFF_RXQ_AVAIL, 0x1000),
+        dma.subview(OFF_RXQ_USED, 0x1000),
         RX_QUEUE_SIZE,
     );
     let mut rxq = Virtqueue::from_regions(&rxq_regions, RX_QUEUE_SIZE);
 
     // TX queue: 16 entries, fits in one page
-    let mut txq = Virtqueue::new(dma.subslice(OFF_TXQ, 0x1000), 16);
+    let mut txq = Virtqueue::new(dma.subview(OFF_TXQ, 0x1000), 16);
 
     device.setup_queue(RX_QUEUE, &mut rxq);
     device.setup_queue(TX_QUEUE, &mut txq);
@@ -217,8 +214,8 @@ pub fn init(devices: &[PciDevice]) {
     log!("VirtIO net: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-    let rx_bufs: [KernelSlice; RX_BUF_COUNT] =
-        core::array::from_fn(|i| dma.subslice(OFF_RX_BUFS + i * 0x1000, RX_BUF_SIZE as usize));
+    let rx_bufs: [Dma<'static>; RX_BUF_COUNT] =
+        core::array::from_fn(|i| dma.subview(OFF_RX_BUFS + i * 0x1000, RX_BUF_SIZE as usize));
     let tx_phys = dma.phys() + OFF_TX_BUF as u64;
 
     let dma_base_phys = dma.phys() & !(crate::mm::PAGE_2M - 1);

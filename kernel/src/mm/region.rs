@@ -1,5 +1,11 @@
 /// Bounds-checked view into a contiguous kernel memory region.
 /// Like Mmio but for RAM — prevents out-of-bounds reads/writes.
+///
+/// **Not for DMA memory.** That was this type's third caller and it is
+/// [`super::Dma`] now: a view the pool hands out, bounded for the length and not
+/// only the offset, safe at every accessor, and carrying the pool's lifetime so
+/// the residual below cannot arise. What is left here is the loader's and the
+/// process's, where the size and the allocation still travel separately.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct KernelSlice {
     base: *mut u8,
@@ -102,14 +108,5 @@ impl KernelSlice {
     /// Same as `write`, for the whole range.
     pub unsafe fn zero(&self) {
         core::ptr::write_bytes(self.base, 0, self.size);
-    }
-
-    /// Pointer at offset, bounds-checked. For passing to APIs that need raw pointers.
-    pub fn ptr_at(&self, offset: usize) -> *mut u8 {
-        self.check(offset, 0);
-        // SAFETY: `check` just asserted `offset <= self.size`, so this stays
-        // within the range `self` claims to cover — same caveat as
-        // `subslice` above about what "claims" rests on.
-        unsafe { self.base.add(offset) }
     }
 }
