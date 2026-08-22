@@ -54,8 +54,13 @@ pub fn boot_partition_identity(
     // table below has to carry this image's partition GUID and the image does
     // not exist until it is built. `create_gpt_disk` draws a fresh random GUID
     // every time, so there is no second build that would agree with this one.
-    let quiet = !qemu::VERBOSE.load(std::sync::atomic::Ordering::Relaxed);
-    let bytes = toyos_build::build::build_test_image(&repo, &config, &[], &[], quiet, &[]);
+    //
+    // Through the harness's own door rather than straight into `toyos_build`,
+    // so this build is in the kernel census like every other: a staged boot
+    // builds nothing, and a build nothing counted would leave the run reporting
+    // a kernel it made and did not mention.
+    let dir_of_config = config.parent().expect("system.toml has a directory");
+    let bytes = qemu::build_boot_image(dir_of_config, &[], &[], &[]);
     let boot_image = dir.join("gpt-boot.img");
     std::fs::write(&boot_image, &bytes).map_err(|e| format!("write the boot image: {e}"))?;
 
