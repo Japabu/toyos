@@ -39,14 +39,21 @@
 //! | wakeup storm drain | 27.75 ms for 64 waiters on one CPU, 3.1× the 16-waiter figure | `(per queue+1) × 12 ms` = 780 ms | 0.04 |
 //! | starvation | 70 ms at 5 runnable threads, 680 ms at 65 | `(threads+1) × 12 ms` | 0.97 / 0.86 |
 //! | adversarial placement | a CPU an adversary loaded is drained to the surplus floor, and only the CPUs still awake are reached | `threads − 2` stealable | 1.00 |
+//! | a bounded re-arm | every CPU is reached at every width; 10 ms of probe gap | `every_ns + 3 × RUN_CHUNK` = 13 ms | 0.77 |
+//! | a push on surplus | every CPU is reached at every width; 66 ms of probe gap at eight | `(cpus−1) × 12 ms + IPI + 2 × RUN_CHUNK` | 0.77 |
+//! | what the cures cost | 0 idle wakes/s shipped, 154/s for the cheapest re-arm and **0/s** for the push on `audio_pipeline` | wake latency unchanged, under its own bound | — |
 //!
-//! The last case is the only one whose bound is a *count* rather than a
-//! duration, and that is the model's limit rather than a choice: the clock
-//! advances on the executing CPU's step, so a run's makespan is what one CPU
-//! would take at every width and no wall-clock statement about a wide machine
-//! can be read off it. What survives is the protocol — how many tasks the
-//! balance path moved, and which CPUs ever got one — and that is enough to
-//! separate a machine that recovers from one that does not.
+//! The adversarial-placement case is the only one whose bound is a *count*
+//! rather than a duration, and that is the model's limit rather than a choice:
+//! the clock advances on the executing CPU's step, so a run's makespan is what
+//! one CPU would take at every width and no wall-clock statement about a wide
+//! machine can be read off it. What survives is the protocol — how many tasks
+//! the balance path moved, and which CPUs ever got one — and that is enough to
+//! separate a machine that recovers from one that does not. The two cure cases
+//! below it inherit the same limit and answer it the same way: recovery is
+//! counted in CPUs, and timed in **probe gaps** — how long a halted CPU sat
+//! beside a published surplus with no probe of its own outstanding, which is a
+//! quantity the protocol owns end to end.
 //!
 //! Every number came from this file at 16–40 seeds per point:
 //! `cargo test -p toyos-sched-sim --test policy -- --nocapture`. The tables in
@@ -64,6 +71,18 @@
 //! form of "processes own fair share", and it is measured here rather than
 //! asserted anywhere.
 //!
+//! **The balance path is pull-only and one-shot, and both cures for that work.**
+//! An idle CPU posts one probe on its way to `hlt` and nothing re-posts it, so a
+//! CPU that halted before any neighbour published surplus is never probed again:
+//! 0 of 20 seeds reach every CPU at eight. A bounded re-arm of the probe and a
+//! push on surplus each take that to 20 of 20 at every width, and they cost
+//! opposite things — the timer ticks whether or not there is anything to come
+//! for, the push fires only where there is. On the audio pipeline that is 154
+//! extra idle wakes per second against **zero**. Neither is shipped;
+//! `issues/kernel/an-idle-cpu-that-slept-before-the-surplus-is-never-probed.md`
+//! is where the decision sits, and these three cases are the numbers it is owed
+//! against.
+//!
 //! # Determinism, seeds, and what varies
 //!
 //! The simulator is deterministic in its decision stream: a seed is a schedule.
@@ -77,13 +96,14 @@
 //! a reader is owed that. The multi-CPU cases do vary, and there the sweep is
 //! doing what a sweep is for.
 
+use toyos_sched::cpu::Balance;
 use toyos_sched::fair::QUANTUM_NS;
 use toyos_sched_sim::choice::ChoiceStream;
 use toyos_sched_sim::explore::{run, Outcome};
 use toyos_sched_sim::latency::{Latency, ReadyCause};
 use toyos_sched_sim::scenarios;
-use toyos_sched_sim::vm::RUN_CHUNK_NS;
-use toyos_sched_sim::workload::{BalanceShape, Scenario, ShareShape};
+use toyos_sched_sim::vm::{IPI_LATENCY_NS, RUN_CHUNK_NS};
+use toyos_sched_sim::workload::{Scenario, ShareShape};
 
 const MS: u64 = 1_000_000;
 
@@ -704,7 +724,7 @@ fn the_balance_path_drains_the_cpu_an_adversary_loaded() {
 fn without_the_balance_path_a_lopsided_machine_stays_lopsided() {
     for (cpus, threads) in LOPSIDED {
         let scenario =
-            scenarios::lopsided_placement(cpus, threads, WORK).with_balance(BalanceShape::None);
+            scenarios::lopsided_placement(cpus, threads, WORK).with_balance(Balance::None);
         let floor = stealable(threads);
         let (mut most, mut widest) = (0, 0);
 
@@ -728,6 +748,531 @@ fn without_the_balance_path_a_lopsided_machine_stays_lopsided() {
              whose every thread was spawned onto cpu0 — the placement knob is not staging the \
              machine the case above is about",
         );
+    }
+}
+
+/// How long a cure waits before probing again, and how many times.
+///
+/// One quantum, because that is the interval the rest of this scheduler already
+/// works in: a loaded CPU reaches a pass at every quantum boundary, so a thief
+/// that re-probes faster than that is asking a question whose answer cannot have
+/// changed. Four, because the re-arm has to be **bounded** — `times × every_ns`
+/// is the whole window a cure of this shape can see a surplus in, and past it
+/// the CPU halts for good rather than ticking for ever on a machine with nothing
+/// to run.
+const REARM_EVERY_NS: u64 = QUANTUM_NS;
+const REARM_TIMES: u32 = 4;
+
+/// The surplus a push fires at: `SchedPass::post_steal_probe`'s own inequality,
+/// so a push never wakes a CPU whose victim would refuse it.
+const PUSH_THRESHOLD: u32 = 2;
+
+/// The four policies the two cure cases and the cost table are read across.
+fn policies() -> [(&'static str, Balance); 4] {
+    [
+        ("pull (ships)", Balance::Pull),
+        (
+            "re-arm ×1",
+            Balance::PullWithRearm {
+                every_ns: REARM_EVERY_NS,
+                times: 1,
+            },
+        ),
+        (
+            "re-arm ×4",
+            Balance::PullWithRearm {
+                every_ns: REARM_EVERY_NS,
+                times: REARM_TIMES,
+            },
+        ),
+        (
+            "push ≥2",
+            Balance::PushOnSurplus {
+                threshold: PUSH_THRESHOLD,
+            },
+        ),
+    ]
+}
+
+/// What one policy did with one lopsided machine, over a whole sweep.
+#[derive(Default)]
+struct Recovery {
+    /// Seeds in which every CPU of the machine executed a step.
+    full: usize,
+    /// Seeds in which more than cpu0 did.
+    second: usize,
+    /// The most tasks the balance path moved in any seed.
+    best_migrations: u64,
+    /// The worst [`Outcome::probe_gap_ns`] any seed produced.
+    gap_ns: u64,
+    /// The worst and best `machine_working_at_ns` over the seeds that reached
+    /// every CPU; `None` if no seed did.
+    working_worst: Option<u64>,
+    working_best: Option<u64>,
+    /// Idle wakes summed over the sweep, and the worst single run's rate.
+    wakes: u64,
+    worst_rate: f64,
+}
+
+/// Wakes of a halted CPU that found nothing to do, per second of simulated time
+/// — the unit a balance policy's cost is quoted in.
+fn wake_rate(outcome: &Outcome) -> f64 {
+    if outcome.elapsed == 0 {
+        return 0.0;
+    }
+    outcome.idle_wakes_total() as f64 * 1e9 / outcome.elapsed as f64
+}
+
+/// Run the lopsided machine under one policy and fold what it did.
+///
+/// The two ceilings the shipped path already obeys are asserted here rather than
+/// in each case, because they are claims about the *pull* half and every policy
+/// below is built on it: no CPU is given work by anything but the balance path,
+/// and no task is moved twice.
+fn recover(cpus: usize, threads: usize, balance: Balance) -> Recovery {
+    let scenario = scenarios::lopsided_placement(cpus, threads, WORK).with_balance(balance);
+    let floor = stealable(threads);
+    let mut r = Recovery::default();
+    sweep(&scenario, LOPSIDED_SEEDS, |outcome| {
+        let ran = outcome.cpus_reached();
+        assert!(
+            outcome.migrations + 1 >= ran as u64,
+            "{balance:?} at {cpus} cpus: {ran} cpu(s) executed a step on a machine whose every \
+             thread was spawned onto cpu0, and the balance path moved only {} task(s) — one of \
+             those CPUs was given work by something that is not the balance path",
+            outcome.migrations,
+        );
+        assert!(
+            outcome.migrations <= floor,
+            "{balance:?} at {cpus} cpus: the balance path moved {} of {threads} tasks, past the \
+             {floor} that stand above cpu0's surplus floor — a task is being migrated more than \
+             once, which is a thief that became a victim",
+            outcome.migrations,
+        );
+        r.full += usize::from(ran == cpus);
+        r.second += usize::from(ran > 1);
+        r.best_migrations = r.best_migrations.max(outcome.migrations);
+        r.gap_ns = r.gap_ns.max(outcome.probe_gap_ns);
+        r.wakes += outcome.idle_wakes_total();
+        r.worst_rate = r.worst_rate.max(wake_rate(outcome));
+        if let Some(at) = outcome.machine_working_at_ns() {
+            r.working_worst = Some(r.working_worst.unwrap_or(0).max(at));
+            r.working_best = Some(r.working_best.unwrap_or(u64::MAX).min(at));
+        }
+    });
+    r
+}
+
+/// The condition under which "every CPU is reached" is a statement about the
+/// balance path rather than about arithmetic: cpu0 can be drained to
+/// [`stealable`] and every other CPU needs one task, so there has to be at least
+/// one task per starved CPU above the floor.
+fn enough_to_go_round(cpus: usize, threads: usize) {
+    assert!(
+        stealable(threads) >= cpus as u64 - 1,
+        "at {cpus} cpus and {threads} threads only {} task(s) stand above cpu0's surplus floor \
+         and {} CPU(s) need one each — no balance policy can reach every CPU here, so a case \
+         asserting that it does would be asserting arithmetic",
+        stealable(threads),
+        cpus - 1,
+    );
+}
+
+/// **Cure one, measured: a bounded re-arm of the probe.**
+///
+/// `issues/kernel/an-idle-cpu-that-slept-before-the-surplus-is-never-probed.md`
+/// names two ways out of the one-shot probe, and this is the one that needs no
+/// observation of anything: a CPU that halts with nothing to run programs its
+/// one-shot timer [`REARM_EVERY_NS`] ahead and probes again when it fires, up to
+/// [`REARM_TIMES`] times per idle period. Nothing has to notice it, nothing has
+/// to publish anything, and the timer fires whether or not a surplus ever
+/// appeared — which is both why it works and what it costs.
+///
+/// **The derivation, and it is the assertion.** A CPU that halted at `H` is
+/// woken at `H + every_ns`: the model's step relation forbids an execution step
+/// anywhere while a CPU owes a timer delivery, so the clock cannot run past the
+/// armed instant unpunished. Three [`RUN_CHUNK_NS`] chunks of granularity sit on
+/// top, and each is a step the model permits before the probe is posted — the
+/// execution step that carries the clock over the armed instant, the one chunk
+/// of grace `Vm::enabled` gives a CPU that owes a rescheduling pass, and the
+/// execution step that carries the clock over *that*. So no CPU may sit halted
+/// beside a published surplus with no probe outstanding for longer than
+/// `every_ns + 3 × RUN_CHUNK` — [`Outcome::probe_gap_ns`] is that quantity, and
+/// the surplus in this workload is published at clock 0, before any CPU can have
+/// halted, so one re-arm is inside the window at every width.
+///
+/// **What it found**, 20 seeds per width at 60 ms of work per thread and
+/// `every_ns = QUANTUM_NS`:
+///
+/// | cpus | threads | every CPU, ×1 | every CPU, ×4 | pull | probe gap | pull's gap | idle wakes/s, worst run (×1 / ×4) |
+/// |---|---|---|---|---|---|---|---|
+/// | 2 |  8 | 20/20 | 20/20 | 9/20 | 10.0 ms |   480 ms |  8.16 / 21.15 |
+/// | 4 | 16 | 20/20 | 20/20 | 2/20 | 10.0 ms |   960 ms |  8.25 / 23.00 |
+/// | 4 | 64 | 20/20 | 20/20 | 2/20 | 10.0 ms | 3,840 ms |  3.38 /  6.44 |
+/// | 8 | 64 | 20/20 | 20/20 | 0/20 | 10.0 ms | 3,840 ms |  6.75 / 12.89 |
+///
+/// The derived bound is 13,000,000 ns and the measurement is 10,000,000 ns at
+/// every width — 0.77 of it, which is where the rest of this file's numbers sit.
+/// It is *exactly* `every_ns`, because this workload's clock is a multiple of
+/// `RUN_CHUNK_NS` throughout and none of the three granularity chunks is ever
+/// spent; they stay in the bound because the model permits them, not because a
+/// schedule was found that needs them. `Balance::Pull`'s own gap is the whole
+/// run at every width, because nothing in that protocol can close it.
+///
+/// **One re-arm is enough here**: the ×1 and ×4 columns are the same recovery
+/// for two and a half times the wakes. What this workload needs is *a* second
+/// look, not a periodic one — and `times` is what decides how much of the second
+/// kind is bought with it.
+///
+/// **The negative control.** With the cure off and everything else identical
+/// (`Balance::Pull` substituted for the policy under test) this case reds on its
+/// first width, at the recovery assertion:
+///
+/// ```text
+/// with a re-arm every 10000000 ns, 11 of 20 schedules left a CPU of 2 asleep on
+/// a machine whose whole workload sits on cpu0. [...]  left: 9  right: 20
+/// ```
+///
+/// and with that assertion elided, at the derived timing one behind it:
+///
+/// ```text
+/// a CPU sat halted beside a published surplus with no probe outstanding for
+/// 480000000 ns, against a derived 13000000 ns
+/// ```
+///
+/// A CPU's first execution step is reported and **not** asserted: the model does
+/// not oblige a CPU that has a task loaded to take one, so `working_at` measures
+/// the explorer's freedom as much as the protocol's recovery — 20,000,000 ns in
+/// the best seed at eight CPUs against 3,780,000,000 ns in the worst, on runs
+/// whose probe gap is 10,000,000 ns either way. That is the same limit the case
+/// above states about makespan, and it is why recovery is counted in CPUs and
+/// timed in probe gaps.
+#[test]
+fn a_bounded_re_arm_reaches_every_cpu_the_pull_path_left_asleep() {
+    let bound = REARM_EVERY_NS + 3 * RUN_CHUNK_NS;
+    let mut table = Vec::new();
+    for (cpus, threads) in LOPSIDED {
+        enough_to_go_round(cpus, threads);
+        let floor = stealable(threads);
+        let control = recover(cpus, threads, Balance::Pull);
+        for times in [1, REARM_TIMES] {
+            let balance = Balance::PullWithRearm {
+                every_ns: REARM_EVERY_NS,
+                times,
+            };
+            let cured = recover(cpus, threads, balance);
+            println!(
+                "re-arm ×{times} cpus={cpus} threads={threads}: every-cpu \
+                 {}/{LOPSIDED_SEEDS} (pull {}/{LOPSIDED_SEEDS}), gap={} ns (pull {} ns, bound \
+                 {bound} ns), drained {}/{floor}, working_at {:?}..{:?} ns, {} idle wakes over \
+                 the sweep, worst run {:.2}/s",
+                cured.full,
+                control.full,
+                cured.gap_ns,
+                control.gap_ns,
+                cured.best_migrations,
+                cured.working_best,
+                cured.working_worst,
+                cured.wakes,
+                cured.worst_rate,
+            );
+
+            // **The law.** A cure that re-probes every `every_ns` cannot leave a
+            // CPU asleep beside a surplus that was published before it halted,
+            // and in this workload every surplus is.
+            assert_eq!(
+                cured.full, LOPSIDED_SEEDS as usize,
+                "with a re-arm every {REARM_EVERY_NS} ns, {} of {LOPSIDED_SEEDS} schedules left \
+                 a CPU of {cpus} asleep on a machine whose whole workload sits on cpu0. cpu0 \
+                 publishes its surplus at clock 0 — before any CPU can have halted, since no \
+                 execution step is enabled until it has taken its first pass — so every halt is \
+                 inside the first re-arm's window and every CPU must be probed.",
+                LOPSIDED_SEEDS as usize - cured.full,
+            );
+            assert!(
+                cured.gap_ns <= bound,
+                "a CPU sat halted beside a published surplus with no probe outstanding for {} \
+                 ns, against a derived {bound} ns — one re-arm period at {REARM_EVERY_NS} ns \
+                 plus three {RUN_CHUNK_NS} ns chunks of the model's own granularity. Past this \
+                 the timer is not what is waking the CPU.",
+                cured.gap_ns,
+            );
+            // And the drain is unchanged: a cure that reaches every CPU by
+            // moving more tasks than cpu0 has to give would be a different
+            // machine, not a repaired one.
+            assert_eq!(
+                cured.best_migrations, floor,
+                "the best of {LOPSIDED_SEEDS} schedules moved {} tasks and the surplus floor \
+                 leaves {floor} stealable — the re-arm changes when a probe is posted and \
+                 nothing about what answering one hands over",
+                cured.best_migrations,
+            );
+            table.push((cpus, threads, times, cured, control.full, control.gap_ns));
+        }
+    }
+
+    // The negative control, stated where the comparison is: with the cure off,
+    // the same assertion has to fail. It does — at eight CPUs not one of the
+    // twenty schedules reaches every CPU.
+    let (_, _, _, _, worst_control_full, _) = table
+        .iter()
+        .map(|&(c, t, times, ref cured, full, gap)| (c, t, times, cured.full, full, gap))
+        .min_by_key(|&(_, _, _, _, full, _)| full)
+        .expect("the sweep ran");
+    assert!(
+        worst_control_full < LOPSIDED_SEEDS as usize,
+        "`Balance::Pull` reached every CPU in every one of {LOPSIDED_SEEDS} schedules at every \
+         width — then the case above is not measuring a cure, because there is nothing left to \
+         cure",
+    );
+}
+
+/// **Cure two, measured: a push on surplus.**
+///
+/// The other way out of the one-shot probe, and the one that costs almost
+/// nothing: a pass that publishes a surplus of [`PUSH_THRESHOLD`] or more rings
+/// the doorbell of one CPU that reads SLEEPING. No task moves on that ring — the
+/// woken CPU runs its own idle pass and posts an ordinary probe — so the push
+/// adds no second way to migrate anything, only a way to make the pull half run
+/// on a CPU that had stopped asking.
+///
+/// **The derivation, and it is the assertion.** A pass pushes to one CPU, and
+/// `SchedPass::push_on_surplus`'s cursor makes consecutive pushes walk the
+/// machine, so `k` sleeping CPUs are reached in `k` passes of the CPU holding the
+/// surplus. That CPU is running a task, so it reaches a pass at each quantum
+/// boundary: `k × DISPATCH_NS`. The kick is an IPI ([`IPI_LATENCY_NS`], which the
+/// model enforces by disabling every execution step while a delivery is overdue)
+/// and the pass it asks for is one chunk of grace plus the chunk that carries the
+/// clock over it. Here `k` is `cpus − 1`, every CPU but the loaded one, so
+///
+/// ```text
+/// (cpus − 1) × DISPATCH_NS + IPI_LATENCY_NS + 2 × RUN_CHUNK_NS
+/// ```
+///
+/// **What it found**, 20 seeds per width:
+///
+/// | cpus | threads | seeds reaching every CPU | pull | probe gap | derived | measured/bound | idle wakes/s, worst run |
+/// |---|---|---|---|---|---|---|---|
+/// | 2 |  8 | 20/20 | 9/20 |  1.0 ms | 14.2 ms | 0.07 | 2.08 |
+/// | 4 | 16 | 20/20 | 2/20 | 22.0 ms | 38.2 ms | 0.58 | 3.12 |
+/// | 4 | 64 | 20/20 | 2/20 | 22.0 ms | 38.2 ms | 0.58 | 0.78 |
+/// | 8 | 64 | 20/20 | 0/20 | 66.0 ms | 86.2 ms | 0.77 | 1.82 |
+///
+/// The bound is loose at two CPUs for the reason it is tight at eight: there is
+/// one sleeper to reach and the first pass reaches it, so `k = 1` and the `k`
+/// term has nothing to say. The wakes it costs are 11, 36, 36 and 74 over a
+/// twenty-seed sweep — between three and eleven times fewer than the cheapest
+/// re-arm buys the same recovery for.
+///
+/// **The cursor is load-bearing and the measurement is what said so.** Without
+/// it every push goes to the lowest-numbered sleeper, which posts its probe and
+/// halts again with SLEEPING still set — so the next pass re-pokes the CPU that
+/// is already coming, and the one behind it waits for the first one's probe to
+/// be *answered*. Two passes per sleeper: 130,000,000 ns of probe gap at eight
+/// CPUs against the 66,000,000 ns above.
+///
+/// **The negative control**, `Balance::Pull` substituted for the policy under
+/// test and nothing else changed — the recovery assertion first:
+///
+/// ```text
+/// with a push at a surplus of 2, 11 of 20 schedules left a CPU of 2 asleep on a
+/// machine whose whole workload sits on cpu0. [...]  left: 9  right: 20
+/// ```
+///
+/// and the derived timing one behind it:
+///
+/// ```text
+/// a CPU sat halted beside a published surplus with no probe outstanding for
+/// 480000000 ns, against a derived 14200000 ns
+/// ```
+#[test]
+fn a_push_on_surplus_reaches_every_cpu_the_pull_path_left_asleep() {
+    let balance = Balance::PushOnSurplus {
+        threshold: PUSH_THRESHOLD,
+    };
+    let mut reached_all = 0;
+    for (cpus, threads) in LOPSIDED {
+        enough_to_go_round(cpus, threads);
+        let floor = stealable(threads);
+        let sleepers = cpus as u64 - 1;
+        let bound = sleepers * DISPATCH_NS + IPI_LATENCY_NS + 2 * RUN_CHUNK_NS;
+        let control = recover(cpus, threads, Balance::Pull);
+        let cured = recover(cpus, threads, balance);
+
+        println!(
+            "push ≥{PUSH_THRESHOLD} cpus={cpus} threads={threads}: every-cpu \
+             {}/{LOPSIDED_SEEDS} (pull {}/{LOPSIDED_SEEDS}), gap={} ns (pull {} ns, bound \
+             {bound} ns), drained {}/{floor}, working_at {:?}..{:?} ns, {} idle wakes over the \
+             sweep, worst run {:.2}/s",
+            cured.full,
+            control.full,
+            cured.gap_ns,
+            control.gap_ns,
+            cured.best_migrations,
+            cured.working_best,
+            cured.working_worst,
+            cured.wakes,
+            cured.worst_rate,
+        );
+
+        assert_eq!(
+            cured.full, LOPSIDED_SEEDS as usize,
+            "with a push at a surplus of {PUSH_THRESHOLD}, {} of {LOPSIDED_SEEDS} schedules \
+             left a CPU of {cpus} asleep on a machine whose whole workload sits on cpu0. cpu0 \
+             publishes a surplus of {} at clock 0 and pushes to one sleeping CPU per pass, \
+             walking them in turn, so every one of them is rung inside {sleepers} passes.",
+            LOPSIDED_SEEDS as usize - cured.full,
+            threads - 1,
+        );
+        assert!(
+            cured.gap_ns <= bound,
+            "a CPU sat halted beside a published surplus with no probe outstanding for {} ns, \
+             against a derived {bound} ns — {sleepers} sleeping CPU(s) at one push per pass and \
+             {DISPATCH_NS} ns a pass, plus {IPI_LATENCY_NS} ns of IPI latency and two \
+             {RUN_CHUNK_NS} ns chunks for the pass the kick asks for. Past this the push is \
+             reaching the same CPU twice instead of walking the machine.",
+            cured.gap_ns,
+        );
+        assert_eq!(
+            cured.best_migrations, floor,
+            "the best of {LOPSIDED_SEEDS} schedules moved {} tasks and the surplus floor leaves \
+             {floor} stealable — the push changes which CPU asks and nothing about what \
+             answering hands over",
+            cured.best_migrations,
+        );
+        reached_all += usize::from(control.full == LOPSIDED_SEEDS as usize);
+    }
+    assert!(
+        reached_all < LOPSIDED.len(),
+        "`Balance::Pull` reached every CPU in every schedule at every width — then the case \
+         above is not measuring a cure",
+    );
+}
+
+/// **What the two cures cost the idle path**, on the workloads a desktop
+/// actually runs.
+///
+/// `kernel/CLAUDE.md` makes anything added to the idle loop an audio change, and
+/// both cures add exactly one kind of thing: a wake of a CPU that had halted.
+/// [`Outcome::idle_wakes`] counts them — a wake whose first pass reaches the idle
+/// disposition again — so the count is a property of the run rather than of the
+/// policy, and `Balance::Pull`'s own figure is the baseline the others are read
+/// against. It is **zero on every workload here**, which is what makes the
+/// comparison one.
+///
+/// **What it found**, 20 seeds per point. The first figure is the whole sweep's
+/// wakes, the second the worst single run's rate against simulated time:
+///
+/// | workload | pull | re-arm ×1 | re-arm ×4 | push ≥2 |
+/// |---|---|---|---|---|
+/// | `interactive_mix(2,4)`  | 0, 0.00/s |  44,  31.58/s |  171,  88.00/s |    9,  11.76/s |
+/// | `interactive_mix(2,16)` | 0, 0.00/s |  49,  11.94/s |  174,  30.14/s |    2,   3.08/s |
+/// | `interactive_mix(4,16)` | 0, 0.00/s | 104,  20.90/s |  363,  63.01/s |   53,  24.62/s |
+/// | `wakeup_storm(4,16)`    | 0, 0.00/s | 251,  92.13/s | 1004, 306.22/s |   80,  97.56/s |
+/// | `wakeup_storm(8,64)`    | 0, 0.00/s | 521, 150.67/s | 2075, 534.78/s |  748, 380.95/s |
+/// | `audio_pipeline(4)`     | 0, 0.00/s | 111, 153.85/s |  351, 243.90/s | **0, 0.00/s** |
+///
+/// **The last row is the decision.** `audio_pipeline` is four threads on four
+/// CPUs, so no CPU ever holds a fair band two deep and no CPU ever has surplus to
+/// announce: the push fires **not once** in the whole sweep and costs the idle
+/// path literally nothing, while the re-arm ticks every idle CPU regardless,
+/// because a timer cannot ask whether there is anything to come for. That is the
+/// difference between the two cures stated in the unit the owner has to decide
+/// in, on the workload the owner cares about.
+///
+/// **And the row above it is the qualification.** Under a wakeup storm at eight
+/// CPUs the push costs 748 wakes against the cheapest re-arm's 521: a storm is
+/// a machine that keeps producing surplus beside CPUs that keep going idle, so
+/// the observation the push rests on keeps coming back true. The push is cheap
+/// where nothing is queued and dear where a great deal is — which is the
+/// opposite way round from the re-arm, and the reason the two rows are both here.
+///
+/// **The wake latency does not move**, which is the other half of the same
+/// question. The watched thread's worst wake is the same nanosecond under all
+/// four policies at every point but one (`wakeup_storm(8,64)`, where the push's
+/// 50,750,000 ns is *better* than the shipped path's 57,000,000 ns), and the mean
+/// moves by under 2%. That is a schedule perturbation and not a price: the model
+/// charges a scheduler pass zero nanoseconds (`SimHwState::pass_cost_ns`), so it
+/// can *count* an extra wake and cannot bill one. The count is what goes to the
+/// owner; what a wake costs the CPU it wakes is the kernel's own measurement to
+/// make.
+#[test]
+fn the_two_cures_are_priced_against_the_pull_path() {
+    const COST_SEEDS: u64 = 20;
+    let points: [(&str, usize, usize, Scenario); 6] = [
+        ("interactive_mix(2,4)", 2, 4, scenarios::interactive_mix(2, 4)),
+        ("interactive_mix(2,16)", 2, 16, scenarios::interactive_mix(2, 16)),
+        ("interactive_mix(4,16)", 4, 16, scenarios::interactive_mix(4, 16)),
+        ("wakeup_storm(4,16)", 4, 16, scenarios::wakeup_storm(4, 16)),
+        ("wakeup_storm(8,64)", 8, 64, scenarios::wakeup_storm(8, 64)),
+        ("audio_pipeline(4)", 4, 0, scenarios::audio_pipeline(4)),
+    ];
+    for (label, cpus, hogs, scenario) in points {
+        // Whose wake latency this workload is about: the interactive thread, the
+        // storm's waiters, or the audio clients.
+        let watched = scenario
+            .procs
+            .iter()
+            .position(|p| matches!(p.name, "sleeper" | "waiters" | "client"))
+            .expect("every workload here has a thread whose wake latency is the point");
+        // One run queue's worth of rivals plus the leader, exactly as
+        // `an_interactive_wake_waits_out_at_most_the_band_it_is_queued_behind`
+        // derives it. `audio_pipeline` carries its own thread count rather than
+        // a hog parameter, so it is counted from the scenario.
+        let rivals = if hogs > 0 {
+            hogs.div_ceil(cpus) as u64 + 1
+        } else {
+            scenario.procs.iter().map(|p| p.initial.len() as u64).sum::<u64>() / cpus as u64 + 1
+        };
+        let bound = (rivals + 1) * DISPATCH_NS;
+
+        for (name, balance) in policies() {
+            let scenario = scenario.clone().with_balance(balance);
+            let mut woken = Latency::default();
+            let (mut wakes, mut worst_rate) = (0u64, 0.0f64);
+            sweep(&scenario, COST_SEEDS, |outcome| {
+                woken.merge(outcome.wait(watched, ReadyCause::Woken));
+                wakes += outcome.idle_wakes_total();
+                worst_rate = worst_rate.max(wake_rate(outcome));
+            });
+            println!(
+                "cost {label} [{name}]: idle wakes {wakes} over {COST_SEEDS} runs, worst run \
+                 {worst_rate:.2}/s; woken[{}] bound={bound} ns",
+                woken.summary(),
+            );
+
+            assert!(
+                woken.count() >= COST_SEEDS,
+                "{label} [{name}]: the watched thread was woken {} time(s) over {COST_SEEDS} \
+                 runs — the distribution below is a measurement of nothing",
+                woken.count(),
+            );
+            // The audio-relevant claim, asserted under every policy and not only
+            // the shipped one: a cure that lengthened the wake path would be
+            // paying for the balance path out of the interactive one.
+            assert!(
+                woken.max_ns() <= bound,
+                "{label} [{name}]: a wake waited {} ns against a derived {bound} ns — {rivals} \
+                 runnable thread(s) on one run queue plus the leader, at {DISPATCH_NS} ns a \
+                 dispatch. A balance policy may cost idle wakes; it may not cost wake latency. \
+                 Distribution: {}",
+                woken.max_ns(),
+                woken.summary(),
+            );
+            // And the baseline is a baseline. Under `Pull` nothing arms a timer
+            // on a CPU with an empty queue and nothing rings a doorbell without
+            // a message behind it, so every wake of a halted CPU here carries
+            // work — if this stops being zero the column the cures are read
+            // against has stopped meaning "what the shipped path costs".
+            if balance == Balance::Pull {
+                assert_eq!(
+                    wakes, 0,
+                    "{label}: the shipped balance path woke a halted CPU {wakes} time(s) for \
+                     nothing over {COST_SEEDS} runs. Every column beside it is quoted as a cost \
+                     *over* this one",
+                );
+            }
+        }
     }
 }
 

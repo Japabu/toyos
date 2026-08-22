@@ -11,10 +11,10 @@
 #[cfg(not(feature = "loom"))]
 pub use alloc::sync::Arc;
 #[cfg(not(feature = "loom"))]
-pub use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+pub use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 #[cfg(feature = "loom")]
-pub use loom::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
+pub use loom::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 #[cfg(feature = "loom")]
 pub use loom::sync::Arc;
 

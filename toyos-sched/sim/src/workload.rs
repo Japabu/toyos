@@ -11,6 +11,7 @@
 //! `Futex`. Giving it a second opcode would be modelling a second wake path
 //! — the very thing §8.2 removes.
 
+use toyos_sched::cpu::Balance;
 use toyos_sched::queue::FairOrder;
 use toyos_sched::task::WaitClass;
 
@@ -254,25 +255,6 @@ pub enum PlacementShape {
     AllOn(usize),
 }
 
-/// Whether the pull half of the balance path runs.
-///
-/// A scenario dimension for [`PlacementShape`]'s reason and with the same two
-/// roles: the shipped answer, and the control that says what the measurement
-/// would be without it. `kernel::sched::driver::env` sets `steal: true` and
-/// never clears it, so [`BalanceShape::None`] is a kernel this tree has not
-/// shipped — `toyos-sched/loom`'s `loom_retire` already builds an `Env` with
-/// `steal: false` for the same reason, to state what the rest of the protocol
-/// does without it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum BalanceShape {
-    /// Spec §7.7 and §9.4's pull half: an idle pass probes the CPU with the
-    /// most surplus, and a loaded pass answers a probe out of `pop_surplus`.
-    Pull,
-    /// No probe and no answer. A task woken or placed onto a busy CPU waits
-    /// there until that CPU's own queue reaches it.
-    None,
-}
-
 /// Which teardown/balance algorithm the VM drives the core with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Protocol {
@@ -302,7 +284,18 @@ pub struct Scenario {
     pub share: ShareShape,
     pub charge: ChargeShape,
     pub placement: PlacementShape,
-    pub balance: BalanceShape,
+    /// What the balance path does. A scenario dimension for [`PlacementShape`]'s
+    /// reason and with the same roles: the shipped answer
+    /// ([`Balance::Pull`], which is what `kernel::sched::driver::env` selects),
+    /// the control that says what the measurement would be without it
+    /// ([`Balance::None`]), and the two candidate cures for the one-shot probe
+    /// that neither the kernel nor any default here selects.
+    ///
+    /// **The core's own type rather than a parallel copy of it**, exactly as
+    /// [`Scenario::order`] carries `FairOrder`: every setting is a policy the
+    /// core implements, so the simulator drives the real code whichever one a
+    /// scenario names.
+    pub balance: Balance,
     /// How the fair band picks between two ready threads of one share. A
     /// scenario dimension for the same reason [`ShareShape`] is, and the type is
     /// the core's own rather than a parallel copy of it: the broken orderings
@@ -412,7 +405,7 @@ impl Scenario {
         self
     }
 
-    pub fn with_balance(mut self, balance: BalanceShape) -> Self {
+    pub fn with_balance(mut self, balance: Balance) -> Self {
         self.balance = balance;
         self
     }
