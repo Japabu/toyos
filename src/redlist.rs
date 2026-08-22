@@ -1333,8 +1333,10 @@ pub const KNOWN_RED: &[Red] = &[
                (`issues/build/every-recorded-stall-predates-the-panic-discriminator.md`) — \
                and nothing in it separates that from the host. One sighting, no denominator \
                on record; what retires it is loaded suites of the fixed tree with no red under \
-               this name, three by the Poisson rule (p = e^-3 against a rate of one per suite), \
-               and the count taken on 2026-08-22 is in the row's evidence",
+               this name, three by the Poisson rule (p = e^-3 against a rate of one per suite). \
+               That count is owed: the 2026-08-22 sweep found the guest suite refused in its \
+               worktree for the whole session, the shared sysroot being claimed by \
+               `wt/toyos-census`'s ABI landing (#209)",
         evidence: "a landing gate on a documentation-only branch",
         source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-07",
@@ -1416,8 +1418,8 @@ pub const KNOWN_RED: &[Red] = &[
                `cld`, 0 in 7,418 after) is a cause the capture cannot exclude and does not \
                show; twelve wide beside a second worktree's suite is that class's exposure. One \
                sighting; retires at three loaded suites of the fixed tree with no red under this \
-               name (p = e^-3 against one per suite), the count taken on 2026-08-22 being in \
-               this row's evidence",
+               name (p = e^-3 against one per suite). That count is owed: on 2026-08-22 the \
+               guest suite was refused behind `wt/toyos-census`'s sysroot claim (#209)",
         evidence: "one 12-wide full suite on 2026-08-09 while a second worktree's suite was live, \
                    then the harness's isolated re-run",
         source: "issues/diagnostics/blocked-dump-cannot-fire-on-a-total-freeze.md",
@@ -2036,8 +2038,9 @@ pub const KNOWN_RED: &[Red] = &[
                0.991 s sits in); `kernel/src/panic.rs` now names the first crash under a \
                `DOUBLE PANIC`, so the next sighting says whether it was a fault. Not shown \
                here, so the row stands. One sighting in one loaded suite; retires at three \
-               loaded suites of the fixed tree with no red under this name (p = e^-3), the \
-               count taken on 2026-08-22 being in this row's evidence",
+               loaded suites of the fixed tree with no red under this name (p = e^-3). That \
+               count is owed: on 2026-08-22 the guest suite was refused behind \
+               `wt/toyos-census`'s sysroot claim (#209)",
         evidence: "dev host, 2026-08-19 22:21 UTC, `cargo test` in wt/toyos-hkpfix beside \
                    wt/toyos-freshness's suite; 267 of 268 passed, this one red at 25 s in the \
                    parallel phase, green alone in the same run",
@@ -2152,8 +2155,9 @@ pub const KNOWN_RED: &[Red] = &[
                `cld`, 0 in 7,418 after, twelve wide on TCG like this suite. Not shown: the \
                report this sighting never printed is the only thing that could, so the row \
                stands. Prior rate 1 of 3 loaded suites; retires at nine loaded suites of the \
-               fixed tree with no red under this name (p = e^-3), the count taken on \
-               2026-08-22 being in this row's evidence",
+               fixed tree with no red under this name (p = e^-3). That count is owed: on \
+               2026-08-22 the guest suite was refused behind `wt/toyos-census`'s sysroot \
+               claim (#209)",
         evidence: "three full `cargo test` runs in one session on `wt/toyos-purecrates`, twelve \
                    wide, `fastest boot 1522 ms against the reference 1320 ms` on the run that \
                    red",
