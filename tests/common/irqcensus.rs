@@ -122,6 +122,11 @@ pub fn observe(seq: u32, line: &str) {
 struct Guest {
     /// Interrupts on cpu0 as a fraction of the machine's.
     boot_cpu_share: f64,
+    /// Interrupts on cpu0, so the run's pooled share is an exact ratio of two
+    /// integers rather than a mean of per-guest fractions. A run is twelve
+    /// shards on CI and one process here, so the order statistics below are
+    /// per-shard and only this pair adds up across them.
+    on_boot_cpu: u64,
     total: u64,
     /// Per source, summed over every CPU, and the cpu0 part of it.
     per_source: [(u64, u64); SOURCES.len()],
@@ -148,6 +153,7 @@ fn guests() -> Vec<Guest> {
             }
             Some(Guest {
                 boot_cpu_share: boot as f64 / total as f64,
+                on_boot_cpu: boot,
                 total,
                 per_source,
                 cpus: by_cpu.len(),
@@ -180,12 +186,14 @@ pub fn summary() -> String {
     shares.sort_by(|a, b| a.partial_cmp(b).expect("a share is never NaN"));
     let total: u64 = guests.iter().map(|g| g.total).sum();
     let mut out = String::new();
+    let on_boot_cpu: u64 = guests.iter().map(|g| g.on_boot_cpu).sum();
     let _ = writeln!(
         out,
-        "  --- irq census: {} guest(s) reported, {} interrupt(s); cpu0's share median {:.1}% \
-         p90 {:.1}% max {:.1}%",
+        "  --- irq census: {} guest(s) reported, {} interrupt(s), {on_boot_cpu} of them on cpu0 \
+         ({:.1}%); per guest cpu0's share is median {:.1}% p90 {:.1}% max {:.1}%",
         guests.len(),
         total,
+        on_boot_cpu as f64 / total as f64 * 100.0,
         quantile(&shares, 0.5) * 100.0,
         quantile(&shares, 0.9) * 100.0,
         shares[shares.len() - 1] * 100.0,

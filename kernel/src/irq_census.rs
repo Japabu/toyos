@@ -8,10 +8,11 @@
 //! one CPU's interrupt bandwidth is the machine's — and the ceiling is only
 //! worth moving against a number. This is that number: a per-CPU, per-source
 //! delivery count, printed as one `irq: cpuN …` line per CPU beside the
-//! process-exit census (`process::exit`) and on the blocked-task dump.
+//! process-exit census (`process::exit`), on `SYS_SHUTDOWN` and on the
+//! blocked-task dump.
 //!
 //! **The counters are in `PerCpu`, so recording one is a single instruction.**
-//! [`took`] emits exactly `add qword ptr gs:[<off>], 1` twice — once for the
+//! `irq_took!` emits exactly `add qword ptr gs:[<off>], 1` twice — once for the
 //! machine's total and once for the source — with no register, no lock prefix
 //! and no memory operand outside this CPU's own block. Two reasons that is
 //! sound without a `lock`:
@@ -32,6 +33,18 @@
 //! increment is missing shows up as `total > Σ sources` rather than as a number
 //! that is quietly too small. `irq_census_conservation` is the gate that asks.
 //!
+//! **What it said the first time it was read.** Dev host, TCG, `cargo test
+//! --test toyos-build` 12-wide, 2026-08-22: 43 of the run's 80 guests printed a
+//! census — a test that boots and runs no program reaches no process exit — and
+//! of **18,314** interrupts **12,239 (66.8%) were cpu0's**, per guest a median
+//! of 87.9%. **Every one of the 7,962 device interrupts (xhci, net, sound,
+//! i8042) was cpu0's**, on the dev host and on all twelve hosted KVM shards
+//! alike; what is already spread is the timer and the shootdown IPI, which are
+//! per-CPU by construction. An interrupt count is a function of timing and moves
+//! between runs — the distribution is what to compare.
+//! `issues/kernel/every-interrupt-lands-on-the-boot-cpu.md` carries both
+//! machines' tables.
+//!
 //! **What is not counted, and why.** CPU exceptions are not interrupts a
 //! placement policy will ever place — they are raised by the instruction stream
 //! on the CPU that ran it — so `common_entry` counts nothing and the identity
@@ -51,8 +64,14 @@ use crate::scheduler::MAX_CPUS;
 ///
 /// Exhaustive, and each variant is one IDT `direct` vector — `arch::idt`'s
 /// table is what this list mirrors. Adding a device vector means adding a
-/// variant here and one [`took`] at its handler, or the total will outrun the
-/// sum of the sources and `irq_census_conservation` will say so.
+/// variant here and one `irq_took!` at its handler.
+///
+/// **A variant nothing counts does not compile.** `irq_took!` is the only thing
+/// that names one, so deleting an increment makes its variant unconstructed and
+/// `-D dead-code` refuses the kernel — measured, by deleting `irq_took!(Xhci)`.
+/// That covers the increment being *removed*; what it cannot cover is an
+/// increment that runs on some deliveries and not others, which is what
+/// `irq_census_conservation` is for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(usize)]
 pub enum Source {
