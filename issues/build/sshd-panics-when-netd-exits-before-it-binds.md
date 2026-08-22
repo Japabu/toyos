@@ -263,7 +263,14 @@ children, so the message is the entire diagnostic"*, and a machine that has a
 NIC and cannot bind must still be loud. What is wrong is that "the network
 service is gone" and "the network service refused" arrive as the same error.
 
-Two honest shapes, and neither is this branch's to choose:
+Two honest shapes were written down here before the producer was known, and
+**neither is what the fix turned out to be.** Both assumed the distinction
+already reached the SDK and that what was lost was downstream of it — the
+message, or the ordering. The reading above says the distinction never reached
+the SDK at all on the two write paths: `hangup` had no arm for either kernel
+word, so there was nothing for a message to carry. Kept as written, because a
+shortlist that was wrong is the more useful record now that the answer is
+beside it:
 
 - **The error's kind survives to the message.** The distinction largely
   exists already — `toyos`'s net client separates gone-service from refusal —
