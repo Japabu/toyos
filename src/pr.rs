@@ -369,6 +369,12 @@ fn merge_base_into_branch(root: &Path, branch: &str) -> Result<String, String> {
 /// on its own branch from the start; a later revert leaves the commit in
 /// history and the only remedy is rebuilding the branch. Cost one full rebuild
 /// on 2026-08-19 (`issues/build/abi-split-reads-commits-not-the-tree.md`).
+///
+/// **The ABI half is not always a pure declaration.** A syscall that gains a
+/// capability argument gains it in the ABI PR with the kernel accepting and
+/// ignoring it — the wrapper's signature and the kernel's argument decoding are
+/// one fact and cannot land apart — and the demand that *reads* it is the
+/// second PR. `SYS_SYSINFO`'s roster right landed that way on 2026-08-22.
 pub fn abi_lands_alone(root: &Path, base: &str) -> Result<(), String> {
     let commits = branch_commits(root, base)?;
     if commits.iter().any(|c| c.declares_inseparable) {
