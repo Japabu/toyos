@@ -2311,6 +2311,34 @@ pub const KNOWN_RED: &[Red] = &[
         source: "issues/build/the-duration-profile-is-enforced-where-it-was-not-measured.md",
         measured: "2026-08-21",
     },
+    // The same name on the instrument the profile *is* — twelve hosted shards —
+    // where it is not a machine gap at all but the test's own spread. Both rows
+    // stand: the one above is about a T14 lane pricing a hosted profile, this
+    // one is about the hosted lane pricing itself.
+    Red {
+        test: "xhci_full_speed_device",
+        instrument: Instrument::Ci,
+        finding: Finding::fires(1, 6),
+        standing: Standing::Stands,
+        what: "the durations gate and not the test, again, and from the other side of the \
+               commitment line: `xhci_full_speed_device is priced at 9890 ms — over the 8000 ms \
+               a Fast test may be committed at and under the 10000 ms line — and \
+               xhci_full_speed_device remains Fast`. Since 2026-08-22 a landing renders the \
+               price verdict only for names it registered or re-tiered, so on a pull request or \
+               a merge-queue composition that left this name alone the same sentence prints as \
+               a `::warning::` and the job exits 0; **on the nightly it is a red, and it is a \
+               finding about this test's variance to be fixed at the test** — not a re-run, and \
+               not a `Why::Cost` row, which the return rule refuses the moment a run prices it \
+               at or under 8,000 ms",
+        evidence: "six hosted twelve-shard runs, 2026-08-20 to 2026-08-22, priced it 4,700, \
+                   6,816, 6,900, 7,456, 7,499 and 9,890 ms with its two slowest shards \
+                   producing its second- and third-cheapest prices; within-name sd of ln(price) \
+                   0.219 against a population 0.124 over 640 observations, the 9th most \
+                   variable of 83 Fast names. The 9,890 ms reading dequeued merge-queue \
+                   composition 32550410305",
+        source: "issues/build/xhci-full-speed-device-jumped-47-percent-over-its-commitment.md",
+        measured: "2026-08-22",
+    },
     // One observation, so `Seen` and not a rate: the harness re-ran it alone and
     // it passed, and its own verdict line declined to call that a
     // classification. The row is here because a `<symbol unread: …>` stopped

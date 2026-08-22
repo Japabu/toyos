@@ -43,10 +43,42 @@
 //! measured value from that run's own `test-durations-merged` artifact, never a
 //! re-run. Learned on 2026-08-19, when three PRs stalled on exactly this while
 //! everyone read the red as stale noise.
+//!
+//! **Two axes decide whether the price verdict is rendered, and they compose.**
+//! *Which instrument* is the first, above: only the hosted twelve-shard shape
+//! the profile was taken in may render it at all. *Which names* is the second,
+//! and it is the owner's ruling of 2026-08-22: a run measuring a change renders
+//! the verdict for the names that change registered or re-tiered, and prints
+//! every other one as a `::warning::` naming the name, the price and why this
+//! run does not enforce it. The nightly passes no base, so [`Enforced`] is
+//! `Everything` there and the full verdict reds — fixed by a pull request the
+//! next day like every other nightly red.
+//!
+//! The reason is measured. Over six hosted twelve-shard runs — 72 shard-runs,
+//! 640 observations, 130 names — a per-shard common price factor explains 57%
+//! of the run-to-run variance a name shows and spreads about 1.28x from p10 to
+//! p90; it is *not* the shard's boot width (slope 0.014, R² 0.003 on the
+//! merge-queue lane), so nothing normalises it away
+//! (`issues/build/a-shards-boot-width-does-not-price-its-tests.md`). A name
+//! priced anywhere near a line therefore reads over it on some runs by shard
+//! luck, and under the required merge queue that red dequeues the composition —
+//! every pull request behind it included, none of whose authors touched the
+//! name. `xhci_full_speed_device` is the recorded case: six prices from 4,700
+//! to 9,890 ms on one unchanged test, the last of them reding composition
+//! 32550410305.
+//!
+//! Nothing about what a tier *is* moved: `src/tiers.rs`'s ceiling is still hard
+//! and unmargined and its rule is unchanged. Nor is the tree's own bookkeeping
+//! softened — a committed `UNMEASURED` marker past its bought run, a duplicate
+//! execution label, a short shard set, an erased Fast label and every
+//! declaration verdict [`crate::tiers::Verdict::priced`] marks `false` red on
+//! every run at every base, because none of them is a fact about which shard ran
+//! what.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 /// The file name a sharded run leaves its own measurement in.
 const SHARD_PREFIX: &str = "test-durations.shard-";
@@ -60,6 +92,80 @@ const SHARD_PREFIX: &str = "test-durations.shard-";
 /// the two spellings together so the wording cannot move out from under the
 /// workflow in silence.
 pub const TIER_DISAGREEMENT: &str = "the merged CI profile and tier declaration disagree";
+
+/// The flag a run measuring one change passes to say what it changed *from*.
+///
+/// A `const` for the same reason [`TIER_DISAGREEMENT`] is one: the value comes
+/// out of `.github/workflows/ci.yml`'s event context — `merge_group.base_sha`
+/// or `pull_request.base.sha` — and `src/ci.rs` holds the spelling in the
+/// workflow against the spelling here. Drop the flag from the workflow and
+/// every run silently becomes the nightly, reding compositions on names nobody
+/// in them touched; misspell it and nothing at all changes, which is the same
+/// failure with no line to read.
+pub const TIER_BASE_FLAG: &str = "--tier-base";
+
+/// Which names this run renders the tier's *price* verdict for.
+///
+/// Not which names it measures, and not which tests ran: every Fast test runs
+/// on every run and every verdict is computed. This decides only which of them
+/// may stop a landing.
+pub enum Enforced {
+    /// All of them. The nightly's twelve hosted shards, a push to `main`, a
+    /// `workflow_dispatch`, a hand-run merge — anything that named no base.
+    /// **A base that is absent or empty means this and never the reverse**: a
+    /// workflow expression that evaluates to nothing must widen the gate, not
+    /// silence it.
+    Everything,
+    /// Only the names the change under measurement registered, re-tiered, or
+    /// gave a different `Why` in `src/tiers.rs`'s `RELEGATED`. Every other
+    /// price verdict prints as a `::warning::` and the job exits 0.
+    Touched { base: String, names: BTreeSet<String> },
+}
+
+impl Enforced {
+    /// What this run passed, read from the command line.
+    pub fn from_args(root: &Path, args: &[String]) -> Enforced {
+        let Some(pos) = args.iter().position(|a| a == TIER_BASE_FLAG) else {
+            return Enforced::Everything;
+        };
+        match args.get(pos + 1).map(String::as_str) {
+            None | Some("") => Enforced::Everything,
+            Some(base) => {
+                Enforced::Touched { base: base.to_string(), names: touched_names(root, base) }
+            }
+        }
+    }
+
+    /// Whether a price verdict about `name` may stop this run.
+    fn renders(&self, name: &str) -> bool {
+        match self {
+            Enforced::Everything => true,
+            Enforced::Touched { names, .. } => names.contains(name),
+        }
+    }
+
+    /// The `[durations]` line saying what this run's verdict is about, which is
+    /// the line a reader of a green job needs in order to know it was green
+    /// about the whole tree or about two names.
+    fn scope(&self) -> String {
+        match self {
+            Enforced::Everything => "[durations] the tier verdict is rendered for every name: \
+                 this run named no base, so it is the instrument of record"
+                .to_string(),
+            Enforced::Touched { base, names } if names.is_empty() => format!(
+                "[durations] the tier verdict is rendered for no name: this change registered \
+                 and re-tiered nothing against {base}, so every price verdict below is a \
+                 warning and the nightly renders them"
+            ),
+            Enforced::Touched { base, names } => format!(
+                "[durations] the tier verdict is rendered for the {} name(s) this change \
+                 registered or re-tiered against {base}: {}",
+                names.len(),
+                names.iter().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+}
 
 /// `--merge-durations <dir>`: every shard file under `dir`, into
 /// `tests/test-durations`.
@@ -75,6 +181,7 @@ pub fn dispatch(root: &Path, args: &[String]) {
         panic!("--merge-durations needs the directory the shard files are in")
     });
     let dir = Path::new(dir);
+    let enforced = Enforced::from_args(root, args);
 
     let mut files = Vec::new();
     collect(dir, &mut files);
@@ -100,14 +207,29 @@ pub fn dispatch(root: &Path, args: &[String]) {
     let out = root.join("tests/test-durations");
     let before = read_profile(&out);
     report(&merged, &before, count);
+    println!("{}", enforced.scope());
 
     let profile = merged_profile(&merged, &before);
     let body: String = profile.iter().map(|(n, ms)| format!("{n} {ms}\n")).collect();
     fs::write(&out, body).unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));
-    if let Err(refusal) = validate_written_profile(&profile, &before) {
+
+    let rendered = render_verdict(&profile, &before, &enforced);
+    if !rendered.warned.is_empty() {
+        println!(
+            "[durations] {} price verdict(s) this run does not render, listed as warnings \
+             above and refused by the nightly: {}",
+            rendered.warned.len(),
+            rendered.names.join(", ")
+        );
+        for warning in &rendered.warned {
+            println!("::warning::{warning}");
+        }
+    }
+    if !rendered.refused.is_empty() {
         panic!(
-            "{TIER_DISAGREEMENT}:\n{refusal}\n\
+            "{TIER_DISAGREEMENT}:\n{}\n\
              The measured profile was written to {} for inspection",
+            rendered.refused.join("\n"),
             out.display()
         );
     }
@@ -120,28 +242,347 @@ pub fn dispatch(root: &Path, args: &[String]) {
     );
 }
 
+/// What the tier rule came to on this run: what it refuses, and what it would
+/// have refused had this been the run that renders the whole verdict.
+struct Rendered {
+    refused: Vec<String>,
+    warned: Vec<String>,
+    /// The names behind `warned`, for the one summary line.
+    names: Vec<String>,
+}
+
 /// The verdict issued only after the measured artifact has been written.
 ///
 /// A new test's explicit UNMEASURED row buys exactly one KVM instrument run.
 /// Even when that execution is fast, the commit carrying the marker stays red;
-/// the next commit must replace it with the artifact's measured value.
-fn validate_written_profile(
+/// the next commit must replace it with the artifact's measured value. **That
+/// refusal does not move with the base** — a committed marker is a row the
+/// change itself put in the profile, so it is the change's own business on
+/// every run — and neither does any verdict `tiers::Verdict::priced` marks
+/// `false`. Only a measured price may be softened to a warning, and only for a
+/// name this change left alone.
+fn render_verdict(
     profile: &BTreeMap<String, u64>,
     before: &BTreeMap<String, u64>,
-) -> Result<(), String> {
+    enforced: &Enforced,
+) -> Rendered {
+    let mut out = Rendered { refused: Vec::new(), warned: Vec::new(), names: Vec::new() };
+
     let provisional: Vec<&str> = before
         .iter()
         .filter(|(_, ms)| **ms == crate::tiers::UNMEASURED_MS)
         .map(|(label, _)| label.as_str())
         .collect();
     if !provisional.is_empty() {
-        return Err(format!(
+        out.refused.push(format!(
             "committed UNMEASURED profile marker(s) are provisional and may not land: {}. \
              Replace them with the values in the measured artifact and assign the final tier",
             provisional.join(", ")
         ));
+        return out;
     }
-    crate::tiers::validate_ci_profile(profile)
+
+    for verdict in crate::tiers::ci_profile_verdicts(profile) {
+        if !verdict.priced {
+            out.refused.push(verdict.message);
+        } else if enforced.renders(&verdict.name) {
+            match enforced {
+                Enforced::Everything => out.refused.push(verdict.message),
+                Enforced::Touched { .. } => out.refused.push(format!(
+                    "{} [enforced on this run: this change registered or re-tiered {}]",
+                    verdict.message, verdict.name
+                )),
+            }
+        } else {
+            out.warned.push(format!(
+                "{} [not enforced on this run: this change did not register or re-tier {}, and \
+                 a price near a line moves about 1.28x from p10 to p90 with the shard that ran \
+                 it. The nightly's twelve hosted shards render the full verdict, and a nightly \
+                 red on this name is fixed by a pull request the next day]",
+                verdict.message, verdict.name
+            ));
+            out.names.push(verdict.name);
+        }
+    }
+    out.names.sort();
+    out.names.dedup();
+    out
+}
+
+/// Every registered name this change registered, re-tiered, re-scheduled, or
+/// moved into, out of, or across `src/tiers.rs`'s `RELEGATED`.
+///
+/// Two files answer it and no third: `tests/toyos.rs` is where a name's
+/// `(name, Sched, Tier)` row lives, and `src/tiers.rs`'s `RELEGATED` is where
+/// its `Why` does. A change to either is a change to what tier that name
+/// claims, which is exactly the claim the price verdict grades. Everything else
+/// a diff can touch — a kernel path, a test body, a `ci_ms` note — may well
+/// move a price, and deliberately does not enter here: a name whose price moved
+/// without its declaration moving is what the nightly is for.
+fn touched_names(root: &Path, base: &str) -> BTreeSet<String> {
+    let registered = changed(
+        &registrations(&at_base(root, base, "tests/toyos.rs")),
+        &registrations(&at_head(root, "tests/toyos.rs")),
+    );
+    let relegated = changed(
+        &relegation_whys(&at_base(root, base, "src/tiers.rs")),
+        &relegation_whys(&at_head(root, "src/tiers.rs")),
+    );
+    registered.union(&relegated).cloned().collect()
+}
+
+/// The keys the two sides disagree about, added and removed included.
+fn changed(
+    base: &BTreeMap<String, String>,
+    head: &BTreeMap<String, String>,
+) -> BTreeSet<String> {
+    base.keys()
+        .chain(head.keys())
+        .filter(|key| base.get(*key) != head.get(*key))
+        .cloned()
+        .collect()
+}
+
+/// One tracked file as this run's checkout has it.
+fn at_head(root: &Path, path: &str) -> String {
+    fs::read_to_string(root.join(path))
+        .unwrap_or_else(|e| panic!("reading {}: {e}", root.join(path).display()))
+}
+
+/// The same file at the base this run was asked to measure against.
+///
+/// **A base that was named and cannot be read is a refusal, never a silent
+/// widening or a silent narrowing.** The usual cause is a depth-1 checkout: the
+/// base commit is not in the clone, `git show` says so, and the fix is
+/// `fetch-depth: 0` on the job rather than a guess about which names moved.
+fn at_base(root: &Path, base: &str, path: &str) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show", &format!("{base}:{path}")])
+        .output()
+        .unwrap_or_else(|e| panic!("running git show {base}:{path}: {e}"));
+    assert!(
+        out.status.success(),
+        "git show {base}:{path} failed ({}): {}. {TIER_BASE_FLAG} names the commit this change \
+         is measured against, so it must be in this clone — a depth-1 checkout does not have \
+         it, and `fetch-depth: 0` is what puts it there. Refusing rather than guessing which \
+         names this change touched",
+        out.status,
+        String::from_utf8_lossy(&out.stderr).trim(),
+    );
+    String::from_utf8(out.stdout).unwrap_or_else(|e| panic!("{base}:{path} is not UTF-8: {e}"))
+}
+
+/// Rust source with every `//`/`/* */` comment and every string literal's
+/// *contents* blanked, byte for byte, so an offset into it is an offset into
+/// the original.
+///
+/// Deliberately not a parser. The two tables this reads are plain data and the
+/// whole job is to find brackets and keys that are code rather than prose — a
+/// `guards:` string full of parentheses and a comment naming a test are exactly
+/// what a `find` on the raw text gets wrong. Quotes survive so a name can still
+/// be sliced out of the original by its delimiters.
+fn mask(text: &str) -> Vec<u8> {
+    let src = text.as_bytes();
+    let mut out = vec![b' '; src.len()];
+    let mut i = 0;
+    while i < src.len() {
+        match src[i] {
+            b'/' if src.get(i + 1) == Some(&b'/') => {
+                while i < src.len() && src[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if src.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < src.len() && !(src[i] == b'*' && src.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(src.len());
+            }
+            b'"' => {
+                out[i] = b'"';
+                i += 1;
+                while i < src.len() && src[i] != b'"' {
+                    // A string's contents become filler rather than blanks: a
+                    // blank would let an empty literal and a full one look the
+                    // same to a scan that only reads the mask.
+                    out[i] = b'_';
+                    if src[i] == b'\\' {
+                        i += 1;
+                        if i < src.len() {
+                            out[i] = b'_';
+                        }
+                    }
+                    i += 1;
+                }
+                if i < src.len() {
+                    out[i] = b'"';
+                    i += 1;
+                }
+            }
+            // A char literal, told from a lifetime by what follows the quote:
+            // an escape, or a single byte and a closing quote. `'"'` and `'}'`
+            // are the ones that matter — either would desynchronise everything
+            // after it, and `tests/toyos.rs` has a `trim_matches('"')` in it.
+            // A multibyte char literal cannot hold a delimiter, so falling
+            // through on one costs nothing.
+            b'\'' if src.get(i + 1) == Some(&b'\\') || src.get(i + 2) == Some(&b'\'') => {
+                out[i] = b'\'';
+                i += 1;
+                if src.get(i) == Some(&b'\\') {
+                    i += 1;
+                }
+                i = (i + 2).min(src.len());
+            }
+            byte => {
+                out[i] = byte;
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The half-open byte range of `const <name>: … = &[ … ]`'s body.
+///
+/// The `= ` matters: the *type* of every one of these tables starts `&[` too,
+/// so a scan for the first `&[` after the name finds the declaration instead of
+/// the data.
+fn table_span(masked: &[u8], name: &str) -> Option<(usize, usize)> {
+    let decl = find(masked, 0, &format!("const {name}:"))?;
+    let eq = find(masked, decl, "] =")? + 3;
+    let open = find(masked, eq, "&[")? + 2;
+    Some((open, closer(masked, open, b'[', b']')?))
+}
+
+/// Where the delimiter opened just before `from` is closed, counting only
+/// delimiters the mask says are code.
+fn closer(masked: &[u8], from: usize, open: u8, close: u8) -> Option<usize> {
+    let mut depth = 1usize;
+    for (offset, byte) in masked[from..].iter().enumerate() {
+        if *byte == open {
+            depth += 1;
+        } else if *byte == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(from + offset);
+            }
+        }
+    }
+    None
+}
+
+/// Every top-level `open … close` span inside `[lo, hi)`.
+fn spans(masked: &[u8], lo: usize, hi: usize, open: u8, close: u8) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut start = lo;
+    for (i, byte) in masked.iter().enumerate().take(hi).skip(lo) {
+        if *byte == open {
+            depth += 1;
+            if depth == 1 {
+                start = i + 1;
+            }
+        } else if *byte == close && depth > 0 {
+            depth -= 1;
+            if depth == 0 {
+                out.push((start, i));
+            }
+        }
+    }
+    out
+}
+
+/// `needle` at a code position at or after `from`.
+fn find(masked: &[u8], from: usize, needle: &str) -> Option<usize> {
+    let needle = needle.as_bytes();
+    (from..masked.len().saturating_sub(needle.len() - 1))
+        .find(|i| &masked[*i..*i + needle.len()] == needle)
+}
+
+/// The string literal starting at or after `from`, and where it ended.
+fn literal(text: &str, masked: &[u8], from: usize, hi: usize) -> Option<(String, usize)> {
+    let open = (from..hi).find(|i| masked[*i] == b'"')?;
+    let close = (open + 1..hi).find(|i| masked[*i] == b'"')?;
+    Some((text[open + 1..close].to_string(), close + 1))
+}
+
+/// Whitespace collapsed to single spaces, so a rewrapped line is not a change.
+fn flat(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Every registration row of `tests/toyos.rs`, name to what is declared about
+/// it — the table it is in and the rest of its tuple, which is its `Sched` and
+/// its `Tier`.
+fn registrations(text: &str) -> BTreeMap<String, String> {
+    let masked = mask(text);
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for table in ["MACHINE_TESTS", "SCREEN_TESTS", "AUDIO_TESTS"] {
+        let (lo, hi) = table_span(&masked, table).unwrap_or_else(|| {
+            panic!(
+                "tests/toyos.rs no longer declares {table} as `const {table}: … = &[ … ]`, so \
+                 which names a change registered or re-tiered cannot be read from it"
+            )
+        });
+        for (rlo, rhi) in spans(&masked, lo, hi, b'(', b')') {
+            let Some((name, after)) = literal(text, &masked, rlo, rhi) else { continue };
+            let row = format!(
+                "{table}({})",
+                flat(text[after..rhi].trim_start().trim_start_matches(','))
+            );
+            // Accumulated rather than overwritten: one name declared in two
+            // tables must read as two declarations, or moving it between them
+            // would look like no change at all.
+            out.entry(name).or_default().push_str(&row);
+        }
+    }
+    out
+}
+
+/// Every `RELEGATED` row of `src/tiers.rs`, test name to its `Why`.
+///
+/// `ci_ms` and `guards` are deliberately not read: the first is a note about
+/// the last measurement and the second is prose, and neither changes what tier
+/// the name claims.
+fn relegation_whys(text: &str) -> BTreeMap<String, String> {
+    let masked = mask(text);
+    let (lo, hi) = table_span(&masked, "RELEGATED").unwrap_or_else(|| {
+        panic!(
+            "src/tiers.rs no longer declares RELEGATED as `const RELEGATED: … = &[ … ]`, so \
+             which names a change re-tiered cannot be read from it"
+        )
+    });
+    let mut out = BTreeMap::new();
+    for (rlo, rhi) in spans(&masked, lo, hi, b'{', b'}') {
+        let Some(at) = find(&masked, rlo, "test:").filter(|at| *at < rhi) else { continue };
+        let Some((name, _)) = literal(text, &masked, at, rhi) else { continue };
+        let why = match find(&masked, rlo, "why:").filter(|at| *at < rhi) {
+            // The value runs to the comma that ends the field, and
+            // `Why::RidesTheBootOf("…")` has a paren pair inside it — so the
+            // comma has to be one at depth zero.
+            Some(at) => {
+                let mut depth = 0usize;
+                let end = (at + 4..rhi)
+                    .find(|i| {
+                        match masked[*i] {
+                            b'(' => depth += 1,
+                            b')' => depth = depth.saturating_sub(1),
+                            b',' if depth == 0 => return true,
+                            _ => {}
+                        }
+                        false
+                    })
+                    .unwrap_or(rhi);
+                flat(&text[at + 4..end])
+            }
+            None => String::new(),
+        };
+        out.insert(name, why);
+    }
+    out
 }
 
 /// Add one execution label to a whole-run profile.
@@ -349,11 +790,32 @@ fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tiers::{FAST_CEILING_MS, FAST_COMMIT_MS};
     use std::path::PathBuf;
 
     fn shards(names: &[&str]) -> Vec<PathBuf> {
         names.iter().map(|n| PathBuf::from("/tmp").join(format!("{SHARD_PREFIX}{n}"))).collect()
     }
+
+    fn root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
+    fn committed_profile() -> BTreeMap<String, u64> {
+        read_profile(&root().join("tests/test-durations"))
+    }
+
+    /// A run measuring a change that touched exactly these names.
+    fn touched(names: &[&str]) -> Enforced {
+        Enforced::Touched {
+            base: "0000000".to_string(),
+            names: names.iter().map(|n| n.to_string()).collect(),
+        }
+    }
+
+    /// The Fast name the tier tests price against. Ordinary, cheap, and not
+    /// near either line, so putting it in the band is the whole mutation.
+    const A_FAST_NAME: &str = "iommu_empty_domain";
 
     #[test]
     fn a_whole_run_is_every_shard_of_one_run_exactly_once() {
@@ -426,6 +888,11 @@ mod tests {
         assert!(refusal.contains("one shard may have run"), "{refusal}");
     }
 
+    /// **The UNMEASURED rule does not move with the base.** A committed marker
+    /// is a row the change itself put in the profile, so it is refused on the
+    /// run that measures the change — including one whose change touched no
+    /// name at all, which is every run where this filter could have swallowed
+    /// it.
     #[test]
     fn an_unmeasured_marker_buys_one_red_measurement_commit() {
         let measured = BTreeMap::from([(
@@ -437,10 +904,104 @@ mod tests {
         let after = merged_profile(&measured, &before);
         assert_eq!(after.get("new_fast_test"), Some(&321));
 
-        let refusal = validate_written_profile(&after, &before).unwrap_err();
-        assert!(refusal.contains("new_fast_test"), "{refusal}");
-        assert!(refusal.contains("may not land"), "{refusal}");
-        assert!(refusal.contains("measured artifact"), "{refusal}");
+        for enforced in [Enforced::Everything, touched(&[]), touched(&["new_fast_test"])] {
+            let rendered = render_verdict(&after, &before, &enforced);
+            let refusal = rendered.refused.join("\n");
+            assert!(rendered.warned.is_empty(), "{:?}", rendered.warned);
+            assert!(refusal.contains("new_fast_test"), "{refusal}");
+            assert!(refusal.contains("may not land"), "{refusal}");
+            assert!(refusal.contains("measured artifact"), "{refusal}");
+        }
+    }
+
+    /// **The name a change registered or re-tiered is the name it is refused
+    /// for.** A pull request that priced its own new test in the band gets the
+    /// verdict, in the same words the nightly would use, plus the reason this
+    /// run is the one rendering it.
+    #[test]
+    fn a_changed_name_priced_without_margin_is_refused_on_a_pull_request_run() {
+        let mut profile = committed_profile();
+        profile.insert(A_FAST_NAME.to_string(), FAST_COMMIT_MS + 1);
+
+        let rendered = render_verdict(&profile, &committed_profile(), &touched(&[A_FAST_NAME]));
+        assert!(rendered.warned.is_empty(), "{:?}", rendered.warned);
+        let refusal = rendered.refused.join("\n");
+        assert!(refusal.contains(A_FAST_NAME), "{refusal}");
+        assert!(refusal.contains("priced without margin"), "{refusal}");
+        assert!(refusal.contains("enforced on this run"), "{refusal}");
+    }
+
+    /// **The negative control for the whole change, and the assertion that
+    /// reds if the base-aware filter is removed:** `rendered.refused` is empty
+    /// for a name over the commitment line that this change did not touch. The
+    /// second half is the other direction — the same profile on the nightly,
+    /// where the identical verdict is a refusal.
+    ///
+    /// This is `xhci_full_speed_device` at 9,890 ms in merge-queue composition
+    /// 32550410305, in the shape a unit test can hold: a name nothing in the
+    /// change under measurement went near.
+    #[test]
+    fn an_untouched_name_is_a_warning_on_a_landing_and_a_refusal_on_the_nightly() {
+        let mut profile = committed_profile();
+        profile.insert(A_FAST_NAME.to_string(), FAST_COMMIT_MS + 1);
+        let before = committed_profile();
+
+        let landing = render_verdict(&profile, &before, &touched(&["some_other_test"]));
+        assert!(landing.refused.is_empty(), "{:?}", landing.refused);
+        assert_eq!(landing.names, [A_FAST_NAME]);
+        let warning = landing.warned.join("\n");
+        assert!(warning.contains(A_FAST_NAME), "{warning}");
+        assert!(warning.contains("priced without margin"), "{warning}");
+        assert!(warning.contains("not enforced on this run"), "{warning}");
+        assert!(warning.contains("The nightly's twelve hosted shards"), "{warning}");
+
+        let nightly = render_verdict(&profile, &before, &Enforced::Everything);
+        assert!(nightly.warned.is_empty(), "{:?}", nightly.warned);
+        let refusal = nightly.refused.join("\n");
+        assert!(refusal.contains(A_FAST_NAME), "{refusal}");
+        assert!(refusal.contains("priced without margin"), "{refusal}");
+
+        // The ceiling's own red is the same rule on the same axis: hard,
+        // unmargined, and still the nightly's to render for a name a change
+        // left alone.
+        profile.insert(A_FAST_NAME.to_string(), FAST_CEILING_MS + 1);
+        assert!(render_verdict(&profile, &before, &touched(&[])).refused.is_empty());
+        assert!(
+            render_verdict(&profile, &before, &Enforced::Everything)
+                .refused
+                .join("\n")
+                .contains("remains Fast")
+        );
+    }
+
+    /// A verdict about the *declaration* is true whoever measured it, so no
+    /// base softens one. Missing evidence for a Nightly row is the case that
+    /// would otherwise let a deleted test's profile row rot on every landing.
+    #[test]
+    fn a_declaration_verdict_is_refused_at_every_base() {
+        let mut profile = committed_profile();
+        profile.remove("desktop_window_child");
+        let rendered = render_verdict(&profile, &committed_profile(), &touched(&[]));
+        assert!(rendered.warned.is_empty(), "{:?}", rendered.warned);
+        let refusal = rendered.refused.join("\n");
+        assert!(refusal.contains("desktop_window_child"), "{refusal}");
+        assert!(refusal.contains("missing CI evidence"), "{refusal}");
+    }
+
+    /// **A base nobody named enforces everything.** The nightly passes no
+    /// flag; a workflow expression that evaluates to nothing passes an empty
+    /// one; both are the instrument of record and neither may silence the
+    /// gate. `--tier-base` with a real sha is the only way to narrow it, and
+    /// that path asks git, so it is not exercised here.
+    #[test]
+    fn a_missing_or_empty_base_enforces_everything() {
+        let renders = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            Enforced::from_args(&root(), &args).renders("any_name_at_all")
+        };
+        assert!(renders(&["--merge-durations", "/tmp/durations"]));
+        assert!(renders(&["--merge-durations", "/tmp/durations", TIER_BASE_FLAG]));
+        assert!(renders(&["--merge-durations", "/tmp/durations", TIER_BASE_FLAG, ""]));
     }
 
     #[test]
@@ -456,6 +1017,183 @@ mod tests {
         let before = BTreeMap::from([(nightly.to_string(), 45_000)]);
 
         assert_eq!(merged_profile(&measured, &before).get(nightly), Some(&12_345));
+    }
+
+    /// **The scan's view of `RELEGATED` against the compiler's.** `Why` derives
+    /// `Debug`, so every row's parsed text can be checked against the value the
+    /// compiler built from the same bytes — an independent reading of the one
+    /// table, not a fixture that agrees with itself.
+    #[test]
+    fn the_relegation_scan_reads_what_the_compiler_reads() {
+        let parsed = relegation_whys(&at_head(&root(), "src/tiers.rs"));
+        let names: BTreeSet<String> =
+            crate::tiers::relegated_names().iter().map(|n| n.to_string()).collect();
+        assert_eq!(parsed.keys().cloned().collect::<BTreeSet<_>>(), names);
+        for row in crate::tiers::RELEGATED {
+            assert_eq!(
+                parsed.get(row.test).map(String::as_str),
+                Some(format!("Why::{:?}", row.why).as_str()),
+                "{}",
+                row.test
+            );
+        }
+    }
+
+    /// **The scan's view of `tests/toyos.rs` against `src/tiers.rs`.** Every
+    /// relegated name must be registered `Tier::Nightly` and no other name may
+    /// be — the same bidirectional agreement `tests/toyos.rs` gates itself on,
+    /// asked here of the text this reads rather than of the values it compiles.
+    /// A table that moved out from under the scan fails this rather than
+    /// quietly reporting that a change touched nothing.
+    #[test]
+    fn the_registration_scan_agrees_with_the_relegation_table() {
+        let parsed = registrations(&at_head(&root(), "tests/toyos.rs"));
+        let declared_nightly: BTreeSet<&str> = parsed
+            .iter()
+            .filter(|(_, row)| row.contains("Tier::Nightly"))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(declared_nightly, crate::tiers::relegated_names());
+        // The three tables held 145 rows when this was written; the floor is
+        // loose because the number moves with every registration, and the
+        // agreement above is what actually has teeth.
+        assert!(
+            parsed.len() > 100,
+            "{} registration row(s) found — the three tables are bigger than that",
+            parsed.len()
+        );
+        assert_eq!(
+            parsed.get("xhci_full_speed_device").map(String::as_str),
+            Some("MACHINE_TESTS(Sched::Parallel, Tier::Fast)")
+        );
+        assert_eq!(
+            parsed.get("audio_tone").map(String::as_str),
+            Some("AUDIO_TESTS(Tier::Nightly)")
+        );
+    }
+
+    /// **The whole path, git included**, in a repository this test builds: a
+    /// base commit, an edit on top of it, and `--tier-base <sha>` naming the
+    /// first. The two file paths and the `<sha>:<path>` spelling are what this
+    /// has teeth on — the scan is checked against real tables elsewhere, and
+    /// neither check sees the other's failure.
+    #[test]
+    fn the_base_a_run_names_is_read_out_of_git() {
+        let dir = std::env::temp_dir().join("toyos-durations-base");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("tests")).unwrap();
+        fs::create_dir_all(dir.join("src")).unwrap();
+        let registrations = |tier: &str| {
+            format!(
+                "const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[\n    \
+                 (\"kept\", Sched::Parallel, Tier::Fast),\n    \
+                 (\"retiered\", Sched::Parallel, Tier::{tier}),\n];\n\
+                 const SCREEN_TESTS: &[(&str, Sched, Tier)] = &[];\n\
+                 const AUDIO_TESTS: &[(&str, Tier)] = &[];\n"
+            )
+        };
+        let relegated = |rows: &str| {
+            format!("pub const RELEGATED: &[Relegated] = &[\n{rows}];\n")
+        };
+        fs::write(dir.join("tests/toyos.rs"), registrations("Fast")).unwrap();
+        fs::write(dir.join("src/tiers.rs"), relegated("")).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"]);
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "base"]);
+        let base = String::from_utf8(
+            Command::new("git").arg("-C").arg(&dir).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        fs::write(dir.join("tests/toyos.rs"), registrations("Nightly")).unwrap();
+        fs::write(
+            dir.join("src/tiers.rs"),
+            relegated(
+                "    Relegated { test: \"retiered\", ci_ms: 9, why: Why::Cost, guards: \"g\" },\n",
+            ),
+        )
+        .unwrap();
+
+        let args: Vec<String> = vec!["--merge-durations".into(), "d".into(), TIER_BASE_FLAG.into(), base];
+        let enforced = Enforced::from_args(&dir, &args);
+        assert!(enforced.renders("retiered"));
+        assert!(!enforced.renders("kept"));
+        assert!(enforced.scope().contains("retiered"), "{}", enforced.scope());
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .expect("run git")
+            .success();
+        assert!(ok, "git {args:?} in {}", dir.display());
+    }
+
+    /// What "the change touched this name" means, in the two files that answer
+    /// it: a new registration, a re-tiering, a removal, a `Why` that moved, a
+    /// row that appeared, a row that left — and nothing for a comment, a
+    /// `ci_ms` note or a reworded `guards`.
+    #[test]
+    fn a_touched_name_is_one_whose_declaration_moved() {
+        // The prelude is not decoration: a `'\"'` read as an opening quote, or
+        // a `'}'` counted as a delimiter, desynchronises everything after it,
+        // and both are in the real `tests/toyos.rs`.
+        let base_reg = "\
+fn quoted(s: &'static str) -> &str { s.trim_matches('\"').trim_matches('}') }
+const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
+    // A comment mentioning (\"ghost\", Sched::Serial, Tier::Fast).
+    (\"kept\", Sched::Parallel, Tier::Fast),
+    (\"retiered\", Sched::Parallel, Tier::Fast),
+    (\"removed\", Sched::Parallel, Tier::Fast),
+];
+const SCREEN_TESTS: &[(&str, Sched, Tier)] = &[(\"rescheduled\", Sched::Parallel, Tier::Fast)];
+const AUDIO_TESTS: &[(&str, Tier)] = &[(\"audio\", Tier::Nightly)];
+";
+        let head_reg = "\
+const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
+    (\"kept\", Sched::Parallel, Tier::Fast),
+    (\"retiered\", Sched::Parallel, Tier::Nightly),
+    (\"added\", Sched::Parallel, Tier::Fast),
+];
+const SCREEN_TESTS: &[(&str, Sched, Tier)] = &[(\"rescheduled\", Sched::Serial, Tier::Fast)];
+const AUDIO_TESTS: &[(&str, Tier)] = &[(\"audio\", Tier::Nightly)];
+";
+        assert_eq!(
+            changed(&registrations(base_reg), &registrations(head_reg)),
+            ["added", "removed", "rescheduled", "retiered"]
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<BTreeSet<_>>()
+        );
+
+        let base_why = "\
+fn quoted(s: &'static str) -> &str { s.trim_matches('\"').trim_matches('}') }
+const RELEGATED: &[Relegated] = &[
+    Relegated { test: \"stays\", ci_ms: 1, why: Why::Cost, guards: \"a { and a ,\" },
+    Relegated { test: \"reclassified\", ci_ms: 2, why: Why::Cost, guards: \"g\" },
+    Relegated { test: \"returns\", ci_ms: 3, why: Why::RidesTheBootOf(\"stays\"), guards: \"g\" },
+];
+";
+        let head_why = "\
+const RELEGATED: &[Relegated] = &[
+    // 2026-08-22: `returns` left this table.
+    Relegated { test: \"stays\", ci_ms: 99, why: Why::Cost, guards: \"reworded\" },
+    Relegated { test: \"reclassified\", ci_ms: 2, why: Why::TimerAnchored, guards: \"g\" },
+    Relegated { test: \"relegated\", ci_ms: 4, why: Why::Cost, guards: \"g\" },
+];
+";
+        assert_eq!(
+            changed(&relegation_whys(base_why), &relegation_whys(head_why)),
+            ["reclassified", "relegated", "returns"]
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<BTreeSet<_>>()
+        );
     }
 
     #[test]

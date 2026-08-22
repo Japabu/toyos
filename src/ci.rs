@@ -333,6 +333,47 @@ mod tests {
         );
     }
 
+    /// The second axis of the same job, held together for the same reason.
+    ///
+    /// Which *names* a run renders the price verdict for is decided by
+    /// [`crate::durations::TIER_BASE_FLAG`] and by the two event expressions
+    /// that fill it. Both failure directions are silent in the file that
+    /// carries them: drop the flag and every pull request and every merge-queue
+    /// composition quietly becomes the nightly, reding on names nobody in them
+    /// touched; drop one of the two event expressions and that event quietly
+    /// stops narrowing at all, with the workflow still reading perfectly.
+    /// `merge_group` in particular is the lane the verdict is *rendered* on, so
+    /// losing its base is losing the whole change.
+    #[test]
+    fn the_names_a_landing_is_judged_on_come_from_the_event_that_produced_it() {
+        let path = repo_root().join(".github/workflows/ci.yml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} is a gate and is not readable: {e}", path.display()));
+        let (_, durations) = jobs(&text)
+            .into_iter()
+            .find(|(name, _)| name == "durations")
+            .expect("ci.yml renders the duration verdict in a job called `durations`");
+        assert!(
+            durations.contains(crate::durations::TIER_BASE_FLAG),
+            "the `durations` job no longer passes {:?}, so it renders the whole tier verdict on \
+             every pull request and every merge-queue composition — the state that dequeued \
+             composition 32550410305 on a name nothing in it had touched",
+            crate::durations::TIER_BASE_FLAG
+        );
+        for base in ["github.event.merge_group.base_sha", "github.event.pull_request.base.sha"] {
+            assert!(
+                durations.contains(base),
+                "the `durations` job stopped reading {base}, so that event names no base and \
+                 silently falls back to the nightly's whole-tree verdict"
+            );
+        }
+        assert!(
+            durations.contains("fetch-depth: 0"),
+            "reading the base's `tests/toyos.rs` needs the base commit in the clone, and \
+             actions/checkout leaves a depth-1 one without it"
+        );
+    }
+
     /// The declaration is read by a shell and by this crate, so both have to
     /// agree that it holds one version and nothing else.
     #[test]
