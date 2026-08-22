@@ -136,9 +136,11 @@ pub fn read(
     // The nesting gate, armed here for the same reason and once — on a kernel
     // thread of its own, because `IF` is clear for the whole of every syscall
     // and a record emitted from one is bracketed whether the guard exists or
-    // not.
+    // not. One thread for both windows: which of the two the injection aims at
+    // is `log::nested`'s to decide from the arm set, and a boot arming neither
+    // spawns nothing.
     #[cfg(feature = "boot-actuators")]
-    if crate::actuator::log_nested_emit() {
+    if crate::actuator::log_nested_emit() || crate::actuator::log_nested_reserve() {
         super::nested::start_once();
     }
 

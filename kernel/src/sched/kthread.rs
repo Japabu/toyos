@@ -43,10 +43,13 @@ use super::payload::ThreadSched;
 ///
 /// **The test kernel carries room for one `log-storm` thread per shard on top,
 /// and the shipping kernel carries none of it.** That storm is one ordinary
-/// stealable task per CPU — which is the whole reason it can exercise the
-/// migration §2.3a's bracket exists to survive — and it exists only in the
-/// build that has the actuator. A shipping kernel spawning a fourth still dies
-/// naming it, so the rule above is untouched where it applies.
+/// stealable task per CPU, and it exists only in the build that has the
+/// actuator. A shipping kernel spawning a fourth still dies naming it, so the
+/// rule above is untouched where it applies. It used to say the storm is what
+/// exercises the migration §2.3a's bracket exists to survive, and that was
+/// never true of any workload here: a task is stealable while it is *Ready*,
+/// and nothing switches a Ring 0 context out between two instructions
+/// (`issues/kernel/a-ring-0-loop-is-never-preempted.md`).
 #[cfg(not(feature = "boot-actuators"))]
 const MAX_KERNEL_TASKS: usize = 3;
 #[cfg(feature = "boot-actuators")]

@@ -186,6 +186,18 @@ struct Origin {
 /// a whole newer generation committed into its slot and overwrite that live
 /// record before any final re-check can help.
 ///
+/// **What the bracket buys that a reader can see is the *order*, and that is
+/// what is gated.** `emit` stamps `at_ns` on the line above this call, so an
+/// interrupt that logs from inside the window takes the lower sequence numbers
+/// under the later timestamps and the producer it interrupted lands above them
+/// carrying an earlier one — which is what `read.rs`'s `Descent::advance` may
+/// not survive. `log-nested-reserve` puts an interrupt there and
+/// `log_reserve_window_negative` reads the result with the `cli` removed. The
+/// mid-body half is real and is *not* observable from any reader: a lapped
+/// writer republishes the previous generation's number, which is exactly what
+/// an unpublished slot looks like, and the record it destroyed is already below
+/// `Shard::oldest_readable`.
+///
 /// `preempt::disable` would buy migration exclusion for two locked
 /// read-modify-writes per record and would still leave single-step #DB enabled.
 /// That is the cost this whole design exists to avoid — one `fetch_add` per line

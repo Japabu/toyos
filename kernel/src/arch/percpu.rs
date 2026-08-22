@@ -646,6 +646,17 @@ pub fn reserve_log_slot(
             pid_off = const OFF_CURRENT_PID,
             options(preserves_flags),
         );
+        // **`log-nested-reserve`'s injection point, and it is here rather than
+        // anywhere tidier because "between the shard pointer and the `xadd`" is
+        // the whole claim** (§2.3a): the self-IPI goes out with the shard
+        // pointer already in a register and the sequence number not yet taken,
+        // so whether the handler's own records are reserved *before* this one is
+        // decided by the guard's `cli` and by nothing else. `emit` stamped
+        // `record.at_ns` before this call, so a handler that gets in ahead
+        // carries the later timestamps under the lower sequence numbers — which
+        // is the observable. Empty in every build but the test kernel's, so this
+        // folds to the two statements it is written between.
+        crate::log::nested::reserve_window();
         seq = (&*(shard as *const log::Shard)).reserve(guard);
     }
     (shard as *const log::Shard, seq, cpu, tid, pid)
