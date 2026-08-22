@@ -134,10 +134,19 @@ the log, on a host measured at 2.30x width, of the boot stick's *own* flush:
 
 Same opcode, same device class, same partition — `USB_TIMEOUT_NS` breached on the
 status phase of SYNCHRONIZE CACHE by a stick that answered the identical command
-280 ms later. `MAX_TRANSPORT_ATTEMPTS` is 3
-(`kernel/src/drivers/xhci/wait/msc.rs:87`), so that run was one recovery short of
-this issue's failure. That falsifies the constant's own claim that "nothing but a
-dead device can reach it".
+280 ms later. That falsifies the constant's own claim that "nothing but a dead
+device can reach it".
+
+**And it dates the defect.** That break was *absorbed*: `SCSI 0x35 completed on
+attempt 2`, the write not lost, the boot fine. It could be, because
+`block::OPERATION` did not exist yet — `5479129d`, "A block-device operation
+carries the caller's budget, and the driver honours it", landed **2026-08-20**,
+seven days after that log and one day before this issue's sighting. Since it
+landed, the recovery that used to save this write is refused before it can be
+re-issued, because the budget above the driver is exactly as long as the transfer
+bound below it. The retry machinery `MAX_TRANSPORT_ATTEMPTS` = 3
+(`kernel/src/drivers/xhci/wait/msc.rs:87`) provides has been unreachable-on-timeout
+ever since.
 
 ## What a spurious refusal costs
 
@@ -147,6 +156,57 @@ rest of the boot. `LOG_WRITE_BUDGET` (`:123`, 5 s) is explicitly *not* the polic
 for errors — its own doc says "an **error** ends it at once" — and it bounds only
 the case where the calls succeed slowly. So logd is written to tell "busy" from
 "gone" and the kernel gives it one word for both.
+
+## Reproduced, 2026-08-22, and the producer is both deadlines in series
+
+73 consecutive full 12-wide `cargo test --test toyos-build` suites on the dev
+host, `wt/toyos-fsync` at `8c0f9526`, 12:09:11Z to 13:09:27Z, 272 tests each.
+`esp_filesystem` **red once in 73**; the harness's own re-run of that red was
+`ALONE esp_filesystem: GREEN`, as in the sighting. `wt/toyos-dmapool` had its own
+suite on the same twelve guest slots for 21 of the 73 passes, the red among them.
+Host load average 2.00 at the start and 11.86 at the end.
+
+The red's kernel log — which only exists because this branch stopped the failure
+arm dropping it:
+
+    [kernel 2.606 cpu0] usb-storage: 00:02.0 slot 1 transport broke on SCSI 0x2a: no answer in the status phase in 2000 ms
+    [kernel 2.606 cpu0] xHCI: 00:02.0 slot 1 endpoint 3 is Running, recovering
+    [kernel 2.607 cpu0] xHCI: 00:02.0 slot 1 endpoint 4 is Running, recovering
+    [kernel 2.607 cpu0] usb-storage: 00:02.0 slot 1 SCSI 0x2a not issued: 2000ms (the block-device operation is refused with an I/O error, and the caller's own give-up policy decides what happens next)
+    [kernel 2.607 cpu0] usb-storage: write of 1 blocks at 87364 failed on disk 0
+    [kernel 2.609 cpu0] log-volume: write of guest-blob.bin: device I/O failed
+
+    thread 'main' (1) panicked at src/bin/esp_files.rs:130:22:
+    fsync the blob: Kind(Other)
+    [kernel 2.671 cpu0] syscalls: pid=7 total=546 syscall_wall=2108ms ...
+    [kernel 2.671 cpu0] exit: test_rs_esp_files pid=7 code=101 cpu=2139ms
+
+**Both `(a)` deadlines fired, and the second one is a consequence of the first.**
+
+1. `wait_transfer`'s `USB_TIMEOUT_NS` was breached on the **status phase of a
+   WRITE(10)** during `flush_file`'s page write-back — not on the flush, and not
+   on a dead device: both endpoints read *Running*, so the transfers were still
+   the controller's to complete.
+2. Reset Recovery ran and succeeded, in 1 ms
+   (`kernel/src/drivers/xhci/wait/msc.rs:1018`).
+3. Attempt 2 was then refused at `msc.rs:723-728` without being issued, because
+   `block::OPERATION` is **2 s and `USB_TIMEOUT_NS` is also 2 s**: one breached
+   transfer spends the entire operation budget, so `MAX_TRANSPORT_ATTEMPTS` = 3
+   is unreachable whenever the break was a timeout.
+4. `false` → `BlockError` → `IoError` → `Error::Io` → `SyscallError::Io` →
+   `Kind(Other)`.
+
+That is exactly the failure the retry loop's own doc says it exists to prevent
+(`msc.rs:674-680`): "a driver that recovers and then reports failure has thrown
+away a write it could have completed — the T14's boot disk losing a block to one
+transport hiccup". The driver recovered and then reported failure, and the budget
+above it made that inevitable rather than possible.
+
+**The aggregate width does not predict it.** The failing pass measured
+`fastest boot 1385 ms … 1.05x width`, the loop's median; the sighting's was
+1.56x. `fastest boot` is a minimum over 78 guests, so it says nothing about the
+one guest that lost its vCPU — and that guest spent `syscall_wall=2108ms`, all of
+it inside one `SYS_FSYNC`, in a boot whose peers were up in 1,385 ms.
 
 ## What was measured, 2026-08-22, dev host
 
@@ -172,12 +232,27 @@ the case where the calls succeed slowly. So logd is written to tell "busy" from
 
 ## What is owed
 
-1. **The two `(a)` bounds are host wall clock and are documented as unreachable
-   by a live device.** The tree has nothing to convert them *to* — every other
-   bounded wait in it is `clock::settles` on the same TSC — and for real hardware
-   a time bound is the correct bound, so this is not a "replace the clock" fix.
-   What is wrong is that the refusal is *reported as a device failure*.
-2. **`BlockError` is one bit and a budget refusal is not a device fact.**
+1. **`OPERATION` and `USB_TIMEOUT_NS` are both 2 s, and in series that makes the
+   transport's retry dead on any timeout-induced break.** `block.rs`'s derivation
+   reads "Below: one whole `USB_TIMEOUT_NS`, so a caller that has spent more than
+   a single transfer's entire allowance on commands that are *completing* is
+   talking to a device too slow to serve" — the word doing the work is
+   *completing*, and a transfer that breached its own bound did not complete. For
+   `MAX_TRANSPORT_ATTEMPTS` to mean anything the operation has to outlast one
+   breached transfer plus one Reset Recovery plus one re-issue. **Not an agent's
+   number to move**: `OPERATION` is derived against `/bin/logd`'s
+   `LOG_WRITE_BUDGET` of 5 s on one side and against the CPU pin
+   `issues/audio/disk-wait-pins-a-cpu.md` measures on the other, so raising it
+   lengthens an audio-path stall. The alternatives — a shorter `USB_TIMEOUT_NS`,
+   or `MAX_TRANSPORT_ATTEMPTS` cut to 1 with the doc saying that a timed-out
+   transfer is never retried — are the same trade seen from the other end.
+   Owner's call.
+2. **The two `(a)` bounds are host wall clock and were documented as unreachable
+   by a live device** (corrected at both sites on 2026-08-22). The tree has
+   nothing to convert them *to* — every other bounded wait in it is
+   `clock::settles` on the same TSC — and for real hardware a time bound is the
+   correct bound, so this is not a "replace the clock" fix.
+3. **`BlockError` is one bit and a budget refusal is not a device fact.**
    `kernel/src/block.rs:65-84` argues for one bit on the ground that "above this
    trait there is exactly one thing to do with the answer" — which is false for
    the one consumer that matters: logd retries nothing on an error and gives up
@@ -188,7 +263,7 @@ the case where the calls succeed slowly. So logd is written to tell "busy" from
    `BlockError`, in `toyos-fat32`'s `IoError`/`Error`, and one arm in
    `as_syscall_error` — three crates, one of them the pure FAT32 crate, against a
    documented decision. **Owner's call, not an agent's.**
-3. `Broke::Silence`'s `Display` (`kernel/src/drivers/xhci/wait/msc.rs:233-237`)
+4. `Broke::Silence`'s `Display` (`kernel/src/drivers/xhci/wait/msc.rs:233-237`)
    says "no answer in the {phase} phase in 2000 ms" on both exits from
    `wait_transfer` — including `wait/mod.rs:384-386`, where the port read
    disconnected and no 2000 ms elapsed. A pulled stick is logged as a timeout.

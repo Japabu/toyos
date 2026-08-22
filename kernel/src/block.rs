@@ -43,6 +43,20 @@ pub type DeviceId = u32;
 /// it — the same is now recorded one layer down for `USB_TIMEOUT_NS` — and what
 /// the caller is told when it does is the sentence below.
 ///
+/// **The term the two-part derivation is missing is the recovery.** "One whole
+/// `USB_TIMEOUT_NS`" is the allowance for transfers that *complete*; a transfer
+/// that breached its own bound did not, and what the driver does next is a Reset
+/// Recovery and a re-issue (`xhci/wait/msc.rs`'s `scsi`, and its own doc on why
+/// recovering and then reporting failure loses a write the device would have
+/// taken). With this budget equal to that bound, one breached transfer spends
+/// all of it and `MAX_TRANSPORT_ATTEMPTS` is unreachable: the recovery succeeds
+/// and the re-issue is refused unissued. Measured 2026-08-22, 1 red in 73 full
+/// 12-wide suites, `esp_filesystem`'s `fsync` on `/log`; the identical break was
+/// absorbed by the retry on CI on 2026-08-13, before this constant existed.
+/// Sizing it is a trade against `/bin/logd`'s 5 s on one side and the CPU pin in
+/// `issues/audio/disk-wait-pins-a-cpu.md` on the other, so the number is not an
+/// agent's to move.
+///
 /// **A [`Budget`] and not a [`crate::time::Tripwire`]**: expiry is a degraded
 /// answer, named. The operation is refused, the device is *not* marked failed —
 /// nothing was in flight when the refusal was taken — and the caller gets the
