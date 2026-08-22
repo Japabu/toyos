@@ -7,6 +7,10 @@ pub mod durations;
 pub mod forkcheck;
 pub mod hostws;
 pub mod image;
+/// The issue tracker's own frontmatter gate, and like `sourcegate` below it is
+/// read by nothing but its own tests.
+#[cfg(test)]
+pub mod issuegate;
 pub mod libc;
 pub mod mergehealth;
 pub mod pr;

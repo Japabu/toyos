@@ -1269,6 +1269,13 @@ fn discover_c_tests() -> Vec<String> {
 
 /// Discover Rust test binaries from build output.
 /// Skips shared libraries, helper binaries, and audio tests (dedicated boot).
+///
+/// **A name that arrives this way is registered by nothing but its file.**
+/// `tests/toyos-rust-tests/src/bin/<name>.rs` is the whole declaration — no row
+/// here names it — so `src/durations.rs`'s touched-names scan reads that
+/// directory beside the registration tables, on the same stem rule. Move the
+/// rule and both ends move, or a new test's price verdict goes unrendered on
+/// the run that introduces it.
 fn discover_rust_tests(bins: &[(String, Vec<u8>)]) -> Vec<String> {
     let mut names: Vec<String> = bins
         .iter()
