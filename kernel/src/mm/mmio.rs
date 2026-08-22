@@ -2,17 +2,23 @@ use core::ptr::{read_volatile, write_volatile};
 
 use super::DirectMap;
 
-/// Bounds-checked MMIO handle. Copy, no ownership, no lifetime.
-/// Created by `paging::map_mmio`, which is also what makes the window readable
-/// on every CPU and not just the one that mapped it.
+/// Bounds-checked volatile window. Copy, no ownership, no lifetime.
+///
+/// Named for what it was built for and what nearly every value of it still is:
+/// a device's register window, created by `paging::map_mmio`, which is also
+/// what makes it readable on every CPU and not just the one that mapped it.
+/// [`Mmio::over_phys`] is the other constructor, for memory this kernel owns
+/// that a *device* also reads — same bound, same volatility, no mapping to do.
 #[derive(Clone, Copy)]
 pub struct Mmio {
     base: *mut u8,
     size: u64,
 }
 
-// SAFETY: MMIO registers are at fixed physical addresses, not tied to any
-// thread — `Mmio` is `Copy` and carries no lock, so `Send` costs nothing new.
+// SAFETY: a window is at a fixed address for the life of the machine, whether
+// it is a register window `map_mmio` mapped or the direct map's view of pages
+// the kernel never releases (`over_phys`), and it is not tied to any thread —
+// `Mmio` is `Copy` and carries no lock, so `Send` costs nothing new.
 unsafe impl Send for Mmio {}
 // SAFETY: same fixed-address reasoning as `Send`. Every access goes through
 // `read_volatile`/`write_volatile` below, which forces the ordering the
@@ -25,12 +31,34 @@ impl Mmio {
         Self { base: base.as_mut_ptr(), size }
     }
 
+    /// The same bounded volatile window, over physical memory *this kernel*
+    /// owns rather than over a device's registers.
+    ///
+    /// For the two readers that cannot be handed the value `paging::map_mmio`
+    /// returned. The IOMMU's DMA-fault handler may take no lock, so what it
+    /// keeps between the boot that programmed a unit and the interrupt that
+    /// reports on one is an `AtomicU64` — a physical address, from which this
+    /// rebuilds the window. The IOMMU's remapping tables are the other:
+    /// ordinary PMM pages that the *unit* also walks, so every access to one
+    /// is volatile for the same reason a register access is, and wants the
+    /// same bound.
+    ///
+    /// The alternative at both sites is a raw pointer whose bound is the offset
+    /// alone; this is the same window with the length in it.
+    ///
+    /// # Safety
+    /// `base` must name `size` bytes of physical memory this kernel owns for
+    /// the life of the machine — a window `map_mmio` mapped, or PMM pages that
+    /// are never released — and reading and writing them volatilely must be
+    /// what the caller means, because that is all this type does.
+    pub unsafe fn over_phys(base: DirectMap, size: u64) -> Self {
+        Self::new(base, size)
+    }
+
     /// The window's base as an integer.
     ///
-    /// For the one reader that cannot hold the handle: the IOMMU's DMA-fault
-    /// interrupt handler may take no lock, so the
-    /// windows it reads live in `AtomicU64`s and are dereferenced there rather
-    /// than through this type. Everything that *can* hold an `Mmio` should.
+    /// For a caller that has to hand the address itself somewhere this type
+    /// cannot go — a `clflush` operand, or a line of a log.
     pub fn addr(self) -> u64 {
         self.base as u64
     }
