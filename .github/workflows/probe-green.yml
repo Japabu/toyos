@@ -81,8 +81,9 @@ jobs:
       - name: rust
         if: steps.local.outputs.cache != 'yes'
         run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --profile minimal --default-toolchain stable
+          # To a file first, never `curl | sh` — `ci.yml`'s `rust` step says why.
+          curl --proto '=https' --tlsv1.2 -sSf -o "$RUNNER_TEMP/rustup-init.sh" https://sh.rustup.rs
+          sh "$RUNNER_TEMP/rustup-init.sh" -y --profile minimal --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - id: key
