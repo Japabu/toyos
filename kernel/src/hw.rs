@@ -40,6 +40,18 @@ pub struct IrqGuard {
 impl IrqGuard {
     pub fn close() -> Self {
         let rflags: u64;
+        // SAFETY: three instructions that read and write nothing but `RFLAGS`
+        // and one stack slot they push and immediately pop — no `nostack`, so
+        // the compiler keeps `%rsp` valid and leaves no red zone for the push
+        // to land in. `cli` cannot fail in Ring 0, and closing interrupts is
+        // always sound: what it costs is latency, and the `Drop` below is what
+        // bounds that.
+        //
+        // Irreducible, and it is why `arch::cpu::disable_interrupts` is not
+        // enough on its own: the *saving* of the caller's `IF` and the `cli`
+        // have to be one uninterruptible sequence, or an interrupt between the
+        // `pushfq` and the `cli` records a flag word this CPU no longer has.
+        // Two safe calls cannot express that; one `asm!` block can.
         unsafe {
             asm!("pushfq", "pop {}", "cli", out(reg) rflags, options(nomem));
         }
@@ -49,6 +61,15 @@ impl IrqGuard {
 
 impl Drop for IrqGuard {
     fn drop(&mut self) {
+        // SAFETY: `rflags` is the word this guard's own `close` read out of
+        // `RFLAGS` on this CPU, so `popfq` restores a flag word the machine
+        // produced rather than one anything computed — including the caller's
+        // `IF`, which is the whole point (a nested guard restores "closed").
+        // Same stack-slot argument as `close`.
+        //
+        // Irreducible for `close`'s reason, in reverse: restoring a saved flag
+        // word is not `sti`, and `arch::cpu` offers no unconditional-restore
+        // primitive because there is nothing safe to build one out of.
         unsafe {
             asm!("push {}", "popfq", in(reg) self.rflags, options(nomem));
         }
@@ -92,6 +113,17 @@ impl Machine for KernelHw {
     }
 
     fn halt(&self) {
+        // SAFETY: two instructions that touch no memory and no stack. `sti`
+        // and `hlt` are Ring 0 instructions this kernel always runs in, and
+        // `hlt` is only ever a wait — the scheduler core calls this having
+        // decided this CPU has nothing to run.
+        //
+        // Irreducible, and it is not `arch::cpu::halt`: that one is `cli; hlt`
+        // in a loop, a CPU that never comes back. This is the opposite pair,
+        // and the *order* is the whole of it — `sti` unmasks one instruction
+        // boundary before `hlt`, so a wake that arrives in between is taken
+        // rather than slept through. Two safe calls would put a sequence point
+        // where the architecture guarantees there is none.
         unsafe { asm!("sti; hlt", options(nomem, nostack)); }
     }
 
