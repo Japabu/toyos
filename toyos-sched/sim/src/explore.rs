@@ -98,6 +98,9 @@ pub struct Outcome {
     pub process_finish_ns: Vec<Option<u64>>,
     /// How many tasks the balance path moved between CPUs.
     pub migrations: u64,
+    /// Per CPU: when it first took an execution step — see
+    /// [`crate::vm::Vm::first_exec_ns`].
+    pub first_exec_ns: Vec<Option<u64>>,
     /// What each CPU's passes cost, as the core's `feature = "check"` recorder
     /// measured them — the on-target instrument, driven here by the scenario's
     /// modelled `pass_cost_ns`.
@@ -129,6 +132,20 @@ impl Outcome {
     /// One process's waits of one kind, for a case that knows which it means.
     pub fn wait(&self, process: usize, cause: ReadyCause) -> &crate::latency::Latency {
         self.run_wait[process].get(cause)
+    }
+
+    /// When the whole machine was working: the last CPU's first execution step,
+    /// or `None` if some CPU never took one.
+    ///
+    /// `None` is the answer that matters and it is not the same as a large
+    /// number: a CPU that never ran anything is a CPU the balance path never
+    /// reached, and a caller that folded that into a maximum would report the
+    /// *other* CPUs' recovery as the machine's.
+    pub fn machine_working_at_ns(&self) -> Option<u64> {
+        self.first_exec_ns
+            .iter()
+            .copied()
+            .try_fold(0, |worst, at| Some(worst.max(at?)))
     }
 
     pub fn report(&self) -> String {
@@ -268,6 +285,7 @@ fn outcome_of(scenario: &'static str, vm: &Vm<'_>, choices: &ChoiceStream) -> Ou
         process_service_ns: vm.service_ns.clone(),
         process_finish_ns: vm.finish_ns.clone(),
         migrations: vm.migrations,
+        first_exec_ns: vm.first_exec_ns.clone(),
         pass_costs: (0..vm.handles.len())
             .map(|cpu| {
                 let cpu = CpuId(cpu as u32);

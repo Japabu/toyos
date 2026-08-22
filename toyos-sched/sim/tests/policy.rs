@@ -38,6 +38,15 @@
 //! | interactive wake | 637 ms worst at 64 hogs; every wake but one at 0 ns | `(rivals+1) × 12 ms` = 792 ms | 0.80 |
 //! | wakeup storm drain | 27.75 ms for 64 waiters on one CPU, 3.1× the 16-waiter figure | `(per queue+1) × 12 ms` = 780 ms | 0.04 |
 //! | starvation | 70 ms at 5 runnable threads, 680 ms at 65 | `(threads+1) × 12 ms` | 0.97 / 0.86 |
+//! | adversarial placement | a CPU an adversary loaded is drained to the surplus floor, and only the CPUs still awake are reached | `threads − 2` stealable | 1.00 |
+//!
+//! The last case is the only one whose bound is a *count* rather than a
+//! duration, and that is the model's limit rather than a choice: the clock
+//! advances on the executing CPU's step, so a run's makespan is what one CPU
+//! would take at every width and no wall-clock statement about a wide machine
+//! can be read off it. What survives is the protocol — how many tasks the
+//! balance path moved, and which CPUs ever got one — and that is enough to
+//! separate a machine that recovers from one that does not.
 //!
 //! Every number came from this file at 16–40 seeds per point:
 //! `cargo test -p toyos-sched-sim --test policy -- --nocapture`. The tables in
@@ -74,7 +83,7 @@ use toyos_sched_sim::explore::{run, Outcome};
 use toyos_sched_sim::latency::{Latency, ReadyCause};
 use toyos_sched_sim::scenarios;
 use toyos_sched_sim::vm::RUN_CHUNK_NS;
-use toyos_sched_sim::workload::{Scenario, ShareShape};
+use toyos_sched_sim::workload::{BalanceShape, Scenario, ShareShape};
 
 const MS: u64 = 1_000_000;
 
@@ -550,6 +559,176 @@ fn a_wakeup_storm_drains_without_serializing() {
          is serializing the storm.",
     );
     println!("storm drain 16→64 waiters on one cpu: {small} ns → {large} ns");
+}
+
+/// Seeds per point for the two adversarial-placement cases.
+const LOPSIDED_SEEDS: u64 = 20;
+
+/// The widths the adversarial machine is measured at: CPUs, and threads all
+/// spawned onto cpu0 of them.
+const LOPSIDED: [(usize, usize); 4] = [(2, 8), (4, 16), (4, 64), (8, 64)];
+
+/// How far the balance path can drain the CPU an adversary loaded, derived.
+///
+/// Both halves of the pull path stop at the same inequality:
+/// `answer_steal_requests` refuses below `fair_len() > 1` and `post_steal_probe`
+/// will not probe a victim publishing a surplus under two — and `fair_len` is
+/// sampled after the pick, so it excludes the task the CPU is about to run. So
+/// the floor a loaded CPU can be drained to is one running task plus one queued
+/// behind it, and everything above that floor is stealable, one task per
+/// answered probe.
+///
+/// It is also the ceiling on the *whole run's* migrations, because in this
+/// workload a thief never becomes a victim: a CPU holding one task publishes a
+/// surplus of zero, so no task in flight here is ever moved twice.
+fn stealable(threads: usize) -> u64 {
+    threads as u64 - 2
+}
+
+/// **Adversarial placement**: every thread of a saturating workload spawned onto
+/// one CPU, and what the balance path does with the machine that leaves.
+///
+/// Spawn placement is least-loaded-with-rotation, so this state arises from no
+/// workload at all — which is why the simulator grew a placement knob for it
+/// (`workload::PlacementShape`), and why until it did, the only balance path
+/// anything had measured was the handful of probes a wakeup storm happens to
+/// provoke. What this stages is the machine the pull half of §7.7 exists for:
+/// every runnable thread on cpu0, every other CPU with nothing, and no wake, no
+/// block and no second placement anywhere in the run.
+///
+/// **What it found**, 20 seeds per point at 60 ms of work per thread:
+///
+/// | cpus | threads | seeds reaching every CPU | seeds reaching a second CPU | best seed's migrations | the floor |
+/// |---|---|---|---|---|---|
+/// | 2 |  8 | 9/20 |  9/20 |  6 |  6 |
+/// | 4 | 16 | 2/20 | 13/20 | 14 | 14 |
+/// | 4 | 64 | 2/20 | 13/20 | 62 | 62 |
+/// | 8 | 64 | 0/20 | 15/20 | 62 | 62 |
+///
+/// **Two findings, and the second is the one nobody had written down.**
+///
+/// Where the balance path runs at all it drains the loaded CPU *completely*:
+/// the best seed at every width moves exactly [`stealable`] tasks — all but the
+/// one cpu0 is running and the one queued behind it — so a machine an adversary
+/// piled onto one CPU is emptied to the protocol's own floor, one task per
+/// answered probe.
+///
+/// And **it only ever reaches the CPUs that are still awake.** The probe is
+/// posted from an idle pass, one per idle trip, and only against a victim that
+/// has already *published* a surplus of two; a CPU whose idle pass ran before
+/// the loaded one published halts with no probe outstanding, and nothing in this
+/// protocol wakes it — there is no push half, and a loaded CPU never announces
+/// that it has surplus. That is why the first column falls with width: at eight
+/// CPUs all seven have to lose the same race and none of the twenty seeds
+/// did. `issues/kernel/an-idle-cpu-that-slept-before-the-surplus-is-never-probed.md`
+/// carries it; the assertions below are about what the path does when it runs,
+/// which is the half that is a law.
+#[test]
+fn the_balance_path_drains_the_cpu_an_adversary_loaded() {
+    let mut table = Vec::new();
+    for (cpus, threads) in LOPSIDED {
+        let scenario = scenarios::lopsided_placement(cpus, threads, WORK);
+        let floor = stealable(threads);
+        let (mut best, mut widest, mut full, mut reached) = (0, 0, 0, 0);
+
+        sweep(&scenario, LOPSIDED_SEEDS, |outcome| {
+            let ran = outcome.first_exec_ns.iter().filter(|at| at.is_some()).count();
+            // **Every CPU beyond cpu0 that ran was handed its first task by the
+            // balance path**, because nothing else in this workload can put one
+            // there: the placement is `AllOn(0)`, nothing blocks and nothing
+            // wakes. An answered probe hands over exactly one task, so a machine
+            // in which `ran` CPUs did work owes at least `ran - 1` migrations.
+            assert!(
+                outcome.migrations + 1 >= ran as u64,
+                "at {cpus} cpus {ran} cpu(s) executed a step on a machine whose every thread \
+                 was spawned onto cpu0, and the balance path moved only {} task(s) — one of \
+                 those CPUs was given work by something that is not the balance path",
+                outcome.migrations,
+            );
+            // And the ceiling: no task is moved twice, so the whole run cannot
+            // exceed what cpu0 held above the surplus floor.
+            assert!(
+                outcome.migrations <= floor,
+                "at {cpus} cpus the balance path moved {} of {threads} tasks, past the {floor} \
+                 that stand above cpu0's surplus floor — a task is being migrated more than \
+                 once, which is a thief that became a victim",
+                outcome.migrations,
+            );
+            best = best.max(outcome.migrations);
+            widest = widest.max(ran);
+            full += usize::from(ran == cpus);
+            reached += usize::from(ran > 1);
+        });
+
+        println!(
+            "lopsided cpus={cpus} threads={threads}: {full}/{LOPSIDED_SEEDS} seeds reached \
+             every cpu, {reached}/{LOPSIDED_SEEDS} reached a second, widest={widest}, best \
+             seed moved {best} of a {floor} floor",
+        );
+        // **The drain, asserted where it is a law.** The best seed is the one in
+        // which a thief was awake for the whole run, and there the balance path
+        // has to empty cpu0 down to the floor and no further. Anything less is a
+        // path that gives up while surplus is still published; anything more is
+        // the ceiling above.
+        assert_eq!(
+            best, floor,
+            "at {cpus} cpus and {threads} threads on cpu0, the best of {LOPSIDED_SEEDS} \
+             schedules moved {best} tasks and the surplus floor leaves {floor} stealable. A \
+             machine with a thief awake for the whole run must be drained to that floor: one \
+             task per answered probe, until `fair_len() > 1` stops being true",
+        );
+        table.push((cpus, threads, full, reached, best, floor));
+    }
+
+    for &(cpus, threads, full, reached, best, floor) in &table {
+        println!(
+            "lopsided cpus={cpus} threads={threads}: every-cpu {full}/{LOPSIDED_SEEDS}, \
+             second-cpu {reached}/{LOPSIDED_SEEDS}, drained {best}/{floor}",
+        );
+    }
+}
+
+/// The negative control for the case above: the same lopsided machine with the
+/// pull half of the balance path switched off.
+///
+/// Without it "the balance path drains the CPU an adversary loaded" is a number
+/// with nothing to compare it to — the simulator would report the same drain if
+/// the tasks had been placed by the shipped policy in the first place, and the
+/// case above would be measuring the placement knob rather than the balance
+/// path. With `Env::steal` off nothing can move a task off cpu0 at all.
+///
+/// **Measured**: at every width the drain is 0 against a floor of 6, 14, 62 and
+/// 62, and exactly one CPU of the machine ever executes a step — so the
+/// assertion next door reds on its first width.
+#[test]
+fn without_the_balance_path_a_lopsided_machine_stays_lopsided() {
+    for (cpus, threads) in LOPSIDED {
+        let scenario =
+            scenarios::lopsided_placement(cpus, threads, WORK).with_balance(BalanceShape::None);
+        let floor = stealable(threads);
+        let (mut most, mut widest) = (0, 0);
+
+        sweep(&scenario, LOPSIDED_SEEDS, |outcome| {
+            most = most.max(outcome.migrations);
+            widest = widest.max(outcome.first_exec_ns.iter().filter(|at| at.is_some()).count());
+        });
+
+        println!(
+            "lopsided-control cpus={cpus} threads={threads}: {most} migrations against a \
+             {floor} floor, {widest} of {cpus} cpus ran",
+        );
+        assert_eq!(
+            most, 0,
+            "with `Env::steal` off the balance path still moved {most} task(s) at {cpus} cpus \
+             — nothing else in this protocol migrates, so this is not a control",
+        );
+        assert_eq!(
+            widest, 1,
+            "with the balance path off, {widest} of {cpus} cpus executed a step on a machine \
+             whose every thread was spawned onto cpu0 — the placement knob is not staging the \
+             machine the case above is about",
+        );
+    }
 }
 
 /// **The starvation bound**: the worst wait of a runnable task under saturation,

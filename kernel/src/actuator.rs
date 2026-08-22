@@ -177,6 +177,26 @@ actuators! {
     /// See `kernel/src/nvme_gate.rs`.
     nvme_spent_budget = "nvme-spent-budget";
 
+    /// Establish three nested `scheduler::Operation`s with known deadlines and
+    /// report what every level observed and what each drop restored — once from
+    /// a boot phase, which has no task, and once from `iod`'s body, which is
+    /// one.
+    ///
+    /// **The law it reads has no host-side reader and cannot get one.**
+    /// `Operation::begin` stores `outer.min(until)`, so an inner establishment
+    /// may only narrow; the type reaches `percpu::cpu_id` and
+    /// `driver::current_handle`, and `kernel/` is excluded from the host
+    /// workspace, so nothing off a booted machine can construct one. The
+    /// establishments the other gates drive are incidental to what those gates
+    /// are about — `nvme-spent-budget` proves a narrowing happened by the
+    /// refusal it produces and reads none of the values — and every one of them
+    /// is the task-less kind.
+    ///
+    /// It measures and stages nothing: no driver behaviour changes with it on,
+    /// no device is touched, and every guard is dropped before the function
+    /// returns. See `kernel/src/sched_gate.rs`.
+    sched_operation_nesting = "sched-operation-nesting";
+
     /// Answer SYNCHRONIZE CACHE with the ILLEGAL REQUEST / INVALID COMMAND
     /// OPERATION CODE a stick with no write cache gives. QEMU's `scsi-disk`
     /// implements 0x35 for every front end that reaches it, so the difference

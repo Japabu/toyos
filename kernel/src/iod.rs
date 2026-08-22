@@ -55,6 +55,18 @@ pub fn start() {
 extern "C" fn body(_arg: u64) -> ! {
     let parkable = scheduler::Parkable::at_entry();
     let handle = crate::sched::driver::current_handle().expect("iod runs as a task");
+    // The task half of the operation-nesting gate, and this thread is where it
+    // lives because of the sentence above: `iod` is the one context in this
+    // kernel that is a task, exists on every boot, and reaches its loop with
+    // nothing to do — so asking the question here displaces no work and needs
+    // no thread of its own. Every establishment any other gate drives is a
+    // boot phase's, which is the *other* slot (`kernel/src/sched_gate.rs`).
+    // Between `at_entry` above and the arm below because it must not be inside
+    // an establishment, which is what `at_entry` refuses, and it leaves none.
+    #[cfg(feature = "boot-actuators")]
+    if crate::actuator::sched_operation_nesting() {
+        crate::sched_gate::run("iod");
+    }
     // Armed once and held across the loop — §5.3a's edge contract: a producer
     // that pushes while this thread is draining must find the watch still
     // armed.

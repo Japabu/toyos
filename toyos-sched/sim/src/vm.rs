@@ -38,8 +38,8 @@ use crate::payload::{
     MockAddressSpace, SimCtx, SimPayload, SimPreempt, SimShareLock, SimWaitList, StdLock,
 };
 use crate::workload::{
-    AgeShape, BlockShape, ChargeShape, MigrateShape, Op, ParkShape, Protocol, Scenario, Script,
-    ShareShape, WindowShape,
+    AgeShape, BalanceShape, BlockShape, ChargeShape, MigrateShape, Op, ParkShape, PlacementShape,
+    Protocol, Scenario, Script, ShareShape, WindowShape,
 };
 
 /// How finely a `Run(ns)` op is chopped. Small enough that a 10 ms quantum
@@ -469,6 +469,18 @@ pub struct Vm<'q> {
     /// than judged: a wakeup storm that drains in parallel across a machine is
     /// only evidence about the balance path if the balance path ran.
     pub migrations: u64,
+    /// Per CPU: the instant it first took an execution step, or `None` for a
+    /// CPU that never ran anything at all.
+    ///
+    /// **How long a machine took to start working**, which is a different
+    /// question from every latency beside it: those are asked of a task, and
+    /// this is asked of the CPU. It exists for the adversarial placement case
+    /// (`scenarios::lopsided_placement`), where every thread is spawned onto
+    /// one CPU and the only thing that can put work on the others is the pull
+    /// half of the balance path — so the last of these is when that path
+    /// finished recovering the machine, and a `None` in it is a CPU it never
+    /// reached.
+    pub first_exec_ns: Vec<Option<u64>>,
 }
 
 /// One contention window: a maximal interval over which the same set of
@@ -589,6 +601,7 @@ impl<'q> Vm<'q> {
             run_wait: vec![RunWait::default(); process_count],
             finish_ns: vec![None; process_count],
             migrations: 0,
+            first_exec_ns: vec![None; n],
             next_irq,
             next_key: 1,
             next_spawn_cpu: 0,
@@ -657,12 +670,20 @@ impl<'q> Vm<'q> {
         // what used to misread contention as emptiness. Ties rotate, or every
         // task of a freshly booted system would land on cpu0 and the
         // scenarios would never see two CPUs at once.
+        //
+        // `AllOn` is the adversary and not a policy — see [`PlacementShape`].
+        // The rotation counter still advances under it, so the two answers
+        // differ in where a task lands and in nothing else.
         let base = self.next_spawn_cpu;
-        let dst = (0..self.scenario.cpus)
+        let least_loaded = (0..self.scenario.cpus)
             .map(|offset| (base + offset) % self.scenario.cpus)
             .min_by_key(|&c| self.handles.get(CpuId(c as u32)).load())
             .expect("at least one cpu");
-        self.next_spawn_cpu = (dst + 1) % self.scenario.cpus;
+        self.next_spawn_cpu = (least_loaded + 1) % self.scenario.cpus;
+        let dst = match self.scenario.placement {
+            PlacementShape::LeastLoadedRotating => least_loaded,
+            PlacementShape::AllOn(cpu) => cpu,
+        };
         let builder = TaskBuilder {
             key,
             share,
@@ -868,6 +889,11 @@ impl<'q> Vm<'q> {
             Step::Exec(cpu) => Some(cpu),
             _ => None,
         };
+        // Stamped from the same reading, and *before* the step runs: the
+        // instant this CPU began working, not the instant it stopped.
+        if let Some(cpu) = executed {
+            self.first_exec_ns[cpu].get_or_insert(self.clock.0);
+        }
         self.execute_inner(step, choices);
         let owed = self.hw.with(|s| s.need_resched.clone());
         // A CPU number: it reads `owed` and writes `self.resched_at` at the
@@ -1038,6 +1064,10 @@ impl<'q> Vm<'q> {
         // Copied out before the borrow: the injection below runs while the
         // pass holds `CpuSched`, and these are the only fields it needs.
         let queues = self.queues;
+        // The one policy bit in the `Env` (`sched::driver::env`), read off the
+        // scenario for the same reason as the shapes above it — see
+        // [`BalanceShape`].
+        let steal = self.scenario.balance == BalanceShape::Pull;
         let mut injected = None;
         let (action, parked, end) = {
             let Vm {
@@ -1052,7 +1082,7 @@ impl<'q> Vm<'q> {
                 cpus: handles,
                 frontier,
                 preempt: &SimPreempt,
-                steal: true,
+                steal,
             };
             let pass = SchedPass::begin(&mut cpus[cpu], env, now);
             match dispose {
