@@ -1709,7 +1709,7 @@ fn sys_log_read(
 /// **The largest authority this kernel has, and the last one that was free.**
 /// It took no argument at all: any process that could make a syscall could end
 /// every other one, and a daemon endowed exactly one connector held this too.
-/// It is checked the way the four beside it are — resolve the handle, demand
+/// It is checked the way the five beside it are — resolve the handle, demand
 /// the right, refuse otherwise — so what can cut the power is exactly what
 /// `/bin/init` endowed from `system.toml`, as minting a device claim, entering
 /// the RT band, opening a process by pid and reading the log already were.
@@ -2538,7 +2538,7 @@ fn sysinfo_thread_bound() -> usize {
 /// that decision and it is taken here, above the demand, so the two can never
 /// disagree about which call this is.
 ///
-/// The refusal is `HandleError`'s ordinary one, as at the four arms beside
+/// The refusal is `HandleError`'s ordinary one, as at the five arms beside
 /// this: a capability that resolves without the bit is `PermissionDenied` and
 /// the caller carries on, and a handle the caller does not hold ends it. It is
 /// demanded before the table lock, because `refuse` takes the process down and

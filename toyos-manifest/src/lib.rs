@@ -68,9 +68,9 @@ const SYSCAP_RIGHTS: &[(&str, Rights)] = &[
     // program whose whole loop is read-then-park.
     ("logread", Rights::LOG.union(Rights::WAIT)),
     // Power the machine off. The largest authority on the list — it ends every
-    // process there is, including the ones that hold the other four — and the
-    // last one to have been free: `SYS_SHUTDOWN` took no handle at all, so a
-    // program endowed exactly one connector could halt the machine with it.
+    // process there is, including the ones that hold the other five — and the
+    // last but one to have been free: `SYS_SHUTDOWN` took no handle at all, so
+    // a program endowed exactly one connector could halt the machine with it.
     ("power", Rights::POWER),
     // Read the roster of every process in the machine: `SYS_SYSINFO`'s
     // per-thread entries, each carrying a pid, a size, a CPU time and a name.
