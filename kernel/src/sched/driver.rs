@@ -906,8 +906,10 @@ fn execute(action: Action<KernelPayload>) {
             //
             // Not `Machine::irq_guard`: both exits must *set* IF — the halt
             // because `sti;hlt` is one atom, the stay-awake exit because panic
-            // recovery reaches the idle loop with IF already 0.
-            unsafe { asm!("cli", options(nomem, nostack)) };
+            // recovery reaches the idle loop with IF already 0. A guard would
+            // restore, and restoring 0 on the stay-awake exit is a CPU that
+            // leaves the pass deaf.
+            crate::arch::cpu::disable_interrupts();
             let cpu = CpuId(percpu::cpu_id());
             let awake = cpus().get(cpu).doorbell().kick_pending()
                 || crate::preempt::need_resched()
@@ -949,7 +951,7 @@ fn execute(action: Action<KernelPayload>) {
                 // still picked, because this decides only whether to sleep.
                 || crate::drivers::xhci::port_work_pending();
             if awake {
-                unsafe { asm!("sti", options(nomem, nostack)) };
+                crate::arch::cpu::enable_interrupts();
                 drop(token);
                 return;
             }
@@ -1020,9 +1022,30 @@ fn drain_irqs() {
 pub fn enter_idle_loop() -> ! {
     percpu::set_current_tid(None);
     percpu::set_current_pid(None);
+    // SAFETY: irreducible — `set_kernel_stack` reaches its `PerCpu` through
+    // `gs:[0]`, so its `# Safety` is that the caller is the CPU that GS base
+    // belongs to. It is: this runs on the CPU it is putting into the idle loop,
+    // after `percpu::init_bsp`/`init_ap` gave that CPU its GS base, and the
+    // argument comes from `idle_stack_top`, which reads the same `PerCpu`. What
+    // it writes is the two words every Ring 3 → Ring 0 entry takes its stack
+    // from, and the value is the stack the `mov rsp` below is about to stand
+    // on — nothing safe can express "this is the stack I am about to be on".
     unsafe { percpu::set_kernel_stack(percpu::idle_stack_top()) };
+    // SAFETY: irreducible — `activate` writes CR3, whose `# Safety` is that the
+    // tables are live. `kernel_cr3` is the one address space this kernel builds
+    // at boot and never frees, and it is the space this function's own code and
+    // stack are mapped in, so the write cannot unmap what executes it. The idle
+    // context carries no user address space, which is the whole reason this is
+    // the space to be in.
     unsafe { crate::mm::paging::kernel_cr3().activate() };
     let sp = percpu::idle_stack_top();
+    // SAFETY: irreducible — a stack pointer cannot be moved from Rust, and this
+    // is the one function that has to. It is sound because nothing on the
+    // outgoing stack is live past it: `enter_idle_loop` returns `!` and its
+    // caller is boot or AP bring-up, whose frames nothing ever unwinds; `sp` is
+    // this CPU's own idle stack top, just installed above; and `options
+    // (noreturn)` is the truth, because `jmp` is the last instruction and
+    // `idle_loop` is `-> !`.
     unsafe {
         asm!(
             "mov rsp, {sp}",
@@ -1306,10 +1329,28 @@ pub fn write_stack_canary(stack: &OwnedAlloc) {
     // that nothing else has seen yet, so this writes exactly its own bytes.
     #[cfg(feature = "heap-tripwire")]
     unsafe { core::ptr::write_bytes(stack.ptr(), STACK_FILL, KERNEL_STACK_SIZE) };
+    // SAFETY: the same fresh allocation, whose length is `KERNEL_STACK_SIZE`
+    // and whose alignment is 4096, so eight bytes at offset zero are its own
+    // and aligned. **Irreducible where it is cheap to be reducible**: the
+    // bounded form is `OwnedAlloc::slice(8).write::<u64>(0, …)`, which is an
+    // `unsafe fn` too — `KernelSlice`'s accessors all are — so it would trade
+    // this block for that one and add an assert. What decides it is the
+    // *reader* below rather than this writer: the two have to have the same
+    // shape, and the reader runs inside `with_cpu` on every pass.
     unsafe { *(stack.ptr() as *mut u64) = STACK_CANARY };
 }
 
 fn check_stack_canary(payload: &KernelPayload) {
+    // SAFETY: `payload.kernel_stack` is the `OwnedAlloc` `write_stack_canary`
+    // painted at spawn, alive for as long as the task is — the payload owns it
+    // and `Hw::release` is the only drop — so the word this reads is the one
+    // that was written, or the overflow this exists to name.
+    //
+    // **Irreducible here for a reason that is not about this expression.** It
+    // runs inside `with_cpu`'s exclusive region on *every* pass, which is the
+    // kernel's hottest path and one the idle loop is on; `KernelSlice` would
+    // bound the read and would still be an `unsafe fn` call, so the trade is a
+    // per-pass `assert!` bought for no block removed.
     let canary = unsafe { *(payload.kernel_stack.ptr() as *const u64) };
     if canary != STACK_CANARY {
         panic!(
