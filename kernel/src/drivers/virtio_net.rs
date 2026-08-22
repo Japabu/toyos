@@ -1,5 +1,4 @@
 use alloc::boxed::Box;
-use core::ptr::write_bytes;
 
 use super::pci::{PciDevice, MSIX_ENTRY};
 use super::virtio::{BufDir, DescSlot, Virtqueue, VirtqueueRegions, VirtioDevice, VIRTIO_F_VERSION_1};
@@ -44,15 +43,15 @@ fn dma() -> KernelSlice {
     DMA.lock().as_ref().unwrap().slice()
 }
 
+/// **The RX buffers are `KernelSlice`s and not raw pointers, and that is what
+/// deleted this type's `unsafe impl Send`.** A `KernelSlice` knows its own
+/// physical address and its own length, so `rx_phys` went with the pointers.
 struct VirtioNic {
     device: VirtioDevice,
     rxq: Virtqueue,
     txq: Virtqueue,
-    /// Physical addresses for device DMA descriptors.
-    rx_phys: [u64; RX_BUF_COUNT],
     tx_phys: u64,
-    /// Virtual pointers for kernel read/write.
-    rx_ptrs: [*mut u8; RX_BUF_COUNT],
+    rx_bufs: [KernelSlice; RX_BUF_COUNT],
     // Maps virtqueue descriptor index -> rx_bufs index
     desc_to_buf: [u16; RX_QUEUE_SIZE as usize],
     /// The RX queue's refusal count as of the last line this driver wrote
@@ -67,14 +66,19 @@ struct VirtioNic {
     tx_slot: Option<DescSlot>,
 }
 
-unsafe impl Send for VirtioNic {}
-
 impl VirtioNic {
     fn refill_rx(&mut self, buf_idx: usize, slot: DescSlot) {
-        unsafe { write_bytes(self.rx_ptrs[buf_idx], 0, NET_HDR_SIZE); }
+        // SAFETY: irreducible — `KernelSlice::zero` is an `unsafe fn` and there
+        // is no safe way to clear DMA memory. Bounded by construction: the
+        // subslice is exactly `NET_HDR_SIZE` bytes at the front of a
+        // `RX_BUF_SIZE` buffer, and `subslice` asserts that. Exclusive: this
+        // runs before the descriptor is handed back to the device, so nothing
+        // is writing the buffer, and `buf_idx` came from `desc_to_buf`, whose
+        // every entry `poll_used` bounded to this queue.
+        unsafe { self.rx_bufs[buf_idx].subslice(0, NET_HDR_SIZE).zero() };
         let desc_id = self.rxq.submit(
             slot,
-            &[(self.rx_phys[buf_idx], RX_BUF_SIZE, BufDir::Writable)],
+            &[(self.rx_bufs[buf_idx].phys(), RX_BUF_SIZE, BufDir::Writable)],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
             RX_QUEUE,
@@ -119,7 +123,7 @@ impl crate::net::Nic for VirtioNic {
 
     fn refill_rx_buf(&mut self, buf_index: usize) -> Result<(), SyscallError> {
         // RX_BUF_COUNT is not a chosen number: it is the length of
-        // `pending_rx_slots`/`rx_phys`/`rx_ptrs` and the buffer count baked
+        // `pending_rx_slots`/`rx_bufs` and the buffer count baked
         // into the DMA pool layout, so this check is exactly the array bound.
         // An index past it used to be silently ignored *and* reported as
         // success; an unpolled index used to panic the kernel.
@@ -213,12 +217,8 @@ pub fn init(devices: &[PciDevice]) {
     log!("VirtIO net: MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
-    let rx_phys: [u64; RX_BUF_COUNT] = core::array::from_fn(|i| {
-        dma.phys() + (OFF_RX_BUFS + i * 0x1000) as u64
-    });
-    let rx_ptrs: [*mut u8; RX_BUF_COUNT] = core::array::from_fn(|i| {
-        dma.ptr_at(OFF_RX_BUFS + i * 0x1000)
-    });
+    let rx_bufs: [KernelSlice; RX_BUF_COUNT] =
+        core::array::from_fn(|i| dma.subslice(OFF_RX_BUFS + i * 0x1000, RX_BUF_SIZE as usize));
     let tx_phys = dma.phys() + OFF_TX_BUF as u64;
 
     let dma_base_phys = dma.phys() & !(crate::mm::PAGE_2M - 1);
@@ -246,7 +246,7 @@ pub fn init(devices: &[PciDevice]) {
 
     const NONE_SLOT: Option<DescSlot> = None;
     let mut nic = VirtioNic {
-        device, rxq, txq, rx_phys, tx_phys, rx_ptrs,
+        device, rxq, txq, tx_phys, rx_bufs,
         desc_to_buf: [0; RX_QUEUE_SIZE as usize],
         reported_refusals: 0,
         pending_rx_slots: [NONE_SLOT; RX_BUF_COUNT],
