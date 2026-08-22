@@ -423,6 +423,62 @@ fn flush_sense() -> Option<(u8, u8, u8)> {
     }
 }
 
+/// Where this device's `block` field stands and what it held, taken at the top
+/// of a [`XhciController::bot`] round trip.
+///
+/// **Because `dev.block` is a stack slot and it changed inside one call.** Two
+/// of the nine deaths of one storm arm are byte-identical —
+/// `KernelSlice OOB: offset=0xffff80007cae3310 size=0xd total=0x200000` out of
+/// `bot`'s status phase — and `0xd` is `CSW_LEN`, `0x200000` is the DMA pool, so
+/// the offset is `dev.block + MSC_CSW` and `block` was holding a **kernel text
+/// address**. The command phase twenty lines earlier had already subsliced the
+/// same field successfully, so the write landed during the wait.
+///
+/// [`XhciController::with_storage`] copies the whole `Disk` out of
+/// `self.msc[at]` onto its own frame and writes it back afterwards, so the
+/// `&mut MscDevice` every phase holds points into **this task's kernel stack**,
+/// at a fixed depth, above the frames that are running. A mid-function text
+/// address landing there is a *return address*: something executed with that
+/// slot as its stack pointer. The `KernelSlice` bounds check is what noticed,
+/// and it notices far too late to say where — this says where, the moment the
+/// phase that waited comes back.
+#[cfg(feature = "stack-witness")]
+#[derive(Clone, Copy)]
+struct BlockWitness {
+    at: u64,
+    was: usize,
+}
+
+#[cfg(feature = "stack-witness")]
+fn block_witness(dev: &MscDevice) -> BlockWitness {
+    BlockWitness { at: &raw const dev.block as u64, was: dev.block }
+}
+
+/// See [`BlockWitness`]. Nothing in this driver writes `block` after
+/// [`bind_msc`] hands the device over, so any difference here is a write from
+/// outside the driver entirely.
+#[cfg(feature = "stack-witness")]
+fn block_witness_holds(dev: &MscDevice, entered: BlockWitness) {
+    let at = &raw const dev.block as u64;
+    if at == entered.at && dev.block == entered.was {
+        return;
+    }
+    // SAFETY: driver code runs on the CPU whose GS base is its own `PerCpu`.
+    let (top, _) = unsafe { crate::arch::percpu::entry_stacks() };
+    panic!(
+        "USB BOT WITNESS: MscDevice::block changed inside one round trip — the field at \
+         {at:#018x} held {:#018x} and now holds {:#018x} (the frame moved by {}). This CPU's \
+         Ring 3 entry stack is {top:#018x}, so the field stands {} bytes below it and the \
+         running rsp is {:#018x}. `with_storage` copies the device onto this stack, so a \
+         kernel text value here is a return address something else pushed.",
+        entered.was,
+        dev.block,
+        at.wrapping_sub(entered.at) as i64,
+        top.wrapping_sub(at) as i64,
+        crate::arch::cpu::read_rsp(),
+    );
+}
+
 /// Which way a block transfer moves, so one batching loop serves both without
 /// a `&[u8]` pretending to be a `&mut [u8]`.
 enum Host<'a> {
@@ -767,6 +823,8 @@ impl XhciController {
 
         let dma = self.dma();
         let tag = dev.next_tag();
+        #[cfg(feature = "stack-witness")]
+        let entered_with = block_witness(dev);
         let cbw = super::super::zero_dma(dma, dev.block + MSC_CBW, CBW_LEN as usize);
         // SAFETY: irreducible — `KernelSlice::write`/`copy_from` are `unsafe
         // fn`s and a Command Block Wrapper is bytes at fixed offsets (USB
@@ -840,6 +898,8 @@ impl XhciController {
         }
         got?;
 
+        #[cfg(feature = "stack-witness")]
+        block_witness_holds(dev, entered_with);
         let csw = dma.subslice(dev.block + MSC_CSW, CSW_LEN as usize);
         // SAFETY: irreducible — `KernelSlice::read` is an `unsafe fn` and a
         // Command Status Wrapper is bytes at fixed offsets (USB BOT 1.0 §5.2).

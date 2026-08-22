@@ -635,6 +635,31 @@ pub unsafe fn set_kernel_stack(rsp: u64) {
     core::ptr::write_unaligned(&raw mut (*percpu).tss.rsp0, rsp);
 }
 
+/// The two words [`set_kernel_stack`] writes: the stack `syscall` switches to
+/// (`kernel_rsp`) and the one an interrupt from Ring 3 switches to (`tss.rsp0`).
+///
+/// **Read only by an instrument, and it reads both because they are written
+/// together and used apart.** Every Ring 3 → Ring 0 entry in the machine takes
+/// its stack from one of these two, so a value here that is not the running
+/// task's stack top is a stack pointer aimed at memory some other execution
+/// owns — and the entry that uses it writes a return address there, which is the
+/// shape a stray-write class chased across 2026-08-19..21 kept finding in kernel
+/// data. It never was that: across 25,123 storm boots these two words always
+/// agreed with the running task's own stack top, and the text-in-data came from
+/// a `memcpy` running backwards (`arch::entry`'s `cld`).
+///
+/// # Safety
+/// Must be called from the CPU whose GS base points to the relevant PerCpu.
+#[cfg(feature = "stack-witness")]
+pub unsafe fn entry_stacks() -> (u64, u64) {
+    let percpu: *const PerCpu;
+    core::arch::asm!("mov {}, gs:[0]", out(reg) percpu, options(nomem, nostack, preserves_flags));
+    (
+        (*percpu).kernel_rsp,
+        core::ptr::read_unaligned(&raw const (*percpu).tss.rsp0),
+    )
+}
+
 /// Read this CPU's ID from GS-relative percpu data.
 pub fn cpu_id() -> u32 {
     let id: u32;

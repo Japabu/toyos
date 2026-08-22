@@ -441,6 +441,8 @@ fn flush_ring0_timer_fires_to_trace() {
 /// and halts. The three ahead of it are the exceptions that are not that —
 /// #DB resumes, and #DF and #MC are aborts with no instruction to return to.
 extern "sysv64" fn trap_dispatch(frame: *mut TrapFrame) {
+    #[cfg(feature = "df-witness")]
+    crate::arch::cpu::df_witness("trap_dispatch");
     let frame = unsafe { &mut *frame };
     match Vector::from_raw(frame.vector) {
         Vector::Debug => exceptions::debug_handler(frame),
