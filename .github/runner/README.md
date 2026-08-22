@@ -3,15 +3,24 @@
 Trusted Linux jobs use the image in this directory through a registry bound to
 `127.0.0.1` on the T14. `.github/workflows/route.yml` names the registry
 digest — once, for the whole repository — so a rebuild cannot silently move the
-QEMU/Rust instrument. Fork pull requests and merge queues select `debian:sid`
-on GitHub-hosted runners.
+QEMU/Rust instrument. Every other job selects `debian:sid` on a GitHub-hosted
+runner.
 
-Only the jobs that need the accelerator, the persistent build cache or hours of
-this machine's CPU are routed here: the guest lanes, the audio gate, the green
-probe and the toolchain bootstrap. Every coordinating job stays GitHub-hosted,
-where it is free and parallel — this runner has one worker, and a job waiting
-there for something another job on the same machine has to produce cannot
-finish.
+**What still comes here is a `schedule` other than `ci.yml`'s — gate A and
+portability — and a `workflow_dispatch`.** Since 2026-08-22 `route.yml` sends
+every `pull_request` and every `push` to GitHub-hosted runners along with
+merge-queue refs and `ci.yml`'s nightly: this runner has one worker, and
+thirteen runs of branch traffic were measured queued behind one scheduled gate
+A that morning while a required `toolchain` job sat 57 minutes in the queue and
+then failed. Of the three things this machine has — the accelerator, the
+persistent build cache, hours of its CPU — a branch's guest lane needs none in
+particular, and a hosted lane runs it twelve-wide.
+
+The admission hook below is deliberately wider than that: it still admits a
+same-repo `pull_request` and a `push`, because it is the machine's boundary and
+not a copy of the routing rule. Every coordinating job stays GitHub-hosted,
+where it is free and parallel — a job waiting here for something another job on
+the same machine has to produce cannot finish.
 
 The image contains the apt dependencies and stable Rust. The host directory
 `/home/t14/actions-runner-cache` is mounted only into trusted T14 containers:
@@ -124,8 +133,9 @@ gh api repos/ToyOSOrg/ToyOS/actions/permissions/fork-pr-contributor-approval
 ```
 
 so a fork pull request from anyone who has landed one commit runs workflows
-with no approval. Those runs are GitHub-hosted — `route.yml` sends them there
-and the hook refuses them regardless — so this is not a hole in the T14 today.
+with no approval. Those runs are GitHub-hosted — `route.yml` sends every pull
+request there and the hook refuses a fork's regardless — so this is not a hole
+in the T14 today.
 It is what stands between a stranger and a second attempt at finding one, and
 `all_outside_collaborators` costs one click per genuine outside contribution.
 **Recommended, and an owner settings action: no file in this repository can

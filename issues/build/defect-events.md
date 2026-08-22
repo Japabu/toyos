@@ -133,6 +133,46 @@ ledger was written.
   line, and `tests/CLAUDE.md`'s "a widened bound is a finding" has a mirror —
   a narrowed one is too.
 
+- **`i8042_health` reds the `durations` job from either side of the line** —
+  origin: introduced (PR #186, the same orchestrator return sweep as the entry
+  above, reading nightly run 32444411794's 9,509 ms as a `Why::Cost` row
+  crossing back to Fast). discoverer: automated gate (the `durations` job on
+  pull request #197, run 32506320411, job 96850003410, 2026-08-21 17:16 UTC,
+  measuring 10,281 ms — `guest partition: success` in the same run, so a green
+  suite reds a required check). escape boundary: `main`. 9,509 and 10,281 are
+  8% apart with the 10,000 ms line between them, so the tier was decided by
+  which shard the test landed on, and the red landed on #197 — whose diff is
+  soundd's stats line and a mixer counter, nothing i8042 touches.
+  `cargo run -- --known-red i8042_health` answered `NOT ON THE LIST`, so every
+  author who met it re-derived that from scratch.
+  `issues/build/i8042-health-sits-on-the-ten-second-line.md` (on #197's branch)
+  is the sighting; the fix is the margin rule below, which relegates it as an
+  honest `Why::Cost` row at its committed 9,509 ms.
+
+- **The one-sample tier rule** — origin: pre-existing, and it is the root cause
+  of both entries above. discoverer: automated gate — the same `durations` gate,
+  three times in one afternoon on three different names (`i8042_absent` runs
+  32475363422/32476143292, `i8042_health` run 32506320411,
+  `xhci_full_speed_device` run 32513441183), which is what made the pattern
+  visible as a rule and not as three tests. escape boundary: `main` — the rule
+  had been the tree's since 2026-08-11 and every relegation and return since was
+  decided by it. `src/tiers.rs` reded a `Tier::Fast` name measured over
+  `FAST_CEILING_MS` and invited a `Why::Cost` row back the moment one
+  measurement landed under it, **both on one sample**, so any test priced within
+  a few percent of the line was a coin flip per partition and its red landed on
+  whichever pull request measured it next. Fixed by the owner's decision of
+  2026-08-21 — *the fast tier demands margin* — as `FAST_COMMIT_MS`
+  (`FAST_CEILING_MS * 4 / 5` = 8,000 ms): the price a test may be **committed**
+  at, refusing a Fast name priced in the band and requiring margin of a returning
+  `Why::Cost` row. Three names relegated with it (`i8042_health` 9,509 ms,
+  `double_panic_names_the_fault` 9,120 ms, `console_line_atomicity` 8,925 ms);
+  the two returns of the same morning were re-checked against the new line and
+  keep their Fast (`idle_stack_guard` 5,049 ms, `dump_nmi_probe` 6,284 ms). What
+  the fix does *not* cover is
+  `issues/build/xhci-full-speed-device-jumped-47-percent-over-its-commitment.md`:
+  that name had margin and jumped anyway, which the rule's own derivation says
+  is a finding about the test rather than a straddle.
+
 ## 2026-08-22
 
 - **The direction flag no Ring 0 entry cleared** — origin: pre-existing (every
