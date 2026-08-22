@@ -9512,7 +9512,7 @@ fn run_machine_test(
             // 2. Monotonic: a counter that went backwards is a torn read or a
             //    word two CPUs are writing, which is what the no-`lock` argument
             //    in `kernel/src/irq_census.rs` rests on being impossible.
-            let mut newest: std::collections::BTreeMap<u32, Census> = Default::default();
+            let mut newest: std::collections::BTreeMap<u32, Census> = std::collections::BTreeMap::new();
             for census in &lines {
                 if let Some(prev) = newest.get(&census.cpu) {
                     if census.total < prev.total {
