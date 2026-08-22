@@ -71,22 +71,39 @@ shows when the vCPUs are not all running at once. What the load buys is a
 running one on a deliberately oversubscribed KVM host is a cheaper instrument
 than 6,576 TCG boots per sighting.
 
-## 2026-08-21: the stray-write class this was read as a sighting of is resolved
+## A second sighting the same day, on the dev host, on the newer tree
 
-The dev host's `BTreeMap`-inside-its-own-`insert` class — a per-CPU scheduler
-record reading as a value no operation on it produces — was resolved that day:
-no Ring 0 entry cleared the direction flag, `compiler_builtins::mem::memmove`
-sets it across three `rep` string operations with interrupts enabled, and every
-`memcpy`/`memset` reached from an entry taken inside that window wrote the `n`
-bytes *below* its destination. `arch::entry::ring3_naked_asm`'s `cld` and
-`arch::syscall::init`'s `DF` in `IA32_FMASK` close it: 17 deaths in 7,059
-twelve-wide boots without them, 0 in 7,418 with them.
+2026-08-21, `wt/toyos-bimodal` at `fa5eb83b` (`main` `13953023` plus a soundd
+stats-line instrument), dev host, cross-arch TCG, plain `cargo test` — the
+12-wide fast tier. One death in 275 tests:
 
-`SCHEDS` is `static` and a `None` written back into it is exactly what a
-backwards `memset`/`memcpy` landing in `.bss` produces, so **this sighting is
-consistent with that mechanism and needs no bring-up ordering bug at all** — the
-fix is architecture-neutral and applies to the KVM path unchanged. What is owed
-is a re-measurement, not a new hypothesis.
+```
+[kernel 1.366 cpu1] PANIC: panicked at src/sched/driver.rs:264:28:
+cpu 1 has no CpuSched
+[kernel 1.367 cpu1]     0xffff80007d15419c  core::panicking::panic_fmt+0x2c
+[kernel 1.367 cpu1]     0xffff80007d122f03  kernel::sched::driver::with_cpu::<...>+0x283
+[kernel 1.367 cpu1]     0xffff80007d08c234  kernel::sched::driver::pass+0x94
+[kernel 1.367 cpu1]     0xffff80007d08cb76  kernel::sched::driver::idle_loop+0x26
+[kernel 1.367 cpu1]   Contexts: cpu1 crashed at rsp=0xffff800000e41d98, asking about ctx 0x0
+[kernel 1.367 cpu1]   cpu0 is on ctx 0xffff800000debd48 pid=0 tid=0 ...
+```
+
+Byte-for-byte the same shape — `idle_loop -> pass -> with_cpu`, `asking about
+ctx 0x0`, during bring-up — at the same site: `driver.rs:264` is the `:224`
+above after `main` grew `kernel/src/sched/driver.rs` by 157 lines and
+`kernel/src/mm/alloc.rs` by 651 between `53101d08` and `13953023`. So **the heap
+sweep and the scheduler work that landed between the two sightings did not
+remove it**, and it is not specific to KVM, to eight vCPUs or to the audio
+configs: this one was a four-CPU boot on a host running twelve guests at once.
+
+The red it produced was named `swiss_german_layout`, which was only the test
+whose boot it landed in — `tests/CLAUDE.md`'s "that red's name is the workload,
+never the cause". The harness's own `ALONE:` line then reported it GREEN alone
+and blamed the test's `Sched::Parallel`, which is the misreading the same file
+warns about two lines later. Anyone meeting a lone `Init process crashed during
+boot` under an unrelated test name should search the capture for this panic
+before believing the name.
+>>>>>>> origin/main
 
 ## Whoever takes it
 

@@ -2022,10 +2022,17 @@ fn measure_audio_run(
     );
     eprintln!(
         "        {label}{name} smp={smp} soundd: wake_lat {}us ({:.2} pipelines, limit {}us) \
-         drains {}/{} underruns {}/{} submitted {} wakes {} batch {} windows {} — {host}",
+         [irq {}us + pickup {}us, {} empty wakes, batch {}, {} late of {}] \
+         drains {}/{} underruns {}/{} submitted {} wakes {} batch {} windows {} — {} — {host}",
         counters.max_wake_lat_us,
         counters.max_wake_lat_us as f64 / audio::PIPELINE_DEPTH_US as f64,
         baseline.counters.max_wake_lat_us,
+        counters.worst.irq_late_us,
+        counters.worst.pickup_us,
+        counters.worst.empty,
+        counters.worst.batch,
+        counters.late_wakes,
+        counters.wakes,
         counters.drains,
         baseline.counters.drains,
         counters.underruns,
@@ -2034,6 +2041,7 @@ fn measure_audio_run(
         counters.wakes,
         counters.max_batch,
         counters.windows,
+        audio::boot_clocks(qemu.boot_log()),
     );
 
     let breaches = audio::check_counters(&counters, &baseline.counters);
