@@ -10,6 +10,18 @@ name: route
 # caller reads the answer from the outputs below and none of them repeats the
 # condition.
 #
+# One exception, and it is not about trust: `ci.yml`'s nightly `schedule` is
+# the run that has to refresh `tests/test-durations`, and that profile has one
+# instrument — twelve GitHub-hosted shards, never the T14's 1/1 lane
+# (issues/build/the-duration-profile-is-enforced-where-it-was-not-measured.md).
+# So `ci.yml`'s `schedule` alone is hosted, exactly like a merge-queue ref;
+# `workflow_dispatch` stays every workflow's manual T14 lane, on purpose.
+# `github.workflow` is the caller's name even from inside this reusable
+# workflow, which is the one signal that tells `ci.yml`'s `schedule` apart from
+# gate A's or portability's — both of those stay trusted, gate A because its
+# own baseline has no attested runner instrument either way
+# (issues/audio/gate-a-has-no-runner-baseline.md).
+#
 # A reusable workflow because it is the only form that reaches the places the
 # answer is needed: `runs-on` and `container` see the `needs` context and not
 # `env`, so no workflow-level variable can serve them, and Actions has no YAML
@@ -64,11 +76,14 @@ jobs:
           # `head.repo.full_name` and not `head.repo.fork`: what makes a pull
           # request trusted is that its head is *this* repository, which is a
           # different question from whether that repository is itself a fork of
-          # something.
+          # something. The `schedule` clause is `ci.yml` only: `github.workflow`
+          # is the calling workflow's `name:`, so gate A's and portability's own
+          # `schedule` triggers do not match `'ci'` and stay trusted.
           HOSTED: >-
             ${{ github.event_name == 'merge_group'
                 || (github.event_name == 'pull_request'
-                    && github.event.pull_request.head.repo.full_name != github.repository) }}
+                    && github.event.pull_request.head.repo.full_name != github.repository)
+                || (github.event_name == 'schedule' && github.workflow == 'ci') }}
         run: |
           if [ "$HOSTED" = true ]; then
             trusted=no

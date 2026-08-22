@@ -370,10 +370,12 @@ jobs:
   # nightly run that silently skipped instead of naming why the toolchain
   # never arrived would be the quiet loss `nightly-red` exists to catch.
   #
-  # Both triggers are trusted, so `route` sends this to the T14 today. It is
-  # written through the same outputs and the same cache probe as `guest`
-  # anyway: the one place these two jobs are allowed to differ is the
-  # accelerator, and a second shape written here is how that stops being true.
+  # `route` sends `workflow_dispatch` to the T14 and `schedule` hosted — the
+  # same split `guest` runs under, since `route.yml`'s one `ci.yml`-schedule
+  # clause routes this job through the identical output. It is written
+  # through the same outputs and the same cache probe as `guest` anyway: the
+  # one place these two jobs are allowed to differ is the accelerator, and a
+  # second shape written here is how that stops being true.
   tcg:
     needs: [route, toolchain-ready]
     if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
