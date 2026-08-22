@@ -703,13 +703,18 @@ pub fn spawn(
         syscall_total_ns: 0,
     }));
 
+    // One table, two holders: the entry owns it, and the main thread's task
+    // record carries a clone so a crash report on that thread reads the names
+    // without asking the process table (`process`'s module header).
+    let syms = Arc::new(syms);
+
     let mut guard = PROCESS_TABLE.lock();
     let table = guard.as_mut().unwrap();
     let pid = table.insert_with(|pid| ProcessEntry::new(
         pid,
         start::make_name(path),
         proc_data,
-        Arc::new(Lock::new(syms)),
+        Arc::clone(&syms),
         ThreadEntry::new(thread_data),
     ));
     let tid = table.get(pid).unwrap().main_tid();
@@ -725,6 +730,7 @@ pub fn spawn(
         ks_rsp,
         child_pt.clone(),
         fs_base,
+        syms,
     );
     table.get_mut(pid).unwrap().threads_mut().get_mut(tid).unwrap().set_sched(sched);
     drop(guard);
