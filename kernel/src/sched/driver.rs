@@ -37,7 +37,7 @@ use core::cell::UnsafeCell;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
-use toyos_sched::cpu::{Action, CpuHandle, CpuHandles, CpuSched, Env, SchedPass};
+use toyos_sched::cpu::{Action, Balance, CpuHandle, CpuHandles, CpuSched, Env, SchedPass};
 use toyos_sched::fair::Frontier;
 use toyos_sched::hw::{CpuId, Hw, Kicker, Machine, Nanos};
 use toyos_sched::mailbox::{mailbox, Kick, PreemptGuard, Urgency};
@@ -661,10 +661,16 @@ pub enum Dispose {
 
 /// The environment every pass runs against.
 ///
-/// `steal` is the one policy bit in it, and it is on: an idle pass probes the
-/// busiest CPU for work and a loaded pass answers probes from surplus (spec
-/// §7.7, §9.4's pull half). Without it a task woken onto a busy CPU waits
-/// there until the owner yields.
+/// `balance` is the one policy value in it, and it is [`Balance::Pull`]: an idle
+/// pass probes the busiest CPU for work and a loaded pass answers probes from
+/// surplus (spec §7.7, §9.4's pull half). Without it a task woken onto a busy
+/// CPU waits there until the owner yields.
+///
+/// The other settings of that knob are the simulator's, and deliberately not
+/// this line's: [`Balance::PullWithRearm`] and [`Balance::PushOnSurplus`] both
+/// add wakes to the idle path, which `kernel/CLAUDE.md` makes an audio change,
+/// and what they buy and cost is measured in `toyos-sched/sim/tests/policy.rs`
+/// rather than decided here.
 ///
 /// The guard comes in by reference because its lifetime is the pass's and it
 /// belongs to the caller that raised the count.
@@ -674,7 +680,7 @@ fn env(preempt: &PreemptOff) -> Env<'_, crate::hw::KernelHw, PreemptOff> {
         cpus: cpus(),
         frontier: &FRONTIER,
         preempt,
-        steal: true,
+        balance: Balance::Pull,
     }
 }
 

@@ -101,6 +101,12 @@ pub struct Outcome {
     /// Per CPU: when it first took an execution step — see
     /// [`crate::vm::Vm::first_exec_ns`].
     pub first_exec_ns: Vec<Option<u64>>,
+    /// Per CPU: wakes out of `hlt` that found nothing to do — what a balance
+    /// policy costs the idle path. See [`crate::vm::Vm::idle_wakes`].
+    pub idle_wakes: Vec<u64>,
+    /// The longest a halted CPU sat beside a published surplus with no probe
+    /// outstanding — see [`crate::vm::Vm::probe_gap_ns`].
+    pub probe_gap_ns: u64,
     /// What each CPU's passes cost, as the core's `feature = "check"` recorder
     /// measured them — the on-target instrument, driven here by the scenario's
     /// modelled `pass_cost_ns`.
@@ -146,6 +152,18 @@ impl Outcome {
             .iter()
             .copied()
             .try_fold(0, |worst, at| Some(worst.max(at?)))
+    }
+
+    /// How many CPUs of the machine ever executed a step.
+    pub fn cpus_reached(&self) -> usize {
+        self.first_exec_ns.iter().filter(|at| at.is_some()).count()
+    }
+
+    /// Wakes out of `hlt` that found nothing to do, summed over the machine —
+    /// the price of a balance policy over one run. Divide by [`Self::elapsed`]
+    /// for a rate; `sim/tests/policy.rs` does.
+    pub fn idle_wakes_total(&self) -> u64 {
+        self.idle_wakes.iter().sum()
     }
 
     pub fn report(&self) -> String {
@@ -286,6 +304,8 @@ fn outcome_of(scenario: &'static str, vm: &Vm<'_>, choices: &ChoiceStream) -> Ou
         process_finish_ns: vm.finish_ns.clone(),
         migrations: vm.migrations,
         first_exec_ns: vm.first_exec_ns.clone(),
+        idle_wakes: vm.idle_wakes.clone(),
+        probe_gap_ns: vm.probe_gap_ns,
         pass_costs: (0..vm.handles.len())
             .map(|cpu| {
                 let cpu = CpuId(cpu as u32);
