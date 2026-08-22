@@ -31,6 +31,10 @@ pub fn context() -> u64 {
 /// Read DR6 (debug status — which breakpoint fired and why).
 pub fn read_dr6() -> u64 {
     let val: u64;
+    // SAFETY: reading a debug register in Ring 0 touches no memory and cannot
+    // fault — `DR6` is defined on every x86-64 CPU, and `CR4.DE` decides only
+    // what `DR4`/`DR5` mean. Irreducible: it is the instruction, and the `#DB`
+    // handler has no other way to ask which watchpoint fired.
     unsafe { asm!("mov {}, dr6", out(reg) val); }
     val
 }
