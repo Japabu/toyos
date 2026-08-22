@@ -75,8 +75,8 @@ use std::path::Path;
 /// isolation, being one manual machine. A defect found by a non-owning
 /// instrument transfers to its owner. Only three of the four can appear below:
 /// **metal is not an instrument here**, because nothing below is ToyOS on bare
-/// hardware. The T14 does run the suite — since `985f3834` it runs every
-/// trusted event's — but it runs it in QEMU under KVM, which is [`Ci`].
+/// hardware. The T14 does run the suite — nightly for gate A, and on any
+/// dispatch — but it runs it in QEMU under KVM, which is [`Ci`].
 ///
 /// [`Ci`]: Instrument::Ci
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
@@ -85,13 +85,18 @@ pub enum Instrument {
     /// machine**, `--jobs 1`, nothing else on the box.
     ///
     /// **Two machines wear this name and they do not price alike.**
-    /// `.github/workflows/route.yml` sends a fork's pull request and a
-    /// merge-queue ref to twelve GitHub-hosted shards of four EPYC cores each,
-    /// and every other event to one 1/1 lane on the T14's i5-1135G7. A row has
-    /// to say which in its [`Red::evidence`], because the difference is not
-    /// noise: one tip measured `xhci_full_speed_device` at 6,845 ms in the
-    /// first and 12,156 ms in the second on one day
+    /// `.github/workflows/route.yml` sends every event to twelve GitHub-hosted
+    /// shards of four EPYC cores each except a `workflow_dispatch` and a
+    /// `schedule` that is not `ci.yml`'s; those two get one 1/1 lane on the
+    /// T14's i5-1135G7. A row has to say which in its [`Red::evidence`],
+    /// because the difference is not noise: one tip measured
+    /// `xhci_full_speed_device` at 6,845 ms in the first and 12,156 ms in the
+    /// second on one day
     /// (`issues/build/the-duration-profile-is-enforced-where-it-was-not-measured.md`).
+    /// Rows measured on a pull request or a push between 2026-08-21 and
+    /// 2026-08-22 were taken on the T14 under the routing of those days — a
+    /// fact about which machine that row's number came from, not a reason to
+    /// discount it.
     Ci,
     /// The dev host with the test run by itself. Cross-arch TCG on arm64.
     DevHostAlone,

@@ -3,11 +3,13 @@ name: ci
 # The guest suite: twelve KVM shards on GitHub-hosted Linux x86_64, or one
 # complete 1/1 lane on the persistent T14. Both shapes own one booted kernel at
 # a time and run exactly the Fast tier as a partition — every Fast test runs
-# exactly once per run. The T14 shape pulls its prepared image from a loopback
-# registry and builds directly in content-keyed local storage; it downloads no
-# apt, Rust, custom-toolchain or build-cache payload on a warm run. `ci/**` is
-# where throwaway probe branches live; they trigger their own workflows and not
-# this one.
+# exactly once per run. Since 2026-08-22 every event this workflow answers to
+# takes the hosted shape except `workflow_dispatch`, which is the T14's manual
+# lane (`route.yml` carries the measurement that moved it). The T14 shape pulls
+# its prepared image from a loopback registry and builds directly in
+# content-keyed local storage; it downloads no apt, Rust, custom-toolchain or
+# build-cache payload on a warm run. `ci/**` is where throwaway probe branches
+# live; they trigger their own workflows and not this one.
 #
 # `main` moves only through a merged pull request, so a branch push and the pull
 # request on it are two runs of the same guest partition. `main`'s own run is what
@@ -51,10 +53,13 @@ jobs:
   # strands one runner rather than every shard.
   #
   # GitHub-hosted, and it must stay that way: this job does nothing but poll an
-  # API for up to two hours, and the release it waits for is built by
-  # `toolchain.yml`'s own job on the T14. The T14 has one worker, so a version
-  # of this job that ran there would hold the lane against the build it is
-  # waiting for and time out every time a tree needs a new toolchain.
+  # API for up to two hours for what `toolchain.yml`'s own job publishes, and a
+  # coordinating job must never hold a lane against the thing it is waiting
+  # for. That was literal while the T14 built the toolchain for branch traffic
+  # — one worker, and this job's two-hour ceiling measured against a queue: on
+  # 2026-08-22 run 32549542807 sat 57 minutes in it and then failed in nine
+  # seconds. Since that day both this job and the build it waits for are hosted
+  # on every event but `workflow_dispatch`.
   toolchain-ready:
     runs-on: ubuntu-latest
     timeout-minutes: 150
@@ -372,10 +377,11 @@ jobs:
   #
   # `route` sends `workflow_dispatch` to the T14 and `schedule` hosted — the
   # same split `guest` runs under, since `route.yml`'s one `ci.yml`-schedule
-  # clause routes this job through the identical output. It is written
-  # through the same outputs and the same cache probe as `guest` anyway: the
-  # one place these two jobs are allowed to differ is the accelerator, and a
-  # second shape written here is how that stops being true.
+  # clause routes this job through the identical output, and this job runs on
+  # no other event. It is written through the same outputs and the same cache
+  # probe as `guest` anyway: the one place these two jobs are allowed to differ
+  # is the accelerator, and a second shape written here is how that stops being
+  # true.
   tcg:
     needs: [route, toolchain-ready]
     if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
@@ -491,6 +497,18 @@ jobs:
   # accelerator produced it. `guest-suite` accepts `skipped` here because that
   # means either the established nightly rule or a trusted run, which has no
   # GitHub cache to write.
+  #
+  # Since the routing change of 2026-08-22 this is the *ordinary* case rather
+  # than the fork-and-queue one: every pull request and every push writes the
+  # cache the shards that run beside it restore, and only the nightly and a
+  # `workflow_dispatch` skip it. **The persistent T14 cache needs no job of its
+  # own.** It is not written by this job and never was: every trusted job links
+  # its content-keyed build directory in place
+  # (`.github/runner/link-build-cache.sh`), so the runs that still use the
+  # machine — the nightly gate A on `main`'s tip, and any dispatch — are also
+  # what keep it warm. A T14 job added here to warm it on every push to `main`
+  # would spend the machine's one lane on exactly the traffic this routing
+  # moved off it.
   cache-writer:
     needs: [route, toolchain-ready]
     if: github.event_name != 'schedule' && needs.route.outputs.trusted != 'yes'
@@ -598,16 +616,22 @@ jobs:
   # the T14 would lend it nothing and lose its only lane while it ran.
   #
   # **The profile has one instrument, so only that instrument renders the
-  # verdict.** `tests/test-durations` is what twelve hosted shards measured;
-  # since `route.yml` every trusted event's lane is one partition on the T14,
-  # which does not price the same tests alike, and the name that crosses the
-  # line rotates run to run — four consecutive T14 lanes reded four different
-  # names, one of them on a pull request that changed a Markdown file and a
-  # `const` array row. So on a T14 lane this job still merges, still reports and
-  # still uploads the measured artifact, and prints the price verdict as a
-  # warning instead of failing on it; a merge-queue ref and a fork's pull
-  # request are hosted, the profile is true there, and the queue is required
-  # before `main` moves. `src/durations.rs`'s module header carries the
+  # verdict.** `tests/test-durations` is what twelve hosted shards measured; a
+  # 1/1 lane on the T14 does not price the same tests alike, and the name that
+  # crosses the line rotates run to run — four consecutive T14 lanes reded four
+  # different names, one of them on a pull request that changed a Markdown file
+  # and a `const` array row. So on a T14 lane this job still merges, still
+  # reports and still uploads the measured artifact, and prints the price
+  # verdict as a warning instead of failing on it.
+  #
+  # Since the routing change of 2026-08-22 that softening is a corner rather
+  # than the common case: a pull request, a push, a merge-queue ref and the
+  # nightly are all hosted, so the verdict renders for real on the run that
+  # introduces a name, and only a `workflow_dispatch` on the T14 reaches the
+  # warning branch. The branch stays because that dispatch is still a whole
+  # lane's measurement taken on the wrong instrument.
+  #
+  # `src/durations.rs`'s module header carries the
   # measurements. Nothing about correctness moves: the T14 lane's suite run
   # gates every test's verdict exactly as before, and every refusal
   # `--merge-durations` raises that is *not* the price verdict — a duplicate
@@ -769,9 +793,11 @@ jobs:
               or the guest partition did not leave a complete measurement."
             exit 1
           fi
-          # `cache-writer` runs only for hosted, non-nightly work. A nightly or
-          # T14 run reports it `skipped` by design; anything else means the
-          # hosted write itself failed.
+          # `cache-writer` runs only for hosted, non-nightly work — since the
+          # 2026-08-22 routing that is every pull request and every push. The
+          # nightly `schedule` and a `workflow_dispatch` on the T14 report it
+          # `skipped` by design; anything else means the hosted write itself
+          # failed.
           if [ "${{ needs.cache-writer.result }}" != success ] \
              && [ "${{ needs.cache-writer.result }}" != skipped ]; then
             echo "::error::cache-writer reported ${{ needs.cache-writer.result }}. Its build is"

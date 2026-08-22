@@ -14,17 +14,20 @@
 //!
 //! **One profile, one instrument, and the profile's instrument is the hosted
 //! shards.** `tests/test-durations` holds what twelve GitHub-hosted shards
-//! measured; since `985f3834` every trusted event's guest lane is instead one
-//! 1/1 partition on the T14, which does not price the same tests alike —
+//! measured; a 1/1 partition on the T14 does not price the same tests alike —
 //! `main`'s tip `13953023` measured `xhci_full_speed_device` at 6,845 ms hosted
 //! and 12,156 ms on the T14 the same day, and twenty interleaved reps an arm
 //! cannot tell that tip from the tree the profile was recorded on (p = 0.42).
 //! So the tier verdict is rendered only where the profile was taken:
 //! `.github/workflows/ci.yml`'s `durations` job matches
-//! [`TIER_DISAGREEMENT`] on a T14 lane, prints it as a warning and exits 0,
-//! and the merge queue — always hosted, and required before `main` moves — is
-//! what fails on it. Every other refusal raised here is about the tree or the
-//! partition, not about machine speed, and reds on either instrument.
+//! [`TIER_DISAGREEMENT`] on a T14 lane, prints it as a warning and exits 0.
+//! From `985f3834` (2026-08-20) that softening covered every pull request,
+//! because it had put every trusted event's guest lane on the T14; since
+//! 2026-08-22 `route.yml` routes a pull request, a push, a merge-queue ref and
+//! the nightly to the hosted shards, so the verdict renders for real on the run
+//! that introduces a name and only a `workflow_dispatch` reaches the warning.
+//! Every other refusal raised here is about the tree or the partition, not
+//! about machine speed, and reds on either instrument.
 //!
 //! Why a command and not a `cat`: the shards are a *partition*, and that is the
 //! property the merged file's usefulness rests on. A repeated name means two
