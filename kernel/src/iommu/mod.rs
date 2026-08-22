@@ -29,6 +29,13 @@
 //! would be a type with a single value and a single implementor — a dead
 //! abstraction, and the seam is not the code that would name it.
 
+// Every `unsafe` block under `iommu::` has either stopped existing or carries a
+// `SAFETY:` saying why it could not — the reduction-before-documentation sweep
+// `issues/build/clippy-has-never-run-here.md` records. `host-tests.yml`'s two
+// kernel clippy invocations both run with `-D warnings`, so `warn` here is what
+// gates: a new undocumented block anywhere in this module tree fails CI.
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 pub mod vtd;
 
 /// The address width a device's translations cover.

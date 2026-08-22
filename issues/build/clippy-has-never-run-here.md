@@ -135,14 +135,14 @@ before adopting:
 | root files (`user_ptr.rs`, `process.rs`, `preempt.rs`, `inbox.rs`, `main.rs`, `symbols.rs`, `hw.rs`, `file_backing.rs`, `sync.rs`, `scheduler.rs`, `pipe.rs`, `page_cache.rs`, `bcachefs_adapter.rs`) | 76 | **adopted** — 13 removed, 63 documented, 4 filed. Per file and per finding below. |
 | `mm/` | 35 | **adopted** — every site now carries a `SAFETY:` comment; two (`object::shm::Pages`, `mm::paging::AddressSpace`'s `Send`/`Sync` impls) turned out to look vestigial rather than load-bearing, filed rather than removed: `issues/kernel/redundant-send-sync-impls-mm-object.md` |
 | `elf/` | 23 | **adopted** — every site now carries a `SAFETY:` comment; writing the justification found two functions (`elf::read_backing_into`, `elf::index::RelocationIndex::apply_to_page`) that write through a raw pointer without being `unsafe fn`, filed as `issues/kernel/raw-pointer-writers-not-marked-unsafe-in-loader.md` (every current call site is correct; the gap is that nothing enforces the next one being) |
-| `sched/` | 8 | not yet swept |
+| `sched/` | 8 | **adopted 2026-08-22**, under the reduction ruling. 8 findings (26 `unsafe` blocks in all); **4 removed, 5 documented, 1 filed** (`issues/kernel/five-more-inline-cli-sti-where-a-safe-helper-exists.md`, which is outside this area). |
 | `loader/` | 8 | **adopted** — every site now carries a `SAFETY:` comment (one finding shared with `elf/`, above) |
-| `iommu/` | 8 | not yet swept |
-| `log/` | 2 | not yet swept |
+| `iommu/` | 8 | **adopted 2026-08-22**, under the reduction ruling. 8 findings (8 `unsafe` blocks in all); **5 removed, 3 documented, 0 filed** — the area's whole remainder is two window constructions and a `clflush`. |
+| `log/` | 2 | **adopted 2026-08-22**, under the reduction ruling. 2 findings (9 `unsafe` blocks in all, seven of them documented before this pass); **0 removed, 2 documented, 1 filed** (`issues/build/logrecord-has-no-as-bytes.md`). |
 | `object/` | 1 | **adopted** — the one site is `object::shm::Pages`'s `Send`/`Sync` pair, part of the finding filed above |
 | `completion/` | 0 undocumented (3 unsafe sites, all already carrying a `SAFETY:`/`Safety:` comment predating this pass) | already documented |
-| **adopted so far** | **371** (`mm` 35 + `elf` 23 + `loader` 8 + `object` 1 + root files 76 + `drivers` 121 + `arch` 107) | gated at the source, because the kernel is one crate with no `-p` scoping to hang a lint on. The area sweeps opened their entry module (`mm/mod.rs`, `object/mod.rs`, `elf/mod.rs`, `loader/mod.rs`, `drivers/mod.rs`, `arch/mod.rs`) with `#![warn(clippy::undocumented_unsafe_blocks)]`; the root-file sweep could not — there is no entry module above them but the crate root — so it **inverted the form**: `main.rs` carries one crate-level `#![warn(...)]` and an `#[allow(...)]` on each `mod` line still owed. Both compose with `host-tests.yml`'s existing `-D warnings` on the two kernel invocations, so no command line changed. The module attributes are now redundant under the crate one and are left where they are — deleting them touches swept areas for nothing, and each still records its own area's status. |
-| **remaining** | **18** (`sched` 8 + `iommu` 8 + `log` 2) | measured 2026-08-22 with `--force-warn clippy::undocumented_unsafe_blocks` over both kernel invocations, which is what reads *through* the remaining `allow`s. Each `allow` in `main.rs` is deleted by the pull request that sweeps its area, so the list is the ledger; `drivers` and `arch` both left it the day it arrived, and the three names left are one pull request between them. |
+| **adopted** | **389** — the whole kernel (`mm` 35 + `elf` 23 + `loader` 8 + `object` 1 + root files 76 + `drivers` 121 + `arch` 107 + `sched` 8 + `iommu` 8 + `log` 2) | gated at the source, because the kernel is one crate with no `-p` scoping to hang a lint on. Every area sweep opened its entry module (`mm/mod.rs`, `object/mod.rs`, `elf/mod.rs`, `loader/mod.rs`, `drivers/mod.rs`, `arch/mod.rs`, `sched/mod.rs`, `iommu/mod.rs`, `log/mod.rs`) with `#![warn(clippy::undocumented_unsafe_blocks)]`; the root-file sweep could not — there is no entry module above them but the crate root — so it **inverted the form**: `main.rs` carries one crate-level `#![warn(...)]`, and an `#[allow(...)]` on a `mod` line is the form a tree not yet swept would take. Both compose with `host-tests.yml`'s existing `-D warnings` on the two kernel invocations, so no command line changed. The module attributes are redundant under the crate one and are left where they are — each still records its own area's status. |
+| **remaining** | **0** | measured 2026-08-22, after the last two sweeps (`arch`, and `sched`+`iommu`+`log`) merged, with `--force-warn clippy::undocumented_unsafe_blocks` over both kernel invocations: no finding anywhere in `kernel/src`. The `allow` list in `main.rs` is empty, which is the state this row was opened to reach; a new tree that cannot be gated the day it appears goes on that list and comes off it by the pull request that sweeps it. |
 
 ### `drivers/`, per driver (swept 2026-08-22)
 
@@ -433,6 +433,79 @@ validity requirement is real but not type-enforced — filed as
 `issues/kernel/raw-pointer-writers-not-marked-unsafe-in-loader.md`. Four
 real findings from three areas, which is the whole reason this pass writes
 the justification by hand instead of pattern-matching the comment shape.
+
+### `sched/`, `iommu/` and `log/`, the three small areas (swept 2026-08-22)
+
+18 findings between them, which reproduced the 8/8/2 this table recorded on
+2026-08-20 exactly. `unsafe` blocks before and after, counted over each area's
+`.rs` files excluding comment lines; "found" is the `undocumented_unsafe_blocks`
+finding count, smaller than "before" wherever an area already had documented
+blocks.
+
+| area | found | blocks before | after | removed |
+|---|---:|---:|---:|---:|
+| `sched/` (`driver.rs` 7, `dump.rs` 1) | 8 | 26 | 22 | 4 |
+| `iommu/` (`vtd/table.rs` 5, `vtd/fault.rs` 3) | 8 | 8 | 3 | 5 |
+| `log/` (`user.rs` 1, `shard.rs` 1) | 2 | 9 | 9 | 0 |
+| **total** | **18** | **43** | **34** | **9** |
+
+**`sched/` removed four by naming a function that already existed.**
+`arch::cpu::{enable_interrupts, disable_interrupts}` are safe, `#[inline]`,
+and expand to the same `asm!("sti"/"cli", options(nomem, nostack))` the four
+sites spelled by hand — `driver::execute`'s idle arm (which may not use an
+`IrqGuard`, because both its exits have to *set* `IF` rather than restore it)
+and `dump::deaf_window`. Five more of the same shape are outside this sweep's
+areas and are filed rather than reached into:
+`issues/kernel/five-more-inline-cli-sti-where-a-safe-helper-exists.md`.
+
+**`iommu/` removed five with one addition to `mm`.** `Mmio` was already a
+bounds-checked volatile window with safe accessors and one constructor,
+`paging::map_mmio`; `Mmio::over_phys` is a second, `unsafe`, for physical
+memory this kernel owns and has no mapping left to do — and with it two raw
+address derivations replace nine raw dereferences:
+
+- `vtd::table::Table::window` — the 4 KiB of a remapping table, so an index, a
+  byte offset and a 32-bit field are all bounded against the same 4 KiB rather
+  than each against an `assert!` of its own. It also bounds the `clflush`
+  operand, which is an address carrying no length: `Table::slot` hands the
+  flush a subregion that has already been checked.
+- `vtd::fault::window` — the register window of an armed unit, rebuilt inside
+  the DMA-fault handler from the physical address `arm` published. That handler
+  may take no lock, so what it can keep is an `AtomicU64` and not an `Mmio`;
+  before this it dereferenced that address raw, and the bound on its fault-record
+  walk lived in `Records::fit` at *arm* time, one function and one boot phase
+  away from the read. `FaultUnit.regs` now holds the physical base (0 stays the
+  unused-slot sentinel, because `vtd::window` refuses a register base of 0) and
+  `FaultUnit.records` the offset inside the window it was declared as.
+
+What stayed: `table::flush`'s `clflush`/`mfence`, which has no safe spelling
+and no narrower one — the instruction takes an address and no length, so the
+bound has to be on the caller's side, and it now is.
+
+**`log/` removed nothing, and both reasons are named at the site.**
+`shard::initialize_zeroed` writes one word in place through a caller-supplied
+pointer because the alternative is materialising a 512 KiB `Shard` on the BSP's
+16 KiB stack — irreducible. `log::user`'s record-to-bytes slice is reducible and
+was not reduced: six other boundary-crossing types carry a safe `as_bytes` in
+`toyos-abi` and `LogRecord` is the one that does not, which makes the fix an
+edit under `toyos-abi/src` — its own pull request and a sysroot claim. Filed as
+`issues/build/logrecord-has-no-as-bytes.md`.
+
+**What was reducible and was declined, with the reason.** The kernel stack
+canary's two accesses (`write_stack_canary`, `check_stack_canary`) can go
+through `OwnedAlloc::slice` → `KernelSlice`, which would bound them — but every
+`KernelSlice` accessor is itself an `unsafe fn`, so the trade is one block for
+another *plus* an `assert!`, and the reader runs inside `with_cpu`'s exclusive
+region on every scheduler pass. Zero blocks removed for a per-pass cost is not
+a reduction; both sites say so.
+
+The scheduler substitution's oracle was the compiler. Emitting the kernel's
+assembly at the guest's own `[profile.toyos]` (`opt-level = 2`) before and
+after, and diffing instructions only, gave **0 lines of difference across
+225,014** — `#[inline]` leaves nothing behind at that optimisation level, so
+the four sites are the same four instructions they were. The instrument has
+teeth: mutating one `enable_interrupts()` to `disable_interrupts()` moved
+exactly one of those 225,014 lines, `sti` → `cli`.
 
 ## Shape (unchanged from stage one)
 

@@ -265,6 +265,14 @@ impl Shard {
     /// large enough for one [`Shard`]. It may be called exactly once.
     #[cfg(not(feature = "loom"))]
     pub unsafe fn initialize_zeroed(ptr: *mut Self) {
+        // SAFETY: irreducible, and the doc comment above says why in one line —
+        // a safe constructor returns a value, and a 512 KiB value is a value
+        // this kernel has no stack to hold. So the one word that is not already
+        // correct in zeroed storage is written *in place*, through the caller's
+        // pointer, under the caller's contract: zeroed, aligned, unpublished,
+        // large enough, once. `addr_of_mut!` and not `&mut (*ptr).head` because
+        // the rest of the allocation is still uninitialised as far as the type
+        // system is concerned, and a reference would claim otherwise.
         unsafe {
             core::ptr::addr_of_mut!((*ptr).head).write(AtomicU64::new(FIRST_SEQ));
         }
