@@ -61,3 +61,15 @@ Nothing in the run's diff (a workflow, a `const`, doc comments and issue text)
 reaches a boot. The cost is that a crash report — the artifact the panic path
 exists to produce — silently loses a frame's name whenever another CPU is
 reporting at the same time, which is exactly when a reader most needs it.
+
+## A second name, on the hosted instrument
+
+2026-08-22 12:45Z, run `32573597349`, job `97032648155` — a hosted twelve-shard
+`guest (1)`, not the T14 — `fault_gates` reded the same way: `the crash report
+could not read a symbol it was asked for, so a bare address in it is a lost race
+and not a verdict`, the process exited 0, and the harness's re-run alone was
+green. `fault_gates` spawns children into deliberate faults the way
+`panic_recovery` spawns them into panics, so it has the same weather. The diff it
+landed on (PR #227: the scheduler simulator and a `Balance` enum) reaches no
+crash-path code. Two names, two instruments, one mechanism; `src/redlist.rs`
+carries a row for each.
