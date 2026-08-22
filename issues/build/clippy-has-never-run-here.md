@@ -174,9 +174,15 @@ because each is a decision past a documentation sweep:
   the shape `user_ptr.rs`'s `UserBytes` header argues against. Three of them are
   `&mut`, and `create` maps the page into the process *before* building the
   headers — the cheap half of the fix is a reordering.
-- `issues/kernel/initrd-extents-are-not-bounded-by-the-image.md` —
-  `InitrdBacking` is given the *file's* size and never the image's, so nothing
-  bounds an extent against the end of the initrd it came out of.
+- `InitrdBacking` was given the *file's* size and never the image's, so nothing
+  bounded an extent against the end of the initrd it came out of. **Decided and
+  fixed 2026-08-22**: it holds the image (`bcachefs::SliceBlockIO`, now `Copy`)
+  and reads through `SliceBlockIO::block`, which is the one thing that knows
+  both the block number and the length. `file_backing.rs` and
+  `bcachefs_adapter.rs` now contain no `unsafe` at all — the `Send`/`Sync` pair,
+  the extent-to-pointer path and the copy out of it are gone, and the one
+  remaining claim about the initrd region is `SliceBlockIO::new`'s, made once in
+  `main.rs` where the region is named. A reduction, not a comment.
 - The futex word and the crash dump read user memory with `*ptr` where
   `copy_in` uses `read_volatile`. **Decided and fixed 2026-08-22**: both are
   `read_volatile`, and the rule is now `user_ptr.rs`'s module header rather

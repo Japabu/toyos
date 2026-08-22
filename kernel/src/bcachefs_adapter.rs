@@ -313,18 +313,23 @@ impl FileSystem for BcacheFsAdapter {
 }
 
 /// VFS adapter for read-only bcachefs (initrd mounted in memory).
+///
+/// It holds the image rather than the image's base address, because an
+/// [`InitrdBacking`] handed only a base can compute an address for any block
+/// the btree names and has nothing to compare it against. `SliceBlockIO` is
+/// `Copy`, so the mount and every backing check against the same length.
+///
+/// The `unsafe impl Send` this used to carry went with the raw pointer: a
+/// `SliceBlockIO` is `Send + Sync` in its own crate, on its own argument.
 pub struct ReadOnlyBcacheFsAdapter {
     fs: Mounted<SliceBlockIO, ReadOnly>,
-    initrd_base: *const u8,
+    image: SliceBlockIO,
     name_to_id: HashMap<String, FileId>,
 }
 
-// Safety: initrd memory is static for the kernel's lifetime
-unsafe impl Send for ReadOnlyBcacheFsAdapter {}
-
 impl ReadOnlyBcacheFsAdapter {
-    pub fn new(fs: Mounted<SliceBlockIO, ReadOnly>, initrd_base: *const u8) -> Self {
-        Self { fs, initrd_base, name_to_id: HashMap::new() }
+    pub fn new(fs: Mounted<SliceBlockIO, ReadOnly>, image: SliceBlockIO) -> Self {
+        Self { fs, image, name_to_id: HashMap::new() }
     }
 }
 
@@ -354,7 +359,7 @@ impl FileSystem for ReadOnlyBcacheFsAdapter {
         let (extents, size) = present("open", name, self.fs.file_extents(name))?;
         if let Some(&file_id) = self.name_to_id.get(name) {
             file_cache::open(file_id);
-            let backing = Arc::new(InitrdBacking::new(self.initrd_base, extents, size));
+            let backing = Arc::new(InitrdBacking::new(self.image, extents, size));
             return Ok((file_id, Some(backing)));
         }
 
@@ -363,7 +368,7 @@ impl FileSystem for ReadOnlyBcacheFsAdapter {
 
         self.name_to_id.insert(String::from(name), file_id);
 
-        let backing = Arc::new(InitrdBacking::new(self.initrd_base, extents, size));
+        let backing = Arc::new(InitrdBacking::new(self.image, extents, size));
         Ok((file_id, Some(backing)))
     }
 
@@ -410,7 +415,7 @@ impl FileSystem for ReadOnlyBcacheFsAdapter {
 
     fn open_backing(&mut self, name: &str) -> Result<Arc<dyn FileBacking>, SyscallError> {
         let (extents, size) = present("open_backing", name, self.fs.file_extents(name))?;
-        Ok(Arc::new(InitrdBacking::new(self.initrd_base, extents, size)))
+        Ok(Arc::new(InitrdBacking::new(self.image, extents, size)))
     }
 }
 
@@ -537,26 +542,18 @@ pub fn open_home() -> Option<Mounted<PageCacheBlockIO, ReadWrite>> {
     }
 }
 
-/// Mount a read-only bcachefs filesystem from a memory slice (initrd).
+/// Mount a read-only bcachefs filesystem from an image already in memory
+/// (initrd).
 ///
-/// `ptr`/`len` are the initrd region `KernelArgs` names, passed straight
-/// through from `kernel_main`'s one call. **This function is not an `unsafe
-/// fn` and by its signature ought to be** — it takes a raw pointer and a
-/// length and hands them to something that reads through them, which is the
-/// pattern `issues/kernel/raw-pointer-writers-not-marked-unsafe-in-loader.md`
-/// already records two of in `elf::`; the single call site here is correct and
-/// nothing enforces that the next one is.
-pub fn mount_initrd(ptr: *const u8, len: usize) -> Mounted<SliceBlockIO, ReadOnly> {
-    // SAFETY: `SliceBlockIO::new` asks that `ptr` be valid for `len` bytes for
-    // as long as the `SliceBlockIO` lives. The one caller passes the initrd
-    // region out of `KernelArgs` — placed by the bootloader, never freed,
-    // never written — and the mount it builds lives for the rest of the boot,
-    // so the region outlives it trivially.
-    //
-    // Irreducible here: the region arrives as an address and a length from
-    // firmware, so somebody has to make the first claim that it is memory.
-    // What is *reducible* is which signature carries that claim, and the doc
-    // comment above says so.
-    let io = unsafe { SliceBlockIO::new(ptr, len) };
-    Mounted::<SliceBlockIO, ReadOnly>::open(io).expect("Failed to mount bcachefs initrd")
+/// **It takes the image and not `(ptr, len)`, and that is the whole of what
+/// this function used to get wrong about its own signature.** A raw pointer and
+/// a length handed to something that reads through them is a call that ought to
+/// be `unsafe` — the pattern
+/// `issues/kernel/raw-pointer-writers-not-marked-unsafe-in-loader.md` records
+/// two more of in `elf::`. Taking a `SliceBlockIO` moves the claim to
+/// `SliceBlockIO::new`, which is already an `unsafe fn` and already states it,
+/// so there is one claim about the initrd region in the whole kernel and it is
+/// made where the region is named.
+pub fn mount_initrd(image: SliceBlockIO) -> Mounted<SliceBlockIO, ReadOnly> {
+    Mounted::<SliceBlockIO, ReadOnly>::open(image).expect("Failed to mount bcachefs initrd")
 }
