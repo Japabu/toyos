@@ -1,5 +1,5 @@
 ---
-status: open
+status: assigned
 kind: defect
 opened: 2026-08-15
 ---
@@ -139,6 +139,121 @@ list whenever sshd starts, since sshd is not the last entry in it.
 The branch it fired on is a diff of documentation and `src/redlist.rs` strings
 with no code in it. The harness answered `ALONE: GREEN, and it was alone both
 times` again, and shard 1's other 173 names passed.
+
+**A fourth sighting, and the sign holds for a fourth boot.** Merge-queue run
+`32550410305`, job `96976123706` (`guest (2)`), 2026-08-22 — the queue's own
+composition, so no branch owns it:
+
+```
+[kernel 1.135 cpu0] spawn: /bin/sshd pid=8 …
+thread 'main' (1) panicked at sshd/src/main.rs:359:23:
+sshd: cannot bind 0.0.0.0:22: netd error
+[kernel 1.153 cpu0] exit: netd pid=7 code=0
+```
+
+**18 ms**, in the same direction as the 23 ms and 7 ms before it. Four boots of
+the panic arm, every one with sshd binding before netd's exit line, against one
+recorded clean exit with it binding 5 ms after. `boot_partition_identity` is the
+victim for the fourth time; `src/redlist.rs` carries three rows for it, and this
+sighting is recorded here rather than as a fourth because the rows have nothing
+new to say — what is new is below, and it is not a capture.
+
+## The producer, read out of the code
+
+**It is `toyos::net::hangup` (`toyos/src/net.rs:334`), and netd is not the
+owner** — netd answers nothing at all on this path. The four-candidate
+shortlist above collapses to two, and both are the same fact under two kernel
+words.
+
+netd on a machine with no NIC returns before it ever takes its acceptor:
+`userland/netd/src/main.rs:1224`'s `else` arm says the line and returns, and
+`endow::acceptor("netd")` is the statement after it. So there is no teardown
+answer to be wrong — nothing accepts, nothing sends an `ErrorResponse`, and no
+code is chosen anywhere. The acceptor handle is released by process teardown
+(`HandleTable::drain`, `kernel/src/object/handle.rs:554`), which runs
+`port::Acceptor::on_zero_handles` (`kernel/src/object/port.rs:195`):
+
+```rust
+let queued = { /* lock */ queue.closed = true; take(&mut queue.pending) };
+for connection in &queued { connection.inbox.close_now(); }
+drop(queued);
+```
+
+A client's own end was cross-wired to those very queues when it connected
+(`kernel/src/arch/syscall.rs:1954-1975`): the `PendingConnection`'s `inbox` **is**
+the client's `outbox`, and its `rx`/`tx` are the far ends of the client's two
+pipes. So for a client that connected while netd was alive and sends after that
+hook has run there are exactly two refusals, in this order:
+
+1. **`SYS_HANDLE_SEND` answers `SyscallError::Gone`.** `HandleQueue::push` finds
+   the queue `None` and refuses (`kernel/src/object/service.rs:44-52`), and
+   `sys_handle_send` returns that word (`kernel/src/arch/syscall.rs:2141-2175`).
+   `tcp_bind` hands netd the notify pipe end, and `Connection::send_with_handles`
+   moves the handles *before* it writes the frame (`toyos/src/ipc.rs:235-243`) —
+   so this is the first thing a bind can be refused at.
+2. **`SYS_WRITE` answers `SyscallError::NotFound`.** `drop(queued)` took the
+   server's read end with it, so the pipe has no reader and `ops::write_pipe`
+   maps `PipeWrite::BrokenPipe` to `NotFound` (`kernel/src/object/ops.rs:442-449`,
+   reached for a connection at `ops.rs:488`). That the word is `NotFound` and not
+   `Gone` is `issues/isolation/a-broken-pipe-answers-not-found.md`.
+
+Both arrive at the SDK as `IpcError::Syscall(_)` (`toyos/src/ipc.rs:241` and
+`:629`), and `hangup` had one arm: `IpcError::Disconnected => NetdNotFound`,
+everything else `NetError::Io`. `Disconnected` is raised in exactly one place —
+`ipc::read_exact` on a `read` that answered zero (`toyos/src/ipc.rs:601-611`) —
+so it only ever covered the netd that left while this endpoint was waiting for
+the **response**. The two writes ahead of that read had no arm at all.
+`NetError::Io` is `ErrorKind::Other` in the std fork
+(`rust/library/std/src/sys/net/connection/toyos.rs:25`), which is sshd's
+`panic!` arm.
+
+**Which of the two ran is not decidable from any capture, and does not need to
+be**: they are two syscalls of one `send_with_handles`, microseconds apart, and
+one change fixes both. The `Gone` window is the wider of the two — a
+`SYS_PIPE` sits between `NetdConn::connect` and the transfer
+(`toyos/src/net.rs:424-437`) — so it is the likelier producer, but that is an
+inference and the fix does not rest on it.
+
+**The clean arm is the same mechanism a few microseconds later**, which is what
+explains the timing sign every sighting has. Once the hook has run, a *new*
+`SYS_NAMESPACE_OPEN` finds `connector.closed()` and answers `Gone`
+(`kernel/src/arch/syscall.rs:1946-1948`) → `EndowError::ServerGone`
+(`toyos/src/endow.rs:151-155`) → `NetError::NetdNotFound`
+(`toyos/src/net.rs:287-288`) → `ErrorKind::NotConnected`. Binding *after* netd's
+exit line takes that path and always did; binding *before* it took `hangup`'s
+`_` arm. The two now agree.
+
+One thing the reading adds that no capture could: `on_zero_handles` is
+**deferred** to a drain site (`kernel/src/object/mod.rs`'s `ZERO_QUEUE`, drained
+at syscall exit, at each scheduler pass and in the idle loop). So there is a
+third window in which netd has exited and the hook has not run yet — in it the
+send succeeds, the response read hits EOF, and the client gets `Disconnected`
+and exits cleanly. That is why the race is a rate rather than a certainty, and
+why it does not correlate with anything the harness controls.
+
+## What was done
+
+- **The SDK is the owner.** `hangup` maps both gone-shaped kernel words to
+  `NetError::NetdNotFound`; nothing else is widened, so the "What the fix is
+  not" section below still holds — every other refusal is still `NetError::Io`
+  and still panics. `toyos/src` is a shared-sysroot source, so it is its own
+  branch and its own pull request: `wt/toyos-sshdbind-sdk`, PR #217, draft and
+  unbuilt until the sysroot frees.
+- **`netd_gone_mid_bind`** (`tests/toyos-rust-tests/src/bin/`) stages the
+  sequence deterministically against a port of its own — no netd, no NIC and no
+  clock. Three arms: refused at `SYS_NAMESPACE_OPEN` (the arm that already
+  worked, asserted through `std::net::TcpListener` because
+  `ErrorKind::NotConnected` is the literal thing sshd matches on), refused at
+  `SYS_HANDLE_SEND`, refused at `SYS_WRITE`. The ordering edge is a second
+  connection to the same port read with a blocking read: the hook closes every
+  queued inbox and only *then* drops the connections, so an EOF on one proves
+  the other's outbox is already closed. The last two arms are red without PR
+  #217 and are that PR's negative control in the guest.
+- **No netd delay-exit knob was added, deliberately.** `kernel/src/actuator.rs`
+  admits an instrument on the claim that the state under it cannot be staged
+  otherwise, and this state can: the test above stages it with the same kernel
+  objects and no timing at all. A netd that sleeps on a parameter would be a
+  weaker instrument that also had to be maintained.
 
 ## What the fix is not
 
