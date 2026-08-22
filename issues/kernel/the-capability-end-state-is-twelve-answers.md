@@ -83,44 +83,42 @@ Four pid-addressed syscalls were deleted and their numbers retired rather than
 reused — 26 `SYS_WAITPID`, 33 `SYS_FIND_PID`, 37 `SYS_GRANT_SHARED`, 65
 `SYS_KILL` (`kernel/src/arch/syscall.rs:63`).
 
-## 4. Can a process enumerate objects it lacks authority over? — RULED 2026-08-20
+## 4. Can a process enumerate objects it lacks authority over? — RULED 2026-08-20, IMPLEMENTED 2026-08-22
 
-**The owner ruled: `SYS_SYSINFO` demands a right** — one more `SysCap` bit,
-endowed by `system.toml` to whatever carries `ps`, exactly as `logread` is
-endowed today. Implementation queued behind the in-flight ABI landings (one
-ABI-bearing task holds the machine at a time);
-`issues/isolation/sysinfo-enumerates-every-process.md` carries it.
+**No.** The owner ruled that `SYS_SYSINFO` demands a right, and it does:
+`Rights::ROSTER` on a `SysCap` (`toyos-abi/src/handle.rs`), spelled `roster` in
+`toyos_manifest`'s `SYSCAP_RIGHTS` (`toyos-manifest/src/lib.rs`), demanded by
+`sys_sysinfo` before a single per-process entry is collected or written
+(`kernel/src/arch/syscall.rs`), and endowed by `system.toml` to `toybox` —
+which is what `/bin/ps` is under another name — exactly as `logread` is endowed
+to `logd`. The machine header the same call answers first stays ambient, which
+is question 5's committed set: `free`, netd's memory budget and the compositor's
+taskbar read it and nothing else, and which of the two answers a call is asking
+for is the buffer's own length. `endowment_denied` is the gate — a capability
+without the bit refused an entry, the same capability answered one byte of
+buffer earlier, and `/bin/ps` run twice on either side of it. Landed as PR #209
+(the ABI half) and PR #211.
 
-The object graph is clean. No syscall lists another process's handles; a
-`Namespace` answers `lookup` and has no listing operation at all
-(`kernel/src/object/namespace.rs:59`); `SYS_ENDOWMENTS` answers the caller's own
-table (`kernel/src/arch/syscall.rs:1707`); reading the machine's log is gated on
+The rest of the object graph was clean when this was audited and is unchanged.
+No syscall lists another process's handles; a `Namespace` answers `lookup` and
+has no listing operation at all (`kernel/src/object/namespace.rs:59`);
+`SYS_ENDOWMENTS` answers the caller's own table
+(`kernel/src/arch/syscall.rs:1707`); reading the machine's log is gated on
 `Rights::LOG` (`:1683`) precisely because it is "every process's business and no
 process's right by default"; the per-kind object census is `SYS_DEBUG`, which a
-shipping kernel does not have (`:704`, `:792`).
-
-Against that, **`SYS_SYSINFO` is a census with names.** It walks
-`PROCESS_TABLE` and writes pid, tid, state, resident memory, CPU time and the
-28-byte *name* of every process and thread in the machine, taking no handle and
-no right (`kernel/src/arch/syscall.rs:2472`-`2554`, name at `:2550`); `ps` is a
-toybox applet any process can run (`userland/toybox/src/ps.rs:28`).
-`SYS_READDIR` enumerates any directory by path, which is question 2's ambient
-VFS rather than a separate hole. Filed:
-`issues/isolation/sysinfo-enumerates-every-process.md`.
-
-**Smallest decision:** does `SYS_SYSINFO` need a right? **Recommendation: yes**
-— one more `SysCap` bit (bits 10..31 of `Rights` are free), endowed by
-`system.toml` to whichever program is meant to carry `ps`, exactly as `logread`
-is endowed to `logd` today.
+shipping kernel does not have (`:704`, `:792`). `SYS_READDIR` enumerates any
+directory by path, which is question 2's ambient VFS rather than a separate
+hole.
 
 ## 5. What ambient authority intentionally remains, if any? — RULED 2026-08-20, by composition
 
 Questions 2 and 4's rulings plus the `SYS_SHUTDOWN` fix (PR #169/#172) settle
 this one: the list below, minus `SYS_SHUTDOWN` (now `Rights::POWER`) and minus
-`SYS_SYSINFO` (ruled rights-bearing, implementation queued), **is the
-committed intentional set** — a process's own execution, address space and
-record, machine facts, creation-that-confers-nothing, and the filesystem/
-`SYS_DLOPEN`/`SYS_SPAWN` path space under question 2's declared exception.
+`SYS_SYSINFO`'s census (now `Rights::ROSTER`, PR #209/#211 — its machine header
+stays, as a machine fact beside `SYS_CPU_COUNT`), **is the committed intentional
+set** — a process's own execution, address space and record, machine facts,
+creation-that-confers-nothing, and the filesystem/`SYS_DLOPEN`/`SYS_SPAWN` path
+space under question 2's declared exception.
 
 Nothing states the set, so nothing is *intentional* yet. Classifying every arm
 of `syscall_dispatch` by what it demands, a process with an **empty handle
@@ -134,7 +132,9 @@ table** can still reach:
 - **its own record** — `SYS_GETPID`, `SYS_GET_ENV`, `SYS_ENDOWMENTS`,
   `SYS_QUERY_MODULES`, `SYS_SCHED_INFO`, `SYS_GETCWD`, `SYS_CHDIR`;
 - **machine facts** — `SYS_CLOCK`, `SYS_CLOCK_REALTIME`, `SYS_CLOCK_EPOCH`,
-  `SYS_CPU_COUNT`, `SYS_RANDOM`;
+  `SYS_CPU_COUNT`, `SYS_RANDOM`, and `SYS_SYSINFO`'s header (total and used
+  memory, the CPU count, the live-thread count, the uptime and the two CPU-time
+  accumulators) but not the roster after it;
 - **object creation, which confers nothing over anything that exists** —
   `SYS_PIPE`, `SYS_PORT_CREATE` ("needs no right and grants none — a port with
   no clients is not authority", `kernel/src/arch/syscall.rs:1731`),
@@ -148,7 +148,8 @@ table** can still reach:
 `SYS_DLOPEN` and `SYS_SPAWN` ambient under question 2's ruling; make
 `SYS_SHUTDOWN` and `SYS_SYSINFO` rights-bearing, because neither is path
 authority and both are machine-wide. Then this list, minus those two, is the
-committed answer.
+committed answer. **Both are done** — `Rights::POWER` and `Rights::ROSTER` — so
+the list minus them is what the tree now enforces.
 
 ## 6. Can rights ever increase after delegation? — COMMITTED
 
@@ -300,7 +301,9 @@ Four decisions, in one place, for the owner:
 2. **`SYS_SHUTDOWN`** (questions 2 and 5) — ambient or rights-bearing.
    Recommended: rights-bearing.
 3. **`SYS_SYSINFO`** (questions 4 and 5) — ambient or rights-bearing.
-   Recommended: rights-bearing, one more `SysCap` bit.
+   Recommended: rights-bearing, one more `SysCap` bit. Ruled that way on
+   2026-08-20 and implemented on 2026-08-22 as `Rights::ROSTER`, with the
+   machine header left ambient.
 4. **Threads as objects** (question 9) — intended or declined. Recommended:
    declined until a caller exists.
 

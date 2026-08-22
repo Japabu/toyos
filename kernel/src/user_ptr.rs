@@ -38,30 +38,79 @@ pub const MAX_USER_STR: u64 = 64 * 1024;
 /// Must be `#[repr(C)]`, `Copy`, have no padding, and be valid for any bit pattern.
 pub unsafe trait UserSafe: Copy {}
 
+// **Every impl below is irreducible, and the reason is the same one for all
+// fourteen: `UserSafe` states a property of a type's *bytes* — `#[repr(C)]`,
+// no padding, every bit pattern a value — and Rust offers no way to observe
+// any of the three.** There is no `const fn` that reports a struct's padding
+// and no trait bound that means "valid for any bit pattern", so the only
+// mechanical alternative is a derive macro, which would be a proc-macro crate
+// this kernel does not have and would move the same claim rather than check
+// it. What each impl below can do is say what it checked, and every one was
+// checked by reading the definition: `#[repr(C)]`, `Copy`, integer fields
+// only, and an explicit `_pad` wherever alignment would otherwise have left a
+// hole. Integer fields only is what makes "any bit pattern" true — nothing
+// here holds an enum, a `bool`, a `char`, a reference or a `NonZero`.
+//
+// Padding matters in both directions. `copy_out` writes `size_of::<T>()`
+// bytes into a page userland reads, so a padding byte would be uninitialized
+// kernel stack leaving the kernel; `copy_in` reads the same width back, so a
+// padding byte would be a value the kernel never wrote.
+
 // Primitives used in syscall arguments.
+// SAFETY: a primitive integer, and an array of them, is `#[repr(C)]`-compatible
+// by definition, has no padding, and every bit pattern is a value.
 unsafe impl UserSafe for u32 {}
+// SAFETY: see `u32`.
 unsafe impl UserSafe for u64 {}
+// SAFETY: see `u32` — an array adds no padding between elements.
 unsafe impl UserSafe for [u32; 2] {}
+// SAFETY: see `u32`.
 unsafe impl UserSafe for [u64; 2] {}
 
 // Kernel types.
+// SAFETY: `#[repr(C)] Copy`, three `u64`s (`object::ops::Stat`) — 24 bytes, no
+// padding, and `file_type` is a `u64` and not the enum it names precisely so
+// that every bit pattern stays a value.
 unsafe impl UserSafe for crate::object::ops::Stat {}
 
 // ABI types.
+// SAFETY: `#[repr(C)] Copy`, ten `u64`s — 80 bytes, no padding. Every field is
+// a pointer or a length the kernel validates where it uses it, never here.
 unsafe impl UserSafe for toyos_abi::syscall::SpawnArgs {}
+// SAFETY: `#[repr(C)] Copy`, `RawHandle` (a `#[repr(transparent)]` `u32`), an
+// explicit `_pad: u32`, then six `u64`s — 56 bytes, no padding.
 unsafe impl UserSafe for toyos_abi::syscall::NamespaceBuild {}
+// SAFETY: `#[repr(C)] Copy`, `u64`, `u64`, `i64` — 24 bytes, no padding.
 unsafe impl UserSafe for toyos_abi::syscall::SchedInfo {}
+// SAFETY: `#[repr(C)] Copy`, `u64`s and `u32`s in pairs — 128 bytes, no
+// padding: the two `u32` pairs (`fault_demand_count`/`fault_zero_count` and
+// `io_read_ops`/`pid`) are what keeps every `u64` 8-aligned, and `pid` was
+// named padding until it was given a meaning.
 unsafe impl UserSafe for toyos_abi::syscall::ProcessStats {}
+// SAFETY: `#[repr(C)] Copy`, `[RawHandle; 2]` then six `u32`s — 32 bytes,
+// align 4, no padding.
 unsafe impl UserSafe for toyos_abi::FramebufferInfo {}
+// SAFETY: `#[repr(C)] Copy`, `RawHandle`, an explicit `_pad: u32`, `u64` — 16
+// bytes, no padding.
 unsafe impl UserSafe for toyos_abi::syscall::InboxSetup {}
 
+// SAFETY: `#[repr(C)] Copy`, two `u8`s — 2 bytes, align 1, no padding.
+// `keycode` and `modifiers` are `u8` and not enums or bitflags exactly so that
+// a transition the kernel does not recognise is still a value.
 unsafe impl UserSafe for toyos_abi::input::RawKeyEvent {}
+// SAFETY: `#[repr(C)] Copy`, `u8`, `i8`, `u16`, `u16` — 6 bytes, align 2, and
+// the two bytes ahead of `abs_x` are what makes it 2-aligned, so there is no
+// padding.
 unsafe impl UserSafe for toyos_abi::input::MouseEvent {}
 
 /// 88 bytes of `u32`, `u32`, `u64`, `u64` and `[u64; 8]` — `#[repr(C)]`, no
 /// padding by its own `const` size assertion, and valid for every bit pattern:
 /// the kernel clamps each number where it uses it rather than trusting it where
 /// it arrives (`log::read::Cursor::from_reader`).
+// SAFETY: the doc comment above is the argument, and this one carries the
+// evidence: `toyos_abi::log`'s `const _: () = assert!(size_of::<LogCursor>()
+// == 24 + 8 * MAX_LOG_SHARDS)` fails to compile if a padding byte ever appears
+// — the only member of this list whose no-padding claim a gate checks.
 unsafe impl UserSafe for toyos_abi::log::LogCursor {}
 
 /// Translate a user virtual address to its direct-map address, demand-paging
@@ -162,12 +211,30 @@ impl<'a> SyscallContext<'a> {
     /// than the second lock-and-translate the borrow already paid.
     pub fn copy_in<T: UserSafe>(&self, ptr: UserAddr) -> Result<T, SyscallError> {
         let kptr = object::<T>(ptr)?;
+        // SAFETY: `object::<T>` returned, so `is_user_object` accepted
+        // `size_of::<T>()` bytes at `ptr` with `align_of::<T>()`, and the
+        // translation that followed put the whole object inside one 2 MiB
+        // physical page — the direct map is what makes that address readable
+        // with SMAP on. `T: UserSafe` is the claim that every bit pattern of
+        // those bytes is a `T`.
+        //
+        // Irreducible: this is where a user address becomes a kernel value,
+        // and the only alternative to a raw read is a reference — which is
+        // precisely what [`UserBytes`]'s header refuses, because another
+        // thread of the same process may write these bytes at any instant.
+        // `read_volatile` and not a plain read for the same reason: one read,
+        // not one the compiler may split, fold or repeat.
         Ok(unsafe { (kptr as *const T).read_volatile() })
     }
 
     /// Write a typed value into user memory.
     pub fn copy_out<T: UserSafe>(&self, ptr: UserAddr, value: &T) -> Result<(), SyscallError> {
         let kptr = object::<T>(ptr)?;
+        // SAFETY: `copy_in`'s argument in the other direction — same
+        // validation, same one-page window, and `T: UserSafe` guarantees the
+        // `size_of::<T>()` bytes this writes are all initialized, so no
+        // padding byte of kernel stack leaves the kernel. Irreducible for
+        // `copy_in`'s reason.
         unsafe { (kptr as *mut T).write_volatile(*value) };
         Ok(())
     }
@@ -239,6 +306,17 @@ impl UserBytes<'_> {
             dst.len(),
             self.len
         );
+        // SAFETY: the assert above proves `off + dst.len() <= self.len`, and
+        // `window` proved the whole `self.len` range is one physically
+        // contiguous direct-map window — so `add` stays inside it and the
+        // copy reads only bytes this `UserBytes` covers. `dst` is a `&mut`
+        // the caller owns, so the two ranges cannot overlap.
+        //
+        // Irreducible, and deliberately so: the type's own header argues that
+        // a `&[u8]` here is the bug, because `noalias` would let the compiler
+        // assume bytes another thread of the same process can rewrite do not
+        // change. A raw `copy_nonoverlapping` *is* the safe abstraction here;
+        // there is nothing above it to move to.
         unsafe {
             core::ptr::copy_nonoverlapping(self.kptr.add(off), dst.as_mut_ptr(), dst.len());
         }
@@ -251,6 +329,11 @@ impl UserBytes<'_> {
             "UserBytes::sub {off}+{len} past a {}-byte window",
             self.len
         );
+        // SAFETY: the assert proves `off + len <= self.len`, so the result is
+        // still inside the contiguous window `window` validated — which is
+        // exactly `add`'s requirement. Irreducible: narrowing a window is
+        // pointer arithmetic, and the safe spelling (`wrapping_add`) would
+        // drop the in-bounds claim this assert has just established.
         UserBytes { kptr: unsafe { self.kptr.add(off) }, len, _scope: PhantomData }
     }
 }
@@ -287,6 +370,11 @@ impl UserBytesMut<'_> {
             src.len(),
             self.len
         );
+        // SAFETY: [`UserBytes::read_at`]'s argument in the other direction —
+        // the assert proves `off + src.len() <= self.len` and `window` proved
+        // the range is one contiguous direct-map window. Irreducible for the
+        // same reason: a `&mut [u8]` over a page the process also maps is the
+        // borrow this type exists to refuse.
         unsafe {
             core::ptr::copy_nonoverlapping(src.as_ptr(), self.kptr.add(off), src.len());
         }
@@ -299,6 +387,8 @@ impl UserBytesMut<'_> {
             "UserBytesMut::fill_zero {off}+{len} past a {}-byte window",
             self.len
         );
+        // SAFETY: same as `write_at`, with a constant source byte instead of a
+        // slice — the assert bounds `off + len` against the validated window.
         unsafe { core::ptr::write_bytes(self.kptr.add(off), 0, len) };
     }
 
@@ -309,6 +399,7 @@ impl UserBytesMut<'_> {
             "UserBytesMut::sub {off}+{len} past a {}-byte window",
             self.len
         );
+        // SAFETY: [`UserBytes::sub`]'s argument exactly.
         UserBytesMut { kptr: unsafe { self.kptr.add(off) }, len, _scope: PhantomData }
     }
 }
@@ -354,6 +445,15 @@ impl ByteSource for UserBytes<'_> {
 /// One `translate` per 2 MiB boundary crossed, plus the last byte: a window
 /// whose pages are not physically adjacent would make an offset into it name a
 /// page belonging to somebody else.
+///
+/// **The two address computations here are `wrapping_add`, and that is not a
+/// spelling choice.** Both exist to be *compared* against a translation, and
+/// what they are testing is precisely whether the byte at that offset is still
+/// inside the same physical allocation. `add` promises the compiler it already
+/// is — so on the run where the pages are *not* contiguous, which is the run
+/// this function exists to catch, `add` would be undefined behaviour and the
+/// comparison it feeds would be one the optimizer is entitled to fold away.
+/// Neither result is ever dereferenced.
 fn window(ptr: UserAddr, len: usize) -> Option<*mut u8> {
     if !toyos_userbound::in_user_half(ptr.raw(), len as u64) {
         return None;
@@ -364,12 +464,12 @@ fn window(ptr: UserAddr, len: usize) -> Option<*mut u8> {
     let mut boundary = (start & !(crate::mm::PAGE_2M - 1)) + crate::mm::PAGE_2M;
     while boundary < end {
         let k = translate(boundary)?;
-        if k != unsafe { kptr.add((boundary - start) as usize) } {
+        if k != kptr.wrapping_add((boundary - start) as usize) {
             return None;
         }
         boundary += crate::mm::PAGE_2M;
     }
-    if len > 1 && translate(end - 1)? != unsafe { kptr.add(len - 1) } {
+    if len > 1 && translate(end - 1)? != kptr.wrapping_add(len - 1) {
         return None;
     }
     Some(kptr)

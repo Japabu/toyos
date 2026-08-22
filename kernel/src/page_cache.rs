@@ -98,7 +98,15 @@ pub struct PageCache {
     /// superblock — touched by every btree walk — as readily as a leaf.
     referenced: Vec<bool>,
     /// Page data stored in fixed-size 1MB chunks to avoid giant reallocations.
-    chunks: Vec<Box<[u8; CHUNK_SIZE]>>,
+    ///
+    /// `Box<[u8]>` and not `Box<[u8; CHUNK_SIZE]>`: the array type forced a
+    /// hand-written `alloc_zeroed` + `Box::from_raw`, because `Box::new` of a
+    /// 1 MiB array builds it on the kernel stack first. Every use of a chunk
+    /// is a `[off..off + 4096]` slice, which the unsized type serves
+    /// identically — and `vec![0u8; CHUNK_SIZE]` reaches the same
+    /// `alloc_zeroed` through `alloc`'s own zeroing specialization for `u8`,
+    /// with no stack temporary and no `unsafe`.
+    chunks: Vec<Box<[u8]>>,
     hand: u32,
     max_slots: usize,
     evictions: u64,
@@ -151,13 +159,7 @@ impl PageCache {
             self.dirty.push(false);
             self.referenced.push(false);
             if slot as usize / PAGES_PER_CHUNK >= self.chunks.len() {
-                let chunk: Box<[u8; CHUNK_SIZE]> = unsafe {
-                    let layout = alloc::alloc::Layout::new::<[u8; CHUNK_SIZE]>();
-                    let ptr = alloc::alloc::alloc_zeroed(layout);
-                    assert!(!ptr.is_null(), "page cache: chunk allocation failed");
-                    Box::from_raw(ptr as *mut [u8; CHUNK_SIZE])
-                };
-                self.chunks.push(chunk);
+                self.chunks.push(vec![0u8; CHUNK_SIZE].into_boxed_slice());
             }
             slot
         } else {
