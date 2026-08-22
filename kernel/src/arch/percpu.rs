@@ -829,7 +829,15 @@ pub fn init_bsp(lapic_id: u32) {
     super::control_regs::init(0);
     super::fpu::init();
 
-    cpu::wrmsr(MSR_GS_BASE, ptr as u64);
+    // SAFETY: `wrmsr` asks its caller to own the MSR it names and the value it
+    // writes. `IA32_GS_BASE` is where every `gs:` access in this kernel lands,
+    // and this write is what makes those accesses mean anything at all on the
+    // BSP — before it, `gs:` is whatever firmware left. `ptr` is the live,
+    // never-freed `PerCpu` `alloc_percpu` returned above, whose `&mut` ended at
+    // the `load_gdt` line, so publishing it hands the CPU the only reference
+    // there is. Nothing between the allocation and here may read `gs:`, which is
+    // why `PERCPU_READY` is stored on the line below rather than earlier.
+    unsafe { cpu::wrmsr(MSR_GS_BASE, ptr as u64) };
 
     // GS base is now valid — enable CPU/TID context in log! macro
     crate::log::PERCPU_READY.store(true, core::sync::atomic::Ordering::Release);

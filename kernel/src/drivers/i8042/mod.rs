@@ -1199,14 +1199,25 @@ fn read_data(deadline: u64) -> Option<u8> {
 
 fn command(cmd: u8, deadline: u64) -> bool {
     wait_writable(deadline) && {
-        outb(COMMAND, cmd);
+        // SAFETY: `outb` asks its caller to own the port and the byte.
+        // `COMMAND` is 0x64, the 8042's fixed architectural command port — no
+        // other device on any machine this kernel targets decodes it, and the
+        // controller has no path to memory. Every `cmd` that reaches here is one
+        // of this module's `CMD_*` constants, which are the controller's own
+        // documented command bytes.
+        unsafe { outb(COMMAND, cmd) };
         true
     }
 }
 
 fn write_data(byte: u8, deadline: u64) -> bool {
     wait_writable(deadline) && {
-        outb(DATA, byte);
+        // SAFETY: `command`'s argument for the port — `DATA` is 0x60, the other
+        // half of the same controller's two-port block. The byte is either a
+        // configuration word this module built or a device command destined for
+        // the keyboard or the mouse behind the controller, neither of which can
+        // reach memory.
+        unsafe { outb(DATA, byte) };
         true
     }
 }

@@ -84,10 +84,12 @@ pub const CR0: u64 = cr0::PE | cr0::MP | cr0::ET | cr0::NE | cr0::WP | cr0::PG;
 /// `PAE` is long mode's, `OSFXSR` and `OSXMMEXCPT` are `FXSAVE64`'s and SSE's,
 /// and `MCE` is a machine check reported rather than a shutdown with nothing to
 /// read. **`DE` is here for zero legacy and not for a need**: this kernel
-/// references no `DR4` or `DR5` — `arch::debug` and the `#DB` handler use `DR0`,
-/// `DR6` and `DR7` — and `DE` clear is the 386 behaviour where `DR4` and `DR5`
-/// alias `DR6` and `DR7` instead of raising `#UD` (SDM Vol. 3B §17.2.2,
-/// *Debug Registers DR4 and DR5*). All five are older than x86-64 and
+/// references no debug register at all — `arch::debug` and the `#DB` handler
+/// that read `DR0`, `DR6` and `DR7` are both gone, because nothing armed a
+/// watchpoint and vector 1 is a userland bug — and `DE` clear is the 386
+/// behaviour where `DR4` and `DR5` alias `DR6` and `DR7` instead of raising
+/// `#UD` (SDM Vol. 3B §17.2.2, *Debug Registers DR4 and DR5*). All five are
+/// older than x86-64 and
 /// present on everything that implements it, and `FSGSBASE` is not — but every
 /// context switch uses `rdfsbase`/`wrfsbase`, so a CPU without it would `#UD` at
 /// the first one. All are checked against CPUID rather than assumed: setting a
@@ -200,8 +202,19 @@ pub fn init(cpu_id: u32) {
         // optional bit and asserted `LA57` is clear; `PAE` is in
         // `CR4_REQUIRED`; and both call sites of this function run on the kernel
         // address space, whose PCID is 0.
-        unsafe { cpu::write_cr4(declared) };
-        cpu::wrmsr(efer::MSR, EFER);
+        //
+        // `wrmsr` asks its caller to own the MSR and the value. [`EFER`] is this
+        // file's declaration and its doc comment argues all three bits in it and
+        // the one left out; `IA32_EFER` is architectural on every CPU in long
+        // mode, and `declaration` has just asserted this one reports both
+        // `SYSCALL` and `NX`, which are the two bits being set that a CPU can
+        // lack. **One block, because `CR4` and `EFER` are one declaration
+        // applied to one CPU** — [`self_check`] below asks about them together
+        // for the same reason.
+        unsafe {
+            cpu::write_cr4(declared);
+            cpu::wrmsr(efer::MSR, EFER);
+        }
         if declared & cr4::SMAP != 0 {
             // SMAP binds only while `RFLAGS.AC` is clear, and `AC` here is
             // whatever was inherited — `INIT` clears it on an AP, firmware
@@ -219,6 +232,33 @@ pub fn init(cpu_id: u32) {
 /// is the flush this machine uses.
 pub fn pcid_active() -> bool {
     DECLARED_CR4.load(Ordering::Acquire) & cr4::PCIDE != 0
+}
+
+/// Proof that this machine's declaration carries `PCIDE`, and therefore that
+/// `INVPCID` is not `#UD` on any CPU in it.
+///
+/// **The one requirement [`cpu::invpcid`](super::cpu::invpcid) cannot discharge
+/// for itself.** Its other fault — `#GP` on a descriptor type above 3 — is a
+/// value a caller passes, and [`Invpcid`](super::cpu::Invpcid) makes that
+/// unrepresentable. This one is not a value at all; it is a fact about the
+/// silicon, and `CR4_OPTIONAL` is where this kernel admits the fact can go
+/// either way. So the wrapper takes the *answer* rather than trusting the caller
+/// to have asked the question, and a call that skipped the check has no
+/// spelling.
+///
+/// Zero-sized, so it costs nothing: an `Option<PcidActive>` is one byte, and the
+/// `if let` a caller writes is the `if` it was writing anyway.
+///
+/// It cannot go stale. [`DECLARED_CR4`] is written once, by whichever CPU
+/// reaches [`declaration`] first, and every CPU after it asserts the same
+/// value — nothing in this kernel ever clears `PCIDE`.
+pub struct PcidActive(());
+
+impl PcidActive {
+    /// `Some` where the declaration carries `PCIDE`, `None` where it does not.
+    pub fn ask() -> Option<Self> {
+        pcid_active().then_some(Self(()))
+    }
 }
 
 /// What this CPU says [`CR4_REQUIRED`] and [`CR4_OPTIONAL`] come to, checked
