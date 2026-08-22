@@ -2544,6 +2544,25 @@ pub const KNOWN_RED: &[Red] = &[
         source: "issues/boot-media/fsync-on-log-returns-other-under-a-loaded-host.md",
         measured: "2026-08-22",
     },
+    // A boot that had not reached logd's first write inside the test's window,
+    // once in four beside another agent's suite, green alone and three of three
+    // after — no rate yet, and the row exists so the next reader of this name
+    // gets the sighting instead of `NOT ON THE LIST`.
+    Red {
+        test: "kernel_log_file",
+        instrument: Instrument::DevHostLoaded,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`logd never opened a file` — the captured boot log ends at `log-volume: \
+               partition mounted` at 0.221 s, so the guest had not reached logd's first write \
+               inside the window, not a file written wrong; `ALONE kernel_log_file: GREEN`, \
+               which is a hypothesis about its `Sched` and not a finding",
+        evidence: "dev host, 2026-08-22, `--nightly kernel_log_file` on merged `main` 11cc6ef1 \
+                   at `1.55x width` with a second agent's `cargo test --workspace` on the same \
+                   laptop: 1 red, then 3 of 3 green at load 3.1 with the neighbour still present",
+        source: "issues/boot-media/kernel-log-file-reds-beside-other-guests-and-is-green-alone.md",
+        measured: "2026-08-22",
+    },
 ];
 
 // ---------------------------------------------------------------------------
