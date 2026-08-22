@@ -75,6 +75,7 @@ pub fn qemu_version_note(root: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
 
     fn repo_root() -> PathBuf {
@@ -223,6 +224,153 @@ mod tests {
         assert!(
             !text.contains("${{ runner.name"),
             "where a lane ran is `route.yml`'s answer, not the name of the runner reading it"
+        );
+    }
+
+    /// `route.yml`'s `HOSTED` expression, as one whitespace-normalised line.
+    ///
+    /// Not a YAML parser, for the reason [`jobs`] is not one: the shape is
+    /// fixed — a `HOSTED: >-` key and a folded block indented under it — and
+    /// anything else is a file to name rather than a shape to accommodate.
+    fn hosted_expression(text: &str) -> String {
+        let mut lines = text.lines().skip_while(|l| !l.trim_start().starts_with("HOSTED:"));
+        let head = lines.next().expect("route.yml declares HOSTED");
+        let indent = head.len() - head.trim_start().len();
+        let mut expr = String::new();
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if line.len() - line.trim_start().len() <= indent {
+                break;
+            }
+            expr.push(' ');
+            expr.push_str(line.trim());
+        }
+        expr.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Every event name `route.yml`'s `HOSTED` expression tests for.
+    fn hosted_events(expr: &str) -> BTreeSet<String> {
+        expr.split("github.event_name == '")
+            .skip(1)
+            .filter_map(|rest| rest.split('\'').next())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Where a Linux job runs is one expression in one file, and this is what
+    /// it has to say.
+    ///
+    /// `route.yml`'s `HOSTED` decides the whole repository's routing and every
+    /// consumer reads the answer back through `needs.route.outputs.trusted`, so
+    /// a clause dropped from it is invisible in every other file. The direction
+    /// that hurts is the one that puts branch traffic back on the T14: that
+    /// machine has one runner with one worker, and on 2026-08-22T05:03Z
+    /// thirteen runs — seven `toolchain`, five `ci`, one `landing`, all of them
+    /// `pull_request` or `push` from this repository's own branches — were
+    /// queued behind one scheduled gate A, while `toolchain.yml`'s `build`, a
+    /// required check, spent 57 minutes in that queue and then failed in nine
+    /// seconds (run 32549542807).
+    ///
+    /// So the events are pinned as a set rather than as four `contains` calls:
+    /// a clause added here is as much a routing change as one removed, and the
+    /// set is what says which.
+    #[test]
+    fn every_pull_request_and_push_routes_to_the_hosted_lane() {
+        let path = repo_root().join(".github/workflows/route.yml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} decides where CI runs: {e}", path.display()));
+        let expr = hosted_expression(&text);
+
+        assert_eq!(
+            hosted_events(&expr),
+            ["merge_group", "pull_request", "push", "schedule"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>(),
+            "route.yml's HOSTED names a different set of events than the routing rule: \
+             {expr:?}"
+        );
+        assert!(
+            expr.contains("github.event_name == 'schedule' && github.workflow == 'ci'"),
+            "the `schedule` clause has to stay `ci.yml`'s alone — gate A's and \
+             portability's schedules are the T14's: {expr:?}"
+        );
+        assert!(
+            !expr.contains("head.repo"),
+            "HOSTED tells a pull request apart by where its head is, so a same-repo pull \
+             request is on the T14 again — which is the queue this rule was rewritten to \
+             empty: {expr:?}"
+        );
+        assert!(
+            !expr.contains("workflow_dispatch"),
+            "a dispatch is the T14's manual lane, and this expression naming it means \
+             nothing routes to the machine but a schedule: {expr:?}"
+        );
+    }
+
+    /// The scan, shown refusing the shape it is written against.
+    #[test]
+    fn the_hosted_scan_reads_the_clauses_and_not_the_prose_around_them() {
+        let file = concat!(
+            "        env:\n",
+            "          # push is a comment here and not a clause\n",
+            "          HOSTED: >-\n",
+            "            ${{ github.event_name == 'merge_group'\n",
+            "                || github.event_name == 'pull_request' }}\n",
+            "        run: |\n",
+            "          echo github.event_name == 'schedule'\n",
+        );
+        let expr = hosted_expression(file);
+        assert_eq!(
+            expr,
+            "${{ github.event_name == 'merge_group' || github.event_name == 'pull_request' }}"
+        );
+        assert_eq!(
+            hosted_events(&expr),
+            ["merge_group", "pull_request"].into_iter().map(str::to_string).collect()
+        );
+    }
+
+    /// The second axis of the same job, held together for the same reason.
+    ///
+    /// Which *names* a run renders the price verdict for is decided by
+    /// [`crate::durations::TIER_BASE_FLAG`] and by the two event expressions
+    /// that fill it. Both failure directions are silent in the file that
+    /// carries them: drop the flag and every pull request and every merge-queue
+    /// composition quietly becomes the nightly, reding on names nobody in them
+    /// touched; drop one of the two event expressions and that event quietly
+    /// stops narrowing at all, with the workflow still reading perfectly.
+    /// `merge_group` in particular is the lane the verdict is *rendered* on, so
+    /// losing its base is losing the whole change.
+    #[test]
+    fn the_names_a_landing_is_judged_on_come_from_the_event_that_produced_it() {
+        let path = repo_root().join(".github/workflows/ci.yml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} is a gate and is not readable: {e}", path.display()));
+        let (_, durations) = jobs(&text)
+            .into_iter()
+            .find(|(name, _)| name == "durations")
+            .expect("ci.yml renders the duration verdict in a job called `durations`");
+        assert!(
+            durations.contains(crate::durations::TIER_BASE_FLAG),
+            "the `durations` job no longer passes {:?}, so it renders the whole tier verdict on \
+             every pull request and every merge-queue composition — the state that dequeued \
+             composition 32550410305 on a name nothing in it had touched",
+            crate::durations::TIER_BASE_FLAG
+        );
+        for base in ["github.event.merge_group.base_sha", "github.event.pull_request.base.sha"] {
+            assert!(
+                durations.contains(base),
+                "the `durations` job stopped reading {base}, so that event names no base and \
+                 silently falls back to the nightly's whole-tree verdict"
+            );
+        }
+        assert!(
+            durations.contains("fetch-depth: 0"),
+            "reading the base's `tests/toyos.rs` needs the base commit in the clone, and \
+             actions/checkout leaves a depth-1 one without it"
         );
     }
 
