@@ -687,10 +687,10 @@ jobs:
           # is a change under review — and empty means the whole verdict, never
           # none of it. `merge_group` first: a queued composition is measured
           # against the `main` the queue built it on, not against the base the
-          # pull request opened from.
-          TIER_BASE: >-
-            ${{ github.event.merge_group.base_sha
-                || github.event.pull_request.base.sha }}
+          # pull request opened from. One line: a folded scalar would put a
+          # newline inside the `${{ }}`, which is a question nobody should have
+          # to ask of a value that decides what this gate refuses.
+          TIER_BASE: ${{ github.event.merge_group.base_sha || github.event.pull_request.base.sha }}
         run: |
           set -o pipefail
           if ! ls /tmp/durations/*/test-durations.shard-* >/dev/null 2>&1; then
