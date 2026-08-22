@@ -25,6 +25,12 @@ const RIP_OFFSET: usize = 80;
 #[unsafe(naked)]
 pub(super) extern "sysv64" fn nmi_entry() {
     naked_asm!(
+        // The `cld` `arch::entry::ring3_naked_asm` gives every other gate, at the
+        // one entry that is not routed through it. An NMI arrives between
+        // arbitrary instructions — `memmove`'s `std` … `cld` window included —
+        // and `note` is a `sysv64` call, which the ABI says may not be entered
+        // with the direction flag set.
+        "cld",
         "push rax",
         "push rcx",
         "push rdx",

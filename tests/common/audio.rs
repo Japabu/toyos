@@ -404,6 +404,23 @@ pub struct SounddWindow {
     pub max_wake_lat_us: u64,
     pub max_batch: u32,
     pub clients: u32,
+    /// The worst wake taken apart, as `toyos_mixer::WorstWake` describes it.
+    /// `worst_irq_late_us + worst_pickup_us == max_wake_lat_us`, up to the
+    /// truncation each half takes on its way to microseconds.
+    pub worst: WorstWake,
+    /// Wakes in this window a whole device period or more past their grid
+    /// point — how many stalls the maximum is the maximum *of*.
+    pub late_wakes: u32,
+}
+
+/// soundd's decomposition of its worst wake, carried through the harness so a
+/// per-run line can say *which* half the number is.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WorstWake {
+    pub irq_late_us: u64,
+    pub pickup_us: u64,
+    pub empty: u32,
+    pub batch: u32,
 }
 
 /// Worst/total over every stats window of one run.
@@ -412,6 +429,10 @@ pub struct SounddCounters {
     pub windows: usize,
     /// Worst single-window wake lateness — the sharpest instrument here.
     pub max_wake_lat_us: u64,
+    /// The decomposition belonging to *that* window's worst wake. Taken from
+    /// the window that set the maximum rather than maximised on its own: two
+    /// independently-worst halves describe a wake that never happened.
+    pub worst: WorstWake,
     /// Cycles that found the whole DMA pipeline free (§5.9 recovery).
     pub drains: u32,
     /// Periods submitted with no client audio behind them: silence that
@@ -419,7 +440,40 @@ pub struct SounddCounters {
     pub underruns: u32,
     pub submitted: u32,
     pub wakes: u32,
+    /// Summed over the run's windows: how many wakes were a whole period or
+    /// more late, which is what separates one stall from a thousand.
+    pub late_wakes: u32,
     pub max_batch: u32,
+}
+
+/// The two numbers this boot drew for its clocks, off the kernel's own boot
+/// lines: the TSC period against the HPET (`kernel/src/clock.rs`) and the LAPIC
+/// timer's tick rate against that (`kernel/src/arch/apic.rs`).
+///
+/// **They are here because they are the only per-boot draws that scale every
+/// armed timer for the boot's whole life**, which is the shape
+/// `issues/audio/t14-wake-lateness-is-bimodal-per-boot.md` is looking for: a
+/// wake latency that is one of two values, decided at boot and steady inside
+/// it, cannot come from anything re-decided per wake. Both calibrations are
+/// busy-wait windows on a virtual machine, so both are exactly the kind of
+/// number a host that stalls the guest mid-window would move.
+///
+/// Printed, never asserted: what a correct pair looks like on a given host is
+/// not something this harness knows, and a threshold nobody measured is the
+/// problem `tests/audio-baseline.toml` exists to avoid.
+pub fn boot_clocks(boot_log: &str) -> String {
+    let field = |marker: &str, upto: char| {
+        boot_log.find(marker).map(|at| {
+            let rest = &boot_log[at + marker.len()..];
+            let end = rest.find(upto).unwrap_or(rest.len());
+            rest[..end].trim().to_string()
+        })
+    };
+    format!(
+        "tsc {} lapic {}",
+        field("TSC: ", ' ').unwrap_or_else(|| "?".into()),
+        field("LAPIC timer: ", '\n').unwrap_or_else(|| "?".into()),
+    )
 }
 
 /// Kernel logging shares the virtio-console with userspace and is not
@@ -444,7 +498,7 @@ fn strip_kernel_logging(serial: &str) -> String {
 
 const STATS_MARKER: &str = "soundd: wakes=";
 /// soundd's stats fields, in the order it prints them.
-const STATS_KEYS: [&str; 8] = [
+const STATS_KEYS: [&str; 13] = [
     "wakes",
     "completions",
     "submitted",
@@ -453,6 +507,14 @@ const STATS_KEYS: [&str; 8] = [
     "max_wake_lat_us",
     "max_batch",
     "clients",
+    // `deferred` and `starve_max` sit between these and `clients` on the wire
+    // and are read by nothing here; the scan is forward-only from the previous
+    // key, so a printed field this list omits is simply stepped over.
+    "worst_irq_late_us",
+    "worst_pickup_us",
+    "worst_empty",
+    "worst_batch",
+    "late_wakes",
 ];
 
 /// Read `key=<digits>` at or after `from`, tolerating a foreign line spliced
@@ -503,14 +565,28 @@ pub fn parse_soundd_counters(serial: &str) -> Result<SounddCounters, String> {
             max_wake_lat_us: vals[5],
             max_batch: vals[6] as u32,
             clients: vals[7] as u32,
+            worst: WorstWake {
+                irq_late_us: vals[8],
+                pickup_us: vals[9],
+                empty: vals[10] as u32,
+                batch: vals[11] as u32,
+            },
+            late_wakes: vals[12] as u32,
         };
         out.windows += 1;
-        out.max_wake_lat_us = out.max_wake_lat_us.max(w.max_wake_lat_us);
+        // The decomposition travels with the maximum it decomposes: `>=` so
+        // the first window still sets one, and so a later window that ties
+        // hands over its own halves rather than leaving stale ones behind.
+        if w.max_wake_lat_us >= out.max_wake_lat_us {
+            out.max_wake_lat_us = w.max_wake_lat_us;
+            out.worst = w.worst;
+        }
         out.max_batch = out.max_batch.max(w.max_batch);
         out.drains += w.drains;
         out.underruns += w.underruns;
         out.submitted += w.submitted;
         out.wakes += w.wakes;
+        out.late_wakes += w.late_wakes;
     }
     Ok(out)
 }

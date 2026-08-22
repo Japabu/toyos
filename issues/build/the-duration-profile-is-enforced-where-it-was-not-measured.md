@@ -152,6 +152,34 @@ same refusal hosted, a `may not land` marker refusal on the T14, a duplicate
 label on the T14, and a tier refusal with the routing output empty (a failed or
 skipped `route`) all still exit 101.
 
+## Closed 2026-08-21: the nightly gap
+
+**The orchestrator's ruling: the nightly refreshes the profile, so it runs
+where the profile lives.** `route.yml`'s `HOSTED` expression now carries one
+more clause: `github.event_name == 'schedule' && github.workflow == 'ci'`.
+`github.workflow` is the calling workflow's name even from inside a reusable
+workflow, so this reaches `ci.yml`'s own `schedule` — and only that one —
+without touching gate A's `10 3 * * *` or portability's `15 3 * * *`, which
+stay trusted (T14) exactly as before; `workflow_dispatch` is untouched on
+every workflow, so it stays the T14's manual lane on purpose. `ci.yml`'s
+nightly `schedule` is now routed hosted, exactly like a merge-queue ref:
+twelve GitHub-hosted shards, `debian:sid`, `SUITE_TIER_ARGS` still widened to
+`--nightly` (that switch never read `trusted`), `tcg` still hosted on the same
+event, `nightly-red`'s own `needs:`/`if:` untouched. `cache-writer` was and
+stays `skipped` on `schedule` by its own explicit
+`github.event_name != 'schedule'` guard, unrelated to `trusted`.
+
+So the instrument that recorded `tests/test-durations` is the instrument that
+now refreshes it: `durations`'s `GUEST_LANE_TRUSTED` reads `no` on a nightly
+run again, the softened-warning branch in the ruling above does not fire, and
+the price verdict renders for real on every nightly, the same as it does on
+the merge queue. **The gap this file's "What remains" named — no instrument
+matching the profile produces a fresh Nightly number at all — is closed.**
+Verified by construction (`gh workflow run` cannot exercise `schedule`, so
+there is no dispatched run to point at): the `HOSTED` expression traced by
+hand through the affected consumers, `cargo test --lib` green throughout.
+Prospective until the first hosted nightly actually runs, 2026-08-22 03:00Z.
+
 ## What remains
 
 * **`src/redlist.rs`'s `xhci_full_speed_device` row is now about a warning.**
@@ -163,28 +191,14 @@ skipped `route`) all still exit 101.
   instrument is not.** The enum now says two machines wear that name and do not
   price alike. `tests/test-durations` still holds one number per test with no
   record of which machine took it.
-* **Nothing hosted measures the nightly tier any more, and this change does not
-  create that — it exposes it.** `route.yml` sends `schedule` and
-  `workflow_dispatch` to the T14, and those are the only two events that pass
-  `--nightly`; a merge-queue ref and a fork's pull request are hosted and never
-  do. So every fresh Nightly measurement from now on is a T14 number entering a
-  hosted profile — the table above measures that gap at 1.35–1.37× for
-  `xhci_full_speed_device` alone and uncontended — and after this
-  change the nightly's own `durations` job no longer renders a verdict on it
-  either — the `Why::Cost` return rule and the over-the-line rule stop firing
-  there. What the hosted merge queue still checks is Nightly *placement* against
-  whatever numbers are committed, since `merged_profile` preserves rows a fast
-  run did not measure. **The gap is that no instrument matching the profile
-  produces a fresh Nightly number at all.** This is prospective, not yet
-  observed: `985f3834` landed in `a4e0ab75` at 2026-08-21 10:41Z and the nightly
-  that recorded the current profile ran at 03:43Z that morning, before it — the
-  first T14 nightly is 2026-08-22 03:00Z.
 * **The `UNMEASURED` round trip now takes its one bought measurement on the
   T14.** A new Fast name's marker still reds on a T14 lane by design, and the
   measured value the author is told to commit comes from that lane's artifact —
   a T14 number entering a hosted profile. A branch in this repository cannot get
   a hosted twelve-shard measurement at all except by entering the merge queue,
-  so the number is adjudicated there rather than on the pull request.
+  so the number is adjudicated there rather than on the pull request. This is
+  about a branch's pull request, not about `schedule`, so the routing change
+  above does not touch it.
 
 `cargo run -- --known-red xhci_full_speed_device` answers with the row this
 issue is the source of, so an author who meets the refusal does not re-derive

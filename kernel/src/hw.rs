@@ -309,7 +309,11 @@ fn switch_frame_is_wrong(ctx: &KernelCtx, token: &RunToken<KernelPayload>) -> ! 
             crate::log!("  [{addr:#x}] {name:>6} = {word:#018x}");
         }
     }
-    panic!("context_switch: the restored frame's return address is not kernel text");
+    panic!(
+        "context_switch: the frame about to be restored is not one — its rsp is not a kernel \
+         address, or its return slot is not kernel text, or (under `stack-witness`) it is not \
+         inside the stack this context's own `kernel_stack_top` names"
+    );
 }
 
 /// See [`switch_frame_is_wrong`]. Kept tiny so the hot path is a load, a
@@ -320,6 +324,49 @@ fn check_switch_frame(ctx: &KernelCtx, token: &RunToken<KernelPayload>) {
     if !crate::mm::is_kernel_addr(rsp) || !rsp.is_multiple_of(8) {
         switch_frame_is_wrong(ctx, token);
     }
+    // **Is it this task's own stack, and not merely *a* kernel address.**
+    //
+    // A guest parked on its shutdown action — the one capture of this class
+    // taken with both vCPUs still readable — had cpu1 at `RIP=1b7b9f15ffd23100`
+    // with `SS=0`, `DF` set and `RSP=0xffff800000c00680`, which is inside the
+    // *per-CPU* region and no stack at all. That is `context_switch`'s tail
+    // exactly: `popfq` took garbage flags and `ret` took a garbage return
+    // address, sixty-four bytes above an `rsp` of `0xffff800000c00640`. The two
+    // tests above passed it, because that address is a kernel address and the
+    // word at `+56` was one too, so a green guard was never evidence.
+    //
+    // An incoming context's `rsp` belongs to the stack its own
+    // `kernel_stack_top` names or it belongs to nothing: `alloc_kernel_stack`
+    // builds the entry frame at `top - 64` and every later save comes from a
+    // `context_switch` running on that same stack. Two compares, and the
+    // difference is a report that names the task against a triple fault that
+    // says nothing on either channel.
+    //
+    // **And the idle context is not exempt, which is the whole point.** Its
+    // `kernel_stack_top` is zero by construction — per-CPU, and not knowable at
+    // the boot-time init that builds the record — but the stack it names is
+    // knowable *here*, on the CPU the record belongs to, which is exactly where
+    // the arm below this one already reads it to load the TSS. The parked
+    // capture's `rsp` was `0xffff800000c00640`, in the per-CPU region, and cpu0's
+    // idle stack in that same boot ran to `0xffff800000e21000` — so the frame
+    // was in neither a task stack nor an idle one, and a version of this test
+    // that skipped `id: None` would have skipped it. A first storm of 7,349
+    // boots with the task-only form fired zero times against 19 silent deaths,
+    // which is what asking the question of the wrong contexts looks like.
+    //
+    // `ctx.rsp` on an idle context is always a real one when it is restored: a
+    // CPU only ever switches *to* idle after switching away from it, which is
+    // what wrote the value; the idle loop itself is entered by jump.
+    #[cfg(feature = "stack-witness")]
+    {
+        let top = match ctx.id {
+            Some(_) => ctx.kernel_stack_top,
+            None => percpu::idle_stack_top(),
+        };
+        if rsp > top || rsp <= top - crate::process::KERNEL_STACK_SIZE as u64 {
+            switch_frame_is_wrong(ctx, token);
+        }
+    }
     // SAFETY: `rsp` is a kernel address eight bytes below the top of the
     // incoming task's own kernel stack at the shallowest, so the return slot is
     // mapped.
@@ -327,6 +374,222 @@ fn check_switch_frame(ctx: &KernelCtx, token: &RunToken<KernelPayload>) {
     if !crate::mm::is_kernel_addr(ret) {
         switch_frame_is_wrong(ctx, token);
     }
+    #[cfg(feature = "switch-witness")]
+    switch_witness_capture(ctx, token, rsp);
+}
+
+/// The seven words `context_switch` pops between [`check_switch_frame`] and its
+/// `ret`, copied here and compared there.
+///
+/// **What is unmeasured, stated exactly.** The check above reads `ctx.rsp`,
+/// tests it three ways, reads the word at `+56` and returns. The frame is popped
+/// in [`crate::sched::driver::context_switch`], and between the two lie the
+/// preempt-count swap, two per-CPU identity writes, the TSS stack handover, a
+/// **`mov cr3`**, a `wrfsbase` and the `RUNNING_CTX` store. Nothing tests the
+/// frame across that span, and the class's one parked capture is a `popfq`/`ret`
+/// off a frame at `0xffff800000c00640` — inside the per-CPU region, no stack at
+/// all — which every check that runs at the *check* would have passed. So either
+/// the frame is rewritten in the span, or `ctx.rsp` is, and this separates them:
+/// it holds the eight words *and* the pointer, and is compared against the stack
+/// pointer the machine is standing on rather than against the field again.
+///
+/// Per CPU and touched by that CPU alone, in a region where preemption is off and
+/// this CPU is the only executor its own switch has — `sched::driver::tripwire`'s
+/// argument, one level down.
+#[cfg(feature = "switch-witness")]
+struct SwitchShadow {
+    /// The `ctx.rsp` the check validated.
+    rsp: u64,
+    /// The eight words at that address at the moment of the check: `r15`,
+    /// `r14`, `r13`, `r12`, `rbx`, `rbp`, `rflags`, and the return slot.
+    words: [u64; 8],
+    /// The incoming context, so the compare can ask whether the *field* moved
+    /// as well as whether the frame did.
+    ctx: *const KernelCtx,
+    /// The **outgoing** context — `context_switch`'s `rdi`, and the record whose
+    /// `rsp` field the switch is about to write. A capture of this class taken
+    /// from a parked guest has that pointer still in `rdi` at the wild `ret`, so
+    /// naming it here is what turns a register dump into a pair of records.
+    save: u64,
+    /// The stack the incoming context claims, so a report can say where the
+    /// frame lies relative to it without a second lookup.
+    top: u64,
+    incoming: u64,
+    outgoing: u64,
+}
+
+#[cfg(feature = "switch-witness")]
+struct SwitchShadowSlot(core::cell::UnsafeCell<SwitchShadow>);
+
+// SAFETY: indexed by the *calling* CPU's own id, written between
+// `check_switch_frame` and the `mov rsp, rsi` of that same CPU's switch and read
+// in the instruction after it. No other CPU names this slot, and this CPU cannot
+// be preempted across the window — `pass` raised the preempt count and the
+// incoming context's own count is loaded before the switch.
+#[cfg(feature = "switch-witness")]
+unsafe impl Sync for SwitchShadowSlot {}
+
+#[cfg(feature = "switch-witness")]
+static SWITCH_SHADOW: [SwitchShadowSlot; crate::sched::MAX_CPUS] = [const {
+    SwitchShadowSlot(core::cell::UnsafeCell::new(SwitchShadow {
+        rsp: 0,
+        words: [0; 8],
+        ctx: core::ptr::null(),
+        save: 0,
+        top: 0,
+        incoming: u64::MAX,
+        outgoing: u64::MAX,
+    }))
+}; crate::sched::MAX_CPUS];
+
+#[cfg(feature = "switch-witness")]
+fn switch_witness_capture(ctx: &KernelCtx, token: &RunToken<KernelPayload>, rsp: u64) {
+    // SAFETY: this CPU's own slot; see the `Sync` justification above.
+    let shadow = unsafe { &mut *SWITCH_SHADOW[percpu::cpu_id() as usize].0.get() };
+    shadow.rsp = rsp;
+    shadow.ctx = ctx as *const KernelCtx;
+    shadow.save = token.save_ptr() as u64;
+    shadow.top = match ctx.id {
+        Some(_) => ctx.kernel_stack_top,
+        None => percpu::idle_stack_top(),
+    };
+    shadow.incoming = token.incoming().map_or(u64::MAX, |k| k.0);
+    shadow.outgoing = token.outgoing().map_or(u64::MAX, |k| k.0);
+    for (i, word) in shadow.words.iter_mut().enumerate() {
+        // SAFETY: `check_switch_frame` has just established that `rsp` is a
+        // kernel address, eight-aligned, and inside the stack this context's own
+        // `kernel_stack_top` names — and it already read the eighth word.
+        *word = unsafe { core::ptr::read_volatile((rsp + (i as u64) * 8) as *const u64) };
+    }
+}
+
+/// The compare, from inside `context_switch` with the stack pointer already
+/// moved and the first `pop` one instruction away.
+///
+/// `rsp` is the machine's own stack pointer, handed over in `rdi` — not the
+/// field re-read, which is the whole point: `Hw::switch` loads `ctx.rsp` twice
+/// (once for the check, once for the switch, and the `mov cr3` between them
+/// forbids the compiler from forwarding the first), so the value the machine
+/// stands on is not the value anything has ever validated.
+///
+/// # Safety
+/// Called only from [`crate::sched::driver::context_switch`], with `rsp` equal
+/// to the stack pointer and the shadow of this CPU's own pending switch filled.
+#[cfg(feature = "switch-witness")]
+pub(crate) unsafe extern "C" fn switch_witness_verify(rsp: u64) {
+    // SAFETY: this CPU's own slot; see the `Sync` justification above.
+    let shadow = unsafe { &*SWITCH_SHADOW[percpu::cpu_id() as usize].0.get() };
+    let mut now = [0u64; 8];
+    for (i, word) in now.iter_mut().enumerate() {
+        // SAFETY: the frame the machine is standing on, which the check
+        // established is inside a kernel stack.
+        *word = unsafe { core::ptr::read_volatile((rsp + (i as u64) * 8) as *const u64) };
+    }
+    // SAFETY: a `KernelCtx` this kernel's own pass produced, whose record is
+    // alive until a later pass releases it.
+    let field = unsafe { core::ptr::read_volatile(&raw const (*shadow.ctx).rsp) };
+    if rsp == shadow.rsp && field == shadow.rsp && now == shadow.words {
+        return;
+    }
+    switch_window_is_wrong(rsp, field, &now, shadow);
+}
+
+/// A word of the incoming frame — or the pointer to it — changed between the
+/// check and the pop.
+#[cfg(feature = "switch-witness")]
+#[cold]
+#[inline(never)]
+fn switch_window_is_wrong(rsp: u64, field: u64, now: &[u64; 8], shadow: &SwitchShadow) -> ! {
+    const NAMES: [&str; 8] = ["r15", "r14", "r13", "r12", "rbx", "rbp", "rflags", "ret"];
+    crate::log!(
+        "SWITCH WINDOW: cpu{} the frame is not the one that was checked — checked \
+         rsp={:#018x}, standing on rsp={:#018x} ({}), the incoming ctx {:#x} now says \
+         {field:#018x} ({}), outgoing ctx (rdi) {:#018x}; incoming key={} outgoing key={}; \
+         the incoming stack is [{:#018x}, {:#018x})",
+        percpu::cpu_id(),
+        shadow.rsp,
+        rsp,
+        if rsp == shadow.rsp { "THE SAME" } else { "MOVED" },
+        shadow.ctx as u64,
+        if field == shadow.rsp { "unchanged" } else { "CHANGED SINCE THE CHECK" },
+        shadow.save,
+        shadow.incoming,
+        shadow.outgoing,
+        shadow.top.wrapping_sub(crate::process::KERNEL_STACK_SIZE as u64),
+        shadow.top,
+    );
+    for (i, name) in NAMES.iter().enumerate() {
+        let checked = shadow.rsp + (i as u64) * 8;
+        let standing = rsp + (i as u64) * 8;
+        // SAFETY: both are eight-aligned kernel addresses inside a stack this
+        // CPU has just been executing on or is about to.
+        let there_now = unsafe { core::ptr::read_volatile(checked as *const u64) };
+        crate::log!(
+            "  {name:>6}: [{checked:#x}] was {:#018x}, is {there_now:#018x}{} | \
+             [{standing:#x}] is {:#018x}",
+            shadow.words[i],
+            if there_now == shadow.words[i] { "" } else { "  <== THE CHECKED FRAME WAS WRITTEN" },
+            now[i],
+        );
+    }
+    report_contexts(rsp, Some(shadow.ctx as u64));
+    panic!(
+        "context_switch: the seven words it is about to pop are not the seven words \
+         `check_switch_frame` validated, or the stack pointer it is standing on is not \
+         the one that was checked"
+    );
+}
+
+/// The negative control: stage the defect [`switch_witness_verify`] exists to
+/// catch, in the window it exists to watch, and require it to fire.
+///
+/// **An instrument that has never fired has not been shown to be able to.** Both
+/// arms write exactly once, at the [`MUTATE_AT`]th switch of the boot, so the
+/// machine reaches a state where the log is up and the report is readable rather
+/// than dying on the first switch a CPU takes.
+///
+/// * `switch-witness-mutate-frame` writes one word of the incoming frame — the
+///   `rbx` slot — which is the "another execution wrote this frame" arm, and the
+///   one no check before this one could see.
+/// * `switch-witness-mutate-rsp` moves `ctx.rsp` up by eight *after* the check
+///   has validated it, which is the double-load hazard staged: `Hw::switch`
+///   re-reads the field, so the machine switches onto a frame nothing validated.
+///   Eight and not garbage on purpose — the frame stays inside the same kernel
+///   stack, so a build whose witness does **not** fire keeps running and the
+///   control's failure is visible as a *survival* rather than as a different
+///   death.
+///
+/// # Safety
+/// A mutation build is not a kernel anybody boots for any other purpose.
+#[cfg(any(feature = "switch-witness-mutate-frame", feature = "switch-witness-mutate-rsp"))]
+unsafe fn switch_witness_mutate(restore: *const KernelCtx) {
+    /// Switches into the boot before the one write.
+    ///
+    /// **Small because it was measured.** A boot of the storm's shape reaches
+    /// `compositor: ready` with fewer than three hundred context switches behind
+    /// it — a `MUTATE_AT` of 300 produced a clean boot, which is what a control
+    /// that never fires looks like whether or not the instrument works. Eight is
+    /// past the three kernel threads and inside the first dispatches, and it is
+    /// reached by every boot there is.
+    const MUTATE_AT: u64 = 8;
+    static SWITCHES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    if SWITCHES.fetch_add(1, core::sync::atomic::Ordering::Relaxed) != MUTATE_AT {
+        return;
+    }
+    // SAFETY: a live `KernelCtx` this pass produced, and a build that exists to
+    // corrupt it.
+    let rsp = unsafe { (*restore).rsp };
+    #[cfg(feature = "switch-witness-mutate-frame")]
+    // SAFETY: the `rbx` slot of the frame `check_switch_frame` has just
+    // validated, inside the incoming task's own kernel stack.
+    unsafe {
+        core::ptr::write_volatile((rsp + 32) as *mut u64, 0xdead_beef_dead_beef)
+    };
+    #[cfg(feature = "switch-witness-mutate-rsp")]
+    // SAFETY: as above, and the field is this context's own.
+    unsafe {
+        core::ptr::write_volatile(&raw const (*restore).rsp as *mut u64, rsp + 8)
+    };
 }
 
 impl Hw for KernelHw {
@@ -365,6 +628,11 @@ impl Hw for KernelHw {
             (*save).preempt = crate::preempt::count();
             let incoming: &KernelCtx = &*restore;
             check_switch_frame(incoming, &token);
+            #[cfg(any(
+                feature = "switch-witness-mutate-frame",
+                feature = "switch-witness-mutate-rsp"
+            ))]
+            switch_witness_mutate(restore);
             crate::preempt::set_count(incoming.preempt);
             percpu::set_current_tid(incoming.id.map(|id| id.1));
             percpu::set_current_pid(incoming.id.map(|id| id.0));

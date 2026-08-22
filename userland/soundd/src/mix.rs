@@ -36,10 +36,11 @@ const STATS_INTERVAL_NANOS: u64 = 2_000_000_000;
 /// effect and stays here. `#106`'s status tool reads one shape, so the null
 /// sink prints the same line.
 fn report(stats: &MixStats, clients: usize) {
-    say!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={} deferred={} starve_max={}",
+    say!("soundd: wakes={} completions={} submitted={} underruns={} drains={} max_wake_lat_us={} max_batch={} clients={} deferred={} starve_max={} worst_irq_late_us={} worst_pickup_us={} worst_empty={} worst_batch={} late_wakes={}",
         stats.wakes, stats.completions, stats.submitted, stats.underruns, stats.drains,
         stats.max_wake_lat_ns / 1_000, stats.max_batch, clients, stats.deferred,
-        stats.starve_max);
+        stats.starve_max, stats.worst.irq_late_ns / 1_000, stats.worst.pickup_ns / 1_000,
+        stats.worst.empty, stats.worst.batch, stats.late_wakes);
 }
 
 /// Signal every client before the wait so priority inheritance can fill their
@@ -295,17 +296,10 @@ pub(crate) fn mix_thread(
 
         let n_records = backend.completions(&mut records);
         if n_records > 0 {
-            // Measured against the prediction this wait was *armed* on, not
-            // against whatever the DLL holds when the wait returns. They differ
-            // on a window's first wake, armed while soundd was still idle and
-            // asking for no wake time at all — reading the estimate directly
-            // scores that sleep as a missed deadline. Nothing is hidden:
-            // whenever soundd armed a timer the distance from that prediction
-            // is the sample, however large.
-            if let Some(t_est) = armed_on {
-                let lateness = syscall::clock_nanos().saturating_sub(t_est as u64);
-                stats.max_wake_lat_ns = stats.max_wake_lat_ns.max(lateness);
-            }
+            // Read before the record loop, because it is what a *pickup* is
+            // measured to: the instant soundd first held the record, not the
+            // instant it finished acting on a batch of them.
+            let seen_at = syscall::clock_nanos();
             let mut wake_completions = 0u32;
             for rec in &records[..n_records] {
                 let n = rec.mask.count_ones();
@@ -348,10 +342,47 @@ pub(crate) fn mix_thread(
                 wake_completions += n;
                 dll.update(rec.timestamp_nanos as f64, n);
             }
+            // Measured against the prediction this wait was *armed* on, not
+            // against whatever the DLL holds when the wait returns. They differ
+            // on a window's first wake, armed while soundd was still idle and
+            // asking for no wake time at all — reading the estimate directly
+            // scores that sleep as a missed deadline. Nothing is hidden:
+            // whenever soundd armed a timer the distance from that prediction
+            // is the sample, however large.
+            //
+            // **And it is recorded in two halves**, split at the oldest
+            // record's ISR timestamp: everything before it is the device
+            // failing to complete when it was due, everything after it is
+            // soundd failing to run once it had. `WorstWake` is where that
+            // distinction is argued; here it costs one subtraction, because
+            // both instants were already in hand.
+            if let Some(t_est) = armed_on {
+                let t_est = t_est as u64;
+                // Clamped to the grid point, which keeps the identity
+                // `irq_late + pickup == wake_lat` exact: an interrupt that
+                // landed *before* it was due was not late by any amount, and a
+                // soundd that is nonetheless late here slept through it, so all
+                // of the overshoot is the pickup.
+                let irq_at = records[0].timestamp_nanos.max(t_est);
+                stats.wake(
+                    seen_at.saturating_sub(t_est),
+                    irq_at.saturating_sub(t_est),
+                    seen_at.saturating_sub(irq_at),
+                    wake_completions,
+                    period_nanos,
+                );
+            }
             if !streams.is_empty() {
                 stats.completions += wake_completions;
                 stats.max_batch = stats.max_batch.max(wake_completions);
             }
+        } else if armed_on.is_some() {
+            // Armed on a grid point, woken, and the device had produced
+            // nothing. Counted rather than ignored: a run of these is the only
+            // evidence that separates a device that went quiet from a soundd
+            // that overslept, and both arrive as the same large lateness on
+            // the wake that finally carries a record.
+            stats.empty_wake();
         }
 
         // §5.9: nothing unplayed left means the pipeline drained. What died with
@@ -670,7 +701,7 @@ pub(crate) fn null_sink_thread(
                 break;
             }
             let lateness = now.saturating_sub(next_period_ns);
-            stats.max_wake_lat_ns = stats.max_wake_lat_ns.max(lateness);
+            stats.wake_on_software_grid(lateness, period_nanos);
 
             mix_f32.fill(0.0);
             let mut any_data = false;
