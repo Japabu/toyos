@@ -57,6 +57,8 @@ mod input_merge_test;
 mod usb_gate;
 #[cfg(feature = "boot-actuators")]
 mod nvme_gate;
+#[cfg(feature = "boot-actuators")]
+mod sched_gate;
 mod block;
 mod gpt;
 mod page_cache;
@@ -592,6 +594,15 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     vfs::init();
     process::init();
     scheduler::init();
+    // The task-less half of the operation-nesting gate: a boot phase runs on
+    // the BSP with no current task, so what it establishes in is the per-CPU
+    // slot. `iod`'s body runs the other half. Here rather than earlier because
+    // this is the phase that owns the scheduler; it touches no device, waits
+    // for nothing and leaves no establishment behind.
+    #[cfg(feature = "boot-actuators")]
+    if actuator::sched_operation_nesting() {
+        sched_gate::run("boot");
+    }
     pipe::init();
     inbox::init();
 

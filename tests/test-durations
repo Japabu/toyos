@@ -237,6 +237,7 @@ nvme_home_roundtrip 13
 nvme_image_is_held_by_one_guest 0
 nvme_large_device 6052
 nvme_wide_sector 3500
+operation_nesting 18446744073709551615
 panic_recovery 130
 poller_capacity 36
 port_poll_churn 84
@@ -305,6 +306,7 @@ usb_transport_break 5408
 va_exhaustion 6159
 virtio_net_no_msix 2039
 virtio_used_ring 4189
+wake_storm_cost 18446744073709551615
 wall_clock_file 4642
 wall_clock_now 13
 wall_clock_refusals 25658
