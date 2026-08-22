@@ -10,14 +10,18 @@
 //!
 //! The split between `pub fn` and `pub unsafe fn` here is that second half. A
 //! function is `unsafe` when the caller can choose a value that breaks the
-//! machine — `write_cr0`, `write_cr4`, `write_cr3`, `lidt`, `ltr`, `wbinvd` —
-//! and safe when it cannot. **Six wrappers are safe today and should not be**:
-//! `wrmsr`, `outb`, `outw`, `wrfsbase`, `invlpg` and `invpcid` all take a
-//! caller-chosen value that reaches hardware, and `wrmsr` alone can repoint
-//! `LSTAR`. Marking them costs an `unsafe` block at every one of their 25-odd
-//! call sites across `arch/` and the drivers, which is a change to code rather
-//! than to comments — filed as
+//! machine — `write_cr0`, `write_cr4`, `write_cr3`, `lidt`, `ltr`, `wbinvd`,
+//! `wrmsr` — and safe when it cannot. **Five wrappers are safe today and should
+//! not be**: `outb`, `outw`, `wrfsbase`, `invlpg` and `invpcid` all take a
+//! caller-chosen value that reaches hardware, and each is the rest of
 //! `issues/kernel/arch-cpu-safe-wrappers-that-are-not.md`.
+//!
+//! **Where an `unsafe fn` here has a closed set of callers, the honest form is
+//! one safe wrapper that discharges the choice, not an `unsafe` block apiece.**
+//! `arch::apic::Reg` is that for the eighteen x2APIC `wrmsr` calls, and
+//! `mm::paging::activate_kernel` is the pattern it follows. Where the set is not
+//! closed — an MSR that *is* the machine's one declaration — the block sits at
+//! the call and its `SAFETY:` says why that value is the right one.
 
 use core::arch::asm;
 
@@ -36,17 +40,19 @@ pub fn rdmsr(msr: u32) -> u64 {
     (high as u64) << 32 | low as u64
 }
 
+/// # Safety
+/// Both operands reach the CPU unchecked, and the `#GP` on an unimplemented MSR
+/// or a reserved-bit value is the least of what the caller owns. `IA32_LSTAR` is
+/// `SYSCALL`'s only entry point; `IA32_GS_BASE` is where every `gs:` access in
+/// this kernel lands; `IA32_EFER`'s `NXE` decides whether bit 63 of every live
+/// paging entry is a permission or a reserved bit, so clearing it makes W^X
+/// silently not exist. The caller answers for which register it is writing and
+/// for what the machine holds afterwards.
 #[inline]
-pub fn wrmsr(msr: u32, value: u64) {
+pub unsafe fn wrmsr(msr: u32, value: u64) {
     let low = value as u32;
     let high = (value >> 32) as u32;
-    // SAFETY: the instruction touches no memory. Its own failure mode is `#GP`
-    // on an unimplemented MSR or a reserved-bit value, both of which are the
-    // caller's `msr` and `value` — see the module header on why this wrapper
-    // being safe is a gap that is filed rather than closed here.
-    unsafe {
-        asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high, options(nomem, nostack));
-    }
+    asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high, options(nomem, nostack));
 }
 
 #[inline]

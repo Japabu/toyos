@@ -182,27 +182,44 @@ mod canary {
 /// this call on both the BSP's path and an AP's.
 pub fn init() {
     let star = ((percpu::STAR_SYSRET_BASE as u64) << 48) | ((percpu::KERNEL_CS as u64) << 32);
-    cpu::wrmsr(MSR_STAR, star);
-    // `LSTAR` is an IDT slot by another name: the one thing `syscall` can reach.
-    cpu::wrmsr(MSR_LSTAR, Ring3Entry::new(syscall_entry).addr());
-    // Mask IF (bit 9), DF (bit 10) and AC (bit 18) on `SYSCALL` entry.
+    // SAFETY: `cpu::wrmsr` asks its caller to own the MSR it names and the value
+    // it writes, and this function is that owner for all three of `SYSCALL`'s.
+    // `STAR` is built from `percpu`'s own selector constants; `LSTAR` is a
+    // [`Ring3Entry`] — a kernel text address this module classified, and the one
+    // register whose wrong value would aim Ring 3 at somewhere else in the
+    // kernel; `FMASK` is the literal below. None can `#GP` for being
+    // unimplemented: `control_regs::declaration` asserts
+    // `CPUID.80000001H:EDX[11]` on every CPU before this runs, which is what
+    // makes `SYSCALL` exist at all.
     //
-    // **DF is here because `SYSCALL` clears exactly what this word names and
-    // nothing else.** A Ring 3 thread's direction flag is its own and stays its
-    // own — `sysretq` restores `RFLAGS` from `r11`, which the entry saved before
-    // the mask applied — but a kernel that inherits a set one runs every
-    // `rep movs`/`rep stos` backwards, writing the `n` bytes *below* a
-    // destination instead of at it. `arch::entry::ring3_naked_asm`'s `cld`
-    // carries the whole argument; this is the same fix on the one entry where the
-    // hardware lets a mask word make it.
-    //
-    // `entry-df-unclean` is `arch::entry`'s negative control and this is its
-    // other half: the mask this kernel carried before, so the arm stages the
-    // whole defect rather than the gates' share of it.
-    cpu::wrmsr(
-        MSR_FMASK,
-        if cfg!(feature = "entry-df-unclean") { 0x40200 } else { 0x40600 },
-    );
+    // **One block, because the three are one declaration.** A CPU holding two of
+    // them is a CPU whose `SYSCALL` gate is aimed by something this file did not
+    // decide, and there is no point between these writes where that is a state
+    // the machine may be left in.
+    unsafe {
+        cpu::wrmsr(MSR_STAR, star);
+        // `LSTAR` is an IDT slot by another name: the one thing `syscall` can
+        // reach.
+        cpu::wrmsr(MSR_LSTAR, Ring3Entry::new(syscall_entry).addr());
+        // Mask IF (bit 9), DF (bit 10) and AC (bit 18) on `SYSCALL` entry.
+        //
+        // **DF is here because `SYSCALL` clears exactly what this word names and
+        // nothing else.** A Ring 3 thread's direction flag is its own and stays
+        // its own — `sysretq` restores `RFLAGS` from `r11`, which the entry saved
+        // before the mask applied — but a kernel that inherits a set one runs
+        // every `rep movs`/`rep stos` backwards, writing the `n` bytes *below* a
+        // destination instead of at it. `arch::entry::ring3_naked_asm`'s `cld`
+        // carries the whole argument; this is the same fix on the one entry where
+        // the hardware lets a mask word make it.
+        //
+        // `entry-df-unclean` is `arch::entry`'s negative control and this is its
+        // other half: the mask this kernel carried before, so the arm stages the
+        // whole defect rather than the gates' share of it.
+        cpu::wrmsr(
+            MSR_FMASK,
+            if cfg!(feature = "entry-df-unclean") { 0x40200 } else { 0x40600 },
+        );
+    }
 }
 
 // Syscall entry: GS permanently points to kernel per-CPU data (no swapgs needed).

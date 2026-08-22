@@ -80,7 +80,12 @@ pub fn init() {
     // register, and both writes here are the CPU's own live value with `CD`/`NW`
     // moved and then put back; `wbinvd` wants the no-fill window, which the line
     // above it opened; `flush_tlb` is `unsafe` for the same `write_cr4` reason
-    // and is handed the live `CR4` unchanged but for `PGE`.
+    // and is handed the live `CR4` unchanged but for `PGE`; and `wrmsr` wants a
+    // caller that owns the MSR and the value, which is this file's whole subject
+    // — `IA32_PAT` is architectural on every CPU that reports PAT in
+    // `CPUID.01H:EDX[16]` (true of everything in long mode), `PAT_VALUE` is
+    // [`ENTRIES`] packed by a `const fn`, and the assertion below reads the
+    // register back rather than trusting the write.
     unsafe {
         core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags);
         let cr0 = cpu::read_cr0();

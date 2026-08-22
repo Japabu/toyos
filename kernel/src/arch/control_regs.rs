@@ -200,8 +200,19 @@ pub fn init(cpu_id: u32) {
         // optional bit and asserted `LA57` is clear; `PAE` is in
         // `CR4_REQUIRED`; and both call sites of this function run on the kernel
         // address space, whose PCID is 0.
-        unsafe { cpu::write_cr4(declared) };
-        cpu::wrmsr(efer::MSR, EFER);
+        //
+        // `wrmsr` asks its caller to own the MSR and the value. [`EFER`] is this
+        // file's declaration and its doc comment argues all three bits in it and
+        // the one left out; `IA32_EFER` is architectural on every CPU in long
+        // mode, and `declaration` has just asserted this one reports both
+        // `SYSCALL` and `NX`, which are the two bits being set that a CPU can
+        // lack. **One block, because `CR4` and `EFER` are one declaration
+        // applied to one CPU** — [`self_check`] below asks about them together
+        // for the same reason.
+        unsafe {
+            cpu::write_cr4(declared);
+            cpu::wrmsr(efer::MSR, EFER);
+        }
         if declared & cr4::SMAP != 0 {
             // SMAP binds only while `RFLAGS.AC` is clear, and `AC` here is
             // whatever was inherited — `INIT` clears it on an AP, firmware
