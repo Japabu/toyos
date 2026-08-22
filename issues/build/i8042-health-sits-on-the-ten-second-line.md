@@ -35,3 +35,18 @@ it; or decide that a name whose CI cost straddles the line needs a hysteresis
 the profile does not have today. The measurement to take first is its variance —
 two points cannot say whether 9,509 and 10,281 are one population or a
 regression between them.
+
+**The first option was taken and the variance was measured, 2026-08-22.** PR
+#200's margin sweep relegated this name with `Why::Cost` and the guards row
+`src/tiers.rs` now carries; `tests/test-durations` still prices it 9,509 ms, so
+its row sits in the band on purpose and the return rule holds it there. PR
+#214's measurement
+(`issues/build/a-shards-boot-width-does-not-price-its-tests.md`) is the variance
+this file asked for: over six hosted twelve-shard runs it was over
+`FAST_COMMIT_MS` in **five of the six**, at widths 1.14x to 2.50x with no
+relation to the width — the only one of thirteen over-the-line Fast observations
+in those runs that is over it consistently rather than by shard luck. So this is
+a population and not a coin: 9,509 and 10,281 are two draws from a distribution
+whose bulk is at or above the line, and `Why::Cost` is the honest reading. What
+is still owed is the second option — the 772 ms, and now the rest of it.
+`cargo run -- --known-red i8042_health` still answers `NOT ON THE LIST`.
