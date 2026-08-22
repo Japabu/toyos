@@ -157,16 +157,19 @@ jobs:
       #
       # The kernel has no `-p` (it is one crate) and no directory scoping on
       # the clippy command line, so a kernel *area* is gated at the source
-      # instead of the invocation: `mm::`, `object::`, `elf::` and `loader::`
-      # (measured 2026-08-20: 35 + 1 + 23 + 8 = 67 blocks, every one now
-      # carrying a `SAFETY:` comment) each open with `#![warn
-      # (clippy::undocumented_unsafe_blocks)]`, which is `allow`-by-default
-      # everywhere else in the kernel and only `warn` inside those four module
-      # trees — composing with the `-D warnings` both kernel invocations below
-      # already carry turns that `warn` into a hard error, with no new flag
-      # here. The other 322 blocks (`arch/`, `drivers/`, `sched/`, `iommu/`,
-      # `log/` and the root files) are measured, not gated — not tractable in
-      # one pass, and recorded as follow-up in the same issue.
+      # instead of the invocation: `mm::`, `object::`, `elf::`, `loader::`
+      # (measured 2026-08-20: 35 + 1 + 23 + 8 = 67 blocks) and `sched::`,
+      # `iommu::`, `log::` (2026-08-22: 8 + 8 + 2 = 18 more) each open with
+      # `#![warn(clippy::undocumented_unsafe_blocks)]`, which is
+      # `allow`-by-default everywhere else in the kernel and only `warn` inside
+      # those seven module trees — composing with the `-D warnings` both kernel
+      # invocations below already carry turns that `warn` into a hard error,
+      # with no new flag here. Under the owner's 2026-08-20 ruling an area's
+      # sweep removes what it can before it documents the rest, so those 85 are
+      # a mix of blocks that stopped existing and blocks that carry a `SAFETY:`
+      # saying why they could not. The other 304 (`arch/`, `drivers/` and the
+      # root files) are measured, not gated — not tractable in one pass, and
+      # recorded as follow-up in the same issue.
       #
       # Measured on the dev host with three fresh `CARGO_TARGET_DIR`s and a warm
       # cargo registry: **19.2 s** for the workspace (139 crates checked),
