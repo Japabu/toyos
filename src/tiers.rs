@@ -540,8 +540,18 @@ pub const RELEGATED: &[Relegated] = &[
         // those three boots, and the dev host puts them at 12.2 s of the 18.4 s
         // the three cost there, so 19,740 × 12.2/18.4 = 13,090. A committed
         // number rather than an `UNMEASURED` marker because only a Fast name may
-        // carry one — fast CI is what would replace it, and fast CI does not run
-        // this. The next nightly replaces it with a shard's own.
+        // carry one — fast CI is what replaces a marker, and fast CI does not
+        // run this.
+        //
+        // **It is already known to be high, and that is tracked rather than
+        // guessed at.** The same session replaced the storm's wall-clock arming
+        // with the victim's own syscall count (`nmi_gate::SPINNING_SYSCALLS`),
+        // which took these two boots from 12.2 s to 7.2 s on the same host. The
+        // next nightly's measurement is the one to believe and it may well
+        // return this name to Fast; it stays Nightly until a shard says so
+        // rather than on that arithmetic, because a price that lands in the last
+        // fifth before `FAST_COMMIT_MS` is decided by which partition ran it,
+        // and 7.2 s scaled by the same ratio lands exactly there.
         ci_ms: 13_090,
         why: Why::Cost,
         guards: "That `syscall_window_nmi` is not vacuous: a kernel with vector 2's IST index \

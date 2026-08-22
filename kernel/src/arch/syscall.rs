@@ -336,6 +336,13 @@ fn cancelled() -> u64 {
 }
 
 fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    // Which CPU is spinning on `syscall` is what `syscall-window-nmi` aims its
+    // storm at, and this is the only place that knows. One relaxed load and a
+    // predictable branch, ahead of everything else so the call is counted
+    // whatever it turns out to be; in a shipping kernel `nmi_gate` does not
+    // exist and neither does this line.
+    #[cfg(feature = "boot-actuators")]
+    crate::nmi_gate::note_syscall();
     let t0 = crate::clock::nanos_since_boot();
 
     process::with_current_data(|data| {
