@@ -41,7 +41,7 @@ use crate::process::{
     PROCESS_TABLE,
 };
 use crate::sync::Lock;
-use crate::{scheduler, vfs, DirectMap, UserAddr};
+use crate::{scheduler, vfs, UserAddr};
 use toyos_abi::handle::Rights;
 use toyos_abi::syscall::SyscallError;
 use toyos_elf::section::SectionTable;
@@ -555,9 +555,12 @@ pub fn spawn(
             return Err(SyscallError::ResourceExhausted.into());
         }
     };
-    let stack_phys = DirectMap::from_phys(stack_pages.phys());
     let stack_vaddr = UserAddr::new(crate::vma::STACK_BASE);
-    let user_stack = UserStack::new(stack_vaddr, stack_phys, USER_STACK_SIZE as u64);
+    // The window is the allocation's own, so `USER_STACK_SIZE` is named once
+    // here — at the `PageAlloc::new` above — and every argv write is bounded
+    // against what was actually allocated rather than against a second copy of
+    // the constant.
+    let user_stack = UserStack::new(stack_vaddr, stack_pages.window());
     {
         let mut pt = child_pt.lock();
         // The stack is data, and `Prot::ReadWrite` is what makes it stop being

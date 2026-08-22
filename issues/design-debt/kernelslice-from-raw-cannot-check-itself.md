@@ -11,21 +11,28 @@ bounds check `KernelSlice` performs is against a size the caller asserted;
 `from_raw` cannot validate it against the allocation, so a slice longer than its
 buffer passes every check the slice makes.
 
-**Two call sites, each correct only by adjacency**: `OwnedAlloc::slice`
-(`process.rs`, the one site with an assert) and the ELF loader (`elf/mod.rs`'s
-`load_shared_lib`, where size and allocation share `load_size` by proximity
-rather than by construction — and every past OOB in the loader came through this
-type).
+**One call site left, and it is correct only by adjacency**: the ELF loader
+(`elf/mod.rs`'s `load_shared_lib`, where size and allocation share `load_size` by
+proximity rather than by construction — and every past OOB in the loader came
+through this type).
 
-**The third is gone (2026-08-22).** `DmaPool::alloc` was the other one, and DMA
-memory is `mm::Dma` now: the pool constructs the view, the constructor is private
-to `mm::dma`, and the view borrows the pool — so for that memory the type *does*
-check that the region outlives it, and `DmaPool::leak` is the only way to reach
-`'static`. `KernelSlice::ptr_at`, whose `offset <= size` bound said nothing about
-the length read through the pointer, had no callers left and is deleted with it;
-`copy_from` went the same way.
+Fix shape for what is left: the allocator constructs the slice, sized from the
+allocation it owns, and then `from_raw` is private to `mm` or deleted. The loader
+stops naming sizes at all.
 
-Fix shape for what is left: allocators construct the slice. Give `PageAlloc` and
-the contiguous PMM path a `slice()` method like `OwnedAlloc`'s, sized from the
-allocation they own, then make `from_raw` private to `mm` or delete it. The
-loader stops naming sizes at all.
+## 2026-08-22 — `PageAlloc` has one now
+
+`PageAlloc::window()` (`process.rs`) is that method, sized from the allocation's
+own `ptr()`/`size()`, and the demand-paging fill and `UserStack` reach the frame
+through it instead of through a bare `*mut u8`. `OwnedAlloc::slice` is the other
+one that already had it, with an assert.
+
+## 2026-08-22 — DMA memory no longer goes through this type at all
+
+`DmaPool::alloc` was the third unchecked call site. DMA memory is `mm::Dma` now:
+the pool constructs the view, the constructor is private to `mm::dma`, and the
+view **borrows the pool** — so for that memory the type does check that the
+region outlives it, and `DmaPool::leak` is the only way to reach `'static`.
+`KernelSlice::ptr_at`, whose `offset <= size` bound said nothing about the length
+read through the pointer it returned, had no callers left and is deleted with it;
+`copy_from` went the same way. The loader's `load_size` is what keeps this open.

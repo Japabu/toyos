@@ -1,3 +1,21 @@
+#![warn(clippy::undocumented_unsafe_blocks)]
+//! The machine, and the only part of this kernel that knows which one.
+//!
+//! Every `unsafe` block under here carries a `SAFETY:` comment saying why it is
+//! irreducible as well as why it is sound, and the attribute above is what keeps
+//! that true — it composes with the `-D warnings` both kernel clippy invocations
+//! already carry, so a new block without one does not build. It is also the
+//! last of these a kernel area needed: `main.rs`'s crate-level warn carries an
+//! `allow` only for `sched/`, `iommu/` and `log/` now.
+//!
+//! Where the machine access lives: [`cpu`] is one instruction per function and
+//! the bottom of the tree, [`percpu`] owns `PerCpu`, its `gs:` offsets and the
+//! `const`-generic primitives every GS access in the kernel goes through, and
+//! [`entry`] owns the bracket — including the `cld` every Ring 0 entry owes
+//! itself. Outside this directory nothing writes a `gs:` string, and the six
+//! `arch::cpu` wrappers that take a caller-chosen value and are safe anyway are
+//! that module's header's subject.
+
 pub mod apic;
 pub mod control_regs;
 pub mod cpu;
@@ -40,6 +58,14 @@ impl LogCommitGuard {
         const IF: u64 = 1 << 9;
 
         let rflags: u64;
+        // SAFETY: three blocks' worth of one argument, so it is written once
+        // here. `pushfq`/`pop` is balanced and `push`/`popfq` is balanced, so
+        // `rsp` ends where it started and no `nostack` is claimed. `cli` and the
+        // masked `popfq` write `RFLAGS` and nothing else. **Irreducible by
+        // sequence**: reading `RFLAGS`, clearing IF and — where Ring 3 left TF
+        // set — clearing TF too must be one uninterruptible run, which is the
+        // same reason `hw::IrqGuard` cannot be built out of `cpu::` calls
+        // either. The `popfq` in `Drop` restores exactly the word `close` read.
         unsafe {
             // Deliberately no `nomem`: besides these instructions using the
             // stack, the implicit memory clobber keeps shard selection and
@@ -75,6 +101,9 @@ impl LogCommitGuard {
 
 impl Drop for LogCommitGuard {
     fn drop(&mut self) {
+        // SAFETY: `close`'s argument — a balanced `push`/`popfq` writing back
+        // the `RFLAGS` word this guard captured, on the CPU that captured it
+        // (`_not_send_sync` is what keeps that true).
         unsafe {
             // Deliberately no `nomem`: the final slot store must stay before
             // interrupts and single-step traps are reopened.
@@ -124,6 +153,12 @@ pub unsafe fn percpu_fetch_add(
     if crate::actuator::log_shared_reservation() {
         let previous = counter.load(core::sync::atomic::Ordering::Relaxed);
         if crate::log::nested::inject() {
+            // SAFETY: `sti` and `cli` write one `RFLAGS` bit each and touch no
+            // memory. This whole branch is an actuator that exists to *stage* a
+            // defect — the window between a load and a store — so what it is
+            // doing is unsound by design and sound as machine code; in a
+            // shipping kernel `log_shared_reservation()` is `const fn … { false }`
+            // and none of it is emitted.
             unsafe {
                 // The window, and nothing else in the machine opens one here.
                 core::arch::asm!("sti");
@@ -138,6 +173,14 @@ pub unsafe fn percpu_fetch_add(
     }
 
     let previous: u64;
+    // SAFETY: `counter.as_ptr()` is a live `&AtomicU64`, so the operand is a
+    // naturally aligned, writable eight bytes for the whole block. The unlocked
+    // `xadd` is atomic against an interrupt on this CPU because it retires
+    // whole, and this function is `unsafe` precisely so its caller answers for
+    // the other half — that no other CPU writes the word, with `guard` covering
+    // the shard selection that established it. Irreducible: `fetch_add` is the
+    // safe spelling and it is the *locked* instruction, which cost 350 ms of
+    // boot under TCG (the doc comment above carries the measurement).
     unsafe {
         // No `preserves_flags`: `xadd` changes arithmetic flags. The guard's
         // later `popfq` restores the caller's flags, but code between these two

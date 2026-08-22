@@ -29,15 +29,15 @@ mod sleeplock;
 mod sync;
 mod id_map;
 
-// The five module trees the sweep has not reached. Each `allow` is deleted by
-// the pull request that documents that area, and the list is the whole of what
-// the kernel still owes the lint — 107, 121, 8, 8 and 2 blocks when it was
-// measured (2026-08-22). An area that instead gates itself with its own
-// `#![warn(...)]` inside its `mod.rs`, the way `mm/`, `object/`, `elf/` and
-// `loader/` already do, wins over the line here — the inner attribute is the
-// more specific one — so this list is never a way to un-gate a swept tree,
-// only a record of the ones nobody has swept.
-#[allow(clippy::undocumented_unsafe_blocks, reason = "arch/: not yet swept")]
+// The module trees the sweep has not reached. Each `allow` is deleted by the
+// pull request that documents that area, and the list is the whole of what the
+// kernel still owes the lint; `issues/build/clippy-has-never-run-here.md`
+// carries the per-area counts, which move as areas land and are not restated
+// here. An area that instead gates itself with its own `#![warn(...)]` inside
+// its `mod.rs`, the way `arch/`, `mm/`, `object/`, `elf/` and `loader/` already
+// do, wins over the line here — the inner attribute is the more specific one —
+// so this list is never a way to un-gate a swept tree, only a record of the ones
+// nobody has swept.
 mod arch;
 mod drivers;
 
@@ -595,11 +595,23 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     inbox::init();
 
 
-    // Mount initrd as read-only root filesystem (bcachefs, no extraction)
+    // Mount initrd as read-only root filesystem (bcachefs, no extraction).
+    //
+    // The image is named once, here, and the mount and every file backing under
+    // it hold that same `(base, len)` pair — which is what lets a block number
+    // out of the initrd's own btree be compared against the initrd's end.
     assert!(!initrd.is_empty(), "No initrd provided");
-    let initrd_base = initrd.as_ptr();
-    let initrd_fs = bcachefs_adapter::mount_initrd(initrd_base, initrd.len());
-    vfs::lock().set_root(Box::new(bcachefs_adapter::ReadOnlyBcacheFsAdapter::new(initrd_fs, initrd_base)));
+    // SAFETY: `SliceBlockIO::new` asks that the region be valid for `len` bytes
+    // for as long as the value lives. `initrd` is the region `KernelArgs` names
+    // — placed by the bootloader, reserved out of the PMM above, never freed
+    // and never written — and what is built from it lives for the rest of the
+    // boot, so the region outlives it trivially. Irreducible: the region
+    // arrives as an address and a length from firmware, so somebody has to make
+    // the first claim that it is memory, and this is the one place that claim
+    // is made.
+    let initrd_image = unsafe { bcachefs::SliceBlockIO::new(initrd.as_ptr(), initrd.len()) };
+    let initrd_fs = bcachefs_adapter::mount_initrd(initrd_image);
+    vfs::lock().set_root(Box::new(bcachefs_adapter::ReadOnlyBcacheFsAdapter::new(initrd_fs, initrd_image)));
 
     // NVMe bcachefs at /home when the device is ours, a tmpfs when it is not,
     // so a machine we may not write to still boots to a working system. The

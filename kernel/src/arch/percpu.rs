@@ -1,4 +1,4 @@
-use core::mem::size_of;
+use core::mem::{offset_of, size_of};
 use core::sync::atomic::{AtomicU32, AtomicU8};
 
 use alloc::alloc::alloc_zeroed;
@@ -191,23 +191,193 @@ impl PerCpu {
     }
 }
 
-// Compile-time checks: assembly uses hardcoded GS-relative offsets into PerCpu.
-// If any field is reordered or resized, these will fail at compile time.
-const _: () = assert!(core::mem::offset_of!(PerCpu, self_ptr) == 0);
-const _: () = assert!(core::mem::offset_of!(PerCpu, cpu_id) == 8);
-const _: () = assert!(core::mem::offset_of!(PerCpu, kernel_rsp) == 16);
-const _: () = assert!(core::mem::offset_of!(PerCpu, user_rsp) == 24);
-const _: () = assert!(core::mem::offset_of!(PerCpu, tss) == 32);
-const _: () = assert!(core::mem::offset_of!(PerCpu, current_tid) == 136);
-const _: () = assert!(core::mem::offset_of!(PerCpu, current_pid) == 140);
-const _: () = assert!(core::mem::offset_of!(PerCpu, syscall_rbp) == 232);
-const _: () = assert!(core::mem::offset_of!(PerCpu, preempt_count) == 240);
-const _: () = assert!(core::mem::offset_of!(PerCpu, need_resched) == 244);
-const _: () = assert!(core::mem::offset_of!(PerCpu, ring0_timer_fires) == 248);
-const _: () = assert!(core::mem::offset_of!(PerCpu, last_seen_ring0_fires) == 252);
-const _: () = assert!(core::mem::offset_of!(PerCpu, fault_state) == 256);
-const _: () = assert!(core::mem::offset_of!(PerCpu, last_armed_ticks) == 260);
-const _: () = assert!(core::mem::offset_of!(PerCpu, log_shard) == 264);
+// Where each field this kernel reaches through `gs:` sits inside `PerCpu`.
+//
+// **Derived from the type and asserted against the number the assembly
+// hardcodes.** `arch::entry`'s stubs, `arch::syscall`'s entry and the Ring 0
+// timer stub all write the displacement as a literal, so the assertion is the
+// whole of what keeps the two sides in step — a reordered or resized field
+// would otherwise move only the Rust half. Every GS access written in Rust
+// names one of these constants; none of them names a number.
+const OFF_SELF_PTR: u32 = offset_of!(PerCpu, self_ptr) as u32;
+const OFF_CPU_ID: u32 = offset_of!(PerCpu, cpu_id) as u32;
+const OFF_USER_RSP: u32 = offset_of!(PerCpu, user_rsp) as u32;
+const OFF_CURRENT_TID: u32 = offset_of!(PerCpu, current_tid) as u32;
+const OFF_CURRENT_PID: u32 = offset_of!(PerCpu, current_pid) as u32;
+const OFF_IDLE_STACK_TOP: u32 = offset_of!(PerCpu, idle_stack_top) as u32;
+const OFF_SYSCALL_RIP: u32 = offset_of!(PerCpu, syscall_rip) as u32;
+const OFF_SYSCALL_NUM: u32 = offset_of!(PerCpu, syscall_num) as u32;
+const OFF_SYSCALL_RBP: u32 = offset_of!(PerCpu, syscall_rbp) as u32;
+const OFF_RING0_TIMER_FIRES: u32 = offset_of!(PerCpu, ring0_timer_fires) as u32;
+const OFF_LAST_SEEN_RING0_FIRES: u32 = offset_of!(PerCpu, last_seen_ring0_fires) as u32;
+const OFF_LAST_ARMED_TICKS: u32 = offset_of!(PerCpu, last_armed_ticks) as u32;
+/// `arch::syscall`'s and `arch::idt`'s entry stubs open and close this count in
+/// naked assembly, and `preempt` is the Rust half of the same word.
+pub(crate) const OFF_PREEMPT_COUNT: u32 = offset_of!(PerCpu, preempt_count) as u32;
+/// Set by the timer ISR, cleared by the deferred-preempt epilogue — `preempt`.
+pub(crate) const OFF_NEED_RESCHED: u32 = offset_of!(PerCpu, need_resched) as u32;
+/// Read by `preempt::enable`'s slow path, which declines to reschedule a CPU
+/// that is inside a fault or panic report.
+pub(crate) const OFF_FAULT_STATE: u32 = offset_of!(PerCpu, fault_state) as u32;
+
+const _: () = assert!(OFF_SELF_PTR == 0);
+const _: () = assert!(OFF_CPU_ID == 8);
+const _: () = assert!(offset_of!(PerCpu, kernel_rsp) == 16);
+const _: () = assert!(OFF_USER_RSP == 24);
+const _: () = assert!(offset_of!(PerCpu, tss) == 32);
+const _: () = assert!(OFF_CURRENT_TID == 136);
+const _: () = assert!(OFF_CURRENT_PID == 140);
+const _: () = assert!(OFF_IDLE_STACK_TOP == 208);
+const _: () = assert!(OFF_SYSCALL_RIP == 216);
+const _: () = assert!(OFF_SYSCALL_NUM == 224);
+const _: () = assert!(OFF_SYSCALL_RBP == 232);
+const _: () = assert!(OFF_PREEMPT_COUNT == 240);
+const _: () = assert!(OFF_NEED_RESCHED == 244);
+const _: () = assert!(OFF_RING0_TIMER_FIRES == 248);
+const _: () = assert!(OFF_LAST_SEEN_RING0_FIRES == 252);
+const _: () = assert!(OFF_FAULT_STATE == 256);
+const _: () = assert!(OFF_LAST_ARMED_TICKS == 260);
+const _: () = assert!(offset_of!(PerCpu, log_shard) == 264);
+
+/// Every GS-relative access this kernel makes, as `const`-generic primitives.
+///
+/// **Here because this module owns the layout they index into.** The offsets
+/// above are declared and asserted a few lines up, the entry stubs hardcode the
+/// same numbers, and a GS access written anywhere else is a third place that has
+/// to know both. `preempt` carried six of these of its own, spelled against
+/// three hand-copied literals; they are these, and its literals are now
+/// `OFF_PREEMPT_COUNT`, `OFF_NEED_RESCHED` and `OFF_FAULT_STATE`.
+///
+/// The offset is a `const` operand, so each still assembles to the
+/// immediate-displacement form a hand-written `asm!` string produced —
+/// `mov %gs:8, %eax`, `lock addl $1, %gs:240` — and no register is spent
+/// reaching it.
+///
+/// **What none of them can check, and every caller owes**: `GS_BASE` must
+/// already point at this CPU's `PerCpu`. [`init_bsp`] writes it on the BSP and
+/// the trampoline in `arch::smp` writes it before an AP executes any Rust;
+/// `preempt`'s callers ask `percpu_ready()` first, because they run on the BSP
+/// before `init_bsp` does.
+///
+/// Each is irreducible in the same way: a GS-relative access is a machine
+/// facility with no Rust operation behind it, and `PerCpu` cannot be a `static`
+/// because every CPU needs a different one under the same name.
+pub(crate) mod gs {
+    use core::arch::asm;
+
+    /// One naturally aligned per-CPU `u64` load.
+    #[inline]
+    pub fn read_u64<const OFF: u32>() -> u64 {
+        let v: u64;
+        // SAFETY: `OFF` is one of this module's asserted field offsets, so
+        // `GS_BASE + OFF` is a live, naturally aligned word of this CPU's own
+        // `PerCpu` once the caller's half of the contract above holds. `nomem`
+        // because the access reaches no memory any Rust value names;
+        // `preserves_flags` because `mov` writes none.
+        unsafe {
+            asm!("mov {v}, gs:[{off}]", v = out(reg) v, off = const OFF,
+                options(nomem, nostack, preserves_flags));
+        }
+        v
+    }
+
+    /// One naturally aligned per-CPU `u32` load.
+    #[inline]
+    pub fn read_u32<const OFF: u32>() -> u32 {
+        let v: u32;
+        // SAFETY: `read_u64`'s argument, for four bytes.
+        unsafe {
+            asm!("mov {v:e}, gs:[{off}]", v = out(reg) v, off = const OFF,
+                options(nomem, nostack, preserves_flags));
+        }
+        v
+    }
+
+    /// One naturally aligned per-CPU `u32` store. No `lock` prefix: a 32-bit
+    /// store to an aligned address is atomic on x86, and a same-CPU IRQ cannot
+    /// land inside one instruction.
+    #[inline]
+    pub fn write_u32<const OFF: u32>(v: u32) {
+        // SAFETY: `read_u64`'s argument, minus `nomem` — this one does write the
+        // word, and every other writer of it is on this CPU, so the store's own
+        // atomicity is the whole of the synchronization.
+        unsafe {
+            asm!("mov gs:[{off}], {v:e}", off = const OFF, v = in(reg) v,
+                options(nostack, preserves_flags));
+        }
+    }
+
+    /// One per-CPU byte load.
+    #[inline]
+    pub fn read_u8<const OFF: u32>() -> u8 {
+        let v: u8;
+        // SAFETY: `read_u64`'s argument, for one byte.
+        unsafe {
+            asm!("mov {v}, gs:[{off}]", v = out(reg_byte) v, off = const OFF,
+                options(nomem, nostack, preserves_flags));
+        }
+        v
+    }
+
+    /// One per-CPU byte store, from a register. Single-byte stores are
+    /// naturally atomic on x86 — no `lock` prefix needed.
+    #[inline]
+    pub fn write_u8<const OFF: u32>(v: u8) {
+        // SAFETY: `write_u32`'s argument, for one byte.
+        unsafe {
+            asm!("mov gs:[{off}], {v}", off = const OFF, v = in(reg_byte) v,
+                options(nostack, preserves_flags));
+        }
+    }
+
+    /// One per-CPU byte store, from an *immediate*.
+    ///
+    /// Its own primitive rather than [`write_u8`] called with a constant,
+    /// because the instruction differs: this is the one-instruction
+    /// `mov byte ptr gs:[244], 1`, where the register form would first
+    /// materialise the value.
+    #[inline]
+    pub fn write_u8_imm<const OFF: u32, const VAL: u8>() {
+        // SAFETY: `write_u32`'s argument, for one byte.
+        unsafe {
+            asm!("mov byte ptr gs:[{off}], {val}", off = const OFF, val = const VAL,
+                options(nostack, preserves_flags));
+        }
+    }
+
+    /// One `lock`-prefixed increment of a per-CPU `u32`.
+    ///
+    /// The prefix is not optional and is why the two counter primitives are
+    /// their own: both kernel code and IRQ entry read-modify-write
+    /// `preempt_count` on the same CPU, and an interrupt landing between the
+    /// load and the store of a plain `add` loses whichever side went second.
+    ///
+    /// Increment and decrement stay two functions rather than one taking a
+    /// delta, so the instruction is still the immediate-form `lock add`/`lock
+    /// sub` every description of this path names — `arch::syscall`'s and
+    /// `arch::idt`'s entry stubs open and close the same count with the same two
+    /// instructions.
+    #[inline]
+    pub fn lock_inc_u32<const OFF: u32>() {
+        // SAFETY: `write_u32`'s argument. **No `preserves_flags`**, and that is
+        // a fix rather than an omission: `lock add` writes OF, SF, ZF, AF, CF
+        // and PF, so a caller claiming it would be telling the compiler it could
+        // keep a comparison's result live across a preempt-count change.
+        unsafe {
+            asm!("lock add dword ptr gs:[{off}], 1", off = const OFF, options(nostack));
+        }
+    }
+
+    /// One `lock`-prefixed decrement of a per-CPU `u32`. See [`lock_inc_u32`].
+    #[inline]
+    pub fn lock_dec_u32<const OFF: u32>() {
+        // SAFETY: `lock_inc_u32`'s argument exactly, including why
+        // `preserves_flags` is absent.
+        unsafe {
+            asm!("lock sub dword ptr gs:[{off}], 1", off = const OFF, options(nostack));
+        }
+    }
+}
 
 /// **One stack size, so "which stack am I on" is not a question kernel code
 /// has to answer.**
@@ -320,9 +490,19 @@ const STACK_FILL_WORD: u64 = u64::from_ne_bytes([STACK_FILL; 8]);
 /// Allocate and initialize PerCpu for a CPU. Returns a raw pointer (lives forever).
 fn alloc_percpu(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
     let layout = Layout::from_size_align(size_of::<PerCpu>(), 16).unwrap();
+    // SAFETY: `size_of::<PerCpu>()` is non-zero and 16 is a power of two, which
+    // is the whole of `alloc_zeroed`'s contract. Irreducible because the block
+    // is never freed and is published into `IA32_GS_BASE`, so no owning handle
+    // — `Box`, `Vec`, `OwnedAlloc` — can hold it: the machine's lifetime is the
+    // allocation's, and a drop would be a bug rather than a release.
     let ptr = unsafe { alloc_zeroed(layout) } as *mut PerCpu;
     assert!(!ptr.is_null(), "percpu: alloc failed");
 
+    // SAFETY: the allocation above succeeded (asserted), is `size_of::<PerCpu>()`
+    // bytes at 16-byte alignment, and is zeroed — which is a valid `PerCpu`,
+    // every field being an integer, an array of them or an atomic over one. It
+    // is not published anywhere until this function returns, so this `&mut` is
+    // the only reference to it in the machine.
     let percpu = unsafe { &mut *ptr };
     percpu.self_ptr = ptr as u64;
     percpu.cpu_id = cpu_id;
@@ -355,6 +535,9 @@ fn alloc_log_shard(cpu_id: u32) -> u64 {
         return &raw const log::BOOT_SHARD as u64;
     }
     let layout = Layout::from_size_align(size_of::<log::Shard>(), 64).unwrap();
+    // SAFETY: `alloc_percpu`'s argument — a non-zero size at a power-of-two
+    // alignment, never freed, and the allocation this CPU logs into for the life
+    // of the machine.
     let ptr = unsafe { alloc_zeroed(layout) } as *mut log::Shard;
     assert!(!ptr.is_null(), "percpu: log shard alloc failed for cpu{cpu_id}");
     // SAFETY: this is a fresh zeroed, 64-byte-aligned allocation which is not
@@ -378,6 +561,13 @@ fn alloc_log_shard(cpu_id: u32) -> u64 {
 /// another CPU — which is sound only while this CPU owns the shard. The live
 /// [`crate::arch::LogCommitGuard`] proves that neither migration nor a
 /// single-step #DB can happen from this pointer read through publication.
+///
+/// **Four reads in one `asm!` block rather than four [`gs`] calls, and the
+/// difference is the absent `nomem`.** Without it the block is an implicit
+/// memory clobber, which is what keeps the shard *selection* on the closed side
+/// of the compiler barrier the guard opened — the same reason
+/// [`crate::arch::LogCommitGuard::close`] spells its `pushfq` without `nomem`.
+/// A `gs::read_u64` here would carry `nomem` and let the selection float.
 pub fn reserve_log_slot(
     guard: &crate::arch::LogCommitGuard,
 ) -> (*const log::Shard, u64, u32, u32, u32) {
@@ -386,17 +576,28 @@ pub fn reserve_log_slot(
     let cpu: u32;
     let tid: u32;
     let pid: u32;
+    // SAFETY: the four `mov`s are `gs`'s contract — `GS_BASE` points at this
+    // CPU's `PerCpu`, which the live `guard` also proves has not migrated. The
+    // `reserve` below dereferences `log_shard`, which `alloc_percpu` fills for
+    // cpu0 and for every AP before that AP executes an instruction, so it is
+    // never null on a live CPU (the field's own doc carries that argument), and
+    // the shard is a `'static` allocation that is never freed. `guard` is passed
+    // through to `reserve`, which is where the unlocked `xadd`'s soundness
+    // condition is stated.
     unsafe {
         core::arch::asm!(
             "mov {shard}, gs:[{shard_off}]",
-            "mov {cpu:e}, gs:[8]",
-            "mov {tid:e}, gs:[136]",
-            "mov {pid:e}, gs:[140]",
+            "mov {cpu:e}, gs:[{cpu_off}]",
+            "mov {tid:e}, gs:[{tid_off}]",
+            "mov {pid:e}, gs:[{pid_off}]",
             shard = out(reg) shard,
             cpu = out(reg) cpu,
             tid = out(reg) tid,
             pid = out(reg) pid,
-            shard_off = const core::mem::offset_of!(PerCpu, log_shard),
+            shard_off = const offset_of!(PerCpu, log_shard),
+            cpu_off = const OFF_CPU_ID,
+            tid_off = const OFF_CURRENT_TID,
+            pid_off = const OFF_CURRENT_PID,
             options(preserves_flags),
         );
         seq = (&*(shard as *const log::Shard)).reserve(guard);
@@ -460,6 +661,15 @@ fn alloc_idle_stack(percpu: &mut PerCpu) {
     // Filled rather than zeroed, for [`idle_stack_high_water`]: a zero is a
     // value the stack legitimately holds, so it cannot tell untouched from
     // written. After the guard, because the guard's page is no longer mapped.
+    //
+    // SAFETY: `alloc_idle_slot` returned `IDLE_SLOT` bytes of direct-mapped
+    // physical memory it owns forever, `guard_kernel_page` has since unmapped
+    // the first `IDLE_GUARD_SIZE` of them, and this writes the `IDLE_STACK_SIZE`
+    // above that — the whole of what is left, and nothing else. Irreducible in
+    // that the region is a stack about to be entered by an `iretq`, not a Rust
+    // value: `&mut [u8]` over it would be a borrow of memory a CPU is about to
+    // start pushing frames onto (`issues/kernel/pagealloc-has-no-checked-window.md`
+    // is the same shape, filed by the root-file sweep).
     unsafe {
         core::ptr::write_bytes(
             (base + IDLE_GUARD_SIZE as u64) as *mut u8,
@@ -507,10 +717,21 @@ pub fn idle_stack_high_water() -> usize {
 fn alloc_ist1_stack(percpu: &mut PerCpu) {
     let total = IST1_GUARD_SIZE + IST1_STACK_SIZE;
     let layout = Layout::from_size_align(total, 4096).unwrap();
+    // SAFETY: `alloc_percpu`'s argument — non-zero size, power-of-two alignment,
+    // never freed. The 4096 is not decoration: `IST1_GUARD_SIZE` is a page and
+    // the guard's detection rests on it starting at one.
     let base = unsafe { alloc_zeroed(layout) };
     assert!(!base.is_null(), "percpu: IST1 stack alloc failed");
+    // SAFETY: `total` bytes from `base`, which is exactly the allocation just
+    // made and asserted non-null. Same irreducibility as `alloc_idle_stack`'s
+    // fill: what is being written is a stack the CPU will switch to on #DF, not
+    // a Rust value that could hold a borrow.
     unsafe { core::ptr::write_bytes(base, STACK_FILL, total) };
     let top = base as u64 + total as u64;
+    // SAFETY: `Tss` is `repr(C, packed)`, so `&raw mut percpu.tss.ist[0]` is a
+    // well-formed but possibly unaligned pointer into a live `PerCpu` this
+    // function holds `&mut` to — which is precisely `write_unaligned`'s domain
+    // and why the plain assignment it replaces would be undefined.
     unsafe { core::ptr::write_unaligned(&raw mut percpu.tss.ist[0], top); }
 }
 
@@ -520,11 +741,15 @@ fn alloc_ist1_stack(percpu: &mut PerCpu) {
 /// the callers are on the panic path, where a corrupted percpu block is one of
 /// the things that could have brought us here.
 fn ist1_top() -> Option<u64> {
-    let percpu: *const PerCpu;
-    unsafe { core::arch::asm!("mov {}, gs:[0]", out(reg) percpu, options(nomem, nostack, preserves_flags)); }
+    let percpu = gs::read_u64::<OFF_SELF_PTR>() as *const PerCpu;
     if !crate::mm::is_kernel_addr(percpu as u64) {
         return None;
     }
+    // SAFETY: the address came out of this CPU's own `self_ptr` and has just
+    // been checked to be a kernel one, which is as far as a panic-path reader
+    // can get — the whole point of this function is that the block may be
+    // corrupt, so the read is checked afterwards rather than trusted. Unaligned
+    // because `Tss` is `repr(C, packed)`.
     let top = unsafe { core::ptr::read_unaligned(&raw const (*percpu).tss.ist[0]) };
     let total = (IST1_GUARD_SIZE + IST1_STACK_SIZE) as u64;
     let base = top.checked_sub(total)?;
@@ -573,19 +798,33 @@ pub fn ist1_report() {
 /// Sequential u64s from `base`. Every address is inside the allocation the
 /// caller just bounds-checked, so there is nothing here that can fault.
 fn words(base: u64, len: usize) -> impl Iterator<Item = u64> {
+    // SAFETY: `i < len / 8`, so every address is inside `[base, base + len)`,
+    // which both callers have already established is a live stack allocation of
+    // theirs — `ist1_report` after bounding `rsp` inside it, `idle_stack_high_water`
+    // off the arena's own record. `read_volatile` because a fill pattern being
+    // read back is exactly the observation the optimiser is entitled to remove.
     (0..len / 8).map(move |i| unsafe { core::ptr::read_volatile((base as *const u64).add(i)) })
 }
 
 /// Initialize per-CPU data for the BSP. Call after paging + allocator but before IDT/syscall.
 pub fn init_bsp(lapic_id: u32) {
     let ptr = alloc_percpu(0, lapic_id);
+    // SAFETY: `alloc_percpu` just returned a live, initialised, never-freed
+    // `PerCpu` that nothing else has a reference to — it is not published into
+    // `IA32_GS_BASE` until the `wrmsr` below.
     let percpu = unsafe { &mut *ptr };
 
     percpu.kernel_rsp = cpu::read_rsp();
+    // SAFETY: `Tss` is `repr(C, packed)`, so `rsp0` may be unaligned; the
+    // pointer is into the `&mut PerCpu` above.
     unsafe { core::ptr::write_unaligned(&raw mut percpu.tss.rsp0, cpu::read_rsp()); }
     alloc_idle_stack(percpu);
     alloc_ist1_stack(percpu);
 
+    // SAFETY: `load_gdt` asks to be called exactly once per CPU during init, and
+    // this is the BSP's one call — `init_ap` is every AP's. The GDT and TSS it
+    // loads are this `PerCpu`'s own, filled by `alloc_percpu` and
+    // `alloc_ist1_stack` above.
     unsafe { percpu.load_gdt(); }
     super::control_regs::init(0);
     super::fpu::init();
@@ -603,6 +842,9 @@ pub fn init_bsp(lapic_id: u32) {
 /// to write into IA32_GS_BASE before loading the IDT.
 pub fn alloc_ap(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
     let ptr = alloc_percpu(cpu_id, lapic_id);
+    // SAFETY: `init_bsp`'s argument — a live, never-freed `PerCpu` nothing else
+    // references. This one runs on the BSP for an AP that has not been sent its
+    // INIT-SIPI yet, so the CPU it belongs to has executed no instruction.
     let percpu = unsafe { &mut *ptr };
     alloc_idle_stack(percpu);
     alloc_ist1_stack(percpu);
@@ -616,7 +858,13 @@ pub fn alloc_ap(cpu_id: u32, lapic_id: u32) -> *mut PerCpu {
 /// like the BSP. Everything else is silent: `boot_aps` already logs one line per
 /// AP that came up.
 pub fn init_ap(percpu_ptr: *mut PerCpu) {
+    // SAFETY: the pointer is this CPU's own `PerCpu`, read back out of `gs:[0]`
+    // by the one caller (`smp::ap_entry`) after the trampoline put it in
+    // `IA32_GS_BASE`; the BSP built it in `alloc_ap` and dropped its `&mut`
+    // before sending the SIPI, so this is again the only reference to it.
     let percpu = unsafe { &mut *percpu_ptr };
+    // SAFETY: `load_gdt` asks to be called exactly once per CPU during init, and
+    // this is that call for this AP — `init_bsp` is the BSP's.
     unsafe { percpu.load_gdt(); }
     super::control_regs::init(percpu.cpu_id);
     super::fpu::init();
@@ -629,8 +877,7 @@ pub fn init_ap(percpu_ptr: *mut PerCpu) {
 /// # Safety
 /// Must be called from the CPU whose GS base points to the relevant PerCpu.
 pub unsafe fn set_kernel_stack(rsp: u64) {
-    let percpu: *mut PerCpu;
-    core::arch::asm!("mov {}, gs:[0]", out(reg) percpu, options(nomem, nostack, preserves_flags));
+    let percpu = gs::read_u64::<OFF_SELF_PTR>() as *mut PerCpu;
     (*percpu).kernel_rsp = rsp;
     core::ptr::write_unaligned(&raw mut (*percpu).tss.rsp0, rsp);
 }
@@ -652,8 +899,7 @@ pub unsafe fn set_kernel_stack(rsp: u64) {
 /// Must be called from the CPU whose GS base points to the relevant PerCpu.
 #[cfg(feature = "stack-witness")]
 pub unsafe fn entry_stacks() -> (u64, u64) {
-    let percpu: *const PerCpu;
-    core::arch::asm!("mov {}, gs:[0]", out(reg) percpu, options(nomem, nostack, preserves_flags));
+    let percpu = gs::read_u64::<OFF_SELF_PTR>() as *const PerCpu;
     (
         (*percpu).kernel_rsp,
         core::ptr::read_unaligned(&raw const (*percpu).tss.rsp0),
@@ -662,41 +908,63 @@ pub unsafe fn entry_stacks() -> (u64, u64) {
 
 /// Read this CPU's ID from GS-relative percpu data.
 pub fn cpu_id() -> u32 {
-    let id: u32;
-    unsafe { core::arch::asm!("mov {:e}, gs:[8]", out(reg) id, options(nomem, nostack, preserves_flags)); }
-    id
+    gs::read_u32::<OFF_CPU_ID>()
 }
 
 /// Read the Tid of the thread currently running on this CPU. None means idle.
 pub fn current_tid() -> Option<crate::process::Tid> {
-    let raw: u32;
-    unsafe { core::arch::asm!("mov {:e}, gs:[136]", out(reg) raw, options(nomem, nostack, preserves_flags)); }
+    let raw = gs::read_u32::<OFF_CURRENT_TID>();
     if raw == u32::MAX { None } else { Some(crate::process::Tid::from_raw(raw)) }
 }
 
 /// Set the Tid of the thread running on this CPU. None sets idle (u32::MAX).
 pub fn set_current_tid(tid: Option<crate::process::Tid>) {
-    let raw = tid.map_or(u32::MAX, |t| t.raw());
-    unsafe { core::arch::asm!("mov gs:[136], {:e}", in(reg) raw, options(nostack, preserves_flags)); }
+    gs::write_u32::<OFF_CURRENT_TID>(tid.map_or(u32::MAX, |t| t.raw()));
 }
 
 /// Read the Pid of the process running on this CPU. None means idle.
 pub fn current_pid() -> Option<crate::process::Pid> {
-    let raw: u32;
-    unsafe { core::arch::asm!("mov {:e}, gs:[140]", out(reg) raw, options(nomem, nostack, preserves_flags)); }
+    let raw = gs::read_u32::<OFF_CURRENT_PID>();
     if raw == u32::MAX { None } else { Some(crate::process::Pid::from_raw(raw)) }
 }
 
 /// Set the Pid of the process running on this CPU. None sets idle (u32::MAX).
 pub fn set_current_pid(pid: Option<crate::process::Pid>) {
-    let raw = pid.map_or(u32::MAX, |p| p.raw());
-    unsafe { core::arch::asm!("mov gs:[140], {:e}", in(reg) raw, options(nostack, preserves_flags)); }
+    gs::write_u32::<OFF_CURRENT_PID>(pid.map_or(u32::MAX, |p| p.raw()));
 }
 
+/// This CPU's `PerCpu`, reached through its own self-reference at `gs:[0]`.
+///
+/// Only [`init_ap`]'s caller needs it: every field this module publishes is read
+/// through [`gs`] at the field's own offset, one instruction, with no pointer
+/// materialised at all.
 pub fn percpu_ptr() -> *mut PerCpu {
-    let p: *mut PerCpu;
-    unsafe { core::arch::asm!("mov {}, gs:[0]", out(reg) p, options(nomem, nostack, preserves_flags)); }
-    p
+    gs::read_u64::<OFF_SELF_PTR>() as *mut PerCpu
+}
+
+/// The count of Ring 0 timer fires the assembly stub has taken, and the count
+/// the trace has already accounted for.
+///
+/// Written by the Ring 0 timer stub with a plain `inc` (IF is clear there, and
+/// only that stub writes); read and reconciled by `arch::idt`'s exit-to-user
+/// path, which owns the difference.
+pub fn ring0_timer_fires() -> u32 {
+    gs::read_u32::<OFF_RING0_TIMER_FIRES>()
+}
+
+pub fn last_seen_ring0_fires() -> u32 {
+    gs::read_u32::<OFF_LAST_SEEN_RING0_FIRES>()
+}
+
+pub fn set_last_seen_ring0_fires(v: u32) {
+    gs::write_u32::<OFF_LAST_SEEN_RING0_FIRES>(v);
+}
+
+/// Remember the one-shot count this CPU just armed, for the Ring 0 timer stub's
+/// reload — `arch::apic` is the only caller, and the stub reads the same word
+/// from `gs:` with no Rust in its path.
+pub fn set_last_armed_ticks(ticks: u32) {
+    gs::write_u32::<OFF_LAST_ARMED_TICKS>(ticks);
 }
 
 /// The byte immediately below this CPU's idle stack — the last byte of its
@@ -708,37 +976,39 @@ pub fn idle_guard_byte() -> u64 {
 
 /// Top of this CPU's idle stack.
 pub fn idle_stack_top() -> u64 {
-    unsafe { (*percpu_ptr()).idle_stack_top }
+    gs::read_u64::<OFF_IDLE_STACK_TOP>()
 }
 
 /// User RIP saved at last syscall entry (for panic diagnostics).
 pub fn syscall_rip() -> u64 {
-    unsafe { (*percpu_ptr()).syscall_rip }
+    gs::read_u64::<OFF_SYSCALL_RIP>()
 }
 
 /// Syscall number saved at last syscall entry (for panic diagnostics).
 pub fn syscall_num() -> u64 {
-    unsafe { (*percpu_ptr()).syscall_num }
+    gs::read_u64::<OFF_SYSCALL_NUM>()
 }
 
 /// User RSP saved at last syscall entry.
 pub fn user_rsp() -> u64 {
-    unsafe { (*percpu_ptr()).user_rsp }
+    gs::read_u64::<OFF_USER_RSP>()
 }
 
 /// User RBP saved at last syscall entry (for panic diagnostics).
 pub fn syscall_rbp() -> u64 {
-    unsafe { (*percpu_ptr()).syscall_rbp }
+    gs::read_u64::<OFF_SYSCALL_RBP>()
 }
 
 /// Swap the per-CPU fault state. Returns the previous state.
 /// Not atomic — safe because only exception/panic entry points read or write
 /// fault_state, and they all run with interrupts disabled (interrupt gate for
 /// exceptions, explicit cli for panics). The timer handler never touches it.
+///
+/// Read and written through [`gs`], which is also how `preempt::faulting` reads
+/// the same byte — one way to reach a per-CPU field, not two.
 pub fn swap_fault_state(new: CpuFaultState) -> CpuFaultState {
-    let p = unsafe { &mut (*percpu_ptr()).fault_state };
-    let old = *p;
-    *p = new as u8;
+    let old = gs::read_u8::<OFF_FAULT_STATE>();
+    gs::write_u8::<OFF_FAULT_STATE>(new as u8);
     match old {
         0 => CpuFaultState::Normal,
         1 => CpuFaultState::PageFault,
@@ -750,5 +1020,5 @@ pub fn swap_fault_state(new: CpuFaultState) -> CpuFaultState {
 
 /// Set the per-CPU fault state.
 pub fn set_fault_state(new: CpuFaultState) {
-    unsafe { (*percpu_ptr()).fault_state = new as u8; }
+    gs::write_u8::<OFF_FAULT_STATE>(new as u8);
 }
