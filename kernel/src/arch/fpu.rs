@@ -63,6 +63,13 @@ impl UserFpState {
     /// because the macro sizes its reservation from `size_of::<Self>()`.
     pub fn saved_from_cpu() -> Self {
         let mut state = Self([0u8; 512]);
+        // SAFETY: `fxsave64` writes 512 bytes to its operand and requires
+        // 16-byte alignment. `state` is a live local `UserFpState`, which is
+        // `repr(C, align(16))` over exactly `[u8; 512]` — the type is the whole
+        // guarantee, and it is the same type `arch::entry`'s naked bracket sizes
+        // its reservation from. Irreducible: this is the instruction, and the
+        // file's own header says these are the only lines in the kernel naming
+        // one.
         unsafe {
             core::arch::asm!(
                 "fxsave64 [{}]",
@@ -110,6 +117,11 @@ pub fn init() {
 /// `FNINIT` for the x87 half, `LDMXCSR` for the SSE half. Neither waits, so
 /// this is safe to run over an FPU left holding a pending unmasked exception.
 fn load_initial() {
+    // SAFETY: `fninit` takes no operand. `ldmxcsr` reads four bytes from its
+    // operand — `&MXCSR_INITIAL`, a live `const`-initialised `u32` — and is
+    // `#GP` if the value sets a reserved bit, which `0x1F80` does not; it is
+    // `#UD` without `CR4.OSFXSR`, which `init`'s doc comment is the ordering
+    // constraint for. `readonly` is honest: nothing is written.
     unsafe {
         core::arch::asm!(
             "fninit",
@@ -181,6 +193,9 @@ pub fn log_state() {
     let (_, _, ecx1, _) = super::cpu::cpuid(1, 0);
     let xsave = ecx1 & (1 << 26) != 0;
     let osxsave = ecx1 & (1 << 27) != 0;
+    // SAFETY: `xgetbv0` asks for `CR4.OSXSAVE`, and the branch this is in is
+    // exactly CPUID leaf 1's `OSXSAVE` bit — the CPU's own report of that same
+    // register bit.
     let xcr0 = if osxsave { unsafe { xgetbv0() } } else { 0 };
     let (d0a, d0b, d0c, _) = if max_leaf >= 0xD { super::cpu::cpuid(0xD, 0) } else { (0, 0, 0, 0) };
     let (d1a, _, _, _) = if max_leaf >= 0xD { super::cpu::cpuid(0xD, 1) } else { (0, 0, 0, 0) };

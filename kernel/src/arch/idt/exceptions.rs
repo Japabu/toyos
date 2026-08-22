@@ -6,12 +6,30 @@ use toyos_userbound::{blame, Blame, Faulted, Ring};
 
 use super::{Vector, TrapFrame, PF_PRESENT, PF_WRITE, PF_INSTRUCTION_FETCH};
 
+/// COM1's data register, for the one line this file writes without the log.
+const SERIAL_COM1: u16 = 0x3F8;
+
 /// Walk RBP chain for kernel backtrace with symbol resolution.
 pub(crate) fn kernel_backtrace(start_rbp: u64, max_frames: usize) {
     let mut rbp = start_rbp;
     for _ in 0..max_frames {
         if rbp == 0 || !rbp.is_multiple_of(8) || !mm::is_kernel_addr(rbp) { break; }
+        // SAFETY: `rbp` is non-zero, 8-aligned and a kernel address, all just
+        // checked, so both reads are inside the direct map — which covers every
+        // byte of physical memory and is mapped for the life of the machine, so
+        // neither can fault. What the words *mean* is not checked and cannot be:
+        // this walks a frame chain on a stack that has already failed, and
+        // `return_addr` is filtered on the next line rather than trusted.
+        //
+        // **Irreducible for the frame chain and not for the read.** `rbp` is a
+        // register out of a `TrapFrame`, so there is no allocation to borrow and
+        // no `KernelSlice` to carry — but the read itself should be a
+        // `read_volatile` like `safe_read_kernel`'s, and the argument the two
+        // differ on is the root-file sweep's open finding
+        // (`issues/kernel/user-pages-still-read-through-a-plain-deref.md`).
         let saved_rbp = unsafe { *(rbp as *const u64) };
+        // SAFETY: the same argument, for the return address one word up — `rbp`
+        // is 8-aligned and a kernel address, and the direct map is contiguous.
         let return_addr = unsafe { *((rbp + 8) as *const u64) };
         if return_addr == 0 || !mm::is_kernel_addr(return_addr) { break; }
         symbols::resolve_kernel_return(return_addr);
@@ -51,6 +69,11 @@ fn safe_read_kernel(addr: u64) -> Option<u64> {
     if !addr.is_multiple_of(8) || !mm::is_kernel_addr(addr) {
         return None;
     }
+    // SAFETY: `addr` is 8-aligned and a kernel address, checked immediately
+    // above, so the read is inside the direct map and cannot fault. Irreducible
+    // for `kernel_backtrace`'s reason: the address is a raw stack word, not a
+    // borrow of anything. `read_volatile` because this runs on the crash path
+    // and the values it reads are memory another CPU may still be writing.
     Some(unsafe { core::ptr::read_volatile(addr as *const u64) })
 }
 
@@ -64,18 +87,38 @@ fn safe_read_u64(addr: u64, user_pml4: *const u64) -> Option<u64> {
         let pml4_idx = ((addr >> 39) & 0x1FF) as usize;
         let pdpt_idx = ((addr >> 30) & 0x1FF) as usize;
         let pd_idx = ((addr >> 21) & 0x1FF) as usize;
+        // SAFETY: the four reads below are one page walk, and each is guarded
+        // by the present bit of the entry before it. `user_pml4` is a direct-map
+        // pointer to the live PML4 the caller read out of `CR3`; every index is
+        // masked to nine bits, so `add` stays inside that 512-entry table; and
+        // each next-level pointer is a direct-map address of the physical frame
+        // the previous entry named, which the direct map covers by construction.
+        // The last read is `page_phys + offset` with `offset` masked to 2 MiB,
+        // so it is inside the leaf the walk just resolved.
+        //
+        // **This is why the walk is here rather than through `mm::paging`**: the
+        // caller is an exception handler on a faulted CPU, which may not take
+        // the address space's lock and may not itself demand-page — the whole
+        // reason a translation is done by hand instead of dereferencing `addr`.
+        // The reads should still be volatile; see `kernel_backtrace`.
         let pml4e = unsafe { *user_pml4.add(pml4_idx) };
         if pml4e & 1 == 0 { return None; }
         let pdpt = crate::DirectMap::from_phys(pml4e & 0x000F_FFFF_FFFF_F000).as_ptr::<u64>();
+        // SAFETY: the walk's argument, one level down.
         let pdpte = unsafe { *pdpt.add(pdpt_idx) };
         if pdpte & 1 == 0 { return None; }
         let pd = crate::DirectMap::from_phys(pdpte & 0x000F_FFFF_FFFF_F000).as_ptr::<u64>();
+        // SAFETY: the walk's argument, one level down again.
         let pde = unsafe { *pd.add(pd_idx) };
         if pde & 1 == 0 { return None; }
         let page_phys = pde & 0x000F_FFFF_FFE0_0000;
         let offset = addr & (mm::PAGE_2M - 1);
+        // SAFETY: the walk's argument — a direct-map read of a byte inside the
+        // present 2 MiB leaf the three entries above resolved.
         Some(unsafe { *crate::DirectMap::from_phys(page_phys + offset).as_ptr::<u64>() })
     } else if mm::is_kernel_addr(addr) {
+        // SAFETY: `addr` is 8-aligned (checked at the top) and a kernel address
+        // (checked in this arm), so it is inside the direct map.
         Some(unsafe { *(addr as *const u64) })
     } else {
         None
@@ -407,10 +450,13 @@ pub(crate) fn try_recover_from_panic() -> ! {
 /// #DB handler — logs full context when a hardware watchpoint fires.
 /// Returns to resume execution.
 pub(super) fn debug_handler(frame: &TrapFrame) {
-    unsafe {
-        for &b in b"\n!!! DB TRAP !!!\n" {
-            core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") b);
-        }
+    // The UART directly, and ahead of everything: a `#DB` may have been taken
+    // inside the log's own machinery, so the first thing this handler says has
+    // to depend on nothing the trap could have been about. `cpu::outb` is that
+    // instruction with the same operands — it is what the five bytes of inline
+    // assembly here used to spell.
+    for &b in b"\n!!! DB TRAP !!!\n" {
+        cpu::outb(SERIAL_COM1, b);
     }
 
     let dr6 = debug::read_dr6();
@@ -420,6 +466,13 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
     // clear-at-exit site. This returning handler emits at most 32 records
     // (including a 20-frame backtrace), far short of one 512-record lap; the
     // publication guard's safety argument relies on both facts.
+    // SAFETY: two register-to-debug-register writes, no memory operand and no
+    // fault in Ring 0. Zero in `DR7` disarms every breakpoint and zero in `DR6`
+    // clears the status bits — the two values that can only *reduce* what the
+    // hardware will trap on, so there is nothing a caller could choose wrongly.
+    // Irreducible, and deliberately not moved into `arch::debug`: that module's
+    // header says it is the read side of the debug registers and not a place to
+    // arm one from, and a disarm sitting there would be an arm with a zero in it.
     unsafe {
         core::arch::asm!("mov dr7, {}", in(reg) 0u64);
         core::arch::asm!("mov dr6, {}", in(reg) 0u64);
@@ -461,8 +514,22 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
     }
 
     let watched_addr: u64;
+    // SAFETY: `read_dr6`'s argument — reading a debug register in Ring 0 touches
+    // no memory and cannot fault. Beside its `DR7`/`DR6` siblings above rather
+    // than in `arch::debug` for the same reason they are.
     unsafe { core::arch::asm!("mov {}, dr0", out(reg) watched_addr); }
     if mm::is_kernel_addr(watched_addr) && watched_addr.is_multiple_of(8) {
+        // SAFETY: `watched_addr` is a kernel address and 8-aligned, both just
+        // checked, so the read is inside the direct map.
+        //
+        // Those are `safe_read_kernel`'s two checks written out again, and this
+        // is reducible to it — one `if let Some(val)`, one fewer block, one
+        // fewer copy of the predicate. Left alone because nothing in the suite
+        // reaches this handler at all: `arch::debug`'s header records that the
+        // arming tools were deleted, so `#DB` is raised only by a Ring 3 `TF` or
+        // an `int 1`, and no test does either
+        // (`issues/kernel/the-db-handler-is-exercised-by-nothing.md`). A
+        // restructure with no test under it is what this sweep does not do.
         let val = unsafe { *(watched_addr as *const u64) };
         log!("  Value at watched addr {:#x} = {:#018x}", watched_addr, val);
     }

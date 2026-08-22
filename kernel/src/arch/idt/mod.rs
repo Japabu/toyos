@@ -19,6 +19,7 @@ use super::entry::{
     restore_user_state, ring3_naked_asm, save_user_state, Ring0Entry, Ring3Entry,
 };
 use super::cpu::{outb, io_wait};
+use super::percpu;
 use crate::sync::Lock;
 
 // PIC ports
@@ -402,35 +403,22 @@ pub(crate) extern "sysv64" fn kernel_exit_to_user_check() {
         }
         assert!(!crate::scheduler::in_schedule_self(),
             "exit-to-user inside a scheduler pass");
-        unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+        // The pair is `arch::cpu`'s, which is that exact `sti`/`cli` with those
+        // exact options — not an `IrqGuard`, because both of this loop's exits
+        // have to *set* IF rather than restore whatever the caller had.
+        cpu::enable_interrupts();
         crate::scheduler::do_preempt();
-        unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+        cpu::disable_interrupts();
         flush_ring0_timer_fires_to_trace();
     }
 }
 
 fn flush_ring0_timer_fires_to_trace() {
-    let cur: u32;
-    let last: u32;
-    unsafe {
-        core::arch::asm!(
-            "mov {cur:e}, gs:[248]",
-            "mov {last:e}, gs:[252]",
-            cur = out(reg) cur,
-            last = out(reg) last,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    let missed = cur.wrapping_sub(last);
+    let cur = percpu::ring0_timer_fires();
+    let missed = cur.wrapping_sub(percpu::last_seen_ring0_fires());
     if missed > 0 {
         crate::trace::trace(crate::trace::Kind::TimerFireBurst, missed);
-        unsafe {
-            core::arch::asm!(
-                "mov gs:[252], {cur:e}",
-                cur = in(reg) cur,
-                options(nomem, nostack, preserves_flags),
-            );
-        }
+        percpu::set_last_seen_ring0_fires(cur);
     }
 }
 
@@ -443,6 +431,12 @@ fn flush_ring0_timer_fires_to_trace() {
 extern "sysv64" fn trap_dispatch(frame: *mut TrapFrame) {
     #[cfg(feature = "df-witness")]
     crate::arch::cpu::df_witness("trap_dispatch");
+    // SAFETY: `frame` is `rsp` at the moment `common_entry` finished its pushes,
+    // handed straight to this call — so it points at the `TrapFrame` those
+    // pushes and the CPU's own interrupt frame just built, on this CPU's kernel
+    // stack, which nothing else can be holding a reference to. Irreducible
+    // because the frame is built by naked assembly and its `&mut` is the only
+    // way a handler can write `rip`/`rsp` back for the `iretq`.
     let frame = unsafe { &mut *frame };
     match Vector::from_raw(frame.vector) {
         Vector::Debug => exceptions::debug_handler(frame),
@@ -451,7 +445,7 @@ extern "sysv64" fn trap_dispatch(frame: *mut TrapFrame) {
         Vector::PageFault => {
             cpu::enable_interrupts();
             exceptions::page_fault_handler(frame);
-            unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+            cpu::disable_interrupts();
         }
         _ => exceptions::exception_handler(frame),
     }
@@ -495,6 +489,12 @@ pub fn init() {
         base: IDT.data_ptr() as u64,
     };
 
+    // SAFETY: `lidt` asks for a valid IDT descriptor. `ptr` is one, built two
+    // lines above out of `size_of::<Idt>()` and the address of the `static IDT`
+    // this function has just filled — a `'static` whose entries `install_gates`
+    // wrote from the one table, so every slot is either a classified handler or
+    // `IdtEntry::EMPTY`. The descriptor itself is a local, which is what `lidt`
+    // wants: the CPU copies the base and limit out of it.
     unsafe {
         cpu::lidt(&ptr as *const IdtPointer as *const u8);
     }

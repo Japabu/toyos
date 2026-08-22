@@ -127,11 +127,21 @@ fn debug_heap_alloc(bytes: usize, align: usize) -> u64 {
     let Ok(layout) = core::alloc::Layout::from_size_align(bytes, align) else {
         return SyscallError::InvalidArgument.to_u64();
     };
+    // SAFETY: `layout` came from `Layout::from_size_align`, which refused a
+    // zero size or a non-power-of-two alignment on the line above, and that is
+    // `alloc`'s whole contract. **Irreducible on purpose**: the doc comment
+    // above is the argument — a `Vec` dropped immediately is a malloc/free pair
+    // whose result nothing observes, which LLVM may delete, and an actuator the
+    // optimiser can remove certifies nothing about the allocator.
     let p = unsafe { alloc::alloc::alloc(layout) };
     if p.is_null() {
         return SyscallError::ResourceExhausted.to_u64();
     }
+    // SAFETY: `p` is a live, non-null allocation of at least one byte, asserted
+    // by the null check above. Volatile for the same reason the raw pair is raw.
     unsafe { core::ptr::write_volatile(p, 1u8) };
+    // SAFETY: `p` came from `alloc` with this exact `layout` and has not been
+    // freed, which is `dealloc`'s contract.
     unsafe { alloc::alloc::dealloc(p, layout) };
     0
 }
@@ -707,6 +717,12 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         #[cfg(feature = "test-actuators")]
         SYS_DEBUG => match a1 {
             DA::PANIC => panic!("SYS_DEBUG: kernel panic triggered by userspace"),
+            // SAFETY: **this one is unsound by design and that is the whole
+            // action** — a null dereference in Ring 0, staged so a test can see
+            // what the kernel does with a fault the kernel itself caused. It is
+            // behind `test-actuators`, which no shipped kernel is built with.
+            // Volatile so the read is actually emitted; a plain one the
+            // optimiser may fold to `unreachable` and then nothing faults.
             DA::NULL_READ => { unsafe { core::ptr::read_volatile(core::ptr::null::<u64>()); } 0 }
             DA::LOCK_ACROSS_SWITCH => {
                 if !LOCK_ACROSS_SWITCH_ARMED.swap(false, core::sync::atomic::Ordering::Relaxed) {
@@ -735,6 +751,12 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             // delivered onto this same unusable stack.
             DA::DOUBLE_FAULT => {
                 log!("SYS_DEBUG: provoking a double fault");
+                // SAFETY: unsound by design, like `NULL_READ` above and behind
+                // the same feature — the comment on this arm is the argument for
+                // why only the hardware can produce the state under test.
+                // `options(noreturn)` is honest: the `push` raises `#SS` on a
+                // non-canonical `rsp`, delivering that needs another push to the
+                // same `rsp`, and the `#DF` that follows never comes back here.
                 unsafe {
                     core::arch::asm!(
                         "mov rsp, {bad}",
@@ -767,6 +789,12 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
             DA::IDLE_GUARD_READ => {
                 let addr = super::percpu::idle_guard_byte();
                 log!("SYS_DEBUG: reading the idle stack guard at {addr:#x}");
+                // SAFETY: the third of this feature's deliberate faults. The
+                // address is `percpu::idle_guard_byte()`, the last byte of a page
+                // `alloc_idle_stack` took out of the direct map, so the read is
+                // the `#PF` the test is asserting on — and a kernel *without* the
+                // guard returns from it, which is the failure. Volatile because
+                // the value is discarded and a plain read would be deleted.
                 unsafe { core::ptr::read_volatile(addr as *const u8) };
                 0
             }
@@ -3023,6 +3051,20 @@ fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
         None => {
             let page_alloc = process::PageAlloc::new(tls_memsz.max(1), crate::mm::pmm::Category::Tls)
                 .ok_or(SyscallError::ResourceExhausted)?;
+            // SAFETY: `page_alloc` is a fresh `PageAlloc` of at least
+            // `tls_memsz.max(1)` bytes that nothing else has a pointer to yet —
+            // it is mapped into the process below, not above. `template` is the
+            // module's TLS image out of the loaded ELF, live for as long as the
+            // module is, and `template.size()` is its own length, which
+            // `elf::tls_modules` derives from the same program header as
+            // `m.memsz`. The two regions are a fresh physical page and kernel
+            // image data, so they cannot overlap.
+            //
+            // Irreducible only for want of a bounded window over `PageAlloc`:
+            // the length checked here is the *source's*, and nothing types the
+            // destination's — the root-file sweep filed exactly that
+            // (`issues/kernel/pagealloc-has-no-checked-window.md`), and this is a
+            // third site of the same shape.
             unsafe {
                 if let Some(template) = &tls_template {
                     core::ptr::copy_nonoverlapping(template.base(), page_alloc.ptr(), template.size());
@@ -3048,6 +3090,18 @@ fn tls_alloc_block(module_id: u64) -> Result<u64, SyscallError> {
     process::with_current_data(|data| {
         let tls = data.tls_pages.as_ref().expect("sys_tls_alloc_block: thread has no TLS allocation");
         let dtv_kern = tls.ptr() as *mut u64;
+        // SAFETY: `module_id` crossed the trust boundary and is bounded at the
+        // top of `tls_alloc_block` — non-zero and at most
+        // `loader::DTV_INITIAL_CAPACITY`, checked against the kernel's own
+        // constant and never against the `len` word in the DTV, which the
+        // process can rewrite. `loader` lays the DTV out at offset 0 of the
+        // thread's kernel-side TLS allocation with `DTV_INITIAL_CAPACITY` entries
+        // after the two header words, so `2 + (module_id - 1)` is in bounds. The
+        // allocation is this thread's own and this thread is the one running.
+        //
+        // **The bound and the write are fifty lines and one function apart**,
+        // which is the same missing type as the `copy_nonoverlapping` above:
+        // nothing here would notice the check moving.
         unsafe { *dtv_kern.add(2 + (module_id - 1) as usize) = tls_vaddr.raw(); }
     });
     Ok(tls_vaddr.raw())
@@ -3191,6 +3245,18 @@ fn sys_query_modules(out: &mut UserBytesMut) -> u64 {
     // bytes are its fields — the alternative is a per-field encoder for a
     // layout the ABI already fixes.
     fn encode(info: &ModuleInfo) -> [u8; core::mem::size_of::<ModuleInfo>()] {
+        // SAFETY: `transmute_copy` needs the destination to be no larger than
+        // the source and the bytes to be a valid value of it. The destination is
+        // `[u8; size_of::<ModuleInfo>()]`, so the sizes are equal by
+        // construction, and every byte pattern is a valid `[u8; N]`.
+        // `ModuleInfo` is `#[repr(C)]` over five integers with no padding, so no
+        // uninitialised byte is read either.
+        //
+        // Reducible, and not reduced here: six other boundary-crossing types
+        // carry a safe `as_bytes` in `toyos-abi` and this is one that does not,
+        // which makes the fix an edit under `toyos-abi/src` — its own pull
+        // request and a sysroot claim. Filed as
+        // `issues/build/moduleinfo-has-no-as-bytes.md`, beside `LogRecord`'s.
         unsafe { core::mem::transmute_copy(info) }
     }
 
