@@ -157,19 +157,21 @@ jobs:
       #
       # The kernel has no `-p` (it is one crate) and no directory scoping on
       # the clippy command line, so a kernel *area* is gated at the source
-      # instead of the invocation: `mm::`, `object::`, `elf::`, `loader::`
-      # (measured 2026-08-20: 35 + 1 + 23 + 8 = 67 blocks) and `sched::`,
-      # `iommu::`, `log::` (2026-08-22: 8 + 8 + 2 = 18 more) each open with
-      # `#![warn(clippy::undocumented_unsafe_blocks)]`, which is
-      # `allow`-by-default everywhere else in the kernel and only `warn` inside
-      # those seven module trees — composing with the `-D warnings` both kernel
-      # invocations below already carry turns that `warn` into a hard error,
-      # with no new flag here. Under the owner's 2026-08-20 ruling an area's
-      # sweep removes what it can before it documents the rest, so those 85 are
-      # a mix of blocks that stopped existing and blocks that carry a `SAFETY:`
-      # saying why they could not. The other 304 (`arch/`, `drivers/` and the
-      # root files) are measured, not gated — not tractable in one pass, and
-      # recorded as follow-up in the same issue.
+      # instead of the invocation — and since the root-file sweep landed
+      # (2026-08-22) the default is **on**: `kernel/src/main.rs` opens with a
+      # crate-level `#![warn(clippy::undocumented_unsafe_blocks)]` and carries
+      # an `#[allow(...)]` on the one `mod` line whose tree is not swept yet
+      # (`arch` — 107 blocks, after `drivers` closed its 121 and `sched`,
+      # `iommu` and `log` their 18 the same day). Composing with the
+      # `-D warnings` both kernel invocations below already carry turns that
+      # `warn` into a hard error, with no new flag here. Everything else — the
+      # 76 root-file blocks, plus `mm::`, `object::`, `elf::`, `loader::`,
+      # `drivers::`, `sched::`, `iommu::` and `log::`, which also still open
+      # with their own `#![warn(...)]` from their sweeps — is gated, and a new
+      # file added beside `main.rs` is gated the day it appears. To read
+      # *through* the `allow` and re-measure what is owed, add
+      # `--force-warn clippy::undocumented_unsafe_blocks`;
+      # `issues/build/clippy-has-never-run-here.md` carries the per-area ledger.
       #
       # Measured on the dev host with three fresh `CARGO_TARGET_DIR`s and a warm
       # cargo registry: **19.2 s** for the workspace (139 crates checked),

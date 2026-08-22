@@ -739,6 +739,23 @@ pub fn futex_wait(
         if !same_frame {
             return true;
         }
+        // SAFETY: `same_frame` above has just re-translated `addr` in the
+        // *current* address space and found it still naming `phys_addr`'s
+        // frame — so the direct-map address is a live, mapped 4-byte word this
+        // instant, and not one the PMM has reissued behind an `munmap`. The
+        // futex ABI requires the address to be 4-byte aligned, checked at the
+        // syscall before the translation the caller handed in.
+        //
+        // Irreducible: this is the futex word, and the whole mechanism is that
+        // userland writes it while the kernel reads it — so a `&u32` is out
+        // (`user_ptr.rs`'s header: the borrow is the bug) and copying it
+        // through `UserBytes` would need the syscall's `SyscallContext`, which
+        // returned long before this closure runs from the scheduler.
+        //
+        // What is *not* discharged: this is a plain deref where the value can
+        // change under the compiler, and a `read_volatile` is what it should
+        // be. Filed rather than changed on the scheduler's own path:
+        // `issues/kernel/user-pages-still-read-through-a-plain-deref.md`.
         let word = unsafe { *phys_addr.as_ptr::<u32>() };
         word != expected
     };
@@ -1027,6 +1044,21 @@ pub(crate) fn reap_poisoned() {
     {
         let mut guard = process::PROCESS_TABLE.lock();
         let table = guard.as_mut().unwrap();
+        // SAFETY: `IdleProof::new_unchecked` asks that the caller really be
+        // running on the per-CPU idle stack, because `reap_finished` may drop
+        // the thread entry that owns the stack it is standing on.
+        // `reap_poisoned` has exactly one caller in the tree —
+        // `sched::driver::idle_loop`, which `enter_idle_loop` reaches only
+        // after switching `%rsp` to the per-CPU idle stack — and the doc
+        // comment above states that as this function's contract.
+        //
+        // Irreducible **as a proof rather than a check**: `IdleProof` is
+        // zero-sized and exists so the requirement is stated where it is
+        // established instead of at every use, which is a reduction already
+        // taken — `reap_finished` and `collect_orphan_zombies` need no
+        // `unsafe` because of it. Minting it here is the one remaining claim,
+        // and nothing at run time can make it: the idle stack is a stack like
+        // any other and the caller's identity is not a value.
         reaped = process::reap_finished(table, unsafe { process::IdleProof::new_unchecked() });
         for (slot, wake) in POISONED.iter().zip(wakes.iter_mut()) {
             let raw = slot.load(Ordering::Relaxed);

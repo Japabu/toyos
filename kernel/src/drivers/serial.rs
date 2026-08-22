@@ -128,7 +128,45 @@ static BACKEND_LOCKED: AtomicBool = AtomicBool::new(false);
 /// state shared with poll callers; same-CPU re-entry from an IRQ handler
 /// would otherwise deadlock the spin.
 pub struct BackendGuard {
-    rflags: u64,
+    rflags: SavedFlags,
+}
+
+/// An `RFLAGS` word this CPU itself pushed, and the only thing `popfq` may be
+/// given.
+///
+/// **The type is what makes [`SavedFlags::restore`] safe.** Restoring flags is
+/// a memory-safety operation only because of what a *forged* word can carry —
+/// `DF` set makes every `rep` in the machine run backwards (root `CLAUDE.md`
+/// records the three days that cost), `IF` set re-enables interrupts inside a
+/// critical section, `TF` single-steps. None of that is reachable from a value
+/// that came out of `pushfq` on this CPU, and [`save_and_cli`] is the only
+/// constructor, so the two call sites that used to spell `unsafe {
+/// restore_flags(x) }` are ordinary safe code now. Not `Copy` and not `Clone`:
+/// a saved word is one CPU's state at one instant, and duplicating it is how it
+/// would end up restored somewhere it did not come from.
+pub struct SavedFlags(u64);
+
+impl SavedFlags {
+    /// Put the word back. `&self` rather than `self` because [`BackendGuard`]
+    /// restores from `Drop`, which cannot move a field out; restoring twice
+    /// writes the same bits twice and is inert.
+    #[inline]
+    fn restore(&self) {
+        // SAFETY: irreducible — `popfq` has no safe spelling; this is the
+        // instruction, not a wrapper around one. Sound because `self.0` can
+        // only have come from `save_and_cli`'s `pushfq` on this CPU: no bit
+        // reaches `RFLAGS` that the CPU did not have set moments earlier, so
+        // there is no `DF`/`IF`/`TF` transition here that the caller did not
+        // already make. `nomem` because the asm touches no memory.
+        unsafe {
+            core::arch::asm!(
+                "push {}",
+                "popfq",
+                in(reg) self.0,
+                options(nomem),
+            );
+        }
+    }
 }
 
 impl BackendGuard {
@@ -156,7 +194,7 @@ impl BackendGuard {
         {
             Some(Self { rflags })
         } else {
-            unsafe { restore_flags(rflags); }
+            rflags.restore();
             None
         }
     }
@@ -194,13 +232,21 @@ impl BackendGuard {
 impl Drop for BackendGuard {
     fn drop(&mut self) {
         BACKEND_LOCKED.store(false, Ordering::Release);
-        unsafe { restore_flags(self.rflags); }
+        self.rflags.restore();
     }
 }
 
+/// This CPU's `RFLAGS`, and interrupts off — one instruction sequence, because
+/// the value is only worth anything if nothing ran between the read and the
+/// `cli`.
 #[inline]
-fn save_and_cli() -> u64 {
+fn save_and_cli() -> SavedFlags {
     let rflags: u64;
+    // SAFETY: irreducible — `pushfq`/`cli` have no safe spelling. Sound because
+    // the sequence only reads `RFLAGS` and clears `IF`: it writes no memory
+    // (`nomem`), touches no other register than the `out`, and masking
+    // interrupts is what every caller is asking for. The value goes straight
+    // into `SavedFlags`, which is what lets `restore` be safe.
     unsafe {
         core::arch::asm!(
             "pushfq",
@@ -210,19 +256,7 @@ fn save_and_cli() -> u64 {
             options(nomem),
         );
     }
-    rflags
-}
-
-#[inline]
-unsafe fn restore_flags(rflags: u64) {
-    unsafe {
-        core::arch::asm!(
-            "push {}",
-            "popfq",
-            in(reg) rflags,
-            options(nomem),
-        );
-    }
+    SavedFlags(rflags)
 }
 
 pub fn has_data() -> bool {

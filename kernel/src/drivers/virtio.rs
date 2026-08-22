@@ -145,6 +145,73 @@ impl VirtioPciConfig {
 /// DMA region specification for a virtqueue.
 use crate::mm::KernelSlice;
 
+/// One of a virtqueue's three rings, and **the only thing in this driver that
+/// reads or writes DMA memory**.
+///
+/// Eleven `unsafe` blocks used to spell `read_volatile(slice.ptr_at(off) as
+/// *const T)` and `write_volatile(slice.ptr_at(off) as *mut T, v)` inline; they
+/// are the three methods below now, and every call site is ordinary safe code.
+/// Same shape as [`crate::mm::Mmio`], whose `read_u32`/`write_u32` are safe for
+/// the same reasons, and constructed the same way — privately, from something
+/// that already carries the proof.
+///
+/// **It is also a bound that was not there.** `KernelSlice::ptr_at` asserts
+/// only that the *offset* is inside the region, so a `u32` read at `size - 1`
+/// used to run three bytes past the end of the ring. [`Ring::ptr`] goes through
+/// `subslice`, which asserts `offset + size_of::<T>() <= size`, so the length
+/// of what is read is part of the check.
+///
+/// Volatile, not plain: the device writes the used ring and reads the
+/// descriptor and available rings concurrently with this CPU, so no access may
+/// be elided, merged or reordered against its neighbours. The residual — that
+/// the `KernelSlice` describes real memory at all — is `KernelSlice::from_raw`'s
+/// own, inherited and not created here
+/// (`issues/design-debt/kernelslice-from-raw-cannot-check-itself.md`).
+#[derive(Clone, Copy)]
+struct Ring(KernelSlice);
+
+impl Ring {
+    fn phys(self) -> u64 {
+        self.0.phys()
+    }
+
+    /// A pointer to the `T` at `offset`, bounds-checked for all of `T` and not
+    /// just for `offset`.
+    fn ptr<T>(self, offset: usize) -> *mut T {
+        self.0.subslice(offset, core::mem::size_of::<T>()).base().cast::<T>()
+    }
+
+    fn read<T: Copy>(self, offset: usize) -> T {
+        // SAFETY: irreducible — a volatile read has no safe spelling, and this
+        // is the one in the driver. Sound because `ptr` went through
+        // `KernelSlice::subslice`, which asserted `offset + size_of::<T>() <=
+        // size`, so the whole `T` is inside the ring; the ring's own offsets
+        // (`USED_IDX_OFF`, `USED_RING_OFF + i * USED_ELEM_SIZE`,
+        // `AVAIL_RING_OFF + i * 2`, `i * size_of::<VirtqDesc>()`) are natural
+        // multiples of the width being read and the regions are placed at
+        // 4-or-better alignment by `VirtqueueRegions`, so the pointer is
+        // aligned for `T`.
+        unsafe { read_volatile(self.ptr::<T>(offset)) }
+    }
+
+    fn write<T: Copy>(self, offset: usize, value: T) {
+        // SAFETY: irreducible and sound for the same reasons as `read`. A write
+        // races the device by design — that is what a virtqueue is — and
+        // `volatile` plus the `fence`s at the call sites is the ordering
+        // discipline the spec asks for, not something this type could enforce.
+        unsafe { write_volatile(self.ptr::<T>(offset), value) }
+    }
+
+    fn zero(self) {
+        // SAFETY: irreducible — `KernelSlice::zero` is an `unsafe fn` and there
+        // is no safe way to clear DMA memory. Sound because it writes exactly
+        // the region's own `size` bytes, and every caller here is bringing a
+        // ring up before the device has been told where it is, so nothing else
+        // is reading or writing it.
+        unsafe { self.0.zero() }
+    }
+}
+
 pub struct VirtqueueRegions {
     pub desc: KernelSlice,
     pub avail: KernelSlice,
@@ -240,7 +307,7 @@ impl core::fmt::Display for UsedRefusal {
 /// memory plus its own `last_used_idx`, so an ISR can drain completions
 /// while another CPU submits to the same queue under a lock.
 pub struct UsedRingConsumer {
-    used: KernelSlice,
+    used: Ring,
     size: u16,
     last_used_idx: u16,
     refused: u32,
@@ -260,7 +327,7 @@ impl UsedRingConsumer {
     /// how the count is read from somewhere that can.
     pub fn poll(&mut self) -> Option<u16> {
         loop {
-            let used_idx = unsafe { read_volatile(self.used.ptr_at(USED_IDX_OFF) as *const u16) };
+            let used_idx: u16 = self.used.read(USED_IDX_OFF);
             if used_idx == self.last_used_idx {
                 return None;
             }
@@ -268,9 +335,8 @@ impl UsedRingConsumer {
             // used idx — pair with that ordering before reading the element.
             fence(Ordering::Acquire);
             let slot = self.last_used_idx % self.size;
-            let id: Untrusted<u32> = Untrusted::new(unsafe {
-                read_volatile(self.used.ptr_at(USED_RING_OFF + slot as usize * USED_ELEM_SIZE) as *const u32)
-            });
+            let id: Untrusted<u32> =
+                Untrusted::new(self.used.read(USED_RING_OFF + slot as usize * USED_ELEM_SIZE));
             self.last_used_idx = self.last_used_idx.wrapping_add(1);
             let Ok(head) = id.index(self.size as usize) else {
                 self.refused = self.refused.saturating_add(1);
@@ -291,9 +357,9 @@ impl UsedRingConsumer {
 
 /// A VirtIO split virtqueue.
 pub struct Virtqueue {
-    desc: KernelSlice,
-    avail: KernelSlice,
-    used: KernelSlice,
+    desc: Ring,
+    avail: Ring,
+    used: Ring,
     size: u16,
     last_used_idx: u16,
     notify_offset: u16,
@@ -328,22 +394,25 @@ fn chain_bytes(bufs: &[(u64, u32, BufDir)]) -> u32 {
 
 impl Virtqueue {
     /// Create a new virtqueue from a contiguous DMA region.
+    ///
+    /// Zeroes the whole buffer and not just the three rings: the padding
+    /// between them is not read by anything, but a caller handing this a page
+    /// out of a fresh `DmaPool` gets a page it can reason about.
     pub fn new(buf: KernelSlice, queue_size: u16) -> Self {
-        unsafe { buf.zero(); }
+        Ring(buf).zero();
         Self::from_regions(&VirtqueueRegions::from_contiguous(buf, queue_size), queue_size)
     }
 
     /// Create a new virtqueue from explicit DMA regions.
     pub fn from_regions(regions: &VirtqueueRegions, queue_size: u16) -> Self {
-        unsafe {
-            regions.desc.zero();
-            regions.avail.zero();
-            regions.used.zero();
-        }
+        let (desc, avail, used) = (Ring(regions.desc), Ring(regions.avail), Ring(regions.used));
+        desc.zero();
+        avail.zero();
+        used.zero();
         Self {
-            desc: regions.desc,
-            avail: regions.avail,
-            used: regions.used,
+            desc,
+            avail,
+            used,
             size: queue_size,
             last_used_idx: 0,
             notify_offset: 0,
@@ -407,23 +476,8 @@ impl Virtqueue {
                 flags |= VIRTQ_DESC_F_NEXT;
             }
             let desc = VirtqDesc { addr: *addr, len: *len, flags, next: desc_idx + 1 };
-            let desc_ptr = self
-                .desc
-                .ptr_at(desc_idx as usize * core::mem::size_of::<VirtqDesc>())
-                as *mut VirtqDesc;
-            unsafe { write_volatile(desc_ptr, desc) };
+            self.desc.write(desc_idx as usize * core::mem::size_of::<VirtqDesc>(), desc);
         }
-    }
-
-    fn avail_idx_ptr(&self) -> *mut u16 {
-        self.avail.ptr_at(AVAIL_IDX_OFF) as *mut u16
-    }
-    fn avail_ring_ptr(&self, i: u16) -> *mut u16 {
-        self.avail.ptr_at(AVAIL_RING_OFF + i as usize * 2) as *mut u16
-    }
-
-    fn used_idx_ptr(&self) -> *const u16 {
-        self.used.ptr_at(USED_IDX_OFF) as *const u16
     }
 
     /// Where the used element at ring position `i` sits.
@@ -441,12 +495,10 @@ impl Virtqueue {
     /// hand-written ones it replaced: the next consumer of this queue does not
     /// have to know the rule, because the code that breaks it does not compile.
     fn used_ring_id(&self, i: u16) -> Untrusted<u32> {
-        Untrusted::new(unsafe { read_volatile(self.used.ptr_at(self.used_elem_at(i)) as *const u32) })
+        Untrusted::new(self.used.read(self.used_elem_at(i)))
     }
     fn used_ring_len(&self, i: u16) -> Untrusted<u32> {
-        Untrusted::new(unsafe {
-            read_volatile(self.used.ptr_at(self.used_elem_at(i) + 4) as *const u32)
-        })
+        Untrusted::new(self.used.read(self.used_elem_at(i) + 4))
     }
 
     /// Return the initial pool of descriptor slots. Call once after construction.
@@ -483,16 +535,13 @@ impl Virtqueue {
             }
 
             let desc = VirtqDesc { addr: *addr, len: *len, flags, next: next_idx };
-            let desc_ptr = self.desc.ptr_at(desc_idx as usize * core::mem::size_of::<VirtqDesc>()) as *mut VirtqDesc;
-            unsafe { write_volatile(desc_ptr, desc); }
+            self.desc.write(desc_idx as usize * core::mem::size_of::<VirtqDesc>(), desc);
         }
 
-        let avail_idx = unsafe { read_volatile(self.avail_idx_ptr()) };
-        unsafe {
-            write_volatile(self.avail_ring_ptr(avail_idx % size), first_desc);
-            fence(Ordering::Release);
-            write_volatile(self.avail_idx_ptr(), avail_idx.wrapping_add(1));
-        }
+        let avail_idx: u16 = self.avail.read(AVAIL_IDX_OFF);
+        self.avail.write(AVAIL_RING_OFF + (avail_idx % size) as usize * 2, first_desc);
+        fence(Ordering::Release);
+        self.avail.write(AVAIL_IDX_OFF, avail_idx.wrapping_add(1));
 
         fence(Ordering::Release);
         let notify_off = self.notify_offset as u64 * notify_multiplier as u64;
@@ -504,7 +553,7 @@ impl Virtqueue {
     /// Check if the device has completed any request.
     pub fn has_used(&self) -> bool {
         assert!(!self.used_split, "virtqueue: used ring split off");
-        let used_idx = unsafe { read_volatile(self.used_idx_ptr()) };
+        let used_idx: u16 = self.used.read(USED_IDX_OFF);
         used_idx != self.last_used_idx
     }
 
@@ -532,7 +581,7 @@ impl Virtqueue {
     pub fn poll_used(&mut self) -> Option<(DescSlot, u32)> {
         assert!(!self.used_split, "virtqueue: used ring split off");
         loop {
-            let used_idx = unsafe { read_volatile(self.used_idx_ptr()) };
+            let used_idx: u16 = self.used.read(USED_IDX_OFF);
             if used_idx == self.last_used_idx {
                 return None;
             }
@@ -593,12 +642,10 @@ impl Virtqueue {
     #[cfg(feature = "boot-actuators")]
     fn write_used_as_a_device_would(&self, at: u16, id: u32, len: u32) {
         let slot = at % self.size;
-        unsafe {
-            write_volatile(self.used.ptr_at(self.used_elem_at(slot)) as *mut u32, id);
-            write_volatile(self.used.ptr_at(self.used_elem_at(slot) + 4) as *mut u32, len);
-            fence(Ordering::Release);
-            write_volatile(self.used_idx_ptr() as *mut u16, at.wrapping_add(1));
-        }
+        self.used.write(self.used_elem_at(slot), id);
+        self.used.write(self.used_elem_at(slot) + 4, len);
+        fence(Ordering::Release);
+        self.used.write::<u16>(USED_IDX_OFF, at.wrapping_add(1));
     }
 
     /// Submit a descriptor chain and wait for the device to complete it.

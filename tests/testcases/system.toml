@@ -27,9 +27,14 @@ syscap = ["rt"]
 # and read what reached the volume, and test-runner spawns `/bin/shutdown`
 # directly — it holds no `launcher` connector, so the applet's authority is the
 # dup it is endowed here rather than the `toybox` row.
+# `roster` because four guest binaries read `SYS_SYSINFO`'s per-thread entries —
+# soundd's, for the idle-suspend certification, and their own, which arrive in
+# the same machine-wide answer and have no narrower question in the ABI. It is
+# also what `endowment_denied` narrows *away* to prove the refusal, so an estate
+# without it would make that arm vacuous rather than red.
 [programs.test-runner]
 receives = ["soundd"]
-syscap = ["device", "dup", "logread", "power"]
+syscap = ["device", "dup", "logread", "power", "roster"]
 
 [programs.toybox]
 receives = ["soundd"]

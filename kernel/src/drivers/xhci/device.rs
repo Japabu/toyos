@@ -1,5 +1,4 @@
 use core::num::NonZeroU8;
-use core::ptr::{write_volatile, write_bytes};
 
 use crate::log;
 use toyos_xhci::enumerate::{
@@ -8,7 +7,7 @@ use toyos_xhci::enumerate::{
 use toyos_xhci::job::{Await, Outcome, Stages};
 use toyos_xhci::port::{self, Reset};
 use super::{deadline, Answer, Trb, TrbRing, What, XhciController, PAGE};
-use super::{OFF_DCBAA, OFF_INPUT_CTX, OFF_DATA_BUF};
+use super::{OFF_INPUT_CTX, OFF_DATA_BUF};
 use super::{DEV_INT_RING, DEV_EP0_RING, DEV_OUT_CTX, DEV_REPORT};
 use super::{TRB_ENABLE_SLOT, TRB_ADDRESS_DEVICE, TRB_CONFIGURE_EP, TRB_EVALUATE_CONTEXT};
 use super::{enqueue_control, CC_SUCCESS};
@@ -155,12 +154,10 @@ impl Walk {
 /// addressed, and the A1 flag alone is what says EP0 is the context to look at.
 fn evaluate_ep0_trb(ctrl: &mut XhciController, slot_id: u8, max_packet: u16) -> Trb {
     let dma = ctrl.dma();
-    let input_ctx = dma.subslice(OFF_INPUT_CTX, PAGE);
-    let input_ctx_ptr = input_ctx.base();
-    unsafe { input_ctx.zero(); }
-    ctrl.write_ctx32(input_ctx_ptr, 0, 1, 1 << 1);
+    let input_ctx = super::zero_dma(dma, OFF_INPUT_CTX, PAGE);
+    ctrl.write_ctx32(input_ctx, 0, 1, 1 << 1);
     let ep0_dw1 = (3u32 << 1) | (4u32 << 3) | ((max_packet as u32) << 16);
-    ctrl.write_ctx32(input_ctx_ptr, 2, 1, ep0_dw1);
+    ctrl.write_ctx32(input_ctx, 2, 1, ep0_dw1);
 
     let mut evaluate = Trb::ZERO;
     evaluate.param = input_ctx.phys();
@@ -545,7 +542,7 @@ fn control(
     // decided about. Zeroed before each read so a short answer leaves zeroes
     // behind it rather than the last device's descriptor.
     if data.is_some() {
-        unsafe { write_bytes(dma.ptr_at(OFF_DATA_BUF), 0, MAX_CONFIG_DESC); }
+        super::zero_dma(dma, OFF_DATA_BUF, MAX_CONFIG_DESC);
     }
     let trbs = enqueue_control(
         &mut state.ep0_ring, bm_request_type, b_request, w_value, w_index, data, len,
@@ -564,7 +561,19 @@ fn read_back(
     delivered: u16,
 ) -> Result<Learnt, ()> {
     let port = state.port_idx + 1;
-    let buf = ctrl.dma().ptr_at(OFF_DATA_BUF);
+    // The whole scratch page as bytes, once, instead of three raw reads off a
+    // pointer further down. Every read below indexes this slice, so a
+    // descriptor length the device chose can no longer walk past the buffer:
+    // `delivered` is bounded against `scratch.len()` by the indexing itself.
+    let page = ctrl.dma().subslice(OFF_DATA_BUF, MAX_CONFIG_DESC);
+    // SAFETY: irreducible — `KernelSlice::as_slice` is an `unsafe fn` and there
+    // is no safe way to view DMA memory as bytes. Bounded by the `subslice`
+    // above, which asserts `OFF_DATA_BUF + MAX_CONFIG_DESC` is inside the pool.
+    // No aliasing `&mut` exists: `control_request` zeroes this page before the
+    // transfer and nothing holds a slice of it across that, and the transfer
+    // has completed — `read_back` is called on a completion event. Enumeration
+    // is serial, so no other port is using the shared scratch.
+    let scratch: &[u8] = unsafe { page.as_slice() };
     match request {
         Request::DeviceDescriptor { want: 8 } => {
             if delivered < 8 {
@@ -572,7 +581,7 @@ fn read_back(
                      descriptor: {delivered} B delivered");
                 return Err(());
             }
-            let stated = unsafe { *buf.add(7) };
+            let stated = scratch[7];
             let Some(ep0_packet) = ep0_packet_from_descriptor(state.speed, stated) else {
                 log!("xHCI: port {port} states bMaxPacketSize0={stated}, which is not a control \
                      packet size a speed-{} device has; skipping it", state.speed);
@@ -590,7 +599,7 @@ fn read_back(
                 log!("xHCI: GET_DESCRIPTOR(Device) on port {port}: {delivered} B delivered");
                 return Err(());
             }
-            let descriptor = unsafe { core::slice::from_raw_parts(buf, 18) };
+            let descriptor = &scratch[..18];
             log!("xHCI: device class={:#x} vendor={:04x} product={:04x}",
                 descriptor[4], le16(descriptor, 8), le16(descriptor, 10));
             Ok(Learnt::Nothing)
@@ -605,7 +614,10 @@ fn read_back(
                      configuration descriptor is at least 9", );
                 return Err(());
             }
-            let config = unsafe { core::slice::from_raw_parts(buf, delivered as usize) };
+            // `delivered` is the device's number, so it bounds the parse; the
+            // slice bounds it in turn — a device claiming more than the page
+            // holds is refused by the `min` rather than read past.
+            let config = &scratch[..(delivered as usize).min(scratch.len())];
             let Some((config_val, function)) = parse_config(config) else {
                 return Ok(Learnt::Nothing);
             };
@@ -672,28 +684,22 @@ fn hid_kind(protocol: HidType) -> &'static str {
 /// is about to be known by.
 fn address_device_trb(ctrl: &mut XhciController, state: &Enumerating) -> Trb {
     let dma = ctrl.dma();
-    let input_ctx = dma.subslice(OFF_INPUT_CTX, PAGE);
-    let input_ctx_ptr = input_ctx.base();
-    unsafe { input_ctx.zero(); }
+    let input_ctx = super::zero_dma(dma, OFF_INPUT_CTX, PAGE);
 
-    ctrl.write_ctx32(input_ctx_ptr, 0, 1, 0x3); // Add Slot + EP0
+    ctrl.write_ctx32(input_ctx, 0, 1, 0x3); // Add Slot + EP0
     let slot_dw0 = ((state.speed as u32) << 20) | (1u32 << 27);
-    ctrl.write_ctx32(input_ctx_ptr, 1, 0, slot_dw0);
-    ctrl.write_ctx32(input_ctx_ptr, 1, 1, (state.port_idx as u32 + 1) << 16);
+    ctrl.write_ctx32(input_ctx, 1, 0, slot_dw0);
+    ctrl.write_ctx32(input_ctx, 1, 1, (state.port_idx as u32 + 1) << 16);
 
     let ep0_dw1 = (3u32 << 1) | (4u32 << 3) | ((state.packet as u32) << 16);
-    ctrl.write_ctx32(input_ctx_ptr, 2, 1, ep0_dw1);
+    ctrl.write_ctx32(input_ctx, 2, 1, ep0_dw1);
     let ep0_dequeue = state.ep0_ring.dequeue();
-    ctrl.write_ctx32(input_ctx_ptr, 2, 2, ep0_dequeue as u32);
-    ctrl.write_ctx32(input_ctx_ptr, 2, 3, (ep0_dequeue >> 32) as u32);
-    ctrl.write_ctx32(input_ctx_ptr, 2, 4, 8);
+    ctrl.write_ctx32(input_ctx, 2, 2, ep0_dequeue as u32);
+    ctrl.write_ctx32(input_ctx, 2, 3, (ep0_dequeue >> 32) as u32);
+    ctrl.write_ctx32(input_ctx, 2, 4, 8);
 
-    let out_ctx = dma.subslice(state.block + DEV_OUT_CTX, PAGE / 2);
-    unsafe { out_ctx.zero(); }
-    unsafe {
-        let dcbaa = dma.ptr_at(OFF_DCBAA) as *mut u64;
-        write_volatile(dcbaa.add(state.slot_id as usize), out_ctx.phys());
-    }
+    let out_ctx = super::zero_dma(dma, state.block + DEV_OUT_CTX, PAGE / 2);
+    ctrl.write_dcbaa(state.slot_id as usize, out_ctx.phys());
 
     let mut addr_dev = Trb::ZERO;
     addr_dev.param = input_ctx.phys();
@@ -732,15 +738,13 @@ fn hid_input_context(
     let int_ep_dci = info.ep.dci();
     let int_ring = TrbRing::init(dma.subslice(state.block + DEV_INT_RING, PAGE));
 
-    let input_ctx = dma.subslice(OFF_INPUT_CTX, PAGE);
-    let input_ctx_ptr = input_ctx.base();
-    unsafe { input_ctx.zero(); }
+    let input_ctx = super::zero_dma(dma, OFF_INPUT_CTX, PAGE);
 
-    ctrl.write_ctx32(input_ctx_ptr, 0, 1, (1u32 << (int_ep_dci as u32)) | 1);
+    ctrl.write_ctx32(input_ctx, 0, 1, (1u32 << (int_ep_dci as u32)) | 1);
 
     let slot_dw0 = ((state.speed as u32) << 20) | ((int_ep_dci as u32) << 27);
-    ctrl.write_ctx32(input_ctx_ptr, 1, 0, slot_dw0);
-    ctrl.write_ctx32(input_ctx_ptr, 1, 1, (state.port_idx as u32 + 1) << 16);
+    ctrl.write_ctx32(input_ctx, 1, 0, slot_dw0);
+    ctrl.write_ctx32(input_ctx, 1, 1, (state.port_idx as u32 + 1) << 16);
 
     let ep_ctx_index = int_ep_dci as usize + 1;
     let interval_val = if info.ep.interval == 0 { 0u32 } else if state.speed <= 2 {
@@ -752,14 +756,14 @@ fn hid_input_context(
     } else {
         (info.ep.interval - 1) as u32
     };
-    ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 0, interval_val << 16);
+    ctrl.write_ctx32(input_ctx, ep_ctx_index, 0, interval_val << 16);
 
     let ep_dw1 = (3u32 << 1) | (7u32 << 3) | ((info.ep.max_packet as u32) << 16);
-    ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 1, ep_dw1);
+    ctrl.write_ctx32(input_ctx, ep_ctx_index, 1, ep_dw1);
 
     let int_dequeue = int_ring.dequeue();
-    ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 2, int_dequeue as u32);
-    ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 3, (int_dequeue >> 32) as u32);
+    ctrl.write_ctx32(input_ctx, ep_ctx_index, 2, int_dequeue as u32);
+    ctrl.write_ctx32(input_ctx, ep_ctx_index, 3, (int_dequeue >> 32) as u32);
     // Max ESIT Payload in the high half, Average TRB Length in the low. The
     // first is what an xHC allocates periodic bandwidth from — xHCI 1.2 §6.2.3.8
     // defines it as the bytes this endpoint moves per service interval, and
@@ -770,7 +774,7 @@ fn hid_input_context(
     // endpoint there is one burst of one packet, so both halves are the max
     // packet size, which is what Linux's `xhci_endpoint_init` writes.
     let esit = info.ep.max_packet as u32;
-    ctrl.write_ctx32(input_ctx_ptr, ep_ctx_index, 4, (esit << 16) | esit);
+    ctrl.write_ctx32(input_ctx, ep_ctx_index, 4, (esit << 16) | esit);
     int_ring
 }
 
@@ -828,8 +832,7 @@ fn bind_hid(
         ep_addr: info.ep.addr,
         int_ring,
         ep0_ring: state.ep0_ring,
-        report_phys: report.phys(),
-        report_ptr: report.base(),
+        report,
         report_size,
         role,
         prev_report: [0; 8],

@@ -1202,6 +1202,30 @@ pub fn kernel_cr3() -> Cr3 {
     Cr3(KERNEL_CR3.load(core::sync::atomic::Ordering::Relaxed))
 }
 
+/// Leave whatever user address space is current for the kernel's own.
+///
+/// **Safe, where [`Cr3::activate`] is not, and the difference is which tables.**
+/// `activate` is `unsafe` because an arbitrary `Cr3` may name page tables that
+/// have been freed, or that do not map the code about to execute. Neither is
+/// reachable for *this* one: the kernel address space is built once in `init`,
+/// is never torn down, and maps the whole kernel image and the direct map —
+/// which includes every stack a caller could be standing on. There is no
+/// argument left for a caller to get wrong, so there is nothing for `unsafe`
+/// to mark, and the four teardown sites in `process.rs` that used to write the
+/// pair by hand now say what they mean instead.
+///
+/// The one obligation it does carry is not a memory-safety one: everything the
+/// outgoing user address space mapped stops being addressable at this line.
+pub fn activate_kernel() {
+    // SAFETY: the doc comment above is the whole argument — `KERNEL_CR3` names
+    // the boot-built kernel tables, live for the machine's lifetime, mapping
+    // the code and the stack this call returns onto. Irreducible only in that
+    // a CR3 write is a machine facility with no Rust operation behind it; the
+    // *caller's* half of `activate`'s contract is what this function exists to
+    // discharge once rather than at every site.
+    unsafe { kernel_cr3().activate() };
+}
+
 /// Map a device's registers into the kernel's direct map and tell every CPU.
 ///
 /// The lock and the shootdown are separate statements, and that is the whole

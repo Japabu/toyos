@@ -169,6 +169,15 @@ impl Fb {
 }
 
 struct FbCell(UnsafeCell<Fb>);
+// SAFETY: irreducible, and the reason is the same one `SEQ` below states at
+// length: **the panic path may take no synchronisation primitive.** `Lock::lock`
+// panics after 500M spins and `try_lock` disables preemption on entry while its
+// failure path and its guard's `Drop` re-enable it, which can dispatch the
+// scheduler — so no `Lock`-shaped container may hold this, and a `Cell` is not
+// `Sync`. `Fb` is 40 bytes, far past any atomic. What makes the sharing sound is
+// outside the type and stated where it lives: `FB` is published and read under
+// the `SEQ` seqlock, and `PENDING` is written only during single-threaded boot
+// and inside `set_resolution`'s window.
 unsafe impl Sync for FbCell {}
 
 /// A screenful-and-then-some of rendered log, and which of its lines an
@@ -309,6 +318,12 @@ impl core::fmt::Write for Into<'_> {
 }
 
 struct RenderedCell(UnsafeCell<Rendered>);
+// SAFETY: irreducible for the same reason as `FbCell` — a `Lock` may not be
+// reached from the panic path — and more so: `Rendered` is `SNAPSHOT_CAP` bytes
+// of text plus its alert bitmap, so it is a `static` by construction and can be
+// neither copied out nor atomically swapped. What serialises the three cells is
+// `PAINTING`, taken by every painter without exception, plus the fact that
+// `SNAPSHOT` is written once by `capture` and never again.
 unsafe impl Sync for RenderedCell {}
 
 /// Seqlock over `FB`. Even means stable, odd means a publisher is inside.
@@ -460,6 +475,13 @@ fn publish(fb: Fb) {
     // marker -- at which point a reader that saw an even sequence on both
     // sides could still have read a half-written descriptor.
     core::sync::atomic::fence(Ordering::Release);
+    // SAFETY: irreducible — this is the seqlock's payload store, and the seqlock
+    // exists because the panic path may take no lock (see `SEQ`). Sound on the
+    // protocol around it: `SEQ` is odd across this write, so a concurrent
+    // `snapshot` discards whatever it read, and the two fences are what keep the
+    // store between the odd and even markers. Publishers never race each other —
+    // this is boot-time and `set_resolution`-window only, which is why the
+    // load-then-store of `SEQ` above needs no CAS.
     unsafe { *FB.0.get() = fb };
     SEQ.store(seq.wrapping_add(2), Ordering::Release);
 }
@@ -473,6 +495,13 @@ pub fn detach() {
 
 /// Re-publish the armed descriptor after such a window.
 pub fn rearm() {
+    // SAFETY: irreducible — `PENDING` is an `UnsafeCell` for the reason
+    // `FbCell` states. Sound because `PENDING` is written only during
+    // single-threaded boot (`arm`) and by `disable`, and `rearm` is called from
+    // the same single-threaded sequence and from `set_resolution`'s window,
+    // which is the one place two of these can be in flight — and that window is
+    // itself entered by one CPU. `Fb` is `Copy`, so this takes a copy and holds
+    // no reference into the cell.
     let fb = unsafe { *PENDING.0.get() };
     if validate(&fb) {
         publish(fb);
@@ -484,6 +513,9 @@ pub fn rearm() {
 /// PENDING is what stops a later `rearm` from resurrecting the firmware
 /// framebuffer nobody is scanning out any more.
 pub fn disable() {
+    // SAFETY: irreducible and sound for the same reasons as `rearm`'s read:
+    // `PENDING` has one writer at a time and this is called from the boot
+    // sequence, when virtio-gpu wins device selection.
     unsafe { *PENDING.0.get() = Fb::DETACHED };
     RAW_PHYS.store(0, Ordering::Relaxed);
     detach();
@@ -502,6 +534,16 @@ fn snapshot() -> Option<Fb> {
         if before & 1 != 0 {
             continue;
         }
+        // SAFETY: irreducible — the seqlock's payload read, and the seqlock is
+        // here because the panic path may take no lock. This is the one place
+        // in the module that reads `FB` while a publisher may be inside it, and
+        // it is sound on the protocol rather than on exclusion: the `SEQ`
+        // comparison below discards a value read across a publication, and the
+        // paragraph above this function states what a torn value can and cannot
+        // be — every torn mixture of the two descriptors that are ever
+        // published is caught downstream by the null check, by `bytes == 0`
+        // collapsing `row_base`/`put_pixel` to no-ops, or by `width == 0`
+        // giving `cols == 0`.
         let fb = unsafe { *FB.0.get() };
         core::sync::atomic::fence(Ordering::Acquire);
         if SEQ.load(Ordering::Relaxed) == before {
@@ -576,6 +618,8 @@ pub fn arm(args: &KernelArgs, maps: &[MemoryMapEntry]) {
         return;
     }
 
+    // SAFETY: irreducible and sound for the same reasons as `disable`'s write.
+    // `arm` runs once, during single-threaded boot, before any AP is started.
     unsafe { *PENDING.0.get() = fb };
     RAW_PHYS.store(args.gop_framebuffer, Ordering::Relaxed);
     RAW_SIZE.store(args.gop_framebuffer_size, Ordering::Relaxed);
@@ -642,6 +686,12 @@ pub fn capture() {
     if snapshot().is_none() {
         return;
     }
+    // SAFETY: irreducible — `Rendered` is too large to be anything but a
+    // `static`, and the panic path may take no lock to guard it. Sound because
+    // `SNAPSHOT` is written here and nowhere else, and `capture` is called once
+    // per panic from the panic handler, which `panic::PANICKING` already
+    // serialises to one CPU; the readers (`fatal_text`) run after it on the same
+    // CPU, or on another that reaches them only through `PAINTING`.
     let into = unsafe { &mut *SNAPSHOT.0.get() };
     CAPTURED.store(into.render(0, u64::MAX) > 0, Ordering::Relaxed);
 }
@@ -657,9 +707,17 @@ pub fn discard_capture() {
 /// nothing — a record drain moves a cursor and leaves every shard where it was
 /// — so a later `panic_flush` reports the same records identically.
 fn live_tail() -> View<'static> {
-    let into = unsafe { &mut *LIVE.0.get() };
+    // SAFETY: irreducible for the same reason as `capture`'s `SNAPSHOT` write.
+    // Sound because `LIVE` is reached only from here and every caller holds
+    // `PAINTING`, which is taken by every painter without exception. One block
+    // and not the two this used to be: the `&'static mut` is reborrowed as the
+    // `&'static` the `View` needs rather than dereferencing the cell a second
+    // time, which also makes it impossible for the render and the view to be of
+    // different things.
+    let into: &'static mut Rendered = unsafe { &mut *LIVE.0.get() };
     into.render(0, u64::MAX);
-    unsafe { &*LIVE.0.get() }.view()
+    let rendered: &'static Rendered = into;
+    rendered.view()
 }
 
 // DESIGN RULE: render and everything it calls acquires NO synchronization
@@ -685,6 +743,10 @@ fn live_tail() -> View<'static> {
 /// [`live_tail`] always did.
 fn fatal_text() -> View<'static> {
     if CAPTURED.load(Ordering::Relaxed) {
+        // SAFETY: irreducible for the same reason as `capture`'s write. Sound
+        // because `CAPTURED` is true, which means `capture` finished writing
+        // `SNAPSHOT` and it is never written again — this branch is idempotent,
+        // which is what lets `page_forever` walk it repeatedly.
         unsafe { &*SNAPSHOT.0.get() }.view()
     } else {
         live_tail()
@@ -837,6 +899,11 @@ pub fn boot_checkpoint() {
 /// so the report is exactly the records the dump produced. A byte range could
 /// be widened by any concurrent writer.
 pub fn paint_report(from: u64, to: u64) {
+    // SAFETY: irreducible for the same reason as `capture`'s `SNAPSHOT` write.
+    // Sound because `REPORT` is reached only from here and `report_text`, and
+    // `paint_report` is called from the Ctrl+Alt+D dump on one CPU — the
+    // request reschedules every CPU and the dump itself is what produces the
+    // bracket, so there is one in flight at a time.
     let into = unsafe { &mut *REPORT.0.get() };
     into.render(from, to);
     HOLD_UNTIL.store(
@@ -849,6 +916,9 @@ pub fn paint_report(from: u64, to: u64) {
 /// The report as it was when the dump finished, for however long the hold
 /// lasts. Empty until one has been asked for.
 fn report_text() -> View<'static> {
+    // SAFETY: irreducible for the same reason as `paint_report`'s write. Sound
+    // because both callers reach this after `paint_report` returned — the
+    // render is complete — and `paint_held_report` holds `PAINTING`.
     unsafe { &*REPORT.0.get() }.view()
 }
 
@@ -1174,6 +1244,12 @@ fn panel_carries_report(fb: &Fb) -> bool {
 /// one (SDM Vol. 3A §11.3.1), and a fatal panic halts without ever giving the
 /// buffer another reason to.
 fn flush_stores() {
+    // SAFETY: irreducible — `SFENCE` is the instruction, not a wrapper around
+    // one, and `core::sync::atomic::fence` is a *compiler and CPU ordering*
+    // barrier that emits no `SFENCE` on x86-64, so it would not drain a
+    // write-combining buffer. Sound because the instruction touches no memory
+    // and no register: it orders stores already issued. `nostack` because it
+    // uses none, `preserves_flags` because `SFENCE` writes no flag.
     unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
 }
 
@@ -1256,6 +1332,13 @@ fn get_pixel(fb: &Fb, x: usize, y: usize) -> u32 {
     if idx.saturating_add(4) > fb.bytes {
         return 0;
     }
+    // SAFETY: irreducible — a volatile read of the scanout has no safe
+    // spelling, and the framebuffer is a `*mut u8` from the GOP descriptor
+    // rather than anything `mm` allocated, so there is no bounds-carrying type
+    // to route it through. Bounded by the three checked operations above:
+    // `idx + 4 <= fb.bytes` was just established, and `validate` refused a
+    // descriptor whose base is null or outside the direct map. Volatile because
+    // the scanout is write-combining memory another agent scans out of.
     unsafe { core::ptr::read_volatile(fb.ptr.add(idx as usize) as *const u32) }
 }
 
@@ -1266,6 +1349,9 @@ fn put_pixel(fb: &Fb, x: usize, y: usize, color: u32) {
     if idx.saturating_add(4) > fb.bytes {
         return;
     }
+    // SAFETY: irreducible and bounded exactly as `get_pixel` is — the same
+    // three checked operations, the same `validate`d descriptor, and the same
+    // reason for volatile.
     unsafe { core::ptr::write_volatile(fb.ptr.add(idx as usize) as *mut u32, color) };
 }
 
@@ -1275,6 +1361,13 @@ fn put_pixel(fb: &Fb, x: usize, y: usize, color: u32) {
 fn row_base(fb: &Fb, y: usize, len: usize) -> Option<*mut u32> {
     let start = (y as u64).checked_mul(fb.stride_px as u64)?.checked_mul(4)?;
     let end = start.checked_add((len as u64).checked_mul(4)?)?;
+    // SAFETY: irreducible — the whole point of this function is to hand
+    // `fill_screen` a row pointer whose clamp has been proved once instead of
+    // once per pixel, which the paragraph below argues is the difference
+    // between a repaint nobody notices and one that doubles boot time. Bounded
+    // by the `then`: `start` and `end` are checked products and `end <=
+    // fb.bytes` gates the pointer's existence, so every one of the `len` `u32`s
+    // written from it is inside the published byte count.
     (end <= fb.bytes).then(|| unsafe { fb.ptr.add(start as usize) as *mut u32 })
 }
 
@@ -1312,6 +1405,11 @@ fn fill_screen(fb: &Fb, color: u32) {
     for y in 0..fb.height as usize {
         let Some(row) = row_base(fb, y, width) else { return };
         for x in 0..width {
+            // SAFETY: irreducible — `row_base` returns a pointer rather than a
+            // slice precisely so this loop pays no per-pixel bound, and a
+            // volatile store to the scanout has no safe spelling. Bounded by
+            // `row_base`, which returned `Some` only after proving `width`
+            // `u32`s from `row` are inside `fb.bytes`, and `x < width`.
             unsafe { core::ptr::write_volatile(row.add(x), color) };
         }
     }
