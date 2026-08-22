@@ -3298,25 +3298,6 @@ fn sys_query_modules(out: &mut UserBytesMut) -> u64 {
     use toyos_abi::syscall::ModuleInfo;
     let info_size = core::mem::size_of::<ModuleInfo>();
 
-    // The record is `#[repr(C)]` over five integers with no padding, so its
-    // bytes are its fields — the alternative is a per-field encoder for a
-    // layout the ABI already fixes.
-    fn encode(info: &ModuleInfo) -> [u8; core::mem::size_of::<ModuleInfo>()] {
-        // SAFETY: `transmute_copy` needs the destination to be no larger than
-        // the source and the bytes to be a valid value of it. The destination is
-        // `[u8; size_of::<ModuleInfo>()]`, so the sizes are equal by
-        // construction, and every byte pattern is a valid `[u8; N]`.
-        // `ModuleInfo` is `#[repr(C)]` over five integers with no padding, so no
-        // uninitialised byte is read either.
-        //
-        // Reducible, and not reduced here: six other boundary-crossing types
-        // carry a safe `as_bytes` in `toyos-abi` and this is one that does not,
-        // which makes the fix an edit under `toyos-abi/src` — its own pull
-        // request and a sysroot claim. Filed as
-        // `issues/build/moduleinfo-has-no-as-bytes.md`, beside `LogRecord`'s.
-        unsafe { core::mem::transmute_copy(info) }
-    }
-
     process::with_process_data(|data| {
         let module_count = 1 + data.elf.loaded_libs.len();
 
@@ -3340,7 +3321,7 @@ fn sys_query_modules(out: &mut UserBytesMut) -> u64 {
             path_offset,
             path_len: exe_path_bytes.len() as u32,
         };
-        out.write_at(0, &encode(&exe_info));
+        out.write_at(0, exe_info.as_bytes());
         out.write_at(path_offset as usize, exe_path_bytes);
         path_offset += exe_path_bytes.len() as u32;
 
@@ -3360,7 +3341,7 @@ fn sys_query_modules(out: &mut UserBytesMut) -> u64 {
                 path_offset,
                 path_len: lib_path_bytes.len() as u32,
             };
-            out.write_at((1 + i) * info_size, &encode(&lib_info));
+            out.write_at((1 + i) * info_size, lib_info.as_bytes());
             out.write_at(path_offset as usize, lib_path_bytes);
             path_offset += lib_path_bytes.len() as u32;
         }

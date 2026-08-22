@@ -261,7 +261,7 @@ impl PageCache {
             self.referenced[slot as usize] = true;
             return Ok(self.slot_data(slot));
         }
-        let slot = self.alloc_slot(dev, block).ok_or(BlockError)?;
+        let slot = self.alloc_slot(dev, block).ok_or(BlockError::Device)?;
         let page = self.slot_data_mut(slot);
         if let Err(e) = dev.read_blocks(block, 1, page) {
             self.unbind(slot, block);
@@ -280,7 +280,7 @@ impl PageCache {
                 self.referenced[slot as usize] = true;
                 slot
             }
-            None => self.alloc_slot(dev, block).ok_or(BlockError)?,
+            None => self.alloc_slot(dev, block).ok_or(BlockError::Device)?,
         };
         self.dirty[slot as usize] = true;
         let page = self.slot_data_mut(slot);
@@ -306,7 +306,12 @@ impl PageCache {
         pending.sort_unstable_by_key(|&s| self.slot_to_block[s as usize]);
 
         let mut buf = vec![0u8; 32 * 4096];
-        let mut failed = false;
+        // **The worst of the parts, not the first.** One write-back is many
+        // runs plus a flush, and a caller told "your budget expired" for a
+        // composite that also contained a run the device refused would ask
+        // again for a write it can never make. `BlockError::worse` is where
+        // that rule is stated.
+        let mut failed: Option<BlockError> = None;
         let mut i = 0;
         while i < pending.len() {
             let start = self.slot_to_block[pending[i] as usize];
@@ -334,19 +339,19 @@ impl PageCache {
                         self.dirty[pending[i + j] as usize] = false;
                     }
                 }
-                Err(_) => {
+                Err(e) => {
                     log!("page cache: write-back of {count} blocks at {start} failed");
-                    failed = true;
+                    failed = Some(failed.map_or(e, |had| had.worse(e)));
                 }
             }
 
             i += count;
         }
 
-        if dev.flush().is_err() {
+        if let Err(e) = dev.flush() {
             log!("page cache: flush failed; the write-back above is not durable");
-            failed = true;
+            failed = Some(failed.map_or(e, |had| had.worse(e)));
         }
-        if failed { Err(BlockError) } else { Ok(()) }
+        failed.map_or(Ok(()), Err)
     }
 }

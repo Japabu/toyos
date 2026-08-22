@@ -600,6 +600,12 @@ jobs:
       # wins — is decided here, where a weakening reds in seconds instead of
       # waiting for a nightly audio boot.
       #
+      # `logd` since 2026-08-22: what a refused batch does to this boot's log
+      # volume is a function of three values (`logd::policy::fate`), and the
+      # distinction it turns on — a flush the kernel would not start on the
+      # caller's clock against a stick that cannot flush — has no guest that
+      # stages both arms cheaply.
+      #
       # These stay a loop, and cannot stop being one: that same
       # `.cargo/config.toml` is why `userland` is *excluded* from the host
       # workspace, and cargo refuses to merge an inherited `build.target` away.
@@ -610,7 +616,7 @@ jobs:
         run: |
           set -e -o pipefail
           host=$(rustc -vV | sed -n 's/^host: //p')
-          for crate in sshd calc soundd; do
+          for crate in sshd calc soundd logd; do
             echo "=== userland/$crate" | tee -a /tmp/host.log
             cargo test --manifest-path "userland/$crate/Cargo.toml" --target "$host" 2>&1 \
               | tee -a /tmp/host.log

@@ -89,27 +89,7 @@ impl RecordSink for UserRecords<'_, '_> {
         if self.written >= self.capacity {
             return false;
         }
-        // SAFETY: a `LogRecord` is `#[repr(C)]`, `Copy` and valid for any bit
-        // pattern, so its own bytes are what goes on the wire; `RECORD_BYTES`
-        // is `size_of::<LogRecord>()`, asserted in `toyos-abi`'s own
-        // `const _`. The slice is over one whole record the kernel built on
-        // its own stack — it borrows nothing of the shard and nothing of
-        // userland — and it dies inside this call.
-        //
-        // **Irreducible here and not irreducible.** Six other types that cross
-        // this boundary carry a safe `as_bytes` whose one block lives in
-        // `toyos-abi` beside the layout it depends on — `NicInfo`,
-        // `VirtioSoundInfo`, `FramebufferInfo`, `RawKeyEvent`, `MouseEvent`,
-        // `HdaInfo`; `LogRecord` is the one that does not, so the kernel
-        // spells the same thing by hand.
-        // Giving it one is an edit to `toyos-abi/src`, which lands on its own
-        // pull request and costs a sysroot claim — filed as
-        // `issues/build/logrecord-has-no-as-bytes.md` rather than smuggled
-        // into a sweep.
-        let bytes = unsafe {
-            core::slice::from_raw_parts((record as *const LogRecord).cast::<u8>(), RECORD_BYTES)
-        };
-        self.out.write_at(self.written * RECORD_BYTES, bytes);
+        self.out.write_at(self.written * RECORD_BYTES, record.as_bytes());
         self.written += 1;
         true
     }

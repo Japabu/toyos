@@ -9311,7 +9311,7 @@ fn run_machine_test(
             // first and fail here, because the queue would still be owed a
             // completion and the DMA window still owed a write.
             let console = serial::Serial::named("boot console", boot.as_str());
-            console.must_say("nvme-gate: read with a spent budget refused=true")?;
+            console.must_say("nvme-gate: read with a spent budget refused=true budget=true")?;
             console.must_say("nvme-gate: the same block read afterwards ok=true")?;
 
             let Some(file_budget) = parse_cache_budget(&boot, "file cache: budget ") else {

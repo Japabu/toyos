@@ -150,12 +150,15 @@ ever since.
 
 ## What a spurious refusal costs
 
-`/bin/logd` treats any `Err` from `sync_all` as final: `userland/logd/src/main.rs:274-286`
-sets `volume = None` and the boot's log is console-only from that point, for the
-rest of the boot. `LOG_WRITE_BUDGET` (`:123`, 5 s) is explicitly *not* the policy
-for errors — its own doc says "an **error** ends it at once" — and it bounds only
-the case where the calls succeed slowly. So logd is written to tell "busy" from
-"gone" and the kernel gives it one word for both.
+*(As of 2026-08-22 this section describes what the tree used to do; "what is
+owed" item 3 below carries what replaced it.)*
+
+`/bin/logd` treated any `Err` from `sync_all` as final: `volume = None` and the
+boot's log console-only from that point, for the rest of the boot.
+`LOG_WRITE_BUDGET` (5 s) was explicitly *not* the policy for errors — its own
+doc said "an **error** ends it at once" — and it bounded only the case where the
+calls succeed slowly. So logd was written to tell "busy" from "gone" and the
+kernel gave it one word for both.
 
 ## Reproduced, 2026-08-22, and the producer is both deadlines in series
 
@@ -252,17 +255,23 @@ it inside one `SYS_FSYNC`, in a boot whose peers were up in 1,385 ms.
    nothing to convert them *to* — every other bounded wait in it is
    `clock::settles` on the same TSC — and for real hardware a time bound is the
    correct bound, so this is not a "replace the clock" fix.
-3. **`BlockError` is one bit and a budget refusal is not a device fact.**
-   `kernel/src/block.rs:65-84` argues for one bit on the ground that "above this
-   trait there is exactly one thing to do with the answer" — which is false for
-   the one consumer that matters: logd retries nothing on an error and gives up
-   permanently, but would keep the volume for a refusal that means "your budget,
-   not this stick". The ABI already has the word and needs no change:
-   `SyscallError::WouldBlock`, which `rust/library/std/src/sys/fs/toyos.rs:19`
-   already maps to `io::ErrorKind::WouldBlock`. Threading it costs a variant in
-   `BlockError`, in `toyos-fat32`'s `IoError`/`Error`, and one arm in
-   `as_syscall_error` — three crates, one of them the pure FAT32 crate, against a
-   documented decision. **Owner's call, not an agent's.**
+3. ~~**`BlockError` is one bit and a budget refusal is not a device fact.**~~
+   **Done, 2026-08-22.** `BlockError` is `Device | BudgetExpired`, minted apart
+   by `XhciController::scsi` (`Scsi::Budget`) and by NVMe's `may_issue`, carried
+   through `toyos_fat32::IoError`/`Error`'s matching pair, and answered by
+   `as_syscall_error` as `SyscallError::WouldBlock` — the word the ABI already
+   had. `/bin/logd`'s `policy::fate` keeps the volume across a flush that would
+   block and still ends it on a device fact, bounding the *run* of retries by
+   `LOG_WRITE_BUDGET` so a permanently loaded host does not keep a volume nobody
+   is writing to. What is **not** covered is an end-to-end guest arm: staging a
+   budget-expired flush needs one actuator and
+   `issues/build/the-actuator-arm-set-is-full-at-64.md` is why there is no 65th.
+   The mint is gated by `cache_eviction`'s
+   `nvme-gate: read with a spent budget refused=true budget=true` and
+   `usb_storage_gate`'s `usb-gate:` line of the same shape, the mapping by
+   `toyos-fat32`'s `a_budget_that_expired_is_not_a_device_that_failed` and
+   `a_flush_says_which_of_the_two_refusals_it_was`, and the decision by
+   `logd::policy`'s six.
 4. `Broke::Silence`'s `Display` (`kernel/src/drivers/xhci/wait/msc.rs:233-237`)
    says "no answer in the {phase} phase in 2000 ms" on both exits from
    `wait_transfer` — including `wait/mod.rs:384-386`, where the port read

@@ -32,11 +32,26 @@ pub trait BlockAccess {
     fn flush(&mut self) -> Result<(), IoError>;
 }
 
-/// The device could not do it.
+/// The volume did not do it, and which of two kinds of "did not" it was.
 ///
-/// Carries no detail because there is no detail this crate could act on: every
-/// failure here becomes [`Error::Io`](crate::Error::Io) and propagates to a
-/// caller that owns the device and already knows more about it than a code
-/// could say.
+/// **Two variants, because one of them is not about the device.** Everything a
+/// device can say about itself — a transfer it refused, a controller that gave
+/// up, a request past the end — is one fact this crate can act on none of; that
+/// is [`IoError::Device`], and it carries no detail for the reason the single
+/// unit struct this replaces carried none. But an implementor of
+/// [`BlockAccess`] may also have a *bound of its own* on how long one call may
+/// take, and reaching it is a statement about the caller's clock rather than
+/// about the volume: nothing was attempted, nothing is in flight, and asking
+/// again later is the honest response. Flattening the two costs the caller the
+/// only decision it could make.
+///
+/// The kernel's implementor is `kernel/src/fat32_adapter.rs` over
+/// `block::BlockDevice`, whose `block::OPERATION` budget is that bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IoError;
+pub enum IoError {
+    /// The device refused, failed, or would not answer.
+    Device,
+    /// The implementor's own bound on the operation expired before it was
+    /// attempted. The volume is untouched and the caller may ask again.
+    BudgetExpired,
+}

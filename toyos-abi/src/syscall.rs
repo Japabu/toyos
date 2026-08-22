@@ -1813,6 +1813,36 @@ pub struct ModuleInfo {
     pub path_len: u32,
 }
 
+/// Every byte belongs to a field: this crosses the boundary through
+/// [`ModuleInfo::as_bytes`], so a gap would publish whatever the kernel stack
+/// held. **This is the type where that matters most**, because the buffer it
+/// is written into is a user address: the two `u32`s sit at the end of four
+/// `u64`s, which is 8 bytes together at an 8-aligned offset, so there is no
+/// tail padding today — and this is what says so. A field of any other width
+/// added here reds here rather than publishing kernel stack bytes to userland.
+const _: () = assert!(core::mem::size_of::<ModuleInfo>() == 8 + 8 + 8 + 8 + 4 + 4);
+
+impl ModuleInfo {
+    /// The record's own bytes, which is what `SYS_QUERY_MODULES` writes.
+    ///
+    /// The shape its siblings in this crate have — `NicInfo`,
+    /// `VirtioSoundInfo`, `FramebufferInfo`, `RawKeyEvent`, `MouseEvent`,
+    /// `HdaInfo`, `LogRecord` — and it is here rather than at the kernel's
+    /// copy-out for the reason they are: the `unsafe` belongs beside the
+    /// layout assertion that discharges it, not beside the caller that
+    /// happens to need it.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `self` is a valid `&Self` (non-null, aligned, readable for
+        // `size_of::<Self>()` bytes), and the const assert above proves the
+        // `repr(C)` layout has no padding, so every byte the slice exposes is
+        // an initialized field, not a gap.
+        unsafe {
+            core::slice::from_raw_parts(self as *const Self as *const u8, core::mem::size_of::<Self>())
+        }
+    }
+}
+
 /// Query all loaded modules (exe + dlopen'd libs) in the current process.
 ///
 /// Returns the number of **bytes** the description needs, which is a count
@@ -1892,4 +1922,36 @@ pub fn process_stats(proc: RawHandle, stats: &mut ProcessStats) -> Result<(), Sy
         core::mem::size_of::<ProcessStats>() as u64,
         0,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **The encoder is the wire, so the test decodes the wire.**
+    ///
+    /// Not `as_bytes().len() == size_of::<ModuleInfo>()`, which a padded
+    /// struct passes: every field is read back out of the slice at the offset
+    /// `#[repr(C)]` puts it at. `path_offset` and `path_len` are the two the
+    /// `const _` above is about — a gap before them shifts both, and these are
+    /// the assertions that catch it.
+    #[test]
+    fn module_info_as_bytes_is_the_fields_and_nothing_between_them() {
+        let info = ModuleInfo {
+            base: 0x1122_3344_5566_7788,
+            text_end: 0x2233_4455_6677_8899,
+            eh_frame_hdr: 0x3344_5566_7788_99aa,
+            eh_frame_hdr_size: 0x44,
+            path_offset: 0x55,
+            path_len: 0x66,
+        };
+        let b = info.as_bytes();
+        assert_eq!(b.len(), 40);
+        assert_eq!(u64::from_ne_bytes(b[0..8].try_into().unwrap()), info.base);
+        assert_eq!(u64::from_ne_bytes(b[8..16].try_into().unwrap()), info.text_end);
+        assert_eq!(u64::from_ne_bytes(b[16..24].try_into().unwrap()), info.eh_frame_hdr);
+        assert_eq!(u64::from_ne_bytes(b[24..32].try_into().unwrap()), info.eh_frame_hdr_size);
+        assert_eq!(u32::from_ne_bytes(b[32..36].try_into().unwrap()), info.path_offset);
+        assert_eq!(u32::from_ne_bytes(b[36..40].try_into().unwrap()), info.path_len);
+    }
 }

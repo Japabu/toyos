@@ -59,20 +59,16 @@ pub type DeviceId = u32;
 ///
 /// **A [`Budget`] and not a [`crate::time::Tripwire`]**: expiry is a degraded
 /// answer, named. The operation is refused, the device is *not* marked failed —
-/// nothing was in flight when the refusal was taken — and the caller gets the
-/// `Err` every other refused transfer produces.
-///
-/// **That last clause is a defect and not a design**, and it is where this
-/// budget's cost lands. `/bin/logd` gives its volume up permanently on any `Err`
-/// from `SYS_FSYNC` and keeps it across a slow one, because "busy" and "gone"
-/// want different answers — and the whole path from [`BlockError`] up flattens
-/// them into one `SyscallError::Io`, so it cannot.
-/// `issues/boot-media/fsync-on-log-returns-other-under-a-loaded-host.md` carries
-/// the reading and what a second bit would cost.
+/// nothing was in flight when the refusal was taken — and the caller is told
+/// which of the two happened: [`BlockError::BudgetExpired`], which reaches
+/// userland as `SyscallError::WouldBlock` and never as
+/// [`SyscallError::Io`](toyos_abi::syscall::SyscallError::Io). Until
+/// 2026-08-22 it did not, and `/bin/logd` ended a boot's log for a stick that
+/// was answering.
 pub const OPERATION: Budget = Budget::of(
     Duration::from_secs(2),
-    "the block-device operation is refused with an I/O error, and the caller's \
-     own give-up policy decides what happens next",
+    "the block-device operation is refused as one that would block, and the \
+     caller's own give-up policy decides whether to ask again",
 );
 
 /// Declare the running context inside one block-device operation, bounded by
@@ -92,26 +88,69 @@ pub fn begin_operation() -> Operation {
     Operation::begin(Deadline::at(crate::clock::now() + OPERATION.duration()))
 }
 
-/// A transfer the device did not complete.
+/// An operation this trait did not complete, and which of two reasons it was.
 ///
-/// Deliberately not an enum. Above this trait there is exactly one thing to do
-/// with the answer — stop, and do not believe the buffer — while *why* it
-/// failed (which endpoint stalled, what the sense key was, whether the device
-/// answered at all) is in the driver's own log line, where it can be read. An
-/// enum here would be a vocabulary nothing matches on and every new driver
-/// would have to guess an arm from.
+/// **Two variants and not one bit, because they are not the same fact and the
+/// machine's one consumer acts on them differently.** This was one bit until
+/// 2026-08-22, on the ground that "above this trait there is exactly one thing
+/// to do with the answer — stop, and do not believe the buffer". That is true
+/// of the *buffer* and false of the caller: `/bin/logd` gives its volume up
+/// permanently on any `Err` from `SYS_FSYNC`, which is right for a stick that
+/// cannot flush and wrong for a refusal that means "your budget, not this
+/// stick". `issues/boot-media/fsync-on-log-returns-other-under-a-loaded-host.md`
+/// carried the measurement: 1 red in 73 full 12-wide suites, a boot whose peers
+/// were up in 1,385 ms spending `syscall_wall=2108ms` inside one `SYS_FSYNC`,
+/// and a boot's log ended for a device that was fine.
+///
+/// It is still not a *vocabulary*. Which endpoint stalled, what the sense key
+/// was and whether the device answered at all stay in the driver's own log
+/// line, where a triage reads them; the one distinction here is the one a
+/// caller can act on.
 ///
 /// It is not [`SyscallError`] because a driver has no business naming a
-/// syscall's return, and because this type is one bit where that one is a
-/// vocabulary. The conversion happens where the two meet: `vfs::FileSystem`
-/// answers `SyscallError` and [`SyscallError::Io`] is the variant that exists
-/// for this, so a refused transfer reaches userland as itself rather than as
-/// "no such file".
+/// syscall's return. The conversion happens where the two meet:
+/// `vfs::FileSystem` answers `SyscallError`, [`SyscallError::Io`] is the
+/// variant that exists for [`BlockError::Device`], and
+/// [`SyscallError::WouldBlock`] is the one that exists for
+/// [`BlockError::BudgetExpired`] — a word the ABI already had, which
+/// `rust/library/std/src/sys/fs/toyos.rs` already maps to
+/// `io::ErrorKind::WouldBlock`.
 ///
 /// [`SyscallError`]: toyos_abi::syscall::SyscallError
 /// [`SyscallError::Io`]: toyos_abi::syscall::SyscallError::Io
+/// [`SyscallError::WouldBlock`]: toyos_abi::syscall::SyscallError::WouldBlock
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct BlockError;
+pub enum BlockError {
+    /// The device did not do it. A transfer issued and not completed, a status
+    /// the command carried, a controller recovery gave up on, a request past
+    /// the end of the medium, a volume slot that is not mounted — every fact
+    /// about the hardware or the volume.
+    Device,
+    /// The operation's [`OPERATION`] budget expired, so this was refused
+    /// **before it was attempted**.
+    ///
+    /// Not a fact about the device: nothing was in flight when the refusal was
+    /// taken, no disk was marked failed, and the transport is exactly as the
+    /// last operation left it. A caller that can afford to ask again later
+    /// loses nothing by doing so, and one that cannot is no worse off than the
+    /// single bit left it.
+    BudgetExpired,
+}
+
+impl BlockError {
+    /// Which of two failures stands when one operation composes several.
+    ///
+    /// [`Device`](Self::Device) wins: an operation one of whose parts the
+    /// device refused is a failed operation whatever else expired, and the
+    /// honest answer for the whole is the worse of the halves. `page_cache::sync`
+    /// is the caller — one write-back is many runs plus a flush.
+    pub fn worse(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Device, _) | (_, Self::Device) => Self::Device,
+            _ => Self::BudgetExpired,
+        }
+    }
+}
 
 pub type BlockResult = Result<(), BlockError>;
 

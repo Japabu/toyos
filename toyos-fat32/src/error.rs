@@ -41,11 +41,23 @@ pub enum Error {
     /// listing, because a caller checking that a name is absent gets a
     /// confident wrong answer.
     LimitExceeded,
+    /// The device's implementor refused on *its own* bound, before attempting
+    /// anything ([`IoError::BudgetExpired`]).
+    ///
+    /// **The one variant here that is not a fact about the volume**, and the
+    /// only one a caller may honestly answer by asking again: nothing was
+    /// written, nothing is half done, and the next call finds the volume as
+    /// this one left it. Every other variant describes something true of the
+    /// medium or of the request, which will be just as true next time.
+    BudgetExpired,
 }
 
 impl From<IoError> for Error {
-    fn from(_: IoError) -> Self {
-        Error::Io
+    fn from(e: IoError) -> Self {
+        match e {
+            IoError::Device => Error::Io,
+            IoError::BudgetExpired => Error::BudgetExpired,
+        }
     }
 }
 
@@ -66,6 +78,7 @@ impl Error {
             Error::NoSpace => "no space left on volume",
             Error::TooLarge => "file too large for FAT32",
             Error::LimitExceeded => "limit exceeded",
+            Error::BudgetExpired => "the device would not answer in the caller's own budget",
         }
     }
 }

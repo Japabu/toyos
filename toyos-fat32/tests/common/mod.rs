@@ -64,9 +64,9 @@ impl BlockyFile {
     }
 
     fn check(&self, offset: u64, len: usize) -> Result<(), IoError> {
-        let end = offset.checked_add(len as u64).ok_or(IoError)?;
+        let end = offset.checked_add(len as u64).ok_or(IoError::Device)?;
         if end > self.capacity {
-            return Err(IoError);
+            return Err(IoError::Device);
         }
         Ok(())
     }
@@ -86,7 +86,7 @@ impl BlockAccess for BlockyFile {
             let base = pos / self.block as u64 * self.block as u64;
             let within = (pos - base) as usize;
             let n = (self.block - within).min(buf.len() - done);
-            self.file.read_exact_at(&mut block, base).map_err(|_| IoError)?;
+            self.file.read_exact_at(&mut block, base).map_err(|_| IoError::Device)?;
             buf[done..done + n].copy_from_slice(&block[within..within + n]);
             done += n;
         }
@@ -102,16 +102,16 @@ impl BlockAccess for BlockyFile {
             let base = pos / self.block as u64 * self.block as u64;
             let within = (pos - base) as usize;
             let n = (self.block - within).min(buf.len() - done);
-            self.file.read_exact_at(&mut block, base).map_err(|_| IoError)?;
+            self.file.read_exact_at(&mut block, base).map_err(|_| IoError::Device)?;
             block[within..within + n].copy_from_slice(&buf[done..done + n]);
-            self.file.write_all_at(&block, base).map_err(|_| IoError)?;
+            self.file.write_all_at(&block, base).map_err(|_| IoError::Device)?;
             done += n;
         }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<(), IoError> {
-        self.file.sync_all().map_err(|_| IoError)
+        self.file.sync_all().map_err(|_| IoError::Device)
     }
 }
 
@@ -127,6 +127,16 @@ pub struct SparseDevice {
     sectors: HashMap<u64, [u8; 512]>,
     capacity: u64,
     pub fail_reads_past: Option<u64>,
+    /// Which refusal [`fail_reads_past`](Self::fail_reads_past) and
+    /// [`flush_refuses`](Self::flush_refuses) answer with.
+    ///
+    /// `IoError` is two variants and only one of them is a fact about the
+    /// device, so a fake that could only ever say `Device` could not exercise
+    /// the other half of the mapping at all.
+    pub refusal: IoError,
+    /// Whether [`BlockAccess::flush`] refuses, which is the one call
+    /// `Fat32::sync` makes into the device after the FSInfo write.
+    pub flush_refuses: bool,
     /// The volume's own declared size, when the device is deliberately larger
     /// than it — a partition with slack, or an adapter that reports the whole
     /// device. Requests past it are still served, and counted.
@@ -145,6 +155,8 @@ impl SparseDevice {
             sectors: HashMap::new(),
             capacity,
             fail_reads_past: None,
+            refusal: IoError::Device,
+            flush_refuses: false,
             volume_bytes: None,
             out_of_volume: 0,
         };
@@ -203,13 +215,13 @@ impl BlockAccess for SparseDevice {
     }
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), IoError> {
-        let end = offset.checked_add(buf.len() as u64).ok_or(IoError)?;
+        let end = offset.checked_add(buf.len() as u64).ok_or(IoError::Device)?;
         if end > self.capacity {
-            return Err(IoError);
+            return Err(IoError::Device);
         }
         if let Some(limit) = self.fail_reads_past {
             if end > limit {
-                return Err(IoError);
+                return Err(self.refusal);
             }
         }
         self.note_range(end);
@@ -218,9 +230,9 @@ impl BlockAccess for SparseDevice {
     }
 
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), IoError> {
-        let end = offset.checked_add(buf.len() as u64).ok_or(IoError)?;
+        let end = offset.checked_add(buf.len() as u64).ok_or(IoError::Device)?;
         if end > self.capacity {
-            return Err(IoError);
+            return Err(IoError::Device);
         }
         self.note_range(end);
         self.poke(offset, buf);
@@ -228,6 +240,9 @@ impl BlockAccess for SparseDevice {
     }
 
     fn flush(&mut self) -> Result<(), IoError> {
+        if self.flush_refuses {
+            return Err(self.refusal);
+        }
         Ok(())
     }
 }

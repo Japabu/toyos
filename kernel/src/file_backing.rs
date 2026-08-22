@@ -113,7 +113,7 @@ impl FileBacking for NvmeBacking {
         // another file's contents to whoever still holds this mapping.
         let Some(block) = self.blocks.with(|extents| offset_to_block(extents, file_offset)) else {
             log!("file: read through a backing whose file was deleted");
-            return Err(BlockError);
+            return Err(BlockError::Device);
         };
         if let Some(block) = block {
             // Direct disk read — bypasses block page cache.
@@ -125,7 +125,7 @@ impl FileBacking for NvmeBacking {
             // a partial write into this page can decline instead.
             if page_cache::raw_block_read(block, &mut raw).is_err() {
                 log!("file: read of block {block} failed; serving zeros");
-                return Err(BlockError);
+                return Err(BlockError::Device);
             }
             let valid = BLOCK_SIZE.min((self.size - file_offset) as usize);
             buf[..valid].copy_from_slice(&raw[..valid]);
@@ -187,7 +187,7 @@ impl FileBacking for InitrdBacking {
                  {}-block image it was read out of",
                 self.image.block_count()
             );
-            return Err(BlockError);
+            return Err(BlockError::Device);
         };
         let valid = BLOCK_SIZE.min((self.size - file_offset) as usize);
         buf[..valid].copy_from_slice(&bytes[..valid]);

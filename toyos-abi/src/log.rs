@@ -106,6 +106,14 @@ pub struct LogRecord {
 
 const _: () = assert!(core::mem::size_of::<LogRecord>() == RECORD_BYTES);
 const _: () = assert!(core::mem::align_of::<LogRecord>() == 64);
+/// Every byte belongs to a field: this crosses the boundary through
+/// [`LogRecord::as_bytes`], so a gap would publish whatever the kernel stack
+/// held. Spelled as the sum of the field widths rather than as
+/// [`RECORD_BYTES`], which is the *other* claim about this struct — a padded
+/// layout that happened to reach 1024 bytes would satisfy that one.
+const _: () = assert!(
+    core::mem::size_of::<LogRecord>() == 8 + 8 + 4 + 4 + 2 + 2 + 2 + 1 + 1 + MAX_RECORD_MESSAGE
+);
 /// The kernel's slot is this layout with the first word made atomic, so the
 /// body it copies is everything past that word and must start where it does.
 const _: () = assert!(core::mem::offset_of!(LogRecord, at_ns) == core::mem::size_of::<u64>());
@@ -148,6 +156,24 @@ impl LogRecord {
                 // valid, so this cannot fail and is not an `expect` on input.
                 core::str::from_utf8(&bytes[..e.valid_up_to()]).unwrap_or("")
             }
+        }
+    }
+
+    /// The record's own bytes, which is what goes on the wire.
+    ///
+    /// The shape its six siblings in this crate have (`NicInfo`,
+    /// `VirtioSoundInfo`, `FramebufferInfo`, `RawKeyEvent`, `MouseEvent`,
+    /// `HdaInfo`), and it is here rather than at the kernel's copy-out for the
+    /// reason they are: the `unsafe` belongs beside the layout assertion that
+    /// discharges it, not beside the caller that happens to need it.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `self` is a valid `&Self` (non-null, aligned, readable for
+        // `size_of::<Self>()` bytes), and the const assert above proves the
+        // `repr(C)` layout has no padding, so every byte the slice exposes is
+        // an initialized field, not a gap.
+        unsafe {
+            core::slice::from_raw_parts(self as *const Self as *const u8, core::mem::size_of::<Self>())
         }
     }
 
@@ -244,6 +270,31 @@ mod tests {
         assert_eq!(core::mem::offset_of!(LogRecord, seq), 0);
         assert_eq!(core::mem::offset_of!(LogRecord, at_ns), 8);
         assert_eq!(core::mem::size_of::<LogCursor>(), 88);
+    }
+
+    /// **The encoder is the wire, so the test decodes the wire.**
+    ///
+    /// Not `as_bytes().len() == RECORD_BYTES`, which a padded struct passes:
+    /// every field is read back out of the slice at the offset `#[repr(C)]`
+    /// puts it at, and the tail is the message. A gap anywhere before `msg`
+    /// shifts one of these and the assertion that catches it is the one whose
+    /// field moved.
+    #[test]
+    fn as_bytes_is_the_fields_and_nothing_between_them() {
+        let r = record("hello");
+        let b = r.as_bytes();
+        assert_eq!(b.len(), RECORD_BYTES);
+        assert_eq!(u64::from_ne_bytes(b[0..8].try_into().unwrap()), 7);
+        assert_eq!(u64::from_ne_bytes(b[8..16].try_into().unwrap()), 1_234_567_890);
+        assert_eq!(u32::from_ne_bytes(b[16..20].try_into().unwrap()), 3);
+        assert_eq!(u32::from_ne_bytes(b[20..24].try_into().unwrap()), 4);
+        assert_eq!(u16::from_ne_bytes(b[24..26].try_into().unwrap()), 2);
+        assert_eq!(u16::from_ne_bytes(b[26..28].try_into().unwrap()), 5);
+        assert_eq!(u16::from_ne_bytes(b[28..30].try_into().unwrap()), 0);
+        assert_eq!(b[30], Level::Info as u8);
+        assert_eq!(b[31], 0);
+        assert_eq!(&b[32..37], b"hello");
+        assert!(b[37..].iter().all(|&x| x == 0));
     }
 
     fn record(msg: &str) -> LogRecord {

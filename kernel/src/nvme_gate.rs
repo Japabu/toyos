@@ -49,9 +49,14 @@ pub fn run() {
         let _op = Operation::begin(Deadline::passed());
         let mut guard = page_cache::lock();
         let (_cache, dev) = guard.cache_and_dev();
-        dev.read_blocks(AT, 1, &mut buf).is_err()
+        dev.read_blocks(AT, 1, &mut buf)
     };
-    log!("nvme-gate: read with a spent budget refused={refused}");
+    // `budget=` is the second half of the verdict: `may_issue` refuses an
+    // abandoned controller and a spent budget alike, and only one of the two is
+    // a fact about this device. They were one value until 2026-08-22.
+    log!("nvme-gate: read with a spent budget refused={} budget={}",
+        refused.is_err(),
+        refused == Err(crate::block::BlockError::BudgetExpired));
 
     // And the controller is where the previous operation left it. A refusal
     // taken inside a command instead of between two would have abandoned one:
