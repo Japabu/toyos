@@ -16,13 +16,31 @@
 //! The second arm is the whole of what stops the first passing because the
 //! service was never there.
 //!
-//! **Capabilities.** Four things are reachable no other way — minting a device
-//! claim, entering the real-time band, turning a pid into a process handle, and
-//! powering the machine off
+//! **Capabilities.** Five things are reachable no other way — minting a device
+//! claim, entering the real-time band, turning a pid into a process handle,
+//! reading the roster of every process in the machine, and powering the machine
+//! off
 //! — and each is one bit on a handle to a `SysCap` the kernel mints exactly once,
 //! for `/bin/init`. A handle that carries the wrong *bit* is refused with a word,
 //! because probing what an attenuated capability can still do is what
 //! attenuation is for; a handle that is **no handle at all** ends the caller.
+//!
+//! **The roster arms are the ones whose subject is half a syscall.**
+//! `SYS_SYSINFO` answers a machine header and then one entry per live thread,
+//! and only the second is authority: the entries carry a pid, a size, a CPU
+//! time and a **name** for every process there is, and they were ambient until
+//! the owner ruled on 2026-08-20 that they ride `Rights::ROSTER`. Which of the
+//! two a call is asking for is the buffer's own length, so the arms come in a
+//! pair one byte apart — a buffer one byte short of an entry is answered
+//! without the capability being consulted, and the same buffer one byte longer
+//! is refused to the same handle. A kernel that demanded the bit for the header
+//! fails the first; a kernel that stopped demanding it fails the second.
+//!
+//! `/bin/ps` is then run twice, endowed a duplicate with the bit and a
+//! duplicate without it. The shipped applet reaching those same two answers
+//! through the SDK is what says the manifest's name, the kernel's demand and
+//! the program are one line rather than three that agree by luck — and it is
+//! the only thing in this suite that runs `ps` at all.
 //!
 //! **The shutdown arms are the ones with a machine behind them.** `SYS_SHUTDOWN`
 //! used to take no argument, so both of them made the call and the guest went
@@ -32,8 +50,8 @@
 //!
 //! **A wrong-typed handle is refused with a word here, and that is a property of
 //! the check rather than an exception to the policy.** The table resolves rights
-//! before type, and `DEVICE`, `RT` and `POWER` are bits only a `SysCap` ever
-//! carries — so
+//! before type, and `DEVICE`, `RT`, `POWER` and `ROSTER` are bits only a
+//! `SysCap` ever carries — so
 //! nothing of another type can reach the type check at all, and presenting one is
 //! indistinguishable from presenting an attenuated capability. Asserted, because
 //! it is the answer a caller gets and a test that expected the kill would be
@@ -41,18 +59,25 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::toyos::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
 
 use toyos::endow::{Endowments, SYSCAP_LABEL};
 use toyos::syscap::SysCap;
+use toyos::system::{SYSINFO_ENTRY_SIZE, SYSINFO_HEADER_SIZE};
 use toyos::{namespace, port, AsHandle};
 use toyos_abi::handle::{Rights, HANDLE_INVALID};
 use toyos_abi::syscall::{self, DeviceType, SyscallError, SVC_LABEL};
 use toyos_abi::RawHandle;
 
 const SELF_PATH: &str = "/bin/test_rs_endowment_denied";
+const PS_PATH: &str = "/bin/ps";
 const OPEN: &str = "echo";
 const PRIVILEGED: &str = "privileged";
+
+/// A buffer with room for one roster entry: the smallest question that costs
+/// `Rights::ROSTER`, and one byte more than the largest that does not.
+const ONE_ENTRY: usize = SYSINFO_HEADER_SIZE + SYSINFO_ENTRY_SIZE;
 
 /// `process::HANDLE_FAULT_EXIT_CODE`.
 const HANDLE_FAULT: i32 = 139;
@@ -66,6 +91,10 @@ const NOT_A_HANDLE: &[(&str, &str)] = &[
     // a kernel that took this handle would cut the power to the guest the
     // parent is waiting on.
     ("shutdown-absent", "SYS_SHUTDOWN took a handle nobody holds"),
+    // The fourth. `HANDLE_INVALID` is exactly what a header-only caller sends,
+    // and asking for one entry with it is the same mistake as the three above:
+    // the census is not reachable by naming nothing.
+    ("roster-absent", "SYS_SYSINFO's roster took a handle nobody holds"),
 ];
 
 fn main() {
@@ -79,6 +108,8 @@ fn main() {
 fn test() {
     only_what_was_given();
     a_right_the_capability_lacks_is_a_word();
+    the_roster_is_a_right_and_the_header_is_not();
+    the_shipped_applet_reaches_both_answers();
     for (role, what_would_be_wrong) in NOT_A_HANDLE {
         killed(role, what_would_be_wrong);
     }
@@ -130,9 +161,7 @@ fn probe_with(ns: RawHandle) -> String {
 /// narrowing at all — this binary genuinely cannot enter the real-time band,
 /// which is the privilege a device claim was never enough to confer.
 fn a_right_the_capability_lacks_is_a_word() {
-    let cap: SysCap = Endowments::get()
-        .take(SYSCAP_LABEL)
-        .expect("test-runner endows every binary it spawns a system capability");
+    let cap = cap();
 
     assert_eq!(
         syscall::rt_enter(cap.as_handle()),
@@ -200,6 +229,156 @@ fn a_right_the_capability_lacks_is_a_word() {
     println!("  power: a capability without POWER, and a pipe, were both refused the machine");
 }
 
+/// The estate's system capability, taken once — taking an endowment is a swap,
+/// and three arms below want the same one.
+fn cap() -> &'static SysCap {
+    static CAP: OnceLock<SysCap> = OnceLock::new();
+    CAP.get_or_init(|| {
+        Endowments::get()
+            .take(SYSCAP_LABEL)
+            .expect("test-runner endows every binary it spawns a system capability")
+    })
+}
+
+/// `SYS_SYSINFO`'s two answers, and the one byte of buffer between them.
+///
+/// **The pair is the point.** One capability, two calls that differ only in
+/// whether the buffer has room for a single entry: the shorter is answered and
+/// the longer is refused. A kernel that demanded the bit unconditionally would
+/// fail the first and break `free`, netd and the compositor's taskbar with it;
+/// a kernel that stopped demanding it — the tree as it stood before the owner's
+/// ruling of 2026-08-20 — fails the second.
+///
+/// Narrowed rather than the estate's own cap, because this estate does carry
+/// `ROSTER`: four guest binaries read entries out of the same call, and
+/// `tests/testcases` names `roster` on the test-runner row for them. The
+/// subject is a capability that resolves and lacks the bit.
+fn the_roster_is_a_right_and_the_header_is_not() {
+    let toothless = cap().narrowed(Rights::TRANSFER).expect("a capability carrying less");
+
+    let mut short = [0u8; ONE_ENTRY - 1];
+    assert_eq!(
+        toothless.roster(&mut short),
+        SYSINFO_HEADER_SIZE,
+        "a buffer one byte short of an entry was not answered the machine header",
+    );
+    assert_ne!(
+        u64::from_le_bytes(short[0..8].try_into().unwrap()),
+        0,
+        "the header came back saying this machine has no memory",
+    );
+
+    let mut one = [0u8; ONE_ENTRY];
+    assert_eq!(
+        toothless.roster(&mut one),
+        0,
+        "a capability without ROSTER was given the process roster",
+    );
+    // The demand is above the header write, so a refusal leaves the buffer
+    // exactly as it was — not a header with the entries withheld.
+    assert!(
+        one.iter().all(|&b| b == 0),
+        "a refused roster wrote {} bytes into the caller's buffer",
+        one.iter().filter(|&&b| b != 0).count(),
+    );
+
+    // A handle that is not a capability at all, asking for an entry. `ROSTER`
+    // is a bit nothing else carries, so it never reaches the type check and the
+    // answer is the word the narrowed capability got — the same shape the three
+    // arms above assert for `DEVICE`, `RT` and `POWER`.
+    let mut by_a_console = [0u8; ONE_ENTRY];
+    assert_eq!(
+        syscall::sysinfo(RawHandle(1), &mut by_a_console),
+        0,
+        "a console was taken as a capability by SYS_SYSINFO",
+    );
+
+    // The header with no handle named at all — `HANDLE_INVALID`, which is what
+    // `toyos::system::sysinfo` sends and what every header-only reader in the
+    // tree is. Ambient by the owner's ruling, and this is where that half is
+    // asserted.
+    let mut header = [0u8; SYSINFO_HEADER_SIZE];
+    assert_eq!(
+        toyos::system::sysinfo(&mut header),
+        SYSINFO_HEADER_SIZE,
+        "the machine header stopped being ambient",
+    );
+
+    // And the estate's own capability does carry the bit, so the refusals above
+    // were the bit and not the call — with this process's own entry in the
+    // answer, which is what says entries were written rather than counted.
+    let mut wide = vec![0u8; SYSINFO_HEADER_SIZE + SYSINFO_ENTRY_SIZE * 256];
+    let n = cap().roster(&mut wide);
+    assert!(n >= ONE_ENTRY, "a capability carrying ROSTER was answered {n} bytes");
+    let me = syscall::getpid().raw();
+    let mine = (SYSINFO_HEADER_SIZE..)
+        .step_by(SYSINFO_ENTRY_SIZE)
+        .take_while(|pos| pos + SYSINFO_ENTRY_SIZE <= n)
+        .any(|pos| u32::from_le_bytes(wide[pos..pos + 4].try_into().unwrap()) == me);
+    assert!(mine, "the roster this process was given does not contain this process");
+
+    println!("  roster: one byte short is the header and ambient, one entry costs ROSTER");
+}
+
+/// `/bin/ps`, endowed a duplicate with the bit and a duplicate without it.
+///
+/// **The shipped applet and not a raw call, because the plumbing is the risk.**
+/// The manifest's `roster` name, `syscap_rights`' bit, init's narrowing, the
+/// SDK's `SysCap::roster` and the kernel's demand are five places that have to
+/// agree, and every arm above this one exercises the last of them through the
+/// first only by hand. This runs the program a user runs. It is also the only
+/// thing in this suite that runs `ps` at all.
+fn the_shipped_applet_reaches_both_answers() {
+    let granted = ps_endowed(
+        cap().narrowed(Rights::TRANSFER.union(Rights::ROSTER)).expect("a cap carrying ROSTER"),
+    );
+    let said = String::from_utf8_lossy(&granted.stdout);
+    assert_eq!(granted.status.code(), Some(0), "ps with ROSTER exited nonzero: {said}");
+    let mut lines = said.lines();
+    let header = lines.next().unwrap_or("");
+    assert!(
+        header.contains("PID") && header.contains("NAME"),
+        "ps with ROSTER did not print its column header: {said:?}",
+    );
+    let rows = lines.count();
+    assert!(rows > 0, "ps with ROSTER printed a header and no process: {said:?}");
+
+    let refused = ps_endowed(cap().narrowed(Rights::TRANSFER).expect("a cap carrying less"));
+    let complaint = String::from_utf8_lossy(&refused.stderr);
+    assert_eq!(
+        refused.status.code(),
+        Some(1),
+        "ps without ROSTER did not refuse: {:?} / {complaint:?}",
+        String::from_utf8_lossy(&refused.stdout),
+    );
+    assert!(
+        complaint.contains("ROSTER"),
+        "ps without ROSTER did not say which bit it lacked: {complaint:?}",
+    );
+    assert!(
+        refused.stdout.is_empty(),
+        "ps without ROSTER printed a roster anyway: {:?}",
+        String::from_utf8_lossy(&refused.stdout),
+    );
+
+    println!("  ps: {rows} processes with the bit, and a named refusal without it");
+}
+
+/// Run `/bin/ps` holding exactly `cap` and nothing else of ours.
+///
+/// A fresh duplicate per run: the endowment moves into the child, and a claim
+/// this process kept would be a second holder of one handle.
+fn ps_endowed(cap: SysCap) -> Output {
+    Command::new(PS_PATH)
+        .endow(SYSCAP_LABEL, cap.into_raw().0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn /bin/ps")
+        .wait_with_output()
+        .expect("wait for /bin/ps")
+}
+
 /// Run `role` and require that the kernel ended it at its call.
 ///
 /// The marker is what gives the arm teeth: a child that died before reaching
@@ -239,6 +418,15 @@ fn not_a_handle(role: &str) -> ! {
             format!("{:?}", syscall::device_claim(HANDLE_INVALID, DeviceType::Keyboard))
         }
         "rt-absent" => format!("{:?}", syscall::rt_enter(HANDLE_INVALID)),
+        // `HANDLE_INVALID` with room for one entry. The same number is the
+        // ordinary, correct argument for a header-only call — which is why this
+        // arm exists: the difference between the two is the buffer, and a
+        // kernel that read the handle for both would kill every `free` in the
+        // machine instead.
+        "roster-absent" => {
+            let mut buf = [0u8; ONE_ENTRY];
+            format!("{} bytes", syscall::sysinfo(HANDLE_INVALID, &mut buf))
+        }
         // If this comes back at all the kernel refused it, which is already the
         // wrong answer for a handle nobody holds. If it does not come back, the
         // machine this child is running on has been powered off and the parent

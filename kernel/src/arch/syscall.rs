@@ -461,8 +461,9 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         }
         // The capability is first, as it is at every other arm that takes one.
         // The buffer decides whether it is looked at: the header is a machine
-        // fact like `SYS_CPU_COUNT`, and the roster after it is every process
-        // in the machine by name.
+        // fact like `SYS_CPU_COUNT` and stays ambient, and the roster after it
+        // costs `Rights::ROSTER` because it is every process in the machine by
+        // name.
         SYS_SYSINFO => {
             let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a2), a3) else { return bad_addr };
             sys_sysinfo(RawHandle(a1 as u32), &mut buf)
@@ -2517,17 +2518,46 @@ fn sysinfo_thread_bound() -> usize {
 }
 
 /// The machine's header, then the process roster for as much of `out` as is
-/// left.
+/// left, presenting a `SysCap` that carries [`Rights::ROSTER`] for the second.
 ///
-/// **`syscap` is plumbed and not yet read.** The owner ruled on 2026-08-20 that
-/// the roster rides a right; the ABI half of that had to land on its own pull
-/// request, so this argument arrives one landing before the demand that reads
-/// it. Nothing is gated between the two.
-fn sys_sysinfo(_syscap: RawHandle, out: &mut UserBytesMut) -> u64 {
+/// **Two answers under one number, and only the second is authority.** The
+/// header is total and used memory, the CPU count, the live-thread count, the
+/// uptime and the two accumulators a CPU percentage comes out of — a machine
+/// fact like `SYS_CPU_COUNT`, and `free`, the compositor's taskbar and netd's
+/// memory budget all read it and nothing else. The entries after it are one per
+/// live thread, each carrying a pid, a scheduler state, a resident size, an
+/// accumulated CPU time and a 28-byte **name**: a census of everything the
+/// machine is running, which was ambient until the owner ruled on 2026-08-20
+/// that it rides a right. A process endowed one connector learned the name,
+/// size and CPU share of every daemon and every program the user had open.
+///
+/// **The buffer says which of the two is being asked for**, because that is
+/// what it already said: a buffer with no room for an entry cannot be told
+/// anything about another process, so nothing is demanded of `syscap` and a
+/// header-only caller passes `HANDLE_INVALID`. `max_entries` is the whole of
+/// that decision and it is taken here, above the demand, so the two can never
+/// disagree about which call this is.
+///
+/// The refusal is `HandleError`'s ordinary one, as at the four arms beside
+/// this: a capability that resolves without the bit is `PermissionDenied` and
+/// the caller carries on, and a handle the caller does not hold ends it. It is
+/// demanded before the table lock, because `refuse` takes the process down and
+/// needs that lock itself.
+///
+/// [`Rights::ROSTER`]: toyos_abi::handle::Rights::ROSTER
+fn sys_sysinfo(syscap: RawHandle, out: &mut UserBytesMut) -> u64 {
     const HEADER_SIZE: usize = toyos_abi::syscall::SYSINFO_HEADER_SIZE;
     const ENTRY_SIZE: usize = toyos_abi::syscall::SYSINFO_ENTRY_SIZE;
     if out.len() < HEADER_SIZE {
         return SyscallError::InvalidArgument.to_u64();
+    }
+    let max_entries = (out.len() - HEADER_SIZE) / ENTRY_SIZE;
+    if max_entries > 0 {
+        if let Err(e) = process::with_process_data(|data| {
+            data.handles.get::<crate::object::syscap::SysCap>(syscap, Rights::ROSTER)
+        }) {
+            return e.refuse();
+        }
     }
 
     let (total_mem, used_mem) = crate::mm::pmm::stats();
@@ -2554,7 +2584,16 @@ fn sys_sysinfo(_syscap: RawHandle, out: &mut UserBytesMut) -> u64 {
     header[40..48].copy_from_slice(&total_available_ns.to_le_bytes());
     out.write_at(0, &header);
 
-    let max_entries = (out.len() - HEADER_SIZE) / ENTRY_SIZE;
+    // **The ambient call ends here, having built no roster at all.** Every
+    // header-only caller in the tree — `free`, the compositor's taskbar, netd's
+    // memory budget — used to pay for a `Vec` of every thread in the machine
+    // and a sort of it, to write nothing out of either. It is also what makes
+    // the demand above a fact about the whole path rather than about the write
+    // loop: with no room for an entry, nothing about another process is
+    // collected, let alone copied.
+    if max_entries == 0 {
+        return HEADER_SIZE as u64;
+    }
 
     // Collect and sort by (pid, tid) for stable output. Reserved exactly from
     // the count above, so the buffer is `entry_count * 24` and not whatever
