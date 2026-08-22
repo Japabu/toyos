@@ -131,7 +131,7 @@ before adopting:
 | module | unsafe blocks | status |
 |---|---:|---|
 | `drivers/` | 121 | **adopted 2026-08-22 — the first sweep under the reduction ruling.** 121 undocumented blocks (132 `unsafe` blocks in all); **60 removed, 72 documented, 1 filed.** Per driver below. |
-| `arch/` | 107 | not yet swept |
+| `arch/` | 107 | **adopted 2026-08-22 — the last area, and the highest-risk one.** 107 findings (112 `unsafe` blocks in all); **30 removed, 77 documented, 3 filed.** Per file below. |
 | root files (`user_ptr.rs`, `process.rs`, `preempt.rs`, `inbox.rs`, `main.rs`, `symbols.rs`, `hw.rs`, `file_backing.rs`, `sync.rs`, `scheduler.rs`, `pipe.rs`, `page_cache.rs`, `bcachefs_adapter.rs`) | 76 | **adopted** — 13 removed, 63 documented, 4 filed. Per file and per finding below. |
 | `mm/` | 35 | **adopted** — every site now carries a `SAFETY:` comment; two (`object::shm::Pages`, `mm::paging::AddressSpace`'s `Send`/`Sync` impls) turned out to look vestigial rather than load-bearing, filed rather than removed: `issues/kernel/redundant-send-sync-impls-mm-object.md` |
 | `elf/` | 23 | **adopted** — every site now carries a `SAFETY:` comment; writing the justification found two functions (`elf::read_backing_into`, `elf::index::RelocationIndex::apply_to_page`) that write through a raw pointer without being `unsafe fn`, filed as `issues/kernel/raw-pointer-writers-not-marked-unsafe-in-loader.md` (every current call site is correct; the gap is that nothing enforces the next one being) |
@@ -141,8 +141,8 @@ before adopting:
 | `log/` | 2 | **adopted 2026-08-22**, under the reduction ruling. 2 findings (9 `unsafe` blocks in all, seven of them documented before this pass); **0 removed, 2 documented, 1 filed** (`issues/build/logrecord-has-no-as-bytes.md`). |
 | `object/` | 1 | **adopted** — the one site is `object::shm::Pages`'s `Send`/`Sync` pair, part of the finding filed above |
 | `completion/` | 0 undocumented (3 unsafe sites, all already carrying a `SAFETY:`/`Safety:` comment predating this pass) | already documented |
-| **adopted so far** | **282** (`mm` 35 + `elf` 23 + `loader` 8 + `object` 1 + root files 76 + `drivers` 121 + `sched` 8 + `iommu` 8 + `log` 2) | gated at the source, because the kernel is one crate with no `-p` scoping to hang a lint on. The area sweeps opened their entry module (`mm/mod.rs`, `object/mod.rs`, `elf/mod.rs`, `loader/mod.rs`, `drivers/mod.rs`, `sched/mod.rs`, `iommu/mod.rs`, `log/mod.rs`) with `#![warn(clippy::undocumented_unsafe_blocks)]`; the root-file sweep could not — there is no entry module above them but the crate root — so it **inverted the form**: `main.rs` carries one crate-level `#![warn(...)]` and an `#[allow(...)]` on each `mod` line still owed. Both compose with `host-tests.yml`'s existing `-D warnings` on the two kernel invocations, so no command line changed. The module attributes are now redundant under the crate one and are left where they are — deleting them touches swept areas for nothing, and each still records its own area's status. |
-| **remaining** | **107** (`arch` 107) | measured 2026-08-22 with `--force-warn clippy::undocumented_unsafe_blocks` over both kernel invocations, which is what reads *through* the `allow`. Each `allow` in `main.rs` is deleted by the pull request that sweeps its area, so the list is the ledger; `drivers`, `sched`, `iommu` and `log` left it the day it arrived, and `arch` is what is owed. |
+| **adopted** | **389** — the whole kernel (`mm` 35 + `elf` 23 + `loader` 8 + `object` 1 + root files 76 + `drivers` 121 + `arch` 107 + `sched` 8 + `iommu` 8 + `log` 2) | gated at the source, because the kernel is one crate with no `-p` scoping to hang a lint on. Every area sweep opened its entry module (`mm/mod.rs`, `object/mod.rs`, `elf/mod.rs`, `loader/mod.rs`, `drivers/mod.rs`, `arch/mod.rs`, `sched/mod.rs`, `iommu/mod.rs`, `log/mod.rs`) with `#![warn(clippy::undocumented_unsafe_blocks)]`; the root-file sweep could not — there is no entry module above them but the crate root — so it **inverted the form**: `main.rs` carries one crate-level `#![warn(...)]`, and an `#[allow(...)]` on a `mod` line is the form a tree not yet swept would take. Both compose with `host-tests.yml`'s existing `-D warnings` on the two kernel invocations, so no command line changed. The module attributes are redundant under the crate one and are left where they are — each still records its own area's status. |
+| **remaining** | **0** | measured 2026-08-22, after the last two sweeps (`arch`, and `sched`+`iommu`+`log`) merged, with `--force-warn clippy::undocumented_unsafe_blocks` over both kernel invocations: no finding anywhere in `kernel/src`. The `allow` list in `main.rs` is empty, which is the state this row was opened to reach; a new tree that cannot be gated the day it appears goes on that list and comes off it by the pull request that sweeps it. |
 
 ### `drivers/`, per driver (swept 2026-08-22)
 
@@ -222,6 +222,127 @@ blocks that remain are the same shape — a bounds-checked view over
 approximations of the one thing that belongs on `DmaPool`. The file carries
 the per-file site list.
 
+### `arch/`, per file (swept 2026-08-22)
+
+The largest unswept area left and the highest-risk one — `entry.rs` is every
+Ring 0 entry, `syscall.rs` is the user/kernel boundary, and `control_regs.rs`
+is the one declaration every CPU applies. 107 findings reproduced exactly
+(`--force-warn clippy::undocumented_unsafe_blocks` over both kernel
+invocations). `unsafe` blocks before and after are counted over
+`kernel/src/arch/**/*.rs` excluding comment lines; "found" is smaller than
+"before" wherever a file already had documented blocks or blocks behind a
+feature neither invocation enables.
+
+| file | found | blocks before | after | removed |
+|---|---:|---:|---:|---:|
+| `percpu.rs` | 30 | 32 | 26 | 6 |
+| `cpu.rs` | 21 | 23 | 23 | 0 |
+| `idt/exceptions.rs` | 12 | 12 | 11 | 1 |
+| `smp.rs` | 11 | 11 | 5 | 6 |
+| `syscall.rs` | 9 | 10 | 10 | 0 |
+| `idt/mod.rs` | 7 | 7 | 2 | 5 |
+| `mod.rs` | 4 | 4 | 4 | 0 |
+| `control_regs.rs` | 4 | 4 | 4 | 0 |
+| `apic.rs` | 4 | 4 | 1 | 3 |
+| `fpu.rs` | 3 | 3 | 3 | 0 |
+| `pat.rs` | 1 | 1 | 1 | 0 |
+| `debug.rs` | 1 | 1 | 1 | 0 |
+| **total** | **107** | **112** | **91** | **21** |
+
+**`entry.rs` is not in that table and neither is `tlb.rs`, `mtrr.rs` or any of
+the ten small `idt/` handlers: they contain no `unsafe` block at all.** The
+bracket and the entry stubs are `naked_asm!`, which is a whole function and not
+a block, so the file that owns the `cld` every Ring 0 entry clears was never
+this lint's subject and is untouched by this sweep.
+
+**30 findings removed against 21 blocks, and the difference is nine new
+documented blocks** — eight `const`-generic GS primitives in `arch::percpu::gs`
+and one inside `smp.rs`'s `asm_label_addr!`. Two more removals landed outside
+the area: `preempt.rs` gave up all six of its blocks to the same move, and
+`mm/paging.rs` gained one.
+
+**`percpu.rs` reached its own fields three ways and now reaches them one.**
+`preempt.rs` had six `const`-generic GS primitives and three hand-copied offset
+literals (240, 244, 256) while `arch/percpu.rs` — which declares `PerCpu`,
+asserts every offset against the number the entry stubs hardcode, and reaches
+the same fields — used a raw `asm!` string per accessor *and* `(*percpu_ptr()).field`.
+The primitives move to `arch::percpu::gs`, gain `read_u64` and a register-form
+`write_u8`, and every GS access in the kernel goes through them; `preempt.rs`
+keeps its policy, loses its assembly, and its literals become
+`offset_of!`-derived constants that are still asserted against 240/244/256.
+
+**What the `(*percpu_ptr()).field` form actually cost, which is why this was a
+reduction and not a respelling.** `[profile.toyos]` sets
+`debug-assertions = true`, so every one of those dereferences carried a null
+test, an alignment test and two panic landing pads —
+`panic_null_pointer_dereference` and `panic_misaligned_pointer_dereference` —
+reached from `trap_dispatch`, `crash_report`, `fatal_exception`,
+`sched::driver::execute` and `Machine::idle_wait`. Panic landing pads on the
+crash path. `movq %gs:0,%rsi; testb $7,%sil; jne; testq; je; movq 216(%rsi),%r14`
+is now `movq %gs:216, %r14`, and the kernel's 27 `gs:[0]` self-pointer loads
+are 5.
+
+**Three `asm!("cli"/"sti")` in `idt/mod.rs`** became
+`arch::cpu::{enable,disable}_interrupts`, which is that instruction with those
+options — the three
+`issues/kernel/five-more-inline-cli-sti-where-a-safe-helper-exists.md` names in
+this area. The two it names in `main.rs` are a root file and stay filed.
+
+**`smp.rs`'s `asm_label_addr!` took its `unsafe` inside.** A `lea` off `rip`
+computes an address and reads nothing, so there was no caller obligation to
+state and the six sites that wrote `unsafe { asm_label_addr!(…) }` were each
+restating the same nothing. **`pat.rs` and `smp.rs` also stopped spelling
+instructions `arch::cpu` already names** — `mov cr0`, `mov cr4`, `wbinvd`,
+`mov cr3` — and `mm::paging::load_kernel_flush` is `activate_kernel`'s sibling
+for the one caller that reaches a CR3 switch before `CR4.PCIDE` is set on its
+CPU, where `activate`'s `NOFLUSH` bit is reserved.
+
+**`cpu.rs` gave up nothing and gained a module header instead.** Its
+twenty-one blocks are all irreducible the same way — one instruction Rust has
+no operation for, at the bottom of the tree, with no lower layer to push it
+into — and saying that twenty-one times says nothing. The header says it once;
+each site adds the instruction's own failure mode and which half of it the
+signature discharges. Writing that is what found the first of the three filings
+below.
+
+**Three findings, filed rather than fixed.**
+
+- `issues/kernel/arch-cpu-safe-wrappers-that-are-not.md` — `wrmsr`, `outb`,
+  `outw`, `wrfsbase`, `invlpg` and `invpcid` are safe `fn` and take a
+  caller-chosen value that reaches hardware; `wrmsr` alone can repoint `LSTAR`.
+  Marking them adds an `unsafe` block at 100-odd call sites across `arch/` and
+  the drivers, which is a change to code and not to comments.
+- `issues/kernel/the-db-handler-is-exercised-by-nothing.md` — the missing
+  coverage that decided one reduction *not* taken. `exceptions::debug_handler`
+  spells `safe_read_kernel`'s two checks by hand and collapsing them is one
+  fewer block and one fewer copy of a predicate — but nothing in the suite
+  raises `#DB` at all, and a restructure with no test under it is not what this
+  sweep does. The site says so.
+- `issues/build/moduleinfo-has-no-as-bytes.md` — `sys_query_modules`'s
+  `transmute_copy`, the second boundary-crossing ABI type with no safe
+  `as_bytes` after `LogRecord`. Same reason for filing: the fix is an edit under
+  `toyos-abi/src`, its own pull request and a sysroot claim.
+
+`syscall.rs`'s two raw writes into `PageAlloc` memory are a third site of the
+shape `issues/kernel/pagealloc-has-no-checked-window.md` already carries, and
+the TLS one has its bound fifty lines and one function away from the write;
+both say so at the site rather than opening a second file about it.
+
+**The oracle was the compiler, and the numbers say what moved.** Emitting the
+kernel's assembly at the guest's own `[profile.toyos]` with both actuator
+features on gives **216,782 instruction lines before and 216,584 after**.
+Thirteen functions differ and three disappear (`percpu::syscall_num`,
+`idle_stack_top` and `set_fault_state` were out-of-line calls and are one
+instruction each now); every one of the differences is a per-CPU field read
+losing its pointer, its debug-assertion checks and its landing pads, or the
+register allocation downstream of that. **No privileged or string instruction
+changed count anywhere in the kernel**: `cld` 12, `sti` 14, `cli` 37, `wrmsr`
+58, `rdmsr` 19, `wbinvd` 3, `fxsave64` 12, `fxrstor64` 13, `invlpg` 3, `cpuid`
+41, `iretq` 14, `sysretq` 1, `lgdt` 4 — and `IA32_FMASK`'s `$263680` appears
+twice in both. The naked entry stubs are instruction-identical. The instrument
+has teeth: mutating one `enable_interrupts()` to `disable_interrupts()` moved
+exactly one line of the 216,584, `sti` → `cli`.
+
 ### The root files, per file (swept 2026-08-22)
 
 The first sweep run under the owner's ruling at the top of this file, and the
@@ -245,22 +366,39 @@ counts are what the ruling asks for: removed beside documented.
 | **total** | **76** | **13** | **63** | |
 
 Four findings came out of writing the justifications, filed rather than fixed
-because each is a decision past a documentation sweep:
+because each was a decision past a documentation sweep. **All four were decided
+and fixed on 2026-08-22**, which is what the sweep's own report predicted would
+be worth more than the comments were:
 
-- `issues/kernel/inbox-rings-are-borrowed-not-copied.md` — six of `inbox.rs`'s
-  seven blocks mint `&`/`&mut` over a page the process maps writable, which is
-  the shape `user_ptr.rs`'s `UserBytes` header argues against. Three of them are
-  `&mut`, and `create` maps the page into the process *before* building the
-  headers — the cheap half of the fix is a reordering.
-- `issues/kernel/initrd-extents-are-not-bounded-by-the-image.md` —
-  `InitrdBacking` is given the *file's* size and never the image's, so nothing
-  bounds an extent against the end of the initrd it came out of.
-- `issues/kernel/user-pages-still-read-through-a-plain-deref.md` — the futex
-  word and the crash dump read user memory with `*ptr` where `copy_in` uses
-  `read_volatile`, on a stated argument the two do not follow.
-- `issues/kernel/pagealloc-has-no-checked-window.md` — the demand-paging fill's
-  two raw writes want a bounded window type, and the obvious `&mut [u8]` is the
-  borrow that is wrong for pages about to become a user mapping.
+- Six of `inbox.rs`'s seven blocks minted `&`/`&mut` over a page the process
+  maps writable, which is the shape `user_ptr.rs`'s `UserBytes` header argues
+  against; three were `&mut`, and `create` mapped the page into the process
+  *before* building the headers. **Decided and fixed**: the page is built before
+  it is mapped and `SharedMemObject::phys_before_mapping` refuses the reversed
+  order; the ring headers are reached one `&AtomicU32` at a time and a
+  submission is a `read_volatile` of the whole entry, so no reference over that
+  page exists at all.
+- `InitrdBacking` was given the *file's* size and never the image's, so nothing
+  bounded an extent against the end of the initrd it came out of. **Decided and
+  fixed 2026-08-22**: it holds the image (`bcachefs::SliceBlockIO`, now `Copy`)
+  and reads through `SliceBlockIO::block`, which is the one thing that knows
+  both the block number and the length. `file_backing.rs` and
+  `bcachefs_adapter.rs` now contain no `unsafe` at all — the `Send`/`Sync` pair,
+  the extent-to-pointer path and the copy out of it are gone, and the one
+  remaining claim about the initrd region is `SliceBlockIO::new`'s, made once in
+  `main.rs` where the region is named. A reduction, not a comment.
+- The futex word and the crash dump read user memory with `*ptr` where
+  `copy_in` uses `read_volatile`. **Decided and fixed 2026-08-22**: both are
+  `read_volatile`, and the rule is now `user_ptr.rs`'s module header rather
+  than a per-site preference.
+- The demand-paging fill's two raw writes wanted a bounded window type, and the
+  obvious `&mut [u8]` is the borrow that is wrong for pages about to become a
+  user mapping. **Decided and fixed 2026-08-22**: no new type — `PageAlloc`
+  gained a safe `window()` that hands back the `mm::KernelSlice` this kernel
+  already has, sized from the allocation it owns, and `UserStack` holds one
+  instead of its own private bound. That is also half of
+  `issues/design-debt/kernelslice-from-raw-cannot-check-itself.md`'s named fix
+  shape; the loader and `DmaPool` still name their own sizes, so it stays open.
 
 One correctness fix landed with the sweep rather than being filed, because
 writing the comment is what found it and the fix is a deleted token:

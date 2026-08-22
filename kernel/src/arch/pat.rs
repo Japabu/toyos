@@ -67,23 +67,35 @@ const _: () = assert!(ENTRIES[WC_ENTRY] == WC);
 /// names.
 pub fn init() {
     let flags: u64;
-    let cr0: u64;
-    let cr4: u64;
+    // SAFETY: **one block, because the sequence is the safety argument.** The
+    // `pushfq`/`pop`/`cli` opening is balanced and reads `RFLAGS` before
+    // clearing IF, which has to be one uninterruptible run; everything after it
+    // has to stay inside the no-fill window `write_cr0` opens, which is what
+    // `wbinvd`'s own `# Safety` asks for and what SDM Vol. 3A §11.12.4 makes the
+    // whole procedure. Splitting it would put a compiler-visible boundary in the
+    // middle of a window the CPU is holding.
+    //
+    // Each instruction's own requirement is `arch::cpu`'s, and this file spells
+    // none of them itself: `write_cr0` wants a caller that owns the whole
+    // register, and both writes here are the CPU's own live value with `CD`/`NW`
+    // moved and then put back; `wbinvd` wants the no-fill window, which the line
+    // above it opened; `flush_tlb` is `unsafe` for the same `write_cr4` reason
+    // and is handed the live `CR4` unchanged but for `PGE`.
     unsafe {
         core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags);
-        core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
-        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+        let cr0 = cpu::read_cr0();
+        let cr4 = cpu::read_cr4();
         // CD set with NW clear is no-fill mode: hits still write through, and
         // nothing new enters the caches while the table is inconsistent.
-        core::arch::asm!("mov cr0, {}", in(reg) (cr0 | CR0_CD) & !CR0_NW, options(nostack));
-        core::arch::asm!("wbinvd", options(nostack, preserves_flags));
+        cpu::write_cr0((cr0 | CR0_CD) & !CR0_NW);
+        cpu::wbinvd();
         flush_tlb(cr4);
 
         cpu::wrmsr(IA32_PAT, PAT_VALUE);
 
         flush_tlb(cr4);
-        core::arch::asm!("wbinvd", options(nostack, preserves_flags));
-        core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack));
+        cpu::wbinvd();
+        cpu::write_cr0(cr0);
     }
 
     if flags & RFLAGS_IF != 0 {
@@ -106,14 +118,17 @@ const RFLAGS_IF: u64 = 1 << 9;
 
 /// Flush every TLB entry including the global ones, which a plain CR3 reload
 /// leaves alone (SDM Vol. 3A §4.10.4.1).
+///
+/// # Safety
+/// `cr4` must be this CPU's live `CR4`: both arms put it back verbatim, so a
+/// value from anywhere else would silently become the machine configuration —
+/// which is [`cpu::write_cr4`]'s requirement and not a new one.
 unsafe fn flush_tlb(cr4: u64) {
     if cr4 & CR4_PGE != 0 {
-        core::arch::asm!("mov cr4, {}", in(reg) cr4 & !CR4_PGE, options(nostack));
-        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack));
+        cpu::write_cr4(cr4 & !CR4_PGE);
+        cpu::write_cr4(cr4);
     } else {
-        let cr3: u64;
-        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
-        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack));
+        cpu::write_cr3(cpu::read_cr3());
     }
 }
 

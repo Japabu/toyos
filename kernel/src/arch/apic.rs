@@ -276,6 +276,11 @@ pub fn halt_all_cpus() -> ! {
     // screen and never the serial report if it goes wrong — and it means a
     // line arriving on serial proves the paint already finished.
     let painted = crate::drivers::panic_console::render();
+    // SAFETY: `panic_flush` is `unsafe` because it bypasses both the log-ring
+    // lock and the serial backend lock, which is only correct on a machine that
+    // is about to stop — the doc comment above is the argument for why that is
+    // this path. Irreducible: what makes it sound is the caller's position (the
+    // halt IPI is out, nothing will run again), which no type can carry.
     unsafe { crate::drivers::serial::panic_flush(); }
     // After the flush, because the flush is the deepest this path ever goes:
     // it is where the drain buffer lives, and a check placed before it would
@@ -318,8 +323,7 @@ pub fn init_timer() {
     cpu::wrmsr(X2APIC_TIMER_INIT, 0);
     TIMER_TICKS.store(ticks_10ms, Ordering::Release);
     // Fallback for any Ring 0 fire before the scheduler arms its first quantum.
-    let percpu = unsafe { &*percpu::percpu_ptr() };
-    percpu.last_armed_ticks.store(OneShot::ticks(ticks_10ms as u64).0, Ordering::Relaxed);
+    percpu::set_last_armed_ticks(OneShot::ticks(ticks_10ms as u64).0);
     log!("LAPIC timer: {} ticks/10ms", ticks_10ms);
 }
 
@@ -378,8 +382,7 @@ impl OneShot {
         // An AP reaches its first idle before it has ever run a task, so before
         // this register has ever been written — and an LVT resets masked.
         cpu::wrmsr(X2APIC_LVT_TIMER, TIMER_VECTOR as u64);
-        let percpu = unsafe { &*percpu::percpu_ptr() };
-        percpu.last_armed_ticks.store(self.0, Ordering::Relaxed);
+        percpu::set_last_armed_ticks(self.0);
         cpu::wrmsr(X2APIC_TIMER_INIT, self.0 as u64);
     }
 }
@@ -417,8 +420,7 @@ pub fn arm_within(nanos: u64) {
 /// the Ring 0 stub's for "do not re-arm" — the one count that is not a
 /// [`OneShot`], because it is not an interval.
 pub fn stop_timer() {
-    let percpu = unsafe { &*percpu::percpu_ptr() };
-    percpu.last_armed_ticks.store(0, Ordering::Relaxed);
+    percpu::set_last_armed_ticks(0);
     cpu::wrmsr(X2APIC_TIMER_INIT, 0);
     crate::trace::trace(crate::trace::Kind::TimerStop, 0);
 }

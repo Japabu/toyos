@@ -5,9 +5,9 @@
 // kernel is one crate with no `-p` scoping, so an *area* is gated at the
 // source rather than on `host-tests.yml`'s command line; `-D warnings`, which
 // both kernel clippy invocations already pass, is what turns this `warn` into
-// a hard error. Written here as one crate-level `warn` plus a shrinking list
-// of `allow`ed module trees — rather than one attribute per swept file — so
-// that what is still owed is five lines in one place, and a *new* file added
+// a hard error. Written here as one crate-level `warn` plus a list of
+// `allow`ed module trees — rather than one attribute per swept file — so
+// that whatever is still owed is a list in one place, and a *new* file added
 // beside this one is gated the day it appears instead of the day somebody
 // remembers to give it an attribute.
 //
@@ -29,15 +29,16 @@ mod sleeplock;
 mod sync;
 mod id_map;
 
-// The five module trees the sweep has not reached. Each `allow` is deleted by
-// the pull request that documents that area, and the list is the whole of what
-// the kernel still owes the lint — 107, 121, 8, 8 and 2 blocks when it was
-// measured (2026-08-22). An area that instead gates itself with its own
-// `#![warn(...)]` inside its `mod.rs`, the way `mm/`, `object/`, `elf/` and
-// `loader/` already do, wins over the line here — the inner attribute is the
-// more specific one — so this list is never a way to un-gate a swept tree,
-// only a record of the ones nobody has swept.
-#[allow(clippy::undocumented_unsafe_blocks, reason = "arch/: not yet swept")]
+// Every module tree is swept (the last two landed 2026-08-22), so no `mod` line
+// below carries an `#[allow(clippy::undocumented_unsafe_blocks, reason = …)]`.
+// A tree that cannot be gated the day it appears takes that attribute, and the
+// pull request that sweeps it deletes it again; the list of such lines is the
+// whole of what the kernel owes the lint, and
+// `issues/build/clippy-has-never-run-here.md` carries the per-area record. An
+// area that gates itself with its own `#![warn(...)]` inside its `mod.rs`, the
+// way every swept area does, wins over a line here — the inner attribute is
+// the more specific one — so such a list is never a way to un-gate a swept
+// tree, only a record of the ones nobody has swept.
 mod arch;
 mod drivers;
 
@@ -592,11 +593,23 @@ unsafe fn kernel_main(kernel_args: &KernelArgs) -> ! {
     inbox::init();
 
 
-    // Mount initrd as read-only root filesystem (bcachefs, no extraction)
+    // Mount initrd as read-only root filesystem (bcachefs, no extraction).
+    //
+    // The image is named once, here, and the mount and every file backing under
+    // it hold that same `(base, len)` pair — which is what lets a block number
+    // out of the initrd's own btree be compared against the initrd's end.
     assert!(!initrd.is_empty(), "No initrd provided");
-    let initrd_base = initrd.as_ptr();
-    let initrd_fs = bcachefs_adapter::mount_initrd(initrd_base, initrd.len());
-    vfs::lock().set_root(Box::new(bcachefs_adapter::ReadOnlyBcacheFsAdapter::new(initrd_fs, initrd_base)));
+    // SAFETY: `SliceBlockIO::new` asks that the region be valid for `len` bytes
+    // for as long as the value lives. `initrd` is the region `KernelArgs` names
+    // — placed by the bootloader, reserved out of the PMM above, never freed
+    // and never written — and what is built from it lives for the rest of the
+    // boot, so the region outlives it trivially. Irreducible: the region
+    // arrives as an address and a length from firmware, so somebody has to make
+    // the first claim that it is memory, and this is the one place that claim
+    // is made.
+    let initrd_image = unsafe { bcachefs::SliceBlockIO::new(initrd.as_ptr(), initrd.len()) };
+    let initrd_fs = bcachefs_adapter::mount_initrd(initrd_image);
+    vfs::lock().set_root(Box::new(bcachefs_adapter::ReadOnlyBcacheFsAdapter::new(initrd_fs, initrd_image)));
 
     // NVMe bcachefs at /home when the device is ours, a tmpfs when it is not,
     // so a machine we may not write to still boots to a working system. The
