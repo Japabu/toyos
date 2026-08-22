@@ -269,6 +269,53 @@ actuators! {
     /// the CPU genuinely comes back. See `sched/dump.rs`'s `deaf_window`.
     dump_deaf_cpu = "dump-deaf-cpu";
 
+    /// Storm the CPU that is spinning on `syscall` from Ring 3 with NMIs, and
+    /// count how many arrive at CPL 0 with a user `rsp` — the window
+    /// `arch::idt`'s IST2 row exists for.
+    ///
+    /// **Where an asynchronous interrupt lands is decided inside the guest.**
+    /// QEMU delivers every IPI it is given and has no way to aim one at an
+    /// instruction, so there is no device, machine property or monitor command
+    /// that puts an NMI in a three-instruction window; the alternative — a
+    /// kernel that pretends one arrived — would certify nothing about the stack
+    /// the CPU actually pushes on. Nothing here is faked: another CPU sends it,
+    /// the victim takes it where it is, and the classification is read off the
+    /// CPU's own frame.
+    ///
+    /// **The storm arms on the victim's own syscall count and never on a
+    /// clock**, so it cannot fire at a machine where nothing is spinning yet —
+    /// what that cost while it was a wall-clock instant is written at
+    /// `nmi_gate::SPINNING_SYSCALLS`. Implies `diag-tick`, because the sending
+    /// CPU looks from its idle loop and a quiet CPU would otherwise sleep
+    /// through the run. See `kernel/src/nmi_gate.rs`.
+    syscall_window_nmi = "syscall-window-nmi";
+
+    /// Take the IST index off vector 2's gate, leaving the handler, the ring and
+    /// everything else exactly as it ships.
+    ///
+    /// **The kernel this tree had until 2026-08-22, and the negative control on
+    /// the row above.** With it the CPU builds the NMI frame at whatever `rsp`
+    /// holds, so an NMI in the syscall window writes to a user page from CPL 0,
+    /// SMAP refuses, and the machine takes the `#DF` this whole change is about.
+    /// The IDT is the guest's own memory and no QEMU property edits it, so the
+    /// state is unreachable from the host side; and it replaces the *behaviour*
+    /// rather than a verdict, which is what keeps the gate above non-vacuous.
+    nmi_without_ist = "nmi-without-ist";
+
+    /// Return from inside the NMI handler through an `iretq` with a second NMI
+    /// already pending, which is the one way a second NMI can enter on the
+    /// stack the first is standing on.
+    ///
+    /// **The re-entrancy the design argues cannot happen, staged rather than
+    /// assumed.** The architecture blocks NMI delivery until the handler's
+    /// `iretq`, so nesting needs an early one — a handler that faults gets it
+    /// for free, and Linux's nested-NMI machinery exists for exactly that. No
+    /// host-side stimulus can produce it: it is one CPU, inside a handler,
+    /// between two instructions. What it drives is whether `nmi_entry`'s check
+    /// fires and the machine says so, or whether the outer frame is silently
+    /// overwritten. See `kernel/src/nmi_gate.rs`'s `stage_nested_if_armed`.
+    nmi_nested = "nmi-nested";
+
     /// Report an empty root hub for the first 300 ms of the boot, so the port
     /// scan runs against a controller that has not finished detecting its
     /// devices yet. That is what every physical root hub does after HCRST and
@@ -678,6 +725,7 @@ const IMPLIES: &[(&str, &[&str])] = &[
     ("usb-short-read", &["usb-storage-gate"]),
     ("metal-panic-probe", &["diag-tick"]),
     ("heartbeat", &["diag-tick"]),
+    ("syscall-window-nmi", &["diag-tick"]),
 ];
 
 #[cfg(feature = "boot-actuators")]

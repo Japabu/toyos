@@ -33,16 +33,17 @@ pub mod tlb;
 /// The witness that one log reservation and its publication cannot be
 /// preempted on this CPU.
 ///
-/// **Both IF and TF are clear.** IF excludes IRQ delivery and scheduler
-/// preemption. TF used to matter independently — Ring 3 could set it, `SYSCALL`
-/// did not mask it, and the `#DB` handler logged before returning, so a
-/// single-stepping thread could reserve a whole newer generation while the
-/// interrupted writer was halfway through its slot body. Neither half of that is
-/// true now: `arch::syscall::init` puts `TF` in `IA32_FMASK` and every gate
-/// clears it, so no Ring 0 code in this kernel runs with it set, and `#DB` from
-/// Ring 3 ends the process instead of reporting. The branch below is therefore
-/// unreachable rather than load-bearing
-/// (`issues/kernel/the-log-guard-still-clears-a-flag-ring-0-cannot-hold.md`).
+/// **IF is clear, and TF cannot be set.** IF excludes IRQ delivery and scheduler
+/// preemption, and `cli` is what this closes with. TF used to be cleared here
+/// too, and had to be: Ring 3 could set it, `SYSCALL` did not mask it, and the
+/// `#DB` handler logged before returning — so a single-stepping thread could
+/// reserve a whole newer generation while the interrupted writer was halfway
+/// through its slot body. **Neither half is true any more, so the second write
+/// is gone rather than kept for safety.** `emit` is kernel-only, and the two
+/// ways into Ring 0 both settle the bit before a kernel instruction runs:
+/// `arch::syscall::init` names TF in `IA32_FMASK`, and every interrupt and trap
+/// gate clears it (SDM Vol. 3A §6.12.1). No Ring 0 code in this kernel runs with
+/// TF set, and a `#DB` from Ring 3 ends the process rather than reporting.
 ///
 /// The bracket is deliberately narrower than formatting: it covers only the
 /// shard pointer and identity reads, the unlocked `xadd`, and the body
@@ -59,18 +60,14 @@ pub(crate) struct LogCommitGuard {
 
 impl LogCommitGuard {
     pub fn close() -> Self {
-        const TF: u64 = 1 << 8;
-        const IF: u64 = 1 << 9;
-
         let rflags: u64;
-        // SAFETY: three blocks' worth of one argument, so it is written once
-        // here. `pushfq`/`pop` is balanced and `push`/`popfq` is balanced, so
-        // `rsp` ends where it started and no `nostack` is claimed. `cli` and the
-        // masked `popfq` write `RFLAGS` and nothing else. **Irreducible by
-        // sequence**: reading `RFLAGS`, clearing IF and — where Ring 3 left TF
-        // set — clearing TF too must be one uninterruptible run, which is the
-        // same reason `hw::IrqGuard` cannot be built out of `cpu::` calls
-        // either. The `popfq` in `Drop` restores exactly the word `close` read.
+        // SAFETY: two blocks' worth of one argument, so it is written once
+        // here. `pushfq`/`pop` is balanced, so `rsp` ends where it started and
+        // no `nostack` is claimed; `cli` writes one `RFLAGS` bit and touches no
+        // memory. **Irreducible by sequence**: reading `RFLAGS` and clearing IF
+        // must be one uninterruptible run, which is the same reason
+        // `hw::IrqGuard` cannot be built out of `cpu::` calls either. The
+        // `popfq` in `Drop` restores exactly the word `close` read.
         unsafe {
             // Deliberately no `nomem`: besides these instructions using the
             // stack, the implicit memory clobber keeps shard selection and
@@ -91,14 +88,6 @@ impl LogCommitGuard {
                 return Self { rflags, _not_send_sync: core::marker::PhantomData };
             }
             core::arch::asm!("cli");
-            if rflags & TF != 0 {
-                let masked = rflags & !(TF | IF);
-                core::arch::asm!(
-                    "push {masked}",
-                    "popfq",
-                    masked = in(reg) masked,
-                );
-            }
         }
         Self { rflags, _not_send_sync: core::marker::PhantomData }
     }
