@@ -5,6 +5,13 @@
 //! decides anything: no queue is consulted, no state machine advances, no
 //! ordering-sensitive protocol lives below this line. That is the whole
 //! contract — the simulator replaces this file and nothing else.
+//!
+//! **[`Hw::switch`] loads the incoming context's `rsp` exactly once.**
+//! [`check_switch_frame`] returns the word it validated and that returned value
+//! is what reaches `context_switch`; reading `ctx.rsp` a second time would emit a
+//! second load, because the `mov cr3` between the two is an `asm!` with a memory
+//! clobber that LLVM may not forward across — and the machine would then stand on
+//! a word the guard never saw.
 
 use core::arch::asm;
 
@@ -318,8 +325,17 @@ fn switch_frame_is_wrong(ctx: &KernelCtx, token: &RunToken<KernelPayload>) -> ! 
 
 /// See [`switch_frame_is_wrong`]. Kept tiny so the hot path is a load, a
 /// compare and a not-taken branch.
+///
+/// **It returns the word it validated, and that returned value is what the
+/// machine switches onto.** A caller that read `ctx.rsp` again would be
+/// standing on a word this never saw: `cr3.activate()` is an `asm!` with a
+/// memory clobber, so LLVM may not forward the load across it and a second read
+/// is a second load in the emitted text — two `mov (%r14),…` where the guard
+/// covers only the first. `#[must_use]` is what makes ignoring the answer a
+/// diagnostic rather than a silent reintroduction of that gap.
 #[inline]
-fn check_switch_frame(ctx: &KernelCtx, token: &RunToken<KernelPayload>) {
+#[must_use]
+fn check_switch_frame(ctx: &KernelCtx, token: &RunToken<KernelPayload>) -> u64 {
     let rsp = ctx.rsp;
     if !crate::mm::is_kernel_addr(rsp) || !rsp.is_multiple_of(8) {
         switch_frame_is_wrong(ctx, token);
@@ -376,14 +392,15 @@ fn check_switch_frame(ctx: &KernelCtx, token: &RunToken<KernelPayload>) {
     }
     #[cfg(feature = "switch-witness")]
     switch_witness_capture(ctx, token, rsp);
+    rsp
 }
 
 /// The seven words `context_switch` pops between [`check_switch_frame`] and its
 /// `ret`, copied here and compared there.
 ///
 /// **What is unmeasured, stated exactly.** The check above reads `ctx.rsp`,
-/// tests it three ways, reads the word at `+56` and returns. The frame is popped
-/// in [`crate::sched::driver::context_switch`], and between the two lie the
+/// tests it three ways, reads the word at `+56` and returns it. The frame is
+/// popped in [`crate::sched::driver::context_switch`], and between the two lie the
 /// preempt-count swap, two per-CPU identity writes, the TSS stack handover, a
 /// **`mov cr3`**, a `wrfsbase` and the `RUNNING_CTX` store. Nothing tests the
 /// frame across that span, and the class's one parked capture is a `popfq`/`ret`
@@ -466,11 +483,17 @@ fn switch_witness_capture(ctx: &KernelCtx, token: &RunToken<KernelPayload>, rsp:
 /// The compare, from inside `context_switch` with the stack pointer already
 /// moved and the first `pop` one instruction away.
 ///
-/// `rsp` is the machine's own stack pointer, handed over in `rdi` — not the
-/// field re-read, which is the whole point: `Hw::switch` loads `ctx.rsp` twice
-/// (once for the check, once for the switch, and the `mov cr3` between them
-/// forbids the compiler from forwarding the first), so the value the machine
-/// stands on is not the value anything has ever validated.
+/// `rsp` is the machine's own stack pointer, handed over in `rdi`, and the field
+/// is re-read here beside it. **The two are separate questions and were one
+/// until the single load existed.** `rsp == shadow.rsp` says the word the
+/// machine is standing on is the word the check validated — which is now
+/// `Hw::switch`'s invariant rather than a hope, because `check_switch_frame`
+/// returns that word and nothing reads the field again. `field == shadow.rsp`
+/// says the separate thing: that nothing wrote `ctx.rsp` in the window at all.
+/// Before the invariant a moved field *was* a moved stack pointer — the switch
+/// re-read it across the `mov cr3`, which LLVM may not forward a load over — so
+/// the two answers could not come apart, and `switch-witness-mutate-rsp` is the
+/// build in which they do.
 ///
 /// # Safety
 /// Called only from [`crate::sched::driver::context_switch`], with `rsp` equal
@@ -552,12 +575,16 @@ fn switch_window_is_wrong(rsp: u64, field: u64, now: &[u64; 8], shadow: &SwitchS
 ///   `rbx` slot — which is the "another execution wrote this frame" arm, and the
 ///   one no check before this one could see.
 /// * `switch-witness-mutate-rsp` moves `ctx.rsp` up by eight *after* the check
-///   has validated it, which is the double-load hazard staged: `Hw::switch`
-///   re-reads the field, so the machine switches onto a frame nothing validated.
+///   has validated it. It stages the double-load hazard, and since
+///   [`check_switch_frame`] returns the word it validated it is **the negative
+///   control for that single load**: its verdict is not whether the witness
+///   fires but which of the two clauses in [`switch_witness_verify`] the report
+///   names. A switch that re-read the field reports `MOVED` and stands eight
+///   bytes up its own stack; one that carries the validated value reports `THE
+///   SAME` with the field `CHANGED SINCE THE CHECK`, and the seven words agree.
 ///   Eight and not garbage on purpose — the frame stays inside the same kernel
-///   stack, so a build whose witness does **not** fire keeps running and the
-///   control's failure is visible as a *survival* rather than as a different
-///   death.
+///   stack, so the arm is decided by a word of the report and not by which way
+///   the machine happened to die.
 ///
 /// # Safety
 /// A mutation build is not a kernel anybody boots for any other purpose.
@@ -627,7 +654,11 @@ impl Hw for KernelHw {
             (*save).fs_base = cpu::rdfsbase();
             (*save).preempt = crate::preempt::count();
             let incoming: &KernelCtx = &*restore;
-            check_switch_frame(incoming, &token);
+            // **The only load of `incoming.rsp` this switch has.** See
+            // [`check_switch_frame`]: reading the field again below would put a
+            // second `mov (%r14),…` after the `mov cr3`, and the guard above
+            // covers only the first.
+            let rsp = check_switch_frame(incoming, &token);
             #[cfg(any(
                 feature = "switch-witness-mutate-frame",
                 feature = "switch-witness-mutate-rsp"
@@ -656,7 +687,6 @@ impl Hw for KernelHw {
                     incoming.cr3.activate();
                 }
             }
-            let rsp = incoming.rsp;
             RUNNING_CTX[percpu::cpu_id() as usize]
                 .store(restore as u64, core::sync::atomic::Ordering::Relaxed);
             context_switch(&raw mut (*save).rsp, rsp);
