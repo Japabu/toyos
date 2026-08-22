@@ -934,8 +934,9 @@ mod tests {
         assert_eq!(FAST_COMMIT_MS * 5, FAST_CEILING_MS * 4);
         // A Fast name measured over the ceiling has grown by at least a quarter
         // over the worst price it could lawfully have been committed at, which
-        // is what makes that red a finding rather than a coin landing.
-        assert!(FAST_CEILING_MS * 100 / FAST_COMMIT_MS >= 125);
+        // is what makes that red a finding rather than a coin landing. Both
+        // sides are constants, so the compiler is the one that checks it.
+        const { assert!(FAST_CEILING_MS * 100 / FAST_COMMIT_MS >= 125) };
     }
 
     /// **The margin rule, and the millisecond it turns on.** A Fast label
