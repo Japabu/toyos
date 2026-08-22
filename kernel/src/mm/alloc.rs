@@ -365,14 +365,43 @@ mod tripwire {
         let mut off = 0;
         while off != TAIL_FILL {
             let word = fill.add(off).cast::<u64>().read_unaligned();
-            assert!(
-                word == FILL_WORD,
-                "HEAP TRIPWIRE ({site}): {ptr:?} was written past its {size}-byte allocation — \
-                 tail band word +{} is {word:#018x}",
-                TAIL_FILL_OFF + off,
-            );
+            if word != FILL_WORD {
+                let band = band_words(fill);
+                panic!(
+                    "HEAP TRIPWIRE ({site}): {ptr:?} was written past its {size}-byte \
+                     allocation — tail band word +{} is {word:#018x}; the band reads \
+                     [{:#018x}, {:#018x}, {:#018x}, {:#018x}] and its first byte stands at \
+                     {:#018x}",
+                    TAIL_FILL_OFF + off,
+                    band[0], band[1], band[2], band[3], fill as u64,
+                );
+            }
             off += 8;
         }
+    }
+
+    /// The first four words of a band, for the message a fire produces.
+    ///
+    /// **One dirty word does not say what wrote it and four often do.** The one
+    /// band this instrument has ever caught firing held `stack_top + 16` at
+    /// `stack_top` of a task kernel stack — which is what a `#GP`/interrupt
+    /// frame's saved `RSP` looks like if the entry happened with `rsp` sixteen
+    /// bytes above the stack, and if it is one then the word above it is a
+    /// stack segment selector and the two above *that* are still fill. That
+    /// reading was unfalsifiable from a report that printed one word. A shape
+    /// whose band is shorter than four words reads `FILL_WORD` past the end of
+    /// it, which is what an untouched word reads as anyway.
+    ///
+    /// # Safety
+    /// `fill` is the first byte of a band this module armed.
+    unsafe fn band_words(fill: *const u8) -> [u64; 4] {
+        let mut out = [FILL_WORD; 4];
+        let mut i = 0;
+        while i < 4 && (i + 1) * 8 <= TAIL_FILL {
+            out[i] = fill.add(i * 8).cast::<u64>().read_unaligned();
+            i += 1;
+        }
+        out
     }
 }
 
@@ -477,6 +506,25 @@ pub fn sweep(site: &str) {
         SWEPT.0.load(Ordering::Relaxed),
         SWEPT.1.load(Ordering::Relaxed),
     );
+}
+
+/// Hold `dlmalloc`'s lock for `ns` of guest time and do nothing with it.
+///
+/// **The sweep's cost without the sweep.** `heap-sweep` moved this class's rate
+/// from nothing to the unbanded baseline while compiling no decision, and the
+/// two things it does that a bandless kernel does not are *spend time on the
+/// pass path* and *hold this lock while it does*. `sched-tripwire` already
+/// amplifies by spending time on the same path and takes no lock at all, so the
+/// lock has never been separated from the delay. This is the half with the lock;
+/// `sched::driver`'s `pass-spin` is the same visit without it, and the pair is
+/// one experiment in two arms.
+///
+/// Nothing is read or written through the guard, so a kernel carrying this
+/// allocates exactly what one without it allocates — later.
+#[cfg(feature = "heap-lockspin")]
+pub fn hold_lock(ns: u64) {
+    let _held = ALLOCATOR.dlmalloc.lock();
+    crate::sched::driver::spin_for(ns);
 }
 
 /// How many sweeps have run and how many live records the last one saw, for

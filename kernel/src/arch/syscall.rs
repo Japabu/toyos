@@ -175,7 +175,24 @@ pub fn init() {
     cpu::wrmsr(MSR_STAR, star);
     // `LSTAR` is an IDT slot by another name: the one thing `syscall` can reach.
     cpu::wrmsr(MSR_LSTAR, Ring3Entry::new(syscall_entry).addr());
-    cpu::wrmsr(MSR_FMASK, 0x40200); // mask IF (bit 9) + AC (bit 18) on SYSCALL entry
+    // Mask IF (bit 9), DF (bit 10) and AC (bit 18) on `SYSCALL` entry.
+    //
+    // **DF is here because `SYSCALL` clears exactly what this word names and
+    // nothing else.** A Ring 3 thread's direction flag is its own and stays its
+    // own — `sysretq` restores `RFLAGS` from `r11`, which the entry saved before
+    // the mask applied — but a kernel that inherits a set one runs every
+    // `rep movs`/`rep stos` backwards, writing the `n` bytes *below* a
+    // destination instead of at it. `arch::entry::ring3_naked_asm`'s `cld`
+    // carries the whole argument; this is the same fix on the one entry where the
+    // hardware lets a mask word make it.
+    //
+    // `entry-df-unclean` is `arch::entry`'s negative control and this is its
+    // other half: the mask this kernel carried before, so the arm stages the
+    // whole defect rather than the gates' share of it.
+    cpu::wrmsr(
+        MSR_FMASK,
+        if cfg!(feature = "entry-df-unclean") { 0x40200 } else { 0x40600 },
+    );
 }
 
 // Syscall entry: GS permanently points to kernel per-CPU data (no swapgs needed).
@@ -242,6 +259,8 @@ extern "sysv64" fn syscall_entry() {
 }
 
 extern "sysv64" fn syscall_handler(num: u64, a1: u64, a2: u64, _: u64, a3: u64, a4: u64) -> u64 {
+    #[cfg(feature = "df-witness")]
+    cpu::df_witness("syscall_handler");
     syscall_dispatch(num, a1, a2, a3, a4)
 }
 

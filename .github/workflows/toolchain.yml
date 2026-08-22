@@ -34,11 +34,18 @@ jobs:
   route:
     uses: ./.github/workflows/route.yml
 
-  # The one long build worth the T14's single lane: nearly every branch changes
-  # none of the four trees and this job exits in seconds, and the runs that do
-  # build are hours of compilation that the laptop does faster than a hosted
-  # two-core VM. `ci.yml`'s `toolchain-ready` waits for what this publishes and
-  # is GitHub-hosted for exactly that reason.
+  # Hosted on every event but `workflow_dispatch` since 2026-08-22, and the
+  # reason is this job's own shape: nearly every branch changes none of the four
+  # trees, so it exits in seconds — but on the T14 those seconds queued behind
+  # the machine's one worker, and seven of the thirteen runs waiting there when
+  # `route.yml` was rewritten were this workflow's. `build` is a required check
+  # and `ci.yml`'s `toolchain-ready` waits up to two hours for what it
+  # publishes, so a no-op that waits 34 minutes for a lane is what a pull
+  # request pays. The runs that do build are hours of compilation the laptop
+  # does faster than a hosted runner; that is the trade, and it is taken because
+  # the fast case is nearly every run and the slow case is parallel and
+  # unqueued. A dispatch is still the T14's, for a bootstrap somebody wants on
+  # the machine's own cores.
   build:
     needs: [route]
     runs-on: ${{ needs.route.outputs.runner }}
@@ -103,10 +110,62 @@ jobs:
       # Full history, deliberately: bootstrap finds the upstream commit whose
       # prebuilt LLVM to download by walking back to the newest bors commit,
       # and a shallow clone has none.
+      #
+      # **`rust/` is whatever the last job on this machine left there.** A
+      # self-hosted runner's work area is one directory shared by every job in
+      # this repository, and `rust/` is a tracked gitlink: `actions/checkout`
+      # neither populates it nor cleans it — `git clean` does not touch a
+      # tracked path — so it survives between jobs, and `git submodule update
+      # --init` refuses a non-empty one with `destination path 'rust' already
+      # exists and is not an empty directory`. That is not hypothetical and it
+      # is not a partial clone: `.github/install-toolchain.sh` does `mkdir -p
+      # rust` and hangs the persistent cache's toolchain entry off
+      # `rust/build`, in every trusted guest, gate-A and probe job, so any of
+      # them leaves a `rust/` holding exactly that one symlink and no `.git`.
+      # Measured on the runner 2026-08-22: one entry, `build ->
+      # /toyos-cache/toolchains/toolchain-linux-x86_64-a4ad5f0abfe8a8e2`, 8 KB,
+      # created 04:53:43Z by a guest job — after which every toolchain job on
+      # the machine failed nine seconds in (run 32549542807, twice), while
+      # `ci.yml`'s `toolchain-ready` waited 57 minutes for the release it would
+      # never get. It had only ever worked because a valid checkout from an
+      # earlier job happened to still be there.
+      #
+      # A valid checkout carrying that same `rust/build` link is the second
+      # shape and the dangerous one: the bootstrap below would write the fork's
+      # build tree through the symlink into the cached toolchain entry, and
+      # `publish` would tar it back out. So the link goes and the checkout
+      # stays. Nothing here follows a link — the cache entry itself is never
+      # touched — and what was found is printed before anything is removed,
+      # since the next shape this hits should read as itself and not as
+      # `destination path already exists`.
+      #
+      # `[ -e rust/.git ]` comes before the `rev-parse`, and not after it: git
+      # searches upwards, so `git -C rust rev-parse --git-dir` inside a bare
+      # `rust/` answers about *this* repository and would call the poison a
+      # checkout.
       - name: the rust fork
         if: steps.have.outputs.build == 'yes'
         run: |
           t0=$(date +%s)
+          checkout=no
+          if [ -e rust/.git ] && git -C rust rev-parse --git-dir >/dev/null 2>&1; then
+            checkout=yes
+          fi
+          if [ "$checkout" = yes ]; then
+            if [ -L rust/build ]; then
+              echo "::warning::rust/ is a checkout and rust/build links to $(readlink rust/build)."
+              echo "::warning::The bootstrap would build through it. Unlinking; the target stays."
+              rm -f rust/build
+            fi
+          elif [ -e rust ] || [ -L rust ]; then
+            echo "::warning::rust/ is present and is not a checkout git can use, so"
+            echo "::warning::submodule init would refuse it. Removing it. What was there:"
+            entries=$({ find rust -mindepth 1 -maxdepth 1 2>/dev/null || true; } | wc -l)
+            echo "  entries: $entries"
+            ls -la rust || true
+            du -sh rust 2>/dev/null || true
+            rm -rf rust
+          fi
           git submodule update --init rust
           echo "SUBMODULE-SECONDS: $(( $(date +%s) - t0 ))"
 
