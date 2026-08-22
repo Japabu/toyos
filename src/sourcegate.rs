@@ -88,6 +88,13 @@ const BANS: &[Ban] = &[
             ("kernel/src/drivers/gop.rs", 1),
             // dlmalloc owns the page from here on.
             ("kernel/src/mm/alloc.rs", 1),
+            // `DmaPool::leak`, and here the leak *is* the statement: a device
+            // this kernel has bound is bound for the boot, and the
+            // `Dma<'static>` it answers with is the only way to say so in the
+            // type. It replaced four `static Lock<Option<DmaPool>>`s that
+            // leaked the same pages by never being cleared, where nothing said
+            // so at all.
+            ("kernel/src/mm/dma.rs", 1),
             // Both in `cpu.rs`'s test module, and both are the drop bomb
             // rather than a leak: `Task`'s "the only legal death is
             // `DeadTask::finalize`" is a scheduler invariant, so a test that
