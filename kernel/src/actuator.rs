@@ -269,8 +269,8 @@ actuators! {
     /// the CPU genuinely comes back. See `sched/dump.rs`'s `deaf_window`.
     dump_deaf_cpu = "dump-deaf-cpu";
 
-    /// Storm every other CPU with NMIs while one of them spins on `syscall` from
-    /// Ring 3, and count how many arrive at CPL 0 with a user `rsp` — the window
+    /// Storm the CPU that is spinning on `syscall` from Ring 3 with NMIs, and
+    /// count how many arrive at CPL 0 with a user `rsp` — the window
     /// `arch::idt`'s IST2 row exists for.
     ///
     /// **Where an asynchronous interrupt lands is decided inside the guest.**
@@ -280,9 +280,14 @@ actuators! {
     /// kernel that pretends one arrived — would certify nothing about the stack
     /// the CPU actually pushes on. Nothing here is faked: another CPU sends it,
     /// the victim takes it where it is, and the classification is read off the
-    /// CPU's own frame. Implies `diag-tick`, because the storm fires from the
-    /// idle loop and a quiet cpu0 sleeps past its arming otherwise.
-    /// See `kernel/src/nmi_gate.rs`.
+    /// CPU's own frame.
+    ///
+    /// **The storm arms on the victim's own syscall count and never on a
+    /// clock**, so it cannot fire at a machine where nothing is spinning yet —
+    /// what that cost while it was a wall-clock instant is written at
+    /// `nmi_gate::SPINNING_SYSCALLS`. Implies `diag-tick`, because the sending
+    /// CPU looks from its idle loop and a quiet CPU would otherwise sleep
+    /// through the run. See `kernel/src/nmi_gate.rs`.
     syscall_window_nmi = "syscall-window-nmi";
 
     /// Take the IST index off vector 2's gate, leaving the handler, the ring and

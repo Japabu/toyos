@@ -235,6 +235,13 @@ pub fn spawn(name: &str, body: extern "C" fn(u64) -> !, arg: u64, on_panic: OnPa
     let len = name.len().min(THREAD_NAME_LEN - 1);
     short[..len].copy_from_slice(&name.as_bytes()[..len]);
 
+    // A kernel thread has no user half, so it has no user symbols either — and
+    // it names the empty table rather than being an exception to what a task
+    // carries. A crash report on one resolves nothing here and everything
+    // through `symbols::resolve_kernel`, which is the right answer for a thread
+    // whose every frame is kernel text.
+    let syms = Arc::new(SymbolTable::empty());
+
     // The whole insert-then-place sequence under one hold of the table lock,
     // exactly as `loader::spawn` does it and for the same reason: once the pid
     // is visible its main thread is already in the scheduler.
@@ -245,7 +252,7 @@ pub fn spawn(name: &str, body: extern "C" fn(u64) -> !, arg: u64, on_panic: OnPa
             pid,
             short,
             Arc::new(Lock::new(kernel_process_data(name))),
-            Arc::new(Lock::new(SymbolTable::empty())),
+            Arc::clone(&syms),
             ThreadEntry::new(Arc::new(Lock::new(kernel_thread_data()))),
         )
     });
@@ -265,6 +272,7 @@ pub fn spawn(name: &str, body: extern "C" fn(u64) -> !, arg: u64, on_panic: OnPa
         entry_rsp,
         crate::mm::paging::kernel().clone(),
         0,
+        syms,
     );
     table
         .get_mut(pid)

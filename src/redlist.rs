@@ -2437,11 +2437,31 @@ pub const KNOWN_RED: &[Red] = &[
     // being routine weather when `reap_poisoned` stopped taking the process
     // table on every idle trip, so the next reader of this name gets the
     // mechanism instead of `NOT ON THE LIST`.
+    //
+    // Both rows retire together on 2026-08-22: the crash report no longer asks
+    // the process table for a symbol at all, so what they measured cannot be
+    // produced. The mechanism, the counts and the negative control are the
+    // retirement reason below; a `<symbol unread: …>` under either name now is a
+    // new measurement of a different thing, and its text says which.
     Red {
         test: "panic_recovery",
         instrument: Instrument::Ci,
         finding: Finding::Seen,
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "PR #239: a crash report reads its symbols off the running task's own record, \
+             lock-free, so `<symbol unread: the process table was held>` is not a string the \
+             kernel can emit. The question these two rows left open was which holder, and the \
+             answer is that there is no single one — the table's takers in a conceding window \
+             are a spawn, a demand-paged fault and an exit, which is every process in the \
+             machine doing ordinary work. **The rate, dev host, twelve-wide suite looping \
+             beside it as company, N = 12 rounds of `fault_gates` + `panic_recovery` an arm, \
+             2026-08-22:** 3 of 12 rounds conceded a frame before the fix (7 log lines, 3 \
+             distinct frames, host width 1.70x-4.78x); 0 of 12 after (1.69x-3.55x); and 1 of 12 \
+             with the fix reverted on the *same* base (1.70x-5.84x), which is the negative \
+             control — the pre-fix code still concedes on the tree the after arm was green on. \
+             Six full 12-wide suites of the fixed tree beside those arms conceded nothing \
+             either",
+        ),
         what: "`the crash report could not read a symbol it was asked for, so a bare address \
                in it is a lost race and not a verdict: 0x100000072ce <symbol unread: the \
                process table was held>` — one frame of one report, at an address cpu1's own \
@@ -2449,7 +2469,7 @@ pub const KNOWN_RED: &[Red] = &[
                cpu1 was itself in the panic path",
         evidence: "the T14 1/1 `guest` lane of run 32527751613 (job 96913340222, PR #204, \
                    2026-08-21 21:25Z), whose re-run alone was green",
-        source: "issues/panic-path/a-crash-report-conceded-a-frame-to-a-concurrent-one.md",
+        source: "tests/toyos.rs",
         measured: "2026-08-21",
     },
     // The same concession under a second name, on the other instrument: a
@@ -2460,7 +2480,15 @@ pub const KNOWN_RED: &[Red] = &[
         test: "fault_gates",
         instrument: Instrument::Ci,
         finding: Finding::Seen,
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "PR #239, with the row above and on the same evidence: the lookup takes no lock, so \
+             neither name can produce this string. Both arms of the rate ran both names, and \
+             `fault_gates` supplied 1 of the 3 pre-fix rounds — its concession was the `rip:` \
+             line of a #DE report whose backtrace named every frame including the one above it, \
+             at 0.418 s against `spawn: /bin/test_rs_fault_gate_child pid=8 … symbols=2048KiB \
+             (total=6ms)` at 0.409 s, with that child's own 2,798 us demand-paged instruction \
+             fetch inside the window",
+        ),
         what: "`the crash report could not read a symbol it was asked for, so a bare address \
                in it is a lost race and not a verdict` — `check_symbols_were_read` reding on a \
                `<symbol unread: the process table was held>` frame, the row above's mechanism \
@@ -2468,7 +2496,7 @@ pub const KNOWN_RED: &[Red] = &[
         evidence: "hosted `guest (1)` of run 32573597349 (job 97032648155, PR #227, 2026-08-22 \
                    12:45Z), a diff of the scheduler simulator and one kernel `Balance` enum \
                    with no crash-path code in it",
-        source: "issues/panic-path/a-crash-report-conceded-a-frame-to-a-concurrent-one.md",
+        source: "tests/toyos.rs",
         measured: "2026-08-22",
     },
     // ---------------------------------------------------------------------
