@@ -140,14 +140,33 @@ pub fn send_nmi(cpu_id: u32) {
 /// takes, it is what a machine with nobody left to do the writing pays on its
 /// way down. Half a second against the ~460 ms the panel paint costs on the T14
 /// anyway, and a machine whose logd is alive and schedulable finishes far
-/// inside it. `screen_fatal_halt_composited`'s `/log` half is what says so on
-/// every run.
+/// inside it.
+///
+/// **This wait is insurance and not the mechanism, and that is measured.** With
+/// this constant set to **0 ms** the report still reached `/log` on 3 runs of 3
+/// (dev host, 2026-08-22): `/bin/logd` is already awake and writing while the
+/// panicking CPU is inside `panic_console::capture`, which renders the whole
+/// ring. So what this bound is worth is decided by the runs where logd has
+/// written **nothing** — there the loss is the whole report and never part of
+/// it. `screen_fatal_halt_composited` lost it on **1 of 30** runs with no other
+/// guest on the host and **0 of 30** with eleven, so the expiry is reachable
+/// and host load is not what reaches it. A `/bin/logd` held off its volume for
+/// 3 s reproduces that run exactly, and this volume is known to park for
+/// seconds at a time —
+/// `issues/boot-media/fsync-on-log-returns-other-under-a-loaded-host.md` has
+/// `USB_TIMEOUT_NS` at 2 s with `block::OPERATION`'s 2 s in series behind it,
+/// reproduced 1 in 73.
+///
+/// **Lengthening this number is a trade against how long a dead machine takes
+/// to stop, and it is the owner's.** What is not optional is that a machine
+/// which pays the bound says so where its reader is, which is what
+/// [`LOG_DRAIN_EXPIRED`] and `panic_console::refresh_capture` are for.
 ///
 /// **A [`Budget`] and not a [`Bound`](crate::time::Bound) — the one place
 /// this sweep came out a square, reclassified away from `Tripwire`** — right,
-/// because `:236` logs and *returns* rather than panicking — **and landed on
-/// `Bound`, whose two constructors both demand a register or a specification
-/// section.** This number has neither: it is policy,
+/// because [`wait_for_log_file`] logs and *returns* rather than panicking —
+/// **and landed on `Bound`, whose two constructors both demand a register or a
+/// specification section.** This number has neither: it is policy,
 /// priced against the ~460 ms the panel paint costs anyway. A `Budget`'s expiry
 /// is a degraded answer named at the site, and "the panel is the only copy" is
 /// exactly one.
@@ -155,6 +174,16 @@ const LOG_FILE_DRAIN: Budget = Budget::of(
     Duration::from_millis(500),
     "the report reaches the panel and not /log",
 );
+
+/// The words [`wait_for_log_file`] says when [`LOG_FILE_DRAIN`] is spent.
+///
+/// A constant because it is a *verdict a reader outside this kernel acts on*,
+/// not decoration: `screen_fatal_halt_composited` asks the panel whether the
+/// machine kept the promise or lost the report in silence, and those are two
+/// different outcomes only while this sentence is findable. Kept in sync with
+/// `tests/toyos.rs` by this comment and by that test failing loudly if it
+/// drifts, which is the same arrangement `FATAL_HALT_NONCE` has.
+const LOG_DRAIN_EXPIRED: &str = "the report did not reach /log";
 
 /// Does `/log` still owe this boot the report?
 ///
@@ -241,15 +270,20 @@ fn wait_for_log_file() {
     let deadline = crate::clock::now() + LOG_FILE_DRAIN.duration();
     while owed(want) {
         if crate::clock::now() >= deadline {
-            // Reaches the panel only on the fatal paths that paint the live
-            // ring rather than a snapshot taken before this ran, and reaches
-            // serial on a machine that has one. On a T14 mid-panic it is the
-            // honest record for whoever reads the *next* boot's log and finds
-            // no report in this one.
+            // **The degraded answer, said where the reader of it is.** The
+            // record goes on the ring like any other, and on a machine with a
+            // serial port that is enough — `panic_flush` is still to come. On
+            // the machine this wait exists for it is not: there is no UART, and
+            // `/log` is the thing that has just failed to answer, so the panel
+            // is the only channel left. The panel paints the snapshot
+            // `panic_console::capture` froze *before* this wait began, so the
+            // sentence has to be folded back into it or it reaches nobody at
+            // all. `LOG_DRAIN_EXPIRED` is what the harness reads.
             crate::log!(
-                "panic: the report did not reach /log in {}ns; the panel is the only copy",
+                "panic: {LOG_DRAIN_EXPIRED} in {}ns; the panel is the only copy",
                 LOG_FILE_DRAIN.nanos()
             );
+            crate::drivers::panic_console::refresh_capture();
             return;
         }
         core::hint::spin_loop();
