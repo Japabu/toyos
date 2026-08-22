@@ -109,9 +109,20 @@ pub struct SymbolTable {
     stack_end: u64,
 }
 
-// Safety: the bytes are either the kernel image, mapped for the machine's
-// lifetime, or pages this table owns and frees.
+// SAFETY: the bytes are either the kernel image, mapped for the machine's
+// lifetime, or pages this table owns and frees — so moving the table between
+// CPUs moves the whole of what the two raw pointers name, and nothing is left
+// behind. `SymbolTable` is `!Send` only because `*const u8` is.
+//
+// Irreducible: the pointers exist so that a symbol lookup borrows the tables
+// instead of copying them, and a `&'static [u8]` cannot be written for the
+// half that is a `PageAlloc` this value owns and frees.
 unsafe impl Send for SymbolTable {}
+// SAFETY: same reasoning as `Send`, plus what `Sync` adds: every method here
+// takes `&self` and none of them writes through either pointer — the bytes are
+// fixed when `from_pages`/`from_elf` builds the table and are read-only for
+// its whole life, so concurrent lookups from several CPUs (which is what a
+// multi-CPU panic is) read the same immutable bytes.
 unsafe impl Sync for SymbolTable {}
 
 impl SymbolTable {
@@ -156,6 +167,18 @@ impl SymbolTable {
         Self {
             symtab: start,
             symtab_len,
+            // SAFETY: `read_backtrace_table` is the one caller, and it is also
+            // what laid these pages out — it sized the allocation to hold
+            // `symtab_len + strtab_len` and wrote `.strtab` immediately after
+            // `.symtab`, so `symtab_len` is an offset inside `pages`. The
+            // doc comment above says why the two halves cannot be handed in
+            // separately and so cannot disagree about this offset.
+            //
+            // Irreducible: the two tables share one allocation on purpose (one
+            // `PageAlloc`, one `Drop`), and splitting a `*mut u8` at a run-time
+            // offset is pointer arithmetic. What is *not* discharged here is
+            // that the allocation is big enough — that lives at the caller,
+            // where the size was chosen.
             strtab: unsafe { start.add(symtab_len) },
             strtab_len,
             pages: Some(pages),
@@ -216,6 +239,18 @@ impl SymbolTable {
         if self.symtab.is_null() || self.strtab.is_null() {
             return SymTab::empty();
         }
+        // SAFETY: the doc comment above is the argument in full — both
+        // pointers are non-null by the guard, both ranges are either the
+        // kernel image in the direct map (live for the machine's lifetime) or
+        // pages this `SymbolTable` owns and frees in its own `Drop`, and both
+        // lengths were bounded against the file they were read from. The
+        // returned slices borrow `self`, so they cannot outlive that `Drop`,
+        // and nothing ever writes through either pointer (see the `Sync` impl
+        // above), so no `&mut` can alias them.
+        //
+        // Irreducible: it is the raw-pointer-pair-to-slice conversion, which
+        // is the only way to hand `toyos-elf` — a crate that `forbid`s
+        // `unsafe` and indexes nothing unchecked — anything to look at.
         unsafe {
             SymTab::new(
                 core::slice::from_raw_parts(self.symtab, self.symtab_len),
@@ -299,6 +334,17 @@ fn log_kernel(addr: u64, lookup: impl FnOnce(&SymbolTable) -> Option<(&str, u64)
         log!("    {:#x}", addr);
         return None;
     }
+    // SAFETY: `KERNEL_SYMS` is written exactly once, in `load_kernel`, from a
+    // `Box::into_raw` that is never reclaimed — the table is leaked on purpose
+    // so a panic at any later instant can read it — and the `Release` there
+    // pairs with the `Acquire` above, so a non-null pointer here names a fully
+    // constructed `SymbolTable`. The guard above is what rules out the null it
+    // holds before boot reaches `load_kernel`.
+    //
+    // Irreducible: a `static` that is initialized after boot and read
+    // lock-free from panic, double-fault and NMI context is an `AtomicPtr`;
+    // `OnceLock` and friends need an allocator-free constructor this cannot
+    // give, and any lock here would be one a double fault could find held.
     let table = unsafe { &*ptr };
     if let Some((raw, offset)) = lookup(table) {
         log!("    {:#x}  {}+{:#x}", addr, symbol_text(rustc_demangle::demangle(raw)), offset);

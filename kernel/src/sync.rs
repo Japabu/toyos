@@ -120,12 +120,22 @@ pub struct LockGuard<'a, T> {
 impl<T> Deref for LockGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
+        // SAFETY: a `LockGuard` exists only where `lock()`/`try_lock()` handed
+        // the ticket out, and the ticket is released in `Drop` — so for this
+        // guard's whole life no other CPU holds one over the same `Lock`.
+        // Irreducible: turning a `&UnsafeCell<T>` into a `&T` is the entire
+        // job of a lock, and there is no safe operation that does it — the
+        // proof that nothing else is looking lives in the ticket protocol
+        // above, not in a type.
         unsafe { &*self.lock.data.get() }
     }
 }
 
 impl<T> DerefMut for LockGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: same ticket argument as `deref`, and `&mut self` adds that
+        // no `&T` minted from this guard is alive either. Irreducible for
+        // `deref`'s reason.
         unsafe { &mut *self.lock.data.get() }
     }
 }

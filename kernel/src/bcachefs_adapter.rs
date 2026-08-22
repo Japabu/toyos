@@ -538,7 +538,25 @@ pub fn open_home() -> Option<Mounted<PageCacheBlockIO, ReadWrite>> {
 }
 
 /// Mount a read-only bcachefs filesystem from a memory slice (initrd).
+///
+/// `ptr`/`len` are the initrd region `KernelArgs` names, passed straight
+/// through from `kernel_main`'s one call. **This function is not an `unsafe
+/// fn` and by its signature ought to be** — it takes a raw pointer and a
+/// length and hands them to something that reads through them, which is the
+/// pattern `issues/kernel/raw-pointer-writers-not-marked-unsafe-in-loader.md`
+/// already records two of in `elf::`; the single call site here is correct and
+/// nothing enforces that the next one is.
 pub fn mount_initrd(ptr: *const u8, len: usize) -> Mounted<SliceBlockIO, ReadOnly> {
+    // SAFETY: `SliceBlockIO::new` asks that `ptr` be valid for `len` bytes for
+    // as long as the `SliceBlockIO` lives. The one caller passes the initrd
+    // region out of `KernelArgs` — placed by the bootloader, never freed,
+    // never written — and the mount it builds lives for the rest of the boot,
+    // so the region outlives it trivially.
+    //
+    // Irreducible here: the region arrives as an address and a length from
+    // firmware, so somebody has to make the first claim that it is memory.
+    // What is *reducible* is which signature carries that claim, and the doc
+    // comment above says so.
     let io = unsafe { SliceBlockIO::new(ptr, len) };
     Mounted::<SliceBlockIO, ReadOnly>::open(io).expect("Failed to mount bcachefs initrd")
 }
