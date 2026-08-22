@@ -229,7 +229,7 @@ metal_sim_window_drag 6256
 mmap_prot 32
 mmap_stress 45
 netd_connection_caps 6538
-netd_gone_mid_bind 18446744073709551615
+netd_gone_mid_bind 32
 netd_hostile_peer 4509
 nightly_tier_is_announced 0
 null_sink_client_exits 2167
