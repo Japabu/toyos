@@ -532,6 +532,27 @@ pub const RELEGATED: &[Relegated] = &[
     // under the line. The i8042 pacing fix of 2026-08-19 (PR #143) is the
     // likely cause of the drop; its row is in `git log` on this file.
     Relegated {
+        test: "syscall_window_nmi_controls",
+        // **Derived from a hosted measurement, not measured on a shard, and it
+        // says so.** The hosted lane priced this name's parent — all three boots
+        // under one Fast name — at 19,740 ms (run 32580794553) against a
+        // 10,000 ms ceiling, which is what the split is for. These are two of
+        // those three boots, and the dev host puts them at 12.2 s of the 18.4 s
+        // the three cost there, so 19,740 × 12.2/18.4 = 13,090. A committed
+        // number rather than an `UNMEASURED` marker because only a Fast name may
+        // carry one — fast CI is what would replace it, and fast CI does not run
+        // this. The next nightly replaces it with a shard's own.
+        ci_ms: 13_090,
+        why: Why::Cost,
+        guards: "That `syscall_window_nmi` is not vacuous: a kernel with vector 2's IST index \
+                 taken off must double fault at the syscall entry with `cr2 = rsp - 8`, and a \
+                 second NMI entered on IST2 through an early `iretq` must take the loud path \
+                 rather than silently overwrite the outer handler's frame. The window property \
+                 itself — arrivals at CPL 0 with a user `rsp`, symbolized to the entry, and a \
+                 machine that survives 3,000 of them — is gated per pull request by the Fast \
+                 name and is not what this row costs.",
+    },
+    Relegated {
         test: "kernel_log_file",
         ci_ms: 43_056,
         why: Why::Cost,

@@ -335,9 +335,24 @@ pub fn diskless_boot(
     Ok(())
 }
 
-/// An NMI delivered where CPL is 0 and `rsp` is still the user's, three times
-/// over: the kernel that survives it, the kernel that does not, and the one
-/// re-entrancy the surviving kernel's IST stack cannot absorb.
+/// How long the guest spins. The storm arms at 3 s and stops at its 64th window
+/// arrival; this is what covers the arming plus a slow first storm.
+const SPIN_SECS: u32 = 10;
+
+/// The kernel's own summary line, printed last so a drain that ends on it has
+/// every per-CPU line and the symbolized `rip` under it already.
+const NMI_REPORT: &str = "syscall-window-nmi: sent=";
+
+/// An NMI delivered where CPL is 0 and `rsp` is still the user's, and a machine
+/// that carries on.
+///
+/// **One boot, and the two negative controls are `syscall_window_nmi_controls`'s
+/// two.** All three used to be one name and it priced at 19,740 ms on the hosted
+/// lane against a 10,000 ms ceiling — three Metal boots of 3,000 NMIs each. What
+/// belongs per pull request is the property: the window is reachable, arrivals
+/// land in it, and the machine survives them. What the controls establish is that
+/// the property is not vacuous, which is a claim about the *instrument* and moves
+/// to the nightly tier.
 ///
 /// **The window.** `SYSCALL` switches no stack, so `arch::syscall`'s entry runs
 /// three instructions at CPL 0 with the user's `rsp` and its exit one more
@@ -373,16 +388,11 @@ pub fn syscall_window_nmi(
     c_bins: &[(String, Vec<u8>)],
     rust_bins: &[(String, Vec<u8>)],
 ) -> Result<(), String> {
-    // The kernel's report, and the line every assertion below reads.
-    const REPORT: &str = "syscall-window-nmi: sent=";
-    // How long the guest spins. The storm arms at 3 s and stops at its 64th
-    // window arrival; this is what covers the arming plus a slow first storm.
-    const SPIN_SECS: u32 = 10;
     // One traversal each per iteration, so the two counts are of one order.
     const SAME_ORDER: u64 = 10;
 
     let survived = storm(test_config, c_bins, rust_bins, &["syscall-window-nmi"], SPIN_SECS, |l| {
-        l.contains(REPORT)
+        l.contains(NMI_REPORT)
     })?;
     if survived.contains("DOUBLE FAULT") {
         return Err(format!(
@@ -392,7 +402,7 @@ pub fn syscall_window_nmi(
     }
     let report = survived
         .lines()
-        .find(|l| l.contains(REPORT))
+        .find(|l| l.contains(NMI_REPORT))
         .ok_or_else(|| format!("the storm never reported — is `syscall-window-nmi` on?\n{survived}"))?;
     let field = |name: &str| -> Result<u64, String> {
         report
@@ -438,8 +448,28 @@ pub fn syscall_window_nmi(
     if !survived.contains("nmi-window-spin: ") {
         return Err(format!("the spinner never spoke at all\n{survived}"));
     }
+    Ok(())
+}
 
-    // The negative control: the same boot with vector 2's IST index taken off.
+/// The two negative controls on [`syscall_window_nmi`], which is where the
+/// property is asserted and this is where it is shown not to be vacuous.
+///
+/// **Nightly, and `src/tiers.rs` carries the row.** Two Metal boots of 3,000
+/// NMIs, and both end in a halted machine that has to be drained past its own
+/// report — which is what the price is. A control is a claim about the
+/// instrument rather than about the kernel under review: it says the same test,
+/// run against a kernel with the defect, reds. That does not change per pull
+/// request, and the fixed arm reds per pull request if the kernel does.
+///
+/// `#MC` has no control here and cannot have one: CR4.MCE is set and nothing in
+/// QEMU raises a machine check. Its IST index rides the same table column NMI's
+/// does, plus `arch::idt`'s compile-time assertion over that table.
+pub fn syscall_window_nmi_controls(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    // The first control: the same boot with vector 2's IST index taken off.
     // Everything else — the handler, the gate, the storm, the spinner — is the
     // same, so what the `#DF` below measures is the one byte.
     // Drained past the header, not to it: `double_fault_handler` prints the
@@ -455,8 +485,8 @@ pub fn syscall_window_nmi(
     )?;
     let Some(df) = unfixed.lines().find(|l| l.contains("DOUBLE FAULT")) else {
         return Err(format!(
-            "with no IST on vector 2 the machine survived {sent} NMIs — the control stages \
-             nothing, so the arm above proves nothing either\n{unfixed}"
+            "with no IST on vector 2 the machine survived the whole storm — the control stages \
+             nothing, so `syscall_window_nmi` proves nothing either\n{unfixed}"
         ));
     };
     eprintln!("  [nmi-window] without IST2: {}", df.trim());
