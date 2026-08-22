@@ -2452,6 +2452,25 @@ pub const KNOWN_RED: &[Red] = &[
         source: "issues/panic-path/a-crash-report-conceded-a-frame-to-a-concurrent-one.md",
         measured: "2026-08-21",
     },
+    // The same concession under a second name, on the other instrument: a
+    // hosted twelve-shard run, not the T14. `fault_gates` spawns children into
+    // deliberate faults the way `panic_recovery` spawns them into panics, so two
+    // reports overlapping is its ordinary weather too.
+    Red {
+        test: "fault_gates",
+        instrument: Instrument::Ci,
+        finding: Finding::Seen,
+        standing: Standing::Stands,
+        what: "`the crash report could not read a symbol it was asked for, so a bare address \
+               in it is a lost race and not a verdict` — `check_symbols_were_read` reding on a \
+               `<symbol unread: the process table was held>` frame, the row above's mechanism \
+               under a second name; the process exited 0 and the harness re-ran it alone green",
+        evidence: "hosted `guest (1)` of run 32573597349 (job 97032648155, PR #227, 2026-08-22 \
+                   12:45Z), a diff of the scheduler simulator and one kernel `Balance` enum \
+                   with no crash-path code in it",
+        source: "issues/panic-path/a-crash-report-conceded-a-frame-to-a-concurrent-one.md",
+        measured: "2026-08-22",
+    },
 ];
 
 // ---------------------------------------------------------------------------

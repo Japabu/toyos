@@ -58,6 +58,17 @@
 //! endpoints are five times apart, which is why the assertions are stated at 1,
 //! 16 and 64 and never between neighbours.
 //!
+//! **On a hosted KVM shard the walk is below the instrument altogether.** Run
+//! 32574408810's `guest (1)` (EPYC, TSC 2,445 MHz, twelve shards on the
+//! service's hosts, 2026-08-22) read 30,331 cycles at one waiter, 22,246 at
+//! 16 and 28,200 at 64: the fixed part of the call is ~12 µs there and the
+//! shard's own descheduling moves a minimum of nine by more than the whole
+//! per-waiter term, so the endpoints came out inverted and the first
+//! assertion, as then written, reded a pull request about DMA views. Whether
+//! the walk is readable is therefore the instrument's verdict, printed, and
+//! the ratio is asserted only on a run that can read it — the TCG guest
+//! above can; the hosted shard records its numbers and makes no claim.
+//!
 //! **Every waiter is proved parked before the call that is timed**, by the
 //! answer that call gives: a wake with no limit over `want` parked, unclaimed
 //! waiters answers `want` under every arithmetic, and one that answers anything
@@ -195,27 +206,36 @@ fn main() {
         marginal * 1_000_000_000 / hz,
     );
 
-    // **The loop is not free**, which is the whole of what the model cannot
-    // say: its clock does not advance inside a step, so a 64-waiter storm and a
-    // one-waiter wake cost the same there. If they cost the same here, this
-    // instrument is not reading the walk at all.
-    assert!(
-        large > one,
-        "a wake claiming 64 waiters cost {large} cycles and one claiming a single waiter \
-         {one} — the per-waiter term of the walk is not measurable through this instrument, \
-         so nothing below is a statement about it",
-    );
-    // **And it is linear.** Four times the waiters may cost four times the
-    // walk — that is what a loop over them *is* — and this allows a quarter
-    // more on top, which is the allowance the simulator's storm case states
-    // about the drain for the same reason.
-    assert!(
-        large <= small * 5,
-        "quadrupling the storm from 16 waiters to 64 took the waker's own cost from {small} \
-         cycles to {large}. `post_n` walks the waiters once and does a constant amount per \
-         claim, so four times the waiters may cost four times the loop and no more; past \
-         this, something in the claim grows with the size of the storm",
-    );
+    // **Whether this instrument reads the walk at all is a fact about the
+    // instrument, not about the kernel.** The model's clock does not advance
+    // inside a step, so a 64-waiter storm and a one-waiter wake cost the same
+    // there; on a KVM shard the fixed part of the call is ~30,000 cycles at
+    // 2.4 GHz and a shared host's descheduling moves the minimum of nine by
+    // more than the whole per-waiter term (the table in the header), so the
+    // two endpoints can come out equal or inverted there too. That is not a
+    // finding about `post_n` — it is the resolution limit the header already
+    // names for the middle widths — so it is printed as the instrument's
+    // verdict, and the ratio below is asserted only where the walk is readable.
+    if large <= one {
+        println!(
+            "wake_storm_cost: the per-waiter term is below this instrument's resolution — \
+             {one} cycles at one waiter, {large} at 64, fixed cost {} ns — so the ratio is \
+             not a statement this run can make",
+            one * 1_000_000_000 / hz,
+        );
+    } else {
+        // **And it is linear.** Four times the waiters may cost four times the
+        // walk — that is what a loop over them *is* — and this allows a quarter
+        // more on top, which is the allowance the simulator's storm case states
+        // about the drain for the same reason.
+        assert!(
+            large <= small * 5,
+            "quadrupling the storm from 16 waiters to 64 took the waker's own cost from {small} \
+             cycles to {large}. `post_n` walks the waiters once and does a constant amount per \
+             claim, so four times the waiters may cost four times the loop and no more; past \
+             this, something in the claim grows with the size of the storm",
+        );
+    }
 
     DONE.store(1, Ordering::SeqCst);
     WORD.store(1, Ordering::SeqCst);
