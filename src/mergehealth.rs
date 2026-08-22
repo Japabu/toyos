@@ -52,12 +52,26 @@
 //! window so far can be attributed to a queue nobody has used.
 //!
 //! **Under a queue, an incident is not the same finding it was under the
-//! eased law.** The eased-part verdict keeps its original threshold and text
-//! — it is the record of why the queue came, not a live gate any more. The
-//! queue-part verdict has no threshold to breach: a merge queue's whole point
-//! is pre-merge composition testing, so *any* red on `main`'s tip after the
-//! queue validated it green is the specific failure the queue exists to
-//! prevent, and root `CLAUDE.md`'s rule that a red on `main`'s tip is
+//! eased law, and a red on `main`'s tip is not by itself evidence the queue
+//! failed.** The eased-part verdict keeps its original threshold and text —
+//! it is the record of why the queue came, not a live gate any more. The
+//! queue-part verdict has no threshold to breach, but it also does not treat
+//! every push-triggered red as a queue failure: a merge queue validates a
+//! commit in a separate run, on the `merge_group` event, *before* landing it
+//! ("the composition run"), and that run is a different execution from the
+//! push-triggered run ("the tip run") that fires after the merge on `main`'s
+//! own history — so the tip run can still catch an ordinary flake the
+//! composition run did not happen to hit, with no composition failure
+//! involved at all. [`fetch_composition`]'s doc comment has the verified fact
+//! this keys on: a `merge_group` run's `headSha` is the exact commit that
+//! becomes `main`'s tip, so [`verdict_queued`] looks up each incident's own
+//! composition run by that shared key rather than assuming guilt. Composition
+//! green for every incident is `QUEUE HELD` — the tip run's red is a fact
+//! about that run, adjudicated against `src/redlist.rs` like any other red,
+//! never charged to the queue. Composition red or missing for even one is
+//! `QUEUE DID NOT HOLD`, naming only those — a commit that reached `main`'s
+//! tip without validating clean first is the specific failure a queue exists
+//! to prevent, and root `CLAUDE.md`'s rule that a red on `main`'s tip is
 //! adjudicated at once, not batched into a rolling-week rate, applies to it
 //! directly.
 
@@ -101,7 +115,11 @@ pub fn dispatch(root: &Path, args: &[String]) {
     let runs = fetch(root, since);
     let report = match regime(root) {
         Regime::Unknown => render(&runs, since, now),
-        known => render_split(&runs, since, now, known),
+        Regime::Eased => render_split(&runs, since, now, Regime::Eased, &BTreeMap::new()),
+        known @ Regime::Queued(_) => {
+            let composition = composition_lookup(&fetch_composition(root, since));
+            render_split(&runs, since, now, known, &composition)
+        }
     };
     print!("{report}");
 }
@@ -150,7 +168,58 @@ fn fetch(root: &Path, since: i64) -> Vec<Run> {
         "{TAG} `gh run list` failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let text = String::from_utf8(output.stdout).expect("gh printed non-UTF-8");
+    parse_runs_tsv(&String::from_utf8(output.stdout).expect("gh printed non-UTF-8"))
+}
+
+/// Every `merge_group`-triggered run on `main`'s queue since `since` — the
+/// composition run the queue validates *before* landing a commit, as opposed
+/// to [`fetch`]'s push-triggered run on `main`'s tip *after* landing it.
+/// Filtered to `gh-readonly-queue/main/*` because `--event merge_group` has
+/// no `--branch` filter of its own (a `merge_group` run's branch is the
+/// synthetic queue ref, never `main`).
+///
+/// **Verified, not assumed, 2026-08-22:** a `merge_group` run's `headSha` is
+/// the exact commit that becomes `main`'s tip — `gh run list --event
+/// merge_group --json headSha,conclusion,databaseId,createdAt` against
+/// `gh-readonly-queue/main/pr-174-abad07f3f8a77cf225309a3dcb487df9d7d994b3`
+/// returned `headSha: 625afce1b444f08ad656babebce4b7fc154fde09`, the same sha
+/// `fetch`'s push-triggered run for that landing carries — so a queue-regime
+/// incident's push-triggered red is looked up in this table by the identical
+/// `(head_sha, workflow)` key [`group`] already uses for push runs.
+fn fetch_composition(root: &Path, since: i64) -> Vec<Run> {
+    let since_text = format_instant(since);
+    let filter = format!(">={since_text}");
+    let output = Command::new("gh")
+        .args([
+            "run",
+            "list",
+            "--event",
+            "merge_group",
+            "--created",
+            &filter,
+            "--limit",
+            "500",
+            "--json",
+            "headSha,workflowName,status,conclusion,createdAt,updatedAt,headBranch",
+            "--jq",
+            r#".[] | select(.headBranch | startswith("gh-readonly-queue/main/")) | [.headSha, .workflowName, .status, .conclusion, .createdAt, .updatedAt] | @tsv"#,
+        ])
+        .current_dir(root)
+        .output()
+        .unwrap_or_else(|e| {
+            panic!("{TAG} run `gh run list --event merge_group`: {e} — is `gh` on PATH and authenticated?")
+        });
+    assert!(
+        output.status.success(),
+        "{TAG} `gh run list --event merge_group` failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    parse_runs_tsv(&String::from_utf8(output.stdout).expect("gh printed non-UTF-8"))
+}
+
+/// The six-field TSV shape both [`fetch`] and [`fetch_composition`] ask `gh`
+/// for, oldest first.
+fn parse_runs_tsv(text: &str) -> Vec<Run> {
     let mut runs: Vec<Run> = text
         .lines()
         .map(|line| {
@@ -167,6 +236,26 @@ fn fetch(root: &Path, since: i64) -> Vec<Run> {
         .collect();
     runs.sort_by_key(|r| r.created_at);
     runs
+}
+
+/// [`fetch_composition`]'s runs, grouped into one composition-validation
+/// [`Push`] per merged commit and keyed by that commit's `head_sha` — the
+/// lookup [`verdict_queued`] reads a queue-regime incident's composition
+/// status from, by the same `(head_sha, workflow)` pair `group` already keys
+/// push runs on.
+fn composition_lookup(runs: &[Run]) -> BTreeMap<String, Push> {
+    group(runs).into_iter().map(|p| (p.head_sha.clone(), p)).collect()
+}
+
+/// The composition run's conclusion for `head_sha`'s `workflow`, or `None` if
+/// no `merge_group` run named that pair — a commit the queue never validated
+/// before it reached `main`'s tip.
+fn composition_conclusion<'a>(
+    composition: &'a BTreeMap<String, Push>,
+    head_sha: &str,
+    workflow: &str,
+) -> Option<&'a str> {
+    composition.get(head_sha)?.by_workflow.get(workflow).map(|r| r.conclusion.as_str())
 }
 
 /// What `main`'s branch protection says right now, read the way
@@ -350,6 +439,16 @@ fn header_line(pushes: &[Push], since: i64, now: i64) -> String {
     )
 }
 
+/// One `(push, required-workflow)` pair that went red — the unit
+/// [`verdict_queued`] cross-checks against the composition run that
+/// validated (or did not validate) the same commit before it landed.
+struct RedIncident {
+    push_created_at: i64,
+    head_sha: String,
+    workflow: &'static str,
+    run_updated_at: i64,
+}
+
 /// One partition's counts and detail rows — red incidents (with which
 /// required check and which push each one named), preempted and
 /// still-validating pushes, and the closed/open red-time intervals within
@@ -361,6 +460,7 @@ struct Tally {
     still_validating: u32,
     red_by_workflow: BTreeMap<&'static str, u32>,
     red_rows: Vec<String>,
+    red_incidents: Vec<RedIncident>,
     intervals: Vec<RedInterval>,
 }
 
@@ -369,7 +469,7 @@ fn tally(pushes: &[Push]) -> Tally {
     let mut red_pushes = 0u32;
     let mut preempted_pushes = 0u32;
     let mut still_validating = 0u32;
-    let mut red_rows: Vec<String> = Vec::new();
+    let mut red_incidents: Vec<RedIncident> = Vec::new();
     for push in pushes {
         let mut this_red = false;
         let mut this_preempted = false;
@@ -380,13 +480,12 @@ fn tally(pushes: &[Push]) -> Tally {
                 Some("failure") => {
                     *red_by_workflow.entry(workflow).or_default() += 1;
                     this_red = true;
-                    red_rows.push(format!(
-                        "{} {} ({}) — {}",
-                        format_instant(push.created_at),
-                        short(&push.head_sha),
+                    red_incidents.push(RedIncident {
+                        push_created_at: push.created_at,
+                        head_sha: push.head_sha.clone(),
                         workflow,
-                        run.map(|r| r.updated_at).map(format_instant).unwrap_or_default()
-                    ));
+                        run_updated_at: run.map(|r| r.updated_at).unwrap_or(push.created_at),
+                    });
                 }
                 Some("cancelled") => this_preempted = true,
                 Some(_) | None => {} // success, or missing: neither red nor preempted
@@ -399,8 +498,20 @@ fn tally(pushes: &[Push]) -> Tally {
         preempted_pushes += this_preempted as u32;
         still_validating += this_pending as u32;
     }
+    let red_rows: Vec<String> = red_incidents
+        .iter()
+        .map(|i| {
+            format!(
+                "{} {} ({}) — {}",
+                format_instant(i.push_created_at),
+                short(&i.head_sha),
+                i.workflow,
+                format_instant(i.run_updated_at)
+            )
+        })
+        .collect();
     let intervals = red_intervals(pushes);
-    Tally { red_pushes, preempted_pushes, still_validating, red_by_workflow, red_rows, intervals }
+    Tally { red_pushes, preempted_pushes, still_validating, red_by_workflow, red_rows, red_incidents, intervals }
 }
 
 /// The stat-line block `render` always printed after the header — pulled out
@@ -482,28 +593,60 @@ fn verdict_eased(red_pushes: u32) -> String {
 }
 
 /// The queue-regime verdict: no rolling-week threshold, because a merge
-/// queue's whole point is pre-merge composition testing — any red on `main`'s
-/// tip after the queue validated it green is the specific failure the queue
-/// exists to prevent, adjudicated at once per root `CLAUDE.md`, not batched
-/// into a rate.
-fn verdict_queued(t: &Tally, pushes_len: usize) -> String {
+/// queue's whole point is pre-merge composition testing. A red on `main`'s
+/// tip alone does not mean the queue failed at that job — [`fetch_composition`]'s
+/// module header has the verified fact this keys on: the `merge_group` run
+/// that validated the same commit shares its `head_sha`, so each incident is
+/// rendered against that run's own conclusion rather than assumed guilty.
+/// Composition green for every incident means the queue did exactly what it
+/// exists to do and the push-triggered red is a fact about *that* execution,
+/// adjudicated against `src/redlist.rs` like any other red — not a
+/// composition failure and not a rate question. Composition red or missing
+/// for even one is the failure a queue exists to prevent, named at once per
+/// root `CLAUDE.md`.
+fn verdict_queued(t: &Tally, pushes_len: usize, composition: &BTreeMap<String, Push>) -> String {
     if t.red_pushes == 0 {
-        format!("{TAG} verdict: QUEUE HELD — {pushes_len} queue landing(s), 0 red-main incidents.\n")
-    } else {
-        let mut out = format!(
-            "{TAG} verdict: QUEUE DID NOT HOLD — {} of {pushes_len} queue landing(s) went red on \
-             main's tip, naming each:\n",
-            t.red_pushes
-        );
-        for row in &t.red_rows {
-            out += &format!("{TAG}   {row}\n");
-        }
-        out += &format!(
-            "{TAG}   Per root CLAUDE.md, a red on main's tip is adjudicated at once — file each \
-             of the above; a merge queue existing does not make one a rate question.\n"
-        );
-        out
+        return format!("{TAG} verdict: QUEUE HELD — {pushes_len} queue landing(s), 0 red-main incidents.\n");
     }
+
+    let mut out = String::new();
+    // Per tip (head_sha) rather than per red row: one commit can name more
+    // than one required workflow red, and the tip only held if every one of
+    // its own rows validated clean before landing.
+    let mut held_by_tip: BTreeMap<&str, bool> = BTreeMap::new();
+    for i in &t.red_incidents {
+        let comp = composition_conclusion(composition, &i.head_sha, i.workflow);
+        out += &format!(
+            "{TAG}   {} {} ({}): composition {}, main's tip red at {}\n",
+            format_instant(i.push_created_at),
+            short(&i.head_sha),
+            i.workflow,
+            comp.unwrap_or("none on record"),
+            format_instant(i.run_updated_at)
+        );
+        let held_here = comp == Some("success");
+        held_by_tip.entry(i.head_sha.as_str()).and_modify(|ok| *ok = *ok && held_here).or_insert(held_here);
+    }
+
+    let not_held: Vec<&str> = held_by_tip.iter().filter(|(_, ok)| !**ok).map(|(sha, _)| *sha).collect();
+    out += &if not_held.is_empty() {
+        format!(
+            "{TAG} verdict: QUEUE HELD — {} tip(s) went red on the post-merge push run only; \
+             adjudicate each against src/redlist.rs (a red not on the list is a defect at its \
+             owner, never the queue's).\n",
+            held_by_tip.len()
+        )
+    } else {
+        format!(
+            "{TAG} verdict: QUEUE DID NOT HOLD — {} of {} tip(s) had a red or missing composition \
+             run before landing: {}. Per root CLAUDE.md, a red on main's tip is adjudicated at \
+             once — file each of the above.\n",
+            not_held.len(),
+            held_by_tip.len(),
+            not_held.iter().map(|s| short(s)).collect::<Vec<_>>().join(", ")
+        )
+    };
+    out
 }
 
 fn render(runs: &[Run], since: i64, now: i64) -> String {
@@ -521,7 +664,10 @@ fn render(runs: &[Run], since: i64, now: i64) -> String {
 /// [`render`] always gave. `Regime::Eased` and a not-yet-used `Regime::Queued`
 /// both degenerate correctly — the boundary clamps into the window and one
 /// side ends up empty — rather than needing a separate no-split path.
-fn render_split(runs: &[Run], since: i64, now: i64, regime: Regime) -> String {
+/// `composition` is [`fetch_composition`]'s lookup ([`Regime::Eased`] passes
+/// an empty one — nothing in the queue part to cross-check when there is no
+/// queue part).
+fn render_split(runs: &[Run], since: i64, now: i64, regime: Regime, composition: &BTreeMap<String, Push>) -> String {
     let pushes = group(runs);
     let mut out = header_line(&pushes, since, now);
 
@@ -555,7 +701,7 @@ fn render_split(runs: &[Run], since: i64, now: i64, regime: Regime) -> String {
     out += &format!("{TAG}\n{TAG} -- queue-regime part: {} .. {} --\n", format_instant(boundary), format_instant(now));
     let queued_tally = tally(queued_pushes);
     format_tally(&mut out, queued_pushes.len(), &queued_tally, now);
-    out += &verdict_queued(&queued_tally, queued_pushes.len());
+    out += &verdict_queued(&queued_tally, queued_pushes.len(), composition);
 
     out += &format!("{TAG}\n{TAG} -- totals, both regimes --\n");
     let total_tally = tally(&pushes);
@@ -755,15 +901,18 @@ mod tests {
             // eased part: two clean pushes.
             run("a", "ci", "success", "2026-08-20T00:00:00Z", "2026-08-20T00:05:00Z"),
             run("b", "ci", "success", "2026-08-20T00:20:00Z", "2026-08-20T00:25:00Z"),
-            // queue part, starting 2026-08-20T01:00:00Z: one red landing among three.
+            // queue part, starting 2026-08-20T01:00:00Z: one red landing among three,
+            // and its composition run validated clean — the ordinary post-merge
+            // flake this split exists to tell apart from a real queue failure.
             run("c", "ci", "success", "2026-08-20T01:05:00Z", "2026-08-20T01:10:00Z"),
             run("d", "ci", "failure", "2026-08-20T01:20:00Z", "2026-08-20T01:25:00Z"),
             run("e", "ci", "success", "2026-08-20T01:40:00Z", "2026-08-20T01:45:00Z"),
         ];
+        let composition = composition_lookup(&[run("d", "ci", "success", "2026-08-20T01:12:00Z", "2026-08-20T01:15:00Z")]);
         let since = parse_instant("2026-08-20T00:00:00Z");
         let now = parse_instant("2026-08-20T02:00:00Z");
         let boundary = parse_instant("2026-08-20T01:00:00Z");
-        let report = render_split(&runs, since, now, Regime::Queued(boundary));
+        let report = render_split(&runs, since, now, Regime::Queued(boundary), &composition);
 
         assert!(
             report.contains("regime: merge queue required on main since 2026-08-20T01:00:00Z"),
@@ -787,8 +936,11 @@ mod tests {
         assert!(report.contains("red-main incidents: 1 of 5"), "{report}");
 
         assert!(report.contains("within threshold"), "{report}");
-        assert!(report.contains("QUEUE DID NOT HOLD — 1 of 3 queue landing(s)"), "{report}");
-        assert!(report.contains("2026-08-20T01:20:00Z d (ci) — 2026-08-20T01:25:00Z"), "{report}");
+        // d's composition run validated clean, so the tip run's red does not
+        // indict the queue.
+        assert!(report.contains("d (ci): composition success, main's tip red at 2026-08-20T01:25:00Z"), "{report}");
+        assert!(report.contains("QUEUE HELD — 1 tip(s) went red on the post-merge push run only"), "{report}");
+        assert!(!report.contains("QUEUE DID NOT HOLD"), "{report}");
     }
 
     #[test]
@@ -799,7 +951,7 @@ mod tests {
         ];
         let since = parse_instant("2026-08-20T01:00:00Z");
         let now = parse_instant("2026-08-20T02:00:00Z");
-        let report = render_split(&runs, since, now, Regime::Queued(since));
+        let report = render_split(&runs, since, now, Regime::Queued(since), &BTreeMap::new());
         assert!(report.contains("QUEUE HELD — 2 queue landing(s), 0 red-main incidents."), "{report}");
         assert!(!report.contains("QUEUE DID NOT HOLD"), "{report}");
     }
@@ -809,10 +961,68 @@ mod tests {
         let runs = vec![run("a", "ci", "failure", "2026-08-20T00:00:00Z", "2026-08-20T00:10:00Z")];
         let since = parse_instant("2026-08-20T00:00:00Z");
         let now = parse_instant("2026-08-20T01:00:00Z");
-        let report = render_split(&runs, since, now, Regime::Eased);
+        let report = render_split(&runs, since, now, Regime::Eased, &BTreeMap::new());
         assert!(report.contains("regime: no merge queue required on main"), "{report}");
         assert!(report.contains("QUEUE HELD — 0 queue landing(s), 0 red-main incidents."), "{report}");
         // One red push is within the eased threshold (it takes more than one).
         assert!(report.contains("within threshold"), "{report}");
+    }
+
+    /// One of each composition kind — green, red and missing entirely — a
+    /// straight run of the queue-regime verdict this coordinator asked for:
+    /// only the non-green tips may be named `QUEUE DID NOT HOLD`. Every
+    /// `head_sha` here stays at or under [`short`]'s nine-character width so
+    /// the assertions below match what the report actually prints.
+    #[test]
+    fn composition_status_decides_which_tips_the_queue_is_charged_for() {
+        let runs = vec![
+            run("held", "ci", "failure", "2026-08-20T01:10:00Z", "2026-08-20T01:12:00Z"),
+            run("redcomp", "ci", "failure", "2026-08-20T01:20:00Z", "2026-08-20T01:22:00Z"),
+            run("nocomp", "ci", "failure", "2026-08-20T01:30:00Z", "2026-08-20T01:32:00Z"),
+        ];
+        let composition = composition_lookup(&[
+            run("held", "ci", "success", "2026-08-20T01:00:00Z", "2026-08-20T01:05:00Z"),
+            run("redcomp", "ci", "failure", "2026-08-20T01:00:00Z", "2026-08-20T01:05:00Z"),
+            // "nocomp" never appears: the queue never validated it.
+        ]);
+        let since = parse_instant("2026-08-20T01:00:00Z");
+        let now = parse_instant("2026-08-20T02:00:00Z");
+        let report = render_split(&runs, since, now, Regime::Queued(since), &composition);
+
+        assert!(report.contains("held (ci): composition success, main's tip red at 2026-08-20T01:12:00Z"), "{report}");
+        assert!(
+            report.contains("redcomp (ci): composition failure, main's tip red at 2026-08-20T01:22:00Z"),
+            "{report}"
+        );
+        assert!(
+            report.contains("nocomp (ci): composition none on record, main's tip red at 2026-08-20T01:32:00Z"),
+            "{report}"
+        );
+
+        assert!(
+            report.contains(
+                "QUEUE DID NOT HOLD — 2 of 3 tip(s) had a red or missing composition run before \
+                 landing: nocomp, redcomp."
+            ),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn composition_green_for_every_incident_reports_queue_held_despite_a_tip_going_red() {
+        let runs = vec![run("a", "ci", "failure", "2026-08-20T01:10:00Z", "2026-08-20T01:12:00Z")];
+        let composition = composition_lookup(&[run("a", "ci", "success", "2026-08-20T01:00:00Z", "2026-08-20T01:05:00Z")]);
+        let since = parse_instant("2026-08-20T01:00:00Z");
+        let now = parse_instant("2026-08-20T02:00:00Z");
+        let report = render_split(&runs, since, now, Regime::Queued(since), &composition);
+        assert!(report.contains("a (ci): composition success, main's tip red at 2026-08-20T01:12:00Z"), "{report}");
+        assert!(
+            report.contains(
+                "QUEUE HELD — 1 tip(s) went red on the post-merge push run only; adjudicate each \
+                 against src/redlist.rs"
+            ),
+            "{report}"
+        );
+        assert!(!report.contains("QUEUE DID NOT HOLD"), "{report}");
     }
 }
