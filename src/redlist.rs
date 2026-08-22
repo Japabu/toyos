@@ -75,8 +75,8 @@ use std::path::Path;
 /// isolation, being one manual machine. A defect found by a non-owning
 /// instrument transfers to its owner. Only three of the four can appear below:
 /// **metal is not an instrument here**, because nothing below is ToyOS on bare
-/// hardware. The T14 does run the suite — since `985f3834` it runs every
-/// trusted event's — but it runs it in QEMU under KVM, which is [`Ci`].
+/// hardware. The T14 does run the suite — nightly for gate A, and on any
+/// dispatch — but it runs it in QEMU under KVM, which is [`Ci`].
 ///
 /// [`Ci`]: Instrument::Ci
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Debug)]
@@ -85,13 +85,18 @@ pub enum Instrument {
     /// machine**, `--jobs 1`, nothing else on the box.
     ///
     /// **Two machines wear this name and they do not price alike.**
-    /// `.github/workflows/route.yml` sends a fork's pull request and a
-    /// merge-queue ref to twelve GitHub-hosted shards of four EPYC cores each,
-    /// and every other event to one 1/1 lane on the T14's i5-1135G7. A row has
-    /// to say which in its [`Red::evidence`], because the difference is not
-    /// noise: one tip measured `xhci_full_speed_device` at 6,845 ms in the
-    /// first and 12,156 ms in the second on one day
+    /// `.github/workflows/route.yml` sends every event to twelve GitHub-hosted
+    /// shards of four EPYC cores each except a `workflow_dispatch` and a
+    /// `schedule` that is not `ci.yml`'s; those two get one 1/1 lane on the
+    /// T14's i5-1135G7. A row has to say which in its [`Red::evidence`],
+    /// because the difference is not noise: one tip measured
+    /// `xhci_full_speed_device` at 6,845 ms in the first and 12,156 ms in the
+    /// second on one day
     /// (`issues/build/the-duration-profile-is-enforced-where-it-was-not-measured.md`).
+    /// Rows measured on a pull request or a push between 2026-08-21 and
+    /// 2026-08-22 were taken on the T14 under the routing of those days — a
+    /// fact about which machine that row's number came from, not a reason to
+    /// discount it.
     Ci,
     /// The dev host with the test run by itself. Cross-arch TCG on arm64.
     DevHostAlone,
@@ -2305,6 +2310,34 @@ pub const KNOWN_RED: &[Red] = &[
                    — whose lane totals were 548.8 s, 483.6 s, 429.2 s and 444.1 s of tests",
         source: "issues/build/the-duration-profile-is-enforced-where-it-was-not-measured.md",
         measured: "2026-08-21",
+    },
+    // The same name on the instrument the profile *is* — twelve hosted shards —
+    // where it is not a machine gap at all but the test's own spread. Both rows
+    // stand: the one above is about a T14 lane pricing a hosted profile, this
+    // one is about the hosted lane pricing itself.
+    Red {
+        test: "xhci_full_speed_device",
+        instrument: Instrument::Ci,
+        finding: Finding::fires(1, 6),
+        standing: Standing::Stands,
+        what: "the durations gate and not the test, again, and from the other side of the \
+               commitment line: `xhci_full_speed_device is priced at 9890 ms — over the 8000 ms \
+               a Fast test may be committed at and under the 10000 ms line — and \
+               xhci_full_speed_device remains Fast`. Since 2026-08-22 a landing renders the \
+               price verdict only for names it registered or re-tiered, so on a pull request or \
+               a merge-queue composition that left this name alone the same sentence prints as \
+               a `::warning::` and the job exits 0; **on the nightly it is a red, and it is a \
+               finding about this test's variance to be fixed at the test** — not a re-run, and \
+               not a `Why::Cost` row, which the return rule refuses the moment a run prices it \
+               at or under 8,000 ms",
+        evidence: "six hosted twelve-shard runs, 2026-08-20 to 2026-08-22, priced it 4,700, \
+                   6,816, 6,900, 7,456, 7,499 and 9,890 ms with its two slowest shards \
+                   producing its second- and third-cheapest prices; within-name sd of ln(price) \
+                   0.219 against a population 0.124 over 640 observations, the 9th most \
+                   variable of 83 Fast names. The 9,890 ms reading dequeued merge-queue \
+                   composition 32550410305",
+        source: "issues/build/xhci-full-speed-device-jumped-47-percent-over-its-commitment.md",
+        measured: "2026-08-22",
     },
     // One observation, so `Seen` and not a rate: the harness re-ran it alone and
     // it passed, and its own verdict line declined to call that a
