@@ -45,10 +45,10 @@ pub struct HidDevice {
     /// a bound HID is something the driver may still have to talk to.
     pub ep0_ring: TrbRing,
     /// The eight-byte DMA slot the interrupt endpoint delivers reports into.
-    /// A `KernelSlice` and not a `*mut u8` beside its own physical address:
-    /// it carries the length, so the two accesses below are bounded against
-    /// the slot rather than against `report_size`'s own honesty.
-    pub report: crate::mm::KernelSlice,
+    /// A [`crate::mm::Dma`] view and not a `*mut u8` beside its own physical
+    /// address: it carries the length, so the two accesses below are bounded
+    /// against the slot rather than against `report_size`'s own honesty.
+    pub report: crate::mm::Dma<'static>,
     pub report_size: u32,
     pub role: HidRole,
     /// This keyboard's last report. Per device, because a report is a snapshot
@@ -93,14 +93,12 @@ impl HidDevice {
     pub fn dispatch_report(&mut self) {
         let mut buf = [0u8; 8];
         let size = self.report_size as usize;
-        // SAFETY: irreducible — `KernelSlice::as_slice` is an `unsafe fn` and
-        // there is no safe way to view DMA memory as bytes. Bounded twice:
-        // `subslice` asserts `size <= 8`, which is the slot `bind_hid`
-        // allocated, and `report_size` is 4, 6 or 8 by the `match` that set it.
-        // No aliasing `&mut` exists — this is the only reader — and the
-        // transfer has completed, since `dispatch_report` runs off a Transfer
-        // Event; the endpoint is not requeued until `requeue` below.
-        buf[..size].copy_from_slice(unsafe { self.report.subslice(0, size).as_slice() });
+        // Bounded twice: `copy_to` refuses `size > 8`, which is the slot
+        // `bind_hid` allocated, and `report_size` is 4, 6 or 8 by the `match`
+        // that set it. A copy and not a borrow into DMA memory; the transfer has
+        // completed, since `dispatch_report` runs off a Transfer Event, and the
+        // endpoint is not requeued until `requeue` below.
+        self.report.copy_to(0, &mut buf[..size]);
         // Wake only when the decode actually queued something. A report
         // identical to the last one produces no event, and waking watchers
         // for it made readiness disagree with `has_data()` — which froze the
@@ -212,12 +210,11 @@ impl HidDevice {
         if Self::break_at() != Some(self.completions) {
             return code;
         }
-        // SAFETY: irreducible — `KernelSlice::zero` is an `unsafe fn` and this
-        // actuator's whole job is to leave the slot as a stalled endpoint would
-        // have. Bounded by `subslice` against the 8-byte slot. Exclusive for
-        // the same reason as `dispatch_report`: this runs on the completion,
-        // before the endpoint is requeued.
-        unsafe { self.report.subslice(0, self.report_size as usize).zero() };
+        // This actuator's whole job is to leave the slot as a stalled endpoint
+        // would have. Bounded against the 8-byte slot. Exclusive for the same
+        // reason as `dispatch_report`: this runs on the completion, before the
+        // endpoint is requeued.
+        self.report.subview(0, self.report_size as usize).zero();
         super::CC_STALL
     }
 }

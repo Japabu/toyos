@@ -130,7 +130,7 @@ before adopting:
 
 | module | unsafe blocks | status |
 |---|---:|---|
-| `drivers/` | 121 | **adopted 2026-08-22 — the first sweep under the reduction ruling.** 121 undocumented blocks (132 `unsafe` blocks in all); **60 removed, 72 documented, 1 filed.** Per driver below. |
+| `drivers/` | 121 | **adopted 2026-08-22 — the first sweep under the reduction ruling.** 121 undocumented blocks (132 `unsafe` blocks in all); **60 removed, 72 documented, 1 filed.** Per driver below — and the filed one was built the same day, taking the area from 72 blocks to 37. |
 | `arch/` | 107 | not yet swept |
 | root files (`user_ptr.rs`, `process.rs`, `preempt.rs`, `inbox.rs`, `main.rs`, `symbols.rs`, `hw.rs`, `file_backing.rs`, `sync.rs`, `scheduler.rs`, `pipe.rs`, `page_cache.rs`, `bcachefs_adapter.rs`) | 76 | **adopted** — 13 removed, 63 documented, 4 filed. Per file and per finding below. |
 | `mm/` | 35 | **adopted** — every site now carries a `SAFETY:` comment; two (`object::shm::Pages`, `mm::paging::AddressSpace`'s `Send`/`Sync` impls) turned out to look vestigial rather than load-bearing, filed rather than removed: `issues/kernel/redundant-send-sync-impls-mm-object.md` |
@@ -166,6 +166,17 @@ already had some documented blocks.
 | `mod.rs` | 2 | 2 | 1 | 1 |
 | `virtio_net.rs` | 2 | 2 | 1 | 1 |
 | **total** | **121** | **132** | **72** | **60** |
+
+**Then 37, the same day.** The one reduction this sweep filed rather than did
+was built immediately after it: `mm::Dma`, a safe pool-borrowing view in two
+disciplines, which deleted every one of the 35 blocks that were "a bounds-checked
+view over `DmaPool` memory" plus the two `unsafe impl Send`s that only existed
+because a struct held raw pointers into a pool. Counted the same way, over both
+`cfg` arms: **74 before, 37 after**. (74 rather than 72 because that counter also
+counts `serial::panic_flush`'s `unsafe fn` signature and `msc`'s
+`stack-witness`-gated block.) What is left is exactly the "not this" list below:
+`panic_console` 17, `virtio_sound` 6, `serial` 4, `hda` 3, `virtio_console` 3,
+`acpi` 2, `xhci/wait/mod.rs` 1, `xhci/wait/msc.rs` 1.
 
 Five abstractions did most of it, and none is a wrapper for the lint's
 sake — each replaces a raw-pointer expression whose bound was the *offset*
@@ -213,14 +224,13 @@ reach a `*mut u8` from the GOP descriptor, which no `mm` type describes.
 The two audio drivers gave up none: restructuring either changes what a
 device does, which root `CLAUDE.md` puts behind the owner's sign-off.
 
-**One reduction filed rather than done**, because it is one abstraction
-across every driver rather than a change inside one:
-`issues/kernel/dma-pool-hands-out-raw-access-not-a-view.md`. 35 of the 72
-blocks that remain are the same shape — a bounds-checked view over
-`DmaPool` memory reached through a `KernelSlice` whose every accessor is an
-`unsafe fn` — and the five driver-local helpers this sweep wrote are five
-approximations of the one thing that belongs on `DmaPool`. The file carries
-the per-file site list.
+**One reduction filed rather than done**, because it was one abstraction
+across every driver rather than a change inside one: 35 of the 72 blocks that
+remained were the same shape — a bounds-checked view over `DmaPool` memory
+reached through a `KernelSlice` whose every accessor is an `unsafe fn` — and the
+five driver-local helpers this sweep wrote were five approximations of the one
+thing that belonged on `DmaPool`. It is `kernel/src/mm/dma.rs` now; that module's
+header is where the two disciplines and the lifetime are argued.
 
 ### The root files, per file (swept 2026-08-22)
 

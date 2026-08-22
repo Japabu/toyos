@@ -33,7 +33,6 @@
 //! Here that costs more than it does there, because there is no reset in this
 //! driver to take it back — see [`COMMAND`].
 
-use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 use toyos_untrusted::{Refused, Untrusted};
 use crate::mm::Mmio;
@@ -42,9 +41,8 @@ use super::DmaPool;
 use crate::block::{self, BlockDevice, BlockError, BlockResult, DeviceId};
 use crate::mm::paging::CachePolicy;
 use crate::log;
-use crate::mm::KernelSlice;
+use crate::mm::{Dma, Unaligned};
 use crate::scheduler::Operation;
-use crate::sync::Lock;
 use crate::time::{Budget, Deadline, Duration};
 
 // NVMe register offsets (BAR0 MMIO)
@@ -91,7 +89,12 @@ const COMMAND: Budget = Budget::of(
 );
 
 /// NVMe Identify Namespace data structure (partial — only fields we use).
+///
+/// `Copy` because it is read out of DMA memory by value: the driver takes a copy
+/// of what the controller wrote rather than holding a reference into a window the
+/// device may write again.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct IdentifyNamespace {
     nsze: u64,            // offset 0: namespace size in LBAs
     ncap: u64,            // offset 8: namespace capacity
@@ -146,9 +149,19 @@ struct CqEntry {
     status: u16, // bit 0 = phase, bits [15:1] = status
 }
 
+/// One submission/completion queue pair, as two [`Dma`] views under the
+/// volatile discipline.
+///
+/// **Views and not `*mut SqEntry`/`*mut CqEntry`.** The controller reads the
+/// submission queue and writes the completion queue concurrently with this CPU,
+/// which is what the volatile discipline names — and a view carries the length,
+/// so an entry is bounded against the page the queue actually occupies rather
+/// than against `% QUEUE_DEPTH` being right. It is also what deleted
+/// `unsafe impl Send for NvmeBlockDevice`: every field here is `Send` on its own
+/// now, so the auto trait applies.
 struct NvmeQueue {
-    sq: *mut SqEntry,
-    cq: *mut CqEntry,
+    sq: Dma<'static>,
+    cq: Dma<'static>,
     sq_tail: u16,
     cq_head: u16,
     phase: bool,
@@ -157,7 +170,7 @@ struct NvmeQueue {
 }
 
 impl NvmeQueue {
-    fn new(sq: *mut SqEntry, cq: *mut CqEntry, qid: u16, stride: u32) -> Self {
+    fn new(sq: Dma<'static>, cq: Dma<'static>, qid: u16, stride: u32) -> Self {
         let doorbell_stride = 4u64 << stride;
         Self {
             sq, cq,
@@ -168,16 +181,13 @@ impl NvmeQueue {
     }
 
     fn submit(&mut self, bar: &Mmio, cmd: SqEntry) {
-        // SAFETY: irreducible — a volatile write has no safe spelling, and the
-        // submission queue is a raw `*mut SqEntry` because that is what the
-        // controller was handed in `REG_ASQ`/CREATE_IO_SQ. In range: `sq_tail`
-        // is kept `% QUEUE_DEPTH` on the next line and `init` gave each queue a
-        // whole 4096-byte page, which is `QUEUE_DEPTH * size_of::<SqEntry>()`
-        // (16 * 64) exactly. Not racing the controller: this driver keeps one
-        // command outstanding, so the entry at `sq_tail` is one the device has
-        // not been told about — the `fence` and the doorbell below are what
-        // tell it.
-        unsafe { write_volatile(self.sq.add(self.sq_tail as usize), cmd); }
+        // Bounded by the write itself: `init` gave each queue a whole 4096-byte
+        // page, which is `QUEUE_DEPTH * size_of::<SqEntry>()` (16 * 64) exactly,
+        // and `sq_tail` is kept `% QUEUE_DEPTH` on the next line. Volatile
+        // because the controller reads this queue; not racing it for *this*
+        // entry, since this driver keeps one command outstanding and the `fence`
+        // and doorbell below are what tell the device about it.
+        self.sq.write(self.sq_tail as usize * core::mem::size_of::<SqEntry>(), cmd);
         self.sq_tail = (self.sq_tail + 1) % QUEUE_DEPTH as u16;
         fence(Ordering::Release);
         bar.write_u32(self.sq_doorbell, self.sq_tail as u32);
@@ -213,28 +223,26 @@ impl NvmeQueue {
     /// the body may not read `nanos_since_boot` per iteration.
     fn wait_completion(&mut self, bar: &Mmio, expected: u16) -> Result<u16, Unanswered> {
         let (cq, head, phase) = (self.cq, self.cq_head, self.phase);
+        let at = |i: u16| i as usize * core::mem::size_of::<CqEntry>();
         let answered = crate::clock::settles(COMMAND.nanos(), || {
-            // SAFETY: irreducible — a volatile read has no safe spelling, and
-            // this is a read of memory the controller writes by DMA; volatile
-            // is exactly what makes the spin observe the phase bit flipping
-            // rather than reading it once. In range for the same reason as
-            // `submit`: `cq_head` is kept `% QUEUE_DEPTH` and the queue is a
+            // Volatile is exactly what makes this spin observe the phase bit
+            // flipping rather than reading it once. In range for the same reason
+            // as `submit`: `cq_head` is kept `% QUEUE_DEPTH` and the queue is a
             // whole page. Racing the controller by design — that is what a
             // completion queue is — and the phase bit is the protocol's own
             // answer to whether the entry is complete (NVMe 2.0 §3.3.3.2).
-            let entry = unsafe { read_volatile(cq.add(head as usize)) };
+            let entry: CqEntry = cq.read(at(head));
             ((entry.status & 1) != 0) == phase
         });
         if !answered {
             return Err(Unanswered::Silent);
         }
-        // SAFETY: irreducible and in range for the reasons above. This is the
-        // second read the doc comment argues for: `settles` takes a predicate,
-        // so the read that decided is not the read that is consumed, and it is
-        // sound because one command is outstanding at a time — once the phase
-        // bit at `cq_head` has flipped, nothing writes that entry again until
-        // the head has been the whole way round the queue.
-        let cq = unsafe { read_volatile(self.cq.add(self.cq_head as usize)) };
+        // The second read the doc comment argues for: `settles` takes a
+        // predicate, so the read that decided is not the read that is consumed,
+        // and it is sound because one command is outstanding at a time — once
+        // the phase bit at `cq_head` has flipped, nothing writes that entry
+        // again until the head has been the whole way round the queue.
+        let cq: CqEntry = self.cq.read(at(self.cq_head));
         let status = cq.status >> 1;
         let cid = Untrusted::new(cq.cid);
         self.cq_head = (self.cq_head + 1) % QUEUE_DEPTH as u16;
@@ -293,53 +301,32 @@ const OFF_DATA: usize       = 0x6000;
 const MAX_DATA_PAGES: usize  = 32;
 const DMA_SIZE: usize        = OFF_DATA + MAX_DATA_PAGES * 0x1000;
 
-static DMA_POOL: Lock<Option<DmaPool>> = Lock::new(None);
-
-fn dma() -> KernelSlice {
-    DMA_POOL.lock().as_ref().unwrap().slice()
-}
-
-/// Clear `len` bytes of the DMA window at `off`.
-///
-/// **One writer instead of four.** `create_io_cq`, `create_io_sq`,
-/// `identify_namespace` and `init` each spelled `write_bytes(<a raw pointer
-/// derived from the pool>, 0, <a length>)` in an `unsafe` block of its own,
-/// with the bound stated nowhere. Here it is `subslice`, which asserts
-/// `off + len <= DMA_SIZE`.
-fn zero_dma(off: usize, len: usize) {
-    let region = dma().subslice(off, len);
-    // SAFETY: irreducible — `KernelSlice::zero` is an `unsafe fn` and there is
-    // no safe way to clear DMA memory. Bounded by `subslice` on the line above,
-    // which asserts the region is inside the pool. Exclusive at every call
-    // site: each is preparing a queue, a scratch page or a descriptor buffer
-    // before the command that hands it to the controller is submitted, and this
-    // driver keeps exactly one command outstanding.
-    unsafe { region.zero() }
-}
-
 /// Fill the PRP list with the physical address of every data page after the
 /// first, and answer with the list's own physical address for `prp2`.
 ///
 /// A transfer of more than two pages names its pages through a list rather
 /// than through `prp1`/`prp2` (NVMe 2.0 §4.1.2). `read_sectors` and
 /// `write_sectors` had a byte-identical copy of this loop each.
-fn fill_prp_list(dma: KernelSlice, pages: usize, data_phys: u64) -> u64 {
+/// The unaligned discipline, because the list is written before the command
+/// naming it is submitted: the controller is not reading it while this runs.
+fn fill_prp_list(dma: Dma<'static, Unaligned>, pages: usize, data_phys: u64) -> u64 {
     // The list holds `pages - 1` entries and is one page, so `pages` is
     // bounded by `MAX_DATA_PAGES` — which both callers assert before getting
-    // here — and `subslice` is what turns that into a check.
-    let list = dma.subslice(OFF_PRP_LIST, (pages - 1) * core::mem::size_of::<u64>());
+    // here — and `subview` is what turns that into a check.
+    let list = dma.subview(OFF_PRP_LIST, (pages - 1) * core::mem::size_of::<u64>());
     for i in 1..pages {
-        // SAFETY: irreducible — `KernelSlice::write` is an `unsafe fn`. Bounded
-        // by `write` itself, which asserts `(i - 1) * 8 + 8 <= list.size()`,
-        // and `i` runs to `pages - 1`. Exclusive: the command naming this list
-        // has not been submitted yet, so the controller is not reading it.
-        unsafe { list.write::<u64>((i - 1) * core::mem::size_of::<u64>(), data_phys + i as u64 * 0x1000) };
+        list.write::<u64>((i - 1) * core::mem::size_of::<u64>(), data_phys + i as u64 * 0x1000);
     }
     dma.phys() + OFF_PRP_LIST as u64
 }
 
 struct NvmeController {
     bar: Mmio,
+    /// This controller's DMA window, leaked at `init` and therefore `'static`.
+    /// It used to be a `static Lock<Option<DmaPool>>` that was written once and
+    /// never read for anything but `slice()`; a leaked view says the same thing
+    /// in the type and puts it where the controller is.
+    dma: Dma<'static>,
     admin: NvmeQueue,
     io: NvmeQueue,
     next_cid: u16,
@@ -352,6 +339,19 @@ struct NvmeController {
 }
 
 impl NvmeController {
+    /// Clear `len` bytes of the DMA window at `off`.
+    ///
+    /// **One clearer instead of four.** `create_io_cq`, `create_io_sq`,
+    /// `identify_namespace` and `init` each spelled `write_bytes(<a raw pointer
+    /// derived from the pool>, 0, <a length>)` in an `unsafe` block of its own,
+    /// with the bound stated nowhere. Exclusive at every call site: each is
+    /// preparing a queue, a scratch page or a descriptor buffer before the
+    /// command that hands it to the controller is submitted, and this driver
+    /// keeps exactly one command outstanding.
+    fn zero_dma(&self, off: usize, len: usize) {
+        self.dma.subview(off, len).zero();
+    }
+
     fn alloc_cid(&mut self) -> u16 {
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1);
@@ -437,7 +437,7 @@ impl NvmeController {
     }
 
     fn identify_controller(&mut self) -> bool {
-        let dma = dma();
+        let dma = self.dma;
         let cid = self.alloc_cid();
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | ADMIN_IDENTIFY as u32;
@@ -447,8 +447,8 @@ impl NvmeController {
     }
 
     fn create_io_cq(&mut self) -> bool {
-        zero_dma(OFF_IO_CQ, QUEUE_DEPTH * core::mem::size_of::<CqEntry>());
-        let dma = dma();
+        self.zero_dma(OFF_IO_CQ, QUEUE_DEPTH * core::mem::size_of::<CqEntry>());
+        let dma = self.dma;
         let cid = self.alloc_cid();
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | ADMIN_CREATE_IO_CQ as u32;
@@ -459,8 +459,8 @@ impl NvmeController {
     }
 
     fn create_io_sq(&mut self) -> bool {
-        zero_dma(OFF_IO_SQ, QUEUE_DEPTH * core::mem::size_of::<SqEntry>());
-        let dma = dma();
+        self.zero_dma(OFF_IO_SQ, QUEUE_DEPTH * core::mem::size_of::<SqEntry>());
+        let dma = self.dma;
         let cid = self.alloc_cid();
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | ADMIN_CREATE_IO_SQ as u32;
@@ -471,8 +471,8 @@ impl NvmeController {
     }
 
     fn identify_namespace(&mut self) -> bool {
-        let dma = dma();
-        zero_dma(OFF_IDENTIFY, 4096);
+        let dma = self.dma;
+        self.zero_dma(OFF_IDENTIFY, 4096);
         let cid = self.alloc_cid();
         let mut cmd = SqEntry::ZERO;
         cmd.cdw0 = (cid as u32) << 16 | ADMIN_IDENTIFY as u32;
@@ -483,15 +483,14 @@ impl NvmeController {
             return false;
         }
 
-        // SAFETY: irreducible — `KernelSlice::read` is an `unsafe fn` and this
-        // is the read of what the controller wrote by DMA. A copy rather than
-        // the `&*(ptr as *const IdentifyNamespace)` that was here, so nothing
-        // holds a reference into a window the device may write again. Bounded
-        // by `read`, which asserts `OFF_IDENTIFY + size_of::<IdentifyNamespace>()
-        // <= DMA_SIZE` against a structure that is 384 bytes of the 4096 the
-        // command was given. The transfer has completed: `admin` returned
-        // `true`, which means `wait_completion` saw the phase bit flip.
-        let ns: IdentifyNamespace = unsafe { dma.read(OFF_IDENTIFY) };
+        // A copy rather than the `&*(ptr as *const IdentifyNamespace)` that was
+        // here, so nothing holds a reference into a window the device may write
+        // again. Bounded for the whole structure, which is 384 bytes of the 4096
+        // the command was given. The unaligned discipline: the transfer has
+        // completed — `admin` returned `true`, which means `wait_completion` saw
+        // the phase bit flip — so nothing is writing these bytes, and what is
+        // read is a layout NVMe 2.0 §5.17.2.1 chose.
+        let ns: IdentifyNamespace = dma.unaligned().read(OFF_IDENTIFY);
         let fmt_idx = (ns.flbas & 0x0F) as usize;
         let lba_ds = (ns.lba_formats[fmt_idx] >> 16) & 0xFF;
         // `lba_ds` is an 8-bit device-reported shift, and it reaches both a
@@ -537,7 +536,7 @@ impl NvmeController {
             return Err(BlockError);
         }
 
-        let dma = dma();
+        let dma = self.dma;
         let pages = total_bytes.div_ceil(4096);
         let data_phys = dma.phys() + OFF_DATA as u64;
 
@@ -553,7 +552,7 @@ impl NvmeController {
         if pages == 2 {
             cmd.prp2 = data_phys + 0x1000;
         } else if pages > 2 {
-            cmd.prp2 = fill_prp_list(dma, pages, data_phys);
+            cmd.prp2 = fill_prp_list(dma.unaligned(), pages, data_phys);
         }
 
         let status = match self.io_command(cmd) {
@@ -568,15 +567,13 @@ impl NvmeController {
             return Err(BlockError);
         }
 
-        // SAFETY: irreducible — `KernelSlice::as_slice` is an `unsafe fn` and
-        // this is the one read of what the controller wrote. Bounded on both
-        // sides: `subslice` asserts `OFF_DATA + total_bytes <= DMA_SIZE`
-        // (`total_bytes <= MAX_DATA_PAGES * 4096` was asserted on entry), and
-        // `buf.len() >= total_bytes` was asserted with it. Nothing aliases the
-        // `&[u8]`: the command has completed, so the controller is done with
-        // the window, and no `&mut` into it exists.
-        buf[..total_bytes]
-            .copy_from_slice(unsafe { dma.subslice(OFF_DATA, total_bytes).as_slice() });
+        // A copy out rather than a `&[u8]` into the window, so no reference into
+        // DMA memory outlives the instant the driver knows the controller is
+        // done with it. Bounded on both sides: `copy_to` refuses
+        // `OFF_DATA + total_bytes` past the pool (`total_bytes <= MAX_DATA_PAGES
+        // * 4096` was asserted on entry), and `buf.len() >= total_bytes` was
+        // asserted with it.
+        dma.copy_to(OFF_DATA, &mut buf[..total_bytes]);
         Ok(())
     }
 
@@ -595,17 +592,15 @@ impl NvmeController {
             return Err(BlockError);
         }
 
-        let dma = dma();
+        let dma = self.dma;
         let pages = total_bytes.div_ceil(4096);
         let data_phys = dma.phys() + OFF_DATA as u64;
 
-        // SAFETY: irreducible — `KernelSlice::copy_from` is an `unsafe fn` and
-        // there is no safe way to put bytes into DMA memory. Bounded by
-        // `copy_from`, which asserts `OFF_DATA + total_bytes <= DMA_SIZE`;
-        // `total_bytes <= MAX_DATA_PAGES * 4096` and `buf.len() >= total_bytes`
-        // were both asserted on entry. Exclusive: the write command naming this
-        // window has not been submitted yet.
-        unsafe { dma.copy_from(OFF_DATA, &buf[..total_bytes]) };
+        // Bounded by `copy_from`, which refuses `OFF_DATA + total_bytes` past
+        // the pool; `total_bytes <= MAX_DATA_PAGES * 4096` and
+        // `buf.len() >= total_bytes` were both asserted on entry. Exclusive: the
+        // write command naming this window has not been submitted yet.
+        dma.copy_from(OFF_DATA, &buf[..total_bytes]);
 
         let cid = self.alloc_cid();
         let mut cmd = SqEntry::ZERO;
@@ -619,7 +614,7 @@ impl NvmeController {
         if pages == 2 {
             cmd.prp2 = data_phys + 0x1000;
         } else if pages > 2 {
-            cmd.prp2 = fill_prp_list(dma, pages, data_phys);
+            cmd.prp2 = fill_prp_list(dma.unaligned(), pages, data_phys);
         }
 
         let status = match self.io_command(cmd) {
@@ -638,19 +633,13 @@ impl NvmeController {
 }
 
 /// NVMe block device exposing 4KB block I/O through the BlockDevice trait.
-// SAFETY: irreducible — `block::BlockDevice` requires `Send` and
-// `NvmeController` holds `*mut SqEntry`/`*mut CqEntry` into the DMA pool,
-// which is what makes the auto trait not apply. The pointers cannot become
-// `KernelSlice`s the way virtio-net's and virtio-gpu's did: they are typed
-// queue-entry pointers the controller itself was handed in `REG_ASQ`/`REG_ACQ`
-// and the CREATE_IO_SQ/CQ commands, and every access through them is a
-// volatile read or write of one entry, which `KernelSlice` has no accessor
-// for. Sound because the memory they name is the one `DMA_POOL`, allocated at
-// `init` and never freed, and the device has exactly one owner — the VFS root
-// filesystem holds the `Box<dyn BlockDevice>` and `page_cache::BLOCK_DEV`
-// serialises every call into it.
-unsafe impl Send for NvmeBlockDevice {}
-
+///
+/// **`Send` is derived, not asserted.** `block::BlockDevice` requires it, and
+/// the `unsafe impl` that stood here existed because `NvmeController` held
+/// `*mut SqEntry`/`*mut CqEntry` into the DMA pool. They are [`Dma`] views now —
+/// which carry the length as well as the address, and have the typed volatile
+/// accessor the queues need — so every field is `Send` on its own and the auto
+/// trait applies.
 pub struct NvmeBlockDevice {
     ctrl: NvmeController,
     id: DeviceId,
@@ -760,7 +749,6 @@ impl BlockDevice for NvmeBlockDevice {
 pub fn init(devices: &[PciDevice]) -> Option<NvmeBlockDevice> {
     let pci_dev = *devices.iter().find(|d| d.matches_class(0x01, 0x08, None))?;
     log!("NVMe: found at PCI {:02x}:{:02x}.{}", pci_dev.bus, pci_dev.dev, pci_dev.func);
-    *DMA_POOL.lock() = Some(DmaPool::alloc(DMA_SIZE));
 
     // A refusal rather than a panic, like this driver's existing one for a
     // sector size it cannot serve: a machine whose NVMe function publishes
@@ -791,14 +779,21 @@ pub fn init(devices: &[PciDevice]) -> Option<NvmeBlockDevice> {
         }
     }
 
-    let dma = dma();
-    let admin_sq = dma.ptr_at(OFF_ADMIN_SQ) as *mut SqEntry;
-    let admin_cq = dma.ptr_at(OFF_ADMIN_CQ) as *mut CqEntry;
-    let io_sq = dma.ptr_at(OFF_IO_SQ) as *mut SqEntry;
-    let io_cq = dma.ptr_at(OFF_IO_CQ) as *mut CqEntry;
+    // Leaked rather than held in a `static`: this controller is the machine's
+    // root filesystem for the life of the boot, and the `Lock<Option<DmaPool>>`
+    // that used to hold the pages alive was never cleared either. It is
+    // allocated here, after every refusal above, so a machine whose NVMe
+    // function this driver declines still costs no physical memory.
+    let dma = DmaPool::alloc(DMA_SIZE).leak();
+    const SQ_PAGE: usize = QUEUE_DEPTH * core::mem::size_of::<SqEntry>();
+    const CQ_PAGE: usize = QUEUE_DEPTH * core::mem::size_of::<CqEntry>();
+    let admin_sq = dma.subview(OFF_ADMIN_SQ, SQ_PAGE);
+    let admin_cq = dma.subview(OFF_ADMIN_CQ, CQ_PAGE);
+    let io_sq = dma.subview(OFF_IO_SQ, SQ_PAGE);
+    let io_cq = dma.subview(OFF_IO_CQ, CQ_PAGE);
 
-    zero_dma(OFF_ADMIN_SQ, 4096);
-    zero_dma(OFF_ADMIN_CQ, 4096);
+    dma.subview(OFF_ADMIN_SQ, 4096).zero();
+    dma.subview(OFF_ADMIN_CQ, 4096).zero();
 
     let aqa = ((QUEUE_DEPTH as u32 - 1) << 16) | (QUEUE_DEPTH as u32 - 1);
     bar.write_u32(REG_AQA, aqa);
@@ -815,6 +810,7 @@ pub fn init(devices: &[PciDevice]) -> Option<NvmeBlockDevice> {
 
     let mut ctrl = NvmeController {
         bar,
+        dma,
         admin: NvmeQueue::new(admin_sq, admin_cq, 0, stride),
         io: NvmeQueue::new(io_sq, io_cq, 1, stride),
         next_cid: 0,

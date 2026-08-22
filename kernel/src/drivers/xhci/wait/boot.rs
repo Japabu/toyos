@@ -6,7 +6,6 @@
 //! pass a submit-and-return would give itself back to does not exist yet.
 
 use alloc::vec::Vec;
-use core::ptr::write_volatile;
 use core::sync::atomic::Ordering;
 
 use crate::log;
@@ -16,7 +15,7 @@ use crate::mm::Mmio;
 use crate::drivers::pci::PciDevice;
 use crate::drivers::DmaPool;
 use super::super::{device, legacy};
-use super::super::{storage_count, DEV_STRIDE, MSC_BLOCKS, PortState, Outstanding, Trb};
+use super::super::{storage_count, DEV_STRIDE, MSC_BLOCKS, PortState, Outstanding};
 use device::{begin, reset_done, reset_port};
 use super::super::{ErstEntry, Layout, MscBlock, PortMask, Portsc, Protocols, TrbRing};
 use super::super::{XhciController, PAGE, RING_SIZE, USB_TIMEOUT_NS};
@@ -401,7 +400,9 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
 
     // After the reset, so a controller refused above costs no physical memory
     // at all — and the pool is freed with the `DmaPool` on every refusal below,
-    // since `PhysPage` gives its page back when dropped.
+    // since `PhysPage` gives its page back when dropped. Everything from here to
+    // the last refusal works through `pool.view()`, whose borrow is what says the
+    // pages are still the pool's to give back.
     let pool = DmaPool::alloc(layout.pool_size);
 
     // MaxSlotsEn is what the driver can track, not what the controller can
@@ -409,70 +410,75 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
     // handing back an id with nowhere to put its context.
     op_base.write_u32(OP_CONFIG, layout.dev_blocks as u32);
 
-    let dma = pool.slice();
-    super::super::zero_dma(dma, 0, dma.size());
+    {
+        let dma = pool.view();
+        dma.zero();
 
-    if layout.scratch_count > 0 {
-        for i in 0..layout.scratch_count {
-            let buf = dma.phys() + (layout.scratch_buffers + i * PAGE) as u64;
-            let entry = dma.subslice(
-                layout.scratch_array + i * core::mem::size_of::<u64>(),
-                core::mem::size_of::<u64>(),
-            );
-            // SAFETY: irreducible — a volatile write has no safe spelling, and
-            // the controller reads this array as soon as DCBAA[0] points at it.
-            // Bounded by the `subslice` above, where the previous form
-            // (`(dma.ptr_at(scratch_array) as *mut u64).add(i)`) bounded only
-            // the array's base; `scratch_count` is the controller's own
-            // HCSPARAMS2 figure and `Layout` sized the pool for exactly that
-            // many. Aligned: `scratch_array` is page-aligned and entries are 8
-            // bytes. Exclusive: DCBAA[0] is written after this loop, so the
-            // controller has not been told the array exists.
-            unsafe { write_volatile(entry.base().cast::<u64>(), buf) }
+        if layout.scratch_count > 0 {
+            for i in 0..layout.scratch_count {
+                let buf = dma.phys() + (layout.scratch_buffers + i * PAGE) as u64;
+                // Volatile because the controller reads this array as soon as
+                // DCBAA[0] points at it. Bounded for the whole entry, where the
+                // form before the sweep
+                // (`(dma.ptr_at(scratch_array) as *mut u64).add(i)`) bounded only
+                // the array's base; `scratch_count` is the controller's own
+                // HCSPARAMS2 figure and `Layout` sized the pool for exactly that
+                // many. Aligned: `scratch_array` is page-aligned and entries are
+                // 8 bytes. Exclusive: DCBAA[0] is written after this loop, so the
+                // controller has not been told the array exists.
+                dma.write::<u64>(layout.scratch_array + i * core::mem::size_of::<u64>(), buf);
+            }
+            // DCBAA slot 0 is the scratchpad array pointer, not a device context.
+            super::super::write_dcbaa(dma, 0, dma.phys() + layout.scratch_array as u64);
+            log!("xHCI: {} scratchpad buffers configured", layout.scratch_count);
         }
-        // DCBAA slot 0 is the scratchpad array pointer, not a device context.
-        super::super::write_dcbaa(dma, 0, dma.phys() + layout.scratch_array as u64);
-        log!("xHCI: {} scratchpad buffers configured", layout.scratch_count);
-    }
 
-    op_base.write_u64(OP_DCBAAP, dma.phys() + OFF_DCBAA as u64);
+        op_base.write_u64(OP_DCBAAP, dma.phys() + OFF_DCBAA as u64);
 
-    let cmd_ring = TrbRing::init(dma.subslice(OFF_CMD_RING, PAGE));
-    // CRCR bit 0 is RCS, the cycle state the controller starts on, and the
-    // pointer above it is 64-byte aligned — so the OR lands in that bit and
-    // nowhere else (xHCI 1.2 §5.4.5). Parenthesised because `+` binds tighter
-    // than `|`, and this should not need that table to read.
-    op_base.write_u64(OP_CRCR, (dma.phys() + OFF_CMD_RING as u64) | 1);
+        // CRCR bit 0 is RCS, the cycle state the controller starts on, and the
+        // pointer above it is 64-byte aligned — so the OR lands in that bit and
+        // nowhere else (xHCI 1.2 §5.4.5). Parenthesised because `+` binds tighter
+        // than `|`, and this should not need that table to read.
+        op_base.write_u64(OP_CRCR, (dma.phys() + OFF_CMD_RING as u64) | 1);
 
-    let evt_ring_buf = dma.subslice(OFF_EVT_RING, PAGE);
-    let erst = dma.subslice(OFF_ERST, core::mem::size_of::<ErstEntry>());
-    // SAFETY: irreducible — a volatile write has no safe spelling, and the
-    // controller reads this table the moment `IR0_ERSTBA` is written three
-    // lines below. Bounded by the `subslice` above. Aligned: `OFF_ERST` is
-    // page-aligned and `ErstEntry` is 16 bytes with alignment 8. Exclusive: the
-    // controller has not been given the table's address yet.
-    unsafe {
-        write_volatile(erst.base().cast::<ErstEntry>(), ErstEntry {
-            ring_base: evt_ring_buf.phys(),
+        // Volatile because the controller reads this table the moment
+        // `IR0_ERSTBA` is written three lines below. Bounded for the whole entry.
+        // Aligned: `OFF_ERST` is page-aligned and `ErstEntry` is 16 bytes with
+        // alignment 8. Exclusive: the controller has not been given the table's
+        // address yet.
+        dma.write::<ErstEntry>(OFF_ERST, ErstEntry {
+            ring_base: dma.phys() + OFF_EVT_RING as u64,
             ring_size: RING_SIZE as u32,
             _reserved: 0,
         });
+        rt_base.write_u32(IR0_ERSTSZ, 1);
+        rt_base.write_u64(IR0_ERDP, dma.phys() + OFF_EVT_RING as u64);
+        rt_base.write_u64(IR0_ERSTBA, dma.phys() + OFF_ERST as u64);
+
+        // Enable interrupter 0
+        rt_base.write_u32(IR0_IMOD, 0);
+        rt_base.write_u32(IR0_IMAN, 3);
+
+        // Start controller (R/S + INTE for interrupt delivery)
+        op_base.write_u32(OP_USBCMD, 1 | (1 << 2));
     }
-    rt_base.write_u32(IR0_ERSTSZ, 1);
-    rt_base.write_u64(IR0_ERDP, evt_ring_buf.phys());
-    rt_base.write_u64(IR0_ERSTBA, dma.phys() + OFF_ERST as u64);
-
-    // Enable interrupter 0
-    rt_base.write_u32(IR0_IMOD, 0);
-    rt_base.write_u32(IR0_IMAN, 3);
-
-    // Start controller (R/S + INTE for interrupt delivery)
-    op_base.write_u32(OP_USBCMD, 1 | (1 << 2));
     if !settles(|| controller_answers() && op_base.read_u32(OP_USBSTS) & 1 == 0) {
         refuse(format_args!("it stayed halted for {deadline_ms} ms after R/S"));
         return None;
     }
     log!("xHCI: controller started");
+
+    // The last refusal is behind us, so the pool becomes this controller's for
+    // good: `leak` is what lets [`XhciController`] hold views of it beside it,
+    // which a `DmaPool` field could not (see that struct's `pool`).
+    //
+    // The command ring is built here rather than before R/S because a started
+    // controller does not read it until the host controller doorbell is rung,
+    // and nothing has rung it — `TrbRing::init` re-zeroes a page the whole-pool
+    // clear above already zeroed and puts the wrap Link TRB in the last slot,
+    // which is the state CRCR was programmed for.
+    let dma = pool.leak();
+    let cmd_ring = TrbRing::init(dma.subview(OFF_CMD_RING, PAGE));
 
     // HCRST returns every root-hub port to the state it has with nothing
     // attached, and on a controller with Port Power Control that state is
@@ -509,10 +515,10 @@ fn init_one(pci_dev: &PciDevice) -> Option<XhciController> {
         powered_at,
         context_size,
         layout,
-        pool,
+        pool: dma,
         protocols,
         cmd_ring,
-        event_ring: evt_ring_buf.base() as *const Trb,
+        event_ring: dma.subview(OFF_EVT_RING, PAGE),
         event_head: 0,
         event_phase: true,
         devices: Vec::new(),
