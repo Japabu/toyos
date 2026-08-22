@@ -10,16 +10,30 @@
 //!
 //! The split between `pub fn` and `pub unsafe fn` here is that second half. A
 //! function is `unsafe` when the caller can choose a value that breaks the
-//! machine — `write_cr0`, `write_cr4`, `write_cr3`, `lidt`, `ltr`, `wbinvd` —
-//! and safe when it cannot. **Six wrappers are safe today and should not be**:
-//! `wrmsr`, `outb`, `outw`, `wrfsbase`, `invlpg` and `invpcid` all take a
-//! caller-chosen value that reaches hardware, and `wrmsr` alone can repoint
-//! `LSTAR`. Marking them costs an `unsafe` block at every one of their 25-odd
-//! call sites across `arch/` and the drivers, which is a change to code rather
-//! than to comments — filed as
-//! `issues/kernel/arch-cpu-safe-wrappers-that-are-not.md`.
+//! machine — `write_cr0`, `write_cr4`, `write_cr3`, `lidt`, `ltr`, `wbinvd`,
+//! `wrmsr`, `outb`, `outw`, `wrfsbase` — and safe when it cannot.
+//!
+//! **Two wrappers take a caller-chosen value and are safe anyway, and each
+//! argues it in its own doc comment rather than in a `SAFETY:` block.**
+//! [`invlpg`] and [`invpcid`] *discard* translations, which is the direction
+//! that cannot make an access unsound; keeping a stale entry is what would.
+//! `invpcid`'s two faults are removed rather than argued away — the `#GP` on a
+//! descriptor type above 3 is unrepresentable ([`Invpcid`]) and the `#UD` on a
+//! CPU without the feature is an argument the caller can only get by asking
+//! ([`PcidActive`]). [`inb`] is safe because a read has no value for a caller to
+//! get wrong.
+//!
+//! **Where an `unsafe fn` here has a closed set of callers, the honest form is
+//! one safe wrapper that discharges the choice, not an `unsafe` block apiece.**
+//! `arch::apic::Reg` is that for the eighteen x2APIC `wrmsr` calls, and
+//! `mm::paging::activate_kernel` is the pattern it follows. Where the set is not
+//! closed — a port a device's firmware description names, an MSR that *is* the
+//! machine's one declaration — the block sits at the call and its `SAFETY:`
+//! says why that value is the right one.
 
 use core::arch::asm;
+
+use super::control_regs::PcidActive;
 
 #[inline]
 pub fn rdmsr(msr: u32) -> u64 {
@@ -36,17 +50,19 @@ pub fn rdmsr(msr: u32) -> u64 {
     (high as u64) << 32 | low as u64
 }
 
+/// # Safety
+/// Both operands reach the CPU unchecked, and the `#GP` on an unimplemented MSR
+/// or a reserved-bit value is the least of what the caller owns. `IA32_LSTAR` is
+/// `SYSCALL`'s only entry point; `IA32_GS_BASE` is where every `gs:` access in
+/// this kernel lands; `IA32_EFER`'s `NXE` decides whether bit 63 of every live
+/// paging entry is a permission or a reserved bit, so clearing it makes W^X
+/// silently not exist. The caller answers for which register it is writing and
+/// for what the machine holds afterwards.
 #[inline]
-pub fn wrmsr(msr: u32, value: u64) {
+pub unsafe fn wrmsr(msr: u32, value: u64) {
     let low = value as u32;
     let high = (value >> 32) as u32;
-    // SAFETY: the instruction touches no memory. Its own failure mode is `#GP`
-    // on an unimplemented MSR or a reserved-bit value, both of which are the
-    // caller's `msr` and `value` — see the module header on why this wrapper
-    // being safe is a gap that is filed rather than closed here.
-    unsafe {
-        asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high, options(nomem, nostack));
-    }
+    asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high, options(nomem, nostack));
 }
 
 #[inline]
@@ -257,30 +273,69 @@ pub unsafe fn write_cr3(value: u64) {
     asm!("mov cr3, {}", in(reg) value, options(nostack));
 }
 
+/// Discard this CPU's translation for one linear address.
+///
+/// **Safe with an argument nothing checks, and the reason is the direction.**
+/// `invlpg` takes the address as a *tag* and never dereferences it: an unmapped
+/// or non-canonical one invalidates nothing and does not fault. Discarding a
+/// translation cannot make a memory access unsound — keeping a stale one is what
+/// would — so there is no value of `addr` a caller can get wrong in the
+/// direction this module's `unsafe` exists for.
 #[inline]
 pub fn invlpg(addr: u64) {
-    // SAFETY: `invlpg` takes an address as a *tag*, not as an operand it
-    // dereferences — an unmapped or non-canonical one invalidates nothing and
-    // does not fault. Discarding a translation can never make memory access
-    // unsound; keeping a stale one is what would.
+    // SAFETY: one instruction with no memory operand the compiler can see. The
+    // doc comment above is the whole argument and it is why this wrapper is
+    // safe; irreducible because Rust has no operation for a TLB entry.
     unsafe { asm!("invlpg [{}]", in(reg) addr, options(nostack)); }
 }
 
-/// INVPCID — invalidate TLB entries by type.
-/// Type 0: single (pcid, addr). Type 1: all for pcid. Type 2: all PCIDs.
+/// What one [`invpcid`] discards — the descriptor type, SDM Vol. 3A §4.10.4.1.
+///
+/// **A type and not a number, because `INVPCID` is `#GP` on a type above 3.**
+/// That is the one way a caller could break the instruction, and here it is
+/// unrepresentable rather than checked.
+///
+/// Three variants and not four: type 3 — every PCID *except* the global entries
+/// — has no issuer in this kernel, because there are no global entries to except
+/// (`PAGE_GLOBAL` appears nowhere, which `mm::paging`'s header states). This is
+/// the closed set of what this kernel discards, and a fourth variant nothing
+/// constructs would be dead code with a discriminant.
+#[derive(Clone, Copy)]
+#[repr(u64)]
+pub enum Invpcid {
+    /// One linear address, in one PCID.
+    Address = 0,
+    /// Every entry tagged with one PCID, global pages excepted.
+    SinglePcid = 1,
+    /// Every entry in every PCID, global pages included.
+    AllIncludingGlobal = 2,
+}
+
+/// Discard TLB entries by descriptor type.
+///
+/// **Safe for [`invlpg`]'s reason, and it takes two removals to be so.** The
+/// `#GP` on a descriptor type above 3 is gone by construction ([`Invpcid`]).
+/// The `#UD` on a CPU without the feature is not a value a caller passes — it is
+/// a fact about the machine — so this takes the answer to that question as an
+/// argument ([`PcidActive`]) rather than a comment asking every caller to have
+/// asked it. Unlike `rdfsbase`'s `#UD`, it cannot be discharged by pointing at
+/// `CR4_REQUIRED`: `PCIDE` is in `CR4_OPTIONAL`.
+///
+/// A panic here would be the wrong refusal even so — `flush_tlb_all` is reached
+/// from vector 0xFE's handler and from `Lock::lock`'s spin, which `arch::tlb`'s
+/// header requires to take no lock and to be safe from anywhere — so the
+/// impossible call has no spelling instead of a message.
 #[inline]
-pub fn invpcid(kind: u64, pcid: u64, addr: u64) {
-    let desc: [u64; 2] = [pcid, addr];
-    // SAFETY: the descriptor operand is the local `desc`, sixteen bytes read by
-    // the CPU and declared `readonly`. `invpcid` is `#UD` without CPUID's
-    // `INVPCID` bit and `#GP` on a `kind` above 3 — `control_regs` refuses
-    // `PCIDE` on a CPU without the former, and the three callers in `arch::tlb`
-    // pass literal kinds. As with `invlpg`, discarding translations is the safe
-    // direction.
+pub fn invpcid(_have: PcidActive, kind: Invpcid, pcid: u16, addr: u64) {
+    let desc: [u64; 2] = [pcid as u64, addr];
+    // SAFETY: the descriptor operand is the local `desc` — sixteen bytes the CPU
+    // reads and nothing writes, declared `readonly`. The instruction's two
+    // faults are the doc comment's subject and both are already gone by the time
+    // this line runs. Irreducible: Rust has no operation for a TLB entry.
     unsafe {
         asm!(
             "invpcid {0}, [{1}]",
-            in(reg) kind,
+            in(reg) kind as u64,
             in(reg) desc.as_ptr(),
             options(nostack, readonly),
         );
@@ -301,16 +356,31 @@ pub unsafe fn ltr(selector: u16) {
     asm!("ltr {:x}", in(reg) selector as u64, options(nostack));
 }
 
+/// `sti`, and **not a drop-in for a site that spells the instruction bare.**
+///
+/// The `options(nomem, nostack)` here is honest about the instruction — it
+/// writes one `RFLAGS` bit and touches nothing — and that is exactly what makes
+/// it the wrong helper for a caller whose reason for the `cli`/`sti` is the
+/// *compiler barrier*: a bare `asm!("sti")` carries an implicit memory clobber,
+/// so no load or store may be moved across it. `arch::mod`'s
+/// `LogCommitGuard::close` and `percpu_fetch_add` spell all three of theirs bare
+/// and say so at the site, because what has to stay on the closed side of the
+/// window is the shard selection, the `xadd` and the body publication.
+/// Substituting this function there would delete that barrier and change no
+/// visible line.
+///
+/// Whether IF *should* be set at all is the caller's; `hw::IrqGuard` is the type
+/// for callers that want it restored rather than set.
 #[inline]
 pub fn enable_interrupts() {
-    // SAFETY: one `RFLAGS` bit, no memory. Whether IF *should* be set here is
-    // the caller's — this is the instruction, and `hw::IrqGuard` is the type for
-    // callers that want it restored rather than set.
+    // SAFETY: one `RFLAGS` bit, no memory — which is what the options claim and
+    // what the doc comment above says a barrier-seeking caller must not accept.
     unsafe {
         asm!("sti", options(nomem, nostack));
     }
 }
 
+/// `cli`, with [`enable_interrupts`]'s caveat about the missing barrier.
 #[inline]
 pub fn disable_interrupts() {
     // SAFETY: `enable_interrupts`'s argument. Masking interrupts cannot make
@@ -332,14 +402,16 @@ pub fn rdfsbase() -> u64 {
     val
 }
 
+/// # Safety
+/// `val` becomes this CPU's FS base, and it is `#GP` if non-canonical. `#UD`
+/// without `CR4.FSGSBASE` is `rdfsbase`'s argument and not the caller's:
+/// `control_regs` puts the bit in `CR4_REQUIRED` and asserts it on every CPU
+/// before any context switch runs. The kernel dereferences nothing through
+/// `fs:`, so what the value decides is where the *running thread's* thread-local
+/// accesses land — the caller owns which thread that is.
 #[inline]
-pub fn wrfsbase(val: u64) {
-    // SAFETY: `rdfsbase`'s argument for the `#UD`. The value is the caller's and
-    // is `#GP` if non-canonical; the two callers are the context switch and
-    // `SYS_SET_TLS`, and the kernel itself dereferences nothing through `fs:`.
-    unsafe {
-        asm!("wrfsbase {}", in(reg) val, options(nomem, nostack));
-    }
+pub unsafe fn wrfsbase(val: u64) {
+    asm!("wrfsbase {}", in(reg) val, options(nomem, nostack));
 }
 
 pub fn halt() -> ! {
@@ -353,38 +425,52 @@ pub fn halt() -> ! {
     }
 }
 
+/// # Safety
+/// The instruction cannot fault in Ring 0 — `CR4.UMIP` does not cover port I/O
+/// and there is no I/O permission bitmap, because `Tss::iopb_offset` is past the
+/// segment limit — so what the caller owns is not a fault but a *device*. Any
+/// legacy port is reachable, including ones that program a controller to write
+/// memory, and the port and the byte together are the command. The caller
+/// answers for which device answers at `port` and for what the byte tells it to
+/// do.
 #[inline]
-pub fn outb(port: u16, value: u8) {
-    // SAFETY: the instruction itself touches no memory this compilation unit
-    // names and cannot fault in Ring 0 (`CR4.UMIP` does not cover port I/O, and
-    // there is no I/O permission bitmap because `Tss::iopb_offset` is past the
-    // segment limit). What it *can* do is program a device — see the module
-    // header on why this wrapper being safe is a filed gap.
-    unsafe {
-        asm!("out dx, al", in("dx") port, in("al") value);
-    }
+pub unsafe fn outb(port: u16, value: u8) {
+    asm!("out dx, al", in("dx") port, in("al") value);
 }
 
+/// One byte from an I/O port.
+///
+/// **Safe, and the reason is that there is no value.** A read carries nothing a
+/// caller can get wrong in [`outb`]'s direction: it commands no device and
+/// writes no memory. A port whose read pops a queue — the 8042's data register
+/// is one — still cares which port it is, and that is the driver's correctness
+/// rather than the machine's soundness.
 #[inline]
 pub fn inb(port: u16) -> u8 {
     let value: u8;
-    // SAFETY: `outb`'s argument. A read has no value for a caller to get wrong,
-    // though a device with read-sensitive registers still cares which port.
+    // SAFETY: one instruction into the declared output, no memory operand and no
+    // fault in Ring 0 (`outb`'s `# Safety` carries why). The doc comment above
+    // is why this direction needs no caller obligation.
     unsafe {
         asm!("in al, dx", out("al") value, in("dx") port);
     }
     value
 }
 
+/// # Safety
+/// [`outb`]'s contract, sixteen bits wide.
 #[inline]
-pub fn outw(port: u16, value: u16) {
-    // SAFETY: `outb`'s argument, sixteen bits wide.
-    unsafe {
-        asm!("out dx, ax", in("dx") port, in("ax") value);
-    }
+pub unsafe fn outw(port: u16, value: u16) {
+    asm!("out dx, ax", in("dx") port, in("ax") value);
 }
 
+/// One I/O bus cycle of delay, for a device that needs one between two commands.
 #[inline]
 pub fn io_wait() {
-    outb(0x80, 0);
+    // SAFETY: `outb` asks its caller to own the port and the byte. Port 0x80 is
+    // the POST diagnostic port: nothing on a machine of this kernel's era
+    // decodes it, which is what makes a write to it the architectural way to
+    // spend a bus cycle rather than a command to anything. Zero is the value,
+    // and no device reads it back.
+    unsafe { outb(0x80, 0) };
 }

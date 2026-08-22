@@ -1,13 +1,10 @@
-use crate::arch::{apic, cpu, debug, syscall, percpu};
+use crate::arch::{apic, cpu, syscall, percpu};
 use crate::arch::percpu::CpuFaultState;
 use crate::{alert, log, mm, process, scheduler, symbols};
 
 use toyos_userbound::{blame, Blame, Faulted, Ring};
 
 use super::{Vector, TrapFrame, PF_PRESENT, PF_WRITE, PF_INSTRUCTION_FETCH};
-
-/// COM1's data register, for the one line this file writes without the log.
-const SERIAL_COM1: u16 = 0x3F8;
 
 /// Walk RBP chain for kernel backtrace with symbol resolution.
 pub(crate) fn kernel_backtrace(start_rbp: u64, max_frames: usize) {
@@ -446,96 +443,6 @@ pub(crate) fn try_recover_from_panic() -> ! {
 }
 
 // Exception handlers — called from trap_dispatch in mod.rs
-
-/// #DB handler — logs full context when a hardware watchpoint fires.
-/// Returns to resume execution.
-pub(super) fn debug_handler(frame: &TrapFrame) {
-    // The UART directly, and ahead of everything: a `#DB` may have been taken
-    // inside the log's own machinery, so the first thing this handler says has
-    // to depend on nothing the trap could have been about. `cpu::outb` is that
-    // instruction with the same operands — it is what the five bytes of inline
-    // assembly here used to spell.
-    for &b in b"\n!!! DB TRAP !!!\n" {
-        cpu::outb(SERIAL_COM1, b);
-    }
-
-    let dr6 = debug::read_dr6();
-    // Disable the watchpoint before the first `log!`: the watched word may be
-    // the log shard's own head or body, in which case reserving this report
-    // would otherwise enter #DB again before this handler reached its old
-    // clear-at-exit site. This returning handler emits at most 32 records
-    // (including a 20-frame backtrace), far short of one 512-record lap; the
-    // publication guard's safety argument relies on both facts.
-    // SAFETY: two register-to-debug-register writes, no memory operand and no
-    // fault in Ring 0. Zero in `DR7` disarms every breakpoint and zero in `DR6`
-    // clears the status bits — the two values that can only *reduce* what the
-    // hardware will trap on, so there is nothing a caller could choose wrongly.
-    // Irreducible, and deliberately not moved into `arch::debug`: that module's
-    // header says it is the read side of the debug registers and not a place to
-    // arm one from, and a disarm sitting there would be an arm with a zero in it.
-    unsafe {
-        core::arch::asm!("mov dr7, {}", in(reg) 0u64);
-        core::arch::asm!("mov dr6, {}", in(reg) 0u64);
-    }
-    let is_user = Ring::of_cs(frame.cs).is_user();
-    let tid = percpu::current_tid();
-    let pid = percpu::current_pid();
-
-    log!("=== HARDWARE WATCHPOINT HIT ===");
-    log!("  DR6={:#x} ({})", dr6,
-        if dr6 & 1 != 0 { "DR0" }
-        else if dr6 & 2 != 0 { "DR1" }
-        else if dr6 & 4 != 0 { "DR2" }
-        else if dr6 & 8 != 0 { "DR3" }
-        else { "unknown" });
-    log!("  context_tag={:#x}", debug::context());
-    log!("  mode={} pid={:?} tid={:?}", if is_user { "user" } else { "kernel" }, pid, tid);
-    log!("  rip={:#018x}  rsp={:#018x}  rbp={:#018x}", frame.rip, frame.rsp, frame.rbp);
-    log!("  rax={:#018x}  rbx={:#018x}  rcx={:#018x}", frame.rax, frame.rbx, frame.rcx);
-    log!("  rdx={:#018x}  rsi={:#018x}  rdi={:#018x}", frame.rdx, frame.rsi, frame.rdi);
-
-    log!("  Instruction that wrote:");
-    if is_user {
-        if let Some(pid) = pid {
-            process::resolve_user_symbol(pid, frame.rip).log_bare(frame.rip);
-        }
-    } else {
-        symbols::resolve_kernel(frame.rip);
-    }
-
-    log!("  Backtrace:");
-    if is_user {
-        let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>();
-        if let Some(pid) = pid {
-            user_backtrace(pid, frame.rbp, pml4, 20);
-        }
-    } else {
-        kernel_backtrace(frame.rbp, 20);
-    }
-
-    let watched_addr: u64;
-    // SAFETY: `read_dr6`'s argument — reading a debug register in Ring 0 touches
-    // no memory and cannot fault. Beside its `DR7`/`DR6` siblings above rather
-    // than in `arch::debug` for the same reason they are.
-    unsafe { core::arch::asm!("mov {}, dr0", out(reg) watched_addr); }
-    if mm::is_kernel_addr(watched_addr) && watched_addr.is_multiple_of(8) {
-        // SAFETY: `watched_addr` is a kernel address and 8-aligned, both just
-        // checked, so the read is inside the direct map.
-        //
-        // Those are `safe_read_kernel`'s two checks written out again, and this
-        // is reducible to it — one `if let Some(val)`, one fewer block, one
-        // fewer copy of the predicate. Left alone because nothing in the suite
-        // reaches this handler at all: `arch::debug`'s header records that the
-        // arming tools were deleted, so `#DB` is raised only by a Ring 3 `TF` or
-        // an `int 1`, and no test does either
-        // (`issues/kernel/the-db-handler-is-exercised-by-nothing.md`). A
-        // restructure with no test under it is what this sweep does not do.
-        let val = unsafe { *(watched_addr as *const u64) };
-        log!("  Value at watched addr {:#x} = {:#018x}", watched_addr, val);
-    }
-
-    log!("=== END WATCHPOINT ===");
-}
 
 /// Double fault handler — runs on IST1. Always from kernel. Never returns.
 pub(super) fn double_fault_handler(frame: &TrapFrame) -> ! {

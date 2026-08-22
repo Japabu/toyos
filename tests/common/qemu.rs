@@ -150,6 +150,13 @@ impl LaneFree {
 /// wall clock and ~29.6 s of CPU after any edit to `kernel/`, and
 /// until 2026-08-10 a full run made 45 of them. The set is what a run reports
 /// and what [`declared_kernel_builds`] refuses an addition to.
+///
+/// **A boot that stages its own image builds nothing and counts nothing here.**
+/// It used to build the image it then threw away — so the run reported a kernel
+/// build no guest booted and counted the boot as one that was not the shipping
+/// kernel, on a guest that was. What a boot with a staged image contributes is
+/// what that image was built with, and the build that made it counted itself
+/// (`qemu::build_boot_image`) at the point cargo was actually asked.
 static BOOTS: AtomicU32 = AtomicU32::new(0);
 static FEATURE_BOOTS: AtomicU32 = AtomicU32::new(0);
 static KERNELS: std::sync::Mutex<std::collections::BTreeSet<String>> =
@@ -1708,9 +1715,18 @@ pub struct BootOptions {
     /// kernel an image ships. Only a test whose subject *is* a build sets it —
     /// `fpu-save-nothing`, and the `SYS_DEBUG` boot; everything else names an
     /// actuator in [`BootOptions::kernel_params`] instead.
+    ///
+    /// It decides what this call *builds*, so it may not be set beside a
+    /// [`BootOptions::boot_image`], which is what the guest boots instead —
+    /// see [`refuse_a_staged_image_this_boot_did_not_ask_for`].
     pub kernel_features: &'static [&'static str],
     /// The actuators this boot arms, by the names `kernel/src/actuator.rs`
     /// declares. Non-empty selects the test kernel, which carries all of them.
+    ///
+    /// **The arming is in the image, not in this field.** The names are written
+    /// onto the ESP the build produces, so a boot that also supplies a
+    /// [`BootOptions::boot_image`] arms whatever *that* image was built with:
+    /// the two must agree and are refused when they do not.
     pub kernel_params: &'static [&'static str],
     /// Give the machine an i8042 at all. `-machine q35,i8042=off` is the one
     /// absence scenario QEMU can stage.
@@ -1741,6 +1757,11 @@ pub struct BootOptions {
     /// the boot disk *before* the machine starts cannot use it — and asserting
     /// on the partition table firmware read is exactly that. Such a test
     /// builds the image itself, reads it, and hands it over here.
+    ///
+    /// **It replaces the image, so it replaces everything in it**: this call
+    /// builds nothing when one is set, and every field that would have decided
+    /// what went into that image has to agree with what is already in this one
+    /// — [`refuse_a_staged_image_this_boot_did_not_ask_for`].
     pub boot_image: Option<PathBuf>,
     /// Back the profile's data disks with these files instead of blank ones,
     /// in the order the profile declares them. The USB gate stages a file
@@ -1881,11 +1902,61 @@ pub fn build_boot_image(
     build_boot_image_with(test_crate, c_tests, rust_tests, kernel, kernel_params, false)
 }
 
+/// Refuse a staged [`BootOptions::boot_image`] that is not the image this
+/// boot's other options describe.
+///
+/// **A staged image replaces the image this call would have built, so every
+/// option that decides what goes *into* an image decides nothing here.** The
+/// guest boots the kernel that image ships, armed with the actuators it was
+/// built with, and until this refused, a test that set `kernel_params` beside a
+/// `boot_image` built without them got an unarmed guest, a pass, and a summary
+/// line counting the arm as taken. Measured 2026-08-22: `usb-flush-fails` armed
+/// through `kernel_params` alone on `esp_filesystem` passed with no injected
+/// sense anywhere in the log, while the same actuator baked into the image
+/// failed the same assertion.
+///
+/// A green run with an inert arm is the worst kind of harness defect, because
+/// every negative control staged through one proves nothing.
+///
+/// The image was built by this same process moments earlier and carries its own
+/// list on its own ESP, so the question is asked of the image rather than of
+/// whoever built it — a name is a name on this side of the wire too, and the
+/// guest need not be started to know which kind it is.
+fn refuse_a_staged_image_this_boot_did_not_ask_for(image: &Path, options: &BootOptions) {
+    assert!(
+        options.kernel_features.is_empty(),
+        "[qemu] this boot asks for the kernel build {:?} and hands the guest {}; a staged image \
+         ships the kernel it was built with and this call builds nothing, so the request would \
+         be inert",
+        options.kernel_features,
+        image.display(),
+    );
+    assert!(
+        !options.debug_wait,
+        "[qemu] this boot asks for the {:?} build and hands the guest {}; a staged image ships \
+         the kernel it was built with and this call builds nothing, so the request would be \
+         inert",
+        toyos_build::build::DEBUG_KERNEL_BUILD,
+        image.display(),
+    );
+    if let Some(why) = toyos_build::image::param_conflict(image, options.kernel_params) {
+        panic!(
+            "[qemu] {why}. `BootOptions::boot_image` replaces the image this call would have \
+             built, so `kernel_params` cannot arm a guest booting one: build the staged image \
+             with the same list — `qemu::build_boot_image` takes it — or drop the field"
+        );
+    }
+}
+
 /// Which of [`DECLARED_KERNEL_BUILDS`] this boot wants.
 ///
 /// **A parameter never decides a build.** Every actuator lives in the one test
 /// kernel, so asking for one selects that kernel and nothing more; the third
 /// build is asked for by name and by one test.
+///
+/// A boot handed a [`BootOptions::boot_image`] builds nothing at all, and this
+/// then answers what that image already carries: the two agree or the boot was
+/// refused before it got here.
 fn kernel_of(options: &BootOptions) -> Vec<&'static str> {
     if options.kernel_params.is_empty() {
         return options.kernel_features.to_vec();
@@ -2030,6 +2101,9 @@ impl QemuInstance {
         rust_tests: &[(String, Vec<u8>)],
         options: BootOptions,
     ) -> Self {
+        if let Some(staged) = &options.boot_image {
+            refuse_a_staged_image_this_boot_did_not_ask_for(staged, &options);
+        }
         let mut features: Vec<&str> = kernel_of(&options);
         if options.debug_wait {
             features.push(toyos_build::build::DEBUG_KERNEL_BUILD);
@@ -2038,14 +2112,6 @@ impl QemuInstance {
         if !features.is_empty() {
             FEATURE_BOOTS.fetch_add(1, Ordering::Relaxed);
         }
-        let disk = build_boot_image_with(
-            test_crate,
-            c_tests,
-            rust_tests,
-            &features,
-            options.kernel_params,
-            options.debug_wait,
-        );
 
         let test_dir = super::lane::dir();
         let seq = BOOT_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -2054,9 +2120,23 @@ impl QemuInstance {
         // image file is not a slow test, it is a guest reading bytes another
         // boot is in the middle of writing — and the lane directory alone would
         // not settle it, since one test may hold two instances at once.
+        //
+        // **A staged image builds nothing.** What this call would have built is
+        // the image the guest does not boot, and building it anyway cost a
+        // kernel build the run then reported as one it had made — see
+        // [`refuse_a_staged_image_this_boot_did_not_ask_for`] for what that
+        // report was worth.
         let boot_image = match &options.boot_image {
             Some(staged) => staged.clone(),
             None => {
+                let disk = build_boot_image_with(
+                    test_crate,
+                    c_tests,
+                    rust_tests,
+                    &features,
+                    options.kernel_params,
+                    options.debug_wait,
+                );
                 let path = test_dir.join(format!("boot-{seq}.img"));
                 fs::write(&path, &disk).expect("Failed to write test boot image");
                 path

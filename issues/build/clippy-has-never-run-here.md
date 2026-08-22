@@ -315,19 +315,11 @@ each site adds the instruction's own failure mode and which half of it the
 signature discharges. Writing that is what found the first of the three filings
 below.
 
-**Three findings, filed rather than fixed.**
+**Three findings, filed rather than fixed. Two of them are closed** — the six
+safe-and-should-not-be wrappers are four `unsafe fn` and two whose signatures
+carry the argument, and the `#DB` handler is deleted with `debug_trap` gating
+what replaced it (both on 2026-08-22). One is left:
 
-- `issues/kernel/arch-cpu-safe-wrappers-that-are-not.md` — `wrmsr`, `outb`,
-  `outw`, `wrfsbase`, `invlpg` and `invpcid` are safe `fn` and take a
-  caller-chosen value that reaches hardware; `wrmsr` alone can repoint `LSTAR`.
-  Marking them adds an `unsafe` block at 100-odd call sites across `arch/` and
-  the drivers, which is a change to code and not to comments.
-- `issues/kernel/the-db-handler-is-exercised-by-nothing.md` — the missing
-  coverage that decided one reduction *not* taken. `exceptions::debug_handler`
-  spells `safe_read_kernel`'s two checks by hand and collapsing them is one
-  fewer block and one fewer copy of a predicate — but nothing in the suite
-  raises `#DB` at all, and a restructure with no test under it is not what this
-  sweep does. The site says so.
 - `issues/build/moduleinfo-has-no-as-bytes.md` — `sys_query_modules`'s
   `transmute_copy`, the second boundary-crossing ABI type with no safe
   `as_bytes` after `LogRecord`. Same reason for filing: the fix is an edit under

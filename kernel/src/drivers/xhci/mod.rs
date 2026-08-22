@@ -369,8 +369,20 @@ const MAX_HID_FAILURES: u8 = 8;
 /// A device that never answers must cost that device and not the CPU that
 /// asked it — which is the whole reason this exists, because every wait in
 /// this driver used to be an unbounded `spin_loop`. The bound is generous on
-/// purpose: the transfers it covers complete in microseconds even under TCG,
-/// so nothing but a dead device can reach it.
+/// purpose: the transfers it covers complete in microseconds even under TCG.
+///
+/// **It is not true that only a dead device can reach it, and this doc used to
+/// say so.** [`crate::clock::nanos_since_boot`] is the TSC, and a TCG guest's
+/// TSC advances with the *host's* real time rather than with the guest's work,
+/// so on an oversubscribed host this is a host-wall-clock bound on a device that
+/// is answering. Recorded on CI at 2.30x boot width, on the boot stick's own
+/// SYNCHRONIZE CACHE: `transport broke on SCSI 0x35: no answer in the status
+/// phase in 2000 ms`, then `SCSI 0x35 completed on attempt 2` 280 ms later —
+/// `issues/hardware/usb-transport-break-counts-the-boot-sticks-recovery.md`
+/// carries the log. `MAX_TRANSPORT_ATTEMPTS` absorbed it that time; three
+/// breaches in one command do not get absorbed, and what the caller is then told
+/// is indistinguishable from a stick that cannot flush
+/// (`issues/boot-media/fsync-on-log-returns-other-under-a-loaded-host.md`).
 const USB_TIMEOUT_NS: u64 = 2_000_000_000;
 
 /// When a wait started now would give up. Before `clock::init` this is 0 plus

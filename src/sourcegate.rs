@@ -313,7 +313,7 @@ fn kernel_lines() -> Vec<(String, usize, String)> {
 /// The three log macros and the function they all expand to.
 const LOG_PRODUCERS: &[&str] = &["log!(", "alert!(", "boot_phase!(", "log::emit("];
 
-/// The two places in `kernel/` a `!!!` may still appear, and how many times.
+/// The one place in `kernel/` a `!!!` may still appear, and how many times.
 ///
 /// **Named by file and count rather than tested against the same line as a
 /// `log!`.** A macro invocation is not a line — `rustfmt` puts a long one's
@@ -322,18 +322,21 @@ const LOG_PRODUCERS: &[&str] = &["log!(", "alert!(", "boot_phase!(", "log::emit(
 /// listed here instead, so a new one is a red wherever it is written and
 /// whatever it is written next to.
 ///
-/// Both of these write raw bytes straight to the UART. They never enter the
-/// ring, so `panic_console`'s deleted scan could not see them either and the
-/// record's typed `Level` was never their business.
-/// Counted in occurrences of `!!!` and not in lines, because each of these
-/// writes one at each end of its message.
+/// It writes raw bytes straight to the UART. They never enter the ring, so
+/// `panic_console`'s deleted scan could not see them either and the record's
+/// typed `Level` was never their business. Counted in occurrences of `!!!` and
+/// not in lines, because it writes one at each end of its message.
+///
+/// **It was two.** `arch::idt::exceptions::debug_handler` put
+/// `\n!!! DB TRAP !!!\n` out the port before it disarmed `DR7`, and the handler
+/// went when `#DB` from Ring 3 became the ordinary Ring 3 fault it is. The gate
+/// reds on a stale exemption as well as on a new marker, which is what made this
+/// row part of that deletion rather than something to notice later.
 const SENTINEL_ALLOWED: &[(&str, usize)] = &[
     // The two ends of `panic::last_words`' first line — `\n!!! <the dead end
     // this is> !!!` — written with the IDT possibly gone. Two whichever dead
     // end called it, because there is one writer of them.
     ("kernel/src/panic.rs", 2),
-    // `\n!!! DB TRAP !!!\n`, from the #DB handler before it clears DR7.
-    ("kernel/src/arch/idt/exceptions.rs", 2),
 ];
 
 #[cfg(test)]

@@ -48,6 +48,8 @@ use alloc::vec::Vec;
 use hashbrown::HashMap;
 
 use super::{UserAddr, PAGE_2M};
+use crate::arch::control_regs::PcidActive;
+use crate::arch::cpu::Invpcid;
 use crate::sync::Lock;
 use crate::vma::{self, Region, RegionKind};
 use crate::MemoryMapEntry;
@@ -358,15 +360,15 @@ impl Owed {
         match self {
             Self::Nothing => {}
             Self::Address { va, .. } => {
-                if pcid_active() {
-                    crate::arch::cpu::invpcid(0, target.pcid() as u64, va);
+                if let Some(have) = pcid_active() {
+                    crate::arch::cpu::invpcid(have, Invpcid::Address, target.pcid(), va);
                 } else if Cr3::current().phys() == target.phys() {
                     crate::arch::cpu::invlpg(va);
                 }
             }
             Self::Context => {
-                if pcid_active() {
-                    crate::arch::cpu::invpcid(1, target.pcid() as u64, 0);
+                if let Some(have) = pcid_active() {
+                    crate::arch::cpu::invpcid(have, Invpcid::SinglePcid, target.pcid(), 0);
                 } else if Cr3::current().phys() == target.phys() {
                     flush_tlb_all();
                 }
@@ -419,14 +421,19 @@ const CR3_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 /// therefore whether a targeted flush exists. Without INVPCID there is no way
 /// to flush all PCIDs, so `control_regs` declares neither without the other and
 /// a context switch flushes the whole TLB instead.
-pub fn pcid_active() -> bool {
-    crate::arch::control_regs::pcid_active()
+///
+/// The answer is [`PcidActive`] rather than a `bool`, because it is also
+/// `cpu::invpcid`'s only argument against a `#UD` — one question asked in one
+/// place, whose answer is the thing the instruction needs. Callers that want the
+/// bare fact ask `.is_some()`.
+pub fn pcid_active() -> Option<PcidActive> {
+    crate::arch::control_regs::PcidActive::ask()
 }
 
 /// Flush all TLB entries on this CPU, all PCIDs.
 pub fn flush_tlb_all() {
-    if pcid_active() {
-        crate::arch::cpu::invpcid(2, 0, 0);
+    if let Some(have) = pcid_active() {
+        crate::arch::cpu::invpcid(have, Invpcid::AllIncludingGlobal, 0, 0);
     } else {
         // SAFETY: `write_cr3` requires a valid CR3 (its own `# Safety`); the
         // value here is exactly what `read_cr3` just read back from this
@@ -463,7 +470,7 @@ impl Cr3 {
     /// # Safety
     /// The underlying page tables must be valid and live.
     pub unsafe fn activate(self) {
-        if pcid_active() {
+        if pcid_active().is_some() {
             crate::arch::cpu::write_cr3(self.0 | CR3_NOFLUSH);
         } else {
             crate::arch::cpu::write_cr3(self.0);

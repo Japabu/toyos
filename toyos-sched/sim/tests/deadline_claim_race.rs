@@ -20,7 +20,7 @@
 
 use std::sync::Arc as StdArc;
 
-use toyos_sched::cpu::{Action, CpuHandle, CpuHandles, CpuSched, Env, SchedPass};
+use toyos_sched::cpu::{Action, Balance, CpuHandle, CpuHandles, CpuSched, Env, SchedPass};
 use toyos_sched::fair::{FairShare, Frontier, ShareState};
 use toyos_sched::hw::{CpuId, Kicker, Nanos};
 use toyos_sched::mailbox::{mailbox, Kick, Urgency};
@@ -55,7 +55,7 @@ impl Machine1 {
             cpus: &self.handles,
             frontier: &self.frontier,
             preempt: &SimPreempt,
-            steal: false,
+            balance: Balance::None,
         }
     }
 }

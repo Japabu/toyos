@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read, Seek};
+use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::path::Path;
 
 use bcachefs::{Formatted, VecBlockIO};
 use toyos_fat32::{BlockAccess, Fat32, FatTime, IoError};
@@ -57,6 +58,96 @@ pub fn create_boot_image(
     let esp_volume = create_esp_volume(kernel_bytes, bl_bytes, initrd_bytes, log_guid, cmdline);
     let log_volume = create_log_volume();
     create_gpt_disk(esp_volume, log_volume, log_guid)
+}
+
+/// The file on the ESP that says which actuators an image is armed with.
+///
+/// Written by [`create_esp_volume`] and read back by [`params_of`], from this
+/// one name: the writer and its inverse cannot drift apart while they share it.
+/// The bootloader spells it `\toyos\cmdline`.
+const CMDLINE: &str = "toyos/cmdline";
+
+/// Why a boot may not arm `asked` on the image at `path`, or `None` because
+/// that image is armed with exactly that list.
+///
+/// **An image carries the actuators it was built with**, in [`CMDLINE`] on its
+/// own ESP — the file the bootloader reads and hands the kernel in
+/// `KernelArgs`. So what a guest will be armed with is a fact about the image,
+/// answerable before anything starts and without asking the guest; a caller
+/// that has an image and a list can be told it is holding two different boots.
+///
+/// Pure, and every input a parameter, so both directions can be staged without
+/// a guest — which is what `an_image_says_what_it_is_armed_with` does.
+pub fn param_conflict(path: &Path, asked: &[&str]) -> Option<String> {
+    let baked = match params_of(path) {
+        Ok(baked) => baked,
+        Err(why) => return Some(why),
+    };
+    if baked.iter().map(String::as_str).eq(asked.iter().copied()) {
+        return None;
+    }
+    Some(format!(
+        "the image {} is armed with {baked:?} and the boot asks for {asked:?}",
+        path.display()
+    ))
+}
+
+/// The actuator list an image is armed with, read back off the image.
+///
+/// The ESP is located through the partition table rather than at the offset
+/// [`create_gpt_disk`] happens to place it at: the writer asks `add_partition`
+/// where the partition went, and so does this.
+fn params_of(path: &Path) -> Result<Vec<String>, String> {
+    let (start, len) = {
+        let disk = gpt::GptConfig::new()
+            .writable(false)
+            .logical_block_size(gpt::disk::LogicalBlockSize::Lb512)
+            .open(path)
+            .map_err(|e| format!("{} has no readable GPT: {e}", path.display()))?;
+        let esps: Vec<_> = disk
+            .partitions()
+            .values()
+            .filter(|p| p.part_type_guid == gpt::partition_types::EFI)
+            .collect();
+        let [esp] = esps.as_slice() else {
+            return Err(format!(
+                "{} has {} ESPs, and a boot image has one",
+                path.display(),
+                esps.len()
+            ));
+        };
+        (esp.first_lba * 512, (esp.last_lba - esp.first_lba + 1) * 512)
+    };
+
+    // The ESP alone, and never the whole image: a test image is a quarter of a
+    // gigabyte and this runs once per boot that stages one.
+    let len = usize::try_from(len).map_err(|_| format!("{} has a {len}-byte ESP", path.display()))?;
+    let mut volume = vec![0u8; len];
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("opening {}: {e}", path.display()))?;
+    file.seek(SeekFrom::Start(start))
+        .map_err(|e| format!("seeking to the ESP of {}: {e}", path.display()))?;
+    file.read_exact(&mut volume)
+        .map_err(|e| format!("reading the ESP of {}: {e}", path.display()))?;
+
+    // Read with the driver the kernel mounts this very volume with, rather than
+    // with the crate that formatted it — [`populate`]'s argument, in the other
+    // direction.
+    let mut fs = Fat32::mount(VolumeIo(&mut volume))
+        .map_err(|e| format!("the ESP of {} does not mount: {e}", path.display()))?;
+    let mut file = fs
+        .open(CMDLINE)
+        .map_err(|e| format!("{} has no {CMDLINE} on its ESP: {e}", path.display()))?;
+    let mut text = vec![0u8; usize::try_from(file.len()).unwrap_or(usize::MAX)];
+    fs.read(&mut file, 0, &mut text)
+        .map_err(|e| format!("reading {CMDLINE} from {}: {e}", path.display()))?;
+    let text = String::from_utf8(text)
+        .map_err(|e| format!("{CMDLINE} on {} is not text: {e}", path.display()))?;
+    Ok(if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split(',').map(str::to_string).collect()
+    })
 }
 
 /// A raw block device rejects a write that is not a whole number of sectors, so
@@ -277,8 +368,10 @@ fn create_esp_volume(
             // image anyone ships. Read by the bootloader beside the three above
             // and handed to the kernel in `KernelArgs`, because the earliest
             // actuator fires before `mm::init` and there is nowhere later to
-            // fetch it from. `kernel/src/actuator.rs` is the list.
-            ("toyos/cmdline", cmdline.as_bytes()),
+            // fetch it from. `kernel/src/actuator.rs` is the list, and
+            // [`params_of`] is how the host asks a finished image which of them
+            // a guest booting it would arm.
+            (CMDLINE, cmdline.as_bytes()),
         ],
     );
 
@@ -441,5 +534,65 @@ mod tests {
         {
             assert!(found.iter().any(|p| p.trim_start_matches('/') == want), "{want} is not on the ESP; it holds {found:?}");
         }
+    }
+
+    /// An image says which actuators a guest booting it would arm, and the
+    /// answer comes out of the image rather than from whoever built it.
+    ///
+    /// **This is what makes a staged boot image answerable.** The actuators are
+    /// baked in at build time, so a caller that supplies its own image cannot
+    /// arm anything by asking — and until [`param_conflict`] existed nothing
+    /// refused the pair: the harness took the parameters, built a kernel for
+    /// them, booted the supplied image instead, and reported the arm as taken.
+    /// A green run with an inert arm is the worst kind of harness defect,
+    /// because every negative control staged through one proves nothing.
+    ///
+    /// Both directions, over images this file's own writer produced: the reader
+    /// is the writer's inverse and a round trip is the only thing that says so.
+    #[test]
+    fn an_image_says_what_it_is_armed_with() {
+        let dir = std::env::temp_dir().join(format!("toyos-image-params-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let write = |name: &str, cmdline: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, create_boot_image(b"kernel", b"bootloader", b"initrd", cmdline))
+                .expect("write an image");
+            path
+        };
+
+        // What every shipping image is: nothing armed at all.
+        let shipping = write("shipping.img", "");
+        // Two, because a reader that handed back the whole file as one name
+        // would answer every one-actuator question correctly.
+        let armed = write("armed.img", "usb-flush-fails,fat-boot-reads-fail");
+
+        for (image, asked) in [
+            (&shipping, &[][..]),
+            (&armed, &["usb-flush-fails", "fat-boot-reads-fail"][..]),
+        ] {
+            assert_eq!(
+                param_conflict(image, asked),
+                None,
+                "an image was refused the list it was built with: {asked:?}"
+            );
+        }
+
+        // The recorded defect, 2026-08-22: an actuator armed beside an image
+        // built without it. It has to name both sides — the reader gets the
+        // message and nothing else.
+        for (image, asked, name) in [
+            (&shipping, &["usb-flush-fails"][..], "usb-flush-fails"),
+            (&armed, &[][..], "fat-boot-reads-fail"),
+            (&armed, &["usb-flush-fails"][..], "fat-boot-reads-fail"),
+        ] {
+            let why = param_conflict(image, asked)
+                .unwrap_or_else(|| panic!("{asked:?} was accepted on {}", image.display()));
+            assert!(
+                why.contains(name),
+                "the refusal does not name {name}, which is the whole of what it is about: {why}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

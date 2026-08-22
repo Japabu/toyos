@@ -641,7 +641,19 @@ pub fn shutdown() -> ! {
 
     if pm1a != 0 {
         let val = (slp_typ << 10) | SLP_EN;
-        crate::arch::cpu::outw(pm1a, val);
+        // SAFETY: `outw` asks its caller to own the port and the word, and this
+        // is the one site in the kernel where the *port* is not a constant: it
+        // is `PM1a_CNT_BLK` out of the FADT, so which port this is comes from
+        // firmware and not from this file. That is what makes it the right one —
+        // ACPI defines the S5 transition as this word written to exactly the
+        // port the FADT names, and any other address would be a guess about a
+        // machine whose own description is right here. `PM1A_CNT_PORT` is
+        // written only by the FADT parse, the zero check above is what says the
+        // parse happened, and the word is `SLP_TYPa` in its own field with
+        // `SLP_EN` beside it — the PM1 control register's layout and nothing
+        // this file invents. The machine is expected not to execute another
+        // instruction.
+        unsafe { crate::arch::cpu::outw(pm1a, val) };
     }
 
     crate::arch::cpu::halt();

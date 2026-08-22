@@ -257,7 +257,17 @@ fn bcd_to_bin(bcd: u8) -> Option<u8> {
 }
 
 fn port_read(reg: u8) -> u8 {
-    cpu::outb(CMOS_ADDR, reg);
+    // SAFETY: `outb` asks its caller to own the port and the byte. `CMOS_ADDR`
+    // is 0x70, the CMOS/RTC index register's fixed architectural address, and
+    // the byte selects which of the chip's own registers 0x71 then answers with
+    // — an index and never a command, so no value of `reg` makes the RTC do
+    // anything but present a different byte. Bit 7 of the index is the NMI mask,
+    // and nothing here sets it: the register numbers above are 0x00..=0x0B
+    // constants, and the one index that comes from outside — the century
+    // register the FADT names — is refused outside `0x0E..=0x7F` by
+    // [`acpi::rtc_century_register`](crate::drivers::acpi::rtc_century_register)
+    // before it reaches this file.
+    unsafe { cpu::outb(CMOS_ADDR, reg) };
     cpu::inb(CMOS_DATA)
 }
 

@@ -38,7 +38,7 @@ use crate::payload::{
     MockAddressSpace, SimCtx, SimPayload, SimPreempt, SimShareLock, SimWaitList, StdLock,
 };
 use crate::workload::{
-    AgeShape, BalanceShape, BlockShape, ChargeShape, MigrateShape, Op, ParkShape, PlacementShape,
+    AgeShape, BlockShape, ChargeShape, MigrateShape, Op, ParkShape, PlacementShape,
     Protocol, Scenario, Script, ShareShape, WindowShape,
 };
 
@@ -481,7 +481,52 @@ pub struct Vm<'q> {
     /// finished recovering the machine, and a `None` in it is a CPU it never
     /// reached.
     pub first_exec_ns: Vec<Option<u64>>,
+    /// Per CPU: how many times it was woken out of `hlt` and had nothing to do
+    /// when it got there.
+    ///
+    /// **The price of a balance policy, in the one unit the idle path is charged
+    /// in.** `kernel/CLAUDE.md` makes anything added to the idle loop an audio
+    /// change, and what [`Balance::PullWithRearm`] and [`Balance::PushOnSurplus`]
+    /// add is wakes: a re-armed timer firing on a CPU with nothing queued, or a
+    /// doorbell ring with no message behind it. Both land here, and so does
+    /// anything else that wakes a halted CPU for nothing — the count is a
+    /// property of the *run* and not of the policy, which is what lets
+    /// [`Balance::Pull`]'s own figure be the baseline the others are read
+    /// against.
+    ///
+    /// "Had nothing to do" is the pass's own answer rather than a guess: the
+    /// wake is counted when the first pass after it ends in `Action::Idle`
+    /// again. A wake that dispatched something was worth taking, whoever sent
+    /// it.
+    pub idle_wakes: Vec<u64>,
+    /// Per CPU: woken out of `hlt` and not yet through the pass that says
+    /// whether the wake was worth anything.
+    woken_from_halt: Vec<bool>,
+    /// The longest any one CPU sat **halted, with a sibling publishing a surplus
+    /// of two or more, and no probe of its own outstanding**.
+    ///
+    /// This is the defect
+    /// `issues/kernel/an-idle-cpu-that-slept-before-the-surplus-is-never-probed.md`
+    /// names, as a duration. Under [`Balance::Pull`] the interval ends only when
+    /// the surplus does, because nothing in that protocol can end it; under a
+    /// cure it is bounded by the cure's own period. Both bounds are derived in
+    /// `sim/tests/policy.rs`, and it is the quantity those derivations are
+    /// asserted against — a count of CPUs reached says whether the machine
+    /// recovered, and this says how long it was blind.
+    ///
+    /// Read at step boundaries, which is exactly the model's resolution: the
+    /// clock moves only on an execution step or a clock jump, so no interval can
+    /// open and close between two readings.
+    pub probe_gap_ns: u64,
+    /// Per CPU: when its current probe gap opened, or `None` if it is not in
+    /// one.
+    probe_gap_since: Vec<Option<Nanos>>,
 }
+
+/// The surplus at which a victim is worth probing —
+/// `SchedPass::post_steal_probe`'s own inequality, restated here because
+/// [`Vm::probe_gap_ns`] has to ask the same question from outside the core.
+const PROBE_WORTH_IT: u32 = 2;
 
 /// One contention window: a maximal interval over which the same set of
 /// fair-band processes was continuously runnable.
@@ -602,6 +647,10 @@ impl<'q> Vm<'q> {
             finish_ns: vec![None; process_count],
             migrations: 0,
             first_exec_ns: vec![None; n],
+            idle_wakes: vec![0; n],
+            woken_from_halt: vec![false; n],
+            probe_gap_ns: 0,
+            probe_gap_since: vec![None; n],
             next_irq,
             next_key: 1,
             next_spawn_cpu: 0,
@@ -933,6 +982,34 @@ impl<'q> Vm<'q> {
                 (false, None, _) => {}
             }
         }
+        self.note_probe_gaps();
+    }
+
+    /// [`Vm::probe_gap_ns`]: how long a halted CPU has sat next to a surplus it
+    /// has no probe out for.
+    ///
+    /// The maximum is refreshed on every step the gap is still open rather than
+    /// only when it closes, so a run that quiesces — or stops at a violation —
+    /// with a gap standing still reports it.
+    fn note_probe_gaps(&mut self) {
+        let halted = self.hw.with(|s| s.halted.clone());
+        // A CPU number, for [`Vm::execute`]'s reason: it reads `halted`, asks
+        // `self.cpus` and writes `self.probe_gap_since` at one index, and the
+        // pairing across those three is what this loop is about.
+        #[allow(clippy::needless_range_loop)]
+        for cpu in 0..self.scenario.cpus {
+            let surplus_next_door = (0..self.scenario.cpus).any(|victim| {
+                victim != cpu && self.handles.get(CpuId(victim as u32)).surplus() >= PROBE_WORTH_IT
+            });
+            let blind = halted[cpu] && surplus_next_door && !self.cpus[cpu].probe_outstanding();
+            match (blind, self.probe_gap_since[cpu]) {
+                (true, None) => self.probe_gap_since[cpu] = Some(self.clock),
+                (true, Some(since)) => {
+                    self.probe_gap_ns = self.probe_gap_ns.max(self.clock.since(since));
+                }
+                (false, _) => self.probe_gap_since[cpu] = None,
+            }
+        }
     }
 
     /// Record how long one unwind stamp stood before an execution step (or the
@@ -949,19 +1026,24 @@ impl<'q> Vm<'q> {
                 self.run_pass(cpu, Dispose::None);
             }
             Step::DeliverIpi(cpu) => {
-                self.hw.with(|s| {
+                // Whether this ended a `hlt` is read here and judged later: the
+                // pass that follows says whether the wake was worth taking. See
+                // [`Vm::idle_wakes`].
+                let was_halted = self.hw.with(|s| {
                     s.pending_ipi[cpu] -= 1;
                     s.need_resched[cpu] = true;
-                    s.halted[cpu] = false;
+                    core::mem::replace(&mut s.halted[cpu], false)
                 });
+                self.woken_from_halt[cpu] |= was_halted;
                 self.ipi_due[cpu] = None;
             }
             Step::FireTimer(cpu) => {
-                self.hw.with(|s| {
+                let was_halted = self.hw.with(|s| {
                     s.armed[cpu] = None;
                     s.need_resched[cpu] = true;
-                    s.halted[cpu] = false;
+                    core::mem::replace(&mut s.halted[cpu], false)
                 });
+                self.woken_from_halt[cpu] |= was_halted;
             }
             Step::DeviceIrq(index) => self.device_irq(index),
             Step::Advance => {
@@ -1064,10 +1146,10 @@ impl<'q> Vm<'q> {
         // Copied out before the borrow: the injection below runs while the
         // pass holds `CpuSched`, and these are the only fields it needs.
         let queues = self.queues;
-        // The one policy bit in the `Env` (`sched::driver::env`), read off the
+        // The one policy value in the `Env` (`sched::driver::env`), read off the
         // scenario for the same reason as the shapes above it — see
-        // [`BalanceShape`].
-        let steal = self.scenario.balance == BalanceShape::Pull;
+        // [`Scenario::balance`].
+        let balance = self.scenario.balance;
         let mut injected = None;
         let (action, parked, end) = {
             let Vm {
@@ -1082,7 +1164,7 @@ impl<'q> Vm<'q> {
                 cpus: handles,
                 frontier,
                 preempt: &SimPreempt,
-                steal,
+                balance,
             };
             let pass = SchedPass::begin(&mut cpus[cpu], env, now);
             match dispose {
@@ -1167,6 +1249,11 @@ impl<'q> Vm<'q> {
         }
         if end == BlockEnd::Killed {
             self.killed_at_park += 1;
+        }
+        // The verdict on whatever wake ended this CPU's `hlt`: a pass that
+        // reaches the idle disposition again found nothing to do with it.
+        if core::mem::take(&mut self.woken_from_halt[cpu]) && matches!(action, Action::Idle(_)) {
+            self.idle_wakes[cpu] += 1;
         }
         self.apply(action);
         self.hw.leave_pass();
