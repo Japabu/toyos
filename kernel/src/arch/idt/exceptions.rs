@@ -456,7 +456,13 @@ pub(super) fn debug_handler(frame: &TrapFrame) {
     // instruction with the same operands — it is what the five bytes of inline
     // assembly here used to spell.
     for &b in b"\n!!! DB TRAP !!!\n" {
-        cpu::outb(SERIAL_COM1, b);
+        // SAFETY: `outb` asks its caller to own the port and the byte.
+        // `SERIAL_COM1` is 0x3f8, COM1's data register — a UART, which reaches no
+        // memory — and the bytes are this marker's own ASCII. Deliberately not
+        // `serial::panic_raw`, which is the same instruction behind a
+        // `uart_present()` latch and a THRE spin: the whole point of this line is
+        // to depend on nothing the trap could have been about.
+        unsafe { cpu::outb(SERIAL_COM1, b) };
     }
 
     let dr6 = debug::read_dr6();

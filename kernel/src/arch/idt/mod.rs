@@ -452,29 +452,45 @@ extern "sysv64" fn trap_dispatch(frame: *mut TrapFrame) {
 }
 
 /// Disable the legacy 8259 PIC.
+///
+/// The four ports at the top of this file are the pair's fixed architectural
+/// addresses and the only I/O ports this module names.
 fn disable_pic() {
-    outb(PIC1_CMD, 0x11);
-    io_wait();
-    outb(PIC2_CMD, 0x11);
-    io_wait();
+    // SAFETY: `outb` asks its caller to own the port and the byte it sends.
+    // Every port here is one of the 8259 pair's four, which no other device
+    // decodes on any machine this kernel targets; the bytes are the documented
+    // ICW1..ICW4 initialisation followed by `0xFF` in both mask registers, which
+    // silences the device rather than arming it, and none of them reaches memory.
+    //
+    // **One block, because the sequence is the safety argument.** A PIC left
+    // half-initialised keeps delivering its power-on vectors — 8..15 and 112..119
+    // — into an IDT whose gates at those numbers belong to `#DF`, `#GP`, `#PF`
+    // and the rest, and there is no point between these writes where that is a
+    // state the machine may be left in.
+    unsafe {
+        outb(PIC1_CMD, 0x11);
+        io_wait();
+        outb(PIC2_CMD, 0x11);
+        io_wait();
 
-    outb(PIC1_DATA, 32);
-    io_wait();
-    outb(PIC2_DATA, 40);
-    io_wait();
+        outb(PIC1_DATA, 32);
+        io_wait();
+        outb(PIC2_DATA, 40);
+        io_wait();
 
-    outb(PIC1_DATA, 4);
-    io_wait();
-    outb(PIC2_DATA, 2);
-    io_wait();
+        outb(PIC1_DATA, 4);
+        io_wait();
+        outb(PIC2_DATA, 2);
+        io_wait();
 
-    outb(PIC1_DATA, 0x01);
-    io_wait();
-    outb(PIC2_DATA, 0x01);
-    io_wait();
+        outb(PIC1_DATA, 0x01);
+        io_wait();
+        outb(PIC2_DATA, 0x01);
+        io_wait();
 
-    outb(PIC1_DATA, 0xFF);
-    outb(PIC2_DATA, 0xFF);
+        outb(PIC1_DATA, 0xFF);
+        outb(PIC2_DATA, 0xFF);
+    }
 }
 
 pub fn init() {

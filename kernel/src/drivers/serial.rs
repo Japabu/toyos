@@ -41,18 +41,34 @@ static UART_PRESENT: AtomicBool = AtomicBool::new(false);
 // lines a different kind of statement from the other eight.
 #[allow(clippy::identity_op)]
 pub fn init() {
-    outb(PORT + 1, 0x00); // Disable all interrupts
-    outb(PORT + 3, 0x80); // Enable DLAB (set baud rate divisor)
-    outb(PORT + 0, 0x03); // Set divisor to 3 (lo byte) 38400 baud
-    outb(PORT + 1, 0x00); //                  (hi byte)
-    outb(PORT + 3, 0x03); // 8 bits, no parity, one stop bit
-    outb(PORT + 2, 0xC7); // Enable FIFO, clear them, with 14-byte threshold
-    outb(PORT + 4, 0x0B); // IRQs enabled, RTS/DSR set
-    outb(PORT + 4, 0x1E); // Set in loopback mode, test the serial chip
-    outb(PORT + 0, 0xAE); // Test serial chip (send byte 0xAE and check if serial returns same byte)
-    let loopback = inb(PORT + 0);
-    UART_PRESENT.store(loopback == 0xAE, Ordering::Relaxed);
-    outb(PORT + 4, 0x0F); // Normal operation mode
+    // SAFETY: `outb` asks its caller to own the port and the byte. Every port
+    // here is `PORT + n` with `n` a literal in 0..=4, so all of them are inside
+    // COM1's own eight-register block at 0x3f8 — a UART, which decodes nothing
+    // outside itself and has no way to reach memory. The bytes are the 16550's
+    // documented programming: the divisor latch, the line and FIFO control
+    // words, and the loopback probe.
+    //
+    // **One block, because the sequence is the safety argument.** The DLAB bit
+    // set on line three is what makes the next two writes the divisor latch
+    // rather than the data and interrupt-enable registers, and the loopback bit
+    // set before the probe is what makes the byte read back the chip's own
+    // rather than something on the wire. Either half left standing is a UART
+    // that is not a console.
+    let loopback = unsafe {
+        outb(PORT + 1, 0x00); // Disable all interrupts
+        outb(PORT + 3, 0x80); // Enable DLAB (set baud rate divisor)
+        outb(PORT + 0, 0x03); // Set divisor to 3 (lo byte) 38400 baud
+        outb(PORT + 1, 0x00); //                  (hi byte)
+        outb(PORT + 3, 0x03); // 8 bits, no parity, one stop bit
+        outb(PORT + 2, 0xC7); // Enable FIFO, clear them, with 14-byte threshold
+        outb(PORT + 4, 0x0B); // IRQs enabled, RTS/DSR set
+        outb(PORT + 4, 0x1E); // Set in loopback mode, test the serial chip
+        outb(PORT + 0, 0xAE); // Test serial chip (send byte 0xAE and check if serial returns same byte)
+        let seen = inb(PORT + 0);
+        UART_PRESENT.store(seen == 0xAE, Ordering::Relaxed);
+        outb(PORT + 4, 0x0F); // Normal operation mode
+        seen
+    };
     // The byte, not just the verdict. Replacing the old assert with a silent
     // latch collapsed three different situations into one `false`: no SuperIO
     // at all (0xFF), a chip that answered wrongly, and the right chip at the
@@ -586,7 +602,13 @@ fn uart_write_bytes(bytes: &[u8]) {
             }
             core::hint::spin_loop();
         }
-        outb(PORT, b);
+        // SAFETY: `outb` asks its caller to own the port and the byte. `PORT` is
+        // COM1's data register — a UART, which decodes nothing outside its own
+        // eight registers and cannot reach memory — and the byte is console
+        // output, so there is no value of it that means anything to the device
+        // other than "transmit this". `uart_present()` above is why the chip is
+        // there at all; the THRE spin is why it is ready.
+        unsafe { outb(PORT, b) };
     }
 }
 

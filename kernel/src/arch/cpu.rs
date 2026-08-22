@@ -11,8 +11,8 @@
 //! The split between `pub fn` and `pub unsafe fn` here is that second half. A
 //! function is `unsafe` when the caller can choose a value that breaks the
 //! machine — `write_cr0`, `write_cr4`, `write_cr3`, `lidt`, `ltr`, `wbinvd`,
-//! `wrmsr` — and safe when it cannot. **Five wrappers are safe today and should
-//! not be**: `outb`, `outw`, `wrfsbase`, `invlpg` and `invpcid` all take a
+//! `wrmsr`, `outb`, `outw` — and safe when it cannot. **Three wrappers are safe
+//! today and should not be**: `wrfsbase`, `invlpg` and `invpcid` all take a
 //! caller-chosen value that reaches hardware, and each is the rest of
 //! `issues/kernel/arch-cpu-safe-wrappers-that-are-not.md`.
 //!
@@ -20,8 +20,9 @@
 //! one safe wrapper that discharges the choice, not an `unsafe` block apiece.**
 //! `arch::apic::Reg` is that for the eighteen x2APIC `wrmsr` calls, and
 //! `mm::paging::activate_kernel` is the pattern it follows. Where the set is not
-//! closed — an MSR that *is* the machine's one declaration — the block sits at
-//! the call and its `SAFETY:` says why that value is the right one.
+//! closed — a port a device's firmware description names, an MSR that *is* the
+//! machine's one declaration — the block sits at the call and its `SAFETY:` says
+//! why that value is the right one.
 
 use core::arch::asm;
 
@@ -359,38 +360,52 @@ pub fn halt() -> ! {
     }
 }
 
+/// # Safety
+/// The instruction cannot fault in Ring 0 — `CR4.UMIP` does not cover port I/O
+/// and there is no I/O permission bitmap, because `Tss::iopb_offset` is past the
+/// segment limit — so what the caller owns is not a fault but a *device*. Any
+/// legacy port is reachable, including ones that program a controller to write
+/// memory, and the port and the byte together are the command. The caller
+/// answers for which device answers at `port` and for what the byte tells it to
+/// do.
 #[inline]
-pub fn outb(port: u16, value: u8) {
-    // SAFETY: the instruction itself touches no memory this compilation unit
-    // names and cannot fault in Ring 0 (`CR4.UMIP` does not cover port I/O, and
-    // there is no I/O permission bitmap because `Tss::iopb_offset` is past the
-    // segment limit). What it *can* do is program a device — see the module
-    // header on why this wrapper being safe is a filed gap.
-    unsafe {
-        asm!("out dx, al", in("dx") port, in("al") value);
-    }
+pub unsafe fn outb(port: u16, value: u8) {
+    asm!("out dx, al", in("dx") port, in("al") value);
 }
 
+/// One byte from an I/O port.
+///
+/// **Safe, and the reason is that there is no value.** A read carries nothing a
+/// caller can get wrong in [`outb`]'s direction: it commands no device and
+/// writes no memory. A port whose read pops a queue — the 8042's data register
+/// is one — still cares which port it is, and that is the driver's correctness
+/// rather than the machine's soundness.
 #[inline]
 pub fn inb(port: u16) -> u8 {
     let value: u8;
-    // SAFETY: `outb`'s argument. A read has no value for a caller to get wrong,
-    // though a device with read-sensitive registers still cares which port.
+    // SAFETY: one instruction into the declared output, no memory operand and no
+    // fault in Ring 0 (`outb`'s `# Safety` carries why). The doc comment above
+    // is why this direction needs no caller obligation.
     unsafe {
         asm!("in al, dx", out("al") value, in("dx") port);
     }
     value
 }
 
+/// # Safety
+/// [`outb`]'s contract, sixteen bits wide.
 #[inline]
-pub fn outw(port: u16, value: u16) {
-    // SAFETY: `outb`'s argument, sixteen bits wide.
-    unsafe {
-        asm!("out dx, ax", in("dx") port, in("ax") value);
-    }
+pub unsafe fn outw(port: u16, value: u16) {
+    asm!("out dx, ax", in("dx") port, in("ax") value);
 }
 
+/// One I/O bus cycle of delay, for a device that needs one between two commands.
 #[inline]
 pub fn io_wait() {
-    outb(0x80, 0);
+    // SAFETY: `outb` asks its caller to own the port and the byte. Port 0x80 is
+    // the POST diagnostic port: nothing on a machine of this kernel's era
+    // decodes it, which is what makes a write to it the architectural way to
+    // spend a bus cycle rather than a command to anything. Zero is the value,
+    // and no device reads it back.
+    unsafe { outb(0x80, 0) };
 }
