@@ -130,7 +130,7 @@ before adopting:
 
 | module | unsafe blocks | status |
 |---|---:|---|
-| `drivers/` | 121 | not yet swept |
+| `drivers/` | 121 | **adopted 2026-08-22 — the first sweep under the reduction ruling.** 121 undocumented blocks (132 `unsafe` blocks in all); **60 removed, 72 documented, 1 filed.** Per driver below. |
 | `arch/` | 107 | not yet swept |
 | root files (`user_ptr.rs`, `process.rs`, `preempt.rs`, `inbox.rs`, `main.rs`, `symbols.rs`, `hw.rs`, `file_backing.rs`, `sync.rs`, `scheduler.rs`, `pipe.rs`, `page_cache.rs`, `bcachefs_adapter.rs`) | 76 | **adopted** — 13 removed, 63 documented, 4 filed. Per file and per finding below. |
 | `mm/` | 35 | **adopted** — every site now carries a `SAFETY:` comment; two (`object::shm::Pages`, `mm::paging::AddressSpace`'s `Send`/`Sync` impls) turned out to look vestigial rather than load-bearing, filed rather than removed: `issues/kernel/redundant-send-sync-impls-mm-object.md` |
@@ -141,8 +141,86 @@ before adopting:
 | `log/` | 2 | not yet swept |
 | `object/` | 1 | **adopted** — the one site is `object::shm::Pages`'s `Send`/`Sync` pair, part of the finding filed above |
 | `completion/` | 0 undocumented (3 unsafe sites, all already carrying a `SAFETY:`/`Safety:` comment predating this pass) | already documented |
-| **adopted so far** | **143** (`mm` 35 + `elf` 23 + `loader` 8 + `object` 1 + root files 76) | gated at the source, because the kernel is one crate with no `-p` scoping to hang a lint on. The four area sweeps opened their entry module (`mm/mod.rs`, `object/mod.rs`, `elf/mod.rs`, `loader/mod.rs`) with `#![warn(clippy::undocumented_unsafe_blocks)]`; the root-file sweep could not — there is no entry module above them but the crate root — so it **inverted the form**: `main.rs` carries one crate-level `#![warn(...)]` and an `#[allow(...)]` on each of the five `mod` lines still owed. Both compose with `host-tests.yml`'s existing `-D warnings` on the two kernel invocations, so no command line changed. The four module attributes are now redundant under the crate one and are left where they are — deleting them touches four swept areas for nothing, and each still records its own area's status. |
-| **remaining** | **246** (`drivers` 121 + `arch` 107 + `sched` 8 + `iommu` 8 + `log` 2) | measured 2026-08-22 with `--force-warn clippy::undocumented_unsafe_blocks` over both kernel invocations, which is what reads *through* the five `allow`s. Each `allow` in `main.rs` is deleted by the pull request that sweeps its area, so the list is the ledger. |
+| **adopted so far** | **264** (`mm` 35 + `elf` 23 + `loader` 8 + `object` 1 + root files 76 + `drivers` 121) | gated at the source, because the kernel is one crate with no `-p` scoping to hang a lint on. The area sweeps opened their entry module (`mm/mod.rs`, `object/mod.rs`, `elf/mod.rs`, `loader/mod.rs`, `drivers/mod.rs`) with `#![warn(clippy::undocumented_unsafe_blocks)]`; the root-file sweep could not — there is no entry module above them but the crate root — so it **inverted the form**: `main.rs` carries one crate-level `#![warn(...)]` and an `#[allow(...)]` on each `mod` line still owed. Both compose with `host-tests.yml`'s existing `-D warnings` on the two kernel invocations, so no command line changed. The module attributes are now redundant under the crate one and are left where they are — deleting them touches swept areas for nothing, and each still records its own area's status. |
+| **remaining** | **125** (`arch` 107 + `sched` 8 + `iommu` 8 + `log` 2) | measured 2026-08-22 with `--force-warn clippy::undocumented_unsafe_blocks` over both kernel invocations, which is what reads *through* the `allow`s. Each `allow` in `main.rs` is deleted by the pull request that sweeps its area, so the list is the ledger; `drivers` left it the day it arrived. |
+
+### `drivers/`, per driver (swept 2026-08-22)
+
+Total `unsafe` blocks before and after, counted over
+`kernel/src/drivers/**/*.rs` excluding comment lines; "found" is the
+`undocumented_unsafe_blocks` finding count, which is smaller where a driver
+already had some documented blocks.
+
+| driver | found | blocks before | after | removed |
+|---|---:|---:|---:|---:|
+| `xhci/` (6 files) | 36 | 38 | 17 | 21 |
+| `panic_console/mod.rs` | 18 | 18 | 17 | 1 |
+| `nvme.rs` | 13 | 13 | 9 | 4 |
+| `virtio.rs` | 13 | 13 | 3 | 10 |
+| `virtio_gpu.rs` | 11 | 11 | 2 | 9 |
+| `acpi.rs` | 9 | 9 | 2 | 7 |
+| `virtio_console.rs` | 9 | 9 | 5 | 4 |
+| `virtio_sound.rs` | 2 | 7 | 7 | 0 |
+| `hda.rs` | 2 | 5 | 5 | 0 |
+| `serial.rs` | 4 | 5 | 3 | 2 |
+| `mod.rs` | 2 | 2 | 1 | 1 |
+| `virtio_net.rs` | 2 | 2 | 1 | 1 |
+| **total** | **121** | **132** | **72** | **60** |
+
+Five abstractions did most of it, and none is a wrapper for the lint's
+sake — each replaces a raw-pointer expression whose bound was the *offset*
+with one whose bound is the offset *and the length*:
+
+- `acpi::Mapped` — a firmware-supplied physical address `table_at` has
+  bounded, with the module's only two dereferences on it. Writing the
+  justification found that `xsdt` read four fields off an RSDP address that
+  had never been through `table_at`, so the two cases `MAX_PHYS` exists to
+  stop reached `as_ptr` and wrapped; routed through the check now.
+- `virtio::Ring` — the `Mmio` of a virtqueue. Eleven inline
+  `read_volatile(slice.ptr_at(off) as *const T)` became three methods.
+- `serial::SavedFlags` — an `RFLAGS` word that came out of `pushfq`, which
+  is what makes `restore` a safe method; `DF` set is the failure this type
+  makes unrepresentable.
+- `xhci`'s five helpers — `zero_dma` (12 sites), `write_dcbaa` (3),
+  `TrbRing::put` (3), `msc::read_dma` (4), `msc::write_dma` (2).
+- `virtio_gpu::{put, answer}` — the driver's one writer and one reader of
+  DMA memory, which also deleted three `core::slice::from_raw_parts` views
+  built only to feed `copy_nonoverlapping`.
+
+Four `unsafe impl`s were tested for redundancy by replacing each with a
+`fn _p<T: Send>()` probe and compiling: `DmaPool`'s was redundant and is
+deleted, and `NvmeBlockDevice`, `VConsole`, `ConsoleCell`, `GpuController`,
+`VirtioNic`, `FbCell` and `RenderedCell` all failed the probe and were
+kept. Three more were deleted a different way — by giving `VConsole`,
+`GpuController` and `VirtioNic` `KernelSlice` fields instead of `*mut u8`,
+after which the auto trait applies.
+
+**Two real holes closed while writing the justifications**, both of the
+same kind — a bound that was on the offset and not on the length:
+
+- `xhci::device::read_back` parsed a configuration descriptor through
+  `core::slice::from_raw_parts(buf, delivered as usize)`, where `delivered`
+  is a length the *device* chose in its Transfer Event. A device reporting
+  more than the 256-byte scratch page held read past it.
+- `acpi::xsdt`'s unchecked RSDP address, above.
+
+**What was not removable, and why.** `panic_console` gave up one block of
+eighteen: its five `UnsafeCell` statics cannot be `Lock`s because the panic
+path may take no synchronisation primitive (`Lock::lock` panics after 500M
+spins; `try_lock` can dispatch the scheduler), and `Fb` at 40 bytes and
+`Rendered` at `SNAPSHOT_CAP` bytes fit no atomic. Its framebuffer accesses
+reach a `*mut u8` from the GOP descriptor, which no `mm` type describes.
+The two audio drivers gave up none: restructuring either changes what a
+device does, which root `CLAUDE.md` puts behind the owner's sign-off.
+
+**One reduction filed rather than done**, because it is one abstraction
+across every driver rather than a change inside one:
+`issues/kernel/dma-pool-hands-out-raw-access-not-a-view.md`. 35 of the 72
+blocks that remain are the same shape — a bounds-checked view over
+`DmaPool` memory reached through a `KernelSlice` whose every accessor is an
+`unsafe fn` — and the five driver-local helpers this sweep wrote are five
+approximations of the one thing that belongs on `DmaPool`. The file carries
+the per-file site list.
 
 ### The root files, per file (swept 2026-08-22)
 

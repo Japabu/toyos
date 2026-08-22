@@ -39,7 +39,6 @@ mod id_map;
 // only a record of the ones nobody has swept.
 #[allow(clippy::undocumented_unsafe_blocks, reason = "arch/: not yet swept")]
 mod arch;
-#[allow(clippy::undocumented_unsafe_blocks, reason = "drivers/: not yet swept")]
 mod drivers;
 
 #[macro_use]
