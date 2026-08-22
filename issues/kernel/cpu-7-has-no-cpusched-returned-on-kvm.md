@@ -103,7 +103,24 @@ and blamed the test's `Sched::Parallel`, which is the misreading the same file
 warns about two lines later. Anyone meeting a lone `Init process crashed during
 boot` under an unrelated test name should search the capture for this panic
 before believing the name.
->>>>>>> origin/main
+
+## 2026-08-21: the stray-write class this was read as a sighting of is resolved
+
+The dev host's `BTreeMap`-inside-its-own-`insert` class — a per-CPU scheduler
+record reading as a value no operation on it produces — was resolved that day:
+no Ring 0 entry cleared the direction flag, `compiler_builtins::mem::memmove`
+sets it across three `rep` string operations with interrupts enabled, and every
+`memcpy`/`memset` reached from an entry taken inside that window wrote the `n`
+bytes *below* its destination. `arch::entry::ring3_naked_asm`'s `cld` and
+`arch::syscall::init`'s `DF` in `IA32_FMASK` close it: 17 deaths in 7,059
+twelve-wide boots without them, 0 in 7,418 with them.
+
+`SCHEDS` is `static` and a `None` written back into it is exactly what a
+backwards `memset`/`memcpy` landing in `.bss` produces, so **both sightings
+above are consistent with that mechanism and need no bring-up ordering bug at
+all** — the second one, a TCG boot under a twelve-guest host, is the exposure
+that mechanism predicts. The fix is architecture-neutral and applies to the KVM
+path unchanged. What is owed is a re-measurement, not a new hypothesis.
 
 ## Whoever takes it
 
