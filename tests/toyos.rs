@@ -510,6 +510,13 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     // it reds. Host contention moves this guest's median by a factor of eight,
     // which is the definition of a test that must have the machine to itself.
     ("sched_check_build", Sched::Serial, Tier::Fast),
+    // What nesting a `scheduler::Operation` may and may not do, which is a law
+    // with no host-side reader: the type reaches `percpu::cpu_id` and
+    // `driver::current_handle`, so nothing outside a booted machine can
+    // construct one. Parallel, and nothing in it is a duration — every verdict
+    // is a comparison between two numbers the kernel printed, both of them
+    // offsets it chose itself.
+    ("operation_nesting", Sched::Parallel, Tier::Fast),
     ("short_sleep_livelock", Sched::Parallel, Tier::Fast),
     // The kernel thread and the row that says what its panic means. Two
     // boots, both headless: the second one halts on purpose — and the pair
@@ -9598,6 +9605,144 @@ fn run_machine_test(
             eprintln!("  [i8042] {}", quiet.trim());
             eprintln!("  [i8042] {}", line.trim());
             eprintln!("  [i8042] {health} idle-health lines — the CPU still halts");
+            Ok(())
+        }
+        "operation_nesting" => {
+            // **An inner `scheduler::Operation` may only narrow, and its drop
+            // restores what it displaced.** `Operation::begin` stores
+            // `outer.min(until)`, so a caller cannot buy itself more device
+            // time by starting a second operation inside the first — which is
+            // the failure `block::OPERATION` exists to stop, arriving one layer
+            // lower.
+            //
+            // Nothing host-side can read it: the type reaches `percpu::cpu_id`
+            // and `driver::current_handle`, and `kernel/` is excluded from the
+            // host workspace, so a `Operation` cannot be constructed off a
+            // booted machine. The other gates that drive an establishment —
+            // `cache_eviction`'s `nvme-spent-budget`, `usb_storage_gate`'s —
+            // prove a narrowing happened by the refusal it produces and read
+            // none of the values, and all of them establish from a boot phase,
+            // which is the *task-less* slot. `kernel/src/sched_gate.rs` runs
+            // three nested establishments with known deadlines in both homes
+            // and prints what every level saw.
+            //
+            // **The bound is derived here and not read off the kernel's
+            // verdict**: the kernel prints what each level *asked* for and what
+            // it *observed*, and this recomputes the running minimum. A kernel
+            // that printed a verdict would be marking its own paper.
+            let qemu = QemuInstance::boot_with_options(
+                test_config,
+                c_bins,
+                rust_bins,
+                BootOptions {
+                    kernel_params: &["sched-operation-nesting"],
+                    ..Default::default()
+                },
+            );
+            let log = qemu.boot_log().to_string();
+
+            /// One `key=value` off a gate line, as a number.
+            fn number(line: &str, key: &str) -> Result<u64, String> {
+                line.split_whitespace()
+                    .find_map(|word| word.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
+                    .ok_or_else(|| format!("no numeric {key} in {line:?}"))
+            }
+            /// One `key=value` off a gate line, as a flag.
+            fn flag(line: &str, key: &str) -> Result<bool, String> {
+                line.split_whitespace()
+                    .find_map(|word| word.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
+                    .ok_or_else(|| format!("no boolean {key} in {line:?}"))
+            }
+
+            // Both homes. A task's word is on its `TaskHandle` and a context
+            // with no task uses one slot per CPU, and the two are reached by
+            // different arms of `operation_slot` — so a gate that ran in one
+            // place would leave the other arm unexecuted by any test at all.
+            for site in ["boot", "iod"] {
+                let say = |what: &str| -> Result<String, String> {
+                    let needle = format!("sched-op: {site} {what}");
+                    log.lines()
+                        .find(|line| line.contains(&needle))
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("no {needle:?} line on this boot:\n{log}"))
+                };
+
+                let outside = say("outside")?;
+                if flag(&outside, "established")? {
+                    return Err(format!(
+                        "{site}: an operation was already established before the gate began, \
+                         so nothing below is about the nesting it made: {outside}"
+                    ));
+                }
+
+                // Every level: what it asked for, and what the depth below it
+                // recovered. The bound is the running minimum — an inner
+                // establishment takes the earlier of its own deadline and its
+                // parent's, and only that.
+                let mut asked = Vec::new();
+                let mut narrowest = u64::MAX;
+                for level in 1..=3 {
+                    let line = say(&format!("begin level={level}"))?;
+                    let want = number(&line, "asked")?;
+                    let saw = number(&line, "observed")?;
+                    narrowest = narrowest.min(want);
+                    if saw != narrowest {
+                        return Err(format!(
+                            "{site}: level {level} asked for {want} ns and the depth inside it \
+                             recovered {saw} ns, against the {narrowest} ns that is the \
+                             earliest of it and every level above it. An establishment that \
+                             observes more than its parent allowed is a caller buying itself \
+                             device time by nesting: {line}"
+                        ));
+                    }
+                    asked.push(want);
+                }
+                // The widening attempt has to have been a real one, or the line
+                // above is satisfied by a scenario in which nothing was asked.
+                if asked[2] <= asked[1] {
+                    return Err(format!(
+                        "{site}: level 3 asked for {} ns inside a level 2 of {} ns, so the \
+                         gate never attempted to widen and the narrowing it reports is vacuous",
+                        asked[2], asked[1],
+                    ));
+                }
+
+                // And the restore: each drop puts back what that establishment
+                // displaced rather than clearing the slot, so the operation
+                // above it survives the one below ending.
+                for (level, restored) in [(3, asked[1].min(asked[0])), (2, asked[0])] {
+                    let line = say(&format!("end level={level}"))?;
+                    let saw = number(&line, "observed")?;
+                    if saw != restored {
+                        return Err(format!(
+                            "{site}: with level {level} dropped the depth recovered {saw} ns \
+                             and the frame above it established {restored} ns — a guard that \
+                             restores something else has ended an operation its caller is \
+                             still inside: {line}"
+                        ));
+                    }
+                    if !flag(&line, "established")? {
+                        return Err(format!(
+                            "{site}: dropping level {level} left no operation established at \
+                             all, and its caller is still inside one: {line}"
+                        ));
+                    }
+                }
+
+                let last = say("end level=1")?;
+                if flag(&last, "established")? {
+                    return Err(format!(
+                        "{site}: the outermost guard dropped and an operation is still \
+                         established — the slot was restored rather than cleared, so the next \
+                         depth to ask would be answered a deadline nobody set: {last}"
+                    ));
+                }
+                eprintln!(
+                    "  [operation] {site}: {} ns narrowed to {} ns, a {} ns request changed \
+                     nothing, and both drops restored",
+                    asked[0], asked[1], asked[2],
+                );
+            }
             Ok(())
         }
         "virtio_used_ring" => {

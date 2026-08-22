@@ -228,6 +228,51 @@ pub enum ChargeShape {
     Double { process: &'static str },
 }
 
+/// Where a spawn is placed.
+///
+/// A scenario dimension rather than a constant because the shipped answer is a
+/// *policy*, and it is the one that decides which machines the rest of the
+/// scheduler is ever measured on: least-loaded-with-rotation spreads every
+/// burst by construction, so under it a machine whose runnable threads all sit
+/// on one CPU is not expressible from a workload at all — and that machine is
+/// exactly what the pull half of §7.7 exists for. Both answers below are the
+/// kernel's own code either way; what this decides is which of the two numbers
+/// `Vm::spawn` places by.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PlacementShape {
+    /// Spec §9.4, and `kernel::sched::driver`'s `placement`: the least-loaded
+    /// CPU from the published counters, ties rotating so a freshly booted
+    /// system does not put everything on cpu0.
+    LeastLoadedRotating,
+    /// Every spawn onto one named CPU, whatever the counters say.
+    ///
+    /// **Not a policy this kernel has ever had, and that is the point.** It is
+    /// the adversary: the lopsided machine no legal placement produces and no
+    /// workload can otherwise stage, so that what the balance path does with
+    /// one is a measurement rather than a belief. See
+    /// `scenarios::lopsided_placement`.
+    AllOn(usize),
+}
+
+/// Whether the pull half of the balance path runs.
+///
+/// A scenario dimension for [`PlacementShape`]'s reason and with the same two
+/// roles: the shipped answer, and the control that says what the measurement
+/// would be without it. `kernel::sched::driver::env` sets `steal: true` and
+/// never clears it, so [`BalanceShape::None`] is a kernel this tree has not
+/// shipped — `toyos-sched/loom`'s `loom_retire` already builds an `Env` with
+/// `steal: false` for the same reason, to state what the rest of the protocol
+/// does without it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BalanceShape {
+    /// Spec §7.7 and §9.4's pull half: an idle pass probes the CPU with the
+    /// most surplus, and a loaded pass answers a probe out of `pop_surplus`.
+    Pull,
+    /// No probe and no answer. A task woken or placed onto a busy CPU waits
+    /// there until that CPU's own queue reaches it.
+    None,
+}
+
 /// Which teardown/balance algorithm the VM drives the core with.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Protocol {
@@ -256,6 +301,8 @@ pub struct Scenario {
     pub age: AgeShape,
     pub share: ShareShape,
     pub charge: ChargeShape,
+    pub placement: PlacementShape,
+    pub balance: BalanceShape,
     /// How the fair band picks between two ready threads of one share. A
     /// scenario dimension for the same reason [`ShareShape`] is, and the type is
     /// the core's own rather than a parallel copy of it: the broken orderings
@@ -345,6 +392,28 @@ impl Scenario {
 
     pub fn with_charge(mut self, charge: ChargeShape) -> Self {
         self.charge = charge;
+        self
+    }
+
+    /// **Checked here rather than at the placement site**, which runs once per
+    /// spawn: a CPU index outside the machine is a scenario that was written
+    /// wrong, and a panic at the first spawn of a sweep would name the VM
+    /// instead of the scenario that asked for it.
+    pub fn with_placement(mut self, placement: PlacementShape) -> Self {
+        if let PlacementShape::AllOn(cpu) = placement {
+            assert!(
+                cpu < self.cpus,
+                "{}: placement names cpu{cpu} on a {}-cpu machine",
+                self.name,
+                self.cpus,
+            );
+        }
+        self.placement = placement;
+        self
+    }
+
+    pub fn with_balance(mut self, balance: BalanceShape) -> Self {
+        self.balance = balance;
         self
     }
 
