@@ -88,6 +88,39 @@ consistent with that mechanism and needs no bring-up ordering bug at all** — t
 fix is architecture-neutral and applies to the KVM path unchanged. What is owed
 is a re-measurement, not a new hypothesis.
 
+## A second sighting the same day, on the dev host, on the newer tree
+
+2026-08-21, `wt/toyos-bimodal` at `fa5eb83b` (`main` `13953023` plus a soundd
+stats-line instrument), dev host, cross-arch TCG, plain `cargo test` — the
+12-wide fast tier. One death in 275 tests:
+
+```
+[kernel 1.366 cpu1] PANIC: panicked at src/sched/driver.rs:264:28:
+cpu 1 has no CpuSched
+[kernel 1.367 cpu1]     0xffff80007d15419c  core::panicking::panic_fmt+0x2c
+[kernel 1.367 cpu1]     0xffff80007d122f03  kernel::sched::driver::with_cpu::<...>+0x283
+[kernel 1.367 cpu1]     0xffff80007d08c234  kernel::sched::driver::pass+0x94
+[kernel 1.367 cpu1]     0xffff80007d08cb76  kernel::sched::driver::idle_loop+0x26
+[kernel 1.367 cpu1]   Contexts: cpu1 crashed at rsp=0xffff800000e41d98, asking about ctx 0x0
+[kernel 1.367 cpu1]   cpu0 is on ctx 0xffff800000debd48 pid=0 tid=0 ...
+```
+
+Byte-for-byte the same shape — `idle_loop -> pass -> with_cpu`, `asking about
+ctx 0x0`, during bring-up — at the same site: `driver.rs:264` is the `:224`
+above after `main` grew `kernel/src/sched/driver.rs` by 157 lines and
+`kernel/src/mm/alloc.rs` by 651 between `53101d08` and `13953023`. So **the heap
+sweep and the scheduler work that landed between the two sightings did not
+remove it**, and it is not specific to KVM, to eight vCPUs or to the audio
+configs: this one was a four-CPU boot on a host running twelve guests at once.
+
+The red it produced was named `swiss_german_layout`, which was only the test
+whose boot it landed in — `tests/CLAUDE.md`'s "that red's name is the workload,
+never the cause". The harness's own `ALONE:` line then reported it GREEN alone
+and blamed the test's `Sched::Parallel`, which is the misreading the same file
+warns about two lines later. Anyone meeting a lone `Init process crashed during
+boot` under an unrelated test name should search the capture for this panic
+before believing the name.
+
 ## 2026-08-22: the re-measurement, on this machine, and what it will not do
 
 The recipe above was run on the T14 itself: the CI image at the digest
@@ -141,6 +174,12 @@ an interrupt, so exposure per boot scales with timer ticks per boot — and a TC
 boot on the dev host spends many times the wall clock a KVM boot spends on the
 same guest work. Nothing about the mechanism is emulator-specific; the *rate*
 is, and no storm on this machine has yet been made dense enough to see it.
+
+The second sighting recorded above is the control for that reading rather than
+against it: it is the dev host again, cross-arch TCG again, and a **four**-CPU
+boot, so neither eight vCPUs nor KVM is what this class needs. Every sighting
+this project has on an unfixed tree but one came from the slower instrument, and
+the one that did not is the 254-boot session this file opened with.
 
 ## Whoever takes it
 

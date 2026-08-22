@@ -23,6 +23,15 @@
 #                     named no wake time — the idle path, and the one wake
 #                     after a drain before the DLL re-locks — contribute
 #                     nothing: nothing was due, so nothing can be late.
+#                     **It is two delays added together, and mostly not
+#                     soundd's.** The gate's per-run line splits it at the
+#                     completion interrupt's own timestamp — `irq` is the
+#                     device late, `pickup` is soundd late — and on the T14
+#                     under KVM `pickup` was 10-206us across 176 config-runs
+#                     while the whole number ran 2509-6176us.
+#                     `toyos_mixer::WorstWake` is where that split is argued;
+#                     read it before taking a movement in this number for a
+#                     scheduling change.
 #   drains            Cycles that found the entire DMA pipeline free *and*
 #                     could only have got there by soundd being late.
 #                     The idle path empties the pipeline by design, and a
