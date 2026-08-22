@@ -177,9 +177,10 @@ because each is a decision past a documentation sweep:
 - `issues/kernel/initrd-extents-are-not-bounded-by-the-image.md` —
   `InitrdBacking` is given the *file's* size and never the image's, so nothing
   bounds an extent against the end of the initrd it came out of.
-- `issues/kernel/user-pages-still-read-through-a-plain-deref.md` — the futex
-  word and the crash dump read user memory with `*ptr` where `copy_in` uses
-  `read_volatile`, on a stated argument the two do not follow.
+- The futex word and the crash dump read user memory with `*ptr` where
+  `copy_in` uses `read_volatile`. **Decided and fixed 2026-08-22**: both are
+  `read_volatile`, and the rule is now `user_ptr.rs`'s module header rather
+  than a per-site preference.
 - `issues/kernel/pagealloc-has-no-checked-window.md` — the demand-paging fill's
   two raw writes want a bounded window type, and the obvious `&mut [u8]` is the
   borrow that is wrong for pages about to become a user mapping.

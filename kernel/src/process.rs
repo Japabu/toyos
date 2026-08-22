@@ -1911,12 +1911,18 @@ pub fn dump_crash_diagnostics(fault_addr: u64, rip: u64) {
         // SMAP on.
         //
         // Irreducible, and it is a *crash report* — the value is printed and
-        // decides nothing, so the fact that another thread of the dying
-        // process could rewrite it between two lines of the dump is the
-        // report's subject rather than a hazard. Filed, with the futex read
-        // that has the same shape and does not have that excuse:
-        // `issues/kernel/user-pages-still-read-through-a-plain-deref.md`.
-        Some(unsafe { *phys.as_ptr::<u64>() })
+        // decides nothing, so a word another thread of the dying process
+        // substitutes between two lines of the dump is the report's subject
+        // rather than a hazard.
+        //
+        // `read_volatile` all the same, because the rule is the kernel's and
+        // not this call site's: every read of user memory in this kernel is one
+        // read, not one the compiler may split, fold or repeat. `dump_region`
+        // is where that would show — it reads the same address twice, once to
+        // decide the region is mapped and once inside the loop that prints it —
+        // and a report whose two reads were folded into one would be printing a
+        // value it did not fetch.
+        Some(unsafe { phys.as_ptr::<u64>().read_volatile() })
     };
 
     let dump_region = |label: &str, addr: u64| {
