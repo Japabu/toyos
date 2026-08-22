@@ -343,8 +343,8 @@ impl DmaPool {
 
     /// The whole pool, as a view that may not outlive it.
     ///
-    /// This is where `KernelSlice::from_raw`'s justification used to be argued
-    /// and where it is now enforced: `alloc_contiguous` returned physically
+    /// This is where the deleted `KernelSlice::from_raw`'s justification used to
+    /// be argued and where it is now enforced: `alloc_contiguous` returned physically
     /// contiguous pages, `pages[0].direct_map()` is their first byte in the
     /// direct map, `self` is holding every one of them, and the borrow is what
     /// says the caller may not keep the view past that.
