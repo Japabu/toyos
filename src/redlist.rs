@@ -48,8 +48,11 @@
 //! **What is deliberately not a row.** Gate A's thorough tier compares
 //! distributions against a recorded sample (`tests/audio-baseline.toml`) and its
 //! verdicts are `Fisher p=…`, not "this test went red"; those live with the
-//! baseline. Metal is not an instrument here either — the suite does not run on
-//! the T14.
+//! baseline. Metal is not an instrument here either — not because the suite
+//! skips the T14 (it runs there daily, since `985f3834`), but because it runs
+//! there in QEMU under KVM, which is [`Ci`], not bare hardware.
+//!
+//! [`Ci`]: Instrument::Ci
 
 use crate::day::Day;
 use std::collections::BTreeSet;
