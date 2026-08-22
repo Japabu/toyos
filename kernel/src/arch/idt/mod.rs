@@ -577,6 +577,16 @@ pub fn init() {
     install_gates(&mut IDT.lock());
     #[cfg(feature = "boot-actuators")]
     install_actuator_gates(&mut IDT.lock());
+    // **The kernel this tree had until 2026-08-22**, and the negative control on
+    // vector 2's `ist 2`: the gate keeps its handler and its ring and loses the
+    // one byte that decides which stack the CPU builds the frame on.
+    // Nothing on the host side can reach that state — the IDT is the guest's own
+    // memory, and no QEMU device or machine property edits it.
+    #[cfg(feature = "boot-actuators")]
+    if crate::actuator::nmi_without_ist() {
+        IDT.lock().entries[Vector::Nmi as usize].ist = 0;
+    }
+
     let ptr = IdtPointer {
         limit: (core::mem::size_of::<Idt>() - 1) as u16,
         base: IDT.data_ptr() as u64,

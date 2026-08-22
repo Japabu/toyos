@@ -335,6 +335,212 @@ pub fn diskless_boot(
     Ok(())
 }
 
+/// An NMI delivered where CPL is 0 and `rsp` is still the user's, three times
+/// over: the kernel that survives it, the kernel that does not, and the one
+/// re-entrancy the surviving kernel's IST stack cannot absorb.
+///
+/// **The window.** `SYSCALL` switches no stack, so `arch::syscall`'s entry runs
+/// three instructions at CPL 0 with the user's `rsp` and its exit one more
+/// between `pop rsp` and `sysretq`. A frame the CPU builds there is a supervisor
+/// write to a user page: SMAP refuses it, the `#PF` lands on the same stack, and
+/// the machine takes a `#DF`. `arch::idt`'s IST2 row is the fix and this is what
+/// says the row is load-bearing.
+///
+/// **The derivation, and what is asserted against it.** Every iteration of the
+/// spinner's loop passes through the window exactly once and through Ring 3
+/// exactly once, so the two counts differ only by how many points an NMI can be
+/// delivered at inside each. The spinner's user loop is four instructions —
+/// `mov`, `syscall`, `dec`, `jnz` — and the window is four more: `cld`, the
+/// `rsp` save, the switch, and the exit's gap between `pop rsp` and `sysretq`.
+/// Four against four under a delivery model uniform over instructions, which is
+/// KVM's; under the dev host's TCG, QEMU checks for a pending interrupt between
+/// translation blocks rather than between instructions, and `syscall` and
+/// `sysretq` each end one, so the window contributes one delivery point and the
+/// user side two or three. Both readings say the same thing — one traversal
+/// each, within a small factor — and [`SAME_ORDER`] is the bound: an order of
+/// magnitude, which no reading of the delivery model reaches and a classification
+/// that has stopped tracking the loop fails at once.
+///
+/// Measured here, dev host, TCG, `-smp 4`, 3,000 NMIs sent: **36 window
+/// arrivals against 122 in Ring 3** at 12-wide, **32 against 93** alone.
+///
+/// The bound is not the teeth on its own. What says the count means the window
+/// is the first arrival's own `rip`, symbolized by the kernel and asserted
+/// against `syscall_entry` — `dump_nmi_probe`'s rule, that a probe naming the
+/// wrong instruction is worse than one naming none.
+pub fn syscall_window_nmi(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    // The kernel's report, and the line every assertion below reads.
+    const REPORT: &str = "syscall-window-nmi: sent=";
+    // How long the guest spins. The storm arms at 3 s and stops at its 64th
+    // window arrival; this is what covers the arming plus a slow first storm.
+    const SPIN_SECS: u32 = 10;
+    // One traversal each per iteration, so the two counts are of one order.
+    const SAME_ORDER: u64 = 10;
+
+    let survived = storm(test_config, c_bins, rust_bins, &["syscall-window-nmi"], SPIN_SECS, |l| {
+        l.contains(REPORT)
+    })?;
+    if survived.contains("DOUBLE FAULT") {
+        return Err(format!(
+            "an NMI in the syscall window still took the machine down — vector 2's IST index \
+             is not doing what the table says\n{survived}"
+        ));
+    }
+    let report = survived
+        .lines()
+        .find(|l| l.contains(REPORT))
+        .ok_or_else(|| format!("the storm never reported — is `syscall-window-nmi` on?\n{survived}"))?;
+    let field = |name: &str| -> Result<u64, String> {
+        report
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix(name)?.parse::<u64>().ok())
+            .ok_or_else(|| format!("no {name}N field in {report:?}"))
+    };
+    let (sent, seen) = (field("sent=")?, field("seen=")?);
+    let (window, ring3) = (field("window=")?, field("ring3=")?);
+    eprintln!(
+        "  [nmi-window] {sent} sent, {seen} taken, {window} in the window, {ring3} in Ring 3"
+    );
+    if window == 0 {
+        return Err(format!(
+            "{sent} NMIs were sent and {seen} taken, and not one landed in the syscall window \
+             — the instrument proved nothing about the stack the CPU pushes on\n{survived}"
+        ));
+    }
+    if window * SAME_ORDER < ring3 {
+        return Err(format!(
+            "{window} window arrivals against {ring3} in Ring 3. Every iteration passes through \
+             both exactly once, so they are of one order; a {SAME_ORDER}x shortfall says the \
+             arrivals are not being classified where they land\n{survived}"
+        ));
+    }
+    // What makes the count a claim about the window rather than about some
+    // other Ring 0 frame with a low `rsp`: the kernel symbolizes the first one
+    // it saw, and it has to be the entry.
+    let Some(rest) = survived.split("the first window arrival was here:\n").nth(1) else {
+        return Err(format!("the report named no rip for the first window arrival\n{survived}"));
+    };
+    let named = rest.lines().next().unwrap_or("");
+    if !named.contains("syscall_entry") {
+        return Err(format!(
+            "the first window arrival resolved to `{}`, not to the syscall entry — a Ring 0 \
+             frame with a user `rsp` somewhere else is a different finding, and this test is \
+             not measuring it\n{survived}",
+            named.trim(),
+        ));
+    }
+    // And the machine is still running. An NMI interrupts a CPU; it does not
+    // end one, and it does not end the syscall it landed inside either.
+    if !survived.contains("nmi-window-spin: ") {
+        return Err(format!("the spinner never spoke at all\n{survived}"));
+    }
+
+    // The negative control: the same boot with vector 2's IST index taken off.
+    // Everything else — the handler, the gate, the storm, the spinner — is the
+    // same, so what the `#DF` below measures is the one byte.
+    // Drained past the header, not to it: `double_fault_handler` prints the
+    // address that started the chain, then the registers, then the backtrace
+    // that carries the symbol every assertion below reads, and only then this.
+    let unfixed = storm(
+        test_config,
+        c_bins,
+        rust_bins,
+        &["syscall-window-nmi", "nmi-without-ist"],
+        SPIN_SECS,
+        |l| l.contains("Scanning kernel stack"),
+    )?;
+    let Some(df) = unfixed.lines().find(|l| l.contains("DOUBLE FAULT")) else {
+        return Err(format!(
+            "with no IST on vector 2 the machine survived {sent} NMIs — the control stages \
+             nothing, so the arm above proves nothing either\n{unfixed}"
+        ));
+    };
+    eprintln!("  [nmi-window] without IST2: {}", df.trim());
+    if !unfixed.contains("syscall_entry") {
+        return Err(format!(
+            "the control double faulted somewhere other than the syscall entry\n{unfixed}"
+        ));
+    }
+    // **The exact signature, and the reason this is a control and not a
+    // coincidence**: the address the CPU faulted on is the first qword of the
+    // frame it was trying to push, one below the `rsp` it was pushing at. A #DF
+    // for any other reason does not put `cr2` there.
+    let hex = |line: &str, field: &str| -> Option<u64> {
+        let rest = line.split(field).nth(1)?;
+        let digits: String = rest.trim_start_matches("0x").chars().take(16).collect();
+        u64::from_str_radix(&digits, 16).ok()
+    };
+    let cr2 = unfixed.lines().find_map(|l| hex(l, "cr2="));
+    let rsp = unfixed.lines().find_map(|l| hex(l, "rsp="));
+    match (cr2, rsp) {
+        (Some(cr2), Some(rsp)) if cr2 == rsp.wrapping_sub(8) => {
+            eprintln!("  [nmi-window] without IST2: cr2={cr2:#x} is rsp-8, the frame's first qword");
+        }
+        (cr2, rsp) => {
+            return Err(format!(
+                "the control's #DF reports cr2={cr2:#x?} against rsp={rsp:#x?}; the fault this \
+                 stages is the frame's own first qword at rsp-8, so this is a different \
+                 death\n{unfixed}"
+            ));
+        }
+    }
+
+    // The second control: an NMI handler that returns early through `iretq`
+    // un-masks NMIs while still standing on IST2, which is the one way a second
+    // NMI can enter on that stack. The check has to fire and say so.
+    let nested = storm(
+        test_config,
+        c_bins,
+        rust_bins,
+        &["syscall-window-nmi", "nmi-nested"],
+        SPIN_SECS,
+        |l| l.contains("NESTED NMI"),
+    )?;
+    let Some(loud) = nested.lines().find(|l| l.contains("NESTED NMI")) else {
+        return Err(format!(
+            "a second NMI entered on IST2 and the machine said nothing: the outer handler's \
+             frame was overwritten silently, which is the failure this check exists for\n{nested}"
+        ));
+    };
+    eprintln!("  [nmi-window] nested: {}", loud.trim());
+    Ok(())
+}
+
+/// One storm boot: the spinner in Ring 3, the kernel's NMIs at it, drained until
+/// `done` or the ceiling.
+///
+/// The ceiling is a ceiling and not the run — every arm here ends either with
+/// the kernel's report or with a halted machine, and a halted machine neither
+/// exits QEMU nor disconnects the drain.
+fn storm(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+    params: &'static [&'static str],
+    secs: u32,
+    done: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            kernel_params: params,
+            // Four, so that the scheduler has somewhere to put the spinner that
+            // is not the CPU whose idle loop does the storming.
+            smp: 4,
+            ..Default::default()
+        },
+    );
+    writeln!(qemu.stdin_mut(), "run test_rs_nmi_window_spin {secs}").expect("write to QEMU stdin");
+    qemu.flush_stdin();
+    Ok(qemu.drain_until(Duration::from_secs(u64::from(secs) + 20), |line| done(line)))
+}
+
 /// `[ist1] used N of M bytes, ...`
 fn parse(line: &str) -> Option<(usize, usize)> {
     let rest = line.split(MARKER).nth(1)?;

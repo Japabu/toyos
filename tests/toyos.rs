@@ -245,6 +245,10 @@ const RUST_SKIP: &[&str] = &[
     // ever answers it. `swiss_german_layout`, `locale_detect` and
     // `locale_detect_unrecognized` drive it.
     "locale_gate",
+    // A victim, not a test: it spins on `SYS_GETPID` so that another CPU's NMIs
+    // have somewhere to land, and on its own it asserts nothing and costs ten
+    // seconds. `syscall_window_nmi` runs it on the kernel that storms it.
+    "nmi_window_spin",
     // Driven, not run: `screen_console_clear` types its name at a console it is
     // watching, and on its own it asks the kernel to paint over a panel nobody
     // is reading and exits 0. A verdict its own exit code cannot carry — the
@@ -442,6 +446,14 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("foreign_disk_untouched", Sched::Parallel, Tier::Fast),
     ("boot_partition_identity", Sched::Parallel, Tier::Fast),
     ("double_fault_stack", Sched::Parallel, Tier::Fast),
+    // Three boots of its own, ten seconds of Ring 3 spinning each, and every
+    // verdict is a count the kernel printed or a line it printed: how many NMIs
+    // landed at CPL 0 with a user `rsp`, against how many landed in Ring 3, and
+    // both come off the same storm. No host clock is in any of it — the
+    // ten seconds are how long the victim spins, not a margin anything is
+    // measured against — so Parallel. Carrying `UNMEASURED_MS` until the shards
+    // price it.
+    ("syscall_window_nmi", Sched::Parallel, Tier::Fast),
     // Its own boot, its own feature, and it drives the guest only through
     // stdin — nothing it touches is shared with another test. Returned to
     // Fast on 2026-08-21: the 2026-08-17 drain fix took it from 52,822 ms to
@@ -7611,6 +7623,7 @@ fn run_machine_test(
             common::hda::hda_two_live_refused(test_config, c_bins, rust_bins)
         }
         "double_fault_stack" => faults::double_fault_stack(test_config, c_bins, rust_bins),
+        "syscall_window_nmi" => faults::syscall_window_nmi(test_config, c_bins, rust_bins),
         "idle_stack_guard" => faults::idle_stack_guard(test_config, c_bins, rust_bins),
         "dump_nmi_probe" => faults::dump_nmi_probe(test_config, c_bins, rust_bins),
         "diskless_boot" => faults::diskless_boot(test_config, c_bins, rust_bins),

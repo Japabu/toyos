@@ -65,6 +65,10 @@ use crate::arch::percpu::OFF_NMI_ACTIVE;
 
 /// Ten pushes of eight bytes, so the interrupt frame's `rip` is here.
 const RIP_OFFSET: usize = 80;
+/// …and its `cs` and `rsp`, which are what say whether this NMI landed in the
+/// window the IST exists for: a Ring 0 frame whose `rsp` is a user address.
+const CS_OFFSET: usize = RIP_OFFSET + 8;
+const RSP_OFFSET: usize = RIP_OFFSET + 24;
 
 /// Before any push, the CPU's own five words start at `rsp`.
 const NESTED_RIP_OFFSET: usize = 0;
@@ -96,6 +100,8 @@ pub(super) extern "sysv64" fn nmi_entry() {
         "push r11",
         "push rbp",
         "mov rdi, [rsp + {rip_offset}]",
+        "mov rsi, [rsp + {cs_offset}]",
+        "mov rdx, [rsp + {rsp_offset}]",
         "mov rbp, rsp",
         "and rsp, -16",
         "call {note}",
@@ -128,6 +134,8 @@ pub(super) extern "sysv64" fn nmi_entry() {
         "ud2",
         active = const OFF_NMI_ACTIVE,
         rip_offset = const RIP_OFFSET,
+        cs_offset = const CS_OFFSET,
+        rsp_offset = const RSP_OFFSET,
         nested_rip = const NESTED_RIP_OFFSET,
         nested_rsp = const NESTED_RSP_OFFSET,
         note = sym note,
@@ -135,8 +143,17 @@ pub(super) extern "sysv64" fn nmi_entry() {
     );
 }
 
-extern "sysv64" fn note(rip: u64) {
+/// The entry loads all three words in both builds — two `mov`s on a path only
+/// Ctrl+Alt+D reaches — so that the observer and the shipping handler take the
+/// same frame. What the shipping kernel does with `cs` and `rsp` is nothing.
+extern "sysv64" fn note(rip: u64, cs: u64, rsp: u64) {
+    #[cfg(not(feature = "boot-actuators"))]
+    let _ = (cs, rsp);
+    #[cfg(feature = "boot-actuators")]
+    crate::nmi_gate::observe(rip, cs, rsp);
     crate::sched::dump::note_nmi(rip);
+    #[cfg(feature = "boot-actuators")]
+    crate::nmi_gate::stage_nested_if_armed();
 }
 
 /// A second NMI on a stack the first is still standing on.
