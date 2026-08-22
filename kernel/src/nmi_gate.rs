@@ -23,6 +23,19 @@
 //! - **ring0** — everything else, which on an aimed storm is the victim inside
 //!   the syscall it was making.
 //!
+//! **Which accelerator is running the guest decides whether the window is
+//! reachable at all, and only one of them can.** Under TCG, QEMU checks for a
+//! pending interrupt between translation blocks and `syscall` ends one, so an
+//! NMI pending across it is delivered at `syscall_entry+0` — the dev host reads
+//! 36 to 47 window arrivals per 3,000. Under KVM an NMI to a running vCPU is a
+//! host kick, a VM exit and an injection at the next VM entry, and that entry is
+//! never one of those three instructions: **0 of 6,000 on the hosted lane**
+//! (run 32584121311, two boots, 2,451 and 438 of the same NMIs arriving in
+//! Ring 3, so the aim was right and the delivery point is simply elsewhere).
+//! That is a fact about the instrument. What KVM still witnesses is the machine
+//! taking 3,000 aimed NMIs with IST2 in place and going on working, and what
+//! proves the *window* on both is the `nmi-without-ist` control's `#DF`.
+//!
 //! **The storm is triggered by the victim and aimed at it, and neither used to
 //! be true.** It armed at three seconds of wall clock and sprayed every sibling;
 //! the wall clock is two clocks with no handshake — on a loaded shard the
@@ -231,6 +244,14 @@ pub fn storm() {
         return;
     }
 
+    // The victim's own syscall count either side of the storm. **This is how a
+    // reader knows the victim went on running Ring 3 code through all of it**,
+    // and it is the one witness that costs nothing: waiting for the spinner's
+    // own last line would cost its whole spin on every run, and a delivered
+    // count alone cannot tell a CPU that kept working from one that stopped
+    // after the first NMI.
+    let spun_before: u64 = SYSCALLS.iter().map(|n| n.load(Ordering::Relaxed)).sum();
+
     let mut sent = 0u64;
     while sent < MAX_NMIS {
         // Aimed, not broadcast: every NMI that goes to an idle sibling is a
@@ -255,7 +276,12 @@ pub fn storm() {
         }
     }
 
-    report(sent, cpus);
+    let spun: u64 = SYSCALLS
+        .iter()
+        .map(|n| n.load(Ordering::Relaxed))
+        .sum::<u64>()
+        .saturating_sub(spun_before);
+    report(sent, spun, cpus);
 }
 
 fn total(counter: &[AtomicU64; MAX_CPUS]) -> u64 {
@@ -269,7 +295,7 @@ fn total(counter: &[AtomicU64; MAX_CPUS]) -> u64 {
 /// **last**, after the per-CPU lines and after the symbolized `rip`, because it
 /// is what a reader waits for: a drain that ends on the summary has everything
 /// under it already.
-fn report(sent: u64, cpus: usize) {
+fn report(sent: u64, spun: u64, cpus: usize) {
     for cpu in 0..cpus {
         let seen = SEEN[cpu].load(Ordering::Relaxed);
         if seen == 0 {
@@ -291,7 +317,8 @@ fn report(sent: u64, cpus: usize) {
     let window = total(&WINDOW);
     let ring3 = total(&RING3);
     log!(
-        "syscall-window-nmi: sent={sent} seen={seen} window={window} ring3={ring3} ring0={}",
+        "syscall-window-nmi: sent={sent} seen={seen} window={window} ring3={ring3} ring0={} \
+         spun={spun}",
         seen - window - ring3,
     );
 }

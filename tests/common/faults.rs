@@ -335,8 +335,9 @@ pub fn diskless_boot(
     Ok(())
 }
 
-/// How long the guest spins. The storm arms at 3 s and stops at its 64th window
-/// arrival; this is what covers the arming plus a slow first storm.
+/// How long the guest spins. The storm arms about 190 ms after the spinner
+/// starts — a million syscalls at its measured rate — and this is what covers a
+/// slow arming plus the storm itself on a shard with company.
 const SPIN_SECS: u32 = 10;
 
 /// The kernel's own summary line, printed last so a drain that ends on it has
@@ -361,23 +362,48 @@ const NMI_REPORT: &str = "syscall-window-nmi: sent=";
 /// the machine takes a `#DF`. `arch::idt`'s IST2 row is the fix and this is what
 /// says the row is load-bearing.
 ///
-/// **The derivation, and what is asserted against it.** Every iteration of the
-/// spinner's loop passes through the window exactly once and through Ring 3
-/// exactly once, so the two counts differ only by how many points an NMI can be
-/// delivered at inside each. The spinner's user loop is four instructions —
-/// `mov`, `syscall`, `dec`, `jnz` — and the window is four more: `cld`, the
-/// `rsp` save, the switch, and the exit's gap between `pop rsp` and `sysretq`.
-/// Four against four under a delivery model uniform over instructions, which is
-/// KVM's; under the dev host's TCG, QEMU checks for a pending interrupt between
-/// translation blocks rather than between instructions, and `syscall` and
-/// `sysretq` each end one, so the window contributes one delivery point and the
-/// user side two or three. Both readings say the same thing — one traversal
-/// each, within a small factor — and [`SAME_ORDER`] is the bound: an order of
-/// magnitude, which no reading of the delivery model reaches and a classification
-/// that has stopped tracking the loop fails at once.
+/// **Only one accelerator can put an interrupt in that window, and the verdict
+/// says which one it ran on.** Under TCG, QEMU checks for a pending interrupt
+/// between translation blocks and `syscall` ends one, so a pending NMI is
+/// delivered at `syscall_entry+0`: the dev host reads 36 to 47 arrivals per
+/// 3,000. Under KVM an NMI to a running vCPU is a host kick, a VM exit and an
+/// injection at the next VM entry, and that entry is never one of these three
+/// instructions — **0 of 6,000 on the hosted lane** (run 32584121311, two boots,
+/// with 2,451 and 438 of the same NMIs arriving in Ring 3, so the aim was right
+/// and the delivery point is elsewhere). That is a fact about the instrument,
+/// and CI's guest lane is KVM only (`tests/CLAUDE.md`), so a derived in-window
+/// count asserted there can never be green.
 ///
-/// Measured here, dev host, TCG, `-smp 4`, 3,000 NMIs sent: **36 window
-/// arrivals against 122 in Ring 3** at 12-wide, **32 against 93** alone.
+/// So the accelerator is read off the argv this boot was built from — the same
+/// `-accel kvm` decision `qemu_command` made, not a re-derivation of it — and:
+///
+/// - **under TCG** the derived count is asserted as [`SAME_ORDER`] below;
+/// - **under KVM** the numbers are printed as the instrument's verdict and what
+///   is asserted is what KVM can witness: 3,000 aimed NMIs delivered to a CPU in
+///   Ring 3, no `#DF`, and the victim still making syscalls when the last one
+///   landed.
+///
+/// The window itself is gated on both by `syscall_window_nmi_controls`, whose
+/// `nmi-without-ist` arm double faults at `syscall_entry` with `cr2 = rsp - 8`
+/// wherever it runs. `wake_storm_cost` is the shape this follows: whether an
+/// instrument can read the thing is the instrument's verdict, printed, and the
+/// derived assertion is made only on a run that can read it.
+///
+/// **The derivation, where it applies.** Every iteration of the spinner's loop
+/// passes through the window exactly once and through Ring 3 exactly once, so
+/// the two counts differ only by how many points an NMI can be delivered at
+/// inside each. The spinner's user loop is four instructions — `mov`, `syscall`,
+/// `dec`, `jnz` — and the window is four more: `cld`, the `rsp` save, the
+/// switch, and the exit's gap between `pop rsp` and `sysretq`. Four against four
+/// under a delivery model uniform over instructions; under TCG the window
+/// contributes one block boundary and the user side two or three. Both readings
+/// say one traversal each within a small factor, and [`SAME_ORDER`] is the
+/// bound: an order of magnitude, which no reading of the delivery model reaches
+/// and a classification that has stopped tracking the loop fails at once.
+///
+/// Measured, dev host, TCG, `-smp 4`, 3,000 NMIs sent: **47 window arrivals
+/// against 136 in Ring 3** aimed, **36 against 122** while the storm still
+/// sprayed every sibling.
 ///
 /// The bound is not the teeth on its own. What says the count means the window
 /// is the first arrival's own `rip`, symbolized by the kernel and asserted
@@ -412,13 +438,54 @@ pub fn syscall_window_nmi(
     };
     let (sent, seen) = (field("sent=")?, field("seen=")?);
     let (window, ring3) = (field("window=")?, field("ring3=")?);
+    let spun = field("spun=")?;
     eprintln!(
-        "  [nmi-window] {sent} sent, {seen} taken, {window} in the window, {ring3} in Ring 3"
+        "  [nmi-window] {sent} sent, {seen} taken, {window} in the window, {ring3} in Ring 3, \
+         {spun} syscalls made under the storm"
     );
+
+    // **What every accelerator witnesses.** The storm reached a CPU that was in
+    // Ring 3 and kept it working: a victim that died at the first NMI would
+    // stall `seen` at one, and one that stopped running Ring 3 code would leave
+    // `spun` at zero however many NMIs were delivered.
+    if seen * 10 < sent * 9 {
+        return Err(format!(
+            "{sent} NMIs were sent and only {seen} taken — the victim stopped taking them, \
+             which is what an NMI that ends a CPU looks like from here\n{survived}"
+        ));
+    }
+    if ring3 == 0 {
+        return Err(format!(
+            "not one of {seen} NMIs arrived with a Ring 3 frame — the storm was aimed at a CPU \
+             that was not running the spinner, so this run measured an idle loop\n{survived}"
+        ));
+    }
+    if spun == 0 {
+        return Err(format!(
+            "the victim made no syscall at all while {seen} NMIs were delivered to it — it \
+             stopped running Ring 3 code under the storm\n{survived}"
+        ));
+    }
+
+    if kvm_accelerated() {
+        // The instrument's verdict, not the kernel's. See this function's
+        // header: KVM injects at a VM entry that is never one of the three
+        // instructions, measured 0 of 6,000, so an in-window count asserted here
+        // would be asserting against the hypervisor's scheduling.
+        eprintln!(
+            "  [nmi-window] KVM delivered {window} of {seen} into the window: this accelerator \
+             injects at a VM entry and cannot reach it, so what this run gates is that the \
+             machine took {sent} aimed NMIs with IST2 in place and went on working"
+        );
+        return Ok(());
+    }
+
     if window == 0 {
         return Err(format!(
-            "{sent} NMIs were sent and {seen} taken, and not one landed in the syscall window \
-             — the instrument proved nothing about the stack the CPU pushes on\n{survived}"
+            "{sent} NMIs were sent and {seen} taken under TCG, and not one landed in the \
+             syscall window — this accelerator delivers at translation-block boundaries and \
+             `syscall` ends one, so the instrument proved nothing about the stack the CPU \
+             pushes on\n{survived}"
         ));
     }
     if window * SAME_ORDER < ring3 {
@@ -443,12 +510,21 @@ pub fn syscall_window_nmi(
             named.trim(),
         ));
     }
-    // And the machine is still running. An NMI interrupts a CPU; it does not
-    // end one, and it does not end the syscall it landed inside either.
-    if !survived.contains("nmi-window-spin: ") {
-        return Err(format!("the spinner never spoke at all\n{survived}"));
-    }
     Ok(())
+}
+
+/// Whether this host's guests run under KVM, read off the argv a boot is built
+/// from.
+///
+/// **The decision itself rather than a second reading of it**: `qemu_command`
+/// puts `-accel kvm` there when `toyos_build::kvm_usable()` says so, and
+/// `profile_argv` is that same builder. A CPUID probe in the guest would be a
+/// second place that can be told the wrong answer, and `virtio_net_no_msix` and
+/// `diskless_boot` already assert about a boot by reading its argv.
+fn kvm_accelerated() -> bool {
+    qemu::profile_argv(&storm_options(&[]))
+        .windows(2)
+        .any(|w| w[0] == "-accel" && w[1] == "kvm")
 }
 
 /// The two negative controls on [`syscall_window_nmi`], which is where the
@@ -546,6 +622,25 @@ pub fn syscall_window_nmi_controls(
 /// The ceiling is a ceiling and not the run — every arm here ends either with
 /// the kernel's report or with a halted machine, and a halted machine neither
 /// exits QEMU nor disconnects the drain.
+/// One declaration of the machine every arm boots, so that the argv
+/// [`kvm_accelerated`] reads is the argv the boot is built from.
+fn storm_options(params: &'static [&'static str]) -> BootOptions {
+    BootOptions {
+        kernel_params: params,
+        // `double_fault_stack`'s profile and for its reason: on Metal the 16550
+        // *is* the console, so `serial::panic_raw`'s bytes and the ordinary log
+        // stream arrive on one channel and one reader sees both. The nested-NMI
+        // report is a raw write — that handler may not reach the log ring at all
+        // (`arch::idt::nmi`) — so on any other profile it lands on a UART
+        // nothing here is reading.
+        profile: qemu::Profile::Metal,
+        // Four, so that the scheduler has somewhere to put the spinner that is
+        // not the CPU whose idle loop does the storming.
+        smp: 4,
+        ..Default::default()
+    }
+}
+
 fn storm(
     test_config: &Path,
     c_bins: &[(String, Vec<u8>)],
@@ -554,25 +649,8 @@ fn storm(
     secs: u32,
     done: impl Fn(&str) -> bool,
 ) -> Result<String, String> {
-    let mut qemu = QemuInstance::boot_with_options(
-        test_config,
-        c_bins,
-        rust_bins,
-        BootOptions {
-            kernel_params: params,
-            // `double_fault_stack`'s profile and for its reason: on Metal the
-            // 16550 *is* the console, so `serial::panic_raw`'s bytes and the
-            // ordinary log stream arrive on one channel and one reader sees
-            // both. The nested-NMI report is a raw write — that handler may not
-            // reach the log ring at all (`arch::idt::nmi`) — so on any other
-            // profile it lands on a UART nothing here is reading.
-            profile: qemu::Profile::Metal,
-            // Four, so that the scheduler has somewhere to put the spinner that
-            // is not the CPU whose idle loop does the storming.
-            smp: 4,
-            ..Default::default()
-        },
-    );
+    let mut qemu =
+        QemuInstance::boot_with_options(test_config, c_bins, rust_bins, storm_options(params));
     writeln!(qemu.stdin_mut(), "run test_rs_nmi_window_spin {secs}").expect("write to QEMU stdin");
     qemu.flush_stdin();
     Ok(qemu.drain_until(Duration::from_secs(u64::from(secs) + 20), |line| done(line)))
