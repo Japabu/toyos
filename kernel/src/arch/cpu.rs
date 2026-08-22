@@ -11,9 +11,9 @@
 //! The split between `pub fn` and `pub unsafe fn` here is that second half. A
 //! function is `unsafe` when the caller can choose a value that breaks the
 //! machine — `write_cr0`, `write_cr4`, `write_cr3`, `lidt`, `ltr`, `wbinvd`,
-//! `wrmsr`, `outb`, `outw` — and safe when it cannot. **Three wrappers are safe
-//! today and should not be**: `wrfsbase`, `invlpg` and `invpcid` all take a
-//! caller-chosen value that reaches hardware, and each is the rest of
+//! `wrmsr`, `outb`, `outw`, `wrfsbase` — and safe when it cannot. **Two
+//! wrappers are safe today and should not be**: `invlpg` and `invpcid` take a
+//! caller-chosen value that reaches hardware, and they are the rest of
 //! `issues/kernel/arch-cpu-safe-wrappers-that-are-not.md`.
 //!
 //! **Where an `unsafe fn` here has a closed set of callers, the honest form is
@@ -339,14 +339,16 @@ pub fn rdfsbase() -> u64 {
     val
 }
 
+/// # Safety
+/// `val` becomes this CPU's FS base, and it is `#GP` if non-canonical. `#UD`
+/// without `CR4.FSGSBASE` is `rdfsbase`'s argument and not the caller's:
+/// `control_regs` puts the bit in `CR4_REQUIRED` and asserts it on every CPU
+/// before any context switch runs. The kernel dereferences nothing through
+/// `fs:`, so what the value decides is where the *running thread's* thread-local
+/// accesses land — the caller owns which thread that is.
 #[inline]
-pub fn wrfsbase(val: u64) {
-    // SAFETY: `rdfsbase`'s argument for the `#UD`. The value is the caller's and
-    // is `#GP` if non-canonical; the two callers are the context switch and
-    // `SYS_SET_TLS`, and the kernel itself dereferences nothing through `fs:`.
-    unsafe {
-        asm!("wrfsbase {}", in(reg) val, options(nomem, nostack));
-    }
+pub unsafe fn wrfsbase(val: u64) {
+    asm!("wrfsbase {}", in(reg) val, options(nomem, nostack));
 }
 
 pub fn halt() -> ! {
