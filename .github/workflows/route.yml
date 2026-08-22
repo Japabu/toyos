@@ -2,25 +2,47 @@ name: route
 
 # Where a Linux job runs, decided once for the whole repository.
 #
-# A job may use the persistent T14 exactly when the event that produced it came
-# from inside this repository. A fork's pull request and a merge-queue ref are
-# code nobody has reviewed, and the runner's own admission hook
-# (`.github/runner/accept-trusted.sh`) refuses both — so a workflow that sent
-# them there would not be less safe, it would queue until it timed out. Every
-# caller reads the answer from the outputs below and none of them repeats the
-# condition.
+# **Branch traffic is hosted; the T14 serves what needs the machine.** The
+# runner has one worker, so every job routed to it runs strictly after the
+# last, and a queue there is the slowest path in the system. Measured
+# 2026-08-22T05:03Z (`gh run list --status queued`): thirteen runs waiting
+# behind a scheduled `gate A, thorough` that had held the lane since 03:53Z —
+# seven `toolchain`, five `ci`, one `landing` — every one of them a
+# `pull_request` or a `push` from this repository's own branches, the oldest
+# queued at 03:56:59Z. `toolchain.yml`'s `build` is a required check and
+# `ci.yml`'s `toolchain-ready` waits up to two hours for what it publishes, so
+# that queue is what a pull request waits on: run 32549542807 spent 57 minutes
+# in it for a job that then failed in nine seconds, and two agents waited 50
+# and 90 minutes for their own validation.
 #
-# One exception, and it is not about trust: `ci.yml`'s nightly `schedule` is
-# the run that has to refresh `tests/test-durations`, and that profile has one
-# instrument — twelve GitHub-hosted shards, never the T14's 1/1 lane
+# So a `pull_request` — whatever repository its head is in — and a `push` are
+# hosted, exactly like a merge-queue ref. This repository is public, so
+# GitHub-hosted runners are free and the guest lane runs twelve-wide there;
+# that is already the instrument every merge-queue composition validates on
+# (ten `ci.yml` queue runs on 2026-08-21/22 finished in 10.5 to 17.5 minutes
+# each). A same-repo pull request's guest lane needs none of the three things
+# this machine has — it took the T14 for the persistent cache's speed, and a
+# cache that is reached through a queue is not a speed-up.
+#
+# What stays on the T14 is what needs the machine: every `schedule` except
+# `ci.yml`'s — gate A's audio measurement and portability — and
+# `workflow_dispatch`, which is every workflow's manual T14 lane, on purpose.
+# `ci.yml`'s nightly `schedule` is hosted because it is the run that has to
+# refresh `tests/test-durations`, and that profile has one instrument — twelve
+# GitHub-hosted shards, never the T14's 1/1 lane
 # (issues/build/the-duration-profile-is-enforced-where-it-was-not-measured.md).
-# So `ci.yml`'s `schedule` alone is hosted, exactly like a merge-queue ref;
-# `workflow_dispatch` stays every workflow's manual T14 lane, on purpose.
 # `github.workflow` is the caller's name even from inside this reusable
 # workflow, which is the one signal that tells `ci.yml`'s `schedule` apart from
 # gate A's or portability's — both of those stay trusted, gate A because its
 # own baseline has no attested runner instrument either way
 # (issues/audio/gate-a-has-no-runner-baseline.md).
+#
+# Trust is no longer what decides this, and the runner's own admission hook
+# (`.github/runner/accept-trusted.sh`) is unchanged: it still refuses a fork's
+# pull request and a merge-queue ref by name, so a workflow that sent either
+# here would not be less safe — it would queue until it timed out. Every caller
+# reads the answer from the outputs below and none of them repeats the
+# condition.
 #
 # A reusable workflow because it is the only form that reaches the places the
 # answer is needed: `runs-on` and `container` see the `needs` context and not
@@ -41,8 +63,9 @@ on:
     outputs:
       trusted:
         description: >-
-          `yes` when this event may use the persistent runner, `no` otherwise.
-          The shape of a matrix or a timeout keys on this.
+          `yes` when this event's Linux jobs run on the persistent T14, `no`
+          when they are GitHub-hosted. The shape of a matrix or a timeout keys
+          on this.
         value: ${{ jobs.pick.outputs.trusted }}
       runner:
         description: The `runs-on` label for a job that wants the T14.
@@ -72,17 +95,20 @@ jobs:
     steps:
       - id: pick
         env:
-          # The one place this condition is written in the repository.
-          # `head.repo.full_name` and not `head.repo.fork`: what makes a pull
-          # request trusted is that its head is *this* repository, which is a
-          # different question from whether that repository is itself a fork of
-          # something. The `schedule` clause is `ci.yml` only: `github.workflow`
-          # is the calling workflow's `name:`, so gate A's and portability's own
+          # The one place this condition is written in the repository, and it
+          # no longer asks where a pull request came from: `pull_request` is
+          # hosted whether its head is a fork's or this repository's, because
+          # the T14's one worker cannot serve branch traffic at all. Nothing
+          # here reads `head.repo` any more, and a clause that told a same-repo
+          # pull request apart would put that traffic back on the machine —
+          # `src/ci.rs` holds this expression's event set against that.
+          # The `schedule` clause is `ci.yml` only: `github.workflow` is the
+          # calling workflow's `name:`, so gate A's and portability's own
           # `schedule` triggers do not match `'ci'` and stay trusted.
           HOSTED: >-
             ${{ github.event_name == 'merge_group'
-                || (github.event_name == 'pull_request'
-                    && github.event.pull_request.head.repo.full_name != github.repository)
+                || github.event_name == 'pull_request'
+                || github.event_name == 'push'
                 || (github.event_name == 'schedule' && github.workflow == 'ci') }}
         run: |
           if [ "$HOSTED" = true ]; then
