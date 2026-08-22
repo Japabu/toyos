@@ -928,9 +928,10 @@ pub const INIT_PATH: &str = "/bin/init";
 /// Start `/bin/init`, holding the machine's one full-rights `SysCap`.
 ///
 /// Nothing else can construct one, so the set of processes that can ever mint
-/// a device claim, enter the RT band, open a process by pid or power the
-/// machine off is exactly what init endows. Panics on failure: a boot that
-/// cannot start init has nowhere to report to and nothing left to do.
+/// a device claim, enter the RT band, open a process by pid, list every process
+/// in the machine, or power the machine off is exactly what init endows. Panics
+/// on failure: a boot that cannot start init has nowhere to report to and
+/// nothing left to do.
 pub fn spawn_init() -> Pid {
     let mut handles = HandleTable::new();
     let console = KObjectRef::Console(crate::object::device::ConsoleObject::new());
@@ -951,7 +952,8 @@ pub fn spawn_init() -> Pid {
     // name (`toyos_manifest`'s `logread`): reading every record every CPU wrote,
     // and parking on the source that says there are more. `SYS_LOG_READ` never
     // blocks by design, so a holder given the first without the second would
-    // have to spin.
+    // have to spin. `ROSTER` is alone for the opposite reason: `SYS_SYSINFO`
+    // answers where it stands, so its holder has nothing to park on.
     let rights = Rights::DUP
         .union(Rights::TRANSFER)
         .union(Rights::DEVICE)
@@ -959,7 +961,8 @@ pub fn spawn_init() -> Pid {
         .union(Rights::MANAGE)
         .union(Rights::LOG)
         .union(Rights::WAIT)
-        .union(Rights::POWER);
+        .union(Rights::POWER)
+        .union(Rights::ROSTER);
     let cap_handle = handles
         .install(crate::object::HandleEntry::new(cap, rights))
         .expect("spawn_init: an empty table refused the system capability");

@@ -87,14 +87,18 @@ receives = ["compositor", "filepicker"]
 [programs.files]
 receives = ["compositor", "filepicker"]
 
-# `power` is `/bin/shutdown`'s, and `/bin/shutdown` is this binary under
-# another name: init resolves the symlink to this row, so the applet is endowed
-# a `SysCap` carrying `Rights::POWER` and nothing else in the image is. The
-# row's granularity is the binary, so every other applet is endowed it too —
-# the same shape as `soundd` reaching `ls`, one authority larger.
+# `power` is `/bin/shutdown`'s and `roster` is `/bin/ps`'s, and each of those is
+# this binary under another name: init resolves the symlink to this row, so the
+# applets are endowed a `SysCap` carrying `Rights::POWER | Rights::ROSTER` and
+# nothing else in the image is. The row's granularity is the binary, so every
+# other applet is endowed both too — the same shape as `soundd` reaching `ls`,
+# one authority larger.
+#
+# `free` is the same syscall as `ps` and is named by neither: the machine header
+# is ambient and the process roster is not.
 [programs.toybox]
 receives = ["compositor", "soundd", "surface"]
-syscap = ["power"]
+syscap = ["power", "roster"]
 
 # Symlinks created in the initrd at build time.
 # Paths are relative to the filesystem root (no leading /).
