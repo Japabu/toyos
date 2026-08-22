@@ -139,7 +139,36 @@ impl SharedMemObject {
 
     /// The kernel's own view of the pages, for a subsystem that reads them
     /// through the direct map — an inbox's ring headers are the one case.
+    ///
+    /// Says nothing about who else can see them. A region reached through this
+    /// while a process holds a mapping of it is memory two writers share, and
+    /// the reader has to treat it that way: atomics, or a volatile read of a
+    /// value it copies out once. `inbox.rs` is where that is spelled out.
     pub fn phys(&self) -> DirectMap {
+        self.region.phys
+    }
+
+    /// The same address, for a subsystem that is about to *fill* the pages
+    /// before anybody else can see them.
+    ///
+    /// **The assert is the whole method.** A kernel write through the direct
+    /// map is exclusive only while the region is mapped nowhere; the moment
+    /// [`map_into`](Self::map_into) has run, a sibling thread of the owning
+    /// process can be writing the same bytes and a kernel still initialising is
+    /// racing it. That ordering is easy to reverse by accident and impossible
+    /// to observe when it is wrong — `inbox::create` built its ring headers
+    /// *after* mapping for as long as inboxes had existed, and nothing anywhere
+    /// would have said so. This says so.
+    ///
+    /// Cheap: one uncontended lock and a length test, once per region ever
+    /// created.
+    pub fn phys_before_mapping(&self) -> DirectMap {
+        assert!(
+            self.mapped_in.lock().is_empty(),
+            "shm koid {}: the region is mapped into a process already, so a kernel \
+             write through the direct map is not exclusive",
+            self.core.koid().raw(),
+        );
         self.region.phys
     }
 
