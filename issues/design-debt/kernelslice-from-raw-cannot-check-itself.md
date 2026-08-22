@@ -34,5 +34,6 @@ the pool constructs the view, the constructor is private to `mm::dma`, and the
 view **borrows the pool** — so for that memory the type does check that the
 region outlives it, and `DmaPool::leak` is the only way to reach `'static`.
 `KernelSlice::ptr_at`, whose `offset <= size` bound said nothing about the length
-read through the pointer it returned, had no callers left and is deleted with it;
-`copy_from` went the same way. The loader's `load_size` is what keeps this open.
+read through the pointer it returned, had no callers left and is deleted with it —
+so the offset-only bound is out of the tree entirely. The loader's `load_size` is
+what keeps this open.

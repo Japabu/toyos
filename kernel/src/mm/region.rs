@@ -98,6 +98,13 @@ impl KernelSlice {
     }
 
     /// # Safety
+    /// Same as `write`, for `src.len()` bytes at `offset`.
+    pub unsafe fn copy_from(&self, offset: usize, src: &[u8]) {
+        self.check(offset, src.len());
+        core::ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(offset), src.len());
+    }
+
+    /// # Safety
     /// Same as `write`, for the whole range.
     pub unsafe fn zero(&self) {
         core::ptr::write_bytes(self.base, 0, self.size);
