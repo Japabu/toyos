@@ -31,29 +31,32 @@
 //! syscall costs its caller is exactly what `syscall_cost` reads this way.
 //!
 //! **What it measured**, on this host's TCG guest at `--smp 2`, minimum of nine
-//! timed calls per width:
+//! timed calls per width, two runs of the same tree:
 //!
-//! | waiters | cycles | ns at the guest's 998 MHz |
+//! | waiters | run 1 | run 2 |
 //! |---|---|---|
-//! |  1 |  7,000 |  7.0 µs |
-//! |  2 |  7,000 |  7.0 µs |
-//! |  4 |  7,000 |  7.0 µs |
-//! |  8 | 10,000 | 10.0 µs |
-//! | 16 | 14,000 | 14.0 µs |
-//! | 32 | 23,000 | 23.0 µs |
-//! | 64 | 33,000 | 33.0 µs |
+//! |  1 |  7,000 |  7,000 |
+//! |  2 |  7,000 |  8,000 |
+//! |  4 |  7,000 | 11,000 |
+//! |  8 | 10,000 | 18,000 |
+//! | 16 | 14,000 | 20,000 |
+//! | 32 | 23,000 | 21,000 |
+//! | 64 | 33,000 | 38,000 |
 //!
-//! So **raising a 64-waiter storm costs its waker 33 µs of its own CPU**, which
-//! is 0.3% of a 10 ms quantum, and the marginal cost is 412 cycles — 412 ns
-//! here — per waiter claimed. Quadrupling the storm from 16 to 64 costs 2.4×
-//! the walk, not 4×, because the fixed part of the call is a third of the
-//! 16-waiter figure.
+//! So **raising a 64-waiter storm costs its waker 33–38 µs of its own CPU** at
+//! this guest's 998 MHz, which is a third of one percent of a 10 ms quantum,
+//! and the marginal cost is 412–492 cycles per waiter claimed. Quadrupling the
+//! storm from 16 to 64 costs 2.4× and 1.9× the walk rather than 4×, because the
+//! fixed part of the call is a third of the 16-waiter figure.
 //!
-//! The first three rows are the same number because they are the same number:
-//! this guest's TSC advances in steps of about a thousand cycles, so the
-//! instrument's resolution is a microsecond and the per-waiter term is under it
-//! until eight waiters. That is why the assertions are stated at 1, 16 and 64
-//! and not between neighbours.
+//! **The middle of the sweep is not monotone between runs** — 32 waiters read
+//! under 8 in the second — and the reason is the instrument rather than the
+//! kernel: this guest's TSC advances in steps of about a thousand cycles, so
+//! the resolution is a microsecond and the whole per-waiter term below eight
+//! waiters is inside it, and a minimum of nine calls on a two-CPU guest sharing
+//! a host with eleven others still carries the host's descheduling. The two
+//! endpoints are five times apart, which is why the assertions are stated at 1,
+//! 16 and 64 and never between neighbours.
 //!
 //! **Every waiter is proved parked before the call that is timed**, by the
 //! answer that call gives: a wake with no limit over `want` parked, unclaimed
