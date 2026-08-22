@@ -167,13 +167,18 @@ counts are what the ruling asks for: removed beside documented.
 | **total** | **76** | **13** | **63** | |
 
 Four findings came out of writing the justifications, filed rather than fixed
-because each is a decision past a documentation sweep:
+because each was a decision past a documentation sweep. **All four were decided
+and fixed on 2026-08-22**, which is what the sweep's own report predicted would
+be worth more than the comments were:
 
-- `issues/kernel/inbox-rings-are-borrowed-not-copied.md` — six of `inbox.rs`'s
-  seven blocks mint `&`/`&mut` over a page the process maps writable, which is
-  the shape `user_ptr.rs`'s `UserBytes` header argues against. Three of them are
-  `&mut`, and `create` maps the page into the process *before* building the
-  headers — the cheap half of the fix is a reordering.
+- Six of `inbox.rs`'s seven blocks minted `&`/`&mut` over a page the process
+  maps writable, which is the shape `user_ptr.rs`'s `UserBytes` header argues
+  against; three were `&mut`, and `create` mapped the page into the process
+  *before* building the headers. **Decided and fixed**: the page is built before
+  it is mapped and `SharedMemObject::phys_before_mapping` refuses the reversed
+  order; the ring headers are reached one `&AtomicU32` at a time and a
+  submission is a `read_volatile` of the whole entry, so no reference over that
+  page exists at all.
 - `InitrdBacking` was given the *file's* size and never the image's, so nothing
   bounded an extent against the end of the initrd it came out of. **Decided and
   fixed 2026-08-22**: it holds the image (`bcachefs::SliceBlockIO`, now `Copy`)
