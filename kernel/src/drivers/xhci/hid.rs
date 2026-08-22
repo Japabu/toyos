@@ -1,4 +1,3 @@
-use core::ptr::copy_nonoverlapping;
 use core::sync::atomic::{fence, Ordering};
 
 use crate::{keyboard, mouse};
@@ -45,8 +44,11 @@ pub struct HidDevice {
     /// mass-storage device keeps its: clearing a halt is a control transfer, so
     /// a bound HID is something the driver may still have to talk to.
     pub ep0_ring: TrbRing,
-    pub report_phys: u64,
-    pub report_ptr: *mut u8,
+    /// The eight-byte DMA slot the interrupt endpoint delivers reports into.
+    /// A `KernelSlice` and not a `*mut u8` beside its own physical address:
+    /// it carries the length, so the two accesses below are bounded against
+    /// the slot rather than against `report_size`'s own honesty.
+    pub report: crate::mm::KernelSlice,
     pub report_size: u32,
     pub role: HidRole,
     /// This keyboard's last report. Per device, because a report is a snapshot
@@ -91,7 +93,14 @@ impl HidDevice {
     pub fn dispatch_report(&mut self) {
         let mut buf = [0u8; 8];
         let size = self.report_size as usize;
-        unsafe { copy_nonoverlapping(self.report_ptr as *const u8, buf.as_mut_ptr(), size); }
+        // SAFETY: irreducible — `KernelSlice::as_slice` is an `unsafe fn` and
+        // there is no safe way to view DMA memory as bytes. Bounded twice:
+        // `subslice` asserts `size <= 8`, which is the slot `bind_hid`
+        // allocated, and `report_size` is 4, 6 or 8 by the `match` that set it.
+        // No aliasing `&mut` exists — this is the only reader — and the
+        // transfer has completed, since `dispatch_report` runs off a Transfer
+        // Event; the endpoint is not requeued until `requeue` below.
+        buf[..size].copy_from_slice(unsafe { self.report.subslice(0, size).as_slice() });
         // Wake only when the decode actually queued something. A report
         // identical to the last one produces no event, and waking watchers
         // for it made readiness disagree with `has_data()` — which froze the
@@ -148,7 +157,7 @@ impl HidDevice {
 
     pub fn requeue(&mut self, db_base: &Mmio) {
         let mut trb = Trb::ZERO;
-        trb.param = self.report_phys;
+        trb.param = self.report.phys();
         trb.status = self.report_size;
         trb.control = TRB_NORMAL | (1 << 5); // IOC
         self.int_ring.enqueue(trb);
@@ -203,7 +212,12 @@ impl HidDevice {
         if Self::break_at() != Some(self.completions) {
             return code;
         }
-        unsafe { core::ptr::write_bytes(self.report_ptr, 0, self.report_size as usize); }
+        // SAFETY: irreducible — `KernelSlice::zero` is an `unsafe fn` and this
+        // actuator's whole job is to leave the slot as a stalled endpoint would
+        // have. Bounded by `subslice` against the 8-byte slot. Exclusive for
+        // the same reason as `dispatch_report`: this runs on the completion,
+        // before the endpoint is requeued.
+        unsafe { self.report.subslice(0, self.report_size as usize).zero() };
         super::CC_STALL
     }
 }

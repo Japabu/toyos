@@ -87,8 +87,68 @@ const MAX_TABLE_LEN: usize = 1024 * 1024;
 const MAX_PHYS: u64 = 1 << 52;
 
 /// A physical address that could name a table, or `None`.
-fn table_at(phys: u64) -> Option<DirectMap> {
-    (phys != 0 && phys < MAX_PHYS).then(|| DirectMap::from_phys(phys))
+///
+/// The one constructor of [`Mapped`], which is why it returns one: an address
+/// firmware supplied is not dereferenceable until it has been through here, and
+/// making that the *type* is what stops the next reader from taking a `u64` and
+/// a `DirectMap` and going straight to a pointer.
+fn table_at(phys: u64) -> Option<Mapped> {
+    (phys != 0 && phys < MAX_PHYS).then(|| Mapped(DirectMap::from_phys(phys)))
+}
+
+/// A firmware-supplied physical address that [`table_at`] has bounded, and the
+/// only thing in this module that can be read through.
+///
+/// **This is where nine `unsafe` blocks went.** Every field read here used to
+/// be its own `read_unaligned(base.as_ptr::<u8>().add(offset).cast())` at the
+/// call site — nine of them, each restating the same argument — and the ones
+/// in [`xsdt`] restated it about an address that had never been through
+/// `table_at` at all. Concentrating them in the two accessors below makes the
+/// bound a property of the type instead of a habit at nine call sites, and the
+/// accessors are safe because `Mapped` cannot be built out of an address the
+/// bound does not hold for.
+///
+/// What the bound is: [`MAX_PHYS`] is x86-64's architectural 52-bit physical
+/// ceiling, and `mm` direct-maps all of physical memory at
+/// [`crate::mm::PHYS_OFFSET`], so `phys + PHYS_OFFSET` is a mapped kernel
+/// address that cannot wrap into the user half. What the bound is *not* is a
+/// claim that a table lives there — that is [`Table::open`]'s job, and it is
+/// why reading past a table's declared length still goes through [`Table`].
+#[derive(Clone, Copy)]
+pub struct Mapped(DirectMap);
+
+impl Mapped {
+    /// A copy of the `T` at `offset`. Unaligned by construction: ACPI tables
+    /// are byte-packed and the direct map does not align them.
+    fn field<T: Copy>(self, offset: usize) -> T {
+        // SAFETY: irreducible — this is the module's one dereference of a
+        // firmware-supplied address, so there is no safe primitive left to
+        // express it in terms of. Sound because `Mapped` is only ever built by
+        // `table_at`, which refused 0 and anything at or above `MAX_PHYS`, and
+        // the direct map covers every physical address below that; `offset` is
+        // bounded by the caller (`Table::field` against the declared length,
+        // `Table::open`/`xsdt` against `size_of::<SdtHeader>()`/`size_of::<Rsdp>()`,
+        // both of which are smaller than the `MAX_TABLE_LEN`/`RSDP_MAX_LEN` the
+        // checksum already walked). `read_unaligned` because the tables are
+        // `#[repr(C, packed)]` and nothing aligns them.
+        unsafe { read_unaligned(self.0.as_ptr::<u8>().add(offset).cast::<T>()) }
+    }
+
+    /// One byte, volatile — what the checksum walk reads, kept apart from
+    /// [`Mapped::field`] so the integrity check keeps reading exactly the bytes
+    /// it did before, once each and in order.
+    fn byte(self, offset: usize) -> u8 {
+        // SAFETY: irreducible for the same reason as `field`, and sound on the
+        // same bound; `offset` is `0..len` where the caller bounded `len` by
+        // `MAX_TABLE_LEN` or `RSDP_MAX_LEN` before calling.
+        unsafe { read_volatile(self.0.as_ptr::<u8>().add(offset)) }
+    }
+}
+
+impl core::fmt::Display for Mapped {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.0.fmt(f)
+    }
 }
 
 // ACPI table structures. All packed: tables are not guaranteed aligned, and
@@ -266,7 +326,7 @@ static SLP_TYPA: AtomicU16 = AtomicU16::new(0);
 /// validated, which is the invariant the module doc rests on.
 #[derive(Clone, Copy)]
 pub struct Table {
-    base: DirectMap,
+    base: Mapped,
     len: usize,
 }
 
@@ -279,14 +339,12 @@ impl Table {
     /// until `length` has been bounded — otherwise a header declaring 4 GiB
     /// turns the integrity check into the out-of-bounds read it exists to
     /// prevent.
-    fn open(base: DirectMap, signature: &[u8; 4], needed: usize) -> Result<Table, TableError> {
-        let found: [u8; 4] =
-            unsafe { read_unaligned(base.as_ptr::<u8>().add(offset_of!(SdtHeader, signature)).cast()) };
+    fn open(base: Mapped, signature: &[u8; 4], needed: usize) -> Result<Table, TableError> {
+        let found: [u8; 4] = base.field(offset_of!(SdtHeader, signature));
         if &found != signature {
             return Err(TableError::Absent);
         }
-        let declared: u32 =
-            unsafe { read_unaligned(base.as_ptr::<u8>().add(offset_of!(SdtHeader, length)).cast()) };
+        let declared: u32 = base.field(offset_of!(SdtHeader, length));
         let len = declared as usize;
         let floor = needed.max(size_of::<SdtHeader>());
         if len < floor || len > MAX_TABLE_LEN {
@@ -316,24 +374,23 @@ impl Table {
         if end > self.len {
             return None;
         }
-        Some(unsafe { read_unaligned(self.base.as_ptr::<u8>().add(offset).cast::<T>()) })
+        Some(self.base.field(offset))
     }
 
     /// Like [`Table::field`], but for a caller that has already proved the
     /// length covers `offset`. Used only inside the MADT walk, whose bound is
     /// re-established per entry.
     fn field_unchecked<T: Copy>(&self, offset: usize) -> T {
-        unsafe { read_unaligned(self.base.as_ptr::<u8>().add(offset).cast::<T>()) }
+        self.base.field(offset)
     }
 }
 
 /// The ACPI integrity check: a table is intact when its declared bytes sum to
 /// zero in 8 bits. `len` is bounded by the caller before this runs.
-fn sums_to_zero(base: DirectMap, len: usize) -> bool {
-    let p = base.as_ptr::<u8>();
+fn sums_to_zero(base: Mapped, len: usize) -> bool {
     let mut sum: u8 = 0;
     for i in 0..len {
-        sum = sum.wrapping_add(unsafe { read_volatile(p.add(i)) });
+        sum = sum.wrapping_add(base.byte(i));
     }
     sum == 0
 }
@@ -350,8 +407,14 @@ fn xsdt(rsdp_addr: u64) -> Result<Table, TableError> {
     /// exists so the extended checksum cannot be pointed at the whole map.
     const RSDP_MAX_LEN: usize = 64;
 
-    let base = DirectMap::from_phys(rsdp_addr);
-    let signature: [u8; 8] = unsafe { read_unaligned(base.as_ptr::<[u8; 8]>()) };
+    // Through `table_at` like every other firmware address, which it was not
+    // before: the RSDP's own pointer came from UEFI straight to
+    // `DirectMap::from_phys`, so a zero or a value at or above `MAX_PHYS` —
+    // the two cases `MAX_PHYS`'s own doc says it exists to stop — reached
+    // `as_ptr` and wrapped. Refused by name now, on the path that was the only
+    // one skipping the check.
+    let base = table_at(rsdp_addr).ok_or(TableError::BadRsdp)?;
+    let signature: [u8; 8] = base.field(0);
     if &signature != b"RSD PTR " {
         return Err(TableError::BadRsdp);
     }
@@ -359,14 +422,12 @@ fn xsdt(rsdp_addr: u64) -> Result<Table, TableError> {
         return Err(TableError::BadRsdp);
     }
 
-    let revision: u8 =
-        unsafe { read_unaligned(base.as_ptr::<u8>().add(offset_of!(Rsdp, revision))) };
+    let revision: u8 = base.field(offset_of!(Rsdp, revision));
     if revision < 2 {
         return Err(TableError::NoXsdt);
     }
 
-    let declared: u32 =
-        unsafe { read_unaligned(base.as_ptr::<u8>().add(offset_of!(Rsdp, length)).cast()) };
+    let declared: u32 = base.field(offset_of!(Rsdp, length));
     let len = declared as usize;
     if len < size_of::<Rsdp>() || len > RSDP_MAX_LEN {
         return Err(TableError::Length { declared, needed: size_of::<Rsdp>() });
@@ -375,8 +436,7 @@ fn xsdt(rsdp_addr: u64) -> Result<Table, TableError> {
         return Err(TableError::BadRsdp);
     }
 
-    let address: u64 =
-        unsafe { read_unaligned(base.as_ptr::<u8>().add(offset_of!(Rsdp, xsdt_address)).cast()) };
+    let address: u64 = base.field(offset_of!(Rsdp, xsdt_address));
     let root = table_at(address).ok_or(TableError::NoXsdt)?;
     Table::open(root, b"XSDT", size_of::<SdtHeader>())
 }

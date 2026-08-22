@@ -7,7 +7,36 @@
 //! is refused by name — never truncated to fit, and never trusted because the
 //! transfer that carried them succeeded.
 
-use core::ptr::{copy_nonoverlapping, write_bytes};
+use crate::mm::KernelSlice;
+
+/// Copy `dst.len()` bytes out of the DMA window at `off`.
+///
+/// **One reader instead of four.** `hold`, the read half of `transfer`,
+/// `request_sense` and `bring_up`'s `read_scratch` all spelled
+/// `copy_nonoverlapping(dma.ptr_at(off) as *const u8, out.as_mut_ptr(),
+/// out.len())` in an `unsafe` block of its own, with the bound stated nowhere;
+/// `subslice` asserts `off + dst.len() <= dma.size()` for all of them.
+fn read_dma(dma: &KernelSlice, off: usize, dst: &mut [u8]) {
+    let region = dma.subslice(off, dst.len());
+    // SAFETY: irreducible — `KernelSlice::as_slice` is an `unsafe fn` and there
+    // is no safe way to view DMA memory as bytes. Bounded by the `subslice`
+    // above. No aliasing `&mut` and no device write in flight: every caller is
+    // after a completed transfer (`scsi`/`bot` returned) or, in `hold`'s case,
+    // between the CBW and the data phase, and a device block is one device's —
+    // `MscDevice::block` indexes the pool's mass-storage blocks one to one.
+    dst.copy_from_slice(unsafe { region.as_slice() });
+}
+
+/// Copy `src` into the DMA window at `off`. The write half of [`read_dma`],
+/// and bounded the same way.
+fn write_dma(dma: &KernelSlice, off: usize, src: &[u8]) {
+    // SAFETY: irreducible — `KernelSlice::copy_from` is an `unsafe fn` and
+    // there is no safe way to put bytes into DMA memory. Bounded by
+    // `copy_from`, which asserts `off + src.len() <= dma.size()`. Exclusive:
+    // both callers write before the transfer naming the window is enqueued.
+    unsafe { dma.copy_from(off, src) }
+}
+
 
 
 use crate::log;
@@ -313,9 +342,7 @@ pub(in crate::drivers::xhci) mod short_read {
         }
         let at = at + (len - SHORT_BY) as usize;
         let mut bytes = [0u8; SHORT_BY as usize];
-        unsafe {
-            core::ptr::copy_nonoverlapping(dma.ptr_at(at) as *const u8, bytes.as_mut_ptr(), bytes.len());
-        }
+        super::read_dma(dma, at, &mut bytes);
         Some(Held { at, bytes })
     }
 
@@ -327,9 +354,7 @@ pub(in crate::drivers::xhci) mod short_read {
     ) -> Option<(u32, u32)> {
         let Some(held) = held else { return completion };
         let (code, residue) = completion?;
-        unsafe {
-            core::ptr::copy_nonoverlapping(held.bytes.as_ptr(), dma.ptr_at(held.at), held.bytes.len());
-        }
+        super::write_dma(dma, held.at, &held.bytes);
         Some((code, residue + SHORT_BY))
     }
 }
@@ -615,13 +640,7 @@ impl XhciController {
             ];
 
             if let Host::From(src) = &host {
-                unsafe {
-                    copy_nonoverlapping(
-                        src.as_ptr().add(offset),
-                        dma.ptr_at(dev.block + MSC_DATA),
-                        bytes,
-                    );
-                }
+                write_dma(&dma, dev.block + MSC_DATA, &src[offset..offset + bytes]);
             }
 
             match self.scsi(dev, &cdb, 10, data_phys, bytes as u32, !write, until) {
@@ -641,13 +660,7 @@ impl XhciController {
             }
 
             if let Host::Into(dst) = &mut host {
-                unsafe {
-                    copy_nonoverlapping(
-                        dma.ptr_at(dev.block + MSC_DATA) as *const u8,
-                        dst.as_mut_ptr().add(offset),
-                        bytes,
-                    );
-                }
+                read_dma(&dma, dev.block + MSC_DATA, &mut dst[offset..offset + bytes]);
             }
             done += batch;
         }
@@ -748,7 +761,7 @@ impl XhciController {
     fn request_sense(&mut self, dev: &mut MscDevice) -> (u8, u8, u8) {
         let dma = self.dma();
         let phys = dma.phys() + (dev.block + MSC_SCRATCH) as u64;
-        unsafe { write_bytes(dma.ptr_at(dev.block + MSC_SCRATCH), 0, MSC_SCRATCH_LEN); }
+        super::super::zero_dma(dma, dev.block + MSC_SCRATCH, MSC_SCRATCH_LEN);
         let cdb = [0x03u8, 0, 0, 0, 18, 0];
         // Recursion is not possible: a failing REQUEST SENSE goes through
         // `bot` directly, so it cannot ask for sense data about itself.
@@ -759,13 +772,7 @@ impl XhciController {
         match self.bot(dev, &cdb, 6, phys, 18, true) {
             Ok(Bot::Done { delivered }) if delivered >= 14 => {
                 let mut resp = [0u8; 18];
-                unsafe {
-                    copy_nonoverlapping(
-                        dma.ptr_at(dev.block + MSC_SCRATCH) as *const u8,
-                        resp.as_mut_ptr(),
-                        resp.len(),
-                    );
-                }
+                read_dma(&dma, dev.block + MSC_SCRATCH, &mut resp);
                 (resp[2] & 0x0F, resp[12], resp[13])
             }
             _ => (0, 0, 0),
@@ -818,9 +825,16 @@ impl XhciController {
         let tag = dev.next_tag();
         #[cfg(feature = "stack-witness")]
         let entered_with = block_witness(dev);
-        let cbw = dma.subslice(dev.block + MSC_CBW, CBW_LEN as usize);
+        let cbw = super::super::zero_dma(dma, dev.block + MSC_CBW, CBW_LEN as usize);
+        // SAFETY: irreducible — `KernelSlice::write`/`copy_from` are `unsafe
+        // fn`s and a Command Block Wrapper is bytes at fixed offsets (USB
+        // BOT 1.0 §5.1), so there is no safe form of writing one. Bounded by
+        // each `write`/`copy_from`, which assert against `CBW_LEN`: the last
+        // field ends at `15 + cdb_len` and `cdb_len <= 16` was asserted on
+        // entry, against a `CBW_LEN` of 31. Exclusive: the transfer naming this
+        // block has not been enqueued yet, and a device block belongs to one
+        // device.
         unsafe {
-            cbw.zero();
             cbw.write::<u32>(0, CBW_SIGNATURE.to_le());
             cbw.write::<u32>(4, tag.to_le());
             cbw.write::<u32>(8, data_len.to_le());
@@ -871,7 +885,7 @@ impl XhciController {
         }
 
         let csw_phys = dma.phys() + (dev.block + MSC_CSW) as u64;
-        unsafe { write_bytes(dma.ptr_at(dev.block + MSC_CSW), 0, CSW_LEN as usize); }
+        super::super::zero_dma(dma, dev.block + MSC_CSW, CSW_LEN as usize);
         let mut got = self.framed_phase(dev, true, csw_phys, CSW_LEN, "status");
         if let Err(Broke::Code { code: CC_STALL, .. }) = got {
             // The spec's one legal retry: the device may stall the status
@@ -879,7 +893,7 @@ impl XhciController {
             if !self.restart_bulk(dev, true) {
                 return Err(Broke::Stall { phase: "status" });
             }
-            unsafe { write_bytes(dma.ptr_at(dev.block + MSC_CSW), 0, CSW_LEN as usize); }
+            super::super::zero_dma(dma, dev.block + MSC_CSW, CSW_LEN as usize);
             got = self.framed_phase(dev, true, csw_phys, CSW_LEN, "status");
         }
         got?;
@@ -887,6 +901,13 @@ impl XhciController {
         #[cfg(feature = "stack-witness")]
         block_witness_holds(dev, entered_with);
         let csw = dma.subslice(dev.block + MSC_CSW, CSW_LEN as usize);
+        // SAFETY: irreducible — `KernelSlice::read` is an `unsafe fn` and a
+        // Command Status Wrapper is bytes at fixed offsets (USB BOT 1.0 §5.2).
+        // Bounded by each `read`, which asserts against the `CSW_LEN`-byte
+        // subslice; the last field is a `u8` at 12 of 13. The transfer has
+        // completed — `framed_phase` returned `Ok` above — so the device is not
+        // writing this block. Every number read here is the device's and is
+        // checked on the lines below, never believed.
         let (signature, csw_tag, residue, status) = unsafe {
             (
                 u32::from_le(csw.read::<u32>(0)),
@@ -1069,13 +1090,11 @@ pub(in crate::drivers::xhci) fn prepare(
     let in_ring = TrbRing::init(dma.subslice(block + MSC_IN_RING, PAGE));
     let out_ring = TrbRing::init(dma.subslice(block + MSC_OUT_RING, PAGE));
 
-    let input_ctx = dma.subslice(OFF_INPUT_CTX, PAGE);
-    let input_ctx_ptr = input_ctx.base();
-    unsafe { input_ctx.zero(); }
-    ctrl.write_ctx32(input_ctx_ptr, 0, 1, 1 | (1u32 << in_dci) | (1u32 << out_dci));
+    let input_ctx = super::super::zero_dma(dma, OFF_INPUT_CTX, PAGE);
+    ctrl.write_ctx32(input_ctx, 0, 1, 1 | (1u32 << in_dci) | (1u32 << out_dci));
     let max_dci = in_dci.max(out_dci) as u32;
-    ctrl.write_ctx32(input_ctx_ptr, 1, 0, ((speed as u32) << 20) | (max_dci << 27));
-    ctrl.write_ctx32(input_ctx_ptr, 1, 1, (port_idx as u32 + 1) << 16);
+    ctrl.write_ctx32(input_ctx, 1, 0, ((speed as u32) << 20) | (max_dci << 27));
+    ctrl.write_ctx32(input_ctx, 1, 1, (port_idx as u32 + 1) << 16);
 
     // EP Type 2 is Bulk Out and 6 is Bulk In; CErr 3 is the retry count the
     // controller applies before reporting a transaction error. Average TRB
@@ -1087,17 +1106,17 @@ pub(in crate::drivers::xhci) fn prepare(
         (in_dci, 6u32, info.in_ep.max_packet, info.in_ep.max_burst, &in_ring),
     ] {
         let ctx = dci as usize + 1;
-        ctrl.write_ctx32(input_ctx_ptr, ctx, 0, 0);
+        ctrl.write_ctx32(input_ctx, ctx, 0, 0);
         ctrl.write_ctx32(
-            input_ctx_ptr,
+            input_ctx,
             ctx,
             1,
             (3 << 1) | (ep_type << 3) | ((burst as u32) << 8) | ((mps as u32) << 16),
         );
         let dequeue = ring.dequeue();
-        ctrl.write_ctx32(input_ctx_ptr, ctx, 2, dequeue as u32);
-        ctrl.write_ctx32(input_ctx_ptr, ctx, 3, (dequeue >> 32) as u32);
-        ctrl.write_ctx32(input_ctx_ptr, ctx, 4, mps as u32);
+        ctrl.write_ctx32(input_ctx, ctx, 2, dequeue as u32);
+        ctrl.write_ctx32(input_ctx, ctx, 3, (dequeue >> 32) as u32);
+        ctrl.write_ctx32(input_ctx, ctx, 4, mps as u32);
     }
     Some(MscRings { at, block, in_ring, out_ring })
 }
@@ -1217,16 +1236,10 @@ fn bring_up(ctrl: &mut XhciController, dev: &mut MscDevice) -> bool {
                         cdb_len: u8,
                         want: u32,
                         out: &mut [u8]| {
-        unsafe { write_bytes(dma.ptr_at(dev.block + MSC_SCRATCH), 0, MSC_SCRATCH_LEN); }
+        super::super::zero_dma(dma, dev.block + MSC_SCRATCH, MSC_SCRATCH_LEN);
         match ctrl.scsi(dev, cdb, cdb_len, scratch_phys, want, true, until) {
             Scsi::Ok { delivered } if delivered as usize >= out.len() => {
-                unsafe {
-                    copy_nonoverlapping(
-                        dma.ptr_at(dev.block + MSC_SCRATCH) as *const u8,
-                        out.as_mut_ptr(),
-                        out.len(),
-                    );
-                }
+                read_dma(&dma, dev.block + MSC_SCRATCH, out);
                 true
             }
             Scsi::Refused { key, asc, ascq } => {

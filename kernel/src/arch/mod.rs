@@ -4,9 +4,9 @@
 //! Every `unsafe` block under here carries a `SAFETY:` comment saying why it is
 //! irreducible as well as why it is sound, and the attribute above is what keeps
 //! that true — it composes with the `-D warnings` both kernel clippy invocations
-//! already carry, so a new block without one does not build. `arch/` was the
-//! last area `main.rs`'s crate-level warn still carried an `allow` for; with it
-//! gone the kernel is gated whole.
+//! already carry, so a new block without one does not build. It is also the
+//! last of these a kernel area needed: `main.rs`'s crate-level warn carries an
+//! `allow` only for `sched/`, `iommu/` and `log/` now.
 //!
 //! Where the machine access lives: [`cpu`] is one instruction per function and
 //! the bottom of the tree, [`percpu`] owns `PerCpu`, its `gs:` offsets and the

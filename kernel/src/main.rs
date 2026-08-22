@@ -39,7 +39,6 @@ mod id_map;
 // so this list is never a way to un-gate a swept tree, only a record of the ones
 // nobody has swept.
 mod arch;
-#[allow(clippy::undocumented_unsafe_blocks, reason = "drivers/: not yet swept")]
 mod drivers;
 
 #[macro_use]

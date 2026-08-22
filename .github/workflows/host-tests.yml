@@ -166,14 +166,15 @@ jobs:
       # an `#[allow(...)]` on each `mod` line whose tree is not swept yet.
       # Composing with the `-D warnings` both kernel invocations below already
       # carry turns that `warn` into a hard error, with no new flag here.
-      # Everything else — the root files, plus `arch::`, `mm::`, `object::`,
-      # `elf::` and `loader::`, which each also open with their own
+      # Everything else — the root files, plus `arch::`, `drivers::`, `mm::`,
+      # `object::`, `elf::` and `loader::`, which each also open with their own
       # `#![warn(...)]` from their own sweep — is gated, and a new file added
       # beside `main.rs` is gated the day it appears. To read *through* the
       # remaining `allow`s and re-measure what is owed, add
       # `--force-warn clippy::undocumented_unsafe_blocks`;
       # `issues/build/clippy-has-never-run-here.md` carries the per-area ledger
-      # and the counts, which move as areas land and are not restated here.
+      # and the counts, which move as areas land and are not restated here —
+      # this comment carried a stale list twice before it stopped keeping one.
       #
       # Measured on the dev host with three fresh `CARGO_TARGET_DIR`s and a warm
       # cargo registry: **19.2 s** for the workspace (139 crates checked),

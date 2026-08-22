@@ -1,4 +1,4 @@
-use core::ptr::{copy_nonoverlapping, read_volatile};
+use core::ptr::read_volatile;
 
 use alloc::boxed::Box;
 
@@ -191,7 +191,23 @@ struct FbAlloc {
     phys_addrs: [u64; 2],
 }
 
-unsafe impl Send for GpuController {}
+/// Put `value` at `at` in a command or response buffer.
+///
+/// **The one writer of DMA memory in this driver.** Five call sites used to
+/// spell `copy_nonoverlapping(&cmd as *const _ as *const u8, self.req_ptr,
+/// size_of::<T>())` — three of them via a `from_raw_parts` byte view built for
+/// no other purpose — and every one of them was an `unsafe` block making the
+/// same claim. `KernelSlice::write` writes the same bytes and checks the bound
+/// while it is at it.
+fn put<T: Copy>(buf: KernelSlice, at: usize, value: T) {
+    // SAFETY: irreducible — `KernelSlice::write` is an `unsafe fn` and there is
+    // no safe way to put a command into DMA memory. Bounded: `write` asserts
+    // `at + size_of::<T>() <= buf.size()`, and both buffers are 0x800 bytes
+    // against commands of at most `size_of::<RespEdid>()`. Exclusive: every
+    // caller is between one `submit_and_wait` and the next, so the device holds
+    // no descriptor naming this buffer while the write lands.
+    unsafe { buf.write(at, value) }
+}
 
 struct GpuController {
     device: VirtioDevice,
@@ -199,15 +215,14 @@ struct GpuController {
     cursorq: Virtqueue,
     control_slot: Option<DescSlot>,
     cursor_slot: Option<DescSlot>,
-    /// Physical addresses for virtqueue descriptors (device DMA).
-    req_phys: u64,
-    resp_phys: u64,
-    cursor_req_phys: u64,
-    cursor_resp_phys: u64,
-    /// Virtual pointers for kernel read/write.
-    req_ptr: *mut u8,
-    resp_ptr: *mut u8,
-    cursor_req_ptr: *mut u8,
+    /// The four command and response buffers. `KernelSlice`s and not the raw
+    /// pointer/physical-address pairs they replaced, which is what makes every
+    /// field of this struct `Send` on its own and deleted `unsafe impl Send for
+    /// GpuController {}`.
+    req: KernelSlice,
+    resp: KernelSlice,
+    cursor_req: KernelSlice,
+    cursor_resp: KernelSlice,
     width: u32,
     height: u32,
     resource: u32,
@@ -216,19 +231,42 @@ struct GpuController {
 }
 
 impl GpuController {
-    /// Copy a command struct to the request DMA buffer and submit it.
-    /// Returns the response header's type field.
-    fn command_raw(&mut self, req_bytes: &[u8], resp_size: u32) -> u32 {
+    /// What the device wrote into the control response buffer.
+    ///
+    /// **The one reader of DMA memory in this driver.** Volatile because the
+    /// device wrote these bytes and nothing in the type system says so; bounded
+    /// through `subslice`, which asserts the whole `T` is inside the buffer
+    /// where `ptr_at` would only have asserted the offset was.
+    fn answer<T: Copy>(&self) -> T {
+        // SAFETY: irreducible — a volatile read has no safe spelling, and this
+        // is the driver's only one. Sound because `subslice` just asserted
+        // `size_of::<T>() <= resp.size()` (0x800, against a largest `T` of
+        // `RespEdid`), the buffer is 8-aligned within a page-aligned DMA pool
+        // and every `T` read here has alignment 8 or less, and the transfer
+        // that filled it has completed: `submit_and_wait` returned, and
+        // `poll_used`'s `fence(Acquire)` orders the device's writes before
+        // this read.
         unsafe {
-            copy_nonoverlapping(req_bytes.as_ptr(), self.req_ptr, req_bytes.len());
+            read_volatile(self.resp.subslice(0, core::mem::size_of::<T>()).base().cast::<T>())
         }
+    }
+
+    /// Put one command struct in the request buffer, submit it, and answer with
+    /// whatever the device wrote back.
+    ///
+    /// Typed rather than `&[u8]`: `command_raw` took a byte slice, so every
+    /// caller built one out of its command with `from_raw_parts` — three more
+    /// unsafe blocks for a view nothing else used. Writing the `T` itself
+    /// writes the same bytes.
+    fn command_of<Req: Copy, Resp: Copy>(&mut self, req: &Req) -> Resp {
+        put(self.req, 0, *req);
 
         let slot = self.control_slot.take().expect("GPU: no control slot");
         let returned = self.controlq.submit_and_wait(
             slot,
             &[
-                (self.req_phys, req_bytes.len() as u32, BufDir::Readable),
-                (self.resp_phys, resp_size, BufDir::Writable),
+                (self.req.phys(), core::mem::size_of::<Req>() as u32, BufDir::Readable),
+                (self.resp.phys(), core::mem::size_of::<Resp>() as u32, BufDir::Writable),
             ],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
@@ -236,14 +274,16 @@ impl GpuController {
         );
         self.control_slot = Some(returned);
 
-        unsafe { read_volatile(self.resp_ptr as *const u32) }
+        self.answer()
     }
 
+    /// A command whose answer is only its response header's type field, which
+    /// is every command but GET_EDID.
     fn command<T: Copy>(&mut self, req: &T) -> u32 {
-        let bytes = unsafe {
-            core::slice::from_raw_parts(req as *const T as *const u8, core::mem::size_of::<T>())
-        };
-        self.command_raw(bytes, core::mem::size_of::<CtrlHeader>() as u32)
+        // `CtrlHeader` and not `u32` as the response size: the device is told
+        // how much room it has, and a header is what it writes.
+        let hdr: CtrlHeader = self.command_of(req);
+        hdr.cmd_type
     }
 
     fn get_edid(&mut self, scanout: u32) -> RespEdid {
@@ -252,28 +292,7 @@ impl GpuController {
             scanout,
             padding: 0,
         };
-        let bytes = unsafe {
-            core::slice::from_raw_parts(&cmd as *const _ as *const u8, core::mem::size_of::<GetEdid>())
-        };
-        let resp_size = core::mem::size_of::<RespEdid>() as u32;
-
-        unsafe {
-            copy_nonoverlapping(bytes.as_ptr(), self.req_ptr, bytes.len());
-        }
-
-        let slot = self.control_slot.take().expect("GPU: no control slot");
-        self.control_slot = Some(self.controlq.submit_and_wait(
-            slot,
-            &[
-                (self.req_phys, bytes.len() as u32, BufDir::Readable),
-                (self.resp_phys, resp_size, BufDir::Writable),
-            ],
-            self.device.notify_mmio(),
-            self.device.notify_off_multiplier(),
-            0,
-        ));
-
-        unsafe { read_volatile(self.resp_ptr as *const RespEdid) }
+        self.command_of(&cmd)
     }
 
     fn create_resource(&mut self, id: u32, format: u32, width: u32, height: u32) {
@@ -310,32 +329,22 @@ impl GpuController {
 
         let cmd_size = core::mem::size_of::<ResourceAttachBacking>();
         let entry_size = core::mem::size_of::<MemEntry>();
-        unsafe {
-            copy_nonoverlapping(
-                &cmd as *const _ as *const u8,
-                self.req_ptr,
-                cmd_size,
-            );
-            copy_nonoverlapping(
-                &entry as *const _ as *const u8,
-                self.req_ptr.add(cmd_size),
-                entry_size,
-            );
-        }
+        put(self.req, 0, cmd);
+        put(self.req, cmd_size, entry);
 
         let slot = self.control_slot.take().expect("GPU: no control slot");
         self.control_slot = Some(self.controlq.submit_and_wait(
             slot,
             &[
-                (self.req_phys, (cmd_size + entry_size) as u32, BufDir::Readable),
-                (self.resp_phys, core::mem::size_of::<CtrlHeader>() as u32, BufDir::Writable),
+                (self.req.phys(), (cmd_size + entry_size) as u32, BufDir::Readable),
+                (self.resp.phys(), core::mem::size_of::<CtrlHeader>() as u32, BufDir::Writable),
             ],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
             0,
         ));
 
-        let resp = unsafe { read_volatile(self.resp_ptr as *const u32) };
+        let resp = self.answer::<CtrlHeader>().cmd_type;
         assert!(resp == RESP_OK_NODATA, "VirtIO GPU: RESOURCE_ATTACH_BACKING failed: {:#x}", resp);
     }
 
@@ -374,18 +383,13 @@ impl GpuController {
     }
 
     fn cursor_command<T: Copy>(&mut self, req: &T) {
-        let bytes = unsafe {
-            core::slice::from_raw_parts(req as *const T as *const u8, core::mem::size_of::<T>())
-        };
-        unsafe {
-            copy_nonoverlapping(bytes.as_ptr(), self.cursor_req_ptr, bytes.len());
-        }
+        put(self.cursor_req, 0, *req);
         let slot = self.cursor_slot.take().expect("GPU: no cursor slot");
         self.cursor_slot = Some(self.cursorq.submit_and_wait(
             slot,
             &[
-                (self.cursor_req_phys, bytes.len() as u32, BufDir::Readable),
-                (self.cursor_resp_phys, core::mem::size_of::<CtrlHeader>() as u32, BufDir::Writable),
+                (self.cursor_req.phys(), core::mem::size_of::<T>() as u32, BufDir::Readable),
+                (self.cursor_resp.phys(), core::mem::size_of::<CtrlHeader>() as u32, BufDir::Writable),
             ],
             self.device.notify_mmio(),
             self.device.notify_off_multiplier(),
@@ -561,13 +565,9 @@ pub fn init(devices: &[PciDevice]) -> Option<(Box<dyn Gpu>, GpuInfo)> {
 
     let ctrl_bufs = dma.subslice(OFF_CONTROLQ_BUFS, 0x1000);
     let cursor_bufs = dma.subslice(OFF_CURSORQ_BUFS, 0x1000);
-    let req_phys = ctrl_bufs.phys() + REQ_OFFSET as u64;
-    let resp_phys = ctrl_bufs.phys() + RESP_OFFSET as u64;
-    let cursor_req_phys = cursor_bufs.phys() + REQ_OFFSET as u64;
-    let cursor_resp_phys = cursor_bufs.phys() + RESP_OFFSET as u64;
-    let req_ptr = ctrl_bufs.ptr_at(REQ_OFFSET);
-    let resp_ptr = ctrl_bufs.ptr_at(RESP_OFFSET);
-    let cursor_req_ptr = cursor_bufs.ptr_at(REQ_OFFSET);
+    // Each half of a buffer page: request at 0, response at `RESP_OFFSET`, and
+    // the length is what `KernelSlice` asserts every write and read against.
+    const HALF: usize = RESP_OFFSET - REQ_OFFSET;
 
     let mut gpu = GpuController {
         device,
@@ -575,13 +575,10 @@ pub fn init(devices: &[PciDevice]) -> Option<(Box<dyn Gpu>, GpuInfo)> {
         cursorq,
         control_slot: Some(control_slot),
         cursor_slot: Some(cursor_slot),
-        req_phys,
-        resp_phys,
-        cursor_req_phys,
-        cursor_resp_phys,
-        req_ptr,
-        resp_ptr,
-        cursor_req_ptr,
+        req: ctrl_bufs.subslice(REQ_OFFSET, HALF),
+        resp: ctrl_bufs.subslice(RESP_OFFSET, HALF),
+        cursor_req: cursor_bufs.subslice(REQ_OFFSET, HALF),
+        cursor_resp: cursor_bufs.subslice(RESP_OFFSET, HALF),
         width: 0,
         height: 0,
         resource: 1,
