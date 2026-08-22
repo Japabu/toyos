@@ -10,6 +10,14 @@
 //! have to remember to retire both. It did not — `fire_deadlines` discarded the
 //! index entry of a claim it lost and left the entry's copy standing, which is
 //! a CPU reporting a deadline nothing will fire.
+//!
+//! **Not every arming is a deadline.** [`TimerPlan::no_later_than`] lets a caller
+//! pull the arming forward for a reason nothing in this module knows about — a
+//! CPU that wants waking to look for work again. It moves the instant in one
+//! direction only, which is what keeps invariant T out of it: the invariant
+//! bounds the armed instant from above by the earliest event the CPU owes, so
+//! an extra wake before that instant is a spurious pass and never a missed
+//! deadline.
 
 use crate::hw::Nanos;
 
