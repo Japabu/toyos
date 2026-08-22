@@ -350,6 +350,7 @@ overflow-checks = true
 [dependencies]
 bcachefs = { path = "../bcachefs", default-features = false }
 toyos-abi = { path = "../toyos-abi" }
+toyos-dma = { path = "../toyos-dma" }
 toyos-fat32 = { path = "../toyos-fat32" }
 toyos-elf = { path = "../toyos-elf" }
 toyos-elide = { path = "../toyos-elide" }

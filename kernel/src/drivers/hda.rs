@@ -282,7 +282,11 @@ pub fn drain_completed(buf: &mut crate::user_ptr::UserBytesMut) -> usize {
 struct HdaController {
     regs: Mmio,
     stream: Mmio,
-    /// Kept so the pages outlive the mappings that name them.
+    /// Kept so the pages outlive the mappings that name them — and so a
+    /// controller this driver refuses below gives them back, which is why these
+    /// are pools rather than leaked views. Nothing here holds a [`super::Dma`]
+    /// past `init`: the descriptor list is written once and the PCM ring is
+    /// soundd's, so the borrows all end inside that function.
     _bdl: super::DmaPool,
     _pcm: super::DmaPool,
 }
@@ -483,35 +487,28 @@ pub fn init(devices: &[PciDevice]) {
 
     let bdl = super::DmaPool::alloc(PERIODS * 16);
     let pcm = super::DmaPool::alloc(PERIODS * PERIOD_BYTES);
-    let bdl_slice = bdl.slice();
-    let pcm_slice = pcm.slice();
-    // SAFETY: irreducible — `KernelSlice::zero` is an `unsafe fn` and there is
-    // no safe way to clear DMA memory. Bounded by `zero`, which writes exactly
-    // each region's own `size`. Exclusive: both pools were allocated on the two
-    // lines above and no address of either has reached the controller yet — the
-    // BDL pointer registers are written thirty lines below, after the stream has
-    // been reset.
-    unsafe {
-        bdl_slice.zero();
-        pcm_slice.zero();
-    }
+    // The unaligned discipline for the descriptor list: it is written here,
+    // once, and the controller is not told where it is until `SD_BDPL` thirty
+    // lines below — so nothing races these stores, and what is written is a
+    // layout the HDA specification chose (§3.6.2) rather than a Rust one. The
+    // PCM ring is only ever cleared and handed to soundd, so it takes the
+    // pool's own discipline and never reads or writes a `T` at all.
+    let bdl_view = bdl.view().unaligned();
+    let pcm_view = pcm.view();
+    // Exclusive: both pools were allocated on the two lines above and no address
+    // of either has reached the controller yet.
+    bdl_view.zero();
+    pcm_view.zero();
 
-    let entries = stream::build_bdl(pcm_slice.phys(), PERIOD_BYTES as u32, PERIODS)
+    let entries = stream::build_bdl(pcm_view.phys(), PERIOD_BYTES as u32, PERIODS)
         .expect("hda: the pipeline's own shape builds a descriptor list");
     for (i, entry) in entries.iter().enumerate() {
-        // SAFETY: irreducible — `KernelSlice::write` is an `unsafe fn`; this is
-        // the buffer descriptor list the controller reads, and it has to be
-        // written as bytes at spec offsets. Bounded by `write`, which asserts
-        // each field is inside the pool: `build_bdl` returns exactly `PERIODS`
-        // entries and the pool was allocated `PERIODS * 16` bytes, so the
-        // largest offset is `(PERIODS - 1) * 16 + 12`. Exclusive for the same
-        // reason as the zeroing above — the controller has not been given the
-        // list's address yet.
-        unsafe {
-            bdl_slice.write::<u64>(i * 16, entry.address);
-            bdl_slice.write::<u32>(i * 16 + 8, entry.length);
-            bdl_slice.write::<u32>(i * 16 + 12, u32::from(entry.interrupt_on_completion));
-        }
+        // Bounded by each write: `build_bdl` returns exactly `PERIODS` entries
+        // and the pool was allocated `PERIODS * 16` bytes, so the largest offset
+        // is `(PERIODS - 1) * 16 + 12`.
+        bdl_view.write::<u64>(i * 16, entry.address);
+        bdl_view.write::<u32>(i * 16 + 8, entry.length);
+        bdl_view.write::<u32>(i * 16 + 12, u32::from(entry.interrupt_on_completion));
     }
 
     if !reset_stream(stream) {
@@ -524,8 +521,8 @@ pub fn init(devices: &[PciDevice]) {
         return;
     }
 
-    stream.write_u32(SD_BDPL, bdl_slice.phys() as u32);
-    stream.write_u32(SD_BDPU, (bdl_slice.phys() >> 32) as u32);
+    stream.write_u32(SD_BDPL, bdl_view.phys() as u32);
+    stream.write_u32(SD_BDPU, (bdl_view.phys() >> 32) as u32);
     stream.write_u32(
         SD_CBL,
         stream::cyclic_length(PERIOD_BYTES as u32, PERIODS).expect("fits a u32"),
@@ -548,7 +545,7 @@ pub fn init(devices: &[PciDevice]) {
     regs.write_u32(INTCTL, INTCTL_GIE | (1 << stream_index));
 
     let pcm_region = Region {
-        phys: crate::DirectMap::from_phys(pcm_slice.phys()),
+        phys: crate::DirectMap::from_phys(pcm_view.phys()),
         size: crate::mm::PAGE_2M,
         cache: CachePolicy::DeferToMtrr,
         pages: None,

@@ -20,6 +20,7 @@ members = [
     "toyos-abi",
     "toyos-cc",
     "toyos-desktop",
+    "toyos-dma",
     "toyos-elf",
     "toyos-elide",
     "toyos-fat32",

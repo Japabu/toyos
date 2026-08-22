@@ -9,6 +9,7 @@
 pub mod pmm;
 pub mod paging;
 mod alloc;
+mod dma;
 mod mmio;
 mod region;
 mod unmapped;
@@ -31,6 +32,7 @@ pub use alloc::hold_lock as hold_heap_lock;
 /// Unconditional, because `hw::report_contexts` runs on every kernel crash and
 /// a kernel that carries no sweep answers `None` rather than failing to build.
 pub use alloc::sweep_stats;
+pub use dma::{Dma, DmaPool, Unaligned};
 pub use mmio::Mmio;
 pub use region::KernelSlice;
 pub use unmapped::Unmapped;
