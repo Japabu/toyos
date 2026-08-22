@@ -382,13 +382,16 @@ pub(super) fn deaf_window() {
             // that samples the rip then names `u128_div_rem` for a CPU that
             // never left this loop. `rdtsc` and a 64-bit compare inline.
             let until = crate::clock::tsc_deadline(DEAF_NS);
-            // SAFETY: the actuator's whole content. Interrupts come back on
-            // below and the loop is bounded by the clock.
-            unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+            // The actuator's whole content. Interrupts come back on below and
+            // the loop is bounded by the clock. Not an `IrqGuard`, for the
+            // reason `driver::execute`'s idle arm gives: this must *set* IF on
+            // the way out, and a CPU that reached the idle loop through panic
+            // recovery has IF already 0 for a guard to restore.
+            crate::arch::cpu::disable_interrupts();
             while crate::arch::cpu::rdtsc() < until {
                 core::hint::spin_loop();
             }
-            unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+            crate::arch::cpu::enable_interrupts();
             // The victim is the only thing that can witness its own return, and
             // half of what the probe claims is that an NMI interrupts a CPU
             // rather than killing it.
