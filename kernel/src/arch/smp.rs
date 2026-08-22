@@ -110,16 +110,32 @@ extern "C" {
     static _ap_cs_reload: u8;
 }
 
-/// Get the address of an assembly label directly via LEA, bypassing GOT stubs.
+/// The address of an assembly label, straight out of a `lea`.
+///
+/// **Safe, and the `unsafe` is inside**: a `lea` off `rip` computes an address
+/// and reads nothing, so there is no caller obligation to state — the six sites
+/// that spelled `unsafe { asm_label_addr!(…) }` were each restating the same
+/// nothing. What the address then *means* is the caller's, and every caller here
+/// treats it as an integer.
+///
+/// A macro rather than a function because `sym` needs the label as a token, and
+/// inline asm rather than `&raw const $label` because the PIE linker resolves an
+/// `extern "C" { static }` reference through a GOT stub, which for these labels
+/// is filled in the wrong order.
 macro_rules! asm_label_addr {
     ($label:ident) => {{
         let addr: usize;
-        core::arch::asm!(
-            "lea {}, [rip + {}]",
-            out(reg) addr,
-            sym $label,
-            options(nostack, nomem),
-        );
+        // SAFETY: `lea` with `nomem` reads and writes no memory; the operand is
+        // an assembler symbol, so the only thing that can go wrong is the name
+        // not existing, which is a link error rather than undefined behaviour.
+        unsafe {
+            core::arch::asm!(
+                "lea {}, [rip + {}]",
+                out(reg) addr,
+                sym $label,
+                options(nostack, nomem),
+            );
+        }
         addr as *const u8
     }};
 }
@@ -127,11 +143,17 @@ macro_rules! asm_label_addr {
 /// Copy the trampoline assembly blob to physical page 0x8000.
 /// Accesses via the kernel direct map (PHYS_OFFSET) since there's no identity map.
 fn copy_trampoline() {
-    let start = unsafe { asm_label_addr!(_trampoline_start) };
-    let end = unsafe { asm_label_addr!(_trampoline_end) };
+    let start = asm_label_addr!(_trampoline_start);
+    let end = asm_label_addr!(_trampoline_end);
     let size = end as usize - start as usize;
     assert!(size <= DATA_OFFSET, "trampoline code exceeds data block");
     let dest = crate::DirectMap::from_phys(TRAMPOLINE_PAGE).as_mut_ptr::<u8>();
+    // SAFETY: `start..end` is the `global_asm!` blob below, `'static` bytes of
+    // this kernel's own `.text`. `dest` is the direct-map address of physical
+    // page 0x8000, which `mm` reserves for exactly this and which no allocator
+    // hands out; `size <= DATA_OFFSET` was just asserted, so the copy stays
+    // clear of the `TrampolineData` block at 0x8F00 and inside the page. The two
+    // ranges are kernel text and low physical memory, so they cannot overlap.
     unsafe {
         core::ptr::copy_nonoverlapping(start, dest, size);
     }
@@ -139,19 +161,24 @@ fn copy_trampoline() {
 
 /// Compute the runtime physical address of a trampoline label.
 fn label_addr(label: *const u8) -> u32 {
-    let base = unsafe { asm_label_addr!(_trampoline_start) } as usize;
+    let base = asm_label_addr!(_trampoline_start) as usize;
     0x8000u32 + (label as usize - base) as u32
 }
 
 /// Build the TrampolineData struct with all global (non-per-AP) fields filled.
 fn build_trampoline_data() -> TrampolineData {
-    let pm32_addr = label_addr(unsafe { asm_label_addr!(_ap_pm32) });
-    let lm64_addr = label_addr(unsafe { asm_label_addr!(_ap_lm64) });
-    let cs_reload_addr = label_addr(unsafe { asm_label_addr!(_ap_cs_reload) }) as u64;
+    let pm32_addr = label_addr(asm_label_addr!(_ap_pm32));
+    let lm64_addr = label_addr(asm_label_addr!(_ap_lm64));
+    let cs_reload_addr = label_addr(asm_label_addr!(_ap_cs_reload)) as u64;
 
     // Read kernel's current GDT and IDT descriptors
     let mut kernel_gdt = DescriptorTablePointer { limit: 0, base: 0 };
     let mut kernel_idt = DescriptorTablePointer { limit: 0, base: 0 };
+    // SAFETY: both instructions write ten bytes to the address they are given,
+    // and each is given a `&mut` to a live `DescriptorTablePointer` — `repr(C,
+    // packed)` over a `u16` and a `u64`, which is that shape and that size.
+    // Irreducible: `sgdt`/`sidt` are the only way to ask what this CPU loaded,
+    // and they answer into memory rather than into a register.
     unsafe {
         core::arch::asm!("sgdt [{}]", in(reg) &mut kernel_gdt, options(nostack));
         core::arch::asm!("sidt [{}]", in(reg) &mut kernel_idt, options(nostack));
@@ -205,6 +232,12 @@ pub fn boot_aps(madt: &MadtInfo, boot_cr3: u64) {
         if ap_id == bsp_id { continue; }
 
         let stack_layout = Layout::from_size_align(AP_STACK_SIZE, 4096).unwrap();
+        // SAFETY: `AP_STACK_SIZE` is non-zero and 4096 is a power of two, which
+        // is `alloc_zeroed`'s whole contract. Irreducible for the reason
+        // `percpu::alloc_percpu`'s is: the block is never freed and becomes an
+        // AP's `rsp`, so no owning handle can hold it — a `Box` dropped here
+        // would free the stack a CPU is running on, and no `Vec<u8>` expresses
+        // the page alignment the trampoline's stack needs.
         let stack_base = unsafe { alloc_zeroed(stack_layout) };
         assert!(!stack_base.is_null(), "SMP: failed to allocate AP stack");
 
@@ -216,6 +249,13 @@ pub fn boot_aps(madt: &MadtInfo, boot_cr3: u64) {
         data.stack_top = stack_base as u64 + AP_STACK_SIZE as u64;
         data.entry = ap_entry as *const () as u64;
         data.percpu_ptr = ap_percpu as u64;
+        // SAFETY: `target` is the direct-map address of physical 0x8F00, the
+        // 0x80-byte `TrampolineData` block `copy_trampoline`'s assertion keeps
+        // clear of the blob — reserved low memory no allocator hands out, and
+        // written only here. Unaligned because `TrampolineData` is `repr(C,
+        // packed)`. The AP this describes has not been sent its INIT-SIPI yet,
+        // and `boot_aps` waits for `AP_STARTED` before writing the block again,
+        // so no CPU is reading it while this lands.
         unsafe { core::ptr::write_unaligned(target, data); }
 
         AP_STARTED.store(false, Ordering::Release);
@@ -284,8 +324,9 @@ extern "C" fn ap_entry() -> ! {
     crate::arch::pat::init();
 
     // Switch from boot PML4 (identity + high-half) to kernel PML4 (high-half only).
-    // We're already executing at a high-half address, so this is safe.
-    unsafe { crate::mm::paging::kernel_cr3().load_flush(); }
+    // We're already executing at a high-half address, so this is safe — which is
+    // what `load_kernel_flush` says once instead of here.
+    crate::mm::paging::load_kernel_flush();
 
     // GS base was set by the trampoline; finish percpu init (GDT, CR4).
     percpu::init_ap(percpu::percpu_ptr());
