@@ -574,6 +574,15 @@ const MACHINE_TESTS: &[(&str, Sched, Tier)] = &[
     ("log_conservation_smp4", Sched::Parallel, Tier::Fast),
     ("log_conservation_smp8", Sched::Parallel, Tier::Fast),
     ("log_nested_emit", Sched::Parallel, Tier::Fast),
+    // The same interrupt one window earlier — between a record's shard-pointer
+    // read and its `xadd` — and its negative control, which is the only reader
+    // `log-unbracketed-reserve` has ever had. Parallel and Fast for
+    // `log_nested_emit`'s reasons: both verdicts are the guest's ledger over its
+    // own records, one saying the shard kept a single order and the other that
+    // it lost it by name, and no clock is in either. Carrying `UNMEASURED_MS`
+    // until the shards price them.
+    ("log_reserve_window", Sched::Parallel, Tier::Fast),
+    ("log_reserve_window_negative", Sched::Parallel, Tier::Fast),
     // Two processes building a fixed-width line out of two `write`s each, and a
     // count of the lines that carry both of them. Parallel and Fast: the verdict
     // is a count over a fixed number of lines the guest declares, so a loaded
@@ -7708,6 +7717,12 @@ fn run_machine_test(
             common::logread::log_conservation_smp8(test_config, c_bins, rust_bins)
         }
         "log_nested_emit" => common::logread::log_nested_emit(test_config, c_bins, rust_bins),
+        "log_reserve_window" => {
+            common::logread::log_reserve_window(test_config, c_bins, rust_bins)
+        }
+        "log_reserve_window_negative" => {
+            common::logread::log_reserve_window_negative(test_config, c_bins, rust_bins)
+        }
         "log_poll_outlives_a_close" => {
             common::logread::log_poll_outlives_a_close(test_config, c_bins, rust_bins)
         }

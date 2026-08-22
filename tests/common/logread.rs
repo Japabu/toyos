@@ -165,6 +165,145 @@ pub fn log_nested_emit(
     Ok(())
 }
 
+/// §2.3a's bracket at the window it names first: an interrupt that logs,
+/// landing between a record's shard-pointer read and its unlocked `xadd`.
+///
+/// **The property is that a shard has one order and not two.** `emit` reads the
+/// clock and takes its sequence number inside one IF-off bracket, and every
+/// reader in the tree rests on the two being the same order — `read.rs`'s
+/// `Descent::advance` stops a shard's descent on the first record older than the
+/// window it was asked for, which is only sound while a lower sequence number
+/// cannot carry a later timestamp. `log-nested-reserve` puts an interrupt that
+/// logs into exactly that window: with the bracket the IPI is pending until the
+/// guard drops and the handler's whole burst is reserved *after* the record it
+/// interrupted, and without it the burst is reserved *before*.
+///
+/// **`--smp 8`, and no storm beside it.** Eight shards is where the merge across
+/// shards has to keep each shard's own order while interleaving eight of them;
+/// a storm on the injected CPU would lap the interrupted record before the
+/// reader reached it, which is the one record the verdict is about.
+pub fn log_reserve_window(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let report = storm(test_config, c_bins, rust_bins, 8, &["log-nested-reserve"])?;
+    let declared = report.get("declared")?;
+    let read = report.get("read")?;
+    let dropped = report.get("dropped")?;
+    let shards = report.get("shards")?;
+    if shards != 8 {
+        return Err(format!(
+            "--smp 8 answered {shards} shard(s); the cursor's shard count is the machine's CPU \
+             count\n{}",
+            report.stdout
+        ));
+    }
+    if read == 0 {
+        return Err(format!(
+            "the reservation-window burst was declared and none of it read, so nothing was \
+             injected into anything\n{}",
+            report.stdout
+        ));
+    }
+    // **The derivation, and it is exact rather than a bound.** With the bracket
+    // the IPI is pending across the whole publication, so the interrupted
+    // producer's own record takes `S` and the handler's burst takes
+    // `S+1 ..= S+BURST` after it, with `lognest done` at `S+BURST+1`. `head` is
+    // then `S+BURST+2` and `oldest_readable` is `head - BURST`, which is `S+2` —
+    // so the reader can never answer for the outer record or for the burst's
+    // first, and can answer for every one of the other `BURST-1`. Measured
+    // `read=511 dropped=1` in eight of eight boots on the dev host, 2026-08-22.
+    if declared != BURST || read != BURST - 1 || dropped != 1 {
+        return Err(format!(
+            "the burst declared {declared} record(s), this reader took {read} and lost \
+             {dropped}: one shard generation is {BURST}, and the ring's own drop-oldest policy \
+             puts exactly the burst's first record below `oldest_readable` and nothing else\n{}",
+            report.stdout
+        ));
+    }
+    eprintln!(
+        "  [log] reserve window: burst declared={declared} read={read} dropped={dropped} \
+         shards={shards}"
+    );
+    Ok(())
+}
+
+/// `kernel/src/log/shard.rs`'s `SHARD_RECORDS`, which is how many records
+/// `log::nested`'s handler emits: exactly one shard generation.
+const BURST: u64 = 512;
+
+/// The negative control on [`log_reserve_window`], and on `LogCommitGuard`
+/// itself: the same boot with §2.3a's bracket removed.
+///
+/// **The one thing that can make the log's correctness claim fail on purpose.**
+/// `log-unbracketed-reserve` leaves the guard constructed and dropped exactly as
+/// it is and masks nothing, so the self-IPI is delivered where it was sent —
+/// inside the reservation window — and the handler's `SHARD_RECORDS` records
+/// take the sequence numbers below the one the interrupted producer goes on to
+/// take, while carrying timestamps above all of its. The gate must then refuse
+/// the shard, by name, and the assertion here is that refusal and not merely a
+/// non-zero exit: a boot that failed for any other reason has not read this
+/// actuator.
+///
+/// **The failure is derived, not sampled.** The burst is exactly [`BURST`]
+/// records reserved back to back on one shard, so the interrupted record's own
+/// number is exactly [`BURST`] above the burst's first while its `at_ns` was
+/// stamped before any of them; the reader walks a shard in sequence order, so it
+/// meets the inversion at that record on its first pass over the shard, on every
+/// boot. Measured on the dev host 2026-08-22, eight of eight: the refusal names
+/// `seq 517` in six boots, 518 in one and 665 in one — 517 is 5 + 512, cpu7's
+/// shard having held four boot records before the injection.
+pub fn log_reserve_window_negative(
+    test_config: &Path,
+    c_bins: &[(String, Vec<u8>)],
+    rust_bins: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let mut qemu = QemuInstance::boot_with_options(
+        test_config,
+        c_bins,
+        rust_bins,
+        BootOptions {
+            smp: 8,
+            kernel_params: &["log-nested-reserve", "log-unbracketed-reserve"],
+            ..Default::default()
+        },
+    );
+    let result = qemu.run_test(GATE, CEILING);
+    if let Some(err) = &result.error {
+        return Err(format!(
+            "the unbracketed boot never reported: {err}\nstdout:\n{}\nserial tail:\n{}",
+            result.stdout,
+            tail(&result.serial)
+        ));
+    }
+    if result.exit_code == Some(0) || result.stdout.contains("log-gate: OK") {
+        return Err(format!(
+            "the bracket was removed and the log gate passed anyway ({:?}), so the guard's `cli` \
+             is still measured by nothing\n{}",
+            result.exit_code, result.stdout
+        ));
+    }
+    let refusal = result
+        .stdout
+        .lines()
+        .find(|l| l.contains(INVERSION))
+        .ok_or_else(|| {
+            format!(
+                "the unbracketed boot failed for some other reason than the one this control \
+                 stages — no line said `{INVERSION}`\n{}",
+                result.stdout
+            )
+        })?;
+    eprintln!("  [log] unbracketed: {}", refusal.trim());
+    Ok(())
+}
+
+/// The clause `userland/test-runner/src/log_gate.rs` refuses a descending
+/// `at_ns` with. Two copies of one sentence, and this file is the one that
+/// would notice if the other changed.
+const INVERSION: &str = "within a shard the sequence order is the timestamp order";
+
 /// §3.2: a pending poll on the machine's log is not something a handle closing
 /// can cancel.
 ///

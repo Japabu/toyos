@@ -21,9 +21,13 @@
 //! measured on 2026-08-15 at `--smp 8`: one thread per shard, two threads per
 //! shard with an explicit `yield_now` every sixteen records, and two per shard
 //! parking for 50 µs every sixteen. All three reported **0 of 8 (and 0 of 16)
-//! producers with records on a second shard**. `log-nested-emit`'s gate is what
-//! reaches the reservation race instead, on one CPU, where an interrupt is a
-//! stimulus a test can actually aim.
+//! producers with records on a second shard**. That is not bad luck and no
+//! workload improves on it: nothing in this kernel switches a Ring 0 context
+//! out between two instructions, so no producer can be moved off its CPU inside
+//! the reservation window at any rate
+//! (`issues/kernel/a-ring-0-loop-is-never-preempted.md`).
+//! `log-nested-reserve`'s gate reaches that window instead, on one CPU, where
+//! an interrupt is a stimulus a test can actually aim.
 //!
 //! **It starts when the reader does.** The storm exists to race a reader, so
 //! arming it at boot would spend it before `test-runner` had opened a cursor;

@@ -50,6 +50,22 @@ pub mod tlb;
 /// publication — three identity words plus the message's own `ceil(len/8)`, at
 /// most 1,016 bytes and in practice nine words. It takes no lock and performs
 /// no locked read-modify-write.
+///
+/// **What is measured, and what is argued.** `log-unbracketed-reserve` leaves
+/// this type exactly as it is and makes it mask nothing;
+/// `log_reserve_window_negative` boots it beside `log-nested-reserve` at
+/// `--smp 8` and the log gate refuses the shard by name, because a handler that
+/// logs from inside the reservation window takes the sequence numbers below the
+/// one the interrupted producer had already stamped a timestamp for — and
+/// `log_reserve_window` is the same boot with the `cli` back. That is the
+/// *interrupt* half. The **migration** half is argued and not measured, and on
+/// this kernel it cannot be: preemption here is deferred, `arch::idt`'s
+/// `common_entry` returns to a Ring 0 frame without polling `need_resched`, and
+/// nothing between `close` and the guard's drop reaches `preempt::enable` — so
+/// no Ring 0 producer is switched out inside this bracket at any rate, and only
+/// a Ready task ever migrates. The `cli` still buys it, and it buys it for a
+/// scheduler that does not exist yet.
+/// `issues/kernel/a-ring-0-loop-is-never-preempted.md`.
 #[must_use = "dropping the log commit guard reopens interrupts and single-step traps"]
 pub(crate) struct LogCommitGuard {
     rflags: u64,
@@ -79,10 +95,11 @@ impl LogCommitGuard {
             );
             // **`log-unbracketed-reserve` is the negative control on this whole
             // type** (§9.4): the guard is constructed and dropped exactly as it
-            // is now, and it masks nothing — so a producer can migrate between
-            // reading its shard pointer and the `xadd`, and can resume its body
-            // copy after a whole newer generation has committed into the same
-            // slot. In the shipping kernel the accessor is `const fn … { false }`
+            // is now, and it masks nothing — so an interrupt that logs lands
+            // where it was raised rather than at the drop, and a producer can
+            // resume its body copy after a whole newer generation has committed
+            // into the same slot. `log_reserve_window_negative` is what reads
+            // it. In the shipping kernel the accessor is `const fn … { false }`
             // and this folds to the unconditional `cli` it replaced.
             if crate::actuator::log_unbracketed_reserve() {
                 return Self { rflags, _not_send_sync: core::marker::PhantomData };

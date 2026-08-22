@@ -128,8 +128,13 @@ struct Producer {
     /// What its own `done` record declared, once seen.
     emitted: Option<u64>,
     /// Shards this producer's records were found on. **More than one is a
-    /// producer that migrated mid-storm**, which is what §2.3a's bracket exists
-    /// to survive and what `log_migration_storm` reads.
+    /// producer that migrated mid-storm**, and on this kernel that is zero of
+    /// them and always will be: nothing switches a Ring 0 context out between
+    /// two instructions, so a producer cannot be moved off its CPU inside the
+    /// reservation window
+    /// (`kernel/src/log/storm.rs`'s header carries the measurement). It is
+    /// reported and asserted on by nothing, which is the honest shape for a
+    /// count whose only interesting value is unreachable.
     shards: u32,
     shard_mask: u32,
 }

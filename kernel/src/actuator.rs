@@ -45,8 +45,8 @@ macro_rules! actuators {
             #[cfg(feature = "boot-actuators")]
             #[inline(always)]
             pub fn $name() -> bool {
-                const BIT: u64 = bit_of($wire);
-                ARMED.load(Ordering::Relaxed) & BIT != 0
+                const AT: (usize, u64) = bit_of($wire);
+                ARMED[AT.0].load(Ordering::Relaxed) & AT.1 != 0
             }
 
             $(#[$doc])*
@@ -514,14 +514,28 @@ actuators! {
     /// publication, leaving `LogCommitGuard` a guard that masks nothing.
     ///
     /// **This is the correctness claim the whole design rests on, and the only
-    /// thing that can make it fail on purpose.** With the bracket gone a
-    /// producer can migrate between reading its shard pointer and its unlocked
-    /// `xadd` — two CPUs then read-modify-write one `head` — and can resume its
-    /// body copy after a whole newer generation has committed into the same
-    /// slot. Neither is stageable from the host: there is no injection that
-    /// preempts a kernel between two instructions, and no QEMU property
-    /// migrates a thread. `log_migration_storm` at `--smp 8` is what reads it.
-    /// See `arch::LogCommitGuard::close`.
+    /// thing that can make it fail on purpose.** Its reader is
+    /// `log_reserve_window_negative` at `--smp 8`, which boots it beside
+    /// `log-nested-reserve` and holds the log gate's verdict against what comes
+    /// out: with the bracket gone the handler's records take the sequence
+    /// numbers the interrupted producer had already stamped a timestamp for, so
+    /// the shard's sequence order stops being its timestamp order and the
+    /// reader refuses the descent. Nothing on the host can stage it — there is
+    /// no injection that interrupts a kernel between two instructions.
+    ///
+    /// **The other half of the claim is unreachable on this kernel, and saying
+    /// so is the honest state.** `arch::LogCommitGuard::close` also argues that
+    /// the bracket stops a producer *migrating* between its shard-pointer read
+    /// and its `xadd`, which would put two CPUs on one `head`. Preemption here
+    /// is deferred: `need_resched` is polled by `preempt::enable` and by the
+    /// Ring 3 exit check, `arch::idt`'s `common_entry` returns to a Ring 0
+    /// frame without polling either, and the bracket contains no preemption
+    /// point — so no Ring 0 producer can be switched out inside that window at
+    /// any rate, and only a task that is Ready ever migrates.
+    /// `log::storm`'s header carries the same finding from the other end,
+    /// measured: 0 of 8 and 0 of 16 producers with records on a second shard.
+    /// `issues/kernel/a-ring-0-loop-is-never-preempted.md`
+    /// is the entry. See `arch::LogCommitGuard::close`.
     log_unbracketed_reserve = "log-unbracketed-reserve";
 
     /// Send this CPU its own IPI from halfway through a log record's body copy,
@@ -537,6 +551,26 @@ actuators! {
     /// drop-oldest policy. Without it the same IPI lands inside the copy.
     /// See `kernel/src/log/nested.rs`.
     log_nested_emit = "log-nested-emit";
+
+    /// The same IPI, sent from **between the shard-pointer read and the
+    /// unlocked `xadd`** instead — the first window §2.3a's bracket names.
+    ///
+    /// **The row above stages a corruption no reader can see, and this one
+    /// stages the corruption they can.** A writer lapped mid-body republishes
+    /// the previous generation's sequence number, which is exactly what an
+    /// unpublished slot looks like and is already below
+    /// `Shard::oldest_readable` — so what it costs is one record, and one
+    /// record is what the ring is allowed to drop. Here the damage is to the
+    /// *order*: `emit` stamps `at_ns` before it reserves, so a handler that
+    /// reserves from inside this window takes the lower sequence numbers under
+    /// the later timestamps and the interrupted producer's own record lands
+    /// above them carrying a timestamp from before all of them.
+    /// `read.rs`'s `Descent::advance` is written against exactly that not
+    /// happening — an early stop that would drop a mid-`emit` CPU's whole
+    /// answer to Ctrl+Alt+D — and `test-runner`'s log gate refuses a shard
+    /// whose `at_ns` descends. Nothing on the host reaches it, for the row
+    /// above's reason. See `kernel/src/log/nested.rs`'s `reserve_window`.
+    log_nested_reserve = "log-nested-reserve";
 
     /// Turn the reservation's one unlocked `xadd` into a load, an open
     /// interrupt window and a store — the shape §2.3a says is not
@@ -728,8 +762,19 @@ const IMPLIES: &[(&str, &[&str])] = &[
     ("syscall-window-nmi", &["diag-tick"]),
 ];
 
+/// Words the arm set takes, from how many names there are.
+///
+/// **One was exactly enough until 2026-08-22 and then it was not.** The 64th
+/// actuator filled it and the 65th made `1 << i` overflow, which the `const`
+/// block at the foot of this file refused by name — so the wall was a compile
+/// error and never a boot that quietly read somebody else's bit. Derived rather
+/// than written down, so the next name past a multiple of 64 costs nothing and
+/// no second number has to be kept agreeing with `NAMES`.
 #[cfg(feature = "boot-actuators")]
-static ARMED: AtomicU64 = AtomicU64::new(0);
+const ARM_WORDS: usize = NAMES.len().div_ceil(u64::BITS as usize);
+
+#[cfg(feature = "boot-actuators")]
+static ARMED: [AtomicU64; ARM_WORDS] = [const { AtomicU64::new(0) }; ARM_WORDS];
 
 /// Arm what the boot parameter names, before anything can read it.
 ///
@@ -737,26 +782,56 @@ static ARMED: AtomicU64 = AtomicU64::new(0);
 /// AP exists, so every later read is a plain relaxed load of a word this CPU
 /// wrote or a word a CPU that did not yet exist will find already written.
 ///
+/// **The set is built whole and published word by word, and that is sound for
+/// the same reason** — there is no reader yet, so a torn publication is not a
+/// state anything can observe.
+///
 /// A token this kernel does not declare panics by name. It came from our own
 /// image builder through our own bootloader, so it is a bug in this build
 /// system and not input — there is no trust boundary anywhere on that path.
 #[cfg(feature = "boot-actuators")]
 pub fn init(cmdline: &str) {
-    let mut armed = 0u64;
+    let mut armed = [0u64; ARM_WORDS];
     for token in cmdline.split(',').filter(|t| !t.is_empty()) {
-        armed |= 1 << index_of(token);
+        arm(&mut armed, token);
     }
     for (name, implied) in IMPLIES {
-        if armed & (1 << index_of(name)) != 0 {
+        if is_armed(&armed, name) {
             for one in *implied {
-                armed |= 1 << index_of(one);
+                arm(&mut armed, one);
             }
         }
     }
-    ARMED.store(armed, Ordering::Relaxed);
-    if armed != 0 {
+    for (word, value) in ARMED.iter().zip(armed) {
+        word.store(value, Ordering::Relaxed);
+    }
+    if armed.iter().any(|&word| word != 0) {
         log!("actuators: {cmdline}");
     }
+}
+
+/// Set `name`'s bit in a set being built.
+#[cfg(feature = "boot-actuators")]
+fn arm(armed: &mut [u64; ARM_WORDS], name: &str) {
+    let (word, bit) = at(index_of(name));
+    armed[word] |= bit;
+}
+
+/// Is `name`'s bit set in a set being built? [`IMPLIES`] asks; nothing else
+/// does, because every other reader is an accessor with its bit resolved at
+/// compile time.
+#[cfg(feature = "boot-actuators")]
+fn is_armed(armed: &[u64; ARM_WORDS], name: &str) -> bool {
+    let (word, bit) = at(index_of(name));
+    armed[word] & bit != 0
+}
+
+/// An index in [`NAMES`] as the word it lives in and the bit inside that word.
+/// One expression, so the accessor's `const` and the two runtime callers cannot
+/// disagree about where a name's bit is.
+#[cfg(feature = "boot-actuators")]
+const fn at(index: usize) -> (usize, u64) {
+    (index / u64::BITS as usize, 1 << (index % u64::BITS as usize))
 }
 
 /// A kernel with no actuators in it refuses a parameter rather than ignoring
@@ -771,25 +846,25 @@ pub fn init(cmdline: &str) {
 }
 
 #[cfg(feature = "boot-actuators")]
-fn index_of(name: &str) -> u32 {
+fn index_of(name: &str) -> usize {
     let mut i = 0;
     while i < NAMES.len() {
         if NAMES[i] == name {
-            return i as u32;
+            return i;
         }
         i += 1;
     }
     panic!("boot parameter {name:?}: this kernel declares no such actuator");
 }
 
-/// The bit `name` is armed in, resolved where a typo is a compile error rather
-/// than a boot that quietly reads somebody else's actuator.
+/// The word and bit `name` is armed in, resolved where a typo is a compile error
+/// rather than a boot that quietly reads somebody else's actuator.
 #[cfg(feature = "boot-actuators")]
-const fn bit_of(name: &str) -> u64 {
+const fn bit_of(name: &str) -> (usize, u64) {
     let mut i = 0;
     while i < NAMES.len() {
         if str_eq(NAMES[i], name) {
-            return 1 << i;
+            return at(i);
         }
         i += 1;
     }
@@ -814,7 +889,10 @@ const fn str_eq(a: &str, b: &str) -> bool {
 
 #[cfg(feature = "boot-actuators")]
 const _: () = {
-    assert!(NAMES.len() <= u64::BITS as usize, "more actuators than bits in the arm set");
+    assert!(
+        ARM_WORDS * u64::BITS as usize >= NAMES.len(),
+        "the arm set has fewer bits than there are actuators"
+    );
     let mut i = 0;
     while i < NAMES.len() {
         let mut j = i + 1;
@@ -829,10 +907,10 @@ const _: () = {
     let mut i = 0;
     while i < IMPLIES.len() {
         let (name, implied) = IMPLIES[i];
-        bit_of(name);
+        let _ = bit_of(name);
         let mut j = 0;
         while j < implied.len() {
-            bit_of(implied[j]);
+            let _ = bit_of(implied[j]);
             j += 1;
         }
         i += 1;
