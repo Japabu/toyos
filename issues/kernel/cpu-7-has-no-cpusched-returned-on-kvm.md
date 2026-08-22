@@ -88,10 +88,68 @@ consistent with that mechanism and needs no bring-up ordering bug at all** — t
 fix is architecture-neutral and applies to the KVM path unchanged. What is owed
 is a re-measurement, not a new hypothesis.
 
+## 2026-08-22: the re-measurement, on this machine, and what it will not do
+
+The recipe above was run on the T14 itself: the CI image at the digest
+`route.yml` names, `--device=/dev/kvm`, QEMU 11.1.0, `-cpu host,+rdrand,+smap,
++fsgsbase,+x2apic,+smep`, `-machine q35,kernel-irqchip=split` with the IOMMU,
+`-smp cores=8`, `-m 2G`, the boot stick and the NVMe disk both `snapshot=on`,
+**six guests at once — 48 vCPUs on eight threads**, which is a harder
+oversubscription than the sighting's own (one 8-vCPU guest beside a CI job).
+`compositor: ready` is the completion marker and never a timer; every guest ran
+with `-action reboot=shutdown -action shutdown=pause -action panic=pause`, so a
+death that says nothing parks and has its vCPUs read over QMP rather than being
+lost. Blocks were 240 s, alternated ABBA, and any block that shared the machine
+with a CI job container was discarded and re-run — one was, and no accepted
+block has a witness sample showing company.
+
+| arm | kernel | boots | deaths | silent | hangs | `has no CpuSched` |
+|---|---|---|---|---|---|---|
+| U | shipped, `cld` reverted (`entry-df-unclean`) | 1,790 | **0** | 0 | 0 | 0 |
+| F | shipped | 1,789 | **0** | 0 | 0 | 0 |
+| UA | `sched-tripwire stack-witness`, `cld` reverted | 7,186 | **0** | 0 | 0 | 0 |
+| FA | `sched-tripwire stack-witness` | 6,790 | **0** | 0 | 0 | 0 |
+
+17,555 boots, no death of any kind, no hang, and no QEMU exit. `UA`/`FA` are the
+dev host's own arms A and C carried onto this machine, feature for feature; `U`
+and `F` carry no instrument at all, so they are the kernel this repository
+ships. `objdump` of the four kernels puts `cld` at offset 0 of `common_entry`,
+`syscall_entry`, `timer_entry`, `tlb_flush_entry` and all six
+`device_irq_entry!` expansions in `F`/`FA` and at none of them in `U`/`UA`, with
+`IA32_FMASK` `$0x40600` against `$0x40200`; each guest's boot line names the
+size of the kernel it loaded, and the four sizes are the four disassembled
+files.
+
+**The signature did not return, and the bring-up-ordering hypothesis is refused
+at this width.** This file's own rate — one death in 254 boots — carried onto
+the 8,579 fixed boots expects 33.78 and observed none (Poisson, p = 2.1e-15);
+onto all 17,555 it expects 69.11 (p = 9.6e-31). `driver.rs:212`'s "`init` fills
+`SCHEDS` before any AP is released" is not violated at any rate this machine can
+be made to show.
+
+**And neither did anything else, which is the half that has to be said.** The
+unfixed arms stage the whole defect and produced no death either. So this run
+*bounds* the class on real silicon; it does not attribute the sighting to
+anything. Carried the other way, the dev host's cross-arch TCG rates are refused
+here: arm A's 17 in 7,059 expects 17.31 in `UA`'s 7,186 (p = 3.0e-8), and the
+pooled unfixed 37 in 13,960 expects 23.79 in the 8,976 unfixed boots taken here
+(p = 4.7e-11).
+
+The likely reason is time rather than architecture. The window is
+`compiler_builtins::mem::memmove`'s `std` … `cld` and what has to land in it is
+an interrupt, so exposure per boot scales with timer ticks per boot — and a TCG
+boot on the dev host spends many times the wall clock a KVM boot spends on the
+same guest work. Nothing about the mechanism is emulator-specific; the *rate*
+is, and no storm on this machine has yet been made dense enough to see it.
+
 ## Whoever takes it
 
-Re-run the oversubscribed-KVM recipe this file records on a kernel carrying the
-`cld` — the T14, a CI image by digest, `--device=/dev/kvm`, a contended host. A
-sighting that survives it is a real bring-up ordering question and
-`driver.rs`'s fill against the AP release path is the one-reader thing to read
-first; a clean run of the same width closes this.
+Do not re-run this recipe wider: it has been run at twenty times this sighting's
+width, on this sighting's machine, under heavier oversubscription, and neither
+arm speaks. What reopens the bring-up question is a *new* sighting of `cpu N has
+no CpuSched` on a kernel carrying the `cld`, and `driver.rs`'s fill against the
+AP release path is still the one-reader thing to read first if one arrives.
+What would settle the rate question instead of waiting on it is a reader at the
+entry itself — the flag as the kernel finds it, before `arch::entry`'s `cld`
+clears it — because that counts exposure rather than the fraction of it that
+turns fatal.
