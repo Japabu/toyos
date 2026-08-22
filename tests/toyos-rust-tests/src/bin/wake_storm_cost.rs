@@ -199,7 +199,12 @@ fn main() {
             .unwrap_or_else(|| panic!("{want} waiters were not measured"))
     };
     let (one, small, large) = (at(1), at(16), at(64));
-    let marginal = (large - one) / 63;
+    // Saturating, because on an instrument that cannot resolve the walk the
+    // 64-waiter figure can sit *below* the one-waiter figure (run 32581016737's
+    // hosted shard: 29,768 against 29,939), and under the guest's overflow
+    // checks a bare subtraction there is the panic the verdict below exists to
+    // avoid. Zero is the honest marginal cost of a walk this run cannot see.
+    let marginal = large.saturating_sub(one) / 63;
     println!(
         "wake_storm_cost: {one} cycles at one waiter, {large} at 64 — {marginal} cycles per \
          waiter over the walk, {} ns per waiter",

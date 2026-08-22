@@ -465,6 +465,7 @@ pub fn enqueue_new(
     entry_rsp: u64,
     address_space: crate::process::PageTables,
     fs_base: u64,
+    symbols: alloc::sync::Arc<crate::symbols::SymbolTable>,
 ) -> ThreadSched {
     driver::spawn(NewTask {
         id,
@@ -473,6 +474,7 @@ pub fn enqueue_new(
         address_space,
         fs_base,
         share: share_for(id.0),
+        symbols,
     })
 }
 
@@ -1034,12 +1036,15 @@ pub fn poison_tid(id: TaskId) {
 ///
 /// **Nothing to reap costs no lock.** This took `PROCESS_TABLE` unconditionally
 /// until 2026-08-14, so every CPU with nothing to run held it for a slice of
-/// every trip round the idle loop — against a crash report whose
-/// `process::with_user_symbols` may only `try_lock` that table, and which
-/// therefore lost the faulting function's name whenever the two met. The gate
-/// is the whole of the fix on this side; `sched::reap_gate` argues why a raise
-/// cannot be lost, and `process::with_user_symbols` documents what the reader
-/// now says when it loses anyway.
+/// every trip round the idle loop — against a crash report that may only
+/// `try_lock` that table, and which therefore lost what it was reading whenever
+/// the two met. `sched::reap_gate` argues why a raise cannot be lost.
+///
+/// The report's *symbols* no longer come through here at all — since 2026-08-22
+/// they are the running task's own, read lock-free
+/// (`process::resolve_user_symbol`) — but its page-fault trace still does
+/// (`process::dump_crash_diagnostics`), so the gate keeps the reason it was
+/// built for.
 pub(crate) fn reap_poisoned() {
     if !REAP_GATE.take() {
         return;

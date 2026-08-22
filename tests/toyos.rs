@@ -1610,21 +1610,30 @@ fn check_disk_backtrace(result: &TestResult) -> bool {
     ok & check_symbols_were_read("disk_backtrace", &result.serial)
 }
 
-/// No line of a crash report conceded its symbol to a lock somebody else held.
+/// No line of a crash report conceded its symbol to something it could not
+/// reach.
 ///
 /// **The reason every check above is allowed to be a `contains`.** A symbol
-/// lookup on the fault path is a `try_lock` — it has to be, the faulting thread
-/// may hold either lock itself — so "no name here" used to mean either "this
+/// lookup on the fault path may not wait — the faulting thread may itself hold
+/// whatever it would wait for — so "no name here" used to mean either "this
 /// address has no name" or "nobody looked", and a gate asserting on a name red
 /// intermittently on the second. It was not hypothetical: `fault_gates` red 2
 /// of 5 full runs and `disk_backtrace` 1 of 5 on `wt/toyos-logd`, with the
 /// backtrace three lines below the unresolved `rip:` naming the very symbol the
 /// line above had lost.
 ///
-/// `process::with_user_symbols` now says which, so this reds on the reason
-/// instead — and the reason is worth a red, because `reap_poisoned` no longer
-/// takes the process table on every idle trip, so a busy answer names a holder
-/// worth finding rather than the housekeeping that used to be there.
+/// `process::SymbolLookup` says which, so this reds on the reason instead. Since
+/// 2026-08-22 the lookup takes no lock at all — the names come off the running
+/// task's own record — so the two reasons left are a CPU inside a scheduler pass
+/// and a CPU running nothing, and either one in a report is a finding rather
+/// than weather.
+///
+/// The measured before/after on the dev host under a twelve-wide suite, which is
+/// what makes that a claim — N = 12 rounds of `fault_gates` + `panic_recovery`
+/// an arm, 2026-08-22: 3 of 12 conceded with the table lookup, 0 of 12 without
+/// it, and 1 of 12 with the lookup put back on the same base, that third arm
+/// being the control that says the first two are about the code and not about
+/// the day. `src/redlist.rs` carries the retired rows and the host widths.
 fn check_symbols_were_read(test: &str, serial: &str) -> bool {
     const CONCEDED: &str = "<symbol unread:";
     let lines: Vec<&str> = serial.lines().filter(|l| l.contains(CONCEDED)).collect();

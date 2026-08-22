@@ -35,14 +35,18 @@ pub(crate) fn kernel_backtrace(start_rbp: u64, max_frames: usize) {
 }
 
 /// Walk RBP chain for user backtrace through page tables.
-fn user_backtrace(pid: crate::process::Pid, start_rbp: u64, pml4: *const u64, max_frames: usize) {
+///
+/// The names come off the running task's own symbol table, so this takes no pid:
+/// a user backtrace is always the backtrace of the process whose CPU is
+/// producing the report.
+fn user_backtrace(start_rbp: u64, pml4: *const u64, max_frames: usize) {
     let mut rbp = start_rbp;
     for _ in 0..max_frames {
         if rbp == 0 || !rbp.is_multiple_of(8) { break; }
         let Some(saved_rbp) = safe_read_u64(rbp, pml4) else { break };
         let Some(return_addr) = safe_read_u64(rbp + 8, pml4) else { break };
         if return_addr == 0 { break; }
-        process::resolve_user_symbol_return(pid, return_addr).log_bare(return_addr);
+        process::resolve_user_symbol_return(return_addr).log_bare(return_addr);
         rbp = saved_rbp;
     }
 }
@@ -164,8 +168,15 @@ impl ExceptionContext<'_> {
 // dispatched `do_preempt` and the crash report reached the scheduler from
 // inside a fault. `panic_console` had already refused `try_lock` for exactly
 // this reason and said so in its own comment; the rest of the crash path kept
-// using it, and there are three more uses behind this one — the process table
-// here, plus `resolve_user_symbol` and `dump_crash_diagnostics`.
+// using it, and two uses are still behind this one — the process table here,
+// and `dump_crash_diagnostics`.
+//
+// **A symbol is no longer one of them.** `resolve_user_symbol` took the process
+// table too, and a `try_lock` that must not wait is one that sometimes loses:
+// what it lost was the faulting function's name, on a report that had already
+// resolved the same address a line later. It reads the running task's own
+// symbols now, with no lock in the path at all — `process`'s module header is
+// the rule and `sched::driver::current_symbols` is the read.
 //
 // Fixed centrally rather than per call site: `preempt::enable` now declines
 // the slow path while `PerCpu::fault_state` is non-zero. That is the honest
@@ -268,8 +279,8 @@ fn crash_report_exception(ctx: &ExceptionContext) {
 
     log!("  rip:");
     if ring3 {
-        if let Some(pid) = pid {
-            process::resolve_user_symbol(pid, ctx.frame.rip).log_bare(ctx.frame.rip);
+        if pid.is_some() {
+            process::resolve_user_symbol(ctx.frame.rip).log_bare(ctx.frame.rip);
         } else {
             log!("    {:#x}", ctx.frame.rip);
         }
@@ -311,8 +322,8 @@ fn crash_report_exception(ctx: &ExceptionContext) {
 
     log!("  Backtrace:");
     if ring3 {
-        if let Some(pid) = pid {
-            user_backtrace(pid, ctx.frame.rbp, pml4, 32);
+        if pid.is_some() {
+            user_backtrace(ctx.frame.rbp, pml4, 32);
         }
     } else {
         kernel_backtrace(ctx.frame.rbp, 32);
@@ -323,15 +334,13 @@ fn crash_report_exception(ctx: &ExceptionContext) {
         // many syscalls old. Reading it as the fault site cost the AMD `#GP`
         // investigation its first day.
         let user_rip = percpu::syscall_rip();
-        if user_rip != 0 {
-            if let Some(pid) = pid {
-                log!("  Syscall: num={} user_rip={:#x} user_rsp={:#x}",
-                    percpu::syscall_num(), user_rip, percpu::user_rsp());
-                log!("  User backtrace:");
-                process::resolve_user_symbol(pid, user_rip).log_bare(user_rip);
-                let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>();
-                user_backtrace(pid, percpu::syscall_rbp(), pml4, 20);
-            }
+        if user_rip != 0 && pid.is_some() {
+            log!("  Syscall: num={} user_rip={:#x} user_rsp={:#x}",
+                percpu::syscall_num(), user_rip, percpu::user_rsp());
+            log!("  User backtrace:");
+            process::resolve_user_symbol(user_rip).log_bare(user_rip);
+            let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>();
+            user_backtrace(percpu::syscall_rbp(), pml4, 20);
         }
     }
 
@@ -389,9 +398,9 @@ fn crash_report_panic(info: &core::panic::PanicInfo, rbp: u64) {
             log!("  Syscall: num={} user_rip={:#x} user_rsp={:#x}",
                 percpu::syscall_num(), user_rip, percpu::user_rsp());
             log!("  User backtrace:");
-            process::resolve_user_symbol(pid, user_rip).log_bare(user_rip);
+            process::resolve_user_symbol(user_rip).log_bare(user_rip);
             let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>();
-            user_backtrace(pid, percpu::syscall_rbp(), pml4, 20);
+            user_backtrace(percpu::syscall_rbp(), pml4, 20);
         }
     }
 }
@@ -505,9 +514,9 @@ pub(super) fn double_fault_handler(frame: &TrapFrame) -> ! {
 
                     let pml4 = crate::DirectMap::from_phys(crate::mm::paging::Cr3::current().phys()).as_ptr::<u64>();
                     log!("  User backtrace:");
-                    if let Some(pid) = pid {
-                        process::resolve_user_symbol(pid, maybe_rip).log_bare(maybe_rip);
-                        user_backtrace(pid, user_rbp, pml4, 20);
+                    if pid.is_some() {
+                        process::resolve_user_symbol(maybe_rip).log_bare(maybe_rip);
+                        user_backtrace(user_rbp, pml4, 20);
                     } else {
                         log!("    {:#x}", maybe_rip);
                     }

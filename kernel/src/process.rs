@@ -1,3 +1,36 @@
+//! The process table, and what a process is made of.
+//!
+//! ## What a crash report may take here, and what it may not
+//!
+//! Every reader in this file but two takes [`PROCESS_TABLE`] with `lock()`. The
+//! two that may not — [`dump_crash_diagnostics`] and [`try_for_each_thread`] —
+//! are the ones a machine in trouble reaches, and their rule is a rule about the
+//! whole path rather than about this file: **a crash report may not wait for any
+//! lock, because the faulting thread may be holding it.**
+//! `try_recover_from_panic` exists for exactly that thread, so a wait there is a
+//! deadlock on the one path in the kernel that must always produce output; and
+//! whatever holds this lock while the machine is stuck is a candidate for what
+//! is stuck, which is the census's version of the same argument.
+//!
+//! `try_lock` is what that leaves, and a `try_lock` is a coin toss: the answer
+//! it loses is not printed, and until 2026-08-22 the thing it lost was the
+//! faulting function's *name*. So the rule has a second half, and it is the one
+//! worth stating:
+//!
+//! > **A crash report does not ask this table for a symbol.** It reads the
+//! > symbol table of the task it is reporting on, off that task's own record,
+//! > with no lock in the path — [`resolve_user_symbol`], over
+//! > `sched::driver::current_symbols`. A name is the part of a report a reader
+//! > cannot reconstruct from anything else in it, so it may not be the part that
+//! > depends on what some other CPU happened to be doing.
+//!
+//! What a report still takes from the table is [`dump_crash_diagnostics`]'s
+//! page-fault trace — and it still `try_lock`s, still loses sometimes, and says
+//! so in the report when it does. That is allowed because the trace is a
+//! supplement: the report above it is complete without it. Anything that stops
+//! being true of that — anything a reader could not reconstruct — has to leave
+//! this table the way the names did.
+
 use alloc::alloc::{alloc_zeroed, dealloc, Layout};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -451,7 +484,16 @@ pub struct ProcessEntry {
     object: Arc<crate::object::process::ProcessObject>,
     name: [u8; THREAD_NAME_LEN],
     process_data: Arc<Lock<ProcessData>>,
-    symbols: Arc<Lock<SymbolTable>>,
+    /// This process's backtrace symbols, and **no `Lock` around them**.
+    ///
+    /// A `SymbolTable` is written once, by the loader, and read-only for the
+    /// rest of its life, so the only thing a lock ever guarded was the eager
+    /// release at teardown — which `teardown_bookkeeping` now performs by
+    /// dropping this reference instead. What that buys is the whole point: every
+    /// thread of this process carries a clone of this `Arc` on its own task
+    /// record, so a crash report reaches the names through the task it is
+    /// reporting on and never through the table (see this module's header).
+    symbols: Arc<SymbolTable>,
     main_tid: Tid,
     threads: crate::id_map::IdMap<Tid, ThreadEntry>,
     /// Set once by the single exit/kill path that owns this process's
@@ -467,7 +509,7 @@ impl ProcessEntry {
         pid: Pid,
         name: [u8; THREAD_NAME_LEN],
         process_data: Arc<Lock<ProcessData>>,
-        symbols: Arc<Lock<SymbolTable>>,
+        symbols: Arc<SymbolTable>,
         main_thread: ThreadEntry,
     ) -> Self {
         let mut threads = crate::id_map::IdMap::new();
@@ -1193,6 +1235,9 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         // enqueued now would be invisible to its retire sweep.
         return None;
     }
+    // Every thread of a process names the same symbols, so a crash report on any
+    // of them reads its own process's names without asking this table.
+    let symbols = Arc::clone(&proc.symbols);
     let tid = proc.threads.insert(ThreadEntry::new(thread_data));
 
     // Placed while still holding the table lock: teardown claims the process
@@ -1204,6 +1249,7 @@ pub fn spawn_thread(entry: u64, stack_ptr: u64, arg: u64, stack_base: u64) -> Op
         ks_rsp,
         parent_addr_space,
         fs_base,
+        symbols,
     );
     proc.threads.get_mut(tid).unwrap().set_sched(sched);
     drop(guard);
@@ -1309,7 +1355,15 @@ fn teardown_bookkeeping(table: &mut ProcessTable, process_pid: Pid, code: i32,
     // process has no backtrace left for anyone to take — every caller of
     // `resolve_user_symbol` is a crash report, which runs on the live process
     // before this.
-    *proc.symbols.lock() = SymbolTable::empty();
+    //
+    // Dropping this reference is the release, and the pages go with the *last*
+    // one: phase 2 has already retired every other thread of this process, so
+    // what is left holding a clone is the thread running this line, whose
+    // payload `Hw::release` drops as it leaves the CPU. That is later than the
+    // in-place empty this replaced, by one exit pass, and it is the property
+    // that makes the lock-free read sound — a report cannot be reading a table
+    // whose owner is off every CPU.
+    proc.symbols = Arc::new(SymbolTable::empty());
 
     let cpu_ms = main_cpu_ns / 1_000_000;
     let name = proc.name_str();
@@ -2023,12 +2077,21 @@ pub enum SymbolLookup {
     /// The symbol table was read and covers no such address. A bare address is
     /// the whole truth about it.
     Unnamed,
-    /// Nothing was read — the process table was held elsewhere.
-    TableBusy,
-    /// The entry was read; this process's own symbol table was held.
-    SymbolsBusy,
-    /// The process is no longer in the table, so there is nothing left to ask.
-    NoProcess,
+    /// Nothing was read: a scheduler pass already held this CPU's task record
+    /// when the report began, so the running task — and its symbols — could not
+    /// be reached.
+    ///
+    /// **The one concession left, and it is not hypothetical.** A Rust `panic!`
+    /// raised *inside* `driver::pass` reports from a CPU whose record is exactly
+    /// that: `sched_stress`'s `invariant P` fired at
+    /// `timer_handler -> driver::pass -> SchedPass::finish` on a KVM shard
+    /// (`src/redlist.rs`), and a panic there with a user `syscall_rip` behind it
+    /// asks this question and gets this answer.
+    InPass,
+    /// Nothing was read: this CPU is running no task, so there is no process
+    /// whose symbols could be meant. The idle context, and boot before the first
+    /// task.
+    NoTask,
 }
 
 impl SymbolLookup {
@@ -2042,70 +2105,76 @@ impl SymbolLookup {
         match self {
             Self::Named => {}
             Self::Unnamed => log!("    {:#x}", addr),
-            Self::TableBusy => {
-                log!("    {:#x}  <symbol unread: the process table was held>", addr)
+            Self::InPass => {
+                log!("    {:#x}  <symbol unread: a scheduler pass held this CPU's task record>", addr)
             }
-            Self::SymbolsBusy => {
-                log!("    {:#x}  <symbol unread: the symbol table was held>", addr)
-            }
-            Self::NoProcess => {
-                log!("    {:#x}  <symbol unread: the process is gone from the table>", addr)
+            Self::NoTask => {
+                log!("    {:#x}  <symbol unread: no task is running on this CPU>", addr)
             }
         }
     }
 }
 
-/// Resolve and log a user-mode address against the process's symbol table.
-/// Uses try_lock so it's safe to call from panic handlers; see
-/// [`with_user_symbols`] for what the answer means.
-pub fn resolve_user_symbol(pid: Pid, addr: u64) -> SymbolLookup {
-    with_user_symbols(pid, |syms| crate::symbols::resolve_user(syms, addr))
+/// Resolve and log a user-mode address against the running process's symbol
+/// table. Safe to call from a fault or panic report; see
+/// [`with_current_symbols`] for what the answer means.
+pub fn resolve_user_symbol(addr: u64) -> SymbolLookup {
+    with_current_symbols(|syms| crate::symbols::resolve_user(syms, addr))
 }
 
 /// [`resolve_user_symbol`] for a backtrace frame's return address — see
 /// [`crate::symbols::SymbolTable::resolve_return`].
-pub fn resolve_user_symbol_return(pid: Pid, return_addr: u64) -> SymbolLookup {
-    with_user_symbols(pid, |syms| crate::symbols::resolve_user_return(syms, return_addr))
+pub fn resolve_user_symbol_return(return_addr: u64) -> SymbolLookup {
+    with_current_symbols(|syms| crate::symbols::resolve_user_return(syms, return_addr))
 }
 
-/// Run `f` against a process's symbol table, and say what happened.
+/// Run `f` against the symbol table of the task this CPU is running, and say
+/// what happened.
 ///
 /// **The contract, which is three-way and not two.** `f` decides between
 /// [`Named`](SymbolLookup::Named) and [`Unnamed`](SymbolLookup::Unnamed); the
-/// three remaining answers are this function's own, and each one says that the
-/// address was never looked up at all. The caller must print the address for
-/// any of the four — [`SymbolLookup::log_bare`] is that print — and a report
-/// that renders a concession as a bare number is the defect this shape exists
-/// to make unwritable.
+/// remaining answers are this function's own, and each one says that the address
+/// was never looked up at all. The caller must print the address for any of them
+/// — [`SymbolLookup::log_bare`] is that print — and a report that renders a
+/// concession as a bare number is the defect this shape exists to make
+/// unwritable.
 ///
-/// **Why `try_lock` and not a wait, bounded or otherwise.** This runs from the
-/// fault and panic reports. The faulting thread may itself hold either lock —
-/// that is not a hypothesis, it is what `try_recover_from_panic` is written for
-/// — and a wait would then be a deadlock on the one path that must always
-/// produce output, with the exception's own handler as the deadlocked party. A
-/// bounded retry buys nothing there and costs the report its promptness on
-/// every real contention, so the answer is taken at once and the *reason* is
-/// carried out instead. `exceptions.rs`'s DESIGN RULE (panic-free, try_lock
-/// only) is the same rule from the caller's side.
+/// **No lock, and that is the whole of it.** This used to take `PROCESS_TABLE`
+/// with `try_lock` to find the faulting process's entry, deliberately: this runs
+/// from the fault and panic reports, the faulting thread may itself hold that
+/// lock — not a hypothesis, it is what `try_recover_from_panic` is written for —
+/// and a wait would be a deadlock on the one path that must always produce
+/// output. But a `try_lock` that may not wait is a `try_lock` that sometimes
+/// loses, and what it lost was the name. Measured on the dev host under a
+/// twelve-wide suite, 2026-08-22: three of twelve `fault_gates` +
+/// `panic_recovery` rounds printed
+/// `<symbol unread: the process table was held>` for a frame whose own backtrace
+/// named it a line later. There is no lock holder to go and fix, either — the
+/// takers in that window were a spawn, a demand-paged fault and an exit, which
+/// is every process in the machine doing ordinary work.
 ///
-/// A busy answer is now a real anomaly rather than routine weather:
-/// `scheduler::reap_poisoned` was the standing aggressor and no longer takes
-/// the table when there is nothing to reap. So `<symbol unread: …>` in a report
-/// names a lock holder worth finding, and the fault gates in `tests/toyos.rs`
-/// red on the reason rather than intermittently on a missing name.
-fn with_user_symbols(
-    pid: Pid,
-    f: impl FnOnce(&crate::symbols::SymbolTable) -> bool,
-) -> SymbolLookup {
-    let syms_arc = {
-        let Some(guard) = PROCESS_TABLE.try_lock() else { return SymbolLookup::TableBusy };
-        let Some(table) = guard.as_ref() else { return SymbolLookup::NoProcess };
-        match table.get(pid) {
-            Some(proc) => Arc::clone(&proc.symbols),
-            None => return SymbolLookup::NoProcess,
-        }
+/// So the table is not asked. A task carries its process's symbols on its own
+/// record (`sched::payload::KernelPayload::symbols`), the report reads them off
+/// the task it is reporting on, and the `Arc` is what keeps the bytes alive for
+/// the length of the read. `sched::driver::current_symbols` is the read and
+/// argues why nothing can start a pass underneath it.
+///
+/// **The pid is not a parameter, and that is a narrowing rather than a
+/// convenience.** Every caller passed `percpu::current_pid()` — a report is
+/// always about the process whose CPU is producing it — and passing it meant a
+/// caller *could* ask for another process's names, which no longer resolves to
+/// anything this path can reach.
+fn with_current_symbols(f: impl FnOnce(&crate::symbols::SymbolTable) -> bool) -> SymbolLookup {
+    let Some(syms) = crate::sched::driver::current_symbols() else {
+        // Two causes, and this CPU cannot change its mind between the two reads:
+        // a report is not reschedulable (`preempt::enable` declines while
+        // `PerCpu::fault_state` is non-zero), so no pass can begin or end here.
+        return if crate::sched::driver::in_pass() {
+            SymbolLookup::InPass
+        } else {
+            SymbolLookup::NoTask
+        };
     };
-    let Some(syms) = syms_arc.try_lock() else { return SymbolLookup::SymbolsBusy };
     if f(&syms) {
         SymbolLookup::Named
     } else {
