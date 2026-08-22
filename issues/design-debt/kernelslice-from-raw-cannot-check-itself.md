@@ -19,3 +19,11 @@ Fix shape: allocators construct the slice. Give `PageAlloc` and the contiguous
 PMM path a `slice()` method like `OwnedAlloc`'s, sized from the allocation they
 own, then make `from_raw` private to `mm` or delete it. The loader and DmaPool
 stop naming sizes at all.
+
+## 2026-08-22 — `PageAlloc` has one now
+
+`PageAlloc::window()` (`process.rs`) is that method, sized from the allocation's
+own `ptr()`/`size()`, and the demand-paging fill and `UserStack` reach the frame
+through it instead of through a bare `*mut u8`. Two of the three unchecked call
+sites remain — the ELF loader's `load_size` and `DmaPool::alloc` — so
+`from_raw` is still `pub` and this stays open.

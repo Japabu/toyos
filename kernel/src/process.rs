@@ -158,6 +158,40 @@ impl PageAlloc {
         self.0[0].direct_map().as_mut_ptr()
     }
 
+    /// This allocation as a bounds-checked window, sized from the pages it
+    /// owns.
+    ///
+    /// **The only safe way to build a [`KernelSlice`] over a `PageAlloc`**, and
+    /// the reason it is a method here: `KernelSlice::from_raw` cannot check the
+    /// length against the allocation, so a length written beside the pointer at
+    /// a call site is correct by adjacency and by nothing else.
+    /// [`OwnedAlloc::slice`] is the same shape one type over.
+    ///
+    /// **A window and not a `&mut [u8]`, and these pages are why.** A frame
+    /// filled through this becomes a *user* mapping a few statements later, and
+    /// a `&mut [u8]` over bytes a process maps writable carries `noalias` and
+    /// `dereferenceable` into LLVM — the borrow [`UserBytes`]'s header exists to
+    /// refuse. A `KernelSlice` hands out no reference: `copy_from` and
+    /// `subslice` are a bounds-checked address and a raw copy, which is the
+    /// shape [`UserBytesMut::write_at`] already uses on the other side of the
+    /// same boundary. There is one such window type in this kernel and this is
+    /// it; a fourth private one would have been a fourth thing to get right.
+    ///
+    /// [`KernelSlice`]: crate::mm::KernelSlice
+    /// [`UserBytes`]: crate::user_ptr::UserBytes
+    /// [`UserBytesMut::write_at`]: crate::user_ptr::UserBytesMut::write_at
+    pub fn window(&self) -> crate::mm::KernelSlice {
+        // SAFETY: `KernelSlice::from_raw` asks that `base` be valid for `size`
+        // bytes for as long as the slice is used. Both come from the same
+        // `Vec<PhysPage>` this type owns and frees — `ptr()` is the direct-map
+        // address of the first page and `size()` is `len() * PAGE_2M` over a
+        // run `alloc_contiguous` returned, so the pages really are adjacent —
+        // and the length is therefore the allocation's own rather than a number
+        // a caller chose. That is exactly the check `from_raw` cannot make,
+        // which is why it is made here.
+        unsafe { crate::mm::KernelSlice::from_raw(self.ptr(), self.size()) }
+    }
+
     /// Total size in bytes (always a multiple of 2MB).
     pub fn size(&self) -> usize {
         self.0.len() * PAGE_2M as usize
@@ -261,26 +295,28 @@ fn release_thread_mappings(
 
 pub const KERNEL_STACK_SIZE: usize = 128 * 1024;
 
-/// Type-safe user stack. Knows its virtual address (what userland sees) and
-/// physical address (for kernel direct-map writes). Impossible to confuse the two.
+/// Type-safe user stack. Knows its virtual address (what userland sees) and the
+/// kernel window onto the same pages. Impossible to confuse the two.
+///
+/// The window is the stack's [`PageAlloc`]'s own, so the size the writes are
+/// bounded against is the allocation's and not a constant repeated beside it.
 pub struct UserStack {
     vaddr: UserAddr,
-    phys: DirectMap,
-    size: u64,
+    window: crate::mm::KernelSlice,
 }
 
 impl UserStack {
-    pub fn new(vaddr: UserAddr, phys: DirectMap, size: u64) -> Self {
-        Self { vaddr, phys, size }
+    pub fn new(vaddr: UserAddr, window: crate::mm::KernelSlice) -> Self {
+        Self { vaddr, window }
     }
 
     /// User-visible virtual address of the stack top (highest address).
-    pub fn top(&self) -> u64 { self.vaddr.raw() + self.size }
+    pub fn top(&self) -> u64 { self.vaddr.raw() + self.size() }
 
     /// User-visible virtual base address.
     pub fn base(&self) -> UserAddr { self.vaddr }
 
-    pub fn size(&self) -> u64 { self.size }
+    pub fn size(&self) -> u64 { self.window.size() as u64 }
 
     /// Copy `src` onto this stack, at the *user* address `user_addr`.
     ///
@@ -292,33 +328,29 @@ impl UserStack {
     /// stack — `write_argv` derives every offset by subtracting from `top()` —
     /// but that was an argument, not a check, and it is a check now.
     ///
+    /// The check is [`crate::mm::KernelSlice`]'s rather than one of this type's
+    /// own: a bounded window over kernel pages that become a user mapping is
+    /// one problem, not four, and a stack is that problem exactly as a
+    /// demand-paged frame is.
+    ///
     /// Panics rather than refuses because `user_addr` and `src.len()` are the
     /// kernel's own arithmetic over its own freshly allocated pages, never a
     /// number that crossed the boundary.
     fn write_at(&self, user_addr: u64, src: &[u8]) {
         let offset = user_addr.checked_sub(self.vaddr.raw())
             .expect("UserStack: address below stack base");
-        assert!(
-            offset.checked_add(src.len() as u64).is_some_and(|end| end <= self.size),
-            "UserStack::write_at {offset}+{} past a {}-byte stack",
-            src.len(),
-            self.size
-        );
-        let kptr = DirectMap::from_phys(self.phys.phys() + offset).as_mut_ptr::<u8>();
-        // SAFETY: the assert above proves `[offset, offset + src.len())` lies
-        // inside this stack, whose pages are one physically contiguous
-        // allocation — so the direct-map address of `phys + offset` is
-        // writable for `src.len()` bytes. `src` is a slice the caller owns and
-        // the destination is kernel-only until `loader::start` hands the
+        // SAFETY: `copy_from` asserts `offset + src.len() <= size` against the
+        // stack's own allocation, so the write lands inside the pages
+        // `PageAlloc::window` was built from. `src` is a slice the caller owns
+        // and the destination is kernel-only until `loader::start` hands the
         // address space to Ring 3, so the ranges cannot overlap and nothing
         // else is looking.
         //
-        // Irreducible: the destination is a physical page reached through the
-        // direct map, and the safe spelling would be a `&mut [u8]` over memory
-        // that becomes a user mapping — the borrow `user_ptr.rs`'s header
+        // Irreducible: the destination becomes a user mapping, so the safe
+        // spelling — a `&mut [u8]` — is the borrow `user_ptr.rs`'s header
         // refuses. One raw copy behind one bounds check is the shape
-        // [`crate::user_ptr::UserBytesMut`] already uses for the same problem.
-        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), kptr, src.len()) };
+        // [`crate::user_ptr::UserBytesMut`] uses for the same problem.
+        unsafe { self.window.copy_from(offset as usize, src) };
     }
 
     /// Write argc, argv pointers, and string data onto this stack.
@@ -1706,7 +1738,10 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         Some(a) => a,
         None => return false,
     };
-    let page_ptr = page_alloc.ptr();
+    // The frame as a bounds-checked window rather than a bare `*mut u8`: both
+    // fills below are the kernel's own arithmetic over ELF fields, and an
+    // arithmetic bound is an argument until something checks it.
+    let page = page_alloc.window();
 
     // Fill the 2MB page from ALL regions that overlap this range.
     // Multiple segments (e.g. .text and .rodata) can share a 2MB range.
@@ -1742,31 +1777,25 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
                         }
                         io_reads += 1;
                         let valid = if vma_offset + 4096 <= *file_size { 4096 } else { (*file_size - vma_offset) as usize };
-                        // SAFETY: `page_ptr` is `page_alloc`'s direct-map base
-                        // and `page_alloc` is a local of this function that
-                        // nothing else can see — the frame is not mapped into
-                        // any address space until `map_window` below. The
-                        // destination range is inside it: `page_offset` is
-                        // `vaddr - region_start` with `vaddr < region_end_full`
-                        // and the window is `page_2m` wide, and `valid <= 4096`
-                        // by the line above, so the last byte written is below
-                        // `region_start + page_2m`. `page_buf` is a stack array
+                        // SAFETY: `copy_from` asserts
+                        // `page_offset + valid <= page_2m` against
+                        // `page_alloc`'s own size, so the write lands inside
+                        // the frame — the bound that used to be derived from
+                        // this loop's conditions is now checked. `page_alloc`
+                        // is a local of this function that nothing else can
+                        // see: the frame is not mapped into any address space
+                        // until `map_window` below, so nothing is reading it
+                        // and the `noalias` question the borrow would have
+                        // raised does not arise. `page_buf` is a stack array
                         // this loop owns, so the ranges cannot overlap.
                         //
-                        // Irreducible **here**, and filed rather than fixed:
-                        // the reduction is a bounds-checked window type over
-                        // `PageAlloc`, and the obvious spelling of one — a safe
-                        // `&mut [u8]` — is the borrow `user_ptr.rs`'s header
-                        // refuses, because these same pages become a user
-                        // mapping four statements later. See
-                        // `issues/kernel/pagealloc-has-no-checked-window.md`.
-                        unsafe {
-                            core::ptr::copy_nonoverlapping(
-                                page_buf.as_ptr(),
-                                page_ptr.add(page_offset),
-                                valid,
-                            );
-                        }
+                        // Irreducible: the safe spelling is a `&mut [u8]`, and
+                        // these pages become a user mapping four statements
+                        // later — the borrow `user_ptr.rs`'s header refuses.
+                        // A bounds-checked window that hands out no reference is
+                        // the reduction, and `PageAlloc::window` is where it is
+                        // taken.
+                        unsafe { page.copy_from(page_offset, &page_buf[..valid]) };
                     }
                     vaddr += 4096;
                 }
@@ -1781,18 +1810,20 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
         while offset < page_2m {
             let page_elf_offset = (region_start + offset).wrapping_sub(elf_base);
             if ri.has_relocs_in_page(page_elf_offset) {
-                // SAFETY: `offset < page_2m` is this loop's own condition and
-                // `page_ptr` is the base of a `page_2m`-byte allocation this
-                // function still owns, so the result names a 4 KiB page inside
-                // it — which is what `apply_to_page` writes through.
+                // `subslice` asserts `offset + 4096 <= page_2m` against the
+                // frame's own size, which is precisely `apply_to_page`'s
+                // requirement: it writes only inside the 4 KiB page its pointer
+                // names. The bound used to be `offset < page_2m` — this loop's
+                // condition, an argument rather than a check, and one that says
+                // nothing about the 4096 bytes past `offset`.
                 //
-                // Irreducible for the same reason as the copy above, plus one
-                // of its own: `apply_to_page` takes a `*mut u8` without being
-                // an `unsafe fn`, so the validity requirement is real and not
-                // type-enforced —
+                // The remaining gap is `apply_to_page`'s signature, not this
+                // call: it takes a `*mut u8` without being an `unsafe fn`, so
+                // the validity requirement is real and not type-enforced —
                 // `issues/kernel/raw-pointer-writers-not-marked-unsafe-in-loader.md`.
                 total_relocs = total_relocs.saturating_add(
-                    ri.apply_to_page(page_elf_offset, unsafe { page_ptr.add(offset as usize) }) as u16
+                    ri.apply_to_page(page_elf_offset, page.subslice(offset as usize, 4096).base())
+                        as u16,
                 );
             }
             offset += 4096;

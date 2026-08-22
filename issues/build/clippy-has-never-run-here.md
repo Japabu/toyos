@@ -187,9 +187,14 @@ because each is a decision past a documentation sweep:
   `copy_in` uses `read_volatile`. **Decided and fixed 2026-08-22**: both are
   `read_volatile`, and the rule is now `user_ptr.rs`'s module header rather
   than a per-site preference.
-- `issues/kernel/pagealloc-has-no-checked-window.md` — the demand-paging fill's
-  two raw writes want a bounded window type, and the obvious `&mut [u8]` is the
-  borrow that is wrong for pages about to become a user mapping.
+- The demand-paging fill's two raw writes wanted a bounded window type, and the
+  obvious `&mut [u8]` is the borrow that is wrong for pages about to become a
+  user mapping. **Decided and fixed 2026-08-22**: no new type — `PageAlloc`
+  gained a safe `window()` that hands back the `mm::KernelSlice` this kernel
+  already has, sized from the allocation it owns, and `UserStack` holds one
+  instead of its own private bound. That is also half of
+  `issues/design-debt/kernelslice-from-raw-cannot-check-itself.md`'s named fix
+  shape; the loader and `DmaPool` still name their own sizes, so it stays open.
 
 One correctness fix landed with the sweep rather than being filed, because
 writing the comment is what found it and the fix is a deleted token:
