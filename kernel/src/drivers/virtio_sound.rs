@@ -30,7 +30,7 @@ use super::virtio::{BufDir, UsedRingConsumer, VirtioDevice, Virtqueue, Virtqueue
 use super::DmaPool;
 use crate::log;
 use crate::mm::paging::CachePolicy;
-use crate::mm::{KernelSlice, Mmio};
+use crate::mm::{Dma, Mmio};
 use crate::object::shm::Region;
 use crate::sync::Lock;
 
@@ -76,7 +76,7 @@ const MAX_NAMED_REFUSALS: usize = 16;
 /// Written once, before the vector is armed, and read with no lock afterwards:
 /// the handler may interrupt a CPU holding [`CONTROLLER`].
 struct TxIsr {
-    consumer: UnsafeCell<Option<UsedRingConsumer>>,
+    consumer: UnsafeCell<Option<UsedRingConsumer<'static>>>,
     /// Used-ring entries naming a descriptor that heads no chain. Counted here
     /// and named once from the drain path — the avail ring is the driver's, so
     /// this is a userland bug and a handler that logs is a handler that produces
@@ -313,10 +313,20 @@ pub fn inbox_watchers() -> alloc::vec::Vec<crate::inbox::InboxId> {
 /// left to do with one — their descriptors are written, their addresses are in
 /// the device, and their used rings are consumed by the handler and by the
 /// driver.
+/// The pools are not here, and that is the change of 2026-08-22: they are leaked
+/// at bring-up and what the driver holds is `Dma<'static>`.
+///
+/// They used to be held here to keep their pages alive, and the two were dropped
+/// on every refusal below — while [`TX_ISR`] was already holding a
+/// [`UsedRingConsumer`] over the TX used ring inside one of them, installed
+/// before the last refusal on purpose (see the comment at its store). Freeing
+/// the pages under a `static` that names them was a live dangling region; it
+/// was harmless only because no vector was armed on that path, and a borrowing
+/// view is what makes it unwritable rather than unnoticed. The cost is that a
+/// device whose MSI-X cannot be armed keeps its DMA for the boot, which is a
+/// machine with no audio either way.
 struct Bound {
     notify: Mmio,
-    _dma_kernel: DmaPool,
-    _dma_shared: DmaPool,
 }
 
 static CONTROLLER: Lock<Option<Bound>> = Lock::new(None);
@@ -388,18 +398,6 @@ pub fn init(devices: &[PciDevice]) {
     };
     log!("virtio-sound: found at PCI {:02x}:{:02x}.{}", pci.bus, pci.dev, pci.func);
 
-    let dma_kernel = DmaPool::alloc(KERNEL_DMA_BYTES);
-    let dma_shared = DmaPool::alloc(abi::SHARED_BYTES);
-    let kernel_mem = dma_kernel.slice();
-    let shared = dma_shared.slice();
-    // SAFETY: irreducible — `KernelSlice::zero` is an `unsafe fn` and there is
-    // no safe way to clear DMA memory. Bounded by `zero` itself, which writes
-    // exactly the region's own `size`. Exclusive: the pool was allocated two
-    // lines above and nothing else holds a slice of it — the device has not
-    // been told about it and the userland mapping of this window does not exist
-    // until `set_audio_info` publishes it.
-    unsafe { shared.zero() };
-
     let device = VirtioDevice::init(pci, VIRTIO_F_VERSION_1);
 
     let cfg = device.device_config();
@@ -410,25 +408,35 @@ pub fn init(devices: &[PciDevice]) {
         return;
     }
 
+    // After the refusal above, so a device with no stream to play into costs no
+    // physical memory; leaked because [`TX_ISR`] holds a used-ring consumer over
+    // one of these windows for the life of the boot — see [`Bound`].
+    let kernel_mem = DmaPool::alloc(KERNEL_DMA_BYTES).leak();
+    let shared = DmaPool::alloc(abi::SHARED_BYTES).leak();
+    // Exclusive: the pool was allocated on the line above and nothing else holds
+    // a view of it — the device has not been told about it and the userland
+    // mapping of this window does not exist until `set_audio_info` publishes it.
+    shared.zero();
+
     let mut controlq = queue(
-        kernel_mem.subslice(OFF_CTRL_DESC, OFF_EVENT_DESC - OFF_CTRL_DESC),
-        shared.subslice(abi::OFF_CTRL_AVAIL, abi::avail_bytes(abi::CONTROL_QUEUE_SIZE)),
-        shared.subslice(abi::OFF_CTRL_USED, abi::used_bytes(abi::CONTROL_QUEUE_SIZE)),
+        kernel_mem.subview(OFF_CTRL_DESC, OFF_EVENT_DESC - OFF_CTRL_DESC),
+        shared.subview(abi::OFF_CTRL_AVAIL, abi::avail_bytes(abi::CONTROL_QUEUE_SIZE)),
+        shared.subview(abi::OFF_CTRL_USED, abi::used_bytes(abi::CONTROL_QUEUE_SIZE)),
         abi::CONTROL_QUEUE_SIZE,
     );
     let mut eventq = queue(
-        kernel_mem.subslice(OFF_EVENT_DESC, OFF_TX_DESC - OFF_EVENT_DESC),
-        shared.subslice(abi::OFF_EVENT_AVAIL, abi::avail_bytes(abi::EVENT_QUEUE_SIZE)),
-        shared.subslice(abi::OFF_EVENT_USED, abi::used_bytes(abi::EVENT_QUEUE_SIZE)),
+        kernel_mem.subview(OFF_EVENT_DESC, OFF_TX_DESC - OFF_EVENT_DESC),
+        shared.subview(abi::OFF_EVENT_AVAIL, abi::avail_bytes(abi::EVENT_QUEUE_SIZE)),
+        shared.subview(abi::OFF_EVENT_USED, abi::used_bytes(abi::EVENT_QUEUE_SIZE)),
         abi::EVENT_QUEUE_SIZE,
     );
     // The one used ring the driver never sees: the handler is its only consumer,
     // and a mask derived from a ring userland can rewrite would be a completion
     // for a period that never played.
     let mut txq = queue(
-        kernel_mem.subslice(OFF_TX_DESC, OFF_TX_USED - OFF_TX_DESC),
-        shared.subslice(abi::OFF_TX_AVAIL, abi::avail_bytes(abi::TX_QUEUE_SIZE)),
-        kernel_mem.subslice(OFF_TX_USED, abi::used_bytes(abi::TX_QUEUE_SIZE)),
+        kernel_mem.subview(OFF_TX_DESC, OFF_TX_USED - OFF_TX_DESC),
+        shared.subview(abi::OFF_TX_AVAIL, abi::avail_bytes(abi::TX_QUEUE_SIZE)),
+        kernel_mem.subview(OFF_TX_USED, abi::used_bytes(abi::TX_QUEUE_SIZE)),
         abi::TX_QUEUE_SIZE,
     );
 
@@ -469,11 +477,7 @@ pub fn init(devices: &[PciDevice]) {
         chmaps,
     };
 
-    *CONTROLLER.lock() = Some(Bound {
-        notify: device.notify_mmio(),
-        _dma_kernel: dma_kernel,
-        _dma_shared: dma_shared,
-    });
+    *CONTROLLER.lock() = Some(Bound { notify: device.notify_mmio() });
     *INFO.lock() = Some((info, dma_region));
 
     log!(
@@ -486,7 +490,12 @@ pub fn init(devices: &[PciDevice]) {
     );
 }
 
-fn queue(desc: KernelSlice, avail: KernelSlice, used: KernelSlice, size: u16) -> Virtqueue {
+fn queue<'pool>(
+    desc: Dma<'pool>,
+    avail: Dma<'pool>,
+    used: Dma<'pool>,
+    size: u16,
+) -> Virtqueue<'pool> {
     Virtqueue::from_regions(&VirtqueueRegions::from_separate(desc, avail, used, size), size)
 }
 
@@ -497,7 +506,12 @@ fn queue(desc: KernelSlice, avail: KernelSlice, used: KernelSlice, size: u16) ->
 /// write, so the driver's whole vocabulary is an index into an avail ring and a
 /// doorbell. One control chain serves every command because the device reads the
 /// header first and takes only what that command defines.
-fn build_chains(controlq: &mut Virtqueue, eventq: &mut Virtqueue, txq: &mut Virtqueue, base: u64) {
+fn build_chains(
+    controlq: &mut Virtqueue<'_>,
+    eventq: &mut Virtqueue<'_>,
+    txq: &mut Virtqueue<'_>,
+    base: u64,
+) {
     let at = |offset: usize| base + offset as u64;
 
     controlq.write_chain(

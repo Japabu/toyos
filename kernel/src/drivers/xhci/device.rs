@@ -399,7 +399,7 @@ pub(super) fn slot_answered(
     };
     log!("xHCI: slot {} enabled (dma +{:#x})", slot_id, block);
 
-    let ep0_ring = TrbRing::init(ctrl.dma().subslice(block + DEV_EP0_RING, PAGE));
+    let ep0_ring = TrbRing::init(ctrl.dma().subview(block + DEV_EP0_RING, PAGE));
     let state = Enumerating {
         port_idx,
         speed,
@@ -565,15 +565,15 @@ fn read_back(
     // pointer further down. Every read below indexes this slice, so a
     // descriptor length the device chose can no longer walk past the buffer:
     // `delivered` is bounded against `scratch.len()` by the indexing itself.
-    let page = ctrl.dma().subslice(OFF_DATA_BUF, MAX_CONFIG_DESC);
-    // SAFETY: irreducible — `KernelSlice::as_slice` is an `unsafe fn` and there
-    // is no safe way to view DMA memory as bytes. Bounded by the `subslice`
-    // above, which asserts `OFF_DATA_BUF + MAX_CONFIG_DESC` is inside the pool.
-    // No aliasing `&mut` exists: `control_request` zeroes this page before the
-    // transfer and nothing holds a slice of it across that, and the transfer
-    // has completed — `read_back` is called on a completion event. Enumeration
-    // is serial, so no other port is using the shared scratch.
-    let scratch: &[u8] = unsafe { page.as_slice() };
+    // A copy of the page and not a borrow into it, so nothing holds a reference
+    // into memory the controller may write again: `control_request` zeroes this
+    // page before each transfer, and the one that filled it has completed —
+    // `read_back` is called on a completion event. Enumeration is serial, so no
+    // other port is using the shared scratch. `MAX_CONFIG_DESC` is 256 bytes, so
+    // the copy is a frame this path already has room for.
+    let mut scratch = [0u8; MAX_CONFIG_DESC];
+    ctrl.dma().copy_to(OFF_DATA_BUF, &mut scratch);
+    let scratch: &[u8] = &scratch;
     match request {
         Request::DeviceDescriptor { want: 8 } => {
             if delivered < 8 {
@@ -723,7 +723,7 @@ fn configure_endpoint_trb(ctrl: &mut XhciController, state: &mut Enumerating) ->
     state.rings = Some(rings);
 
     let mut configure = Trb::ZERO;
-    configure.param = ctrl.dma().subslice(OFF_INPUT_CTX, PAGE).phys();
+    configure.param = ctrl.dma().subview(OFF_INPUT_CTX, PAGE).phys();
     configure.control = TRB_CONFIGURE_EP | ((state.slot_id as u32) << 24);
     Some(configure)
 }
@@ -736,7 +736,7 @@ fn hid_input_context(
 ) -> TrbRing {
     let dma = ctrl.dma();
     let int_ep_dci = info.ep.dci();
-    let int_ring = TrbRing::init(dma.subslice(state.block + DEV_INT_RING, PAGE));
+    let int_ring = TrbRing::init(dma.subview(state.block + DEV_INT_RING, PAGE));
 
     let input_ctx = super::zero_dma(dma, OFF_INPUT_CTX, PAGE);
 
@@ -804,7 +804,7 @@ fn bind_hid(
     info: &HidInterfaceInfo,
     int_ring: TrbRing,
 ) {
-    let report = ctrl.dma().subslice(state.block + DEV_REPORT, 8);
+    let report = ctrl.dma().subview(state.block + DEV_REPORT, 8);
     let report_size = match info.protocol {
         HidType::Keyboard => 8,
         HidType::Mouse => 4,

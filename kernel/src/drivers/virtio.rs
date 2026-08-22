@@ -1,4 +1,3 @@
-use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{fence, Ordering};
 
 use toyos_untrusted::{Refused, Untrusted};
@@ -142,106 +141,62 @@ impl VirtioPciConfig {
     }
 }
 
-/// DMA region specification for a virtqueue.
-use crate::mm::KernelSlice;
+use crate::mm::Dma;
 
-/// One of a virtqueue's three rings, and **the only thing in this driver that
-/// reads or writes DMA memory**.
+/// The three rings of a split virtqueue are the archetype of [`Dma`]'s volatile
+/// discipline, and this driver reaches DMA memory through nothing else.
 ///
 /// Eleven `unsafe` blocks used to spell `read_volatile(slice.ptr_at(off) as
-/// *const T)` and `write_volatile(slice.ptr_at(off) as *mut T, v)` inline; they
-/// are the three methods below now, and every call site is ordinary safe code.
-/// Same shape as [`crate::mm::Mmio`], whose `read_u32`/`write_u32` are safe for
-/// the same reasons, and constructed the same way — privately, from something
-/// that already carries the proof.
+/// *const T)` and `write_volatile(slice.ptr_at(off) as *mut T, v)` inline; a
+/// driver-local `Ring` newtype replaced them with three methods in the sweep of
+/// 2026-08-22, and those three are `Dma::read`, `Dma::write` and `Dma::zero`
+/// now. Every call site here is ordinary safe code.
 ///
-/// **It is also a bound that was not there.** `KernelSlice::ptr_at` asserts
-/// only that the *offset* is inside the region, so a `u32` read at `size - 1`
-/// used to run three bytes past the end of the ring. [`Ring::ptr`] goes through
-/// `subslice`, which asserts `offset + size_of::<T>() <= size`, so the length
-/// of what is read is part of the check.
-///
-/// Volatile, not plain: the device writes the used ring and reads the
+/// **Volatile, not plain**: the device writes the used ring and reads the
 /// descriptor and available rings concurrently with this CPU, so no access may
-/// be elided, merged or reordered against its neighbours. The residual — that
-/// the `KernelSlice` describes real memory at all — is `KernelSlice::from_raw`'s
-/// own, inherited and not created here
-/// (`issues/design-debt/kernelslice-from-raw-cannot-check-itself.md`).
-#[derive(Clone, Copy)]
-struct Ring(KernelSlice);
-
-impl Ring {
-    fn phys(self) -> u64 {
-        self.0.phys()
-    }
-
-    /// A pointer to the `T` at `offset`, bounds-checked for all of `T` and not
-    /// just for `offset`.
-    fn ptr<T>(self, offset: usize) -> *mut T {
-        self.0.subslice(offset, core::mem::size_of::<T>()).base().cast::<T>()
-    }
-
-    fn read<T: Copy>(self, offset: usize) -> T {
-        // SAFETY: irreducible — a volatile read has no safe spelling, and this
-        // is the one in the driver. Sound because `ptr` went through
-        // `KernelSlice::subslice`, which asserted `offset + size_of::<T>() <=
-        // size`, so the whole `T` is inside the ring; the ring's own offsets
-        // (`USED_IDX_OFF`, `USED_RING_OFF + i * USED_ELEM_SIZE`,
-        // `AVAIL_RING_OFF + i * 2`, `i * size_of::<VirtqDesc>()`) are natural
-        // multiples of the width being read and the regions are placed at
-        // 4-or-better alignment by `VirtqueueRegions`, so the pointer is
-        // aligned for `T`.
-        unsafe { read_volatile(self.ptr::<T>(offset)) }
-    }
-
-    fn write<T: Copy>(self, offset: usize, value: T) {
-        // SAFETY: irreducible and sound for the same reasons as `read`. A write
-        // races the device by design — that is what a virtqueue is — and
-        // `volatile` plus the `fence`s at the call sites is the ordering
-        // discipline the spec asks for, not something this type could enforce.
-        unsafe { write_volatile(self.ptr::<T>(offset), value) }
-    }
-
-    fn zero(self) {
-        // SAFETY: irreducible — `KernelSlice::zero` is an `unsafe fn` and there
-        // is no safe way to clear DMA memory. Sound because it writes exactly
-        // the region's own `size` bytes, and every caller here is bringing a
-        // ring up before the device has been told where it is, so nothing else
-        // is reading or writing it.
-        unsafe { self.0.zero() }
-    }
+/// be elided, merged or reordered against its neighbours. **Bounded for the
+/// length**: `ptr_at` asserted only that the *offset* was inside the region, so
+/// a `u32` read at `size - 1` used to run three bytes past the end of a ring.
+/// **Aligned**: every offset below is a natural multiple of the width being
+/// read — `USED_IDX_OFF`, `USED_RING_OFF + i * USED_ELEM_SIZE`,
+/// `AVAIL_RING_OFF + i * 2`, `i * size_of::<VirtqDesc>()` — over regions
+/// [`VirtqueueRegions`] places at 4-or-better alignment, which is what the
+/// volatile discipline asserts rather than assumes.
+pub struct VirtqueueRegions<'pool> {
+    pub desc: Dma<'pool>,
+    pub avail: Dma<'pool>,
+    pub used: Dma<'pool>,
 }
 
-pub struct VirtqueueRegions {
-    pub desc: KernelSlice,
-    pub avail: KernelSlice,
-    pub used: KernelSlice,
-}
-
-impl VirtqueueRegions {
+impl<'pool> VirtqueueRegions<'pool> {
     /// Compute regions from a single contiguous DMA buffer.
-    pub fn from_contiguous(buf: KernelSlice, queue_size: u16) -> Self {
+    pub fn from_contiguous(buf: Dma<'pool>, queue_size: u16) -> Self {
         let desc_size = queue_size as usize * core::mem::size_of::<VirtqDesc>();
         let avail_size = 4 + queue_size as usize * 2;
         let used_size = 4 + queue_size as usize * USED_ELEM_SIZE;
         let avail_off = (desc_size + 1) & !1;
         let used_off = (avail_off + avail_size + 3) & !3;
         Self {
-            desc: buf.subslice(0, desc_size),
-            avail: buf.subslice(avail_off, avail_size),
-            used: buf.subslice(used_off, used_size),
+            desc: buf.subview(0, desc_size),
+            avail: buf.subview(avail_off, avail_size),
+            used: buf.subview(used_off, used_size),
         }
     }
 
     /// Compute regions from three separate DMA pages.
-    pub fn from_separate(desc: KernelSlice, avail: KernelSlice, used: KernelSlice, queue_size: u16) -> Self {
+    pub fn from_separate(
+        desc: Dma<'pool>,
+        avail: Dma<'pool>,
+        used: Dma<'pool>,
+        queue_size: u16,
+    ) -> Self {
         let desc_size = queue_size as usize * core::mem::size_of::<VirtqDesc>();
         let avail_size = 4 + queue_size as usize * 2;
         let used_size = 4 + queue_size as usize * USED_ELEM_SIZE;
         Self {
-            desc: desc.subslice(0, desc_size),
-            avail: avail.subslice(0, avail_size),
-            used: used.subslice(0, used_size),
+            desc: desc.subview(0, desc_size),
+            avail: avail.subview(0, avail_size),
+            used: used.subview(0, used_size),
         }
     }
 }
@@ -306,14 +261,14 @@ impl core::fmt::Display for UsedRefusal {
 /// `Virtqueue::split_used_consumer`. Lock-free: reads only device-written
 /// memory plus its own `last_used_idx`, so an ISR can drain completions
 /// while another CPU submits to the same queue under a lock.
-pub struct UsedRingConsumer {
-    used: Ring,
+pub struct UsedRingConsumer<'pool> {
+    used: Dma<'pool>,
     size: u16,
     last_used_idx: u16,
     refused: u32,
 }
 
-impl UsedRingConsumer {
+impl UsedRingConsumer<'_> {
     /// Non-blocking poll: returns the head descriptor id of a completed
     /// chain, or `None` if nothing new.
     ///
@@ -356,10 +311,10 @@ impl UsedRingConsumer {
 }
 
 /// A VirtIO split virtqueue.
-pub struct Virtqueue {
-    desc: Ring,
-    avail: Ring,
-    used: Ring,
+pub struct Virtqueue<'pool> {
+    desc: Dma<'pool>,
+    avail: Dma<'pool>,
+    used: Dma<'pool>,
     size: u16,
     last_used_idx: u16,
     notify_offset: u16,
@@ -392,20 +347,20 @@ fn chain_bytes(bufs: &[(u64, u32, BufDir)]) -> u32 {
     bufs.iter().fold(0u32, |sum, (_, len, _)| sum.saturating_add(*len))
 }
 
-impl Virtqueue {
+impl<'pool> Virtqueue<'pool> {
     /// Create a new virtqueue from a contiguous DMA region.
     ///
     /// Zeroes the whole buffer and not just the three rings: the padding
     /// between them is not read by anything, but a caller handing this a page
     /// out of a fresh `DmaPool` gets a page it can reason about.
-    pub fn new(buf: KernelSlice, queue_size: u16) -> Self {
-        Ring(buf).zero();
+    pub fn new(buf: Dma<'pool>, queue_size: u16) -> Self {
+        buf.zero();
         Self::from_regions(&VirtqueueRegions::from_contiguous(buf, queue_size), queue_size)
     }
 
     /// Create a new virtqueue from explicit DMA regions.
-    pub fn from_regions(regions: &VirtqueueRegions, queue_size: u16) -> Self {
-        let (desc, avail, used) = (Ring(regions.desc), Ring(regions.avail), Ring(regions.used));
+    pub fn from_regions(regions: &VirtqueueRegions<'pool>, queue_size: u16) -> Self {
+        let (desc, avail, used) = (regions.desc, regions.avail, regions.used);
         desc.zero();
         avail.zero();
         used.zero();
@@ -425,7 +380,7 @@ impl Virtqueue {
     /// Hand the used ring to a dedicated (interrupt-context) consumer.
     /// Afterwards this queue is submit-only: `poll_used`/`has_used` panic,
     /// enforcing the single-consumer invariant at runtime.
-    pub fn split_used_consumer(&mut self) -> UsedRingConsumer {
+    pub fn split_used_consumer(&mut self) -> UsedRingConsumer<'pool> {
         assert!(!self.used_split, "virtqueue: used ring already split");
         self.used_split = true;
         UsedRingConsumer {
@@ -694,9 +649,13 @@ pub fn used_selftest() {
     const UNBUILT: u32 = 5;
     const CASES: usize = 11;
 
+    // The one virtqueue in this kernel over a pool that is *not* leaked: the
+    // pages go back when this function returns, and `Dma<'_>`'s borrow is what
+    // says the queue may not outlive them.
     let pool = DmaPool::alloc(0x1000);
-    let mut q = Virtqueue::new(pool.slice().subslice(0, 0x1000), SIZE);
-    q.write_chain(3, &[(pool.slice().phys(), CHAIN, BufDir::Writable)]);
+    let dma = pool.view();
+    let mut q = Virtqueue::new(dma.subview(0, 0x1000), SIZE);
+    q.write_chain(3, &[(dma.phys(), CHAIN, BufDir::Writable)]);
 
     // Write one element where the device would write it and bump the index the
     // device bumps. `at` is what the queue's own `last_used_idx` will be.
@@ -837,7 +796,7 @@ impl VirtioDevice {
 
     /// Configure a virtqueue's addresses and size. Does NOT enable the queue —
     /// call `enable_queue()` after setting MSI-X vectors (if applicable).
-    pub fn setup_queue(&self, index: u16, queue: &mut Virtqueue) {
+    pub fn setup_queue(&self, index: u16, queue: &mut Virtqueue<'_>) {
         let common = self.config.common;
 
         common.write_u16(COMMON_QUEUE_SELECT, index);
