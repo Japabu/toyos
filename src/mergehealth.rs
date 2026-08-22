@@ -27,6 +27,39 @@
 //! the raw counts, the check each red named, and the mechanical half of the
 //! verdict (incident count against the threshold); a breach on interaction
 //! failures specifically is never something a rate alone can say.
+//!
+//! **The regime is read, not assumed.** The eased law was itself provisional
+//! — `landing.yml`'s `gate-stage` job reads `main`'s branch protection back on
+//! every push and already prints whether a `merge_queue` rule is present; this
+//! file asks the same question through `gh api repos/{owner}/{repo}/rules/branches/main`,
+//! the endpoint `gate-stage` reads, and looks for `merge_queue` among the rule
+//! types exactly the way `gate-stage`'s own `queued=...` line does. If it is
+//! there, the window is split at the instant the queue started, and the two
+//! parts are reported (and verdicted) separately, then totalled as before. A
+//! `gh` call that cannot answer at all (no network, no auth) is the only case
+//! this falls back on: it says so and reports the window undivided, exactly
+//! as this file did before it knew regimes existed — it never guesses one.
+//!
+//! **The queue's start is the earliest `merge_group`-triggered workflow run**
+//! on `gh-readonly-queue/main/*` on record, not the ruleset's own `updated_at`:
+//! `updated_at` moves on *any* later edit to *any* rule, an unrelated
+//! required-check addition included, and would silently misdate the regime
+//! rather than refusing; the first `merge_group` run is a fact about the queue
+//! actually processing a landing and cannot be perturbed that way. (Read at
+//! most the 500 most recent such runs — this instrument refuses rather than
+//! silently under-counting if the queue ever outgrows that.) If the rule is
+//! required but has never yet run one, the boundary is "now": nothing in any
+//! window so far can be attributed to a queue nobody has used.
+//!
+//! **Under a queue, an incident is not the same finding it was under the
+//! eased law.** The eased-part verdict keeps its original threshold and text
+//! — it is the record of why the queue came, not a live gate any more. The
+//! queue-part verdict has no threshold to breach: a merge queue's whole point
+//! is pre-merge composition testing, so *any* red on `main`'s tip after the
+//! queue validated it green is the specific failure the queue exists to
+//! prevent, and root `CLAUDE.md`'s rule that a red on `main`'s tip is
+//! adjudicated at once, not batched into a rolling-week rate, applies to it
+//! directly.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -66,7 +99,10 @@ pub fn dispatch(root: &Path, args: &[String]) {
     assert!(since < now, "the window's start must be before now");
 
     let runs = fetch(root, since);
-    let report = render(&runs, since, now);
+    let report = match regime(root) {
+        Regime::Unknown => render(&runs, since, now),
+        known => render_split(&runs, since, now, known),
+    };
     print!("{report}");
 }
 
@@ -131,6 +167,84 @@ fn fetch(root: &Path, since: i64) -> Vec<Run> {
         .collect();
     runs.sort_by_key(|r| r.created_at);
     runs
+}
+
+/// What `main`'s branch protection says right now, read the way
+/// `landing.yml`'s `gate-stage` job reads it.
+enum Regime {
+    /// `gh` could not answer at all — no network, no auth. Never a guess:
+    /// [`dispatch`] falls back to the undivided report this file always gave.
+    Unknown,
+    /// No `merge_queue` rule on `main`: the eased law, for the whole window.
+    Eased,
+    /// A `merge_queue` rule is required, in effect since this instant — the
+    /// earliest `merge_group`-triggered run on record, or now if the rule is
+    /// required but has never yet run one.
+    Queued(i64),
+}
+
+/// Reads `main`'s ruleset through `gh api repos/{owner}/{repo}/rules/branches/main`
+/// — the same endpoint `gate-stage` reads — and asks whether `merge_queue` is
+/// among its rule types, the same test `gate-stage`'s own `queued=...` line
+/// runs. This file's module header has why the queue's start comes from the
+/// earliest `merge_group` run rather than the ruleset's `updated_at`.
+fn regime(root: &Path) -> Regime {
+    let Ok(rules_out) = Command::new("gh")
+        .args(["api", "repos/{owner}/{repo}/rules/branches/main", "--jq", "[.[].type] | join(\" \")"])
+        .current_dir(root)
+        .output()
+    else {
+        return Regime::Unknown;
+    };
+    if !rules_out.status.success() {
+        return Regime::Unknown;
+    }
+    let rules = String::from_utf8_lossy(&rules_out.stdout);
+    if !rules.split_whitespace().any(|r| r == "merge_queue") {
+        return Regime::Eased;
+    }
+
+    let Ok(mg_out) = Command::new("gh")
+        .args([
+            "run",
+            "list",
+            "--event",
+            "merge_group",
+            "--limit",
+            "500",
+            "--json",
+            "createdAt,headBranch",
+            "--jq",
+            r#"[.[] | select(.headBranch | startswith("gh-readonly-queue/main/"))] | sort_by(.createdAt) | [length, (.[0].createdAt // "")] | @tsv"#,
+        ])
+        .current_dir(root)
+        .output()
+    else {
+        return Regime::Unknown;
+    };
+    if !mg_out.status.success() {
+        return Regime::Unknown;
+    }
+    let text = String::from_utf8_lossy(&mg_out.stdout);
+    let mut fields = text.trim().split('\t');
+    let count: usize = fields
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("{TAG} `gh run list --event merge_group` printed no count row"));
+    assert!(
+        count < 500,
+        "{TAG} 500 merge_group runs on gh-readonly-queue/main/* is this instrument's ceiling for \
+         finding the earliest one — the queue has outgrown it, widen the query rather than trust \
+         a possibly-truncated \"earliest\""
+    );
+    let earliest = fields.next().unwrap_or("");
+    if earliest.is_empty() {
+        // Required, but the queue has never processed a landing: nothing in
+        // any window so far can be "queued" either.
+        Regime::Queued(now_epoch_secs())
+    } else {
+        Regime::Queued(parse_instant(earliest))
+    }
 }
 
 /// One push's four required-workflow runs, keyed by workflow name.
@@ -225,24 +339,38 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     sorted[rank.clamp(1, sorted.len()) - 1]
 }
 
-fn render(runs: &[Run], since: i64, now: i64) -> String {
-    let pushes = group(runs);
-    let mut out = String::new();
+fn header_line(pushes: &[Push], since: i64, now: i64) -> String {
     let window_days = (now - since) as f64 / 86_400.0;
-    out += &format!(
+    format!(
         "{TAG} window {} .. {} ({:.2} days), {} push(es) to main\n",
         format_instant(since),
         format_instant(now),
         window_days,
         pushes.len()
-    );
+    )
+}
 
+/// One partition's counts and detail rows — red incidents (with which
+/// required check and which push each one named), preempted and
+/// still-validating pushes, and the closed/open red-time intervals within
+/// just this slice of pushes. Computed the same way whether the partition is
+/// the whole window or one side of a regime split.
+struct Tally {
+    red_pushes: u32,
+    preempted_pushes: u32,
+    still_validating: u32,
+    red_by_workflow: BTreeMap<&'static str, u32>,
+    red_rows: Vec<String>,
+    intervals: Vec<RedInterval>,
+}
+
+fn tally(pushes: &[Push]) -> Tally {
     let mut red_by_workflow: BTreeMap<&str, u32> = BTreeMap::new();
     let mut red_pushes = 0u32;
     let mut preempted_pushes = 0u32;
     let mut still_validating = 0u32;
     let mut red_rows: Vec<String> = Vec::new();
-    for push in &pushes {
+    for push in pushes {
         let mut this_red = false;
         let mut this_preempted = false;
         let mut this_pending = false;
@@ -271,38 +399,45 @@ fn render(runs: &[Run], since: i64, now: i64) -> String {
         preempted_pushes += this_preempted as u32;
         still_validating += this_pending as u32;
     }
+    let intervals = red_intervals(pushes);
+    Tally { red_pushes, preempted_pushes, still_validating, red_by_workflow, red_rows, intervals }
+}
 
-    let pct = |n: u32| if pushes.is_empty() { 0.0 } else { 100.0 * n as f64 / pushes.len() as f64 };
-    out += &format!(
-        "{TAG} red-main incidents: {red_pushes} of {} push(es) ({:.1} %)\n",
-        pushes.len(),
-        pct(red_pushes)
+/// The stat-line block `render` always printed after the header — pulled out
+/// so a partition's block and the aggregate "totals" block share one
+/// implementation instead of three copies of the same arithmetic.
+fn format_tally(out: &mut String, pushes_len: usize, t: &Tally, now: i64) {
+    let pct = |n: u32| if pushes_len == 0 { 0.0 } else { 100.0 * n as f64 / pushes_len as f64 };
+    *out += &format!(
+        "{TAG} red-main incidents: {} of {pushes_len} push(es) ({:.1} %)\n",
+        t.red_pushes,
+        pct(t.red_pushes)
     );
-    for (workflow, n) in &red_by_workflow {
+    for (workflow, n) in &t.red_by_workflow {
         let check = REQUIRED_WORKFLOWS.iter().find(|(w, _)| w == workflow).map(|(_, c)| *c).unwrap_or("?");
-        out += &format!("{TAG}   {workflow} ({check}): {n}\n");
+        *out += &format!("{TAG}   {workflow} ({check}): {n}\n");
     }
-    for row in &red_rows {
-        out += &format!("{TAG}     {row}\n");
+    for row in &t.red_rows {
+        *out += &format!("{TAG}     {row}\n");
     }
-    out += &format!(
-        "{TAG} validation preempted before completion: {preempted_pushes} of {} push(es) ({:.1} %) \
+    *out += &format!(
+        "{TAG} validation preempted before completion: {} of {pushes_len} push(es) ({:.1} %) \
          — a later push superseded this one's required-check run before it finished\n",
-        pushes.len(),
-        pct(preempted_pushes)
+        t.preempted_pushes,
+        pct(t.preempted_pushes)
     );
-    if still_validating > 0 {
-        out += &format!(
-            "{TAG} still validating at snapshot time: {still_validating} push(es), not yet counted \
-             above either way\n"
+    if t.still_validating > 0 {
+        *out += &format!(
+            "{TAG} still validating at snapshot time: {} push(es), not yet counted \
+             above either way\n",
+            t.still_validating
         );
     }
 
-    let intervals = red_intervals(&pushes);
     let closed_minutes: Vec<f64> =
-        intervals.iter().filter_map(|i| i.ended.map(|e| (e - i.started) as f64 / 60.0)).collect();
+        t.intervals.iter().filter_map(|i| i.ended.map(|e| (e - i.started) as f64 / 60.0)).collect();
     let total: f64 = closed_minutes.iter().sum();
-    out += &format!(
+    *out += &format!(
         "{TAG} red-main minutes: total {total:.1}, p95 {:.1} (over {} closed interval(s))\n",
         if closed_minutes.is_empty() {
             0.0
@@ -313,17 +448,22 @@ fn render(runs: &[Run], since: i64, now: i64) -> String {
         },
         closed_minutes.len()
     );
-    for i in intervals.iter().filter(|i| i.ended.is_none()) {
-        out += &format!(
+    for i in t.intervals.iter().filter(|i| i.ended.is_none()) {
+        *out += &format!(
             "{TAG}   STILL RED: {} since {} ({:.1} minutes and counting)\n",
             i.workflow,
             format_instant(i.started),
             (now - i.started) as f64 / 60.0
         );
     }
+}
 
+/// The eased-law verdict text — unchanged by the regime split, on purpose:
+/// per this file's module header it is the record of why the queue came, not
+/// a live gate any more.
+fn verdict_eased(red_pushes: u32) -> String {
     let breach = red_pushes > 1;
-    out += &format!(
+    format!(
         "{TAG} verdict: {}\n",
         if breach {
             "THRESHOLD BREACHED — more than one red-main incident in this window. Per \
@@ -338,7 +478,89 @@ fn render(runs: &[Run], since: i64, now: i64) -> String {
              does not classify interaction failures. Near-zero is what the same issue file \
              expects; a rolling week with more than one still ends this line differently."
         }
-    );
+    )
+}
+
+/// The queue-regime verdict: no rolling-week threshold, because a merge
+/// queue's whole point is pre-merge composition testing — any red on `main`'s
+/// tip after the queue validated it green is the specific failure the queue
+/// exists to prevent, adjudicated at once per root `CLAUDE.md`, not batched
+/// into a rate.
+fn verdict_queued(t: &Tally, pushes_len: usize) -> String {
+    if t.red_pushes == 0 {
+        format!("{TAG} verdict: QUEUE HELD — {pushes_len} queue landing(s), 0 red-main incidents.\n")
+    } else {
+        let mut out = format!(
+            "{TAG} verdict: QUEUE DID NOT HOLD — {} of {pushes_len} queue landing(s) went red on \
+             main's tip, naming each:\n",
+            t.red_pushes
+        );
+        for row in &t.red_rows {
+            out += &format!("{TAG}   {row}\n");
+        }
+        out += &format!(
+            "{TAG}   Per root CLAUDE.md, a red on main's tip is adjudicated at once — file each \
+             of the above; a merge queue existing does not make one a rate question.\n"
+        );
+        out
+    }
+}
+
+fn render(runs: &[Run], since: i64, now: i64) -> String {
+    let pushes = group(runs);
+    let mut out = header_line(&pushes, since, now);
+    let t = tally(&pushes);
+    format_tally(&mut out, pushes.len(), &t, now);
+    out += &verdict_eased(t.red_pushes);
+    out
+}
+
+/// The report once the regime is known (`regime` returned other than
+/// [`Regime::Unknown`]): the window split at the queue's start, each part
+/// reported and verdicted on its own terms, then the totals in the same shape
+/// [`render`] always gave. `Regime::Eased` and a not-yet-used `Regime::Queued`
+/// both degenerate correctly — the boundary clamps into the window and one
+/// side ends up empty — rather than needing a separate no-split path.
+fn render_split(runs: &[Run], since: i64, now: i64, regime: Regime) -> String {
+    let pushes = group(runs);
+    let mut out = header_line(&pushes, since, now);
+
+    let (boundary, regime_line) = match regime {
+        Regime::Unknown => {
+            unreachable!("dispatch routes Regime::Unknown to render, never render_split")
+        }
+        Regime::Eased => {
+            (now, format!("{TAG} regime: no merge queue required on main — eased law throughout\n"))
+        }
+        Regime::Queued(since_instant) => (
+            since_instant,
+            format!(
+                "{TAG} regime: merge queue required on main since {} (earliest \
+                 gh-readonly-queue/main run on record)\n",
+                format_instant(since_instant)
+            ),
+        ),
+    };
+    out += &regime_line;
+    let boundary = boundary.clamp(since, now);
+
+    let split_at = pushes.partition_point(|p| p.created_at < boundary);
+    let (eased_pushes, queued_pushes) = pushes.split_at(split_at);
+
+    out += &format!("{TAG}\n{TAG} -- eased-law part: {} .. {} --\n", format_instant(since), format_instant(boundary));
+    let eased_tally = tally(eased_pushes);
+    format_tally(&mut out, eased_pushes.len(), &eased_tally, now);
+    out += &verdict_eased(eased_tally.red_pushes);
+
+    out += &format!("{TAG}\n{TAG} -- queue-regime part: {} .. {} --\n", format_instant(boundary), format_instant(now));
+    let queued_tally = tally(queued_pushes);
+    format_tally(&mut out, queued_pushes.len(), &queued_tally, now);
+    out += &verdict_queued(&queued_tally, queued_pushes.len());
+
+    out += &format!("{TAG}\n{TAG} -- totals, both regimes --\n");
+    let total_tally = tally(&pushes);
+    format_tally(&mut out, pushes.len(), &total_tally, now);
+
     out
 }
 
@@ -524,6 +746,73 @@ mod tests {
         ];
         let report = render(&runs, parse_instant("2026-08-20T00:00:00Z"), parse_instant("2026-08-20T01:00:00Z"));
         assert!(report.contains("red-main incidents: 1 of 2"), "{report}");
+        assert!(report.contains("within threshold"), "{report}");
+    }
+
+    #[test]
+    fn a_window_straddling_a_regime_start_splits_into_two_partitions_and_verdicts() {
+        let runs = vec![
+            // eased part: two clean pushes.
+            run("a", "ci", "success", "2026-08-20T00:00:00Z", "2026-08-20T00:05:00Z"),
+            run("b", "ci", "success", "2026-08-20T00:20:00Z", "2026-08-20T00:25:00Z"),
+            // queue part, starting 2026-08-20T01:00:00Z: one red landing among three.
+            run("c", "ci", "success", "2026-08-20T01:05:00Z", "2026-08-20T01:10:00Z"),
+            run("d", "ci", "failure", "2026-08-20T01:20:00Z", "2026-08-20T01:25:00Z"),
+            run("e", "ci", "success", "2026-08-20T01:40:00Z", "2026-08-20T01:45:00Z"),
+        ];
+        let since = parse_instant("2026-08-20T00:00:00Z");
+        let now = parse_instant("2026-08-20T02:00:00Z");
+        let boundary = parse_instant("2026-08-20T01:00:00Z");
+        let report = render_split(&runs, since, now, Regime::Queued(boundary));
+
+        assert!(
+            report.contains("regime: merge queue required on main since 2026-08-20T01:00:00Z"),
+            "{report}"
+        );
+        assert!(
+            report.contains("-- eased-law part: 2026-08-20T00:00:00Z .. 2026-08-20T01:00:00Z --"),
+            "{report}"
+        );
+        assert!(
+            report.contains("-- queue-regime part: 2026-08-20T01:00:00Z .. 2026-08-20T02:00:00Z --"),
+            "{report}"
+        );
+        assert!(report.contains("-- totals, both regimes --"), "{report}");
+
+        // eased part: 0 of 2, within threshold — a and b never appear in queue's row.
+        assert!(report.contains("red-main incidents: 0 of 2"), "{report}");
+        // queue part: 1 of 3, naming the one that went red.
+        assert!(report.contains("red-main incidents: 1 of 3"), "{report}");
+        // totals: 1 of 5, exactly as an undivided report would have counted it.
+        assert!(report.contains("red-main incidents: 1 of 5"), "{report}");
+
+        assert!(report.contains("within threshold"), "{report}");
+        assert!(report.contains("QUEUE DID NOT HOLD — 1 of 3 queue landing(s)"), "{report}");
+        assert!(report.contains("2026-08-20T01:20:00Z d (ci) — 2026-08-20T01:25:00Z"), "{report}");
+    }
+
+    #[test]
+    fn a_queue_part_with_no_incidents_reports_the_queue_held() {
+        let runs = vec![
+            run("a", "ci", "success", "2026-08-20T01:05:00Z", "2026-08-20T01:10:00Z"),
+            run("b", "ci", "success", "2026-08-20T01:20:00Z", "2026-08-20T01:25:00Z"),
+        ];
+        let since = parse_instant("2026-08-20T01:00:00Z");
+        let now = parse_instant("2026-08-20T02:00:00Z");
+        let report = render_split(&runs, since, now, Regime::Queued(since));
+        assert!(report.contains("QUEUE HELD — 2 queue landing(s), 0 red-main incidents."), "{report}");
+        assert!(!report.contains("QUEUE DID NOT HOLD"), "{report}");
+    }
+
+    #[test]
+    fn regime_eased_puts_the_whole_window_on_the_eased_side() {
+        let runs = vec![run("a", "ci", "failure", "2026-08-20T00:00:00Z", "2026-08-20T00:10:00Z")];
+        let since = parse_instant("2026-08-20T00:00:00Z");
+        let now = parse_instant("2026-08-20T01:00:00Z");
+        let report = render_split(&runs, since, now, Regime::Eased);
+        assert!(report.contains("regime: no merge queue required on main"), "{report}");
+        assert!(report.contains("QUEUE HELD — 0 queue landing(s), 0 red-main incidents."), "{report}");
+        // One red push is within the eased threshold (it takes more than one).
         assert!(report.contains("within threshold"), "{report}");
     }
 }

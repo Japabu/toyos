@@ -124,3 +124,54 @@ it triggers, and does not itself change the landing protocol.
 numbers over a rolling window on demand and is wired into `ci.yml`'s nightly
 schedule as a reporting step, so this verdict is re-checked automatically
 rather than resting on this one dated snapshot.
+
+## 2026-08-22 report — the organization move landed, and the instrument now reads the regime
+
+**The stronger serialization arrived.** `main`'s ruleset (`gh api
+repos/{owner}/{repo}/rules/branches/main`, the same read `gate-stage` does)
+carries a `merge_queue` rule; the earliest `merge_group`-triggered run on
+`gh-readonly-queue/main/*` is `2026-08-20T14:39:48Z`, so that is the measured
+instant the eased law ended — a fact about the queue actually processing a
+landing, not the ruleset's `updated_at` (which last moved at
+`2026-08-20T13:28:44Z`, when the rule was added, and would drift on any later
+unrelated edit). The repository itself moved to `ToyOSOrg` around the same
+window. `cargo run -- --merge-health` (rolling 7-day window ending
+`2026-08-22T03:26:28Z`) now splits its report at that instant automatically
+and prints a per-regime verdict; see `src/mergehealth.rs`'s module header for
+how.
+
+**The eased-law part of this window confirms the breach already on record.**
+`2026-08-15T03:26:28Z .. 2026-08-20T14:39:48Z`: 85 pushes, **16 red-main
+incidents (18.8 %)** — consistent with, and a continuation of, the
+2026-08-20 backfill above; the threshold (">1 in a rolling week") stayed
+breached for the entirety of the eased law's life. Nothing new to conclude
+here — this is the historical record the queue was the response to, not a
+live gate any more.
+
+**The queue-regime part, `2026-08-20T14:39:48Z .. 2026-08-22T03:26:28Z`: 29
+push(es), 4 red-main incidents (13.8 %) — mechanically "QUEUE DID NOT HOLD"
+four times, and every one traces to an already-tracked cause, not a new
+composition/interaction failure:**
+
+| when (UTC) | headSha | red check | what, traced by hand |
+|---|---|---|---|
+| 15:34:49 | `625afce1b` | `guest-suite` (`screen_console_shell`) | already `KNOWN-RED` (`src/redlist.rs`), dev-host-loaded class, `ALONE: GREEN` on re-run |
+| 10:30:00 (08-21) | `4b71a0f60` | `guest-suite` (`i8042_absent`) | already `KNOWN-RED`, dev-host-loaded timing class (absolute figure moves run to run with no code change), `ALONE` re-run failed too but on a *different* assertion — the harness's own read is "not one defect reproduced" |
+| 15:32:37 (08-21) | `07f89c8bd` | `durations` (`guest-suite`) | the T14 lane's tier-price verdict hard-failed under the ci.yml that existed at that push — the softening that turns this into a warning on a trusted lane (`8a2a1c94`, "The profile has one instrument, and only it renders the tier verdict") landed six hours later the same day, `2026-08-21T21:16:38Z`. Not a live gap: a push made after `8a2a1c94` gets the warning, not the hard fail |
+| 17:07:13 (08-21) | `13953023a` | `guest-suite` (`console_line_atomicity`) | already `KNOWN-RED`, the exact recurring pattern (`writer A/B declared 1000 whole lines and the capture carries 99N`, a different writer and count each sighting), `ALONE: GREEN` |
+
+**Interaction failures (the specific risk the queue exists to prevent): 0,
+same as the eased-law backfill.** The queue is holding on the measure that
+matters — nothing has merged that broke a composition its own pre-merge
+`merge_group` run did not already see green — even though the rolling
+push-triggered run on `main`'s tip is *not* the same execution as the
+`merge_group` one and can still surface the ordinary dev-host-loaded flake
+class the eased-law report already named. `src/mergehealth.rs`'s
+`QUEUE DID NOT HOLD` verdict is deliberately mechanical (it counts, it does
+not classify) precisely because that judgment call — real regression or
+already-tracked flake — is a human or agent reading each row, the way this
+section just did.
+
+The threshold and its ">1 red-main incident in a rolling week" line stay as
+written above: they are the criterion that would apply again if the merge
+queue were ever removed, not a rule this window needs to re-pass.
