@@ -12,9 +12,10 @@
 //! the bottom of the tree, [`percpu`] owns `PerCpu`, its `gs:` offsets and the
 //! `const`-generic primitives every GS access in the kernel goes through, and
 //! [`entry`] owns the bracket — including the `cld` every Ring 0 entry owes
-//! itself. Outside this directory nothing writes a `gs:` string, and the six
-//! `arch::cpu` wrappers that take a caller-chosen value and are safe anyway are
-//! that module's header's subject.
+//! itself. Outside this directory nothing writes a `gs:` string, and which of
+//! [`cpu`]'s wrappers are `unsafe fn` — with the argument for each one that
+//! takes a caller-chosen value and is safe anyway — is that module's header's
+//! subject.
 
 pub mod apic;
 pub mod control_regs;
