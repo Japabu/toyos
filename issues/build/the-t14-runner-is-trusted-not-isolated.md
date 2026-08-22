@@ -39,3 +39,15 @@ The accounts that can trigger a trusted run are the two that can push at all
 (`Japabu` admin, `stu214634` write), which is why the above is accepted rather
 than blocking. It stops being acceptable the moment a third party gets write
 access.
+
+**2026-08-22 narrowed what reaches the machine, and changed none of the
+above.** `route.yml` now sends every `pull_request` and every `push` to
+GitHub-hosted runners, so in the ordinary course only a `schedule` other than
+`ci.yml`'s and a `workflow_dispatch` arrive here — a smaller surface, reached
+by fewer events, but by the same two accounts and with the same consequences
+once admitted. `accept-trusted.sh` is unchanged and still admits a same-repo
+`pull_request` and a `push` by name: it is the machine's boundary, not a copy
+of the routing rule, and it is what holds if a workflow names the `toyos`
+labels directly or the routing regresses. The exits named above — an ephemeral
+runner, a signed cache, `all_outside_collaborators` — are exactly as owed as
+they were.
