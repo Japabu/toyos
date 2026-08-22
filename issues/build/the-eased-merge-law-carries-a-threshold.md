@@ -124,3 +124,63 @@ it triggers, and does not itself change the landing protocol.
 numbers over a rolling window on demand and is wired into `ci.yml`'s nightly
 schedule as a reporting step, so this verdict is re-checked automatically
 rather than resting on this one dated snapshot.
+
+## 2026-08-22 report — the organization move landed, and the instrument now reads the regime
+
+**The stronger serialization arrived.** `main`'s ruleset (`gh api
+repos/{owner}/{repo}/rules/branches/main`, the same read `gate-stage` does)
+carries a `merge_queue` rule; the earliest `merge_group`-triggered run on
+`gh-readonly-queue/main/*` is `2026-08-20T14:39:48Z`, so that is the measured
+instant the eased law ended — a fact about the queue actually processing a
+landing, not the ruleset's `updated_at` (which last moved at
+`2026-08-20T13:28:44Z`, when the rule was added, and would drift on any later
+unrelated edit). The repository itself moved to `ToyOSOrg` around the same
+window. `cargo run -- --merge-health` (rolling 7-day window ending
+`2026-08-22T03:26:28Z`) now splits its report at that instant automatically
+and prints a per-regime verdict; see `src/mergehealth.rs`'s module header for
+how.
+
+**The eased-law part of this window confirms the breach already on record.**
+`2026-08-15T03:26:28Z .. 2026-08-20T14:39:48Z`: 85 pushes, **16 red-main
+incidents (18.8 %)** — consistent with, and a continuation of, the
+2026-08-20 backfill above; the threshold (">1 in a rolling week") stayed
+breached for the entirety of the eased law's life. Nothing new to conclude
+here — this is the historical record the queue was the response to, not a
+live gate any more.
+
+**The queue-regime part, `2026-08-20T14:39:48Z .. 2026-08-22T03:26:28Z`: 29
+push(es), 4 red-main incidents (13.8 %) — and the instrument's first cut at
+this named all four "QUEUE DID NOT HOLD" before it learned to check the fact
+that actually answers the question.** A red on `main`'s push-triggered run
+is not by itself evidence the queue failed: the queue validates a commit in
+its own `merge_group` run *before* landing it, and that run shares its
+`headSha` with the commit that becomes `main`'s tip (verified empirically,
+`src/mergehealth.rs`'s `fetch_composition` doc comment has the command and
+the sha). `cargo run -- --merge-health` now looks each incident's composition
+run up by that shared key instead of assuming guilt, and for all four of
+these it found `composition success`:
+
+| when (UTC) | headSha | red check | composition run | what, traced by hand |
+|---|---|---|---|---|
+| 15:34:49 | `625afce1b` | `guest-suite` (`screen_console_shell`) | success | already `KNOWN-RED` (`src/redlist.rs`), dev-host-loaded class, `ALONE: GREEN` on re-run |
+| 10:30:00 (08-21) | `4b71a0f60` | `guest-suite` (`i8042_absent`) | success | already `KNOWN-RED`, dev-host-loaded timing class (absolute figure moves run to run with no code change), `ALONE` re-run failed too but on a *different* assertion — the harness's own read is "not one defect reproduced" |
+| 15:32:37 (08-21) | `07f89c8bd` | `durations` (`guest-suite`) | success | the T14 lane's tier-price verdict hard-failed under the ci.yml that existed at that push — the softening that turns this into a warning on a trusted lane (`8a2a1c94`, "The profile has one instrument, and only it renders the tier verdict") landed six hours later the same day, `2026-08-21T21:16:38Z`. Not a live gap: a push made after `8a2a1c94` gets the warning, not the hard fail |
+| 17:07:13 (08-21) | `13953023a` | `guest-suite` (`console_line_atomicity`) | success | already `KNOWN-RED`, the exact recurring pattern (`writer A/B declared 1000 whole lines and the capture carries 99N`, a different writer and count each sighting), `ALONE: GREEN` |
+
+**Verdict, corrected: `QUEUE HELD — 4 tip(s) went red on the post-merge push
+run only`.** Every one of the four commits validated clean in the queue
+before it landed; the push-triggered run that follows a merge is a *separate*
+execution of the same suite on `main`'s own history, not a re-check of the
+composition, so it can still surface the ordinary dev-host-loaded flake class
+the eased-law report already named — with no composition failure and no
+interaction failure anywhere in it. **Interaction failures (the specific risk
+the queue exists to prevent): 0, same as the eased-law backfill; and now the
+mechanical verdict says so too, not just the hand trace.** `src/mergehealth.rs`'s
+verdict is still deliberately mechanical about which class a red row falls
+into once composition status is known — `QUEUE HELD` still asks a reader to
+adjudicate each red against `src/redlist.rs`, which is what this table did by
+hand.
+
+The threshold and its ">1 red-main incident in a rolling week" line stay as
+written above: they are the criterion that would apply again if the merge
+queue were ever removed, not a rule this window needs to re-pass.
