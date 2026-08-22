@@ -52,9 +52,9 @@
 //!
 //! `Dma<'pool>` borrows the [`DmaPool`] it came out of, so a view can never
 //! outlive the pages it names. That is the residual
-//! `issues/design-debt/kernelslice-from-raw-cannot-check-itself.md` records —
-//! "the type cannot check that the region it names outlives it" — closed for DMA
-//! memory by construction rather than by adjacency.
+//! `issues/design-debt/kernelslice-outlives-its-allocation.md` still records for
+//! [`super::KernelSlice`] — closed for DMA memory here by construction rather
+//! than by adjacency.
 //!
 //! A driver whose device outlives every scope is served by [`DmaPool::leak`],
 //! which consumes the pool, never gives its pages back, and answers with
@@ -343,8 +343,8 @@ impl DmaPool {
 
     /// The whole pool, as a view that may not outlive it.
     ///
-    /// This is where `KernelSlice::from_raw`'s justification used to be argued
-    /// and where it is now enforced: `alloc_contiguous` returned physically
+    /// This is where the deleted `KernelSlice::from_raw`'s justification used to
+    /// be argued and where it is now enforced: `alloc_contiguous` returned physically
     /// contiguous pages, `pages[0].direct_map()` is their first byte in the
     /// direct map, `self` is holding every one of them, and the borrow is what
     /// says the caller may not keep the view past that.

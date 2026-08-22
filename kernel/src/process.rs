@@ -127,24 +127,23 @@ impl OwnedAlloc {
 
     /// A bounds-checked view of the first `len` bytes.
     ///
-    /// The only safe way to build a `KernelSlice` over an `OwnedAlloc`:
-    /// `KernelSlice::from_raw` cannot check its length against the allocation,
-    /// so a slice longer than the buffer passes every check the slice makes.
+    /// `len` is checked against the allocation rather than trusted: the whole
+    /// window comes from [`crate::mm::Allocation`] and `subslice` bounds the
+    /// prefix against it, so a view longer than the buffer is a panic here and
+    /// not an out-of-bounds write somewhere later.
     pub fn slice(&self, len: usize) -> crate::mm::KernelSlice {
-        assert!(len <= self.size(), "OwnedAlloc::slice: {} > {}", len, self.size());
-        // SAFETY: `from_raw` asks that `base` be valid for `len` bytes for as
-        // long as the slice lives, and the assert above plus `&self` are
-        // exactly that: `len` is inside this allocation and the `OwnedAlloc`
-        // outlives the borrow, so the pages cannot be freed under it.
-        //
-        // Irreducible, and this method is *why*: `KernelSlice::from_raw` is
-        // unsafe because it cannot check a length against an allocation it
-        // knows nothing about (`issues/design-debt/
-        // kernelslice-from-raw-cannot-check-itself.md`). Here the allocation
-        // is known, so this is the one place the check can be made — which is
-        // a reduction already taken, not one still owed.
-        unsafe { crate::mm::KernelSlice::from_raw(self.ptr(), len) }
+        crate::mm::KernelSlice::whole(self).subslice(0, len)
     }
+}
+
+// SAFETY: `ptr()` is the address `alloc_zeroed` returned for `layout` and
+// `size()` is `layout.size()` — the same `Layout`, read off the allocation
+// rather than supplied beside it. `OwnedAlloc` is move-only, frees in its own
+// `Drop` and hands out no copy of the pointer that outlives `&self`, so the
+// bytes stay valid for as long as `self` does.
+unsafe impl crate::mm::Allocation for OwnedAlloc {
+    fn ptr(&self) -> *mut u8 { OwnedAlloc::ptr(self) }
+    fn size(&self) -> usize { OwnedAlloc::size(self) }
 }
 
 impl Drop for OwnedAlloc {
@@ -194,17 +193,11 @@ impl PageAlloc {
     /// This allocation as a bounds-checked window, sized from the pages it
     /// owns.
     ///
-    /// **The only safe way to build a [`KernelSlice`] over a `PageAlloc`**, and
-    /// the reason it is a method here: `KernelSlice::from_raw` cannot check the
-    /// length against the allocation, so a length written beside the pointer at
-    /// a call site is correct by adjacency and by nothing else.
-    /// [`OwnedAlloc::slice`] is the same shape one type over.
-    ///
     /// **A window and not a `&mut [u8]`, and these pages are why.** A frame
     /// filled through this becomes a *user* mapping a few statements later, and
     /// a `&mut [u8]` over bytes a process maps writable carries `noalias` and
     /// `dereferenceable` into LLVM — the borrow [`UserBytes`]'s header exists to
-    /// refuse. A `KernelSlice` hands out no reference: `copy_from` and
+    /// refuse. A [`KernelSlice`] hands out no reference: `copy_from` and
     /// `subslice` are a bounds-checked address and a raw copy, which is the
     /// shape [`UserBytesMut::write_at`] already uses on the other side of the
     /// same boundary. There is one such window type in this kernel and this is
@@ -214,15 +207,7 @@ impl PageAlloc {
     /// [`UserBytes`]: crate::user_ptr::UserBytes
     /// [`UserBytesMut::write_at`]: crate::user_ptr::UserBytesMut::write_at
     pub fn window(&self) -> crate::mm::KernelSlice {
-        // SAFETY: `KernelSlice::from_raw` asks that `base` be valid for `size`
-        // bytes for as long as the slice is used. Both come from the same
-        // `Vec<PhysPage>` this type owns and frees — `ptr()` is the direct-map
-        // address of the first page and `size()` is `len() * PAGE_2M` over a
-        // run `alloc_contiguous` returned, so the pages really are adjacent —
-        // and the length is therefore the allocation's own rather than a number
-        // a caller chose. That is exactly the check `from_raw` cannot make,
-        // which is why it is made here.
-        unsafe { crate::mm::KernelSlice::from_raw(self.ptr(), self.size()) }
+        crate::mm::KernelSlice::whole(self)
     }
 
     /// Total size in bytes (always a multiple of 2MB).
@@ -234,6 +219,17 @@ impl PageAlloc {
     pub fn phys(&self) -> u64 {
         self.0[0].direct_map().phys()
     }
+}
+
+// SAFETY: both halves come from the same `Vec<PhysPage>` this type owns and
+// frees — `ptr()` is the direct-map address of the first page and `size()` is
+// `len() * PAGE_2M` over a run `alloc_contiguous` returned, so the pages really
+// are adjacent and the length really is the allocation's. The pages go back to
+// the PMM when the `Vec` drops each `PhysPage`, which is when `self` dies, so
+// they stay valid for exactly as long as `self` does.
+unsafe impl crate::mm::Allocation for PageAlloc {
+    fn ptr(&self) -> *mut u8 { PageAlloc::ptr(self) }
+    fn size(&self) -> usize { PageAlloc::size(self) }
 }
 
 // MappedPages — physical pages plus the user address they were mapped at
@@ -1865,19 +1861,13 @@ pub fn handle_page_fault(fault_addr: u64, _error_code: u64) -> bool {
             let page_elf_offset = (region_start + offset).wrapping_sub(elf_base);
             if ri.has_relocs_in_page(page_elf_offset) {
                 // `subslice` asserts `offset + 4096 <= page_2m` against the
-                // frame's own size, which is precisely `apply_to_page`'s
-                // requirement: it writes only inside the 4 KiB page its pointer
-                // names. The bound used to be `offset < page_2m` — this loop's
-                // condition, an argument rather than a check, and one that says
-                // nothing about the 4096 bytes past `offset`.
-                //
-                // The remaining gap is `apply_to_page`'s signature, not this
-                // call: it takes a `*mut u8` without being an `unsafe fn`, so
-                // the validity requirement is real and not type-enforced —
-                // `issues/kernel/raw-pointer-writers-not-marked-unsafe-in-loader.md`.
+                // frame's own size, and `apply_to_page` then bounds every write
+                // against the window it was handed rather than against a 4096
+                // of its own. The bound used to be `offset < page_2m` — this
+                // loop's condition, an argument rather than a check, and one
+                // that says nothing about the 4096 bytes past `offset`.
                 total_relocs = total_relocs.saturating_add(
-                    ri.apply_to_page(page_elf_offset, page.subslice(offset as usize, 4096).base())
-                        as u16,
+                    ri.apply_to_page(page_elf_offset, page.subslice(offset as usize, 4096)) as u16,
                 );
             }
             offset += 4096;

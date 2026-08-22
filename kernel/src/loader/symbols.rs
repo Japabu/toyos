@@ -145,18 +145,17 @@ pub fn read_backtrace_table(
         log!("ELF: {}: no {} bytes for its symbol table", path, total);
         return empty();
     };
-    let dst = pages.ptr();
-    if crate::elf::read_backing_into(backing, syms.offset, dst, syms.size as usize).is_err()
+    // The two reads partition the allocation into exactly its two halves, and
+    // `subslice` is what says so: `pages` was asked for `syms.size + strs.size`
+    // bytes, and each window is bounded against what came back rather than
+    // against that sum written out a second time.
+    let dst = pages.window();
+    if crate::elf::read_backing_into(backing, syms.offset, dst.subslice(0, syms.size as usize))
+        .is_err()
         || crate::elf::read_backing_into(
             backing,
             strs.offset,
-            // SAFETY: `pages` is `PageAlloc::new(total, ...)` with `total ==
-            // syms.size + strs.size` above, so `dst.add(syms.size)` stays
-            // inside it — this call and the one above partition the whole
-            // allocation into exactly its two halves, with nothing left
-            // over and nothing overlapping.
-            unsafe { dst.add(syms.size as usize) },
-            strs.size as usize,
+            dst.subslice(syms.size as usize, strs.size as usize),
         )
         .is_err()
     {

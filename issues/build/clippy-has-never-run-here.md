@@ -134,8 +134,8 @@ before adopting:
 | `arch/` | 107 | **adopted 2026-08-22 — the last area, and the highest-risk one.** 107 findings (112 `unsafe` blocks in all); **30 removed, 77 documented, 3 filed.** Per file below. |
 | root files (`user_ptr.rs`, `process.rs`, `preempt.rs`, `inbox.rs`, `main.rs`, `symbols.rs`, `hw.rs`, `file_backing.rs`, `sync.rs`, `scheduler.rs`, `pipe.rs`, `page_cache.rs`, `bcachefs_adapter.rs`) | 76 | **adopted** — 13 removed, 63 documented, 4 filed. Per file and per finding below. |
 | `mm/` | 35 | **adopted** — every site now carries a `SAFETY:` comment; two (`object::shm::Pages`, `mm::paging::AddressSpace`'s `Send`/`Sync` impls) turned out to look vestigial rather than load-bearing, filed rather than removed: `issues/kernel/redundant-send-sync-impls-mm-object.md` |
-| `elf/` | 23 | **adopted** — every site now carries a `SAFETY:` comment; writing the justification found two functions (`elf::read_backing_into`, `elf::index::RelocationIndex::apply_to_page`) that write through a raw pointer without being `unsafe fn`, filed as `issues/kernel/raw-pointer-writers-not-marked-unsafe-in-loader.md` (every current call site is correct; the gap is that nothing enforces the next one being) |
-| `sched/` | 8 | **adopted 2026-08-22**, under the reduction ruling. 8 findings (26 `unsafe` blocks in all); **4 removed, 5 documented, 1 filed** (`issues/kernel/five-more-inline-cli-sti-where-a-safe-helper-exists.md`, which is outside this area). |
+| `elf/` | 23 | **adopted** — every site now carries a `SAFETY:` comment; writing the justification found two functions (`elf::read_backing_into`, `elf::index::RelocationIndex::apply_to_page`) that write through a raw pointer without being `unsafe fn`, filed rather than fixed. Both take a `mm::KernelSlice` now (2026-08-22), so the extent is the allocation's and the file is closed. |
+| `sched/` | 8 | **adopted 2026-08-22**, under the reduction ruling. 8 findings (26 `unsafe` blocks in all); **4 removed, 5 documented, 1 filed** — the five sites of the same shape outside this area, since taken by the root-file and `arch/` sweeps, so that file is closed too. |
 | `loader/` | 8 | **adopted** — every site now carries a `SAFETY:` comment (one finding shared with `elf/`, above) |
 | `iommu/` | 8 | **adopted 2026-08-22**, under the reduction ruling. 8 findings (8 `unsafe` blocks in all); **5 removed, 3 documented, 0 filed** — the area's whole remainder is two window constructions and a `clflush`. |
 | `log/` | 2 | **adopted 2026-08-22**, under the reduction ruling. 2 findings (9 `unsafe` blocks in all, seven of them documented before this pass); **0 removed, 2 documented, 1 filed** (`issues/build/logrecord-has-no-as-bytes.md`). |
@@ -294,9 +294,9 @@ are 5.
 
 **Three `asm!("cli"/"sti")` in `idt/mod.rs`** became
 `arch::cpu::{enable,disable}_interrupts`, which is that instruction with those
-options — the three
-`issues/kernel/five-more-inline-cli-sti-where-a-safe-helper-exists.md` names in
-this area. The two it names in `main.rs` are a root file and stay filed.
+options — three of the five the `sched/` sweep filed. The other two were in
+`main.rs` and the root-file sweep had already taken them, so nothing of that
+finding was left.
 
 **`smp.rs`'s `asm_label_addr!` took its `unsafe` inside.** A `lea` off `rip`
 computes an address and reads nothing, so there was no caller obligation to
@@ -398,9 +398,10 @@ be worth more than the comments were:
   user mapping. **Decided and fixed 2026-08-22**: no new type — `PageAlloc`
   gained a safe `window()` that hands back the `mm::KernelSlice` this kernel
   already has, sized from the allocation it owns, and `UserStack` holds one
-  instead of its own private bound. That is also half of
-  `issues/design-debt/kernelslice-from-raw-cannot-check-itself.md`'s named fix
-  shape; the loader and `DmaPool` still name their own sizes, so it stays open.
+  instead of its own private bound. That was also the first third of the
+  "allocators construct the slice" fix that `KernelSlice::from_raw` was open on;
+  `DmaPool` took the second (it is `mm::Dma` now) and the ELF loader the third,
+  and with all three done `from_raw` is deleted and that file is closed.
 
 One correctness fix landed with the sweep rather than being filed, because
 writing the comment is what found it and the fix is a deleted token:
@@ -431,10 +432,10 @@ here, the same reasoning as the two findings above: this pass's job was
 documentation, and the fix touches a security-relevant module's actual code,
 not its comments. Documenting `elf/` surfaced a related but distinct pattern
 — two functions that take a raw pointer without being `unsafe fn`, so the
-validity requirement is real but not type-enforced — filed as
-`issues/kernel/raw-pointer-writers-not-marked-unsafe-in-loader.md`. Four
-real findings from three areas, which is the whole reason this pass writes
-the justification by hand instead of pattern-matching the comment shape.
+validity requirement is real but not type-enforced — filed rather than fixed,
+and both take a `mm::KernelSlice` now. Four real findings from three areas,
+which is the whole reason this pass writes the justification by hand instead
+of pattern-matching the comment shape.
 
 ### `sched/`, `iommu/` and `log/`, the three small areas (swept 2026-08-22)
 
@@ -456,9 +457,9 @@ blocks.
 and expand to the same `asm!("sti"/"cli", options(nomem, nostack))` the four
 sites spelled by hand — `driver::execute`'s idle arm (which may not use an
 `IrqGuard`, because both its exits have to *set* `IF` rather than restore it)
-and `dump::deaf_window`. Five more of the same shape are outside this sweep's
-areas and are filed rather than reached into:
-`issues/kernel/five-more-inline-cli-sti-where-a-safe-helper-exists.md`.
+and `dump::deaf_window`. Five more of the same shape were outside this sweep's
+areas and were filed rather than reached into; the root-file and `arch/` sweeps
+took all five, so nothing of that finding is left.
 
 **`iommu/` removed five with one addition to `mm`.** `Mmio` was already a
 bounds-checked volatile window with safe accessors and one constructor,

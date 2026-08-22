@@ -10,7 +10,7 @@
 
 use alloc::vec::Vec;
 
-use crate::mm::MAX_HEAP_ALLOC;
+use crate::mm::{KernelSlice, MAX_HEAP_ALLOC};
 use toyos_elf::{RelaCounts, RelaTable, RelocKind};
 
 /// Relocation entries the loader needs, grouped by what it does with them.
@@ -106,15 +106,20 @@ impl RelocationIndex {
         self.entries_i32.sort_unstable_by_key(|&(off, _)| off);
     }
 
-    /// Apply the writes that fall inside `[page_offset, page_offset + 4096)`,
-    /// returning how many landed.
+    /// Apply the writes that fall inside `[page_offset, page_offset +
+    /// page.size())`, returning how many landed.
     ///
-    /// A relocation straddling the page boundary is skipped rather than
-    /// clipped: the loader validated it against the image, so the other half
-    /// belongs to the next page and this is a page-at-a-time limitation, not a
-    /// bounds failure.
-    pub fn apply_to_page(&self, page_offset: u64, page_ptr: *mut u8) -> usize {
-        let end_offset = page_offset + 4096;
+    /// **`page` is a window and not a `*mut u8`**, so the extent this writes
+    /// into is the caller's allocation rather than a 4096 this function assumed
+    /// and nothing checked. The caller hands one 4 KiB page out of the frame it
+    /// is filling; the bound is read off that window, so the two cannot
+    /// disagree.
+    ///
+    /// A relocation straddling the far edge is skipped rather than clipped: the
+    /// loader validated it against the image, so the other half belongs to the
+    /// next page and this is a page-at-a-time limitation, not a bounds failure.
+    pub fn apply_to_page(&self, page_offset: u64, page: KernelSlice) -> usize {
+        let end_offset = page_offset + page.size() as u64;
         let mut count = 0usize;
 
         let start = self.entries_u64.partition_point(|&(off, _)| off < page_offset);
@@ -123,19 +128,14 @@ impl RelocationIndex {
                 break;
             }
             let within_page = (r_offset - page_offset) as usize;
-            if within_page + 8 <= 4096 {
-                // SAFETY: `within_page + 8 <= 4096` was just checked, so this
-                // write lands inside the 4096-byte page `page_ptr` names —
-                // but that `page_ptr` itself is valid for a 4096-byte page at
-                // all is this function's caller's obligation, not something
-                // `apply_to_page` checks; its one call site
-                // (`process.rs`'s fault handler) passes an offset into a 2
-                // MiB buffer it owns, bounded by its own loop. See
-                // issues/kernel/raw-pointer-writers-not-marked-unsafe-in-loader.md
-                // for why that obligation is not yet type-enforced.
-                unsafe {
-                    core::ptr::write_unaligned(page_ptr.add(within_page) as *mut u64, value);
-                }
+            if within_page + 8 <= page.size() {
+                // SAFETY: `KernelSlice::write` is an `unsafe fn`; it asserts
+                // `within_page + 8 <= page.size()` against the allocation
+                // `page` was built from, which is the whole of what the write
+                // needs — the caller can no longer hand a length that is not
+                // the window's. Nothing else can see the frame: it is filled
+                // before it is mapped into any address space.
+                unsafe { page.write::<u64>(within_page, value) };
                 count += 1;
             }
         }
@@ -146,12 +146,10 @@ impl RelocationIndex {
                 break;
             }
             let within_page = (r_offset - page_offset) as usize;
-            if within_page + 4 <= 4096 {
+            if within_page + 4 <= page.size() {
                 // SAFETY: same argument as the `entries_u64` loop above, for
                 // 4 bytes instead of 8.
-                unsafe {
-                    core::ptr::write_unaligned(page_ptr.add(within_page) as *mut i32, value);
-                }
+                unsafe { page.write::<i32>(within_page, value) };
                 count += 1;
             }
         }
