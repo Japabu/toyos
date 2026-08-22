@@ -172,3 +172,46 @@ ledger was written.
   `issues/build/xhci-full-speed-device-jumped-47-percent-over-its-commitment.md`:
   that name had margin and jumped anyway, which the rule's own derivation says
   is a finding about the test rather than a straddle.
+
+## 2026-08-22
+
+- **The direction flag no Ring 0 entry cleared** — origin: pre-existing (every
+  kernel this repository has ever built; there was no `cld` anywhere in
+  `kernel/src` and `IA32_FMASK` was `0x40200`). discoverer: runtime observation
+  — three days of boot storms correlated across a signature no test names and
+  no gate could have caught, the writer being one instruction below every
+  instrument that had already cleared the scheduler's own record, the heap, the
+  entry stacks and the switch frame. escape boundary: **release or real
+  hardware** — the class was sighted on the T14 under KVM before it was
+  understood (`issues/kernel/cpu-7-has-no-cpusched-returned-on-kvm.md`), not
+  only on the dev host under cross-arch TCG. PR #202 ("No Ring 0 entry cleared
+  the direction flag, and that was the stray writer"):
+  `compiler_builtins::mem::memmove`'s overlapping path is `std` … three `rep`
+  string operations … `cld`, interruptible throughout, and no gate clears `DF` —
+  so an interrupt taken inside that window entered the kernel with the flag set
+  and every `memcpy`/`memset` after it wrote its `n` bytes *below* its
+  destination. Dev host, cross-arch TCG: 37 deaths in 13,960 unfixed boots
+  against 0 in 7,418 fixed (Poisson, expected 19.66, p = 2.9e-9).
+
+- **What real hardware said about it, which is not what it was asked** — the
+  epistemically independent oracle the high-risk rule owes was to be silicon,
+  and it returned a null rather than a confirmation. 2026-08-21/22 on the T14
+  (i5-1135G7, KVM, QEMU 11.1.0, the CI image by digest, `-smp cores=8`, six
+  guests at once on eight threads, `compositor: ready` as the marker and a
+  parked guest read over QMP): **0 deaths in 8,976 unfixed boots and 0 in 8,579
+  fixed**, across both the shipped kernel and the dev host's own
+  `sched-tripwire stack-witness` arms — the two `objdump`-verified apart by the
+  ten `cld`s and the `IA32_FMASK` word. So the contrast that would have
+  confirmed the fix could not form: the dev host's rate is refused on this
+  machine (arm A's 17 in 7,059 expects 17.31 in the 7,186 instrumented unfixed
+  boots taken here, p = 3.0e-8; the pooled 37 in 13,960 expects 23.79 in 8,976,
+  p = 4.7e-11), and the T14's own prior sighting rate is refused too (1 in 254
+  expects 69.11 in 17,555, p = 9.6e-31). The fix's independent oracles remain
+  the four outside this tree that PR #202 already names — SDM Vol. 3A §6.12.1,
+  the System V AMD64 ABI, Linux's `MSR_SYSCALL_MASK` and its entry `cld`, and
+  `objdump` of an unmodified crates.io `compiler_builtins`. **The lesson is
+  about the instrument**: exposure to this defect scales with timer ticks per
+  boot, and a KVM boot spends a fraction of the wall clock a TCG boot spends on
+  the same guest work — so the emulator was not the weaker instrument here, it
+  was very much the stronger one, and a class measured only there is not
+  replicated by pointing faster silicon at it.

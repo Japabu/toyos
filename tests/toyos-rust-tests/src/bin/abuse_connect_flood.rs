@@ -36,8 +36,8 @@ const NAME: &str = "abuse-connect-flood";
 
 /// Physical bytes in use, from `SYS_SYSINFO`'s header.
 fn used_bytes() -> u64 {
-    let mut buf = [0u8; 48];
-    let n = toyos_abi::syscall::sysinfo(&mut buf);
+    let mut buf = [0u8; toyos::system::SYSINFO_HEADER_SIZE];
+    let n = toyos::system::sysinfo(&mut buf);
     assert_eq!(n, buf.len(), "SYS_SYSINFO would not fill its header");
     u64::from_le_bytes(buf[8..16].try_into().unwrap())
 }

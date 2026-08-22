@@ -19,11 +19,12 @@ the reap path. `poison_tid` says so in the log and then carries on:
 poison_tid: cpu 0 slot still held 82:0 — its waiter is stranded
 ```
 
-Found while auditing
-`issues/kernel/ring0-jump-to-zero-under-port-polls.md`, where that exact
-line is in the report and the fault it accompanies has the register state of a
-task resumed from a kernel stack that was freed and reissued under it. The two
-may be the same event; nothing has shown that they are.
+Found while auditing the Ring 0 fetch at address zero of 2026-08-09 — closed on
+2026-08-22 with the direction-flag class (PR #202), whose backwards `memset`
+writes the all-zero frame that sighting resumed from — where that exact line is
+in the report: the process had faulted once before, and the slot already held it.
+Whether the two faults were one event or two was never shown, and this defect
+stands on the first line of this file either way.
 
 ## Why one slot was enough and is not
 

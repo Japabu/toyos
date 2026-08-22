@@ -3,8 +3,9 @@
 pub use toyos_abi::syscall::RealTime;
 use toyos_abi::syscall;
 
-pub const SYSINFO_HEADER_SIZE: usize = 48;
-pub const SYSINFO_ENTRY_SIZE: usize = 64;
+/// The ABI's, re-exported rather than restated: two spellings of one layout are
+/// a reader that walks off by a field the day one of them moves.
+pub use toyos_abi::syscall::{SYSINFO_ENTRY_SIZE, SYSINFO_HEADER_SIZE};
 
 /// The time of day in the machine's own zone, or `None` on a machine whose
 /// clock never answered.
@@ -21,8 +22,20 @@ pub fn clock_epoch() -> Option<u64> {
     syscall::clock_epoch()
 }
 
-pub fn sysinfo(buf: &mut [u8]) -> usize {
-    syscall::sysinfo(buf)
+/// The machine's header: total and used memory, the CPU count, the live-thread
+/// count, the uptime, and the busy and available CPU nanoseconds a percentage
+/// is derived from.
+///
+/// **Ambient, and the buffer is what says so.** The same syscall answers the
+/// process roster after this header, and writing one entry of that costs
+/// [`Rights::ROSTER`] on a `SysCap` — so this takes an array of exactly the
+/// header's length and a caller that only wants machine facts cannot express
+/// the privileged question by accident. [`crate::syscap::SysCap::roster`] is
+/// the other half.
+///
+/// [`Rights::ROSTER`]: toyos_abi::handle::Rights::ROSTER
+pub fn sysinfo(buf: &mut [u8; SYSINFO_HEADER_SIZE]) -> usize {
+    syscall::sysinfo(toyos_abi::handle::HANDLE_INVALID, buf)
 }
 
 // Powering the machine off used to be a free function here, over a syscall that

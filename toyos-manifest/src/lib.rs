@@ -68,10 +68,16 @@ const SYSCAP_RIGHTS: &[(&str, Rights)] = &[
     // program whose whole loop is read-then-park.
     ("logread", Rights::LOG.union(Rights::WAIT)),
     // Power the machine off. The largest authority on the list — it ends every
-    // process there is, including the ones that hold the other four — and the
-    // last one to have been free: `SYS_SHUTDOWN` took no handle at all, so a
-    // program endowed exactly one connector could halt the machine with it.
+    // process there is, including the ones that hold the other five — and the
+    // last but one to have been free: `SYS_SHUTDOWN` took no handle at all, so
+    // a program endowed exactly one connector could halt the machine with it.
     ("power", Rights::POWER),
+    // Read the roster of every process in the machine: `SYS_SYSINFO`'s
+    // per-thread entries, each carrying a pid, a size, a CPU time and a name.
+    // The machine header the same call answers first is ambient, so `free` and
+    // every daemon that sizes itself off total memory name nothing here — this
+    // is the census alone, and `/bin/ps` is what it is for.
+    ("roster", Rights::ROSTER),
 ];
 
 /// The whole right set a program's `syscap` list asks for.
@@ -103,7 +109,7 @@ pub struct Program {
     /// Rights on the `SysCap` duplicate init endows this program, by the names
     /// [`syscap_rights`] takes. Empty for all but a handful: nothing else in
     /// the system may enter the RT band, mint a device claim, read the machine
-    /// log or power the machine off.
+    /// log, list every process in the machine, or power the machine off.
     pub syscap: Vec<String>,
 }
 
@@ -379,6 +385,27 @@ mod tests {
         // And it is not the RT band's, nor a device claim's, however it is
         // spelled.
         assert!(syscap_rights(&["log".into()]).is_err());
+    }
+
+    /// **The census is one bit and the log is another**, asserted because the
+    /// two are the same shape — a machine-wide reading no program gets by
+    /// default — and a config that named one meaning the other would build an
+    /// image whose `ps` works and whose `logd` writes nothing, or the reverse.
+    ///
+    /// `WAIT` is deliberately absent: `SYS_SYSINFO` answers where it stands and
+    /// there is nothing to park on, so a roster holder needs no readiness
+    /// source the way `logread` does.
+    #[test]
+    fn the_process_roster_is_its_own_name_and_its_own_bit() {
+        assert_eq!(
+            syscap_rights(&["roster".into()]).unwrap(),
+            Rights::TRANSFER.union(Rights::ROSTER)
+        );
+        assert!(!syscap_rights(&["roster".into()]).unwrap().contains(Rights::LOG));
+        assert!(!syscap_rights(&["logread".into()]).unwrap().contains(Rights::ROSTER));
+        // Not the applet's name, and not the syscall's.
+        assert!(syscap_rights(&["ps".into()]).is_err());
+        assert!(syscap_rights(&["sysinfo".into()]).is_err());
     }
 
     /// A class name reaches init through this file, so a `devices` entry the

@@ -57,8 +57,12 @@ exclude = [
     # submodule this repository does not resolve for.
     "rust",
     # The userland SDK. It compiles against the ToyOS sysroot and is a path
-    # dependency of `rust/library/std`; there is nothing in it a host `cargo
-    # test` could run.
+    # dependency of `rust/library/std`, so it keeps its own resolution and
+    # cannot be a member. It is host-tested all the same — its `lib.rs` is
+    # `cfg_attr(not(test), no_std)` and `host-tests.yml`'s `toyos SDK host
+    # tests` step runs `cargo test` in it against the host triple. Every crate
+    # in `exclude` that has host tests is named in that workflow; nothing here
+    # reaches them.
     "toyos",
     # Guest programs `src/build.rs` builds for `x86_64-unknown-toyos`, each from
     # its own directory. The harness's own integration test lives here too

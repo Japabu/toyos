@@ -896,13 +896,28 @@ pub const KNOWN_RED: &[Red] = &[
         test: "metal_sim_pointer_churn",
         instrument: Instrument::Ci,
         finding: Finding::Seen,
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the capture was behind the colon the whole time, read 2026-08-22 with `gh run view \
+             31396171916 --log-failed`: `[kernel 0.669 cpu1 tid=0] SEGFAULT tid=0: execute \
+             unmapped address at 0x1b`, `cs=0x0008`, `rsp=0xffff800000dda000` with eight zero \
+             quadwords from it, and one line later cpu0's `#PF UNHANDLED: cr2=0x0 rip=0x0 \
+             err=0x10 user=false` — two CPUs dying at 0.669 s in the spawn burst, both on a \
+             Ring 0 fetch at a tiny address. That is the signature whose four dev-host rows \
+             were deleted with PR #149 (`SchedPass::answer_steal_requests`: a CPU handed a \
+             thief the context it was still standing on — 13 deaths in 1,272 boots to 0 in \
+             1,584), and the zeroed frame under it is what PR #202's backwards `memset` writes \
+             (no Ring 0 entry cleared `DF`; 37 deaths in 13,960 twelve-wide boots without the \
+             `cld`, 0 in 7,418 with it, p = 2.9e-9, commit 5e74971e). Both mechanisms are \
+             gone, so the death this row measured cannot recur; a red under this name now is a \
+             new measurement. The name was the workload, on a KVM shard, exactly as \
+             `tests/CLAUDE.md` says",
+        ),
         what: "`[qemu] Init process crashed during boot:`, 244 s in the phase, and \
                `ALONE: GREEN, and it was alone both times — nothing the harness controls differed, \
                so it failed once and passed once. That is a rate and not a classification`. The \
                name is 0 of 5 in the probe and declared closed in a write-up",
         evidence: "run 31396171916, `main` at 7af7c20, shard 2",
-        source: "issues/hardware/metal-sim-pointer-churn-red-again-on-main.md",
+        source: "src/redlist.rs",
         measured: "2026-08-10",
     },
     // ---------------------------------------------------------------------
@@ -958,7 +973,7 @@ pub const KNOWN_RED: &[Red] = &[
                    `serial:` because `in_test` never became true, so its lines went to \
                    `TestResult::before` and the caller drops that — its cause is unrecorded and is \
                    not counted here",
-        source: "issues/kernel/the-check-build-guest-stopped-answering-on-kvm-twice.md",
+        source: "tests/common/passcost.rs",
         measured: "2026-08-16",
     },
     // ---------------------------------------------------------------------
@@ -992,7 +1007,7 @@ pub const KNOWN_RED: &[Red] = &[
                    `Instrument::Ci` row above. The TCG explanation of *this* magnitude stands — \
                    nothing on KVM has come within five times it — but the implied claim about the \
                    other accelerator does not",
-        source: "issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
+        source: "tests/common/passcost.rs",
         measured: "2026-08-15",
     },
     Red {
@@ -1045,7 +1060,7 @@ pub const KNOWN_RED: &[Red] = &[
                    samples the gate's argument assumed a busy machine produces. The controlled \
                    experiment that turned that counter-evidence into the retirement above is in \
                    `tests/common/passcost.rs`",
-        source: "issues/kernel/invariant-p-cannot-hold-under-cross-arch-tcg.md",
+        source: "tests/common/passcost.rs",
         measured: "2026-08-17",
     },
     Red {
@@ -1316,7 +1331,17 @@ pub const KNOWN_RED: &[Red] = &[
         what: "`round 1: the guest never printed CHURN-DONE 0 100`, **598 s** in the wide phase \
                against a phase that is ~45 s on a quiet host, `ALONE … GREEN`. The landing gate it \
                killed ran 778.9 s with four other `--land` processes on the host, on a branch whose \
-               whole delta was two documentation lines",
+               whole delta was two documentation lines. **2026-08-22:** a kernel death of PR \
+               #202's class (no Ring 0 entry cleared `DF`; 37 deaths in 13,960 loaded boots \
+               before the `cld`, 0 in 7,418 after) leaves exactly this capture too — a guest \
+               that stops mid-test under load, on a date before any wait could see a panic \
+               (`issues/build/every-recorded-stall-predates-the-panic-discriminator.md`) — \
+               and nothing in it separates that from the host. One sighting, no denominator \
+               on record; what retires it is loaded suites of the fixed tree with no red under \
+               this name, three by the Poisson rule (p = e^-3 against a rate of one per suite). \
+               That count is owed: the 2026-08-22 sweep found the guest suite refused in its \
+               worktree for the whole session, the shared sysroot being claimed by \
+               `wt/toyos-census`'s ABI landing (#209)",
         evidence: "a landing gate on a documentation-only branch",
         source: "issues/build/parallel-tests-red-under-other-suites.md",
         measured: "2026-08-07",
@@ -1371,7 +1396,15 @@ pub const KNOWN_RED: &[Red] = &[
         what: "`the report the keystroke painted does not carry \"== VERDICT:\"`; the decoded \
                panel was the boot-log tail ending `[page 2/4]`, with none of the dump's three \
                summary markers. The isolated re-run painted `0 overdue, 0 absurd, 0 unheld, 0 \
-               never ran` and passed in 6 s",
+               never ran` and passed in 6 s. **2026-08-22:** the dump is dispatched from a \
+               scheduler pass, so a machine whose CPUs had halted paints exactly this panel — \
+               the boot-log tail and no verdict — and a kernel death of PR #202's class (no \
+               Ring 0 entry cleared `DF`; 37 deaths in 13,960 loaded boots before the `cld`, \
+               0 in 7,418 after, and the class has one KVM sighting) is a cause this capture \
+               cannot exclude. Not shown: no serial line names a death, and the sighting \
+               predates the wait that would have. Retires on the hosted lane by the Poisson \
+               rule: at the recorded rate of one red in two runs, six consecutive green runs \
+               (p = e^-3)",
         evidence: "PR #33 run 31472702284, job 93736011023, merge ref \
                    1d19104d1b832da1aaad43906e0673cb87db93ba",
         source: "issues/diagnostics/blocked-dump-cannot-fire-on-a-total-freeze.md",
@@ -1384,7 +1417,14 @@ pub const KNOWN_RED: &[Red] = &[
         standing: Standing::Stands,
         what: "`the report the keystroke painted does not carry \"== VERDICT:\"`, after 520 s in \
                the wide phase; the isolated re-run was green. This is the no-verdict shape, not \
-               the retired compositor-overlay red under the same test name",
+               the retired compositor-overlay red under the same test name. **2026-08-22:** as \
+               the CI row under this name — a machine whose CPUs halted paints this panel, so a \
+               kernel death of PR #202's class (37 deaths in 13,960 loaded boots before the \
+               `cld`, 0 in 7,418 after) is a cause the capture cannot exclude and does not \
+               show; twelve wide beside a second worktree's suite is that class's exposure. One \
+               sighting; retires at three loaded suites of the fixed tree with no red under this \
+               name (p = e^-3 against one per suite). That count is owed: on 2026-08-22 the \
+               guest suite was refused behind `wt/toyos-census`'s sysroot claim (#209)",
         evidence: "one 12-wide full suite on 2026-08-09 while a second worktree's suite was live, \
                    then the harness's isolated re-run",
         source: "issues/diagnostics/blocked-dump-cannot-fire-on-a-total-freeze.md",
@@ -1627,13 +1667,30 @@ pub const KNOWN_RED: &[Red] = &[
     // worktree's suite holding guest slots beside it. Two of the four are the
     // same QEMU-exited-0 signature under two names, which is neither test's
     // subject — a shard's partitioning diff cannot reach a guest that never
-    // booted.
+    // booted. Both are retired since 2026-08-22: that signature is a guest that
+    // reset itself during boot, which is the silent death of PR #202's class.
     // ---------------------------------------------------------------------
     Red {
         test: "screen_fatal_halt",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::Seen,
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the silent death of PR #202's class (commit 5e74971e), retired 2026-08-22. The \
+             harness passes `-no-reboot` (`tests/common/qemu.rs`, whose own comment says a \
+             guest that triple-faults exits QEMU), so `QEMU died before ===READY=== (status \
+             … 0)` is a guest that reset itself during boot having said nothing: not a kill, \
+             which exits on a signal, and not a QEMU that could not start, which exits \
+             non-zero. No Ring 0 entry cleared the direction flag, and every `memcpy`/`memset` \
+             reached from an interrupt inside `memmove`'s `std` window wrote its bytes below \
+             its destination — 37 deaths in 13,960 twelve-wide `bootable.img` boots without \
+             the `cld`, 25 of them silent exactly like this, 0 of any kind in 7,418 with it \
+             (p = 2.9e-9); a parked silent death reads `RFL=[D--Z-P-]` with a non-canonical \
+             RIP (PR #198). Same instrument — TCG, twelve wide, a boot — so the class A/B \
+             transfers, and the cold-build correlation the write-up found is the load that \
+             raised the rate. A clean exit before the marker now is a new measurement. What \
+             the write-up still owes is the harness's, not the kernel's: the arm that reports \
+             this exit drops `seen` and the UART log",
+        ),
         what: "`[qemu] QEMU died before ===READY=== (status: Ok(ExitStatus(unix_wait_status(0))))` \
                — QEMU exited *successfully* before the guest said anything, so the capture holds \
                nothing to bisect and the test's name is the whole of the evidence. \
@@ -1649,7 +1706,12 @@ pub const KNOWN_RED: &[Red] = &[
         test: "double_fault_stack",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::Seen,
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the identical signature, retired 2026-08-22 with `screen_fatal_halt`'s row above \
+             for the identical reason: a guest that reset itself during a loaded boot under \
+             `-no-reboot`, the silent death of PR #202's class (commit 5e74971e; 37 deaths in \
+             13,960 unfixed boots, 0 in 7,418 fixed)",
+        ),
         what: "the identical line, in the same phase as the row above — and the two names have \
                nothing in common but a boot. `ALONE: GREEN`, and green again in 2 s run by name",
         evidence: "the same full `cargo test` on `wt/toyos-ciwall`; the same day the signature also \
@@ -1974,7 +2036,16 @@ pub const KNOWN_RED: &[Red] = &[
                GREEN — it fails only beside other guests`; the load was two worktrees' full \
                suites interleaved over the shared twelve guest slots. **Not about the diff it \
                was found on**, a census-settling change inside `handle_kill_policy`'s own guest \
-               binary",
+               binary. **2026-08-22:** the leading explanation is PR #202's class — no Ring 0 \
+               entry cleared `DF`, and a machine-wide death at boot's edge under two suites on \
+               a branch with no kernel byte is that class's shape (37 deaths in 13,960 loaded \
+               boots before the `cld`, 0 in 7,418 after, every one in the spawn burst this \
+               0.991 s sits in); `kernel/src/panic.rs` now names the first crash under a \
+               `DOUBLE PANIC`, so the next sighting says whether it was a fault. Not shown \
+               here, so the row stands. One sighting in one loaded suite; retires at three \
+               loaded suites of the fixed tree with no red under this name (p = e^-3). That \
+               count is owed: on 2026-08-22 the guest suite was refused behind \
+               `wt/toyos-census`'s sysroot claim (#209)",
         evidence: "dev host, 2026-08-19 22:21 UTC, `cargo test` in wt/toyos-hkpfix beside \
                    wt/toyos-freshness's suite; 267 of 268 passed, this one red at 25 s in the \
                    parallel phase, green alone in the same run",
@@ -2080,7 +2151,18 @@ pub const KNOWN_RED: &[Red] = &[
                sat unread in `TestResult::serial`. That is closed at the field rather than at the \
                arm — `TestResult::error` is a `WaitVerdict`, which cannot be built without the \
                capture it was reached on — so the next sighting arrives with `cr2`, the page \
-               walk, the backtrace and `[ist1] used N of M` under the sentence",
+               walk, the backtrace and `[ist1] used N of M` under the sentence. **2026-08-22:** \
+               the leading explanation is PR #202's class — no Ring 0 entry cleared `DF`, so an \
+               interrupt inside `memmove`'s `std` window made every later `memcpy`/`memset` \
+               write below its destination; a kernel stack or a `KernelCtx` written that way \
+               is a `#DF` on the next push, and the class's parked deaths carry non-canonical \
+               RIPs and a null `ss` (PR #198) — 37 deaths in 13,960 loaded boots before the \
+               `cld`, 0 in 7,418 after, twelve wide on TCG like this suite. Not shown: the \
+               report this sighting never printed is the only thing that could, so the row \
+               stands. Prior rate 1 of 3 loaded suites; retires at nine loaded suites of the \
+               fixed tree with no red under this name (p = e^-3). That count is owed: on \
+               2026-08-22 the guest suite was refused behind `wt/toyos-census`'s sysroot \
+               claim (#209)",
         evidence: "three full `cargo test` runs in one session on `wt/toyos-purecrates`, twelve \
                    wide, `fastest boot 1522 ms against the reference 1320 ms` on the run that \
                    red",
@@ -2222,13 +2304,23 @@ pub const KNOWN_RED: &[Red] = &[
     // booting. Their rows are gone with the defect — a `context_switch`
     // restoring a task another CPU was still standing on — so a red under
     // either name now is a new measurement and must be read as one. The one
-    // that stays below is not a kernel death.
+    // below was read as not a kernel death when it was written; it was the
+    // silent one, and it is retired with the same session's two others.
     // ---------------------------------------------------------------------
     Red {
         test: "diskless_boot",
         instrument: Instrument::DevHostLoaded,
         finding: Finding::Seen,
-        standing: Standing::Stands,
+        standing: Standing::Retired(
+            "the same `QEMU died before ===READY=== (status … 0)` as `screen_fatal_halt`'s \
+             2026-08-15 row, retired 2026-08-22 for the same reason: under `-no-reboot` a \
+             status-0 exit before the marker is a guest that reset itself, which is the \
+             silent death of PR #202's class (commit 5e74971e; 37 deaths in 13,960 unfixed \
+             twelve-wide boots, 25 of them silent, 0 in 7,418 fixed). Twelve wide with another \
+             worktree's suite on the host is the exposure that class predicts, and nothing in \
+             the sighting points elsewhere — which is what `Not investigated` below was \
+             waiting for",
+        ),
         what: "`[qemu] QEMU died before ===READY=== (status: Ok(ExitStatus(unix_wait_status(0))))`. \
                **QEMU exited zero**, so this is neither a panicked guest nor a wall-clock guard \
                reporting the content it meant to assert — the process went away cleanly before \

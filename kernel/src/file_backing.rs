@@ -146,8 +146,16 @@ pub struct InitrdBacking {
     size: u64,
 }
 
-// Safety: initrd memory is static and immutable for the kernel's lifetime.
+// SAFETY: initrd memory is static and immutable for the kernel's lifetime —
+// the bootloader placed it, nothing frees it and nothing writes it — so the
+// raw pointer that makes this type `!Send` names memory that is equally valid
+// from every CPU. Irreducible: the initrd arrives as an address and a length
+// from `KernelArgs`, and there is no `&'static [u8]` to be had before the
+// kernel has decided the region is real.
 unsafe impl Send for InitrdBacking {}
+// SAFETY: same reasoning, plus what `Sync` adds: every method takes `&self`
+// and only ever reads through `initrd_base`, so concurrent readers see the
+// same immutable image.
 unsafe impl Sync for InitrdBacking {}
 
 impl InitrdBacking {
@@ -164,6 +172,22 @@ impl InitrdBacking {
             let count = ext.block_count as u64;
             if block_idx < cursor + count {
                 let initrd_block = ext.start_block + (block_idx - cursor);
+                // SAFETY: `initrd_base` names the whole initrd image, which is
+                // one contiguous region the bootloader placed and nothing
+                // frees, and `extents` are block numbers *within* that image
+                // — so the result is an address inside it whenever the extent
+                // list is honest.
+                //
+                // **Irreducible today, and the "whenever" is a real gap**:
+                // `InitrdBacking` is given the *file's* size and never the
+                // image's, so nothing here can check `initrd_block` against
+                // the end of the initrd. The extents come from the bcachefs
+                // btree inside that same image, so a corrupt image reads
+                // whatever follows it rather than being refused. Filed as
+                // `issues/kernel/initrd-extents-are-not-bounded-by-the-image.md`
+                // — the fix is a length this type does not carry, so it is a
+                // change to three call sites in `bcachefs_adapter.rs` and not
+                // to this line.
                 let ptr = unsafe {
                     self.initrd_base.add(initrd_block as usize * BLOCK_SIZE + off_in_block)
                 };
@@ -185,6 +209,15 @@ impl FileBacking for InitrdBacking {
         }
         if let Some(ptr) = self.file_offset_to_ptr(file_offset & !(BLOCK_SIZE_U64 - 1)) {
             let valid = BLOCK_SIZE.min((self.size - file_offset) as usize);
+            // SAFETY: `ptr` is `file_offset_to_ptr`'s answer for a
+            // block-aligned offset, so it is the start of a `BLOCK_SIZE` block
+            // of the initrd, and `valid <= BLOCK_SIZE` bounds the read inside
+            // it. `buf` is a `&mut [u8; BLOCK_SIZE]` the caller owns, in kernel
+            // memory, so it cannot overlap the immutable image.
+            //
+            // Irreducible: the source is a raw region the bootloader placed;
+            // it inherits `file_offset_to_ptr`'s open gap above, and nothing
+            // else here can be moved to a safe operation.
             unsafe {
                 core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), valid);
             }

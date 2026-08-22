@@ -152,6 +152,19 @@ struct Pipe {
     rt_boost_pending: bool,
 }
 
+// SAFETY: `Pipe` is `!Send` for exactly one reason — `Backing::ring` is a
+// `toyos_abi::ring::Ring`, which holds a `*mut u8` at the ring page's
+// direct-map address. That page is the `PhysPage` beside it in the same
+// `Backing`, so pointer and allocation move together and nothing is left
+// behind on the CPU a pipe moves off; every other field is plain data, a
+// `Vec`, or an `Arc<Watch>`. What serialises access to any of it is the
+// `PIPES` table lock, which is the only way to reach a `Pipe` at all.
+//
+// Irreducible while the ring is a raw window, and *checked* rather than
+// assumed — deleting this impl fails to compile (`pipe.rs:209: *mut u8 cannot
+// be sent between threads safely`), which is the test the two vestigial
+// `Send`/`Sync` pairs in `mm::`/`object::` failed. `Ring`'s base cannot become
+// a `&mut [u8]`: `SYS_PIPE_MAP` maps the same page into the process.
 unsafe impl Send for Pipe {}
 
 impl Pipe {

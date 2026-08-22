@@ -331,9 +331,39 @@ impl NetdConn {
 /// to tell "this machine has no network" from "netd failed", and `/bin/sshd`
 /// panicked across the boot of every NIC-less machine that lost the race
 /// rather than exiting with the line it has for exactly this.
+///
+/// **`Disconnected` is only the word for a hang-up this endpoint *read*, and a
+/// request writes twice before it reads at all.** `IpcError::Disconnected` is
+/// raised in one place — `ipc::read_exact`, on a `read` that answered zero — so
+/// it is what a peer that left while this endpoint was waiting for the response
+/// looks like. A peer that left *before* the request went out is refused by the
+/// kernel at one of the two writes instead, and the kernel has two words for it
+/// on a connection whose handle is still live and still this process's:
+///
+/// - `Gone`, from `SYS_HANDLE_SEND`. When the server end's last handle goes,
+///   `port::Acceptor::on_zero_handles` calls `close_now` on every queued
+///   connection's inbox — which is this end's *outbox* — and `HandleQueue::push`
+///   then answers `Gone` rather than filling a queue nobody will drain. Every
+///   request that hands netd pipe ends sends the handles first, so this is the
+///   first refusal a bind can meet.
+/// - `NotFound`, from `SYS_WRITE`. The same hook drops the queued connection,
+///   which drops the server's read end, and `ops::write_pipe` maps a pipe with
+///   no readers to `NotFound`. That the word is `NotFound` and not `Gone` is a
+///   tracked kernel defect of its own —
+///   `issues/isolation/a-broken-pipe-answers-not-found.md`; when it is fixed
+///   this arm is subsumed by the one above rather than being wrong.
+///
+/// Neither word can mean anything else here. This is applied only to `read`,
+/// `write` and `handle_send` on a connection this process holds, and a handle a
+/// process does not hold ends it at the kernel rather than answering a word —
+/// so "not found" on a live connection is its peer and nothing else.
 fn hangup(e: IpcError) -> NetError {
     match e {
-        IpcError::Disconnected => NetError::NetdNotFound,
+        IpcError::Disconnected
+        | IpcError::Syscall(
+            toyos_abi::syscall::SyscallError::Gone
+            | toyos_abi::syscall::SyscallError::NotFound,
+        ) => NetError::NetdNotFound,
         _ => NetError::Io,
     }
 }
@@ -547,4 +577,77 @@ pub fn dns_lookup(hostname: &str, results: &mut [[u8; 4]]) -> Result<usize, NetE
         }
     }
     Ok(written)
+}
+
+/// [`hangup`]'s whole table, which is what decides whether a program that needs
+/// netd leaves quietly or dies loudly.
+///
+/// **Both directions are asserted and the second is the point.** A guard that
+/// accepted every error would pass the three tests above and would be exactly
+/// the fix `issues/build/sshd-panics-when-netd-exits-before-it-binds.md` says
+/// is wrong: a machine that *has* a NIC and cannot bind must still be loud, so
+/// the refusals that are not a peer's absence have to stay [`NetError::Io`].
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use toyos_abi::syscall::SyscallError;
+
+    /// `SYS_HANDLE_SEND` into a connection whose server end has gone. The first
+    /// refusal a `tcp_bind` can meet, because a request that hands netd pipe
+    /// ends moves the handles before it writes the frame.
+    #[test]
+    fn a_gone_handle_transfer_is_a_netd_that_is_not_there() {
+        assert_eq!(hangup(IpcError::Syscall(SyscallError::Gone)), NetError::NetdNotFound);
+    }
+
+    /// `SYS_WRITE` into the same connection a moment later: the queued
+    /// connection has been dropped, so the pipe has no reader and the kernel
+    /// says `NotFound`. See `issues/isolation/a-broken-pipe-answers-not-found.md`
+    /// for why that word and not `Gone`.
+    #[test]
+    fn a_write_with_no_reader_left_is_a_netd_that_is_not_there() {
+        assert_eq!(hangup(IpcError::Syscall(SyscallError::NotFound)), NetError::NetdNotFound);
+    }
+
+    /// The case that already worked: netd was still there for the request and
+    /// left before the response, so the hang-up arrives at a `read` of zero.
+    #[test]
+    fn a_read_that_hung_up_is_a_netd_that_is_not_there() {
+        assert_eq!(hangup(IpcError::Disconnected), NetError::NetdNotFound);
+    }
+
+    /// Everything that is *not* a peer that has gone. Each of these on a
+    /// machine with a live netd is a real failure and must reach the caller as
+    /// one — `/bin/sshd` panics on `NetError::Io` by design.
+    #[test]
+    fn nothing_else_becomes_a_missing_netd() {
+        for e in [
+            IpcError::Syscall(SyscallError::PermissionDenied),
+            IpcError::Syscall(SyscallError::ResourceExhausted),
+            IpcError::Syscall(SyscallError::InvalidArgument),
+            IpcError::Syscall(SyscallError::BadAddress),
+            IpcError::Syscall(SyscallError::WouldBlock),
+            IpcError::Syscall(SyscallError::Io),
+            IpcError::Malformed,
+            IpcError::TooLarge,
+        ] {
+            assert_eq!(hangup(e), NetError::Io);
+        }
+    }
+
+    /// netd's own wire codes are a separate vocabulary and this change does not
+    /// touch it: an `ErrorResponse` netd chose to send is an answer from a netd
+    /// that is *there*, and only `ERR_NOT_CONNECTED` means the machine has no
+    /// network.
+    #[test]
+    fn a_code_netd_chose_is_still_its_own_answer() {
+        assert_eq!(NetError::from_error_code(ERR_NOT_CONNECTED), NetError::NotConnected);
+        assert_eq!(NetError::from_error_code(ERR_ADDR_IN_USE), NetError::AddrInUse);
+        assert_eq!(
+            NetError::from_error_code(ERR_CONNECTION_REFUSED),
+            NetError::ConnectionRefused
+        );
+        assert_eq!(NetError::from_error_code(ERR_OTHER), NetError::Io);
+        assert_eq!(NetError::from_error_code(4242), NetError::Protocol(4242));
+    }
 }

@@ -1,3 +1,17 @@
+//! Every process in the machine, by name.
+//!
+//! **The endowment is the whole of the authority**, as `/bin/shutdown`'s is.
+//! `/bin/ps` is `/bin/toybox` under another name, so what this holds is what
+//! the image's `[programs.toybox]` row declares — a config that does not name
+//! `roster` there builds an image whose `ps` says it cannot and changes nothing
+//! else. Nothing here asks for the capability: it is either in the endowment
+//! table `/bin/init` filled at spawn or it does not exist for this process.
+//!
+//! `free` is the other half of the same syscall and needs none of this: the
+//! machine header is ambient.
+
+use toyos::endow::{Endowments, SYSCAP_LABEL};
+use toyos::syscap::SysCap;
 use toyos::system;
 
 const HEADER: usize = system::SYSINFO_HEADER_SIZE;
@@ -26,11 +40,15 @@ fn state_str(s: u8) -> &'static str {
 }
 
 pub fn main(_args: Vec<String>) {
+    let Some(cap) = Endowments::get().take::<SysCap>(SYSCAP_LABEL) else {
+        eprintln!("ps: this program was endowed no system capability");
+        std::process::exit(1);
+    };
     let mut buf = vec![0u8; HEADER + ENTRY * 128];
-    let n = system::sysinfo(&mut buf);
+    let n = cap.roster(&mut buf);
     if n < HEADER {
-        eprintln!("ps: sysinfo failed");
-        return;
+        eprintln!("ps: refused — this capability carries no ROSTER");
+        std::process::exit(1);
     }
 
     let uptime_ns = u64::from_le_bytes(buf[24..32].try_into().unwrap());

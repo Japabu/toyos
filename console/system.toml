@@ -38,10 +38,11 @@ receives = ["surface", "launcher"]
 
 # `power` because `bin/shutdown` below is this binary, and on the machine this
 # image exists for — no serial port, a prompt on the panel — there is no other
-# way to turn it off.
+# way to turn it off. `roster` because `bin/ps` is the same binary and this
+# image exists to be asked what the machine is doing.
 [programs.toybox]
 receives = ["surface"]
-syscap = ["power"]
+syscap = ["power", "roster"]
 
 [symlinks]
 "bin/cat" = "/bin/toybox"

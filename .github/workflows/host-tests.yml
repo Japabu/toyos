@@ -69,6 +69,7 @@ jobs:
             ~/.cargo/git/db
             target
             userland/target
+            toyos/target
             kernel/target
             bootloader/target
           key: host-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
@@ -109,7 +110,9 @@ jobs:
       # other `kernel-loom` model controls, `debug-wait`, `sched-check` and
       # `fpu-save-nothing` — so `cargo test --lib`, `kernel-loom`'s own suites
       # and `--debug` already close that set, and this gate has no business in
-      # it. Measured against a warm kernel target (`cargo clean -p kernel`,
+      # it. `toyos/` is not linted here either, for the same reason userland is
+      # not: it is a sysroot source, excluded from the host workspace, and its
+      # ordinary build is the custom target. Measured against a warm kernel target (`cargo clean -p kernel`,
       # then both invocations back to back, 2026-08-20): the added invocation
       # costs about **1.6 s** more — the same tree, checked twice, not a
       # second target directory.
@@ -157,16 +160,20 @@ jobs:
       #
       # The kernel has no `-p` (it is one crate) and no directory scoping on
       # the clippy command line, so a kernel *area* is gated at the source
-      # instead of the invocation: `mm::`, `object::`, `elf::` and `loader::`
-      # (measured 2026-08-20: 35 + 1 + 23 + 8 = 67 blocks, every one now
-      # carrying a `SAFETY:` comment) each open with `#![warn
-      # (clippy::undocumented_unsafe_blocks)]`, which is `allow`-by-default
-      # everywhere else in the kernel and only `warn` inside those four module
-      # trees — composing with the `-D warnings` both kernel invocations below
-      # already carry turns that `warn` into a hard error, with no new flag
-      # here. The other 322 blocks (`arch/`, `drivers/`, `sched/`, `iommu/`,
-      # `log/` and the root files) are measured, not gated — not tractable in
-      # one pass, and recorded as follow-up in the same issue.
+      # instead of the invocation — and since the root-file sweep landed
+      # (2026-08-22) the default is **on**: `kernel/src/main.rs` opens with a
+      # crate-level `#![warn(clippy::undocumented_unsafe_blocks)]` and carries
+      # an `#[allow(...)]` on each of the five `mod` lines whose tree is not
+      # swept yet (`arch`, `drivers`, `log`, `sched`, `iommu` — 107 + 121 + 2 +
+      # 8 + 8 = 246 blocks). Composing with the `-D warnings` both kernel
+      # invocations below already carry turns that `warn` into a hard error,
+      # with no new flag here. Everything else — the 76 root-file blocks, plus
+      # `mm::`, `object::`, `elf::` and `loader::`, which also still open with
+      # their own `#![warn(...)]` from the earlier sweeps — is gated, and a new
+      # file added beside `main.rs` is gated the day it appears. To read
+      # *through* the five `allow`s and re-measure what is owed, add
+      # `--force-warn clippy::undocumented_unsafe_blocks`;
+      # `issues/build/clippy-has-never-run-here.md` carries the per-area ledger.
       #
       # Measured on the dev host with three fresh `CARGO_TARGET_DIR`s and a warm
       # cargo registry: **19.2 s** for the workspace (139 crates checked),
@@ -571,11 +578,33 @@ jobs:
               | tee -a /tmp/host.log
           done
 
+      # The SDK's own decisions. `toyos/` is excluded from the host workspace
+      # because it compiles against the ToyOS sysroot and is a path dependency
+      # of `rust/library/std` — but *some* of what it holds is a total function
+      # over kernel words, and `net::hangup` is the one that decides whether a
+      # program whose netd has gone leaves quietly or panics across the boot
+      # (`issues/build/sshd-panics-when-netd-exits-before-it-binds.md`). Its
+      # `lib.rs` is `no_std` for every build but this one, and this one links no
+      # syscall.
+      #
+      # Named here rather than folded into the loop above: it is not under
+      # `userland/`, it has its own lockfile and its own workspace, and it needs
+      # `--target` for a different reason — there is no `.cargo/config.toml`
+      # beside it, so this is the host triple said out loud rather than one
+      # overridden.
+      - name: toyos SDK host tests
+        run: |
+          set -e -o pipefail
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          echo "=== toyos" | tee -a /tmp/host.log
+          cargo test --manifest-path toyos/Cargo.toml --target "$host" 2>&1 \
+            | tee -a /tmp/host.log
+
       # The root package's `--lib`, one `--workspace` over the other host-tested
       # members, `kernel-loom`'s no-loom command, eight negative-control runs
       # (`wake-fence-off` plus the five `kernel-loom` gained 2026-08-17, and
-      # `toyos-sched-loom`'s `no-preempt-guard` and `doorbell-kick-relaxed`) and
-      # the three userland crates. A red is still one line somewhere among them,
+      # `toyos-sched-loom`'s `no-preempt-guard` and `doorbell-kick-relaxed`),
+      # the three userland crates and the SDK. A red is still one line somewhere among them,
       # and `--workspace` prints a `Running ...` line naming the binary rather
       # than the `=== <crate>` the other steps echo, so the summary matches both
       # shapes.
