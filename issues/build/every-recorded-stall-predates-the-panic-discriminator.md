@@ -39,8 +39,10 @@ kernel panic was found under a verdict that named a wait.**
 
 - **`sched_check_build`**, run `31946183485`, job `95162423932`, 2026-08-16 —
   `invariant P` at 200569 ns, `schedule_no_return` halting every CPU 1 ms later,
-  reported as `STALLED: 382s of guard expired`. Already adjudicated:
-  `issues/kernel/the-check-build-guest-stopped-answering-on-kvm-twice.md`.
+  reported as `STALLED: 382s of guard expired`. Already adjudicated as a kernel
+  panic, not a genuine stall — `src/redlist.rs`'s `sched_check_build` row for
+  this run carries the same verdict, and `tests/common/passcost.rs` is where
+  invariant P's replacement now lives.
 - **`hda_client_stall`**, run `31247206462`, `guest (2)`, 2026-08-08 — **new
   here.** The verdict was `FAIL hda_client_stall: the ring arm: timed out after
   117s`, and 24 s *before* that wait gave up its own capture carried

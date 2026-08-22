@@ -66,6 +66,5 @@ that invariant P "has never executed against the kernel in any image or any test
 run", was true when it was written and has not been since. Invariant P itself no
 longer exists: a pass's elapsed time is wall clock and a guest's wall clock
 advances while a hypervisor holds its vCPU, so the budget is measured and gated
-in the harness rather than asserted in the kernel
-(`issues/kernel/the-check-build-guest-stopped-answering-on-kvm-twice.md`).
+in the harness rather than asserted in the kernel (`tests/common/passcost.rs`).
 Widening the window is untouched by that and is what this file still wants.
