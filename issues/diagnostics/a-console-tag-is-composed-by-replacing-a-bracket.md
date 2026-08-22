@@ -1,6 +1,6 @@
 ---
 status: open
-kind: design-debt
+kind: defect
 opened: 2026-08-15
 ---
 
