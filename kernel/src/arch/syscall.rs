@@ -248,14 +248,28 @@ pub fn init() {
 // can context-switch. The epilogue used to run with the user state already put
 // back, so a switch there returned to Ring 3 carrying whatever the task that
 // ran in between had left in the registers.
+//
+// **`SYSCALL` switches no stack, so the instructions before `mov rsp, gs:[16]`
+// run at CPL 0 on the user's stack — and that is the whole of the window an
+// exception may not land in.** It was six instructions and it is three: the
+// three diagnostic stores below it — `syscall_rip`, `syscall_num`,
+// `syscall_rbp` — are reads of `rcx`, `rdi` and `rbp`, which the stack switch
+// does not touch, so they are the same stores done one instruction later on a
+// stack the CPU may write. What is left cannot be shortened: `cld` is at offset
+// 0 by `arch::entry`'s rule and every Ring 0 entry owes it, `rsp` must be parked
+// before it is overwritten, and overwriting it is the fix. The exit has a
+// one-instruction window of the same kind, between `pop rsp` and `sysretq`.
+//
+// Which is why the vectors that can arrive there have an IST (`arch::idt`'s
+// table): the window is a floor, not a bug to be closed.
 #[unsafe(naked)]
 extern "sysv64" fn syscall_entry() {
     ring3_naked_asm!(
         "mov gs:[24], rsp",     // save user RSP to percpu.user_rsp
+        "mov rsp, gs:[16]",     // load kernel RSP from percpu.kernel_rsp
         "mov gs:[216], rcx",    // save user RIP to percpu.syscall_rip
         "mov gs:[224], rdi",    // save syscall number to percpu.syscall_num
         "mov gs:[232], rbp",    // save user RBP to percpu.syscall_rbp
-        "mov rsp, gs:[16]",     // load kernel RSP from percpu.kernel_rsp
         "push gs:[24]",         // user RSP on kernel stack
         "push rcx",             // return RIP
         "push r11",             // return RFLAGS
