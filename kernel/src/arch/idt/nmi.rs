@@ -64,19 +64,22 @@
 //! `src/sourcegate.rs`'s `nmi_does_not_log`.
 //!
 //! **What gates this, and what does not.** An NMI *arriving inside that window*
-//! is staged by `syscall-window-nmi`, and it is reachable on one accelerator
-//! only: under TCG, QEMU checks for a pending interrupt between translation
-//! blocks and `syscall` ends one, so the dev host delivers 36 to 47 arrivals per
-//! 3,000; under KVM the injection happens at a VM entry that is never one of
-//! these three instructions — **0 of 6,000 on the hosted lane** (run
-//! 32584121311), with thousands of the same NMIs arriving in Ring 3, so the aim
-//! was right and the delivery point is simply elsewhere. CI's guest lane is KVM
-//! (`tests/CLAUDE.md`), so **"the window is exercised per pull request" is a
-//! claim this tree may not make.** What holds on both accelerators is the
-//! `nmi-without-ist` control, which takes this gate's IST index off and double
-//! faults at `syscall_entry` with `cr2 = rsp - 8`, and the compile-time
-//! assertion over `arch::idt`'s table that vector 2 and vector 18 carry an index
-//! at all.
+//! is staged by `syscall-window-nmi`, and how often it arrives there is the
+//! accelerator's answer rather than the kernel's. Under TCG, QEMU checks for a
+//! pending interrupt between translation blocks and `syscall` ends one, so the
+//! dev host delivers 36 to 58 arrivals per 3,000, run after run. Under KVM the
+//! injection happens at the next VM entry after the kick's exit, and **which
+//! instruction that is depends on the host**: the hosted lane has measured both
+//! **0 of 6,000** (run 32584121311, with thousands of the same NMIs arriving in
+//! Ring 3, so the aim was right and the injection point was elsewhere) and
+//! **64 of 64** (run 32587665835, every delivery landing on the entry's first
+//! instruction until the storm stopped at its arrival ceiling). CI's guest lane
+//! is KVM (`tests/CLAUDE.md`), so **"the window is exercised per pull request"
+//! is a claim this tree may not make** — and neither is "KVM cannot reach it".
+//! What holds on every host is the `nmi-without-ist` control, which takes this
+//! gate's IST index off and double faults at `syscall_entry` with
+//! `cr2 = rsp - 8`, and the compile-time assertion over `arch::idt`'s table that
+//! vector 2 and vector 18 carry an index at all.
 
 use core::arch::naked_asm;
 

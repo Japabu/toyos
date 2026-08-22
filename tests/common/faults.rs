@@ -362,26 +362,34 @@ const NMI_REPORT: &str = "syscall-window-nmi: sent=";
 /// the machine takes a `#DF`. `arch::idt`'s IST2 row is the fix and this is what
 /// says the row is load-bearing.
 ///
-/// **Only one accelerator can put an interrupt in that window, and the verdict
-/// says which one it ran on.** Under TCG, QEMU checks for a pending interrupt
-/// between translation blocks and `syscall` ends one, so a pending NMI is
-/// delivered at `syscall_entry+0`: the dev host reads 36 to 47 arrivals per
-/// 3,000. Under KVM an NMI to a running vCPU is a host kick, a VM exit and an
-/// injection at the next VM entry, and that entry is never one of these three
-/// instructions — **0 of 6,000 on the hosted lane** (run 32584121311, two boots,
-/// with 2,451 and 438 of the same NMIs arriving in Ring 3, so the aim was right
-/// and the delivery point is elsewhere). That is a fact about the instrument,
-/// and CI's guest lane is KVM only (`tests/CLAUDE.md`), so a derived in-window
-/// count asserted there can never be green.
+/// **Where an NMI lands is the accelerator's answer, and on KVM it is the
+/// host's.** Under TCG, QEMU checks for a pending interrupt between translation
+/// blocks and `syscall` ends one, so a pending NMI is delivered at
+/// `syscall_entry+0`: the dev host reads 36 to 58 arrivals per 3,000, run after
+/// run. Under KVM an NMI to a running vCPU is a host kick, a VM exit and an
+/// injection at the next VM entry — and **which instruction that entry is
+/// depends on where the kick's exit landed**, which is a property of the host
+/// and not of the guest. Both extremes are measured on the hosted lane:
 ///
-/// So the accelerator is read off the argv this boot was built from — the same
-/// `-accel kvm` decision `qemu_command` made, not a re-derivation of it — and:
+/// - **0 of 6,000** (run 32584121311, two boots, with 2,451 and 438 of the same
+///   NMIs arriving in Ring 3, so the aim was right and the injection point was
+///   simply somewhere else);
+/// - **64 of 64** (run 32587665835 `guest (9)`, `window=64 ring3=0 spun=16`,
+///   the exit landing on the `syscall` boundary and the injection on the entry's
+///   first instruction every time, so the storm ended at `ENOUGH` after 64
+///   deliveries).
+///
+/// So an in-window count asserted on KVM would be asserting about the host, in
+/// either direction: a floor reds the first host and a ceiling reds the second.
+/// CI's guest lane is KVM only (`tests/CLAUDE.md`), and the accelerator is read
+/// off the argv this boot was built from — the same `-accel kvm` decision
+/// `qemu_command` made, not a re-derivation of it:
 ///
 /// - **under TCG** the derived count is asserted as [`SAME_ORDER`] below;
-/// - **under KVM** the numbers are printed as the instrument's verdict and what
-///   is asserted is what KVM can witness: 3,000 aimed NMIs delivered to a CPU in
-///   Ring 3, no `#DF`, and the victim still making syscalls when the last one
-///   landed.
+/// - **under KVM** the counts are printed as the instrument's verdict, and what
+///   is asserted is what every host witnesses: nine of ten aimed NMIs delivered,
+///   at least one of them arriving somewhere only the victim can be — in Ring 3
+///   *or* in the window — and no `#DF`.
 ///
 /// The window itself is gated on both by `syscall_window_nmi_controls`, whose
 /// `nmi-without-ist` arm double faults at `syscall_entry` with `cr2 = rsp - 8`
@@ -444,40 +452,65 @@ pub fn syscall_window_nmi(
          {spun} syscalls made under the storm"
     );
 
-    // **What every accelerator witnesses.** The storm reached a CPU that was in
-    // Ring 3 and kept it working: a victim that died at the first NMI would
-    // stall `seen` at one, and one that stopped running Ring 3 code would leave
-    // `spun` at zero however many NMIs were delivered.
+    // **What every accelerator witnesses.** A victim that died at the first NMI
+    // stalls `seen` at one, and one the storm never found leaves both of the
+    // arrival counts that only it can produce at zero.
     if seen * 10 < sent * 9 {
         return Err(format!(
             "{sent} NMIs were sent and only {seen} taken — the victim stopped taking them, \
              which is what an NMI that ends a CPU looks like from here\n{survived}"
         ));
     }
-    if ring3 == 0 {
+    // **Either count is the victim, and requiring the Ring 3 one reds a perfect
+    // run.** A Ring 3 frame and a Ring 0 frame with a user `rsp` are both states
+    // only the CPU running the spinner can be in — an idle sibling is in neither
+    // — so the aim is proved by their sum. It was `ring3 == 0` for one landing,
+    // and the hosted lane then delivered *every* NMI into the window
+    // (`window=64 ring3=0`, run 32587665835): the aim could not have been better
+    // and the check called it a miss.
+    if window + ring3 == 0 {
         return Err(format!(
-            "not one of {seen} NMIs arrived with a Ring 3 frame — the storm was aimed at a CPU \
-             that was not running the spinner, so this run measured an idle loop\n{survived}"
+            "not one of {seen} NMIs arrived with a Ring 3 frame or in the window — both are \
+             states only the CPU running the spinner can be in, so the storm was aimed at a \
+             CPU that was not running it and this run measured an idle loop\n{survived}"
         ));
     }
+
+    if kvm_accelerated() {
+        // **The instrument's verdict, not the kernel's**, and on KVM the
+        // instrument's answer is the host's: the injection lands where the
+        // kick's VM exit did, so one hosted host put none of 3,000 in the window
+        // and another put 64 of 64 there (this function's header carries both).
+        // Neither number says anything about the kernel, so neither is asserted.
+        //
+        // `spun` is printed and not asserted here for the same reason: a storm
+        // that stops at its 64th window arrival is over in a few dozen
+        // deliveries, so the count measures how fast `ENOUGH` arrived — 16
+        // syscalls under a 64-NMI storm is the instrument working, not a stall.
+        // What the victim's liveness rests on is the arrival counts above and
+        // the delivery ratio, which are the same on every host.
+        eprintln!(
+            "  [nmi-window] KVM delivered {window} of {seen} into the window and {ring3} in \
+             Ring 3, with {spun} syscalls made under the storm: where this accelerator injects \
+             is the host's business, so what this run gates is that the machine took {sent} \
+             aimed NMIs with IST2 in place and went on working"
+        );
+        return Ok(());
+    }
+
+    // **Under TCG the arrivals themselves imply the syscalls**, whichever limit
+    // ended the storm: a window arrival is an NMI taken *inside* a syscall
+    // entry, and that syscall then returns from the handler and completes, which
+    // is what increments this counter. The dev host reads tens of them per
+    // thousand deliveries, so a zero here is a CPU that stopped running Ring 3
+    // code rather than a storm that ended early. It is not asserted on KVM for
+    // the reason above: there a storm can be over in 64 deliveries, and the
+    // count then measures how fast the ceiling arrived.
     if spun == 0 {
         return Err(format!(
             "the victim made no syscall at all while {seen} NMIs were delivered to it — it \
              stopped running Ring 3 code under the storm\n{survived}"
         ));
-    }
-
-    if kvm_accelerated() {
-        // The instrument's verdict, not the kernel's. See this function's
-        // header: KVM injects at a VM entry that is never one of the three
-        // instructions, measured 0 of 6,000, so an in-window count asserted here
-        // would be asserting against the hypervisor's scheduling.
-        eprintln!(
-            "  [nmi-window] KVM delivered {window} of {seen} into the window: this accelerator \
-             injects at a VM entry and cannot reach it, so what this run gates is that the \
-             machine took {sent} aimed NMIs with IST2 in place and went on working"
-        );
-        return Ok(());
     }
 
     if window == 0 {
