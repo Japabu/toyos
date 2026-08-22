@@ -10,7 +10,7 @@
 //! node.
 
 use loom::sync::Arc;
-use toyos_sched_loom::cpu::{CpuHandle, CpuHandles, CpuSched, Env, RunToken, SchedPass};
+use toyos_sched_loom::cpu::{Balance, CpuHandle, CpuHandles, CpuSched, Env, RunToken, SchedPass};
 use toyos_sched_loom::fair::{FairShare, Frontier, ShareState};
 use toyos_sched_loom::hw::{CpuId, Hw, Kicker, Machine, Nanos, TraceEvent};
 use toyos_sched_loom::mailbox::{mailbox, MailboxConsumer, Urgency};
@@ -428,7 +428,7 @@ fn the_retire_arm_never_loses_a_parked_task_to_a_racing_wake() {
             cpus: &owner.cpus,
             frontier: &owner.frontier,
             preempt: &guard,
-            steal: false,
+            balance: Balance::None,
         };
         let pass = |cpu: &mut CpuSched<Payload>| {
             let _ = SchedPass::begin(cpu, env, NOW).dispose_none().finish();

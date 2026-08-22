@@ -549,6 +549,39 @@ jobs:
             exit 1
           fi
 
+      # **The balance path's push half, which is a candidate and not shipped.**
+      # `cpu::Balance::PushOnSurplus` rests on one CPU observing another's
+      # SLEEPING bit while that CPU observes its surplus — the store-buffer
+      # litmus test — and `cpu::balance_fence`'s `SeqCst` fence is what forbids
+      # both sides missing. `push-fence-relaxed` weakens it to a release fence,
+      # which orders stores against stores and nothing against a later load, and
+      # `loom_push` must red.
+      #
+      # It is wired here rather than left to whoever adopts the policy, for the
+      # reason `no-preempt-guard` and `doorbell-kick-relaxed` were: a control
+      # nothing runs is a control nobody can trust on the day it matters. This
+      # model's panic unwinds cleanly — nothing is queued in it — so unlike the
+      # step above it does print a `FAILED` line; the verdict is still grepped
+      # by the assertion's own words, because a non-zero exit alone would accept
+      # a compile error.
+      - name: toyos-sched-loom push-on-surplus fence has teeth
+        run: |
+          set -o pipefail
+          echo "=== toyos-sched-loom --features push-fence-relaxed --test loom_push (must red)" \
+            | tee -a /tmp/host.log
+          if cargo test -p toyos-sched-loom \
+               --features push-fence-relaxed --test loom_push 2>&1 \
+               | tee /tmp/push-fence-relaxed.log | tee -a /tmp/host.log; then
+            echo "loom_push passed with the balance fence relaxed: the model has no teeth" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+          if ! grep -q 'published and no push behind it' /tmp/push-fence-relaxed.log; then
+            echo "the fence-relaxed build failed without a_cpu_that_halts_without_seeing_the_surplus_was_pushed reaching its verdict: this step proved nothing" \
+              | tee -a /tmp/host.log
+            exit 1
+          fi
+
       # `userland/.cargo/config.toml` cross-compiles by default, so a userland
       # crate's host tests have to name the host. `calc` is here for the reason
       # the pure crates above are: its arithmetic is decided without a guest,
@@ -601,9 +634,10 @@ jobs:
             | tee -a /tmp/host.log
 
       # The root package's `--lib`, one `--workspace` over the other host-tested
-      # members, `kernel-loom`'s no-loom command, eight negative-control runs
+      # members, `kernel-loom`'s no-loom command, nine negative-control runs
       # (`wake-fence-off` plus the five `kernel-loom` gained 2026-08-17, and
-      # `toyos-sched-loom`'s `no-preempt-guard` and `doorbell-kick-relaxed`),
+      # `toyos-sched-loom`'s `no-preempt-guard`, `doorbell-kick-relaxed` and
+      # `push-fence-relaxed`),
       # the three userland crates and the SDK. A red is still one line somewhere among them,
       # and `--workspace` prints a `Running ...` line naming the binary rather
       # than the `=== <crate>` the other steps echo, so the summary matches both

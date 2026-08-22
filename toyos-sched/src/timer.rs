@@ -36,6 +36,23 @@ impl TimerPlan {
         }
     }
 
+    /// Pull the arming forward to `at`, if a caller has a reason to be woken
+    /// that no parked deadline and no quantum accounts for — today
+    /// [`crate::cpu::Balance::PullWithRearm`]'s re-probe, and nothing else.
+    ///
+    /// One direction only, and that is what keeps invariant T out of it: the
+    /// invariant bounds the armed instant from *above* by the earliest event the
+    /// CPU owes, so a plan that only ever moves earlier cannot violate it. A
+    /// method that could move the arming later would be a missed deadline
+    /// waiting for a caller.
+    pub fn no_later_than(self, at: Option<Nanos>) -> Self {
+        match (self, at) {
+            (_, None) => self,
+            (TimerPlan::Stop, Some(at)) => TimerPlan::Arm(at),
+            (TimerPlan::Arm(planned), Some(at)) => TimerPlan::Arm(planned.min(at)),
+        }
+    }
+
     pub fn armed(&self) -> Option<Nanos> {
         match self {
             TimerPlan::Arm(at) => Some(*at),
