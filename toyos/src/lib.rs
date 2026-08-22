@@ -3,7 +3,13 @@
 //! Typed handles, IPC framing, ports and namespaces, shared memory, and
 //! ergonomic wrappers over the kernel ABI defined in `toyos-abi`.
 
-#![no_std]
+// `not(test)` so this crate's own decisions can be unit-tested on the host.
+// [`net::hangup`] is a total function from a kernel word to a [`net::NetError`]
+// and needs no guest to exercise, but a `#[test]` needs the `test` crate and
+// that needs `std`. Every ordinary build — the `rustc-dep-of-std` one included
+// — is `not(test)` and is `no_std` exactly as before; `cargo test` in this
+// directory is the only build that is not, and it links no syscall.
+#![cfg_attr(not(test), no_std)]
 
 pub mod audio;
 pub mod census;
