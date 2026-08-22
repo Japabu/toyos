@@ -121,7 +121,10 @@ summary, and still uploads `test-durations-merged`; the price verdict is printed
 as a `::warning::` naming the reason and the job exits 0. On a merge-queue ref
 or a fork's pull request — hosted, the shape the profile was taken in — nothing
 changes and the verdict fails exactly as before. The queue is required before
-`main` moves, so the verdict is still rendered on every landing.
+`main` moves, so the verdict is still rendered on every landing. (**That last
+sentence stopped being true on 2026-08-22** — see the amendment below: a landing
+renders the verdict only for the names it touched, and the nightly renders all
+of them.)
 
 The three options as they stood, for the record:
 
@@ -179,6 +182,66 @@ Verified by construction (`gh workflow run` cannot exercise `schedule`, so
 there is no dispatched run to point at): the `HOSTED` expression traced by
 hand through the affected consumers, `cargo test --lib` green throughout.
 Prospective until the first hosted nightly actually runs, 2026-08-22 03:00Z.
+
+## 2026-08-22: the enforcing instrument is the measuring one again
+
+The routing was moved for a different reason — the T14's one worker had
+thirteen runs of branch traffic queued behind one nightly gate A, and
+`issues/build/the-t14-has-one-lane-and-the-nightly-wants-three.md` carries that
+measurement — and this file is downstream of it. `route.yml`'s `HOSTED` now
+covers `merge_group`, `pull_request` from anywhere, `push`, and `ci.yml`'s
+`schedule`; only a `workflow_dispatch` and a non-`ci.yml` `schedule` reach the
+T14.
+
+So the gap this file is about is now a corner rather than the common case: a
+pull request's guest lane is twelve hosted shards again, which is the shape
+`tests/test-durations` was measured in, and the price verdict renders for real
+on the run that introduces a name. The softening in `ci.yml`'s `durations` job
+stays, because a dispatched T14 lane is still a whole partition measured on the
+wrong instrument, and `src/ci.rs`'s
+`the_softened_duration_verdict_is_the_one_the_merge_actually_raises` still holds
+the match string. Two of the three bullets below moved with it:
+
+* the `UNMEASURED` round trip takes its one bought measurement on the hosted
+  shards again, on the pull request itself, so an author no longer commits a
+  T14 number into a hosted profile or waits for the merge queue to adjudicate
+  one;
+* `src/redlist.rs`'s `xhci_full_speed_device` row is a record of four T14 lanes
+  that a pull request no longer runs.
+
+What is unchanged is the fact this file exists for: `tests/test-durations` holds
+one number per test with no record of which machine took it, and the two
+machines that wear `Instrument::Ci` do not price alike. A dispatch, a nightly
+gate A, or any future routing that puts a lane back on the T14 meets it again.
+
+## Amended 2026-08-22: a second axis, which names
+
+The ruling above is about *which instrument* may render the price verdict, and
+it stands. A second axis was added beside it, and it is what makes the sentence
+"the verdict is still rendered on every landing" false: **a landing renders the
+price verdict only for the names it registered or re-tiered.**
+`.github/workflows/ci.yml`'s `durations` job passes `--tier-base <sha>` from
+`github.event.merge_group.base_sha` or `github.event.pull_request.base.sha`, and
+`src/durations.rs` refuses a price verdict only for names whose registration row
+in `tests/toyos.rs` or whose `Why` in `src/tiers.rs`'s `RELEGATED` differs from
+the base's. Every other price verdict prints as a `::warning::` and the job exits
+0. The nightly — twelve hosted shards since the section above — passes no base
+and refuses them all.
+
+The reason is a different measurement from this file's. This file measures two
+*machines* (twelve hosted EPYC shards against one T14 lane, 1.35–1.37x apart);
+`issues/build/a-shards-boot-width-does-not-price-its-tests.md` measures the
+spread *within* the hosted lane: a per-shard common price factor explaining 57%
+of a name's run-to-run variance with a p10–p90 spread of about 1.28x, unrelated
+to the shard's boot width. Under the required merge queue, a price verdict on a
+name nobody in the composition touched dequeues the whole composition — which is
+what merge-queue run `32550410305` did on `xhci_full_speed_device` at 9,890 ms.
+
+The two axes compose and neither replaces the other: the T14 softening still
+applies to whatever refusal survives the base, and everything this file already
+says is a fact about the tree or the partition — a duplicate execution label, a
+short shard set, an erased Fast label, a committed `UNMEASURED` marker past its
+one bought run — is refused at every base as well as on every machine.
 
 ## What remains
 

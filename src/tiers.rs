@@ -8,16 +8,14 @@
 //! [`RELEGATED`] is exactly the set the nightly job selects, and `tests/toyos.rs`
 //! writes [`Tier::Nightly`] against each of those names in its own registration.
 //!
-//! **This is interim and it is a loss.** Fifty-two registered tests are
-//! Nightly: twenty-six for [`Why::Cost`] — a CI execution over the line
-//! (loaded audio and ordinary `audio_tone` each have two measured SMP labels,
-//! all four over it) — twenty-two for [`Why::TimerAnchored`], Nightly by
-//! classification rather than by cost, mostly nowhere near the line and one
-//! (`i8042_quarantine`) straddling it run to run for the classification's own
-//! reason — and four for [`Why::RidesTheBootOf`], riding
-//! `metal_sim_compositor`'s shared boot. Between them they account for
-//! 1,755.2 s of the 2,135.0 s the committed profile prices across 317 labels,
-//! and none is
+//! **This is interim and it is a loss.** Fifty-three registered tests are
+//! Nightly: twenty-four for [`Why::Cost`] — a CI price without margin, which
+//! since 2026-08-21 means over [`FAST_COMMIT_MS`] rather than over the ceiling
+//! itself — twenty-five for [`Why::TimerAnchored`], Nightly by classification
+//! rather than by cost and mostly nowhere near the line — and four for
+//! [`Why::RidesTheBootOf`], riding `metal_sim_compositor`'s shared boot.
+//! Between them they carry 604.8 s of the 994.9 s the committed profile prices
+//! across 327 labels, and none is
 //! gated per pull request. `guards` on every row says what stopped being gated,
 //! because a run that quietly does less is the whole failure mode here.
 //!
@@ -32,12 +30,39 @@
 //! again, on run 32023797195's twelve shards rather than on the dev host:
 //! **5,857 ms and 5,441 ms**.
 //!
+//! **The fast tier demands margin, 2026-08-21.** [`FAST_COMMIT_MS`] is the
+//! price a test may be *committed* at, four fifths of the ceiling, and it is
+//! what both directions of the tier rule are decided against: a Fast name may
+//! not be priced in the band below the ceiling, and a [`Why::Cost`] row returns
+//! only at or under it. Before it, one sample decided both directions, and on
+//! one afternoon three straddlers bounced every merge-queue entry in turn. Read
+//! [`FAST_COMMIT_MS`] for the derivation and the three names.
+//!
 //! **CI is the instrument for a per-PR policy.** The effective profile starts
 //! with the last full twelve-shard run and replaces every name measured by the
 //! first fast-tier run. That retains a price for withheld tests while using the
 //! freshest CI price for everything the fast tier did execute. Dev-host TCG
 //! timings remain useful optimisation evidence, but they do not decide which
 //! side of a KVM CI cutoff a test belongs on.
+//!
+//! **The nightly renders the verdict; a landing renders only its own names,
+//! 2026-08-22.** The rule here is unchanged and so is the ceiling — what moved
+//! is which run's red stops a landing. A pull request's and a merge-queue
+//! composition's `durations` job refuses a price verdict only for the names
+//! that change registered or re-tiered, and prints every other one as a
+//! `::warning::`; the nightly's twelve hosted shards pass no base and refuse
+//! them all, and a nightly red is fixed by a pull request the next day like
+//! every other nightly red. The reason is a measurement, not a preference: over
+//! six hosted twelve-shard runs a per-shard common price factor explains 57% of
+//! a name's run-to-run variance and spreads 1.28x p10–p90
+//! (`issues/build/a-shards-boot-width-does-not-price-its-tests.md`), so a name
+//! priced anywhere near a line reads over it on some runs by shard luck alone —
+//! and under the required merge queue that red dequeues the whole composition,
+//! every pull request behind it included. [`ci_profile_verdicts`] is the shape
+//! that filtering needs: one verdict per name, each saying whether it is about a
+//! price. A verdict about the *declaration* — a marker on a Nightly row, a
+//! duplicate row, an empty `guards`, a rider on a carrier that is not Nightly —
+//! is true whoever measured it and is refused on every run.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -48,6 +73,9 @@ use std::collections::{BTreeMap, BTreeSet};
 ///
 /// **2026-08-12: the line is hard, and there is deliberately no margin or
 /// hysteresis band** — a measured crossing reds `durations`, however close.
+/// That still holds, and [`FAST_COMMIT_MS`] is not a softening of it: the
+/// ceiling refuses the same crossings it always did, and the commitment line
+/// below it refuses ever being *near* one.
 /// Same date, the tier boundary: a test whose verdict or duration is anchored
 /// to real time — it plays or records in real time, waits out a staged latency
 /// window, or measures a rate, such that a 2x slower machine would change its
@@ -56,6 +84,51 @@ use std::collections::{BTreeMap, BTreeSet};
 /// — [`Why::TimerAnchored`] is the classification it needed, and every
 /// borderline name the cost audit raised has one of the three `Why` rows now.
 pub const FAST_CEILING_MS: u64 = 10_000;
+
+/// The price a test may be **committed** at and still be [`Tier::Fast`], in
+/// milliseconds: four fifths of [`FAST_CEILING_MS`].
+///
+/// **The fast tier demands margin — the owner's decision, 2026-08-21.**
+/// [`FAST_CEILING_MS`] alone was a one-sample rule pointing both ways: the gate
+/// reds a Fast name measured over the ceiling, and invites a [`Why::Cost`] row
+/// back to Fast the moment one measurement lands under it. A test whose price
+/// sits within a few percent of the line therefore flips per partition, and the
+/// red lands on whichever pull request measured it next — an author whose diff
+/// has nothing to do with it.
+///
+/// Three of them bounced merge-queue entries on 2026-08-21 alone.
+/// `i8042_absent`: committed 9,221 ms, measured 10,738 ms in runs 32475363422
+/// and 32476143292 — **16% over its commitment**. `i8042_health`: committed
+/// 9,509 ms, measured 10,281 ms in run 32506320411 — **8% over**.
+/// `xhci_full_speed_device`: committed 6,900 ms, measured 10,166 ms in run
+/// 32513441183 — **47% over**, and the one of the three that had margin. Two of
+/// the three had been returned to Fast that same day on one calm nightly sample
+/// each.
+///
+/// **A fifth is the width the evidence asks for, and it is not a curve fit.**
+/// A band that just cleared the observed 8% and 16% straddles would be fitted
+/// to them; a fifth is chosen because of what it makes the *ceiling's* red
+/// mean. Committed at or under 8,000 ms, a name measured over 10,000 ms has
+/// grown by at least a quarter over the price it was committed at — a finding
+/// about that test, not a coin landing. `xhci_full_speed_device`'s 47% is
+/// exactly that finding, and it is why margin does not make it a straddler.
+///
+/// Both directions are this line's, and both live in [`ci_profile_verdicts`]:
+/// a Fast name may not be priced in `(FAST_COMMIT_MS, FAST_CEILING_MS]`, and a
+/// [`Why::Cost`] row returns to Fast only at or under it. **A straddler cannot
+/// be Fast.**
+///
+/// **Margin is not enough by itself, and 2026-08-22 measured why.** A fifth of
+/// room does not make a *variable* name safe: `xhci_full_speed_device` is
+/// committed at 6,900 ms with 31% of margin and was priced 4,700, 6,816, 6,900,
+/// 7,456, 7,499 and 9,890 ms over six hosted twelve-shard runs — the 9th most
+/// variable of 83 Fast names, and the last of those six reded merge-queue
+/// composition 32550410305 in the band. No tier holds such a name under a rule
+/// that reads one sample per run, so the answer is not a wider band but a
+/// narrower *audience*: a landing renders the price verdict only for the names
+/// it touched, and the nightly renders it for all of them. The module header
+/// carries that rule and the measurement behind it.
+pub const FAST_COMMIT_MS: u64 = FAST_CEILING_MS * 4 / 5;
 
 /// A committed profile row that exists only to put a new registration into one
 /// KVM measurement run. `--merge-durations` always refuses a committed marker
@@ -81,7 +154,11 @@ pub enum Tier {
 /// the gates below check different things of each.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Why {
-    /// Over [`FAST_CEILING_MS`] by itself.
+    /// **Priced without margin by itself** — over [`FAST_COMMIT_MS`], whether
+    /// or not it is also over [`FAST_CEILING_MS`]. A row in the band between
+    /// the two is a straddler: cheap enough that a quiet run prices it under
+    /// the ceiling and expensive enough that a loaded one does not, which is
+    /// the state this variant exists to hold rather than to oscillate through.
     Cost,
     /// **Under the ceiling, and relegated anyway** because it shares one boot
     /// with the named test that is over it. `group_of` in `tests/toyos.rs` makes
@@ -108,7 +185,7 @@ pub struct Relegated {
     /// The last measurement recorded for this row, in milliseconds — for
     /// `audio_tone_load`, which registers one test but emits an `(smp=1)` and
     /// an `(smp=8)` label, the sum of both as last recorded. Documentation,
-    /// not a fixture: `validate_ci_profile` checks a fresh profile's tier
+    /// not a fixture: [`ci_profile_verdicts`] checks a fresh profile's tier
     /// *placement*, never this field against it, so a nightly run refreshing
     /// every Nightly label does not have to reproduce this number. A human
     /// updates it by hand when a "returns to Fast" or "belongs Nightly"
@@ -645,6 +722,61 @@ pub const RELEGATED: &[Relegated] = &[
                  comparison bound — a wall-clock verdict whose price straddles the 10,000 ms \
                  line run to run, so no single calm sample may return it.",
     },
+    // 2026-08-21, the margin sweep: [`FAST_COMMIT_MS`] applied to the rest of
+    // the fast tier. These three are every `Tier::Fast` name the committed
+    // profile priced inside the band, and each is an honest `Why::Cost` — none
+    // has a real-time verdict, so none is `TimerAnchored`. Their prices are the
+    // committed profile's, unchanged by this sweep: nothing new was adopted.
+    Relegated {
+        test: "i8042_health",
+        ci_ms: 9_509,
+        why: Why::Cost,
+        guards: "Two boots decide whether the keyboard's own health line can be believed: one \
+                 machine nobody touches must say `0 interrupts — the pin has never asserted` \
+                 and must not print either of the two lines reachable from the `irqs > 0` gate, \
+                 and one machine with a single keystroke must report interrupts, bytes and keys \
+                 all non-zero — the pin, the ISR and the decoder as one chain, where interrupts \
+                 alone would go green on a driver whose ring never filled. It also counts \
+                 `sched: cpu=` lines to prove `verdict_due` self-clears rather than holding a \
+                 CPU awake, which is the failure the quarantine path already had once. What \
+                 still runs per pull request: `screen_i8042_health` (4,495 ms) reads the panel \
+                 copy of the verdict, so a driver that stops speaking entirely is still caught \
+                 — but nothing gated per pull request asks whether the quiet and the asserting \
+                 machines say *different* things, which is the whole claim. Relegated for \
+                 margin, not for a crossing: 9,509 ms committed against 10,281 ms in run \
+                 32506320411, 8% apart with the 10,000 ms line between them.",
+    },
+    Relegated {
+        test: "double_panic_names_the_fault",
+        ci_ms: 9_120,
+        why: Why::Cost,
+        guards: "The only execution anywhere of `fatal_exception`'s kernel arm and the \
+                 `DOUBLE PANIC` branch below it — a Ring 0 exception is not something a guest \
+                 program or a QEMU property can produce, so before this test the branch had \
+                 never run under a test at all. It asserts that a machine two crashes deep \
+                 names which of four states the arriving panic found, the fault by name and \
+                 rip, and the panic that ended it, on the record channel and again on the \
+                 lock-free 16550 copy that a wedged log path cannot hold. What still runs per \
+                 pull request: `reentry_names_the_first_panic` (5,073 ms) covers the other dead \
+                 end — the panic *report* panicking on a CPU already at depth one — so the \
+                 pre-panic byte capture still has a gate; what goes dark is the panic-on-fault \
+                 half, where the depth is zero and `FAULT rip=` never printed.",
+    },
+    Relegated {
+        test: "console_line_atomicity",
+        ci_ms: 8_925,
+        why: Why::Cost,
+        guards: "That a `write` syscall, and not a buffer boundary, is the unit of console \
+                 interleaving: two writers on two CPUs put 2,000 lines through one console and \
+                 not one line may carry both tags, at exact width, with both writers' full \
+                 counts present so a lost capture cannot pass as a clean one. Two more claims \
+                 ride the same capture and have no other gate: a process that exits mid-line \
+                 has its unterminated bytes flushed by the last handle's drop, asserted as an \
+                 exact run length in both directions, and no kernel record may land inside a \
+                 userland line. Every other test in the tree reads the console assuming all \
+                 three; none of them asserts one. Relegated for margin: 8,925 ms committed, \
+                 within 11% of the line.",
+    },
 ];
 
 /// The names [`RELEGATED`] holds, which is what `tests/toyos.rs` checks its own
@@ -679,14 +811,49 @@ pub fn relegated_ms() -> u64 {
     RELEGATED.iter().map(|r| r.ci_ms).sum()
 }
 
-/// Validate the complete CI duration profile against the declared tiers.
+/// One thing the tier rule has to say about one registered name.
+///
+/// The name is carried beside the sentence because *which* run renders a
+/// verdict is decided per name: `src/durations.rs` refuses the ones the change
+/// under measurement registered or re-tiered and prints the rest as warnings,
+/// and it cannot do that against a block of prose.
+pub struct Verdict {
+    /// The registration name — `canonical_profile_name` of the label for a
+    /// price verdict, `Relegated::test` for a row verdict.
+    pub name: String,
+    /// **Whether this verdict is about a measured price.** Only a priced
+    /// verdict may be softened to a warning by a run that did not touch the
+    /// name: it is the one kind whose truth depends on which shard ran the
+    /// test rather than on what the tree says. A marker on a Nightly row, a
+    /// duplicate row, an empty `guards`, missing evidence and a rider on a
+    /// carrier that is not Nightly are all facts about the declaration, true on
+    /// every run, and are refused on every run.
+    pub priced: bool,
+    /// The sentence, naming the name, the price and what is wrong with it.
+    pub message: String,
+}
+
+/// Validate the complete CI duration profile against the declared tiers: every
+/// verdict the rule renders against `ci`, one per finding, each carrying the
+/// registered name it is about and whether it is about a price.
 ///
 /// This is production code because `--merge-durations` is the required gate.
 /// A filtered Rust unit-test invocation can exit successfully after running
 /// zero tests, so CI must not depend on a test name remaining spelled a
 /// particular way for the policy verdict to execute.
-pub fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
-    let mut errors = Vec::new();
+///
+/// The whole verdict, every name: what the nightly renders, and what
+/// `src/durations.rs` filters by name on a pull request or a merge-queue
+/// composition. Nothing here knows about a base — the filtering is the caller's,
+/// because the rule and the audience are two decisions and only one of them is
+/// this module's.
+pub fn ci_profile_verdicts(ci: &BTreeMap<String, u64>) -> Vec<Verdict> {
+    /// A verdict about the declaration: true whoever measured it.
+    fn fact(name: &str, message: String) -> Verdict {
+        Verdict { name: name.to_string(), priced: false, message }
+    }
+
+    let mut errors: Vec<Verdict> = Vec::new();
     let mut seen = BTreeSet::new();
     let nightly = relegated_names();
 
@@ -694,27 +861,50 @@ pub fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
         let name = canonical_profile_name(label);
         if ms == UNMEASURED_MS {
             if nightly.contains(name) {
-                errors.push(format!(
-                    "{label} is marked UNMEASURED but {name} is Nightly, so fast CI cannot \
-                     execute it to replace the marker; bootstrap it as Fast"
+                errors.push(fact(
+                    name,
+                    format!(
+                        "{label} is marked UNMEASURED but {name} is Nightly, so fast CI cannot \
+                         execute it to replace the marker; bootstrap it as Fast"
+                    ),
                 ));
             }
             continue;
         }
-        if ms > FAST_CEILING_MS && !nightly.contains(name) {
-            errors.push(format!(
-                "{label} measured {ms} ms in CI, over the {FAST_CEILING_MS} ms line, \
-                 but {name} remains Fast"
-            ));
+        if nightly.contains(name) {
+            continue;
+        }
+        if ms > FAST_CEILING_MS {
+            errors.push(Verdict {
+                name: name.to_string(),
+                priced: true,
+                message: format!(
+                    "{label} measured {ms} ms in CI, over the {FAST_CEILING_MS} ms line, \
+                     but {name} remains Fast"
+                ),
+            });
+        } else if ms > FAST_COMMIT_MS {
+            errors.push(Verdict {
+                name: name.to_string(),
+                priced: true,
+                message: format!(
+                    "{label} is priced at {ms} ms — over the {FAST_COMMIT_MS} ms a Fast test \
+                     may be committed at and under the {FAST_CEILING_MS} ms line — and {name} \
+                     remains Fast: priced without margin, so relegate it or make it faster. A \
+                     price this close to the line is decided by which partition ran it, and \
+                     reds whichever pull request measures it next"
+                ),
+            });
         }
     }
 
     for row in RELEGATED {
         if !seen.insert(row.test) {
-            errors.push(format!("{} has two tier rows", row.test));
+            errors.push(fact(row.test, format!("{} has two tier rows", row.test)));
         }
         if row.guards.trim().is_empty() {
-            errors.push(format!("{} says nothing about what it guards", row.test));
+            errors
+                .push(fact(row.test, format!("{} says nothing about what it guards", row.test)));
         }
         let labels: Vec<(&str, u64)> = ci
             .iter()
@@ -722,10 +912,13 @@ pub fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
             .map(|(label, &ms)| (label.as_str(), ms))
             .collect();
         if labels.is_empty() {
-            errors.push(format!(
-                "{} is in the nightly tier but has missing CI evidence; an unmeasured \
-                 test stays Nightly, but its evidence must be restored",
-                row.test
+            errors.push(fact(
+                row.test,
+                format!(
+                    "{} is in the nightly tier but has missing CI evidence; an unmeasured \
+                     test stays Nightly, but its evidence must be restored",
+                    row.test
+                ),
             ));
             continue;
         }
@@ -735,24 +928,38 @@ pub fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
             continue;
         }
         match row.why {
-            Why::Cost if !labels.iter().any(|(_, ms)| *ms > FAST_CEILING_MS) => {
-                errors.push(format!(
-                    "{} is Nightly for Cost, but every current CI label is at or under \
-                     the {FAST_CEILING_MS} ms line and it belongs Fast: {labels:?}",
-                    row.test
-                ));
+            // **The return rule, and it asks for margin.** Not "under the
+            // ceiling" — that returned `i8042_absent` on one calm nightly
+            // sample and every merge-queue composition after it measured the
+            // same test over the line. A relegated test comes back only when
+            // its price has room to move.
+            Why::Cost if labels.iter().all(|(_, ms)| *ms <= FAST_COMMIT_MS) => {
+                errors.push(Verdict {
+                    name: row.test.to_string(),
+                    priced: true,
+                    message: format!(
+                        "{} is Nightly for Cost, but every current CI label is at or under \
+                         the {FAST_COMMIT_MS} ms commitment line and it belongs Fast: {labels:?}",
+                        row.test
+                    ),
+                });
             }
             Why::RidesTheBootOf(carrier) => {
-                if !labels.iter().all(|(_, ms)| *ms <= FAST_CEILING_MS) {
-                    errors.push(format!(
-                        "{} now crosses the line itself and must be Why::Cost: {labels:?}",
-                        row.test
-                    ));
+                if !labels.iter().all(|(_, ms)| *ms <= FAST_COMMIT_MS) {
+                    errors.push(Verdict {
+                        name: row.test.to_string(),
+                        priced: true,
+                        message: format!(
+                            "{} is priced without margin itself and must be Why::Cost, not a \
+                             rider on {carrier}: {labels:?}",
+                            row.test
+                        ),
+                    });
                 }
                 if !nightly.contains(carrier) {
-                    errors.push(format!(
-                        "{} rides {carrier}, but {carrier} is not Nightly",
-                        row.test
+                    errors.push(fact(
+                        row.test,
+                        format!("{} rides {carrier}, but {carrier} is not Nightly", row.test),
                     ));
                 }
             }
@@ -760,13 +967,24 @@ pub fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
         }
     }
 
-    if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
+    errors
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// Every verdict as one block of prose, which is what an assertion about
+    /// the whole rule reads. `src/durations.rs` renders them one at a time
+    /// because it decides each one's audience separately; nothing here does.
+    fn validate_ci_profile(ci: &BTreeMap<String, u64>) -> Result<(), String> {
+        let verdicts = ci_profile_verdicts(ci);
+        if verdicts.is_empty() {
+            return Ok(());
+        }
+        Err(verdicts.into_iter().map(|v| v.message).collect::<Vec<_>>().join("\n"))
+    }
 
     fn committed_profile() -> BTreeMap<String, u64> {
         let path =
@@ -807,14 +1025,61 @@ mod tests {
         assert!(refusal.contains("remains Fast"), "{refusal}");
     }
 
+    /// The derivation [`FAST_COMMIT_MS`]'s doc claims, asserted rather than
+    /// described — including the consequence the width was chosen for.
     #[test]
-    fn the_profile_gate_returns_a_cost_row_to_fast_at_the_line() {
+    fn the_commitment_line_is_four_fifths_of_the_ceiling() {
+        assert_eq!(FAST_COMMIT_MS, 8_000);
+        assert_eq!(FAST_COMMIT_MS * 5, FAST_CEILING_MS * 4);
+        // A Fast name measured over the ceiling has grown by at least a quarter
+        // over the worst price it could lawfully have been committed at, which
+        // is what makes that red a finding rather than a coin landing. Both
+        // sides are constants, so the compiler is the one that checks it.
+        const { assert!(FAST_CEILING_MS * 100 / FAST_COMMIT_MS >= 125) };
+    }
+
+    /// **The margin rule, and the millisecond it turns on.** A Fast label
+    /// priced inside the band is refused by name; one millisecond lower is
+    /// not; and the ceiling's own older red still speaks in its own words above
+    /// the band rather than being swallowed by it.
+    #[test]
+    fn a_fast_label_priced_without_margin_is_refused() {
+        let at = |ms: u64| {
+            let mut ci = committed_profile();
+            ci.insert("iommu_empty_domain".to_string(), ms);
+            validate_ci_profile(&ci)
+        };
+        assert!(at(FAST_COMMIT_MS).is_ok());
+
+        let refusal = at(FAST_COMMIT_MS + 1).unwrap_err();
+        assert!(refusal.contains("iommu_empty_domain"), "{refusal}");
+        assert!(refusal.contains("priced without margin"), "{refusal}");
+
+        let refusal = at(FAST_CEILING_MS + 1).unwrap_err();
+        assert!(refusal.contains("remains Fast"), "{refusal}");
+        assert!(!refusal.contains("priced without margin"), "{refusal}");
+    }
+
+    /// **The return rule, both halves.** A `Why::Cost` row comes back only when
+    /// every current label has margin — a label inside the band leaves it
+    /// Nightly, which is precisely the straddle `i8042_absent` re-imported by
+    /// returning on one calm sample under the ceiling.
+    #[test]
+    fn a_cost_row_returns_to_fast_only_with_margin() {
         let mut ci = committed_profile();
-        ci.insert("audio_tone_load (smp=1)".to_string(), FAST_CEILING_MS);
-        ci.insert("audio_tone_load (smp=8)".to_string(), FAST_CEILING_MS - 1);
+        ci.insert("audio_tone_load (smp=1)".to_string(), FAST_COMMIT_MS);
+        ci.insert("audio_tone_load (smp=8)".to_string(), FAST_COMMIT_MS - 1);
         let refusal = validate_ci_profile(&ci).unwrap_err();
         assert!(refusal.contains("audio_tone_load"), "{refusal}");
         assert!(refusal.contains("belongs Fast"), "{refusal}");
+
+        // One label without margin is enough to keep the whole registration
+        // Nightly, and it is not itself a refusal: a Nightly row in the band is
+        // the state this rule exists to hold.
+        ci.insert("audio_tone_load (smp=8)".to_string(), FAST_COMMIT_MS + 1);
+        assert!(validate_ci_profile(&ci).is_ok());
+        ci.insert("audio_tone_load (smp=8)".to_string(), FAST_CEILING_MS);
+        assert!(validate_ci_profile(&ci).is_ok());
     }
 
     /// §5: "Nightly measurements refresh the recorded Nightly costs; they are
@@ -838,12 +1103,12 @@ mod tests {
 
     /// The other half of the same bidirectional rule: drifted numbers do not
     /// launder a Cost row that a fresh measurement puts at or under the
-    /// ceiling. That is a real tier-placement finding ("returns to Fast"),
-    /// never masked by ci_ms no longer being checked for equality.
+    /// commitment line. That is a real tier-placement finding ("returns to
+    /// Fast"), never masked by ci_ms no longer being checked for equality.
     #[test]
-    fn a_cost_row_at_the_ceiling_still_reds_despite_drifted_ci_ms() {
+    fn a_cost_row_with_margin_still_reds_despite_drifted_ci_ms() {
         let mut ci = committed_profile();
-        ci.insert("desktop_window_child".to_string(), FAST_CEILING_MS);
+        ci.insert("desktop_window_child".to_string(), FAST_COMMIT_MS);
         let refusal = validate_ci_profile(&ci).unwrap_err();
         assert!(refusal.contains("desktop_window_child"), "{refusal}");
         assert!(refusal.contains("belongs Fast"), "{refusal}");
