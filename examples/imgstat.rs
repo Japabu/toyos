@@ -24,17 +24,17 @@ impl BlockAccess for Volume {
     }
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), IoError> {
-        let start = usize::try_from(offset).map_err(|_| IoError)?;
-        let end = start.checked_add(buf.len()).ok_or(IoError)?;
+        let start = usize::try_from(offset).map_err(|_| IoError::Device)?;
+        let end = start.checked_add(buf.len()).ok_or(IoError::Device)?;
         if end > self.0.len() {
-            return Err(IoError);
+            return Err(IoError::Device);
         }
         buf.copy_from_slice(&self.0[start..end]);
         Ok(())
     }
 
     fn write_at(&mut self, _offset: u64, _buf: &[u8]) -> Result<(), IoError> {
-        Err(IoError)
+        Err(IoError::Device)
     }
 
     fn flush(&mut self) -> Result<(), IoError> {

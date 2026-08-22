@@ -156,11 +156,20 @@ fn check(index: usize, disk: &mut usb_storage::UsbBlockDevice) {
     // may only narrow — but this file is standing in for the caller of the
     // trait, and establishing exactly what that caller establishes is the
     // layering working rather than being dodged.
+    //
+    // `budget=` is the second half of the verdict and the reason the line is
+    // not just `refused=`: a refusal that arrives as `BlockError::Device` is a
+    // claim about the stick, and `/bin/logd` ends a boot's log on one. The two
+    // were one value until 2026-08-22
+    // (`issues/boot-media/fsync-on-log-returns-other-under-a-loaded-host.md`),
+    // and collapsing them again reds here.
     let spent = {
         let _op = crate::scheduler::Operation::begin(crate::time::Deadline::passed());
-        !crate::drivers::xhci::storage_read(index, at(blocks, HOST_BLOCKS[0]), 1, &mut buf)
+        crate::drivers::xhci::storage_read(index, at(blocks, HOST_BLOCKS[0]), 1, &mut buf)
     };
-    log!("usb-gate: read with a spent budget refused={spent}");
+    log!("usb-gate: read with a spent budget refused={} budget={}",
+        spent.is_err(),
+        spent == Err(crate::block::BlockError::BudgetExpired));
 
     // A read the controller cut short while the device's own CSW claims it
     // moved everything. Armed here rather than by a boot-wide count so the

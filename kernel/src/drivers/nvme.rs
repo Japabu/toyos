@@ -425,15 +425,20 @@ impl NvmeController {
     /// An offline controller refuses silently: the line that says what happened
     /// was written once by [`Self::note`], and one per refused command after it
     /// would bury that line under the page cache's retries.
-    fn may_issue(&self, until: Deadline, op: &str, lba: u64, sector_count: u32) -> bool {
+    ///
+    /// **The two refusals are different answers and it says which.** A
+    /// controller that has been abandoned is [`BlockError::Device`]; a budget
+    /// that ran out is [`BlockError::BudgetExpired`], which is not a fact about
+    /// this controller at all.
+    fn may_issue(&self, until: Deadline, op: &str, lba: u64, sector_count: u32) -> BlockResult {
         if self.failed {
-            return false;
+            return Err(BlockError::Device);
         }
         if until.reached(crate::clock::now()) {
             log!("NVMe: {op} of {sector_count} sectors at {lba} not issued: {}", block::OPERATION);
-            return false;
+            return Err(BlockError::BudgetExpired);
         }
-        true
+        Ok(())
     }
 
     fn identify_controller(&mut self) -> bool {
@@ -532,9 +537,7 @@ impl NvmeController {
         assert!(buf.len() >= total_bytes);
         assert!(total_bytes <= MAX_DATA_PAGES * 4096);
 
-        if !self.may_issue(until, "read", lba, sector_count) {
-            return Err(BlockError);
-        }
+        self.may_issue(until, "read", lba, sector_count)?;
 
         let dma = self.dma;
         let pages = total_bytes.div_ceil(4096);
@@ -559,12 +562,12 @@ impl NvmeController {
             Ok(status) => status,
             Err(why) => {
                 log!("NVMe: read of {sector_count} sectors at {lba}: {why}");
-                return Err(BlockError);
+                return Err(BlockError::Device);
             }
         };
         if status != 0 {
             log!("NVMe: read of {sector_count} sectors at {lba} failed, status={status:#x}");
-            return Err(BlockError);
+            return Err(BlockError::Device);
         }
 
         // A copy out rather than a `&[u8]` into the window, so no reference into
@@ -588,9 +591,7 @@ impl NvmeController {
         assert!(buf.len() >= total_bytes);
         assert!(total_bytes <= MAX_DATA_PAGES * 4096);
 
-        if !self.may_issue(until, "write", lba, sector_count) {
-            return Err(BlockError);
-        }
+        self.may_issue(until, "write", lba, sector_count)?;
 
         let dma = self.dma;
         let pages = total_bytes.div_ceil(4096);
@@ -621,12 +622,12 @@ impl NvmeController {
             Ok(status) => status,
             Err(why) => {
                 log!("NVMe: write of {sector_count} sectors at {lba}: {why}");
-                return Err(BlockError);
+                return Err(BlockError::Device);
             }
         };
         if status != 0 {
             log!("NVMe: write of {sector_count} sectors at {lba} failed, status={status:#x}");
-            return Err(BlockError);
+            return Err(BlockError::Device);
         }
         Ok(())
     }
@@ -734,7 +735,7 @@ impl BlockDevice for NvmeBlockDevice {
     /// they had.
     fn flush(&mut self) -> BlockResult {
         if self.ctrl.failed {
-            return Err(BlockError);
+            return Err(BlockError::Device);
         }
         Ok(())
     }

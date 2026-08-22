@@ -103,28 +103,45 @@ impl BlockDevice for UsbBlockDevice {
 
     fn read_blocks(&mut self, lba: u64, count: u32, buf: &mut [u8]) -> BlockResult {
         let _op = block::begin_operation();
-        if xhci::storage_read(self.index, lba, count, buf) {
-            return Ok(());
+        let done = xhci::storage_read(self.index, lba, count, buf);
+        if done.is_err() {
+            log!("usb-storage: read of {count} blocks at {lba} {} on disk {}",
+                gave_up(done), self.index);
         }
-        log!("usb-storage: read of {count} blocks at {lba} failed on disk {}", self.index);
-        Err(BlockError)
+        done
     }
 
     fn write_blocks(&mut self, lba: u64, count: u32, buf: &[u8]) -> BlockResult {
         let _op = block::begin_operation();
-        if xhci::storage_write(self.index, lba, count, buf) {
-            return Ok(());
+        let done = xhci::storage_write(self.index, lba, count, buf);
+        if done.is_err() {
+            log!("usb-storage: write of {count} blocks at {lba} {} on disk {}",
+                gave_up(done), self.index);
         }
-        log!("usb-storage: write of {count} blocks at {lba} failed on disk {}", self.index);
-        Err(BlockError)
+        done
     }
 
     fn flush(&mut self) -> BlockResult {
         let _op = block::begin_operation();
-        if xhci::storage_flush(self.index) {
-            return Ok(());
+        let done = xhci::storage_flush(self.index);
+        if done.is_err() {
+            log!("usb-storage: cache flush {} on disk {}", gave_up(done), self.index);
         }
-        log!("usb-storage: cache flush failed on disk {}", self.index);
-        Err(BlockError)
+        done
+    }
+}
+
+/// What this layer's line says happened, which is not the same word for the
+/// two refusals.
+///
+/// **"failed" is a claim about the disk**, and a budget refusal is a claim
+/// about the caller's clock: the driver below already wrote the line naming
+/// [`block::OPERATION`], and repeating "failed" over it is what made the
+/// composite log read as a broken stick. `Ok` is unreachable here — the caller
+/// checks — and answers the word that would be least wrong if it were not.
+fn gave_up(done: BlockResult) -> &'static str {
+    match done {
+        Err(BlockError::BudgetExpired) => "ran out of its operation budget",
+        _ => "failed",
     }
 }

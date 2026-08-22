@@ -21,6 +21,7 @@
 
 use crate::mm::{Dma, Unaligned};
 
+use crate::block::{BlockError, BlockResult};
 use crate::log;
 use crate::scheduler::Operation;
 use crate::time::{Budget, Deadline, Duration};
@@ -353,6 +354,20 @@ enum Scsi {
     /// The transport broke, or the device contradicted itself. Nothing about
     /// the buffer is known.
     Broken,
+    /// The command was **not issued**: the caller's [`crate::block::OPERATION`]
+    /// budget had already expired when this attempt came up.
+    ///
+    /// **Apart from [`Self::Broken`], because it is not a fact about the
+    /// disk.** The two were one value until 2026-08-22 and
+    /// `issues/boot-media/fsync-on-log-returns-other-under-a-loaded-host.md`
+    /// measured what that cost: a stick that answered every transfer, a
+    /// recovery that succeeded in 1 ms, and a log volume given up permanently
+    /// because "your budget expired" arrived at `/bin/logd` as "this disk
+    /// cannot flush". Nothing was on a ring when this is returned, no endpoint
+    /// owes a completion, [`MscDevice::failed`] is clear, and the next
+    /// operation finds the transport exactly as this one left it — which is
+    /// what makes asking again the honest answer.
+    Budget,
 }
 
 impl Scsi {
@@ -361,6 +376,16 @@ impl Scsi {
     /// answer and not a failure.
     fn unimplemented(&self) -> bool {
         matches!(self, Self::Refused { key: 0x05, asc: 0x20, ascq: 0x00 })
+    }
+
+    /// What this command's outcome means to [`crate::block::BlockDevice`]'s
+    /// caller. `Ok` never reaches here — the three callers each have their own
+    /// idea of what a complete transfer is.
+    fn as_block_error(&self) -> BlockError {
+        match self {
+            Self::Budget => BlockError::BudgetExpired,
+            _ => BlockError::Device,
+        }
     }
 }
 
@@ -506,29 +531,37 @@ impl XhciController {
     /// is what keeps [`Self::scsi`] usable by `bring_up`: an enumeration is not
     /// a block-device operation, has no establishment above it, and passes
     /// [`Deadline::never`] by name.
-    pub(super) fn msc_read(&mut self, at: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
+    ///
+    /// **They answer [`BlockResult`] and not `bool`**, because the budget they
+    /// recover is also the budget they can *refuse* on, and that refusal is not
+    /// a fact about the disk. One word for both is what
+    /// `issues/boot-media/fsync-on-log-returns-other-under-a-loaded-host.md`
+    /// measured the cost of; [`Scsi::Budget`] carries the difference up.
+    pub(super) fn msc_read(&mut self, at: usize, lba: u64, count: u32, buf: &mut [u8]) -> BlockResult {
         let until = Operation::deadline();
         self.with_storage(at, |ctrl, disk| {
             ctrl.transfer_blocks(&mut disk.dev, lba, count, Host::Into(buf), until)
         })
-        .unwrap_or(false)
+        // No disk under this index: the controller has nothing to ask, which is
+        // a device fact and never a budget.
+        .unwrap_or(Err(BlockError::Device))
     }
 
-    pub(super) fn msc_write(&mut self, at: usize, lba: u64, count: u32, buf: &[u8]) -> bool {
+    pub(super) fn msc_write(&mut self, at: usize, lba: u64, count: u32, buf: &[u8]) -> BlockResult {
         let until = Operation::deadline();
         self.with_storage(at, |ctrl, disk| {
             ctrl.transfer_blocks(&mut disk.dev, lba, count, Host::From(buf), until)
         })
-        .unwrap_or(false)
+        .unwrap_or(Err(BlockError::Device))
     }
 
-    pub(super) fn msc_flush(&mut self, at: usize) -> bool {
+    pub(super) fn msc_flush(&mut self, at: usize) -> BlockResult {
         let until = Operation::deadline();
         self.with_storage(at, |ctrl, disk| {
             let number = disk.index;
             let dev = &mut disk.dev;
             if dev.failed {
-                return false;
+                return Err(BlockError::Device);
             }
             // LBA 0, block count 0: the whole medium, which is the only thing
             // a cache flush above a block device can mean.
@@ -550,18 +583,23 @@ impl XhciController {
                     log!("usb-storage: disk {number} does not implement SYNCHRONIZE CACHE \
                          (sense 0x05/0x20/0x00); its writes are durable once they complete");
                 }
-                return true;
+                return Ok(());
             }
             match outcome {
-                Scsi::Ok { .. } => true,
+                Scsi::Ok { .. } => Ok(()),
                 Scsi::Refused { key, asc, ascq } => {
                     log_refusal(&cdb, key, asc, ascq);
-                    false
+                    Err(BlockError::Device)
                 }
-                Scsi::Broken => false,
+                Scsi::Broken => Err(BlockError::Device),
+                // The flush was never issued. Unlogged here — `scsi` already
+                // named the budget in the line it wrote — and unlogged above,
+                // because `FatFs::sync`'s own doc says a line written on the
+                // log mount is the next flush.
+                Scsi::Budget => Err(BlockError::BudgetExpired),
             }
         })
-        .unwrap_or(false)
+        .unwrap_or(Err(BlockError::Device))
     }
 
     /// Move `count` 4 KiB blocks between the caller's buffer and the disk.
@@ -576,23 +614,23 @@ impl XhciController {
         count: u32,
         mut host: Host<'_>,
         until: Deadline,
-    ) -> bool {
+    ) -> BlockResult {
         let write = matches!(host, Host::From(_));
         // The caller is the kernel and the trait states this contract, so a
         // mismatch is a kernel bug and gets fail-fast. Everything below this
         // line is about the *device's* numbers, which get refusals instead.
         assert_eq!(host.len(), count as usize * HOST_BLOCK as usize);
         if dev.failed {
-            return false;
+            return Err(BlockError::Device);
         }
         if count == 0 {
-            return true;
+            return Ok(());
         }
         match lba.checked_add(count as u64) {
             Some(end) if end <= dev.blocks => {}
             _ => {
                 log!("usb-storage: {lba}+{count} is past the {} blocks this disk has", dev.blocks);
-                return false;
+                return Err(BlockError::Device);
             }
         }
 
@@ -634,13 +672,23 @@ impl XhciController {
                 // did not", so a partial transfer is a failed one.
                 Scsi::Ok { delivered } => {
                     log!("usb-storage: {delivered} of {bytes} B at block {}", lba + done as u64);
-                    return false;
+                    return Err(BlockError::Device);
                 }
                 Scsi::Refused { key, asc, ascq } => {
                     log_refusal(&cdb, key, asc, ascq);
-                    return false;
+                    return Err(BlockError::Device);
                 }
-                Scsi::Broken => return false,
+                // **A partial transfer whose remainder ran out of budget is a
+                // failure of the whole operation and not a retryable one.** The
+                // blocks already moved are on the device and the caller's buffer
+                // half describes them, so `done > 0` is a state no re-issue can
+                // resume from — only the first batch may honestly answer "ask
+                // again". Every caller in this kernel transfers eight blocks or
+                // fewer (`MSC_MAX_BLOCKS`), so the loop turns once and this is
+                // the reachable arm; it is written for the day one does not.
+                other @ (Scsi::Broken | Scsi::Budget) => {
+                    return Err(if done == 0 { other.as_block_error() } else { BlockError::Device });
+                }
             }
 
             if let Host::Into(dst) = &mut host {
@@ -648,7 +696,7 @@ impl XhciController {
             }
             done += batch;
         }
-        true
+        Ok(())
     }
 
     /// One SCSI command, with the transport's recovery applied and the command
@@ -708,7 +756,11 @@ impl XhciController {
             if until.reached(crate::clock::now()) {
                 log!("usb-storage: {slot} SCSI {opcode:#04x} not issued: {}",
                     crate::block::OPERATION);
-                return Scsi::Broken;
+                // Not `Broken`: nothing was issued, nothing is on a ring, and
+                // `dev.failed` is untouched. The two were one value until
+                // 2026-08-22, which is what made `/bin/logd` give up a volume
+                // on a stick that was answering.
+                return Scsi::Budget;
             }
             match self.bot(dev, cdb, cdb_len, data_phys, data_len, data_in) {
                 Ok(Bot::Done { delivered }) => {
@@ -1320,7 +1372,7 @@ impl core::fmt::Display for Printable<'_> {
         f.write_str("\"")
     }
 }
-/// Read `count` 4 KiB blocks at `lba`. `false` means the transfer failed and
+/// Read `count` 4 KiB blocks at `lba`. On `Err` the transfer did not happen and
 /// `buf` holds nothing the caller may believe.
 ///
 /// **The caller must be inside a block-device operation**
@@ -1329,15 +1381,21 @@ impl core::fmt::Display for Printable<'_> {
 /// [`XhciController::scsi`] is where it is honoured. A call with no
 /// establishment above it is refused by name rather than served without a
 /// budget.
-pub fn storage_read(index: usize, lba: u64, count: u32, buf: &mut [u8]) -> bool {
-    with_disk(index, |ctrl, local| ctrl.msc_read(local, lba, count, buf)).unwrap_or(false)
+///
+/// [`BlockError::BudgetExpired`] is that refusal and
+/// [`BlockError::Device`] is everything else — including no disk under this
+/// index, which the controller has nothing to ask about.
+pub fn storage_read(index: usize, lba: u64, count: u32, buf: &mut [u8]) -> BlockResult {
+    with_disk(index, |ctrl, local| ctrl.msc_read(local, lba, count, buf))
+        .unwrap_or(Err(BlockError::Device))
 }
 
-pub fn storage_write(index: usize, lba: u64, count: u32, buf: &[u8]) -> bool {
-    with_disk(index, |ctrl, local| ctrl.msc_write(local, lba, count, buf)).unwrap_or(false)
+pub fn storage_write(index: usize, lba: u64, count: u32, buf: &[u8]) -> BlockResult {
+    with_disk(index, |ctrl, local| ctrl.msc_write(local, lba, count, buf))
+        .unwrap_or(Err(BlockError::Device))
 }
 
-pub fn storage_flush(index: usize) -> bool {
-    with_disk(index, |ctrl, local| ctrl.msc_flush(local)).unwrap_or(false)
+pub fn storage_flush(index: usize) -> BlockResult {
+    with_disk(index, |ctrl, local| ctrl.msc_flush(local)).unwrap_or(Err(BlockError::Device))
 }
 

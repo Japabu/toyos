@@ -260,9 +260,10 @@ pub fn usb_storage_gate(
     // run out of time for, and the clean pass asserted above is what says the
     // disk was left exactly as it was by it. `kernel/src/block.rs`'s
     // `OPERATION` carries the number and why a device that answers needs one.
-    if !log.contains("usb-gate: read with a spent budget refused=true") {
+    if !log.contains("usb-gate: read with a spent budget refused=true budget=true") {
         return Err(format!(
-            "the driver issued a command past the caller's budget\n{log}"
+            "the driver issued a command past the caller's budget, or reported one it \
+             refused as a fact about the disk\n{log}"
         ));
     }
     verify(&image, bytes, nonce)?;

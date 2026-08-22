@@ -244,10 +244,10 @@ struct VolumeIo<'a>(&'a mut [u8]);
 
 impl VolumeIo<'_> {
     fn range(&self, offset: u64, len: usize) -> Result<core::ops::Range<usize>, IoError> {
-        let start = usize::try_from(offset).map_err(|_| IoError)?;
-        let end = start.checked_add(len).ok_or(IoError)?;
+        let start = usize::try_from(offset).map_err(|_| IoError::Device)?;
+        let end = start.checked_add(len).ok_or(IoError::Device)?;
         if end > self.0.len() {
-            return Err(IoError);
+            return Err(IoError::Device);
         }
         Ok(start..end)
     }

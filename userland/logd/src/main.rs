@@ -53,6 +53,16 @@
 //! at the page cache, and this program calling the result durable would have
 //! been a claim of durability that was not one.
 //!
+//! **A flush that would block is not a flush that failed**, and since
+//! 2026-08-22 this program can tell them apart: `io::ErrorKind::WouldBlock`
+//! from `sync_all` is `kernel/src/block.rs`'s `BlockError::BudgetExpired`,
+//! which means the kernel declined to *start* the operation on the caller's own
+//! clock — nothing was issued, the device is untouched, and the bytes are still
+//! in the file waiting for the next batch's flush. Keeping the volume across
+//! one loses nothing and publishes nothing; ending it on one was a boot's log
+//! thrown away for a stick that answered every transfer. `policy::fate` is the
+//! whole decision, and `policy`'s own header is the argument.
+//!
 //! # The console is the kernel's and stays the kernel's
 //!
 //! This program does **not** write kernel records to the console. `klogd` does,
@@ -61,10 +71,11 @@
 //! is going, and when it has stopped going there — the kernel keeping the
 //! console and giving up the filesystem, taken literally.
 
+mod policy;
 mod store;
 mod wall;
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use toyos::endow::{Endowments, SYSCAP_LABEL};
 use toyos::log::{LogTail, Record};
@@ -72,6 +83,7 @@ use toyos::poller::{Poller, READABLE};
 use toyos::syscap::SysCap;
 use toyos_wallclock::Civil;
 
+use policy::{fate, Fate, Step, LOG_WRITE_BUDGET};
 use store::{Volume, DIR, MAX_LOG_BYTES, ROTATE_FAST_BYTES};
 use wall::Wall;
 
@@ -83,44 +95,6 @@ use wall::Wall;
 /// for the life of the process — allocated once, never grown.
 const BATCH: usize = 64;
 
-/// The longest this program will wait for the log volume before it declares the
-/// volume dead (§5.4).
-///
-/// **A policy number, and it says so**: nothing about the device supplies one.
-/// Five seconds: long enough that a slow stick under a boot's worth of other
-/// I/O is not called dead, short enough that a person watching the console
-/// learns about it while they are still watching.
-///
-/// **It is measured around a syscall, so it is reachable only if the syscall
-/// returns** — every bound below it is what decides whether this policy runs at
-/// all. There are two of them and they answer different failures. The transport
-/// bounds one device round trip (`USB_TIMEOUT_NS`, 2 s in
-/// `kernel/src/drivers/xhci`), which is what turns a stick that *stopped
-/// answering* into an `Err` here rather than an unbounded wait; that bound is
-/// never reached by a device that answers, so on its own it says nothing about
-/// how long a call may take. `kernel/src/block.rs`'s `OPERATION` is the other,
-/// 2 s over one whole block-device operation — the batching, the retries and
-/// the recoveries a single `read_blocks` composes — and it is what bounds a
-/// device that answers every transfer and takes too long over the work. Two
-/// plus one command's overshoot is what leaves this constant a second to notice
-/// with.
-///
-/// **What it bounds is slowness and not errors, and that split is measured
-/// rather than chosen.** §5.4 called it "a policy over repeated errors and a
-/// slow-but-answering device", and the first half of that does not survive this
-/// tree: a failing write is *itself* logged by the driver
-/// (`usb-storage: cache flush failed on disk 0`), which commits a kernel record,
-/// which is a record this program then tries to write, which fails. Retrying
-/// inside a budget therefore does not sample a device that might recover — it
-/// runs a feedback loop, measured at **1,737 failing flushes over six seconds**
-/// under `usb-flush-fails` before this constant was given the narrower job.
-///
-/// So an **error** ends it at once, which is what `kernel/src/log_file.rs` did
-/// and for a reason that turns out to be this one rather than an idle loop's
-/// convenience. This bounds the other failure the volume has: a device that
-/// answers, and takes longer doing it than a log is worth. `usb_flush_optional`
-/// is the gate for the first and `--slow-usb` the instrument for the second.
-const LOG_WRITE_BUDGET: Duration = Duration::from_secs(5);
 
 /// How long a park on the log's readiness source waits before looking again.
 ///
@@ -200,6 +174,9 @@ fn main() {
     poller.wait(0, 0, |_| {});
 
     let mut lost = 0u64;
+    // When the current run of consecutive retries began, or `None` when the
+    // last batch was answered. `policy::fate` bounds the run and not the round.
+    let mut retrying_since: Option<Instant> = None;
     loop {
         let batch = match tail.read(&cap, &mut buf) {
             Ok(batch) => batch,
@@ -235,17 +212,17 @@ fn main() {
 
         let newest = batch.last().map_or(0, |r| r.at_ns);
         let began = Instant::now();
-        let mut refused = None;
+        let mut refused: Option<(Step, std::io::ErrorKind, String)> = None;
         for record in batch.iter() {
             let line = format!("{} {record}\n", stamp(boot_local, record.at_ns));
             if let Err(e) = v.write(line.as_bytes()) {
-                refused = Some(("the append", e.to_string()));
+                refused = Some((Step::Append, e.kind(), e.to_string()));
                 break;
             }
         }
         if refused.is_none() {
             if let Err(e) = v.sync() {
-                refused = Some(("the sync", e.to_string()));
+                refused = Some((Step::Flush, e.kind(), e.to_string()));
             }
         }
         // A volume that answered, and took longer than a log is worth doing it.
@@ -254,7 +231,11 @@ fn main() {
         // transport's own bound has expired, so the only place to notice is
         // here.
         if refused.is_none() && began.elapsed() > LOG_WRITE_BUDGET {
-            refused = Some(("the write", format!("it took {:?}", began.elapsed())));
+            refused = Some((
+                Step::TooSlow,
+                std::io::ErrorKind::Other,
+                format!("it took {:?}", began.elapsed()),
+            ));
         }
 
         match refused {
@@ -264,6 +245,7 @@ fn main() {
                 // is only in the page cache would lose the report in exactly
                 // the case the wait exists for.
                 tail.publish_durable(newest);
+                retrying_since = None;
                 if v.full() {
                     if let Err(e) = v.rotate(|line| say!("{line}")) {
                         say!("logd: {DIR} would not take a continuation ({e}) - {}", v.path());
@@ -271,18 +253,46 @@ fn main() {
                     }
                 }
             }
-            Some((step, why)) => {
-                // §5.4, in order: stop feeding the volume, say so once, and keep
-                // running. It does not exit, does not retry and does not queue
-                // for a device that is not answering — "I stop waiting for this
-                // stick and say so" is the whole policy, and the constant above
-                // is why a retry is not part of it.
-                say!(
-                    "logd: {DIR} has not answered ({step}: {why}) - this boot's log is on the \
-                     console only from {}",
-                    v.path()
-                );
-                volume = None;
+            Some((step, kind, why)) => {
+                // The run of consecutive retries, which is what
+                // `LOG_WRITE_BUDGET` bounds. `began` and not `Instant::now()`:
+                // the run starts when the first refused round started, so the
+                // time this batch spent being refused is inside it.
+                let first = retrying_since.is_none();
+                let since = *retrying_since.get_or_insert(began);
+                match fate(step, kind, since.elapsed()) {
+                    // §5.4, in order: stop feeding the volume, say so once, and
+                    // keep running. It does not exit and does not queue for a
+                    // device that is not answering — "I stop waiting for this
+                    // stick and say so" is the whole policy for a device fact.
+                    Fate::GiveUp => {
+                        say!(
+                            "logd: {DIR} has not answered ({}: {why}) - this boot's log is on \
+                             the console only from {}",
+                            step.as_str(),
+                            v.path()
+                        );
+                        volume = None;
+                    }
+                    // **Nothing is published**, because nothing is durable: the
+                    // bytes are in the file and the next batch's flush covers
+                    // them as well as its own, so the kernel's `LOG_DURABLE_NS`
+                    // stays a word that is true.
+                    //
+                    // One line per *run* and not per round: a loaded host
+                    // refuses several batches in a row, and a line each is the
+                    // feedback loop `LOG_WRITE_BUDGET`'s own doc measures.
+                    Fate::Retry => {
+                        if first {
+                            say!(
+                                "logd: {DIR} would not start ({}: {why}) - nothing was lost, so \
+                                 {} is still this boot's log and the next batch is a retry",
+                                step.as_str(),
+                                v.path()
+                            );
+                        }
+                    }
+                }
             }
         }
     }

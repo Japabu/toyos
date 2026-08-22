@@ -197,13 +197,31 @@ struct FatDevice {
 /// the file's chain straddles a FAT block boundary.
 const RESIDENT_BLOCKS: usize = 8;
 
+/// The block layer's answer, in the word `toyos_fat32` speaks.
+///
+/// **One function and not `From`, because it crosses a crate boundary in the
+/// direction that has no orphan.** It is the whole of what carries
+/// `block::OPERATION`'s refusal past this adapter: `toyos-fat32` is a pure
+/// crate with no kernel in it, so the *fact* that a bound expired has to arrive
+/// as a variant rather than as a log line, and this is where the two
+/// vocabularies meet. `Device` on both sides is every fact about the hardware;
+/// `BudgetExpired` on both sides is the caller's own clock.
+fn as_io_error(e: crate::block::BlockError) -> IoError {
+    match e {
+        crate::block::BlockError::Device => IoError::Device,
+        crate::block::BlockError::BudgetExpired => IoError::BudgetExpired,
+    }
+}
+
 impl FatDevice {
-    /// The device byte offset `offset` names, or [`IoError`] if the request
-    /// leaves the partition. Every read and write goes through here.
+    /// The device byte offset `offset` names, or [`IoError::Device`] if the
+    /// request leaves the partition — this adapter's own bound, and a fact
+    /// about the request rather than about the caller's clock. Every read and
+    /// write goes through here.
     fn locate(&self, offset: u64, len: usize) -> Result<u64, IoError> {
-        let end = offset.checked_add(len as u64).ok_or(IoError)?;
+        let end = offset.checked_add(len as u64).ok_or(IoError::Device)?;
         if end > self.len {
-            return Err(IoError);
+            return Err(IoError::Device);
         }
         Ok(self.start + offset)
     }
@@ -220,7 +238,7 @@ impl FatDevice {
             return Ok(());
         }
         let Self { dev, scratch, .. } = self;
-        dev.read_blocks(block, 1, scratch).map_err(|_| IoError)?;
+        dev.read_blocks(block, 1, scratch).map_err(as_io_error)?;
         self.retain(block);
         Ok(())
     }
@@ -260,7 +278,7 @@ impl FatDevice {
                 let end = done + count * BLOCK as usize;
                 self.dev
                     .read_blocks(block, count as u32, &mut buf[done..end])
-                    .map_err(|_| IoError)?;
+                    .map_err(as_io_error)?;
                 done = end;
             } else {
                 let n = (BLOCK as usize - within).min(left);
@@ -286,7 +304,7 @@ impl FatDevice {
                 self.forget(block, count as u64);
                 self.dev
                     .write_blocks(block, count as u32, &buf[done..end])
-                    .map_err(|_| IoError)?;
+                    .map_err(as_io_error)?;
                 done = end;
             } else {
                 // The bytes this request does not cover belong to whoever wrote
@@ -296,7 +314,7 @@ impl FatDevice {
                 self.load(block)?;
                 self.scratch[within..within + n].copy_from_slice(&buf[done..done + n]);
                 let Self { dev, scratch, .. } = self;
-                dev.write_blocks(block, 1, scratch).map_err(|_| IoError)?;
+                dev.write_blocks(block, 1, scratch).map_err(as_io_error)?;
                 self.retain(block);
                 done += n;
             }
@@ -335,7 +353,7 @@ impl BlockAccess for FatVolume {
 
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), IoError> {
         let mut guard = device(self.role).lock();
-        let served = guard.as_mut().ok_or(IoError)?.read_at(offset, buf);
+        let served = guard.as_mut().ok_or(IoError::Device)?.read_at(offset, buf);
         if injected_read_failure(self.role) {
             // Both halves of what a real failure leaves behind, not just the
             // verdict: `FatDevice::read_at` gives the caller back a buffer it
@@ -344,19 +362,19 @@ impl BlockAccess for FatVolume {
             buf.fill(0);
             log!("{}-volume: read of {} B at volume offset {offset} failed",
                 self.role, buf.len());
-            return Err(IoError);
+            return Err(IoError::Device);
         }
         served
     }
 
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), IoError> {
         let mut guard = device(self.role).lock();
-        guard.as_mut().ok_or(IoError)?.write_at(offset, buf)
+        guard.as_mut().ok_or(IoError::Device)?.write_at(offset, buf)
     }
 
     fn flush(&mut self) -> Result<(), IoError> {
         let mut guard = device(self.role).lock();
-        guard.as_mut().ok_or(IoError)?.dev.flush().map_err(|_| IoError)
+        guard.as_mut().ok_or(IoError::Device)?.dev.flush().map_err(as_io_error)
     }
 }
 
@@ -453,7 +471,7 @@ impl FileBacking for FatBacking {
                 // — but silence here is what the other two backings do not do,
                 // and `serving zeros` is the string a triage greps for.
                 log!("{}-volume: not mounted; serving zeros", self.role);
-                return Err(crate::block::BlockError);
+                return Err(crate::block::BlockError::Device);
             };
             let served = dev.read_at(extent.offset + within, &mut buf[done..done + n]);
             if !fat_backing_reads() {
@@ -469,7 +487,7 @@ impl FileBacking for FatBacking {
             if served.is_err() || !fat_backing_reads() {
                 log!("{}-volume: read of {n} B at volume offset {} failed; serving zeros",
                     self.role, extent.offset + within);
-                return Err(crate::block::BlockError);
+                return Err(crate::block::BlockError::Device);
             }
             drop(guard);
             done += n;
@@ -555,6 +573,14 @@ fn as_syscall_error(e: Error) -> SyscallError {
         | Error::Truncated
         | Error::CorruptChain
         | Error::CorruptDirectory => SyscallError::Io,
+        // **Not `Io`, and the difference is the whole of this arm's job.** The
+        // volume was not touched and the device said nothing wrong; what
+        // expired is `block::OPERATION`, which is the *caller's* bound. It
+        // reaches userland as `io::ErrorKind::WouldBlock`
+        // (`rust/library/std/src/sys/fs/toyos.rs`), which is what lets
+        // `/bin/logd` keep a volume across a slow flush and still give it up
+        // on a failing one.
+        Error::BudgetExpired => SyscallError::WouldBlock,
         // The last component of the path is not the thing the operation is
         // defined for. Not `NotFound`: the name does resolve.
         Error::NotADirectory | Error::IsADirectory | Error::DirectoryNotEmpty => {
