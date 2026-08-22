@@ -6,7 +6,15 @@
 //! structurally cannot see: its counters are streaming-scoped, and its boots
 //! always connect a client. No wav analysis — there is no signal, and the
 //! capture freezes while the voice is stopped anyway.
+//!
+//! Another process's threads is the process roster, which costs
+//! `Rights::ROSTER` on a `SysCap` — `tests/testcases` names `roster` on the
+//! test-runner row and every binary it spawns holds the duplicate. A capability
+//! this binary does not hold is a config fact and says so, rather than reading
+//! back zero soundd threads and calling that a suspended daemon.
 
+use toyos::endow::{Endowments, SYSCAP_LABEL};
+use toyos::syscap::SysCap;
 use toyos::system;
 
 const HEADER: usize = system::SYSINFO_HEADER_SIZE;
@@ -16,9 +24,9 @@ const ENTRY: usize = system::SYSINFO_ENTRY_SIZE;
 /// the process name ("soundd"), the control thread under its own
 /// ("soundd-ctrl"); matching the prefix covers both and fails loudly if the
 /// daemon is missing.
-fn soundd_cpu_ns() -> u64 {
+fn soundd_cpu_ns(cap: &SysCap) -> u64 {
     let mut buf = vec![0u8; HEADER + ENTRY * 128];
-    let n = system::sysinfo(&mut buf);
+    let n = cap.roster(&mut buf);
     assert!(n >= HEADER, "sysinfo failed");
 
     let mut total = 0u64;
@@ -41,9 +49,12 @@ fn soundd_cpu_ns() -> u64 {
 }
 
 fn main() {
-    let before = soundd_cpu_ns();
+    let cap: SysCap = Endowments::get()
+        .take(SYSCAP_LABEL)
+        .expect("test-runner endows every binary it spawns a system capability");
+    let before = soundd_cpu_ns(&cap);
     std::thread::sleep(std::time::Duration::from_millis(1000));
-    let after = soundd_cpu_ns();
+    let after = soundd_cpu_ns(&cap);
     assert_eq!(
         after,
         before,

@@ -28,6 +28,7 @@ use std::io::Read;
 use std::os::toyos::process::{ChildExt, CommandExt};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use toyos::endow::{Endowments, SYSCAP_LABEL};
@@ -177,13 +178,31 @@ fn a_thread_of_mine_has_exited() -> bool {
     my_threads().iter().any(|&(is_thread, state)| is_thread && state == ZOMBIE)
 }
 
+/// The estate's system capability, taken once.
+///
+/// **Once, because taking is a swap**: a second `take` of the same label finds
+/// `HANDLE_INVALID` and answers `None`, and two arms here want the same cap —
+/// one for the `MANAGE` refusal, one for the roster below.
+fn cap() -> &'static SysCap {
+    static CAP: OnceLock<SysCap> = OnceLock::new();
+    CAP.get_or_init(|| {
+        Endowments::get()
+            .take(SYSCAP_LABEL)
+            .expect("test-runner endows every binary it spawns a system capability")
+    })
+}
+
 /// This process's threads as the kernel publishes them: `(is a child thread,
 /// scheduler state)`.
+///
+/// Even one's own threads arrive in the machine-wide roster, which is
+/// `Rights::ROSTER` on a `SysCap` — there is no narrower question in the ABI,
+/// and `tests/testcases` names `roster` on the test-runner row for this.
 fn my_threads() -> Vec<(bool, u8)> {
     const HEADER: usize = toyos::system::SYSINFO_HEADER_SIZE;
     const ENTRY: usize = toyos::system::SYSINFO_ENTRY_SIZE;
     let mut buf = vec![0u8; HEADER + ENTRY * 256];
-    let n = toyos::system::sysinfo(&mut buf);
+    let n = cap().roster(&mut buf);
     assert!((HEADER..=buf.len()).contains(&n), "sysinfo answered {n}");
     let me = syscall::getpid().raw();
     (HEADER..)
@@ -250,11 +269,8 @@ fn a_handle_is_the_whole_of_the_right() {
 /// and `DUP`, which is what makes this refusal non-vacuous: the handle resolves,
 /// and it is the right that is missing.
 fn a_pid_is_not_authority() {
-    let cap: SysCap = Endowments::get()
-        .take(SYSCAP_LABEL)
-        .expect("test-runner endows every binary it spawns a system capability");
     assert_eq!(
-        syscall::process_open(cap.as_handle(), syscall::getpid()),
+        syscall::process_open(cap().as_handle(), syscall::getpid()),
         Err(SyscallError::PermissionDenied),
         "a capability without MANAGE opened a process by pid",
     );

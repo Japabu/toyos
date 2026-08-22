@@ -256,9 +256,9 @@ fn test_fragmentation_resistance() {
 
 /// Verify sysinfo reports reasonable memory stats.
 fn test_memory_stats() {
-    let mut buf = [0u8; 4096];
-    let n = toyos_abi::syscall::sysinfo(&mut buf);
-    assert!(n >= 48, "sysinfo returned only {n} bytes, need at least 48");
+    let mut buf = [0u8; toyos::system::SYSINFO_HEADER_SIZE];
+    let n = toyos::system::sysinfo(&mut buf);
+    assert_eq!(n, buf.len(), "sysinfo returned only {n} bytes, need the whole header");
 
     // Binary header: total_mem(u64), used_mem(u64), ...
     let total = u64::from_le_bytes(buf[0..8].try_into().unwrap());
