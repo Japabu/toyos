@@ -1,10 +1,11 @@
 //! The capability whose whole authority is in the rights on the handle.
 //!
-//! Four things are reachable no other way — minting a device claim, entering
-//! the real-time band, turning a pid into a process handle, and powering the
-//! machine off — and each is one bit on a handle to this. The kernel makes
-//! exactly one at boot, for `/bin/init`, so the set of processes that can ever
-//! do any of the four is exactly what init endowed.
+//! Five things are reachable no other way — minting a device claim, entering
+//! the real-time band, turning a pid into a process handle, listing every
+//! process in the machine, and powering the machine off — and each is one bit
+//! on a handle to this. The kernel makes exactly one at boot, for `/bin/init`,
+//! so the set of processes that can ever do any of the five is exactly what
+//! init endowed.
 
 use toyos_abi::handle::Rights;
 use toyos_abi::syscall::{self, DeviceType, SyscallError};
@@ -51,6 +52,20 @@ impl SysCap {
     /// the ones a `system.toml` row named `power` in.
     pub fn shutdown(&self) -> SyscallError {
         syscall::shutdown(self.0.raw())
+    }
+
+    /// The machine's header, then one entry per live thread for as much of
+    /// `buf` as is left. Answers the bytes written, and `0` if it was refused.
+    ///
+    /// Needs [`Rights::ROSTER`], which is what makes the entries — a pid, a
+    /// size, a CPU time and a **name** for every process in the machine — the
+    /// business of `/bin/ps` and not of every program that can make a syscall.
+    /// [`crate::system::sysinfo`] is the header on its own and needs nothing.
+    ///
+    /// A `buf` too small for an entry asks for the header, which this
+    /// capability is not needed for and is not consulted about.
+    pub fn roster(&self, buf: &mut [u8]) -> usize {
+        syscall::sysinfo(self.0.raw(), buf)
     }
 
     /// A second handle to this capability carrying **less**.

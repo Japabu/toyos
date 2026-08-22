@@ -459,16 +459,13 @@ fn syscall_dispatch(num: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         SYS_CLOCK_EPOCH => {
             crate::clock::utc_secs().map_or(SyscallError::NotSupported.to_u64(), |secs| secs)
         }
-        // **Demands nothing because nobody has decided it should**, and not
-        // because the answer is the caller's own: the header is a machine fact
-        // like `SYS_CPU_COUNT`, but the entries name and size every process in
-        // the machine to a caller holding an empty handle table.
-        // `issues/isolation/sysinfo-enumerates-every-process.md` is the open
-        // question and it is the owner's; this line says the silence here is
-        // that and not a judgement anyone made at this arm.
+        // The capability is first, as it is at every other arm that takes one.
+        // The buffer decides whether it is looked at: the header is a machine
+        // fact like `SYS_CPU_COUNT`, and the roster after it is every process
+        // in the machine by name.
         SYS_SYSINFO => {
-            let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a1), a2) else { return bad_addr };
-            sys_sysinfo(&mut buf)
+            let Some(mut buf) = ctx.user_bytes_mut(UserAddr::new(a2), a3) else { return bad_addr };
+            sys_sysinfo(RawHandle(a1 as u32), &mut buf)
         }
         SYS_NANOSLEEP => sys_nanosleep(a1),
         SYS_HANDLE_DUP => sys_handle_dup(RawHandle(a1 as u32), a2),
@@ -2519,9 +2516,16 @@ fn sysinfo_thread_bound() -> usize {
     MAX_SYSINFO_THREADS
 }
 
-fn sys_sysinfo(out: &mut UserBytesMut) -> u64 {
-    const HEADER_SIZE: usize = 48;
-    const ENTRY_SIZE: usize = 64;
+/// The machine's header, then the process roster for as much of `out` as is
+/// left.
+///
+/// **`syscap` is plumbed and not yet read.** The owner ruled on 2026-08-20 that
+/// the roster rides a right; the ABI half of that had to land on its own pull
+/// request, so this argument arrives one landing before the demand that reads
+/// it. Nothing is gated between the two.
+fn sys_sysinfo(_syscap: RawHandle, out: &mut UserBytesMut) -> u64 {
+    const HEADER_SIZE: usize = toyos_abi::syscall::SYSINFO_HEADER_SIZE;
+    const ENTRY_SIZE: usize = toyos_abi::syscall::SYSINFO_ENTRY_SIZE;
     if out.len() < HEADER_SIZE {
         return SyscallError::InvalidArgument.to_u64();
     }
